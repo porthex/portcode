@@ -55,9 +55,7 @@ export default function App() {
 }
 
 function TitleBar() {
-  const session = useStore((s) =>
-    s.sessions.find((x) => x.id === s.activeId)
-  );
+  const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
   const showFiles = useStore((s) => s.showFiles);
   const toggleFiles = useStore((s) => s.toggleFiles);
   return (
@@ -66,9 +64,7 @@ function TitleBar() {
         <button
           onClick={toggleFiles}
           className={`flex h-7 w-7 items-center justify-center rounded-md text-sm transition-colors ${
-            showFiles
-              ? "bg-accent-dim text-accent"
-              : "text-muted hover:bg-panel-2 hover:text-fg"
+            showFiles ? "bg-accent-dim text-accent" : "text-muted hover:bg-panel-2 hover:text-fg"
           }`}
           title="Toggle file explorer"
         >
@@ -81,15 +77,11 @@ function TitleBar() {
             />
           </svg>
         </button>
-        <span className="ml-1 truncate text-sm font-medium">
-          {session?.title ?? "Portcode"}
-        </span>
+        <span className="ml-1 truncate text-sm font-medium">{session?.title ?? "Portcode"}</span>
       </div>
       <div className="flex items-center gap-2 text-xs text-muted">
         {!isTauri() && (
-          <span className="rounded bg-accent-dim px-2 py-0.5 text-accent">
-            preview mode
-          </span>
+          <span className="rounded bg-accent-dim px-2 py-0.5 text-accent">preview mode</span>
         )}
       </div>
     </header>

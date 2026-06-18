@@ -31,18 +31,14 @@ export function MessageView({ message }: { message: Message }) {
               }
               if (b.kind === "tool_use") {
                 const result = message.blocks.find(
-                  (x) => x.kind === "tool_result" && x.toolUseId === b.id
+                  (x) => x.kind === "tool_result" && x.toolUseId === b.id,
                 );
                 return (
                   <ToolCall
                     key={i}
                     name={b.name}
                     input={b.input}
-                    result={
-                      result && result.kind === "tool_result"
-                        ? result
-                        : undefined
-                    }
+                    result={result && result.kind === "tool_result" ? result : undefined}
                   />
                 );
               }

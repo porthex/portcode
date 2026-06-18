@@ -30,9 +30,7 @@ export function ToolCall({
       </button>
       {open && (
         <div className="border-t border-border px-3 py-2">
-          <div className="mb-1 text-[11px] uppercase tracking-wide text-muted">
-            Input
-          </div>
+          <div className="mb-1 text-[11px] uppercase tracking-wide text-muted">Input</div>
           <pre className="mb-2 overflow-x-auto rounded bg-bg p-2 font-mono text-[12px] text-fg select-text">
             {JSON.stringify(input, null, 2)}
           </pre>
@@ -63,11 +61,7 @@ export function ToolCall({
 function StatusDot({ pending, error }: { pending: boolean; error?: boolean }) {
   const color = error ? "bg-danger" : pending ? "bg-warn" : "bg-success";
   return (
-    <span
-      className={`h-2 w-2 shrink-0 rounded-full ${color} ${
-        pending ? "animate-pulse" : ""
-      }`}
-    />
+    <span className={`h-2 w-2 shrink-0 rounded-full ${color} ${pending ? "animate-pulse" : ""}`} />
   );
 }
 

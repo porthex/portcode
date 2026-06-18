@@ -33,7 +33,7 @@ export function CommandPalette() {
         run: () => void updateSettings({ model: m.id }),
       })),
     ],
-    [newSession, toggleFiles, openWorkspace, setShowSettings, updateSettings]
+    [newSession, toggleFiles, openWorkspace, setShowSettings, updateSettings],
   );
 
   const filtered = useMemo(() => {
@@ -96,9 +96,7 @@ export function CommandPalette() {
         />
         <div className="max-h-80 overflow-y-auto py-1">
           {filtered.length === 0 ? (
-            <div className="px-4 py-6 text-center text-sm text-muted">
-              No matching commands
-            </div>
+            <div className="px-4 py-6 text-center text-sm text-muted">No matching commands</div>
           ) : (
             filtered.map((c, i) => (
               <button
@@ -110,9 +108,7 @@ export function CommandPalette() {
                 }`}
               >
                 <span>{c.label}</span>
-                {c.hint && (
-                  <span className="font-mono text-[11px] text-muted">{c.hint}</span>
-                )}
+                {c.hint && <span className="font-mono text-[11px] text-muted">{c.hint}</span>}
               </button>
             ))
           )}

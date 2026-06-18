@@ -80,7 +80,7 @@ function crc32(buf) {
     c ^= buf[i];
     for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1));
   }
-  return (~c) >>> 0;
+  return ~c >>> 0;
 }
 function chunk(type, data) {
   const len = Buffer.alloc(4);

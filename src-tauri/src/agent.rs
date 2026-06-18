@@ -3,7 +3,7 @@
 //! state is persisted to SQLite so threads survive restarts.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -24,7 +24,7 @@ fn emit(app: &AppHandle, channel: &str, ev: StreamEvent) {
     let _ = app.emit(channel, ev);
 }
 
-fn system_prompt(workspace: &PathBuf) -> String {
+fn system_prompt(workspace: &Path) -> String {
     format!(
         "You are Portcode, a fast, native AI coding agent for Windows, part of the \
 Porthex toolset. You help the user understand and modify code in their workspace.\n\n\
@@ -82,7 +82,15 @@ pub async fn run(
     );
 
     let result = run_inner(
-        &app, &http, &settings, &db, &pending, &cancel, &channel, &session_id, user_text,
+        &app,
+        &http,
+        &settings,
+        &db,
+        &pending,
+        &cancel,
+        &channel,
+        &session_id,
+        user_text,
     )
     .await;
 
@@ -111,8 +119,8 @@ async fn run_inner(
 ) -> Result<String, String> {
     let snapshot = { settings.lock().unwrap().clone() };
 
-    let api_key = secrets::get_api_key()
-        .ok_or("No API key set. Add your Anthropic API key in Settings.")?;
+    let api_key =
+        secrets::get_api_key().ok_or("No API key set. Add your Anthropic API key in Settings.")?;
 
     let workspace = snapshot
         .workspace
@@ -205,9 +213,10 @@ async fn run_inner(
                                     Ok(out) => (out, false),
                                     Err(err) => (err, true),
                                 },
-                                Decision::Deny => {
-                                    ("Denied: the user did not approve this action.".to_string(), true)
-                                }
+                                Decision::Deny => (
+                                    "Denied: the user did not approve this action.".to_string(),
+                                    true,
+                                ),
                             }
                         }
                         None => (format!("Unknown tool: {name}"), true),
@@ -243,4 +252,28 @@ async fn run_inner(
 
     db.touch_session(session_id, db::now_ms());
     Ok(final_stop)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_title;
+
+    #[test]
+    fn derive_title_truncates_long_input() {
+        let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let title = derive_title(long);
+        // 42 chars plus the single-character ellipsis.
+        assert!(title.chars().count() <= 43, "title was {title:?}");
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn derive_title_collapses_whitespace() {
+        assert_eq!(derive_title("  hello   world  "), "hello world");
+    }
+
+    #[test]
+    fn derive_title_defaults_when_empty() {
+        assert_eq!(derive_title("   "), "New chat");
+    }
 }

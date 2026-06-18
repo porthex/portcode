@@ -1,0 +1,7 @@
+# Clippy heuristic-lint thresholds, raised (never lowered) from the defaults so
+# that `cargo clippy --all-targets -- -D warnings` stays green for the
+# inherently wide Tauri command / agent-loop signatures (e.g. `agent::run`,
+# `permissions::gate`) without scattering `#[allow]` attributes.
+too-many-arguments-threshold = 8
+too-many-lines-threshold = 300
+type-complexity-threshold = 300

@@ -44,10 +44,7 @@ export async function setApiKey(key: string): Promise<void> {
   return mock.setApiKey(key);
 }
 
-export async function resolvePermission(
-  id: string,
-  decision: "allow" | "deny"
-): Promise<void> {
+export async function resolvePermission(id: string, decision: "allow" | "deny"): Promise<void> {
   if (isTauri()) {
     const { core } = await tauri();
     await core.invoke("resolve_permission", { id, decision });
@@ -69,7 +66,7 @@ export async function listSessions(): Promise<Session[]> {
 export async function createSession(
   id: string,
   title?: string,
-  workspace?: string | null
+  workspace?: string | null,
 ): Promise<void> {
   if (isTauri()) {
     const { core } = await tauri();
@@ -126,13 +123,13 @@ export async function openFolder(): Promise<string | null> {
 export async function runAgent(
   sessionId: string,
   text: string,
-  onEvent: (e: StreamEvent) => void
+  onEvent: (e: StreamEvent) => void,
 ): Promise<{ cancel: () => Promise<void> }> {
   if (isTauri()) {
     const { core, event } = await tauri();
     const channel = `agent://${sessionId}`;
     const unlisten: Unlisten = await event.listen<StreamEvent>(channel, (ev) =>
-      onEvent(ev.payload)
+      onEvent(ev.payload),
     );
     await core.invoke("run_agent", { sessionId, text });
     return {
@@ -204,11 +201,7 @@ const mock = (() => {
       };
       return tree[sub ?? ""] ?? [];
     },
-    async runAgent(
-      _sessionId: string,
-      text: string,
-      onEvent: (e: StreamEvent) => void
-    ) {
+    async runAgent(_sessionId: string, text: string, onEvent: (e: StreamEvent) => void) {
       let cancelled = false;
       (async () => {
         await delay(120);

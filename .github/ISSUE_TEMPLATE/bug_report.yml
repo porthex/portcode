@@ -1,0 +1,146 @@
+name: Bug report
+description: Report something broken in Portcode. Please fill in the Windows/WebView2 details — they make most bugs reproducible.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Portcode is a Windows app built
+        on WebView2, so most issues are specific to a Windows build or WebView2
+        version — the fields below are required because they kill triage
+        round-trips.
+
+        **Security note:** if this is a security vulnerability (permission-gate
+        bypass, sandbox escape, API-key exposure, etc.), **do not** file it here.
+        Report it privately — see [SECURITY.md](https://github.com/porthex/portcode/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and its impact.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps so we can reproduce it.
+      placeholder: |
+        1. Open Portcode on workspace '...'
+        2. Ask the agent to '...'
+        3. Approve/deny '...'
+        4. See the error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened.
+    validations:
+      required: true
+
+  - type: input
+    id: portcode-version
+    attributes:
+      label: Portcode version
+      description: From the app's About screen, or the installer/build you ran.
+      placeholder: e.g. 0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: windows-build
+    attributes:
+      label: Windows build
+      description: Run `winver` and copy the version/build (e.g. "Windows 11 23H2, build 22631.4169").
+      placeholder: e.g. Windows 11 23H2 (build 22631.4169)
+    validations:
+      required: true
+
+  - type: input
+    id: webview2-version
+    attributes:
+      label: WebView2 runtime version
+      description: Settings → Apps → "Microsoft Edge WebView2 Runtime", or via PowerShell (`(Get-AppxPackage *WebView2*).Version` / registry). WebView2-specific rendering bugs are common.
+      placeholder: e.g. 126.0.2592.81
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: How did you install Portcode?
+      options:
+        - NSIS installer (release)
+        - Built from source
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: LLM provider in use
+      description: Which provider was configured when the bug occurred?
+      options:
+        - Anthropic
+        - Other / multiple
+        - Not applicable
+    validations:
+      required: true
+
+  - type: input
+    id: workspace-type
+    attributes:
+      label: Workspace type
+      description: What kind of project/folder was open? (e.g. a Rust repo, a large monorepo, a network drive, a path with spaces/unicode.)
+      placeholder: e.g. local Git repo on C:, ~40k files
+    validations:
+      required: true
+
+  - type: dropdown
+    id: shell-or-write
+    attributes:
+      label: Was a shell command or file write involved?
+      description: Portcode's mutating tools (`shell`, `fs_write`, `fs_edit`) go through the permission gate — this helps us narrow it down.
+      options:
+        - "No"
+        - "Yes — a shell command"
+        - "Yes — a file write/edit"
+        - "Yes — both"
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or screenshots
+      description: Paste any error output, console logs, or screenshots. **Redact secrets and API keys.**
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Before you submit
+      options:
+        - label: This report and any attached logs contain **no API keys, secrets, or other sensitive data**.
+          required: true
+        - label: I searched existing [issues](https://github.com/porthex/portcode/issues) and [Discussions](https://github.com/porthex/portcode/discussions) and did not find a duplicate.
+          required: true
+        - label: I agree to follow this project's [Code of Conduct](https://github.com/porthex/portcode/blob/main/CODE_OF_CONDUCT.md).
+          required: true

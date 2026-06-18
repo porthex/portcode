@@ -478,10 +478,7 @@ struct Shell;
 /// skip the user profile so output is predictable and they never hang on a prompt.
 fn shell_invocation(shell: &str) -> Result<(&'static str, &'static [&'static str]), String> {
     match shell {
-        "powershell" => Ok((
-            "powershell",
-            &["-NoProfile", "-NonInteractive", "-Command"],
-        )),
+        "powershell" => Ok(("powershell", &["-NoProfile", "-NonInteractive", "-Command"])),
         "pwsh" => Ok(("pwsh", &["-NoProfile", "-NonInteractive", "-Command"])),
         "cmd" => Ok(("cmd", &["/C"])),
         other => Err(format!(
@@ -561,6 +558,9 @@ impl Tool for Shell {
         if buf.trim().is_empty() {
             buf = "(no output)".into();
         }
-        Ok(format!("{}\n\n[exit code {code}]", truncate_chars(buf, 100_000)))
+        Ok(format!(
+            "{}\n\n[exit code {code}]",
+            truncate_chars(buf, 100_000)
+        ))
     }
 }

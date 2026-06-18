@@ -105,7 +105,11 @@ struct Request<'a> {
 
 enum Building {
     Text(String),
-    Tool { id: String, name: String, json: String },
+    Tool {
+        id: String,
+        name: String,
+        json: String,
+    },
 }
 
 fn emit(app: &AppHandle, channel: &str, ev: StreamEvent) {

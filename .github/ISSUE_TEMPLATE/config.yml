@@ -1,0 +1,11 @@
+# Issue chooser configuration.
+# Blank issues are disabled so every report goes through a structured form;
+# questions and vulnerabilities are routed away from the issue tracker.
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & "how do I…?"
+    url: https://github.com/porthex/portcode/discussions
+    about: Ask usage questions, share ideas, and get help in GitHub Discussions — not the issue tracker.
+  - name: Report a security vulnerability (private)
+    url: https://github.com/porthex/portcode/security/advisories/new
+    about: Portcode runs shell commands and holds API keys. Disclose privately via GitHub Private Vulnerability Reporting. Do NOT open a public issue. See SECURITY.md.

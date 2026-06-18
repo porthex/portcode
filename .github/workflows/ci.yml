@@ -1,0 +1,96 @@
+name: CI
+
+# Phase 0 quality gates: lint, format, type-check, and tests for both the
+# TypeScript frontend and the Rust (Tauri) backend. Runs on every push to
+# `main` and on every pull request. This workflow performs NO telemetry,
+# analytics, or network reporting — it only builds and tests the code.
+#
+# The full signed `tauri build` is intentionally NOT here; it is gated to
+# tag/label and lives in the Phase 1 `release.yml` (Azure Trusted Signing).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend (lint · format · typecheck · test)
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows-first today. Linux is on the roadmap: add `ubuntu-latest`
+        # to this list (a one-line change) to turn the matrix on.
+        os: [windows-latest]
+        # os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable Corepack (pnpm)
+        run: corepack enable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint (ESLint)
+        run: pnpm lint
+
+      - name: Format check (Prettier)
+        run: pnpm format:check
+
+      - name: Type-check (tsc --noEmit)
+        run: pnpm typecheck
+
+      - name: Test (Vitest)
+        run: pnpm test
+
+  rust:
+    name: Rust (fmt · clippy · test)
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows-first today (MSVC + WebView2). Add `ubuntu-latest` here when
+        # Linux turns on — note the Linux build also needs system WebKitGTK
+        # dependencies, added at that time.
+        os: [windows-latest]
+        # os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The channel, MSVC target, and rustfmt + clippy components are pinned by
+      # `rust-toolchain.toml`, so rustup materializes the correct toolchain.
+      - name: Materialize pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # Single Rust crate today, so each command targets it via --manifest-path.
+      # Switch to `--workspace` once `portcode-core` is extracted (Phase 2).
+      - name: Format check (rustfmt)
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all --check
+
+      - name: Lint (clippy — warnings are errors)
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Test (cargo test)
+        run: cargo test --manifest-path src-tauri/Cargo.toml

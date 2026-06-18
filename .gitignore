@@ -16,3 +16,23 @@ src-tauri/target
 # os
 Thumbs.db
 .DS_Store
+# test / coverage output
+coverage
+*.lcov
+# tool caches
+.vite
+.eslintcache
+# SBOM + signing artifacts (release process)
+*.cdx.json
+*.spdx.json
+*.pfx
+*.snk
+# graphify knowledge graph — https://github.com/safishamsi/graphify
+# The graph (graphify-out/graph.json, graph.html, GRAPH_REPORT.md) is meant to be
+# committed so the whole team shares one map; only these local-only / machine-
+# specific bits are ignored. To opt out of committing the graph entirely, replace
+# this block with a single line: graphify-out/
+graphify-out/.graphify_python
+graphify-out/cost.json
+graphify-out/cache/
+graphify-out/memory/

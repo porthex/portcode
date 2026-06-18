@@ -157,7 +157,10 @@ impl Db {
 
     pub fn touch_session(&self, id: &str, ts: i64) {
         let conn = self.conn.lock().unwrap();
-        let _ = conn.execute("UPDATE sessions SET updated_at = ?2 WHERE id = ?1", params![id, ts]);
+        let _ = conn.execute(
+            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+            params![id, ts],
+        );
     }
 
     pub fn set_title_if_blank(&self, id: &str, title: &str) {
@@ -202,9 +205,9 @@ impl Db {
     /// Canonical message list for feeding the model.
     pub fn load_chat_messages(&self, session_id: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock().unwrap();
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY seq",
-        ) else {
+        let Ok(mut stmt) =
+            conn.prepare("SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY seq")
+        else {
             return Vec::new();
         };
         let rows = stmt.query_map(params![session_id], |r| {

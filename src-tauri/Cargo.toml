@@ -44,3 +44,12 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Lint policy. CI runs `cargo clippy --all-targets -- -D warnings`; these make
+# the same baseline reproducible for local `cargo clippy`. `unsafe_code = "deny"`
+# matches Portcode's posture — the agent core holds secrets and runs shell.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

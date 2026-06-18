@@ -38,10 +38,7 @@ interface AppState {
   setShowSettings: (v: boolean) => void;
   setShowPalette: (v: boolean) => void;
   updateSettings: (s: Partial<Settings>) => Promise<void>;
-  resolvePermission: (
-    decision: "allow" | "deny",
-    always?: boolean
-  ) => Promise<void>;
+  resolvePermission: (decision: "allow" | "deny", always?: boolean) => Promise<void>;
 }
 
 const now = () => Date.now();
@@ -77,7 +74,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   async init() {
     const settings = await ipc.getSettings();
-    let sessions = await ipc.listSessions();
+    const sessions = await ipc.listSessions();
     if (sessions.length === 0) {
       const s = makeSession();
       await ipc.createSession(s.id, s.title, s.workspace);
@@ -115,8 +112,7 @@ export const useStore = create<AppState>((set, get) => ({
       const sessions = st.sessions.filter((s) => s.id !== id);
       const messages = { ...st.messages };
       delete messages[id];
-      const activeId =
-        st.activeId === id ? sessions[0]?.id ?? null : st.activeId;
+      const activeId = st.activeId === id ? (sessions[0]?.id ?? null) : st.activeId;
       return { sessions, messages, activeId };
     });
     if (get().sessions.length === 0) {
@@ -156,7 +152,7 @@ export const useStore = create<AppState>((set, get) => ({
               updatedAt: now(),
               title: msgs.length === 0 ? deriveTitle(text) : s.title,
             }
-          : s
+          : s,
       );
       return {
         sessions,
@@ -172,7 +168,7 @@ export const useStore = create<AppState>((set, get) => ({
       set((st) => {
         const msgs = st.messages[activeId] ?? [];
         const updated = msgs.map((m) =>
-          m.id === assistant.id ? { ...m, blocks: fn(m.blocks) } : m
+          m.id === assistant.id ? { ...m, blocks: fn(m.blocks) } : m,
         );
         return { messages: { ...st.messages, [activeId]: updated } };
       });
@@ -224,9 +220,7 @@ export const useStore = create<AppState>((set, get) => ({
           });
           break;
         case "error":
-          apply((blocks) =>
-            appendText(blocks, `\n\n**Error:** ${e.message}`)
-          );
+          apply((blocks) => appendText(blocks, `\n\n**Error:** ${e.message}`));
           set({ streaming: false, cancel: null, pendingPermission: null });
           break;
         case "turn_end":

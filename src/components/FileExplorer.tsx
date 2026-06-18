@@ -18,7 +18,12 @@ export function FileExplorer() {
     };
   }, [workspace]);
 
-  const name = workspace ? workspace.replace(/[/\\]+$/, "").split(/[/\\]/).pop() : null;
+  const name = workspace
+    ? workspace
+        .replace(/[/\\]+$/, "")
+        .split(/[/\\]/)
+        .pop()
+    : null;
 
   return (
     <aside className="flex h-full w-64 shrink-0 flex-col border-r border-border bg-panel">
@@ -86,8 +91,7 @@ function TreeNode({ entry, depth }: { entry: DirEntry; depth: number }) {
         <span className="shrink-0">{entry.isDir ? "📁" : fileGlyph(entry.name)}</span>
         <span className="truncate">{entry.name}</span>
       </button>
-      {open &&
-        children?.map((c) => <TreeNode key={c.path} entry={c} depth={depth + 1} />)}
+      {open && children?.map((c) => <TreeNode key={c.path} entry={c} depth={depth + 1} />)}
     </div>
   );
 }

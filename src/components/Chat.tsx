@@ -53,8 +53,8 @@ function EmptyState() {
       </div>
       <h1 className="text-lg font-semibold">Portcode</h1>
       <p className="mt-1 max-w-md text-sm text-muted">
-        A fast, native AI coding agent for Windows. Ask it to read, edit, and run
-        code in your workspace. Describe a task to get started.
+        A fast, native AI coding agent for Windows. Ask it to read, edit, and run code in your
+        workspace. Describe a task to get started.
       </p>
       <div className="mt-4 flex items-center gap-2 text-xs text-muted">
         <Kbd>Ctrl</Kbd>

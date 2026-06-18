@@ -14,9 +14,7 @@ export function PermissionPrompt() {
           </span>
           <span>
             Portcode wants to run{" "}
-            <code className="rounded bg-bg px-1.5 py-0.5 font-mono text-warn">
-              {pending.tool}
-            </code>{" "}
+            <code className="rounded bg-bg px-1.5 py-0.5 font-mono text-warn">{pending.tool}</code>{" "}
             on <span className="font-mono text-fg">{pending.summary}</span>
           </span>
         </div>

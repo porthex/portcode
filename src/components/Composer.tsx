@@ -93,9 +93,7 @@ export function Composer() {
 
 function UsageMeter() {
   const model = useStore((s) => s.settings.model);
-  const usage = useStore((s) =>
-    s.activeId ? s.usage[s.activeId] : undefined
-  );
+  const usage = useStore((s) => (s.activeId ? s.usage[s.activeId] : undefined));
   const total = usage ? usage.input + usage.output : 0;
   const cost = usage ? estimateCost(model, usage) : 0;
   return (

@@ -88,7 +88,10 @@ fn create_session(
 
 #[tauri::command]
 fn rename_session(state: State<AppState>, id: String, title: String) -> Result<(), String> {
-    state.db.rename_session(&id, &title).map_err(|e| e.to_string())
+    state
+        .db
+        .rename_session(&id, &title)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -128,13 +131,17 @@ fn list_dir(state: State<AppState>, sub: Option<String>) -> Result<Vec<DirEntry>
     let base = ws
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let base = base.canonicalize().map_err(|e| format!("workspace unavailable: {e}"))?;
+    let base = base
+        .canonicalize()
+        .map_err(|e| format!("workspace unavailable: {e}"))?;
 
     let target = match &sub {
         Some(s) if !s.is_empty() => base.join(s),
         _ => base.clone(),
     };
-    let target = target.canonicalize().map_err(|e| format!("cannot access: {e}"))?;
+    let target = target
+        .canonicalize()
+        .map_err(|e| format!("cannot access: {e}"))?;
     if !target.starts_with(&base) {
         return Err("path is outside the workspace".into());
     }
@@ -152,7 +159,11 @@ fn list_dir(state: State<AppState>, sub: Option<String>) -> Result<Vec<DirEntry>
             .strip_prefix(&base)
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .unwrap_or_else(|_| name.clone());
-        entries.push(DirEntry { name, path: rel, is_dir });
+        entries.push(DirEntry {
+            name,
+            path: rel,
+            is_dir,
+        });
     }
     entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
         (true, false) => std::cmp::Ordering::Less,

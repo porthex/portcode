@@ -1,0 +1,23 @@
+# .graphifyignore — extra excludes for the graphify knowledge graph.
+# https://github.com/safishamsi/graphify
+#
+# graphify already honors .gitignore automatically (node_modules/, dist/,
+# src-tauri/target/, .env*, coverage/, .vite, *.cdx.json, ...), so this file only
+# adds project-specific noise on top. Syntax matches .gitignore (incl. ! negation).
+
+# Lockfiles: large, generated, no semantic value in a knowledge graph
+pnpm-lock.yaml
+src-tauri/Cargo.lock
+
+# Generated Tauri output (mobile projects + bindings; kept in tree, not source of truth)
+src-tauri/gen/
+
+# graphify's own output — never graph the graph
+graphify-out/
+
+# Binary icon/image assets — keep extraction code-focused and fully offline.
+# Image nodes require an LLM pass; delete these lines to include images in the graph.
+*.png
+*.ico
+*.icns
+*.webp

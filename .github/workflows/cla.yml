@@ -1,0 +1,54 @@
+name: CLA Assistant
+
+# Contributor License Agreement check (CLA Assistant Lite).
+#
+# Portcode is Apache-2.0 + CLA. Contributors agree to CLA.md once by commenting
+# the sign-off sentence on their pull request; the signature is recorded and
+# then covers all of their future contributions. Comment `recheck` to re-run.
+#
+# Make "CLA signature" a REQUIRED status check in branch protection so a PR
+# cannot merge until its author has signed (repo-settings checklist, plan §7).
+#
+# One-time maintainer setup: this stores signatures in `signatures.json` on a
+# dedicated, unprotected `cla-signatures` branch — create that (empty) branch
+# once, or point the action at a private repo via a PERSONAL_ACCESS_TOKEN.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, closed, synchronize]
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    name: CLA signature
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check / record CLA signature
+        # Run on PR events, and on the sign-off / recheck comments.
+        if: >-
+          (github.event_name == 'issue_comment' &&
+            (github.event.comment.body == 'recheck' ||
+             github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA'))
+          || github.event_name == 'pull_request_target'
+        uses: contributor-assistant/github-action@v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          path-to-document: "https://github.com/porthex/portcode/blob/main/CLA.md"
+          path-to-signatures: "signatures.json"
+          branch: "cla-signatures"
+          # Bots never sign; exempt them so automated PRs are not blocked.
+          allowlist: "dependabot[bot],renovate[bot],*[bot]"
+          custom-pr-sign-comment: "I have read the CLA Document and I hereby sign the CLA"
+          custom-notsigned-prcomment: >-
+            Thank you for your contribution! Before we can merge it, we need you
+            to agree to our [Contributor License Agreement](https://github.com/porthex/portcode/blob/main/CLA.md).
+            Please post the following comment to sign (you only need to do this once):
+          custom-allsigned-prcomment: "✅ All contributors have signed the CLA. Thank you!"

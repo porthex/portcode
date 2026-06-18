@@ -1,0 +1,5 @@
+# Rust formatting policy. Only stable rustfmt options are set here so
+# `cargo fmt --check` is reproducible on the pinned stable toolchain.
+edition = "2021"
+max_width = 100
+newline_style = "Unix"

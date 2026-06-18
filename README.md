@@ -22,13 +22,13 @@ reliability, a WebView2 UI for a rich coding surface.
 
 ### Keyboard shortcuts
 
-| Shortcut | Action |
-|---|---|
-| `Ctrl+K` | Command palette |
-| `Ctrl+N` | New chat |
-| `Ctrl+B` | Toggle file explorer |
-| `Ctrl+,` | Settings |
-| `Enter` / `Shift+Enter` | Send / newline |
+| Shortcut                | Action               |
+| ----------------------- | -------------------- |
+| `Ctrl+K`                | Command palette      |
+| `Ctrl+N`                | New chat             |
+| `Ctrl+B`                | Toggle file explorer |
+| `Ctrl+,`                | Settings             |
+| `Enter` / `Shift+Enter` | Send / newline       |
 
 ## Why this stack
 
@@ -44,7 +44,7 @@ Chosen for **reliability → speed → capability** (see [`docs/ARCHITECTURE.md`
 
 - **Node** 18+ and **pnpm**
 - **Rust** (stable, MSVC toolchain) — install via [rustup](https://rustup.rs)
-- **VS 2022 Build Tools** with the *Desktop development with C++* workload
+- **VS 2022 Build Tools** with the _Desktop development with C++_ workload
 - **WebView2 runtime** (preinstalled on Windows 11)
 
 ## Develop

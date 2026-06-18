@@ -1,0 +1,24 @@
+# CODEOWNERS — auto-requests reviewers and HARD-gates the security-critical
+# paths to the maintainers. See CONTRIBUTING.md → "Review and merge".
+# Order matters: the LAST matching pattern wins. Make these owners a *required*
+# review in branch protection (repo-settings checklist, plan §7).
+# https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owner for everything in the repository.
+*                                @porthex
+
+# --- Security-critical Rust core (the trust boundary — maintainers only) ---
+/src-tauri/src/permissions.rs    @porthex
+/src-tauri/src/secrets.rs        @porthex
+/src-tauri/src/tools.rs          @porthex
+/src-tauri/src/llm.rs            @porthex
+/src-tauri/src/agent.rs          @porthex
+
+# --- Tauri trust-boundary configuration (IPC, CSP, capabilities, bundling) ---
+/src-tauri/tauri.conf.json       @porthex
+/src-tauri/capabilities/         @porthex
+
+# --- CI / release / supply-chain automation ---
+/.github/workflows/              @porthex
+/.github/dependabot.yml          @porthex
+/.github/CODEOWNERS              @porthex

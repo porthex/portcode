@@ -37,10 +37,7 @@ export function SettingsPanel() {
       >
         <div className="flex items-center justify-between border-b border-border px-5 py-3">
           <h2 className="font-semibold">Settings</h2>
-          <button
-            onClick={() => setShowSettings(false)}
-            className="text-muted hover:text-fg"
-          >
+          <button onClick={() => setShowSettings(false)} className="text-muted hover:text-fg">
             ✕
           </button>
         </div>
