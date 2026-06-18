@@ -1,0 +1,46 @@
+[package]
+name = "portcode"
+version = "0.1.0"
+description = "Portcode — a fast, native Windows AI coding agent (Porthex)."
+authors = ["Porthex"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "portcode_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "process", "sync", "time"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls"] }
+
+async-trait = "0.1"
+anyhow = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+keyring = { version = "3", features = ["windows-native"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# search / matching for tools
+regex = "1"
+globset = "0.4"
+ignore = "0.4"
+similar = "2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
