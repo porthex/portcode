@@ -1,5 +1,5 @@
-name: Feature request
-description: Suggest a new capability or improvement for Portcode.
+name: 🛠️ Detailed feature request
+description: The thorough path with a scope check, for larger proposals. (Just a quick idea? Use "Quick idea".)
 labels: ["enhancement"]
 body:
   - type: markdown

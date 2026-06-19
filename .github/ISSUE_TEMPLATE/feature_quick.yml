@@ -1,0 +1,25 @@
+name: 💡 Quick idea
+description: Suggest an improvement in a sentence or two.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The fast path — just tell us the idea. For larger proposals, the
+        [detailed form](https://github.com/porthex/portcode/issues/new?template=feature_request.yml)
+        helps us scope it against the open-source core.
+  - type: textarea
+    id: idea
+    attributes:
+      label: What's the problem or idea?
+      description: What's painful today, or what would you like Portcode to do?
+      placeholder: "It's annoying that… / It'd be great if Portcode could…"
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: What would the ideal solution look like?
+      description: Even a rough sketch helps. Optional.
+    validations:
+      required: false

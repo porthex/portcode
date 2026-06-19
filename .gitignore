@@ -13,6 +13,8 @@ src-tauri/target
 .vscode/*
 !.vscode/extensions.json
 .idea
+# Nimbalyst editor local working data (plans, session artifacts)
+nimbalyst-local/
 # os
 Thumbs.db
 .DS_Store

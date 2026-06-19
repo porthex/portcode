@@ -1,0 +1,54 @@
+name: 🐞 Quick bug report
+description: Something broken? Report it in ~30 seconds — only two fields required.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The fast path — only two fields are required. Add environment details if
+        you have them; for tricky Windows/WebView2 issues the
+        [detailed form](https://github.com/porthex/portcode/issues/new?template=bug_report.yml)
+        gets you a faster fix. A quick search of
+        [existing issues](https://github.com/porthex/portcode/issues) helps avoid
+        duplicates.
+
+        🔒 **Security issue** (permission-gate bypass, sandbox escape, API-key
+        exposure)? Don't post it here — [report it privately](https://github.com/porthex/portcode/security/advisories/new).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What went wrong, and what did you expect instead?
+      placeholder: I did X, Y happened, but I expected Z.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How can we reproduce it?
+      description: Rough steps are fine.
+      placeholder: |
+        1. Open '...'
+        2. Do '...'
+        3. See the error
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Optional, but it speeds up the fix. Run `winver` for the Windows build.
+      value: |
+        - Portcode version:
+        - Windows build:
+        - WebView2 runtime:
+        - Installed via (release installer / built from source):
+    validations:
+      required: false
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Quick check
+      options:
+        - label: This report contains no API keys, secrets, or other sensitive data.
+          required: true

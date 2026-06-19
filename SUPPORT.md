@@ -14,20 +14,26 @@ Before posting, a quick search of existing Discussions and
 
 ## Bug reports
 
-Found something broken? Open an issue with the
-**[Bug report](https://github.com/porthex/portcode/issues/new?template=bug_report.yml)**
-form. The form asks for the details that make Windows/WebView2 bugs reproducible
-(Windows build, WebView2 runtime version, Portcode version, install method, and
-whether a shell command or file write was involved). Filling these in up front
-avoids slow back-and-forth.
+Found something broken? You have two options:
+
+- **[Quick bug report](https://github.com/porthex/portcode/issues/new?template=bug_quick.yml)** —
+  two fields and you're done. Best when you just want to flag something fast.
+- **[Detailed bug report](https://github.com/porthex/portcode/issues/new?template=bug_report.yml)** —
+  asks for the Windows/WebView2 specifics (Windows build, WebView2 runtime
+  version, Portcode version, install method, and whether a shell command or file
+  write was involved). Slower to fill, but it makes tricky bugs reproducible and
+  avoids back-and-forth.
 
 ## Feature requests
 
-Use the
-**[Feature request](https://github.com/porthex/portcode/issues/new?template=feature_request.yml)**
-form. It includes a scope check against [`GOVERNANCE.md`](GOVERNANCE.md) so we can
-quickly tell whether a request fits the open-source core or the reserved
-commercial surface.
+Have an idea? You have two options:
+
+- **[Quick idea](https://github.com/porthex/portcode/issues/new?template=feature_quick.yml)** —
+  describe it in a sentence or two.
+- **[Detailed feature request](https://github.com/porthex/portcode/issues/new?template=feature_request.yml)** —
+  includes a scope check against [`GOVERNANCE.md`](GOVERNANCE.md) so we can quickly
+  tell whether a request fits the open-source core or the reserved commercial
+  surface. Best for larger proposals.
 
 ## Security vulnerabilities
 

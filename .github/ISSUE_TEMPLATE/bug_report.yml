@@ -1,5 +1,5 @@
-name: Bug report
-description: Report something broken in Portcode. Please fill in the Windows/WebView2 details — they make most bugs reproducible.
+name: 🔬 Detailed bug report
+description: The thorough path for tricky Windows/WebView2 bugs — more fields, faster diagnosis. (In a hurry? Use "Quick bug report".)
 labels: ["bug"]
 body:
   - type: markdown
@@ -9,6 +9,9 @@ body:
         on WebView2, so most issues are specific to a Windows build or WebView2
         version — the fields below are required because they kill triage
         round-trips.
+
+        In a hurry? The [Quick bug report](https://github.com/porthex/portcode/issues/new?template=bug_quick.yml)
+        needs only two fields.
 
         **Security note:** if this is a security vulnerability (permission-gate
         bypass, sandbox escape, API-key exposure, etc.), **do not** file it here.

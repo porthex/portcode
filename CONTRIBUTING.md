@@ -32,8 +32,9 @@ By participating in this project you agree to abide by our
 
 ## Ways to contribute
 
-- **Report bugs** and **request features** through the issue forms (the
-  templates ask for the details we need to reproduce and triage).
+- **Report bugs** and **request features** through the issue forms — pick the
+  **Quick** form for a fast report or the **Detailed** form when you have the full
+  reproduction details.
 - **Improve docs** — corrections and clarifications are always welcome.
 - **Fix bugs or build features** — for anything non-trivial, please open or
   comment on an issue first so we can agree on the approach before you invest
