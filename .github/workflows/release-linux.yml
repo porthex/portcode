@@ -1,0 +1,114 @@
+name: Release (Linux)
+
+# Builds the Tauri v2 app on Linux and produces the two desktop-Linux bundle
+# formats — AppImage and .deb — attaching them to a GitHub Release.
+#
+# This is intentionally UNSIGNED. Linux desktop bundles are not code-signed the
+# way the Windows installer is (Azure Trusted Signing, owner-action, lives in
+# the separate `release.yml`). No signing keys or extra secrets are wired here;
+# the only token used is the workflow's built-in `GITHUB_TOKEN`, solely to
+# upload assets to the release.
+#
+# Trigger: pushing a version tag (`v*`) cuts a DRAFT release with the bundles
+# attached, so a maintainer reviews and publishes. `workflow_dispatch` lets you
+# build the bundles on demand without creating a release (handy for testing);
+# in both cases the bundles are also uploaded as workflow artifacts.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# `contents: write` is required for tauri-action to create the GitHub Release
+# and upload the bundle assets. Everything else stays read-only.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-linux:
+    name: Build Linux bundles (AppImage · deb)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Tauri v2 links against GTK 3 and WebKitGTK 4.1 (NOT the 4.0 that Tauri
+      # v1 used). The bundlers additionally need patchelf (AppImage) and the
+      # usual build toolchain. These must be present before `tauri build`.
+      - name: Install Tauri v2 Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev
+          # System-tray indicator dev package: the name differs by Ubuntu
+          # release. 24.04 (today's ubuntu-latest) ships the Ayatana fork;
+          # 22.04 carries the legacy libappindicator3-dev. Install whichever
+          # resolves so this works regardless of where ubuntu-latest points.
+          sudo apt-get install -y libayatana-appindicator3-dev \
+            || sudo apt-get install -y libappindicator3-dev
+
+      - name: Enable Corepack (pnpm)
+        run: corepack enable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: pnpm
+
+      # tauri-action runs the config's `beforeBuildCommand` (`pnpm build`),
+      # which needs the frontend dependencies installed first.
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The channel, targets, and components are pinned by `rust-toolchain.toml`
+      # (same as CI), so rustup materializes the correct toolchain.
+      - name: Materialize pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build app and bundle AppImage + deb
+        uses: tauri-apps/tauri-action@v0
+        env:
+          # Built-in token — used only to create the release and upload assets.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # `--bundles` overrides the config's Windows-only `nsis` target, so
+          # only the Linux desktop formats are produced. (Tauri v2 CLI flag.)
+          args: --bundles deb,appimage
+          # On a tag push, cut a DRAFT release named for the tag with the
+          # bundles attached. On manual dispatch, `github.ref_type` is `branch`,
+          # so tagName is empty and tauri-action just builds (no release).
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: ${{ github.ref_type == 'tag' && format('Portcode {0}', github.ref_name) || '' }}
+          releaseDraft: true
+          prerelease: false
+
+      # Always keep the built bundles as workflow artifacts — useful for manual
+      # dispatch runs (no release) and for inspecting tag builds.
+      - name: Upload bundles as workflow artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portcode-linux-bundles
+          if-no-files-found: warn
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
