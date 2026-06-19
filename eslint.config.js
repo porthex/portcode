@@ -7,7 +7,15 @@ import reactHooks from "eslint-plugin-react-hooks";
 
 export default tseslint.config(
   {
-    ignores: ["dist/**", "dist-ssr/**", "coverage/**", "node_modules/**", "src-tauri/**"],
+    ignores: [
+      "dist/**",
+      "dist-ssr/**",
+      "coverage/**",
+      "node_modules/**",
+      "src-tauri/**",
+      // graphify knowledge-graph output is machine-generated, not source.
+      "graphify-out/**",
+    ],
   },
   {
     files: ["**/*.{ts,tsx}"],

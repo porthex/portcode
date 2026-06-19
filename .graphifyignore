@@ -21,3 +21,13 @@ graphify-out/
 *.ico
 *.icns
 *.webp
+
+# graphify's own vendored skill + reference docs are tooling/meta (how to drive
+# graphify), not Portcode product knowledge — keep them out of the graph so the
+# map stays focused on the app's architecture. `.claude/settings.json` is NOT
+# matched here, so the project's hook config still participates in the graph.
+.claude/skills/
+
+# Transient research deliverable (graphify recommendation write-up), not part of
+# the product's documented architecture.
+GRAPHIFY_NOTES.md
