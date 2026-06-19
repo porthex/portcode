@@ -1,14 +1,8 @@
 # Release runbook
 
-How a signed Portcode release is cut, verified, rolled back, and set up the
-first time. Portcode is a native Windows AI coding agent (Tauri v2 + Rust +
-React, pnpm) shipped by **Porthex**.
-
-> **Status — documents PR #8.** This runbook describes the signed-release
-> pipeline added in **PR #8** (`feat/phase2-release-pipeline`,
-> `.github/workflows/release.yml`). It is accurate **once PR #8 merges**. The
-> three-file version sync it relies on is automated by **PR #5** (release-please).
-> Until both land, treat the steps below as the target process.
+How a Portcode release is cut, verified, rolled back, and set up the first time.
+Portcode is a native Windows AI coding agent (Tauri v2 + Rust + React, pnpm)
+shipped by **Porthex**.
 
 > **Sensitivity — process only.** This document references secret **names** and
 > steps. It contains **no** secret values, keys, certificates, tokens, or
@@ -17,21 +11,71 @@ React, pnpm) shipped by **Porthex**.
 
 ---
 
+## The branching model — `main` vs `release`
+
+Portcode uses a **release-branch** model. Two long-lived branches, two jobs:
+
+| Branch        | Role                                                                                                                                  |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| **`main`**    | **Active development / integration.** Every PR lands here. CI (`ci.yml`, `e2e.yml`) runs on it. This is the default branch.           |
+| **`release`** | **The branch releases are cut from.** `main` is promoted here when it's time to ship. release-please and the `vX.Y.Z` tags live here. |
+
+Nothing is released straight off `main`. Instead, a known-good `main` is
+**promoted to `release`**, and the release automation runs **on `release`**.
+This keeps day-to-day development on `main` decoupled from the version-bump,
+changelog, and tag churn of cutting a release.
+
+### ⚠️ `release` the BRANCH is not `release` the ENVIRONMENT
+
+Two different things share the name **`release`** — don't conflate them:
+
+- **The `release` git _branch_** — the branch in this repo that releases are cut
+  from (this document). It's where release-please opens its release PR and where
+  the `vX.Y.Z` tags are created.
+- **The `release` GitHub _environment_** — a deployment environment (Settings →
+  Environments) that holds the **signing secrets** and required reviewers. It is
+  used by the signed Windows build job in `release.yml` (added by **PR #8**, see
+  below). An _environment_ gates a workflow job; it is **not** a branch.
+
+A release flows through **both**: the `vX.Y.Z` tag is created on the `release`
+**branch**, and the signed build job that the tag triggers runs in the `release`
+**environment** so it can read the signing secrets.
+
+### What's wired today vs. once PR #8 lands
+
+- **Today (on `main`):** release-please (changelog + 3-file version sync, now
+  targeting `release`) and **`release-linux.yml`**, which on a `v*` tag builds
+  the **unsigned** Linux bundles (AppImage + `.deb`) and attaches them to a
+  **draft** GitHub Release.
+- **Once PR #8 lands:** **`release.yml`** adds the **signed Windows** build —
+  NSIS installer, Authenticode (Azure Trusted Signing), Tauri updater signature,
+  `latest.json`, SBOM, and checksums — running in the `release` **environment**.
+  Until PR #8 merges, treat the Windows-signing sections (§4–§7, §9) as the
+  target process.
+
+---
+
 ## TL;DR — cut a release (happy path)
 
-1. **Land your changes on `main`** with [Conventional Commits](https://www.conventionalcommits.org/)
-   (`feat:`, `fix:`, …) so release-please can compute the next version.
-2. **Merge the open release-please PR** (PR #5's bot). It bumps the version in all
-   three files, updates `CHANGELOG.md`, and creates the **`vX.Y.Z` tag**.
-3. The tag push triggers **`.github/workflows/release.yml`**, which builds the
-   NSIS installer, **Authenticode-signs** it (Azure Trusted Signing),
-   **updater-signs** it (Tauri Ed25519), generates **`latest.json`**, a
-   **CycloneDX SBOM**, and **SHA-256 checksums**, then attaches them all to the
-   GitHub Release.
-4. **Verify** the signed build on a clean Windows VM (§9), then **publish** the
-   release so `latest.json` goes live and auto-update switches on.
+1. **Land your changes on `main`** with
+   [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`,
+   `fix:`, …) so release-please can compute the next version. Let CI go green.
+2. **Promote `main` → `release`.** Open a PR with **base `release`, head `main`**
+   (or fast-forward `release` to `main` when their histories allow). This is the
+   single "we intend to ship this" gate.
+3. **Merge the open release-please PR** _on `release`_. release-please watches
+   pushes to `release`, opens (or updates) a **release PR** there; merging it
+   bumps the version in all **three** files, updates `CHANGELOG.md`, and creates
+   the **`vX.Y.Z` tag** on `release`.
+4. **The tag drives the build.** The `v*` tag triggers the release workflows:
+   `release-linux.yml` (today → unsigned AppImage/`.deb`) and, once **PR #8**
+   lands, the signed Windows `release.yml` running in the `release` environment.
+5. **Verify** the build (§9), then **publish** the draft Release so it goes live
+   (and, on Windows, `latest.json` enables auto-update).
+6. **Sync the bump back to `main`** so the version files and `CHANGELOG.md` on
+   `main` don't drift behind `release` (see "Keeping `main` in sync" below).
 
-Everything below is the detail behind those four lines.
+Everything below is the detail behind those lines.
 
 ---
 
@@ -45,11 +89,14 @@ A release version is kept in lockstep across **three** files:
 | `src-tauri/Cargo.toml`      | `[package] version`                                              |
 | `src-tauri/tauri.conf.json` | `"version"` (the workflow reads the installed version from here) |
 
-**These are bumped automatically by release-please (PR #5).** You do not edit
-them by hand. release-please watches Conventional Commits on `main`, opens a
-"release PR" that bumps all three files plus `CHANGELOG.md`, and — when that PR
-is merged — creates the matching **`vX.Y.Z`** git tag. Merging the release PR
-_is_ how a release is cut; the tag is what triggers the build.
+**These are bumped automatically by release-please.** You do not edit them by
+hand. release-please watches Conventional Commits on the **`release`** branch,
+opens a "release PR" against `release` that bumps all three files plus
+`CHANGELOG.md`, and — when that PR is merged — creates the matching **`vX.Y.Z`**
+git tag on `release`. Merging the release PR _is_ how a release is cut; the tag
+is what triggers the build. The two non-`package.json` files are wired as
+`extra-files` in `release-please-config.json`, and the last-released version per
+branch is tracked in `.release-please-manifest.json`.
 
 > If you ever need a manual bump, change the value in **all three** files
 > identically (they must match) and commit them together. Prefer the
@@ -68,16 +115,41 @@ usually don't move. If a release also pulls in dependency changes, regenerate an
 commit the refreshed lockfiles **before** tagging. The SBOM step (§6) reads both
 `pnpm-lock.yaml` and `Cargo.lock`, so stale lockfiles also produce a wrong SBOM.
 
+### Keeping `main` in sync
+
+Merging the release-please PR adds the version-bump + `CHANGELOG.md` commit to
+**`release`**, so `release` now has a commit `main` doesn't. After the release,
+bring that commit back to `main` so the three version files and the changelog on
+`main` don't lag — open a short PR with **base `main`, head `release`**, or
+cherry-pick the release-please commit onto `main`. Do this promptly after each
+release so the next `main → release` promotion stays a clean fast-forward where
+possible.
+
 ---
 
 ## 2. How the pipeline is wired
 
-`.github/workflows/release.yml` (added by PR #8):
+Two tag-triggered workflows can build a release. Both fire on a **`v*`** tag
+(branch-agnostic) — the tag release-please creates on `release` — so cutting the
+release is the same action regardless of which builders are enabled.
+
+### `release-linux.yml` — unsigned Linux bundles (live today)
+
+- **Triggers** on `push` of a **`v*`** tag, and on **`workflow_dispatch`**.
+- Builds the two desktop-Linux bundle formats — **AppImage** and **`.deb`** — via
+  `tauri-apps/tauri-action`, and attaches them to a **draft** GitHub Release.
+- **Intentionally unsigned.** Linux desktop bundles are not code-signed the way
+  the Windows installer is. The only token used is the built-in `GITHUB_TOKEN`,
+  solely to upload assets.
+
+### `release.yml` — signed Windows installer (added by PR #8)
 
 - **Triggers** on `push` of a **`v*`** tag, and on **`workflow_dispatch`** (a
   manual, unpublished **dry run**). The heavy signed `tauri build` is kept **out**
   of per-PR CI (that stays in `ci.yml`) and runs **once per release**.
-- Runs on **`windows-latest`**, in the protected **`release`** environment.
+- Runs on **`windows-latest`**, in the protected **`release` environment** (the
+  GitHub _environment_, where the signing secrets live — not the `release`
+  branch).
 - Default permissions are least-privilege (`contents: read`); the release job
   opts up to `contents: write` only to create the Release and upload assets.
 - **Every signing step is secret-gated.** Secrets are mirrored into job `env` so a
@@ -87,7 +159,7 @@ commit the refreshed lockfiles **before** tagging. The SBOM step (§6) reads bot
   run.** It never hard-fails for missing secrets; a real signed release just
   additionally requires the `release` environment and its secrets.
 
-### What the workflow does, in order
+### What `release.yml` does, in order
 
 1. Checkout, enable Corepack/pnpm, set up Node 20, materialize the pinned Rust
    toolchain (`rust-toolchain.toml`), restore the cargo cache.
@@ -132,8 +204,8 @@ on afterward (§4–§5).
 
 The installer is **Authenticode-signed in place** via **Azure Trusted Signing**
 so Windows SmartScreen / Defender trust it. This step is **secret-gated** — it
-runs only when the Azure service-principal secrets are present, and is skipped
-cleanly (with a warning) on dry runs.
+runs only when the Azure service-principal secrets are present (in the `release`
+**environment**), and is skipped cleanly (with a warning) on dry runs.
 
 Required secret **names** (values live only in the `release` environment — never
 in the repo or this doc):
@@ -215,12 +287,12 @@ Both are attached to the release (§7).
 Publishing is **gated to tag refs (`v*`)**. The publish step is **idempotent**:
 
 - If a Release for the tag **already exists** (the release-please path — its merge
-  created the tag and the Release), the workflow **uploads the assets to it**
+  created the tag and a draft Release), the workflow **uploads the assets to it**
   (`--clobber`).
 - If it **does not** exist (e.g. a manually pushed tag), the workflow **creates**
   the Release with auto-generated notes.
 
-Assets attached:
+Assets attached (signed Windows build, once PR #8 lands):
 
 - `Portcode_<version>_x64-setup.exe` — the signed installer
 - `SHA256SUMS.txt` — checksums
@@ -228,15 +300,17 @@ Assets attached:
 - `latest.json` — updater manifest
 - `portcode.cdx.json` — CycloneDX SBOM
 
+`release-linux.yml` additionally attaches the unsigned `*.AppImage` and `*.deb`
+bundles to the same tag's draft Release.
+
 ### Recommended publish gate (draft → verify → publish)
 
-For the security-sensitive releases, configure release-please (PR #5) to open the
-GitHub Release as a **draft**. The workflow then attaches the signed installer,
-`latest.json`, checksums, `.sig`, and SBOM to that **draft**, and a maintainer
-**publishes it only after the clean-VM verification in §9**. Publishing the draft
-is what makes `latest/download/latest.json` resolvable and turns on auto-update —
-so a build that fails verification is simply never published (the cleanest
-rollback of all). The Tauri updater reads
+Both release workflows create the Release as a **draft**. The build jobs attach
+their artifacts to that draft, and a maintainer **publishes it only after the
+clean-VM verification in §9**. Publishing the draft is what makes
+`latest/download/latest.json` resolvable and turns on auto-update — so a build
+that fails verification is simply never published (the cleanest rollback of all).
+The Tauri updater reads
 `https://github.com/<org>/<repo>/releases/latest/download/latest.json`, which
 points at the most recent **published, non-prerelease** release.
 
@@ -247,26 +321,30 @@ points at the most recent **published, non-prerelease** release.
 Do this **once**, before the first signed release. All values stay in GitHub /
 your secret vault — **never** in the repo.
 
-1. **Protected `release` environment** — Settings → Environments → New
-   environment → **`release`**. Add **≥ 2 required reviewers** (the two-approval
-   policy below) and, optionally, restrict deployments to protected branches /
-   `v*` tags. Attach all **8 secrets** as **environment** secrets (not repo-wide)
-   so only the gated release job can read them.
-2. **Generate the updater key** — on a trusted machine, run
+1. **`release` branch** — already exists (cut from `main`). It is the source of
+   all releases. Optionally protect it (Settings → Rules) so only maintainers can
+   push and the same CI checks are required before promotion.
+2. **Protected `release` _environment_** — Settings → Environments → New
+   environment → **`release`** (the deployment environment, distinct from the
+   branch). Add **≥ 2 required reviewers** (the two-approval policy below) and,
+   optionally, restrict deployments to protected branches / `v*` tags. Attach all
+   **8 secrets** as **environment** secrets (not repo-wide) so only the gated
+   release job can read them.
+3. **Generate the updater key** — on a trusted machine, run
    `pnpm tauri signer generate` (offline). Store the **private key + password** in
    a password manager; **never commit it**. Paste the **public key** into the
    `updater` config in `src-tauri/tauri.conf.json` (PR #8). Add the private key as
    `TAURI_SIGNING_PRIVATE_KEY` and its password as
    `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
-3. **Azure Trusted Signing** — create the Trusted Signing account + certificate
+4. **Azure Trusted Signing** — create the Trusted Signing account + certificate
    profile and a service principal with the _Trusted Signing Certificate Profile
    Signer_ role; record its values into the six `AZURE_*` secret names from §4.
-4. **`v*` tag protection** — protect the `v*` tag pattern (Settings → Rules) so
+5. **`v*` tag protection** — protect the `v*` tag pattern (Settings → Rules) so
    only maintainers can create/push release tags.
-5. **Allow release-please to open PRs** — Settings → Actions → General → enable
-   **"Allow GitHub Actions to create and approve pull requests"**, or
-   release-please (PR #5) can't open its release PR.
-6. **Two-approval policy** — require **2 reviews** on the release-please PR (it
+6. **Allow release-please to open PRs** — Settings → Actions → General → enable
+   **"Allow GitHub Actions to create and approve pull requests"**, or release-please
+   can't open its release PR on `release`.
+7. **Two-approval policy** — require **2 reviews** on the release-please PR (it
    carries the version bump and is security-sensitive). Keep `main` branch
    protection on.
 
@@ -290,7 +368,8 @@ your secret vault — **never** in the repo.
 ## 9. Verify on a clean Windows VM
 
 Do this on a **fresh Windows VM** (no dev toolchain, no prior Portcode install)
-before publishing a draft release.
+before publishing a draft release. (Applies to the signed Windows build from
+`release.yml`, once PR #8 lands.)
 
 1. **Download** `Portcode_<version>_x64-setup.exe` and `SHA256SUMS.txt` from the
    (draft) release.
@@ -339,9 +418,11 @@ Because publishing is the final gate, the cleanest rollback is to **catch it in
 
 Before cutting a release:
 
-- [ ] CI is **green** on `main` (`ci.yml`).
-- [ ] The `release` environment exists with **all 8 secrets** and **≥ 2 required
-      reviewers**.
+- [ ] CI is **green** on `main` (`ci.yml`, `e2e.yml`).
+- [ ] `main` has been **promoted to `release`** (PR `main → release` merged, or
+      fast-forwarded).
+- [ ] The `release` **environment** exists with **all 8 secrets** and **≥ 2
+      required reviewers** (required for the signed Windows build).
 - [ ] Updater **public key** is in `src-tauri/tauri.conf.json`, matching the
       private key in `TAURI_SIGNING_PRIVATE_KEY`.
 - [ ] `v*` **tag protection** is enabled; "Allow GitHub Actions to create and
@@ -352,23 +433,26 @@ Before cutting a release:
 - [ ] _(Recommended)_ a **dry run** was triggered via `workflow_dispatch` on a
       non-tag ref and the `portcode-unpublished` artifact was inspected.
 
-Then merge the release-please PR and let the `v*` tag drive the rest.
+Then merge the release-please PR (on `release`) and let the `v*` tag drive the
+rest. Afterward, sync the bump back to `main` (§1).
 
 ---
 
 ## Appendix — paths & commands
 
-| What                   | Where (relative to repo root)                                               |
-| ---------------------- | --------------------------------------------------------------------------- |
-| Release workflow       | `.github/workflows/release.yml`                                             |
-| Per-PR CI (no signing) | `.github/workflows/ci.yml`                                                  |
-| NSIS installer         | `src-tauri/target/release/bundle/nsis/Portcode_<version>_x64-setup.exe`     |
-| Checksums              | `src-tauri/target/release/bundle/nsis/SHA256SUMS.txt`                       |
-| Updater signature      | `src-tauri/target/release/bundle/nsis/Portcode_<version>_x64-setup.exe.sig` |
-| Updater manifest       | `src-tauri/target/release/bundle/nsis/latest.json`                          |
-| SBOM                   | `portcode.cdx.json`                                                         |
-| Supply-chain policy    | `deny.toml`                                                                 |
-| Updater public key     | `src-tauri/tauri.conf.json`                                                 |
+| What                     | Where (relative to repo root)                                               |
+| ------------------------ | --------------------------------------------------------------------------- |
+| Signed Windows release   | `.github/workflows/release.yml` (added by PR #8)                            |
+| Linux release (today)    | `.github/workflows/release-linux.yml`                                       |
+| Changelog + version bump | `.github/workflows/release-please.yml` (targets the `release` branch)       |
+| Per-PR CI (no signing)   | `.github/workflows/ci.yml`                                                  |
+| NSIS installer           | `src-tauri/target/release/bundle/nsis/Portcode_<version>_x64-setup.exe`     |
+| Checksums                | `src-tauri/target/release/bundle/nsis/SHA256SUMS.txt`                       |
+| Updater signature        | `src-tauri/target/release/bundle/nsis/Portcode_<version>_x64-setup.exe.sig` |
+| Updater manifest         | `src-tauri/target/release/bundle/nsis/latest.json`                          |
+| SBOM                     | `portcode.cdx.json`                                                         |
+| Supply-chain policy      | `deny.toml`                                                                 |
+| Updater public key       | `src-tauri/tauri.conf.json`                                                 |
 
 ```sh
 # Local dry-run build (unsigned) — same as CI without secrets:

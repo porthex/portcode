@@ -231,6 +231,11 @@ Windows-specific gotchas worth knowing before your first build.
 - Questions and ideas go in
   [GitHub Discussions](https://github.com/porthex/portcode/discussions), not the issue tracker.
 
+**Branching model:** `main` is the active development branch — branch off it (`feat/…`,
+`fix/…`, `docs/…`) and open your PR against `main`. Releases are cut from a separate
+**`release`** branch and shipped as `vX.Y.Z` tags by maintainers. See
+[docs/RELEASE.md](docs/RELEASE.md) for the release flow.
+
 A great first contribution: **a new LLM provider.** It's the most direct way to push the
 "every LLM" mission forward.
 
