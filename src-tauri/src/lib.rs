@@ -219,6 +219,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        // Auto-updater (Phase 2 #1). Update checks are pull-only and verify the
+        // Ed25519 signature in `latest.json` against `plugins.updater.pubkey`.
+        // No update is fetched until application code explicitly calls the plugin,
+        // so a placeholder pubkey is inert until the owner provisions a real key.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let dir = app
                 .path()

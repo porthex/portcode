@@ -39,5 +39,10 @@
       "icons/icon.ico"
     ]
   },
-  "plugins": {}
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://github.com/porthex/portcode/releases/latest/download/latest.json"],
+      "pubkey": "OWNER_PROVIDED_PLACEHOLDER_REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY"
+    }
+  }
 }

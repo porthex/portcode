@@ -24,11 +24,24 @@ coverage
 # tool caches
 .vite
 .eslintcache
-# SBOM + signing artifacts (release process)
+# SBOM + signing artifacts (release process). NEVER commit signing material.
+# CycloneDX SBOMs
 *.cdx.json
 *.spdx.json
+# Authenticode / Azure Trusted Signing material
 *.pfx
 *.snk
+*.cer
+*.crt
+# Tauri updater signing keys (`tauri signer generate`) — private key is a secret
+*.key
+*.key.pub
+# Generated updater + release artifacts (produced in CI, uploaded to Releases)
+*.sig
+latest.json
+# NSIS / bundle output lives under src-tauri/target (already ignored above);
+# this is a belt-and-suspenders guard in case bundles are copied to the root.
+/bundle/
 # graphify knowledge graph — https://github.com/safishamsi/graphify
 # The graph (graphify-out/graph.json, graph.html, GRAPH_REPORT.md) is meant to be
 # committed so the whole team shares one map; only these local-only / machine-
