@@ -195,7 +195,6 @@ const mock = (() => {
           { name: "Cargo.toml", path: "src-tauri/Cargo.toml", isDir: false },
         ],
         docs: [
-          { name: "ARCHITECTURE.md", path: "docs/ARCHITECTURE.md", isDir: false },
           { name: "ROADMAP.md", path: "docs/ROADMAP.md", isDir: false },
         ],
       };

@@ -154,7 +154,7 @@ need an API key from the [Anthropic Console](https://console.anthropic.com/).
 ## How it works
 
 Portcode is deliberately a small number of well-chosen parts, picked for
-**reliability → speed → capability** (full write-up in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
+**reliability → speed → capability**:
 
 - **Tauri v2** shell — a tiny binary that reuses the WebView2 already on Windows.
 - **Rust + Tokio** core — the agent loop, streaming, tools, and the permission gate. No GC
@@ -173,7 +173,7 @@ portcode/
 │     ├─ permissions.rs # permission gate for mutating tools
 │     ├─ db.rs          # SQLite session persistence
 │     └─ secrets.rs     # Credential Manager wrapper
-└─ docs/           # ARCHITECTURE.md, ROADMAP.md, and more
+└─ docs/           # ROADMAP.md, and more
 ```
 
 ---

@@ -46,4 +46,4 @@
 
 - [ ] Verify a live agent reply with a real Anthropic API key
 - [ ] Auto-update infrastructure (host + `tauri signer` keypair)
-- [ ] Licensing decision (recommended: Apache-2.0 + CLA; see ***REMOVED***.md)
+- [ ] Licensing decision (recommended: Apache-2.0 + CLA)
