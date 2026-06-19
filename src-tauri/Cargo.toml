@@ -36,7 +36,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 regex = "1"
 globset = "0.4"
 ignore = "0.4"
-similar = "2"
+similar = "3"
 
 [profile.release]
 opt-level = "s"
