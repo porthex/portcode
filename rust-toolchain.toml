@@ -1,8 +1,9 @@
 # Pin the toolchain so every contributor (and CI) builds Portcode with the
-# same channel and the MSVC target, and automatically has rustfmt + clippy.
-# Additional targets (Linux, mobile) are added here when those platforms land.
+# same channel and targets, and automatically has rustfmt + clippy.
+# Linux (x86_64-unknown-linux-gnu) is enabled alongside Windows; mobile
+# targets are appended here when those platforms land.
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
-targets = ["x86_64-pc-windows-msvc"]
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
 profile = "minimal"

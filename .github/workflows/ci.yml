@@ -26,10 +26,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows-first today. Linux is on the roadmap: add `ubuntu-latest`
-        # to this list (a one-line change) to turn the matrix on.
-        os: [windows-latest]
-        # os: [windows-latest, ubuntu-latest]
+        # Windows + Linux. The frontend leg is pure JS (lint, format, types,
+        # tests), so it needs no system libraries on either OS.
+        os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -64,17 +63,41 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows-first today (MSVC + WebView2). Add `ubuntu-latest` here when
-        # Linux turns on — note the Linux build also needs system WebKitGTK
-        # dependencies, added at that time.
-        os: [windows-latest]
-        # os: [windows-latest, ubuntu-latest]
+        # Windows (MSVC + WebView2) and Linux (GTK + WebKitGTK). Even
+        # `clippy`/`test` compile the Tauri crate, which links against the
+        # system WebKitGTK libraries — so the Linux leg installs them before
+        # any cargo command runs.
+        os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # The channel, MSVC target, and rustfmt + clippy components are pinned by
+      # Tauri v2 links against GTK 3 and WebKitGTK 4.1 (NOT the 4.0 that Tauri
+      # v1 used). These -dev packages must be present before any cargo command
+      # that compiles the crate (clippy and test both do).
+      - name: Install Tauri v2 Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev
+          # System-tray indicator dev package: the name differs by Ubuntu
+          # release. 24.04 (today's ubuntu-latest) ships the Ayatana fork;
+          # 22.04 carries the legacy libappindicator3-dev. Install whichever
+          # resolves so this works regardless of where ubuntu-latest points.
+          sudo apt-get install -y libayatana-appindicator3-dev \
+            || sudo apt-get install -y libappindicator3-dev
+
+      # The channel, targets, and rustfmt + clippy components are pinned by
       # `rust-toolchain.toml`, so rustup materializes the correct toolchain.
       - name: Materialize pinned Rust toolchain
         run: rustup show
