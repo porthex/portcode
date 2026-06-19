@@ -1,0 +1,46 @@
+# Automated changelog + version sync via release-please.
+#
+# On every push to `main`, release-please opens (or updates) one "release PR"
+# that:
+#   - derives the next SemVer from the Conventional Commits since the last
+#     release,
+#   - writes the CHANGELOG.md entry, and
+#   - keeps all THREE version files in lockstep — package.json (the `node`
+#     release type) plus src-tauri/Cargo.toml and src-tauri/tauri.conf.json
+#     (wired as `extra-files` in release-please-config.json).
+# Merging that release PR tags the release (vX.Y.Z) and publishes a GitHub
+# Release whose notes are categorized by .github/release.yml.
+#
+# This job only edits metadata and talks to the GitHub API — it compiles
+# nothing — so it runs on the cheapest hosted runner rather than the Windows
+# build matrix. The signed Windows build stays in the platform-specific release
+# workflow (added in a later phase).
+#
+# NOTE: with the default GITHUB_TOKEN, the repository/org setting
+# "Allow GitHub Actions to create and approve pull requests" must be ON, or the
+# release PR cannot be opened. See the PR description (OWNER ACTIONS).
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Release PR + tagging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run release-please
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

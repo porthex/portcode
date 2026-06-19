@@ -1,0 +1,27 @@
+{
+  // Dedicated config for the WebdriverIO end-to-end suite. The app's root
+  // tsconfig only covers `src/` (browser code), so the e2e files — which run in
+  // Node and use the WebdriverIO + Mocha globals — are type-checked separately
+  // via `pnpm test:e2e:typecheck`. The WebdriverIO runner transpiles these
+  // files at runtime with tsx (which does not type-check), so this config is the
+  // type-safety gate.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node", "@wdio/globals/types", "@wdio/mocha-framework"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["../wdio.conf.ts", "**/*.ts"]
+}

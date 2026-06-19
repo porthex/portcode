@@ -1,0 +1,53 @@
+# GitHub auto-generated release notes — shapes the body GitHub builds when you
+# click "Generate release notes" (and the default body of a published Release).
+# Merged pull requests are grouped into the sections below by their *labels*.
+#
+# This is the label-driven companion to release-please, which derives
+# CHANGELOG.md from Conventional-Commit *types*. Both are kept in sync by
+# convention: a `feat:` PR is labeled `feature`, a `fix:` PR `bug`, Dependabot
+# PRs carry `dependencies` (see .github/dependabot.yml), and so on.
+#
+# Docs: https://docs.github.com/repositories/releasing-projects-on-github/automatically-generated-release-notes
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+      - ignore-for-release
+  categories:
+    - title: Features
+      labels:
+        - feature
+        - feat
+        - enhancement
+    - title: Bug Fixes
+      labels:
+        - fix
+        - bug
+        - bugfix
+    - title: Performance
+      labels:
+        - performance
+        - perf
+    - title: Documentation
+      labels:
+        - documentation
+        - docs
+    - title: Security
+      labels:
+        - security
+    - title: Dependencies
+      labels:
+        - dependencies
+        - deps
+    - title: Maintenance
+      labels:
+        - chore
+        - refactor
+        - build
+        - ci
+        - style
+        - test
+        - maintenance
+    - title: Other Changes
+      labels:
+        - "*"
