@@ -1,7 +1,9 @@
 # Automated changelog + version sync via release-please.
 #
-# On every push to `main`, release-please opens (or updates) one "release PR"
-# that:
+# Releases are cut from the `release` branch, NOT `main`. `main` is the active
+# development / integration branch; when changes are ready to ship, `main` is
+# promoted to `release`. On every push to `release`, release-please opens (or
+# updates) one "release PR" that:
 #   - derives the next SemVer from the Conventional Commits since the last
 #     release,
 #   - writes the CHANGELOG.md entry, and
@@ -23,7 +25,7 @@ name: release-please
 
 on:
   push:
-    branches: [main]
+    branches: [release]
 
 permissions:
   contents: write
@@ -44,3 +46,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+          # Manage the `release` branch explicitly: releases are cut from
+          # `release`, not the repo's default branch. release-please derives its
+          # release-PR head branch name from this target.
+          target-branch: release

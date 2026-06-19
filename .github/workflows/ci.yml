@@ -1,16 +1,17 @@
 name: CI
 
 # Phase 0 quality gates: lint, format, type-check, and tests for both the
-# TypeScript frontend and the Rust (Tauri) backend. Runs on every push to
-# `main` and on every pull request. This workflow performs NO telemetry,
-# analytics, or network reporting — it only builds and tests the code.
+# TypeScript frontend and the Rust (Tauri) backend. Runs on every push to the
+# `main` and `release` branches and on every pull request. This workflow
+# performs NO telemetry, analytics, or network reporting — it only builds and
+# tests the code.
 #
 # The full signed `tauri build` is intentionally NOT here; it is gated to
 # tag/label and lives in the Phase 1 `release.yml` (Azure Trusted Signing).
 
 on:
   push:
-    branches: [main]
+    branches: [main, release]
   pull_request:
 
 permissions:
