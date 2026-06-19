@@ -39,17 +39,17 @@ Everything below is the detail behind those four lines.
 
 A release version is kept in lockstep across **three** files:
 
-| File | Field |
-| --- | --- |
-| `package.json` | `"version"` |
-| `src-tauri/Cargo.toml` | `[package] version` |
+| File                        | Field                                                            |
+| --------------------------- | ---------------------------------------------------------------- |
+| `package.json`              | `"version"`                                                      |
+| `src-tauri/Cargo.toml`      | `[package] version`                                              |
 | `src-tauri/tauri.conf.json` | `"version"` (the workflow reads the installed version from here) |
 
 **These are bumped automatically by release-please (PR #5).** You do not edit
 them by hand. release-please watches Conventional Commits on `main`, opens a
 "release PR" that bumps all three files plus `CHANGELOG.md`, and — when that PR
 is merged — creates the matching **`vX.Y.Z`** git tag. Merging the release PR
-*is* how a release is cut; the tag is what triggers the build.
+_is_ how a release is cut; the tag is what triggers the build.
 
 > If you ever need a manual bump, change the value in **all three** files
 > identically (they must match) and commit them together. Prefer the
@@ -81,7 +81,7 @@ commit the refreshed lockfiles **before** tagging. The SBOM step (§6) reads bot
 - Default permissions are least-privilege (`contents: read`); the release job
   opts up to `contents: write` only to create the Release and upload assets.
 - **Every signing step is secret-gated.** Secrets are mirrored into job `env` so a
-  step's `if:` can detect their *presence* without ever interpolating a value into
+  step's `if:` can detect their _presence_ without ever interpolating a value into
   a run-step (which could leak it to logs). **With no secrets configured the
   workflow still builds, produces a SBOM, and computes checksums — an UNSIGNED dry
   run.** It never hard-fails for missing secrets; a real signed release just
@@ -95,11 +95,11 @@ commit the refreshed lockfiles **before** tagging. The SBOM step (§6) reads bot
 3. **Supply-chain audit** — `cargo-deny` (licenses · advisories · bans · sources),
    reading `deny.toml` at the repo root. Fails fast before build time.
 4. **Build** — `pnpm app:build` → `tauri build` → **NSIS installer** (§3).
-5. **Authenticode sign** the installer via Azure Trusted Signing (§4) — *gated*.
-6. **Updater sign** the installer with `tauri signer sign` (§5) — *gated*, runs
+5. **Authenticode sign** the installer via Azure Trusted Signing (§4) — _gated_.
+6. **Updater sign** the installer with `tauri signer sign` (§5) — _gated_, runs
    **after** Authenticode.
 7. **SHA-256 checksums** over the final (post-sign) bytes → `SHA256SUMS.txt`.
-8. **Updater manifest** `latest.json` (§5) — *gated*.
+8. **Updater manifest** `latest.json` (§5) — _gated_.
 9. **CycloneDX SBOM** via `cdxgen` (§6) → `portcode.cdx.json`, then validated.
 10. **Publish** assets to the GitHub Release on tag refs (§7); on a non-tag dry
     run, the same artifacts are uploaded as a workflow artifact
@@ -138,14 +138,14 @@ cleanly (with a warning) on dry runs.
 Required secret **names** (values live only in the `release` environment — never
 in the repo or this doc):
 
-| Secret name | Purpose |
-| --- | --- |
-| `AZURE_TENANT_ID` | Entra tenant of the signing service principal |
-| `AZURE_CLIENT_ID` | Service-principal (app) client ID |
-| `AZURE_CLIENT_SECRET` | Service-principal client secret |
-| `AZURE_TS_ENDPOINT` | Trusted Signing account endpoint |
-| `AZURE_TS_ACCOUNT` | Trusted Signing account name |
-| `AZURE_TS_CERT_PROFILE` | Certificate profile to sign with |
+| Secret name             | Purpose                                       |
+| ----------------------- | --------------------------------------------- |
+| `AZURE_TENANT_ID`       | Entra tenant of the signing service principal |
+| `AZURE_CLIENT_ID`       | Service-principal (app) client ID             |
+| `AZURE_CLIENT_SECRET`   | Service-principal client secret               |
+| `AZURE_TS_ENDPOINT`     | Trusted Signing account endpoint              |
+| `AZURE_TS_ACCOUNT`      | Trusted Signing account name                  |
+| `AZURE_TS_CERT_PROFILE` | Certificate profile to sign with              |
 
 Signing uses a SHA-256 file digest and an RFC-3161 timestamp from Microsoft's
 public timestamp authority (configured in the workflow), so signatures remain
@@ -163,7 +163,7 @@ signature over the installer before applying it.
   and in the `release` environment secrets. The **public key lives in
   `src-tauri/tauri.conf.json`** (the `updater` plugin config added by PR #8).
 - In CI, **after** Authenticode signing, `tauri signer sign <installer>` writes a
-  detached **`<installer>.sig`** over the *final* installer bytes. (Order matters:
+  detached **`<installer>.sig`** over the _final_ installer bytes. (Order matters:
   Authenticode embeds a certificate into the binary, so the updater signature must
   be taken last, or the updater would reject the download.) The key and password
   are read from `env`, never passed on the command line.
@@ -186,10 +186,10 @@ signature over the installer before applying it.
 
 Required secret **names**:
 
-| Secret name | Purpose |
-| --- | --- |
-| `TAURI_SIGNING_PRIVATE_KEY` | Ed25519 private key contents (from `tauri signer generate`) |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Password protecting that private key |
+| Secret name                          | Purpose                                                     |
+| ------------------------------------ | ----------------------------------------------------------- |
+| `TAURI_SIGNING_PRIVATE_KEY`          | Ed25519 private key contents (from `tauri signer generate`) |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Password protecting that private key                        |
 
 If `TAURI_SIGNING_PRIVATE_KEY` is absent (dry run), the updater signing and
 `latest.json` steps are skipped and **no auto-update is offered** for that build.
@@ -259,8 +259,8 @@ your secret vault — **never** in the repo.
    `TAURI_SIGNING_PRIVATE_KEY` and its password as
    `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 3. **Azure Trusted Signing** — create the Trusted Signing account + certificate
-   profile and a service principal with the *Trusted Signing Certificate Profile
-   Signer* role; record its values into the six `AZURE_*` secret names from §4.
+   profile and a service principal with the _Trusted Signing Certificate Profile
+   Signer_ role; record its values into the six `AZURE_*` secret names from §4.
 4. **`v*` tag protection** — protect the `v*` tag pattern (Settings → Rules) so
    only maintainers can create/push release tags.
 5. **Allow release-please to open PRs** — Settings → Actions → General → enable
@@ -272,16 +272,16 @@ your secret vault — **never** in the repo.
 
 ### The 8 secrets at a glance
 
-| # | Secret name | Group |
-| --- | --- | --- |
-| 1 | `AZURE_TENANT_ID` | Azure Trusted Signing |
-| 2 | `AZURE_CLIENT_ID` | Azure Trusted Signing |
-| 3 | `AZURE_CLIENT_SECRET` | Azure Trusted Signing |
-| 4 | `AZURE_TS_ENDPOINT` | Azure Trusted Signing |
-| 5 | `AZURE_TS_ACCOUNT` | Azure Trusted Signing |
-| 6 | `AZURE_TS_CERT_PROFILE` | Azure Trusted Signing |
-| 7 | `TAURI_SIGNING_PRIVATE_KEY` | Tauri updater |
-| 8 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Tauri updater |
+| #   | Secret name                          | Group                 |
+| --- | ------------------------------------ | --------------------- |
+| 1   | `AZURE_TENANT_ID`                    | Azure Trusted Signing |
+| 2   | `AZURE_CLIENT_ID`                    | Azure Trusted Signing |
+| 3   | `AZURE_CLIENT_SECRET`                | Azure Trusted Signing |
+| 4   | `AZURE_TS_ENDPOINT`                  | Azure Trusted Signing |
+| 5   | `AZURE_TS_ACCOUNT`                   | Azure Trusted Signing |
+| 6   | `AZURE_TS_CERT_PROFILE`              | Azure Trusted Signing |
+| 7   | `TAURI_SIGNING_PRIVATE_KEY`          | Tauri updater         |
+| 8   | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Tauri updater         |
 
 `GITHUB_TOKEN` is provided automatically by Actions and is **not** one of the 8.
 
@@ -349,7 +349,7 @@ Before cutting a release:
 - [ ] Lockfiles (`pnpm-lock.yaml`, `Cargo.lock`) are **committed and clean**.
 - [ ] The release-please PR (version bump across the **3 files** + `CHANGELOG.md`)
       is reviewed with **2 approvals**.
-- [ ] *(Recommended)* a **dry run** was triggered via `workflow_dispatch` on a
+- [ ] _(Recommended)_ a **dry run** was triggered via `workflow_dispatch` on a
       non-tag ref and the `portcode-unpublished` artifact was inspected.
 
 Then merge the release-please PR and let the `v*` tag drive the rest.
@@ -358,17 +358,17 @@ Then merge the release-please PR and let the `v*` tag drive the rest.
 
 ## Appendix — paths & commands
 
-| What | Where (relative to repo root) |
-| --- | --- |
-| Release workflow | `.github/workflows/release.yml` |
-| Per-PR CI (no signing) | `.github/workflows/ci.yml` |
-| NSIS installer | `src-tauri/target/release/bundle/nsis/Portcode_<version>_x64-setup.exe` |
-| Checksums | `src-tauri/target/release/bundle/nsis/SHA256SUMS.txt` |
-| Updater signature | `src-tauri/target/release/bundle/nsis/Portcode_<version>_x64-setup.exe.sig` |
-| Updater manifest | `src-tauri/target/release/bundle/nsis/latest.json` |
-| SBOM | `portcode.cdx.json` |
-| Supply-chain policy | `deny.toml` |
-| Updater public key | `src-tauri/tauri.conf.json` |
+| What                   | Where (relative to repo root)                                               |
+| ---------------------- | --------------------------------------------------------------------------- |
+| Release workflow       | `.github/workflows/release.yml`                                             |
+| Per-PR CI (no signing) | `.github/workflows/ci.yml`                                                  |
+| NSIS installer         | `src-tauri/target/release/bundle/nsis/Portcode_<version>_x64-setup.exe`     |
+| Checksums              | `src-tauri/target/release/bundle/nsis/SHA256SUMS.txt`                       |
+| Updater signature      | `src-tauri/target/release/bundle/nsis/Portcode_<version>_x64-setup.exe.sig` |
+| Updater manifest       | `src-tauri/target/release/bundle/nsis/latest.json`                          |
+| SBOM                   | `portcode.cdx.json`                                                         |
+| Supply-chain policy    | `deny.toml`                                                                 |
+| Updater public key     | `src-tauri/tauri.conf.json`                                                 |
 
 ```sh
 # Local dry-run build (unsigned) — same as CI without secrets:
