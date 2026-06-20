@@ -7,10 +7,17 @@ export function SettingsPanel() {
   const settings = useStore((s) => s.settings);
   const updateSettings = useStore((s) => s.updateSettings);
   const setShowSettings = useStore((s) => s.setShowSettings);
+  const oauthStatus = useStore((s) => s.oauthStatus);
+  const oauthError = useStore((s) => s.oauthError);
+  const loginWithClaude = useStore((s) => s.loginWithClaude);
+  const logoutClaude = useStore((s) => s.logoutClaude);
 
   const [apiKey, setApiKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [savedKey, setSavedKey] = useState(false);
+  const [signingIn, setSigningIn] = useState(false);
+
+  const signedIn = !!oauthStatus?.signedIn;
 
   const saveKey = async () => {
     if (!apiKey.trim()) return;
@@ -23,6 +30,15 @@ export function SettingsPanel() {
       setTimeout(() => setSavedKey(false), 1800);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const signIn = async () => {
+    setSigningIn(true);
+    try {
+      await loginWithClaude();
+    } finally {
+      setSigningIn(false);
     }
   };
 
@@ -64,6 +80,58 @@ export function SettingsPanel() {
           </Field>
 
           <Field
+            label="Subscription (Claude Pro/Max)"
+            hint="Uses your Claude subscription via Anthropic instead of an API key. Experimental — it may stop working if Anthropic changes their service."
+          >
+            {signedIn ? (
+              <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-panel-2 px-3 py-2">
+                <div className="min-w-0 text-sm">
+                  <div className="flex items-center gap-1.5">
+                    <span className="h-2 w-2 shrink-0 rounded-full bg-success" />
+                    <span className="min-w-0 truncate">
+                      Signed in{oauthStatus?.account ? ` as ${oauthStatus.account}` : ""}
+                    </span>
+                    {oauthStatus?.tier && (
+                      <span
+                        title={oauthStatus.tier}
+                        className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wider shadow-sm ${
+                          /max/i.test(oauthStatus.tier)
+                            ? "bg-gradient-to-r from-amber-300 to-amber-500 text-black"
+                            : "bg-gradient-to-r from-violet-400 to-indigo-500 text-white"
+                        }`}
+                      >
+                        {oauthStatus.tier.replace(/^Claude\s+/, "")}
+                      </span>
+                    )}
+                  </div>
+                  {oauthStatus?.expiresAt != null && (
+                    <div className="mt-0.5 text-xs text-muted">
+                      Access expires {formatExpiry(oauthStatus.expiresAt)}
+                    </div>
+                  )}
+                </div>
+                <button
+                  onClick={() => void logoutClaude()}
+                  className="shrink-0 rounded-md border border-border bg-panel px-3 py-2 text-sm text-muted hover:text-fg"
+                >
+                  Log out
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => void signIn()}
+                disabled={signingIn}
+                className="w-full rounded-md bg-accent px-3 py-2 text-sm text-bg disabled:opacity-30 hover:opacity-90"
+              >
+                {signingIn ? "Signing in…" : "Sign in with Claude"}
+              </button>
+            )}
+            {oauthError && (
+              <p className="mt-1.5 text-xs text-danger">Sign-in failed: {oauthError}</p>
+            )}
+          </Field>
+
+          <Field
             label="API key"
             hint={
               settings.apiKeySet
@@ -88,6 +156,11 @@ export function SettingsPanel() {
               </button>
             </div>
           </Field>
+
+          <p className="-mt-2 text-xs text-muted">
+            When signed in with Claude, Portcode uses your subscription; otherwise it uses your API
+            key.
+          </p>
 
           <Field
             label="Default tool permission"
@@ -118,6 +191,14 @@ export function SettingsPanel() {
       </div>
     </div>
   );
+}
+
+function formatExpiry(expiresAt: number): string {
+  // expiresAt is a unix timestamp in seconds.
+  return new Date(expiresAt * 1000).toLocaleString(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
 }
 
 function Field({

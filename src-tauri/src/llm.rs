@@ -11,9 +11,37 @@ use tauri::{AppHandle, Emitter};
 
 use futures_util::StreamExt;
 
+use crate::secrets::Credential;
+
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
 const MAX_TOKENS: u32 = 8192;
+
+/// Beta header that opts an OAuth (subscription) request into Anthropic's
+/// OAuth-authenticated inference path.
+const OAUTH_BETA: &str = "oauth-2025-04-20";
+
+/// First system block required on subscription (OAuth) requests. Anthropic's
+/// subscription inference path authenticates the caller as Claude Code, so this
+/// exact line must lead the system prompt; Portcode's own prompt follows it.
+/// (Requirement verified against opencode's `session/system.ts`.)
+const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// Build the Anthropic `system` field for a turn.
+///
+/// OAuth (subscription) requests are only accepted when the first system block
+/// is exactly the Claude Code identity, so for OAuth we emit a two-element block
+/// array: the identity first, then Portcode's real prompt. API-key requests are
+/// unchanged — `system` stays a plain string and never carries the identity.
+fn build_system(cred: &Credential, system: &str) -> Value {
+    match cred {
+        Credential::OAuth(_) => json!([
+            { "type": "text", "text": CLAUDE_CODE_IDENTITY },
+            { "type": "text", "text": system },
+        ]),
+        Credential::ApiKey(_) => Value::String(system.to_string()),
+    }
+}
 
 /// A single content block, matching the Anthropic content-block wire format.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -96,7 +124,9 @@ pub struct TurnResult {
 struct Request<'a> {
     model: &'a str,
     max_tokens: u32,
-    system: &'a str,
+    // Either a plain string (API key) or an array of system blocks (OAuth, with
+    // the Claude Code identity line first). Anthropic accepts both shapes.
+    system: Value,
     messages: &'a [ChatMessage],
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     tools: &'a [Value],
@@ -121,7 +151,7 @@ fn emit(app: &AppHandle, channel: &str, ev: StreamEvent) {
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_turn(
     http: &reqwest::Client,
-    api_key: &str,
+    cred: &Credential,
     model: &str,
     system: &str,
     messages: &[ChatMessage],
@@ -130,6 +160,10 @@ pub async fn stream_turn(
     channel: &str,
     cancel: &Arc<AtomicBool>,
 ) -> Result<TurnResult, String> {
+    // OAuth (subscription) requests must lead with the Claude Code identity
+    // block; API-key requests send Portcode's prompt verbatim as a plain string.
+    let system = build_system(cred, system);
+
     let body = Request {
         model,
         max_tokens: MAX_TOKENS,
@@ -139,12 +173,22 @@ pub async fn stream_turn(
         stream: true,
     };
 
-    let resp = http
+    let req = http
         .post(API_URL)
-        .header("x-api-key", api_key)
         .header("anthropic-version", API_VERSION)
         .header("content-type", "application/json")
-        .header("accept", "text/event-stream")
+        .header("accept", "text/event-stream");
+    // Authentication differs by credential: an API key uses `x-api-key`; an
+    // OAuth token uses a bearer `authorization` header plus the OAuth beta flag
+    // and deliberately omits `x-api-key`.
+    let req = match cred {
+        Credential::ApiKey(key) => req.header("x-api-key", key.as_str()),
+        Credential::OAuth(tokens) => req
+            .header("authorization", format!("Bearer {}", tokens.access_token))
+            .header("anthropic-beta", OAUTH_BETA),
+    };
+
+    let resp = req
         .json(&body)
         .send()
         .await
@@ -277,4 +321,42 @@ pub async fn stream_turn(
         input_tokens,
         output_tokens,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secrets::OAuthTokens;
+
+    fn oauth_cred() -> Credential {
+        Credential::OAuth(OAuthTokens {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: 0,
+            email: None,
+            plan: None,
+        })
+    }
+
+    #[test]
+    fn oauth_system_prepends_claude_code_identity_block() {
+        let system = build_system(&oauth_cred(), "PORTCODE PROMPT");
+        let blocks = system
+            .as_array()
+            .expect("OAuth system must be a block array");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], CLAUDE_CODE_IDENTITY);
+        assert_eq!(blocks[1]["text"], "PORTCODE PROMPT");
+    }
+
+    #[test]
+    fn api_key_system_is_plain_string_without_identity() {
+        let system = build_system(&Credential::ApiKey("sk-test".into()), "PORTCODE PROMPT");
+        assert_eq!(system, Value::String("PORTCODE PROMPT".into()));
+        assert!(
+            !system.to_string().contains("Claude Code"),
+            "API-key requests must not carry the Claude Code identity"
+        );
+    }
 }

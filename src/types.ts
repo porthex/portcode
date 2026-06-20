@@ -71,6 +71,20 @@ export const DEFAULT_SETTINGS: Settings = {
   workspace: null,
 };
 
+/**
+ * Anthropic subscription (Claude Pro/Max) OAuth status. Mirrors the Rust
+ * core's `OAuthStatus` serde model. `expiresAt` is a unix timestamp in
+ * SECONDS (null when not signed in / unknown).
+ */
+export interface OAuthStatus {
+  signedIn: boolean;
+  expiresAt: number | null;
+  /** Signed-in account email (from the OAuth profile); null if unknown. */
+  account: string | null;
+  /** Plan-tier display label, e.g. "Claude Max" / "Claude Pro"; null if unknown. */
+  tier: string | null;
+}
+
 export const MODELS = [
   { id: "claude-opus-4-8", label: "Claude Opus 4.8" },
   { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },

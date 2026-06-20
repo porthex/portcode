@@ -76,12 +76,12 @@ say so than oversell it.
 
 We think the fastest way to lose your trust is to blur what's real. So:
 
-|                 | **Today (alpha)**                 | **On the roadmap**                                                                   |
-| --------------- | --------------------------------- | ------------------------------------------------------------------------------------ |
-| **Models**      | Claude (Anthropic)                | OpenAI, Gemini, local models — _the mission: every LLM_                              |
-| **Auth**        | Your Anthropic **API key** (BYOK) | Bring your own **subscription**, too                                                 |
-| **OS**          | Windows 10/11                     | Linux                                                                                |
-| **Form factor** | Desktop                           | **📱 Phone Sync** — start a task at your desk, drive and continue it from your phone |
+|                 | **Today (alpha)**                                                                         | **On the roadmap**                                                                   |
+| --------------- | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| **Models**      | Claude (Anthropic)                                                                        | OpenAI, Gemini, local models — _the mission: every LLM_                              |
+| **Auth**        | Anthropic **API key** (BYOK), or **Claude Pro/Max** subscription sign-in _(experimental)_ | Subscription/account sign-in for other providers                                     |
+| **OS**          | Windows 10/11                                                                             | Linux                                                                                |
+| **Form factor** | Desktop                                                                                   | **📱 Phone Sync** — start a task at your desk, drive and continue it from your phone |
 
 **Phone Sync** is the headline of where we're going: a fast, efficient engine to continue
 your coding sessions from iOS/Android. It's vision-stage today (not built) — but it's the
@@ -128,9 +128,16 @@ pnpm app:build         # produces an NSIS installer under src-tauri/target/relea
 
 ### First run
 
-Open **Settings** (gear, bottom-left) → paste your **Anthropic API key** (stored in Windows
-Credential Manager, never on disk) → pick a model → describe a task in the composer. You'll
-need an API key from the [Anthropic Console](https://console.anthropic.com/).
+Open **Settings** (gear, bottom-left) → pick a model → describe a task in the composer. For
+auth, choose one:
+
+- **API key (BYOK)** — paste your **Anthropic API key** (stored in Windows Credential Manager,
+  never on disk). Get one from the [Anthropic Console](https://console.anthropic.com/).
+- **Claude Pro/Max subscription** _(experimental)_ — click **Sign in with Claude** to
+  authenticate your existing subscription in the browser; Portcode then drives inference
+  against it instead of a metered API key. When signed in, the subscription takes precedence
+  over any API key. This uses an unofficial sign-in flow that may break if Anthropic changes
+  their service — see [SECURITY.md](SECURITY.md#subscription-sign-in-experimental).
 
 ---
 
@@ -211,7 +218,8 @@ workflow.
 The near-term engineering plan lives in [docs/ROADMAP.md](docs/ROADMAP.md). The bigger picture:
 
 1. **More providers** — OpenAI, Gemini, and local models, toward the "every LLM" mission.
-2. **Bring your own subscription** — not just raw API keys.
+2. **Broader subscription support** — Claude Pro/Max sign-in has landed (experimental); more
+   provider/account sign-in to follow.
 3. **Linux** — Windows-first today; Linux is next.
 4. **📱 Phone Sync** _(marquee)_ — a fast engine to drive and continue your coding sessions
    from your phone.

@@ -1,7 +1,7 @@
 // IPC bridge. Talks to the Rust core when running under Tauri; otherwise falls
 // back to an in-browser mock so the UI is fully runnable via `vite` alone.
 
-import type { DirEntry, Message, Session, Settings, StreamEvent } from "../types";
+import type { DirEntry, Message, OAuthStatus, Session, Settings, StreamEvent } from "../types";
 
 export const isTauri = (): boolean =>
   typeof window !== "undefined" &&
@@ -42,6 +42,33 @@ export async function setApiKey(key: string): Promise<void> {
     return;
   }
   return mock.setApiKey(key);
+}
+
+// ── Subscription OAuth (Claude Pro/Max) ───────────────────────────────────────
+
+export async function startOauthLogin(): Promise<OAuthStatus> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<OAuthStatus>("start_oauth_login");
+  }
+  return mock.startOauthLogin();
+}
+
+export async function oauthStatus(): Promise<OAuthStatus> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<OAuthStatus>("oauth_status");
+  }
+  return mock.oauthStatus();
+}
+
+export async function oauthLogout(): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("oauth_logout");
+    return;
+  }
+  return mock.oauthLogout();
 }
 
 export async function resolvePermission(id: string, decision: "allow" | "deny"): Promise<void> {
@@ -154,6 +181,9 @@ const mock = (() => {
     workspace: null,
   };
 
+  // Fake subscription-auth state so the sign-in UX is testable without Tauri.
+  let oauth: OAuthStatus = { signedIn: false, expiresAt: null, account: null, tier: null };
+
   const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const resolvers = new Map<string, (d: "allow" | "deny") => void>();
 
@@ -167,6 +197,22 @@ const mock = (() => {
     },
     async setApiKey(_key: string) {
       settings.apiKeySet = true;
+    },
+    async startOauthLogin() {
+      // Simulate a completed sign-in: subscription valid for ~8h.
+      oauth = {
+        signedIn: true,
+        expiresAt: Math.floor(Date.now() / 1000) + 8 * 60 * 60,
+        account: "preview@claude.local",
+        tier: "Claude Max",
+      };
+      return { ...oauth };
+    },
+    async oauthStatus() {
+      return { ...oauth };
+    },
+    async oauthLogout() {
+      oauth = { signedIn: false, expiresAt: null, account: null, tier: null };
     },
     async resolvePermission(id: string, decision: "allow" | "deny") {
       resolvers.get(id)?.(decision);
