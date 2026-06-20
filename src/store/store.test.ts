@@ -360,6 +360,76 @@ describe("draft + UI setters", () => {
   });
 });
 
+describe("oauth (Claude subscription sign-in)", () => {
+  const signedIn = { signedIn: true, expiresAt: 9999, account: "me@x", tier: "Claude Max" };
+
+  it("init keeps oauthStatus null when the oauth bridge rejects", async () => {
+    m.oauthStatus.mockRejectedValue(new Error("core not ready"));
+    await useStore.getState().init();
+    expect(useStore.getState().oauthStatus).toBeNull();
+  });
+
+  it("init stores the signed-in subscription status", async () => {
+    m.oauthStatus.mockResolvedValue(signedIn);
+    await useStore.getState().init();
+    expect(useStore.getState().oauthStatus).toEqual(signedIn);
+  });
+
+  it("refreshOAuthStatus updates state and swallows a transient failure", async () => {
+    m.oauthStatus.mockResolvedValue(signedIn);
+    await useStore.getState().refreshOAuthStatus();
+    expect(useStore.getState().oauthStatus).toEqual(signedIn);
+
+    // A later failure must not clobber the last-known status.
+    m.oauthStatus.mockRejectedValue(new Error("blip"));
+    await useStore.getState().refreshOAuthStatus();
+    expect(useStore.getState().oauthStatus).toEqual(signedIn);
+  });
+
+  it("loginWithClaude stores the status and clears any prior error", async () => {
+    m.startOauthLogin.mockResolvedValue(signedIn);
+    useStore.setState({ oauthError: "old failure" });
+
+    await useStore.getState().loginWithClaude();
+
+    expect(m.startOauthLogin).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().oauthStatus).toEqual(signedIn);
+    expect(useStore.getState().oauthError).toBeNull();
+  });
+
+  it("loginWithClaude records an Error's message on failure", async () => {
+    m.startOauthLogin.mockRejectedValue(new Error("oauth denied"));
+    await useStore.getState().loginWithClaude();
+    expect(useStore.getState().oauthError).toBe("oauth denied");
+  });
+
+  it("loginWithClaude stringifies a non-Error rejection", async () => {
+    m.startOauthLogin.mockRejectedValue("plain failure");
+    await useStore.getState().loginWithClaude();
+    expect(useStore.getState().oauthError).toBe("plain failure");
+  });
+
+  it("logoutClaude clears the subscription on success", async () => {
+    useStore.setState({ oauthStatus: signedIn });
+
+    await useStore.getState().logoutClaude();
+
+    expect(m.oauthLogout).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().oauthStatus).toEqual({
+      signedIn: false,
+      expiresAt: null,
+      account: null,
+      tier: null,
+    });
+  });
+
+  it("logoutClaude records a failure message", async () => {
+    m.oauthLogout.mockRejectedValue(new Error("logout failed"));
+    await useStore.getState().logoutClaude();
+    expect(useStore.getState().oauthError).toBe("logout failed");
+  });
+});
+
 describe("settings + workspace", () => {
   it("updateSettings persists through ipc and stores the echoed result", async () => {
     m.saveSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, model: "claude-haiku-4-5-20251001" });
