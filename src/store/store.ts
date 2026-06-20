@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type {
   ContentBlock,
   Message,
+  OAuthStatus,
   PendingPermission,
   Session,
   Settings,
@@ -17,6 +18,8 @@ interface AppState {
   messages: Record<string, Message[]>; // sessionId -> messages
   usage: Record<string, Usage>; // sessionId -> cumulative token usage
   settings: Settings;
+  oauthStatus: OAuthStatus | null; // Claude subscription sign-in state
+  oauthError: string | null; // last sign-in/out failure, surfaced in Settings
   streaming: boolean;
   showSettings: boolean;
   showFiles: boolean;
@@ -38,6 +41,9 @@ interface AppState {
   setShowSettings: (v: boolean) => void;
   setShowPalette: (v: boolean) => void;
   updateSettings: (s: Partial<Settings>) => Promise<void>;
+  refreshOAuthStatus: () => Promise<void>;
+  loginWithClaude: () => Promise<void>;
+  logoutClaude: () => Promise<void>;
   resolvePermission: (decision: "allow" | "deny", always?: boolean) => Promise<void>;
 }
 
@@ -64,6 +70,8 @@ export const useStore = create<AppState>((set, get) => ({
   messages: {},
   usage: {},
   settings: DEFAULT_SETTINGS,
+  oauthStatus: null,
+  oauthError: null,
   streaming: false,
   showSettings: false,
   showFiles: false,
@@ -73,17 +81,22 @@ export const useStore = create<AppState>((set, get) => ({
   pendingPermission: null,
 
   async init() {
-    const settings = await ipc.getSettings();
+    // Fetch settings and subscription status together. The oauth call is kept
+    // resilient so an unwired/older core can't block startup.
+    const [settings, oauthStatus] = await Promise.all([
+      ipc.getSettings(),
+      ipc.oauthStatus().catch(() => null),
+    ]);
     const sessions = await ipc.listSessions();
     if (sessions.length === 0) {
       const s = makeSession();
       await ipc.createSession(s.id, s.title, s.workspace);
-      set({ settings, sessions: [s], activeId: s.id, messages: { [s.id]: [] } });
+      set({ settings, oauthStatus, sessions: [s], activeId: s.id, messages: { [s.id]: [] } });
       return;
     }
     const activeId = sessions[0].id;
     const msgs = await ipc.getMessages(activeId);
-    set({ settings, sessions, activeId, messages: { [activeId]: msgs } });
+    set({ settings, oauthStatus, sessions, activeId, messages: { [activeId]: msgs } });
   },
 
   async newSession() {
@@ -285,6 +298,35 @@ export const useStore = create<AppState>((set, get) => ({
     const next = await ipc.saveSettings(s);
     set({ settings: next });
   },
+
+  async refreshOAuthStatus() {
+    try {
+      const oauthStatus = await ipc.oauthStatus();
+      set({ oauthStatus });
+    } catch {
+      // Transient / core not ready — keep whatever we last knew.
+    }
+  },
+
+  async loginWithClaude() {
+    set({ oauthError: null });
+    try {
+      const oauthStatus = await ipc.startOauthLogin();
+      set({ oauthStatus });
+    } catch (err) {
+      set({ oauthError: errMessage(err) });
+    }
+  },
+
+  async logoutClaude() {
+    set({ oauthError: null });
+    try {
+      await ipc.oauthLogout();
+      set({ oauthStatus: { signedIn: false, expiresAt: null, account: null } });
+    } catch (err) {
+      set({ oauthError: errMessage(err) });
+    }
+  },
 }));
 
 function appendText(blocks: ContentBlock[], text: string): ContentBlock[] {
@@ -298,4 +340,8 @@ function appendText(blocks: ContentBlock[], text: string): ContentBlock[] {
 function deriveTitle(text: string): string {
   const t = text.trim().replace(/\s+/g, " ");
   return t.length > 42 ? t.slice(0, 42) + "…" : t || "New chat";
+}
+
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }

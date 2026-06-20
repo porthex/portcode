@@ -1,6 +1,7 @@
 mod agent;
 mod db;
 mod llm;
+mod oauth;
 mod permissions;
 mod secrets;
 mod settings;
@@ -24,6 +25,10 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     pub pending: permissions::Pending,
+    /// Serializes OAuth token refreshes so concurrent agent turns don't each
+    /// hit the token endpoint (single-flight). Guards no data — held only for
+    /// the duration of a refresh.
+    pub oauth_refresh: Arc<tokio::sync::Mutex<()>>,
 }
 
 // ── settings & secrets ───────────────────────────────────────────────────────
@@ -59,6 +64,60 @@ fn save_settings(state: State<AppState>, settings: Value) -> Settings {
 #[tauri::command]
 fn set_api_key(key: String) -> Result<(), String> {
     secrets::set_api_key(&key)
+}
+
+// ── subscription OAuth ───────────────────────────────────────────────────────
+
+/// Sign-in state for the frontend. `expires_at` is unix seconds; `account` is a
+/// reserved label (always `None` for now — Anthropic's token response carries no
+/// stable account identifier we surface yet).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OAuthStatus {
+    signed_in: bool,
+    expires_at: Option<i64>,
+    account: Option<String>,
+}
+
+fn current_oauth_status() -> OAuthStatus {
+    match secrets::get_oauth() {
+        Some(t) => OAuthStatus {
+            signed_in: true,
+            expires_at: Some(t.expires_at),
+            account: None,
+        },
+        None => OAuthStatus {
+            signed_in: false,
+            expires_at: None,
+            account: None,
+        },
+    }
+}
+
+/// Run the interactive subscription sign-in (loopback OAuth + PKCE), store the
+/// resulting tokens, and return the new status.
+#[tauri::command]
+async fn start_oauth_login(state: State<'_, AppState>) -> Result<OAuthStatus, String> {
+    let http = state.http.clone();
+    let tokens = oauth::run_loopback_login(&http).await?;
+    secrets::set_oauth(&tokens)?;
+    Ok(OAuthStatus {
+        signed_in: true,
+        expires_at: Some(tokens.expires_at),
+        account: None,
+    })
+}
+
+/// Report whether a subscription sign-in is currently stored.
+#[tauri::command]
+fn oauth_status() -> Result<OAuthStatus, String> {
+    Ok(current_oauth_status())
+}
+
+/// Forget the stored subscription tokens (sign out). Idempotent.
+#[tauri::command]
+fn oauth_logout() -> Result<(), String> {
+    secrets::clear_oauth()
 }
 
 // ── sessions ─────────────────────────────────────────────────────────────────
@@ -187,11 +246,23 @@ async fn run_agent(
     let db = state.db.clone();
     let cancels = state.cancels.clone();
     let pending = state.pending.clone();
+    let oauth_refresh = state.oauth_refresh.clone();
 
     // Run in the background so the command returns immediately and the frontend
     // can register its cancel handle before the run finishes.
     tauri::async_runtime::spawn(async move {
-        agent::run(app, http, settings, db, cancels, pending, session_id, text).await;
+        agent::run(
+            app,
+            http,
+            settings,
+            db,
+            cancels,
+            pending,
+            oauth_refresh,
+            session_id,
+            text,
+        )
+        .await;
     });
     Ok(())
 }
@@ -244,6 +315,7 @@ pub fn run() {
                 db: Arc::new(db),
                 cancels: Arc::new(Mutex::new(HashMap::new())),
                 pending: Arc::new(Mutex::new(HashMap::new())),
+                oauth_refresh: Arc::new(tokio::sync::Mutex::new(())),
             });
             Ok(())
         })
@@ -251,6 +323,9 @@ pub fn run() {
             get_settings,
             save_settings,
             set_api_key,
+            start_oauth_login,
+            oauth_status,
+            oauth_logout,
             list_sessions,
             create_session,
             rename_session,

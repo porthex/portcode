@@ -12,12 +12,16 @@ use uuid::Uuid;
 
 use crate::db::{self, Db};
 use crate::llm::{self, Block, ChatMessage, StreamEvent};
+use crate::oauth;
 use crate::permissions::{self, Decision, Pending};
-use crate::secrets;
+use crate::secrets::{self, Credential};
 use crate::settings::Settings;
 use crate::tools::{self, ToolCtx};
 
 type Cancels = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
+
+/// Refresh an OAuth access token once it is within this many seconds of expiry.
+const REFRESH_SKEW_SECS: i64 = 60;
 
 fn emit(app: &AppHandle, channel: &str, ev: StreamEvent) {
     use tauri::Emitter;
@@ -54,6 +58,38 @@ fn derive_title(text: &str) -> String {
     }
 }
 
+/// Return the credential to authenticate the next request with, refreshing an
+/// OAuth token that is at/near expiry. Refreshes are single-flight: the shared
+/// `refresh_lock` serializes concurrent turns, and the stored token is re-read
+/// under the lock so a token another turn just refreshed is reused rather than
+/// refreshed again.
+async fn ensure_fresh(
+    http: &reqwest::Client,
+    cred: Credential,
+    refresh_lock: &tokio::sync::Mutex<()>,
+) -> Result<Credential, String> {
+    let tokens = match cred {
+        Credential::OAuth(t) => t,
+        api_key => return Ok(api_key),
+    };
+
+    if tokens.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS {
+        return Ok(Credential::OAuth(tokens));
+    }
+
+    let _guard = refresh_lock.lock().await;
+    // Re-check under the lock: another turn may have refreshed already. Prefer
+    // the freshest stored token over the one we came in with.
+    let current = secrets::get_oauth().unwrap_or(tokens);
+    if current.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS {
+        return Ok(Credential::OAuth(current));
+    }
+
+    let refreshed = oauth::refresh(http, &current.refresh_token).await?;
+    secrets::set_oauth(&refreshed)?;
+    Ok(Credential::OAuth(refreshed))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     app: AppHandle,
@@ -62,6 +98,7 @@ pub async fn run(
     db: Arc<Db>,
     cancels: Cancels,
     pending: Pending,
+    oauth_refresh: Arc<tokio::sync::Mutex<()>>,
     session_id: String,
     user_text: String,
 ) {
@@ -88,6 +125,7 @@ pub async fn run(
         &db,
         &pending,
         &cancel,
+        &oauth_refresh,
         &channel,
         &session_id,
         user_text,
@@ -113,14 +151,16 @@ async fn run_inner(
     db: &Arc<Db>,
     pending: &Pending,
     cancel: &Arc<AtomicBool>,
+    refresh_lock: &tokio::sync::Mutex<()>,
     channel: &str,
     session_id: &str,
     user_text: String,
 ) -> Result<String, String> {
     let snapshot = { settings.lock().unwrap().clone() };
 
-    let api_key =
-        secrets::get_api_key().ok_or("No API key set. Add your Anthropic API key in Settings.")?;
+    let mut cred = secrets::load_credential().ok_or(
+        "No credentials set. Sign in with your Claude subscription or add an Anthropic API key in Settings.",
+    )?;
 
     let workspace = snapshot
         .workspace
@@ -158,9 +198,12 @@ async fn run_inner(
             break;
         }
 
+        // Refresh an expiring OAuth token before each turn (no-op for API keys).
+        cred = ensure_fresh(http, cred, refresh_lock).await?;
+
         let turn = llm::stream_turn(
             http,
-            &api_key,
+            &cred,
             &snapshot.model,
             &system,
             &messages,
