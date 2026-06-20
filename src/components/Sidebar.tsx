@@ -8,6 +8,15 @@ export function Sidebar() {
   const deleteSession = useStore((s) => s.deleteSession);
   const setShowSettings = useStore((s) => s.setShowSettings);
   const settings = useStore((s) => s.settings);
+  const oauthStatus = useStore((s) => s.oauthStatus);
+
+  const signedInClaude = !!oauthStatus?.signedIn;
+  const authed = signedInClaude || settings.apiKeySet;
+  const authTitle = signedInClaude
+    ? "Signed in with Claude"
+    : settings.apiKeySet
+      ? "API key set"
+      : "Not authenticated";
 
   return (
     <aside className="flex h-full w-64 shrink-0 flex-col border-r border-border bg-panel">
@@ -62,10 +71,8 @@ export function Sidebar() {
           <GearIcon />
           Settings
           <span
-            className={`ml-auto h-2 w-2 rounded-full ${
-              settings.apiKeySet ? "bg-success" : "bg-warn"
-            }`}
-            title={settings.apiKeySet ? "API key set" : "No API key"}
+            className={`ml-auto h-2 w-2 rounded-full ${authed ? "bg-success" : "bg-warn"}`}
+            title={authTitle}
           />
         </button>
       </div>
