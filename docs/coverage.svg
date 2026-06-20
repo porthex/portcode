@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 300" width="720" role="img" aria-labelledby="t d">
+<title id="t">Portcode frontend test coverage</title>
+<desc id="d">Statement coverage 98.9 percent, lines 100 percent, functions 100 percent, across 177 passing tests.</desc>
+<style>
+  .bg{fill:#0d1117;stroke:#30363d;stroke-width:1}
+  .ttl{fill:#e6edf3;font:600 19px -apple-system,Segoe UI,Helvetica,Arial,sans-serif}
+  .sub{fill:#8b949e;font:400 13px -apple-system,Segoe UI,Helvetica,Arial,sans-serif}
+  .lbl{fill:#8b949e;font:400 14px -apple-system,Segoe UI,Helvetica,Arial,sans-serif}
+  .num{font:600 23px -apple-system,Segoe UI,Helvetica,Arial,sans-serif}
+  .trk{fill:none;stroke:#30363d;stroke-width:13}
+  .arc{fill:none;stroke-width:13;stroke-linecap:round}
+</style>
+<rect class="bg" x="1" y="1" width="718" height="298" rx="16"/>
+<text class="ttl" x="32" y="46">Portcode · frontend test coverage</text>
+<text class="sub" x="32" y="70">177 tests · vitest + v8 · counted on main and release</text>
+
+<circle class="trk" cx="150" cy="172" r="56"/>
+<circle class="arc" cx="150" cy="172" r="56" stroke="#2dd4bf" transform="rotate(-90 150 172)" stroke-dasharray="351.86" stroke-dashoffset="351.86">
+<animate attributeName="stroke-dashoffset" from="351.86" to="3.80" dur="1.4s" begin="0.3s" fill="freeze"/>
+</circle>
+<text class="num" x="150" y="180" text-anchor="middle" fill="#2dd4bf">98.9%</text>
+<text class="lbl" x="150" y="250" text-anchor="middle">statements</text>
+
+<circle class="trk" cx="360" cy="172" r="56"/>
+<circle class="arc" cx="360" cy="172" r="56" stroke="#3fb950" transform="rotate(-90 360 172)" stroke-dasharray="351.86" stroke-dashoffset="351.86">
+<animate attributeName="stroke-dashoffset" from="351.86" to="0" dur="1.4s" begin="0.3s" fill="freeze"/>
+</circle>
+<text class="num" x="360" y="180" text-anchor="middle" fill="#3fb950">100%</text>
+<text class="lbl" x="360" y="250" text-anchor="middle">lines</text>
+
+<circle class="trk" cx="570" cy="172" r="56"/>
+<circle class="arc" cx="570" cy="172" r="56" stroke="#3fb950" transform="rotate(-90 570 172)" stroke-dasharray="351.86" stroke-dashoffset="351.86">
+<animate attributeName="stroke-dashoffset" from="351.86" to="0" dur="1.4s" begin="0.3s" fill="freeze"/>
+</circle>
+<text class="num" x="570" y="180" text-anchor="middle" fill="#3fb950">100%</text>
+<text class="lbl" x="570" y="250" text-anchor="middle">functions</text>
+
+<text class="sub" x="32" y="283">up from 41.6% · 13 files · 0 failures</text>
+</svg>

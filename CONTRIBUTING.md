@@ -173,6 +173,12 @@ cargo test --manifest-path src-tauri/Cargo.toml
   much appreciated**: when a change is easily testable, adding tests genuinely
   helps the project stay healthy, and maintainers are glad to help you write
   them.
+- **Measuring coverage (optional).** `pnpm test:coverage` runs the suite with a
+  v8 coverage report. Coverage is **frontend-only** (the `src/` TypeScript/React
+  tree) and is **counted on `main`/`release`**, where a CI job runs it and
+  enforces a regression floor — feature branches and PRs are never measured or
+  gated. The Rust core is exercised by `cargo test` (above), not a coverage
+  percentage.
 - **Never make live LLM API calls in tests or CI.** Use a deterministic mock
   provider; tests must be reproducible offline and must not require an API key.
 
