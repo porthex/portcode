@@ -12,10 +12,11 @@
 //! String (SAS) the user compares out-of-band (QR when co-present) to defeat a
 //! man-in-the-middle.
 //!
-//! No transport/network is wired here yet (Phase 2). These types are exercised by
-//! the tests below and consumed by the pairing flow + transport in later
-//! increments — hence the module-wide `dead_code` allowance, which comes off once
-//! Phase 1b wires them to Tauri commands. See docs/PHONE_SYNC_PLAN.md.
+//! No transport/network is wired here yet (Phase 2). `StaticKeypair::generate` is
+//! consumed by the Phase 1b pairing flow, but the `Handshake`/`Transport` halves
+//! aren't driven by non-test code until Phase 2 wires the transport — hence the
+//! module-wide `dead_code` allowance, which comes off then. See
+//! docs/PHONE_SYNC_PLAN.md.
 #![allow(dead_code)]
 
 use snow::params::NoiseParams;

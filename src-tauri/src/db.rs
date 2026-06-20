@@ -46,6 +46,17 @@ pub struct MessageRow {
     pub created_at: i64,
 }
 
+/// A phone paired for Phone Sync, keyed by its Curve25519 static public key
+/// (base64). `name` is a user-facing label; timestamps are unix millis.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PairedDevice {
+    pub public_key: String,
+    pub name: String,
+    pub paired_at: i64,
+    pub last_seen: i64,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum UiBlock {
@@ -120,7 +131,13 @@ impl Db {
                 content TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);",
+            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
+            CREATE TABLE IF NOT EXISTS paired_devices (
+                public_key TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                paired_at INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL
+            );",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -280,6 +297,62 @@ impl Db {
                 },
             )
             .collect()
+    }
+
+    // ── paired devices (Phone Sync) ──────────────────────────────────────────
+
+    /// Record a paired device (or refresh an existing one's name/last_seen). The
+    /// `public_key` (base64) is the device identity; re-pairing keeps the original
+    /// `paired_at`.
+    pub fn add_paired_device(&self, public_key: &str, name: &str, ts: i64) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO paired_devices (public_key, name, paired_at, last_seen)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(public_key) DO UPDATE SET name = ?2, last_seen = ?3",
+            params![public_key, name, ts],
+        )?;
+        Ok(())
+    }
+
+    /// All paired devices, most recently paired first.
+    pub fn list_paired_devices(&self) -> Vec<PairedDevice> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT public_key, name, paired_at, last_seen
+             FROM paired_devices ORDER BY paired_at DESC",
+        ) else {
+            return Vec::new();
+        };
+        let rows = stmt.query_map([], |r| {
+            Ok(PairedDevice {
+                public_key: r.get(0)?,
+                name: r.get(1)?,
+                paired_at: r.get(2)?,
+                last_seen: r.get(3)?,
+            })
+        });
+        let Ok(rows) = rows else { return Vec::new() };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// Forget a paired device. Idempotent.
+    pub fn remove_paired_device(&self, public_key: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM paired_devices WHERE public_key = ?1",
+            params![public_key],
+        )?;
+        Ok(())
+    }
+
+    /// Bump a device's `last_seen` (called when a sync session connects in Phase 2).
+    pub fn touch_paired_device(&self, public_key: &str, ts: i64) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE paired_devices SET last_seen = ?2 WHERE public_key = ?1",
+            params![public_key, ts],
+        );
     }
 
     /// Grouped view for the frontend (tool results folded under their assistant).
@@ -591,5 +664,56 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].role, "assistant");
         assert!(matches!(&rows[0].content[0], Block::Text { text } if text == "hello phone"));
+    }
+
+    // ── paired_devices (Phone Sync registry) ─────────────────────────────────
+
+    #[test]
+    fn paired_devices_add_list_and_remove() {
+        let db = mem_db();
+        db.add_paired_device("pubA", "Pixel", 100).unwrap();
+        db.add_paired_device("pubB", "iPhone", 200).unwrap();
+
+        let list = db.list_paired_devices();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].public_key, "pubB"); // most recently paired first
+        assert_eq!(list[0].name, "iPhone");
+        assert_eq!(list[0].paired_at, 200);
+        assert_eq!(list[0].last_seen, 200);
+
+        db.remove_paired_device("pubA").unwrap();
+        let list = db.list_paired_devices();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].public_key, "pubB");
+    }
+
+    #[test]
+    fn re_pairing_updates_name_and_last_seen_but_keeps_paired_at() {
+        let db = mem_db();
+        db.add_paired_device("pub", "Old name", 100).unwrap();
+        db.add_paired_device("pub", "New name", 500).unwrap();
+
+        let list = db.list_paired_devices();
+        assert_eq!(list.len(), 1); // still one row (upsert on the key)
+        assert_eq!(list[0].name, "New name");
+        assert_eq!(list[0].paired_at, 100); // original
+        assert_eq!(list[0].last_seen, 500); // refreshed
+    }
+
+    #[test]
+    fn touch_paired_device_bumps_last_seen_only() {
+        let db = mem_db();
+        db.add_paired_device("pub", "Dev", 100).unwrap();
+        db.touch_paired_device("pub", 999);
+
+        let d = &db.list_paired_devices()[0];
+        assert_eq!(d.paired_at, 100);
+        assert_eq!(d.last_seen, 999);
+    }
+
+    #[test]
+    fn remove_paired_device_is_idempotent() {
+        let db = mem_db();
+        assert!(db.remove_paired_device("nope").is_ok());
     }
 }

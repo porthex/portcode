@@ -14,6 +14,7 @@
 //! keeps doing all the work; the phone is only ever a mirror + remote control.
 
 pub mod noise;
+pub mod pairing;
 pub mod protocol;
 
 use tokio::sync::broadcast;
