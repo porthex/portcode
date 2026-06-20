@@ -5,12 +5,16 @@ import { Chat } from "./components/Chat";
 import { FileExplorer } from "./components/FileExplorer";
 import { SettingsPanel } from "./components/Settings";
 import { CommandPalette } from "./components/CommandPalette";
+import { StatusHud } from "./components/StatusHud";
+import { NeonRain } from "./components/NeonRain";
 import { isTauri } from "./lib/ipc";
 
 export default function App() {
   const init = useStore((s) => s.init);
   const showSettings = useStore((s) => s.showSettings);
   const showFiles = useStore((s) => s.showFiles);
+  const ambientRain = useStore((s) => s.ambientRain);
+  const scanlines = useStore((s) => s.scanlines);
 
   useEffect(() => {
     void init();
@@ -41,13 +45,23 @@ export default function App() {
   }, []);
 
   return (
-    <div className="flex h-full w-full overflow-hidden bg-bg text-fg">
-      <Sidebar />
-      {showFiles && <FileExplorer />}
-      <main className="flex min-w-0 flex-1 flex-col">
-        <TitleBar />
-        <Chat />
-      </main>
+    <div className="relative flex h-full w-full flex-col overflow-hidden bg-bg text-fg">
+      {/* Ambient layers — vignette always on; rain/scanlines are user-opt-in. */}
+      {ambientRain && <NeonRain />}
+      {scanlines && <div className="pc-scanlines" aria-hidden="true" />}
+      <div className="pc-vignette" aria-hidden="true" />
+
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+        <Sidebar />
+        {showFiles && <FileExplorer />}
+        <main className="flex min-w-0 flex-1 flex-col">
+          <TitleBar />
+          <Chat />
+        </main>
+      </div>
+
+      <StatusHud />
+
       {showSettings && <SettingsPanel />}
       <CommandPalette />
     </div>
@@ -58,17 +72,21 @@ function TitleBar() {
   const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
   const showFiles = useStore((s) => s.showFiles);
   const toggleFiles = useStore((s) => s.toggleFiles);
+  const setShowPalette = useStore((s) => s.setShowPalette);
   return (
-    <header className="flex h-11 shrink-0 items-center justify-between border-b border-border bg-panel px-3">
-      <div className="flex items-center gap-1 truncate">
+    <header className="flex h-[46px] shrink-0 items-center justify-between border-b border-border bg-panel/70 px-3.5 backdrop-blur-sm">
+      <div className="flex min-w-0 items-center gap-2.5">
         <button
           onClick={toggleFiles}
-          className={`flex h-7 w-7 items-center justify-center rounded-md text-sm transition-colors ${
-            showFiles ? "bg-accent-dim text-accent" : "text-muted hover:bg-panel-2 hover:text-fg"
+          aria-label="Toggle file explorer (Ctrl+B)"
+          title="Toggle file explorer (Ctrl+B)"
+          className={`flex h-[30px] w-[30px] items-center justify-center rounded-[7px] border transition-colors ${
+            showFiles
+              ? "border-accent-2/30 bg-accent-2/10 text-accent-2"
+              : "border-transparent text-muted hover:text-accent-2"
           }`}
-          title="Toggle file explorer"
         >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
             <path
               d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"
               stroke="currentColor"
@@ -77,12 +95,26 @@ function TitleBar() {
             />
           </svg>
         </button>
-        <span className="ml-1 truncate text-sm font-medium">{session?.title ?? "Portcode"}</span>
+        <span className="truncate font-mono text-[12px] text-muted">
+          portcode<span className="text-faint"> / </span>
+          <span className="text-fg">{session?.title ?? "New chat"}</span>
+        </span>
       </div>
-      <div className="flex items-center gap-2 text-xs text-muted">
+      <div className="flex shrink-0 items-center gap-2.5">
         {!isTauri() && (
-          <span className="rounded bg-accent-dim px-2 py-0.5 text-accent">preview mode</span>
+          <span className="pc-pill pc-pill--warn">
+            <span className="pc-dot pc-dot--warn" />
+            PREVIEW MODE
+          </span>
         )}
+        <button
+          onClick={() => setShowPalette(true)}
+          aria-label="Open command palette (Ctrl+K)"
+          title="Command palette (Ctrl+K)"
+          className="flex items-center gap-1.5 rounded-md border border-border-2 bg-panel-2/80 px-2.5 py-1 font-mono text-[11px] text-muted transition-colors hover:border-accent/50 hover:text-accent"
+        >
+          ⌘K <span className="text-faint">palette</span>
+        </button>
       </div>
     </header>
   );

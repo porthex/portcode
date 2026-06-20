@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, act } from "@testing-library/react";
+import { render, screen, fireEvent, act, cleanup } from "@testing-library/react";
 
 import { SettingsPanel } from "./Settings";
 import { useStore } from "../store/store";
@@ -62,7 +62,9 @@ describe("SettingsPanel — structure", () => {
   it("renders the modal chrome, provider, model select and footer", () => {
     renderPanel();
 
-    expect(screen.getByRole("heading", { name: "Settings" })).toBeInTheDocument();
+    // The Neon-Noir header renders the title as a styled (font-display) span,
+    // not a semantic heading; assert on its literal uppercase text instead.
+    expect(screen.getByText("SETTINGS")).toBeInTheDocument();
     expect(screen.getByText("Anthropic (Claude)")).toBeInTheDocument();
 
     // Model select reflects the store's current model.
@@ -75,12 +77,79 @@ describe("SettingsPanel — structure", () => {
   });
 });
 
+describe("SettingsPanel — Claude subscription sign-in", () => {
+  const signedInStatus = (over: Record<string, unknown> = {}) => ({
+    signedIn: true,
+    expiresAt: 4102444800, // 2100-01-01 — stable so the formatted expiry never flakes
+    account: "you@claude.ai",
+    tier: "Claude Max",
+    ...over,
+  });
+
+  it("shows the sign-in button when signed out and logs in via the store on click", async () => {
+    renderPanel(); // oauthStatus null -> signed out
+    const btn = screen.getByRole("button", { name: "Sign in with Claude" });
+
+    await act(async () => {
+      fireEvent.click(btn);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(m.startOauthLogin).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().oauthStatus?.signedIn).toBe(true);
+  });
+
+  it("renders the signed-in account, a Max tier badge and expiry, and logs out on click", async () => {
+    useStore.setState({ oauthStatus: signedInStatus() });
+    renderPanel();
+
+    expect(screen.getByText(/Signed in as you@claude\.ai/)).toBeInTheDocument();
+    expect(screen.getByText("Max").className).toContain("amber"); // "Claude " stripped; Max gradient
+    expect(screen.getByText(/Access expires/)).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Log out" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(m.oauthLogout).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().oauthStatus?.signedIn).toBe(false);
+  });
+
+  it("uses the non-Max badge styling for a Pro tier", () => {
+    useStore.setState({ oauthStatus: signedInStatus({ tier: "Claude Pro" }) });
+    renderPanel();
+    expect(screen.getByText("Pro").className).toContain("violet");
+  });
+
+  it("surfaces a sign-in error from the store", () => {
+    useStore.setState({ oauthError: "oauth denied" });
+    renderPanel();
+    expect(screen.getByText(/Sign-in failed: oauth denied/)).toBeInTheDocument();
+  });
+});
+
 describe("SettingsPanel — close affordances", () => {
   it("closes via the ✕ button", () => {
     renderPanel({}); // showSettings starts false; set it true so close is observable
     useStore.setState({ showSettings: true });
 
-    fireEvent.click(screen.getByRole("button", { name: "✕" }));
+    // The close button shows a ✕ glyph but carries aria-label="Close settings",
+    // which is its accessible name.
+    fireEvent.click(screen.getByRole("button", { name: "Close settings" }));
+
+    expect(useStore.getState().showSettings).toBe(false);
+  });
+
+  it("closes when Escape is pressed", () => {
+    renderPanel();
+    useStore.setState({ showSettings: true });
+
+    // The panel registers a window keydown listener (mirroring CommandPalette);
+    // pressing Escape anywhere hides the modal.
+    fireEvent.keyDown(window, { key: "Escape" });
 
     expect(useStore.getState().showSettings).toBe(false);
   });
@@ -89,12 +158,14 @@ describe("SettingsPanel — close affordances", () => {
     const { container } = renderPanel();
     useStore.setState({ showSettings: true });
 
-    // The inner card stops propagation -> clicking the heading must NOT close.
-    fireEvent.click(screen.getByRole("heading", { name: "Settings" }));
+    // The inner card (.pc-modal) stops propagation -> clicking content inside it
+    // (here the SETTINGS title) must NOT close.
+    fireEvent.click(screen.getByText("SETTINGS"));
     expect(useStore.getState().showSettings).toBe(true);
 
-    // The outermost element is the backdrop -> clicking it closes.
+    // The outermost element is the .pc-overlay backdrop -> clicking it closes.
     const backdrop = container.firstElementChild as HTMLElement;
+    expect(backdrop.className).toContain("pc-overlay");
     fireEvent.click(backdrop);
     expect(useStore.getState().showSettings).toBe(false);
   });
@@ -178,66 +249,43 @@ describe("SettingsPanel — API key", () => {
     expect(input.value).toBe("");
     expect(screen.getByRole("button", { name: "Saved" })).toBeInTheDocument();
 
-    // The 1800ms timer resets the flash back to "Save"; advancing the fake
-    // timer fires setSavedKey(false), wrapped in act so React re-renders.
+    // The 1800ms timer clears the flash; advancing the fake timer fires
+    // setSavedKey(false), wrapped in act so React re-renders. With a key now
+    // stored, the button settles on its resting "Replace" label (not "Save").
     act(() => {
       vi.advanceTimersByTime(1800);
     });
-    expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
-  });
-});
-
-describe("SettingsPanel — Claude subscription sign-in", () => {
-  const signedInStatus = (over: Record<string, unknown> = {}) => ({
-    signedIn: true,
-    expiresAt: 4102444800, // 2100-01-01 — stable so the formatted expiry never flakes
-    account: "you@claude.ai",
-    tier: "Claude Max",
-    ...over,
+    expect(screen.getByRole("button", { name: "Replace" })).toBeInTheDocument();
   });
 
-  it("shows the sign-in button when signed out and logs in via the store on click", async () => {
-    renderPanel(); // oauthStatus null -> signed out
-    const btn = screen.getByRole("button", { name: "Sign in with Claude" });
+  it("clears the Saved-flash timer on unmount so it can't update state after close", async () => {
+    vi.useFakeTimers();
+    renderPanel({ apiKeySet: false });
 
+    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    // Flush saveKey's microtasks so the 1800ms flash timer is armed.
     await act(async () => {
-      fireEvent.click(btn);
+      await Promise.resolve();
       await Promise.resolve();
       await Promise.resolve();
     });
+    expect(screen.getByRole("button", { name: "Saved" })).toBeInTheDocument();
 
-    expect(m.startOauthLogin).toHaveBeenCalledTimes(1);
-    expect(useStore.getState().oauthStatus?.signedIn).toBe(true);
-  });
-
-  it("renders the signed-in account, a Max tier badge and expiry, and logs out on click", async () => {
-    useStore.setState({ oauthStatus: signedInStatus() });
-    renderPanel();
-
-    expect(screen.getByText(/Signed in as you@claude\.ai/)).toBeInTheDocument();
-    expect(screen.getByText("Max").className).toContain("amber"); // "Claude " stripped; Max gradient
-    expect(screen.getByText(/Access expires/)).toBeInTheDocument();
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Log out" }));
-      await Promise.resolve();
-      await Promise.resolve();
+    // React warns on console.error if a state update lands after unmount. Watch
+    // for it: unmount the modal (as closing it would), then run the timer past
+    // 1800ms. The unmount-effect must have cleared the timer, so setSavedKey
+    // never fires and no warning is emitted.
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    cleanup(); // unmounts the panel before the 1800ms flash elapses
+    act(() => {
+      vi.advanceTimersByTime(1800);
     });
 
-    expect(m.oauthLogout).toHaveBeenCalledTimes(1);
-    expect(useStore.getState().oauthStatus?.signedIn).toBe(false);
-  });
-
-  it("uses the non-Max badge styling for a Pro tier", () => {
-    useStore.setState({ oauthStatus: signedInStatus({ tier: "Claude Pro" }) });
-    renderPanel();
-    expect(screen.getByText("Pro").className).toContain("violet");
-  });
-
-  it("surfaces a sign-in error from the store", () => {
-    useStore.setState({ oauthError: "oauth denied" });
-    renderPanel();
-    expect(screen.getByText(/Sign-in failed: oauth denied/)).toBeInTheDocument();
+    expect(errSpy).not.toHaveBeenCalled();
+    errSpy.mockRestore();
   });
 });
 
@@ -245,11 +293,15 @@ describe("SettingsPanel — default tool permission", () => {
   it("highlights the active policy and switches policy through ipc.saveSettings", async () => {
     renderPanel({ defaultPolicy: "ask" });
 
-    // "ask" is active and carries the accent class; the others do not.
+    // The active policy is styled cyan: it carries a filled accent background
+    // (bg-accent-2/10) + accent text. Inactive buttons use bg-panel-2 and only
+    // an accent *hover* border, so discriminate on the active background token
+    // rather than "border-accent" (which the inactive hover class also matches).
     const ask = screen.getByRole("button", { name: "ask" });
-    expect(ask.className).toContain("border-accent");
+    expect(ask.className).toContain("bg-accent-2/10");
+    expect(ask.className).toContain("text-accent-2");
     const allow = screen.getByRole("button", { name: "allow" });
-    expect(allow.className).not.toContain("border-accent");
+    expect(allow.className).not.toContain("bg-accent-2/10");
 
     fireEvent.click(allow);
     expect(m.saveSettings).toHaveBeenCalledWith({ defaultPolicy: "allow" });
@@ -267,16 +319,71 @@ describe("SettingsPanel — default tool permission", () => {
   });
 });
 
+describe("SettingsPanel — appearance toggles", () => {
+  // APPEARANCE now renders three role="switch" buttons, so each must be queried
+  // by its accessible name rather than the bare switch role.
+  it("reflects the stored typing-animation value and toggles it through ipc.saveSettings", async () => {
+    renderPanel({ typingAnimation: true });
+
+    const sw = screen.getByRole("switch", { name: "Typing animation" });
+    expect(sw).toHaveAttribute("aria-checked", "true");
+
+    fireEvent.click(sw);
+    expect(m.saveSettings).toHaveBeenCalledWith({ typingAnimation: false });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(useStore.getState().settings.typingAnimation).toBe(false);
+  });
+
+  it("shows the typing-animation switch as off when the preference is disabled", () => {
+    renderPanel({ typingAnimation: false });
+    expect(screen.getByRole("switch", { name: "Typing animation" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+  });
+
+  it("reflects neon-rain state and toggles it through the store's setAmbientRain", () => {
+    // ambientRain/scanlines are root store flags (not in Settings), so seed the
+    // store before mount — the component subscribes to them directly.
+    useStore.setState({ ambientRain: false });
+    renderPanel();
+
+    const sw = screen.getByRole("switch", { name: "Neon rain" });
+    expect(sw).toHaveAttribute("aria-checked", "false");
+
+    // Neon rain is client-only UI state (no ipc.saveSettings); it flips the
+    // store's ambientRain flag via setAmbientRain.
+    fireEvent.click(sw);
+    expect(useStore.getState().ambientRain).toBe(true);
+    expect(m.saveSettings).not.toHaveBeenCalled();
+    expect(sw).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("reflects scanlines state and toggles it through the store's setScanlines", () => {
+    useStore.setState({ scanlines: true });
+    renderPanel();
+
+    const sw = screen.getByRole("switch", { name: "Scanlines" });
+    expect(sw).toHaveAttribute("aria-checked", "true");
+
+    fireEvent.click(sw);
+    expect(useStore.getState().scanlines).toBe(false);
+    expect(m.saveSettings).not.toHaveBeenCalled();
+    expect(sw).toHaveAttribute("aria-checked", "false");
+  });
+});
+
 describe("SettingsPanel — footer environment label", () => {
   it("labels preview (browser) when not under Tauri", () => {
     m.isTauri.mockReturnValue(false);
     renderPanel();
-    expect(screen.getByText("preview (browser)")).toBeInTheDocument();
+    expect(screen.getByText("PREVIEW (BROWSER)")).toBeInTheDocument();
   });
 
   it("labels native core when under Tauri", () => {
     m.isTauri.mockReturnValue(true);
     renderPanel();
-    expect(screen.getByText("native core")).toBeInTheDocument();
+    expect(screen.getByText("NATIVE CORE")).toBeInTheDocument();
   });
 });

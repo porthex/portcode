@@ -12,6 +12,15 @@ pub struct Settings {
     pub api_key_set: bool,
     pub default_policy: String,
     pub workspace: Option<String>,
+    /// UI preference: reveal agent replies with a terminal-style typing
+    /// animation. `default` keeps older settings.json files (written before this
+    /// field existed) loading cleanly instead of resetting every setting.
+    #[serde(default = "default_typing_animation")]
+    pub typing_animation: bool,
+}
+
+fn default_typing_animation() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -22,6 +31,7 @@ impl Default for Settings {
             api_key_set: false,
             default_policy: "ask".into(),
             workspace: None,
+            typing_animation: default_typing_animation(),
         }
     }
 }
@@ -42,5 +52,43 @@ impl Settings {
         if let Ok(s) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(Self::path(dir), s);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_settings_without_typing_animation_still_load() {
+        // A settings.json written before `typingAnimation` existed must keep its
+        // other fields and default the new one — not get wiped via
+        // unwrap_or_default() because one field is missing.
+        let json = r#"{
+            "provider": "anthropic",
+            "model": "claude-opus-4-8",
+            "apiKeySet": true,
+            "defaultPolicy": "allow",
+            "workspace": null
+        }"#;
+        let s: Settings = serde_json::from_str(json).expect("legacy settings should deserialize");
+        assert_eq!(s.default_policy, "allow");
+        assert!(
+            s.typing_animation,
+            "missing typingAnimation defaults to true"
+        );
+    }
+
+    #[test]
+    fn typing_animation_serializes_as_camel_case_and_round_trips() {
+        let s = Settings {
+            typing_animation: false,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"typingAnimation\":false"));
+
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert!(!back.typing_animation);
     }
 }

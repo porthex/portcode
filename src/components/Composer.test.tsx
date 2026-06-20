@@ -67,6 +67,23 @@ describe("Composer textarea", () => {
       ).value,
     ).toBe("pasted from explorer");
   });
+
+  it("is enabled when idle and disabled while a turn is streaming", () => {
+    const ta = () =>
+      screen.getByPlaceholderText("Describe a task, ask a question, or give an instruction…");
+
+    const { rerender } = render(<Composer />);
+    // Idle: keystrokes accepted.
+    expect(ta()).toBeEnabled();
+
+    // Streaming: the textarea goes inert so keystrokes are visibly ignored,
+    // mirroring submit()'s `streaming` early-return guard.
+    act(() => {
+      useStore.setState({ streaming: true });
+    });
+    rerender(<Composer />);
+    expect(ta()).toBeDisabled();
+  });
 });
 
 describe("Composer send button", () => {
@@ -82,6 +99,13 @@ describe("Composer send button", () => {
     useStore.setState({ draft: "do a thing" });
     render(<Composer />);
     expect(sendButton()).toBeEnabled();
+  });
+
+  it("exposes an accessible name for screen readers while idle", () => {
+    render(<Composer />);
+    // Icon-only button: the SVG arrow conveys nothing to assistive tech, so the
+    // aria-label is what announces it. byRole(name) matches the accessible name.
+    expect(screen.getByRole("button", { name: "Send message" })).toBe(sendButton());
   });
 
   it("submits on click: clears the draft and forwards the text to send", async () => {
@@ -218,24 +242,35 @@ describe("Composer stop button", () => {
     expect(st.streaming).toBe(false);
     expect(st.cancel).toBeNull();
   });
+
+  it("exposes an accessible name for screen readers while streaming", () => {
+    useStore.setState({ streaming: true });
+    render(<Composer />);
+    // The stop control is a bare red square with no text; the aria-label is the
+    // only thing announcing its purpose to assistive tech.
+    expect(screen.getByRole("button", { name: "Stop generating" })).toBe(stopButton());
+  });
 });
 
 describe("Composer UsageMeter", () => {
   it("always shows the active model and hint text, with no usage span when idle", () => {
     render(<Composer />);
 
-    expect(screen.getByText("Enter to send · Shift+Enter for newline")).toBeInTheDocument();
+    // The hint is split across spans (ENTER / SHIFT+ENTER keycaps in
+    // text-muted); assert the keycap labels rather than one joined node.
+    expect(screen.getByText("ENTER")).toBeInTheDocument();
+    expect(screen.getByText("SHIFT+ENTER")).toBeInTheDocument();
     // Default model from DEFAULT_SETTINGS.
     expect(screen.getByText("claude-opus-4-8")).toBeInTheDocument();
     // No activeId / no usage -> total is 0 -> token+cost span is omitted.
-    expect(screen.queryByText(/tok ·/)).toBeNull();
+    expect(screen.queryByText(/tok$/)).toBeNull();
   });
 
   it("omits the usage span when an active session has no recorded usage", () => {
     // activeId set but usage map empty -> selector yields undefined -> total 0.
     useStore.setState({ activeId: "a" });
     render(<Composer />);
-    expect(screen.queryByText(/tok ·/)).toBeNull();
+    expect(screen.queryByText(/tok$/)).toBeNull();
   });
 
   it("shows tokens and a 4-decimal cost for small Opus usage", () => {
@@ -244,8 +279,10 @@ describe("Composer UsageMeter", () => {
     render(<Composer />);
 
     // fmtTokens(1500) -> "1.5k"; Opus cost = (1200*15 + 300*75)/1e6 = 0.0405
-    // which is >= 0.01, so 2 decimals: $0.04.
-    expect(screen.getByText("1.5k tok · $0.04")).toBeInTheDocument();
+    // which is >= 0.01, so 2 decimals: $0.04. Tokens and cost render in their
+    // own spans (text-accent-2 / text-success), so assert each separately.
+    expect(screen.getByText("1.5k tok")).toBeInTheDocument();
+    expect(screen.getByText("$0.04")).toBeInTheDocument();
     // Hover title carries the localized raw in/out split.
     expect(screen.getByTitle("1,200 in · 300 out")).toBeInTheDocument();
   });
@@ -257,7 +294,8 @@ describe("Composer UsageMeter", () => {
 
     // total 100 -> fmtTokens(100) -> "100"; Opus cost = (100*15)/1e6 = 0.0015
     // which is < 0.01, so 4 decimals: $0.0015.
-    expect(screen.getByText("100 tok · $0.0015")).toBeInTheDocument();
+    expect(screen.getByText("100 tok")).toBeInTheDocument();
+    expect(screen.getByText("$0.0015")).toBeInTheDocument();
     expect(screen.getByTitle("100 in · 0 out")).toBeInTheDocument();
   });
 
@@ -270,7 +308,8 @@ describe("Composer UsageMeter", () => {
     render(<Composer />);
 
     // Unknown model -> estimateCost 0 -> $0.0000; fmtTokens(5000) -> "5.0k".
-    expect(screen.getByText("5.0k tok · $0.0000")).toBeInTheDocument();
+    expect(screen.getByText("5.0k tok")).toBeInTheDocument();
+    expect(screen.getByText("$0.0000")).toBeInTheDocument();
     expect(screen.getByText("no-such-model")).toBeInTheDocument();
   });
 });

@@ -183,6 +183,7 @@ describe("browser fallback (no Tauri core)", () => {
       apiKeySet: false,
       defaultPolicy: "ask",
       workspace: null,
+      typingAnimation: true,
     });
     expect(invoke).not.toHaveBeenCalled();
   });

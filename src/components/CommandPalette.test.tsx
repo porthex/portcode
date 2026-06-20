@@ -71,6 +71,25 @@ describe("visibility", () => {
     // hint labels render for commands that declare one
     expect(screen.getByText("Ctrl+N")).toBeInTheDocument();
   });
+
+  it("gives the search input an accessible name (not just a placeholder)", () => {
+    open();
+    render(<CommandPalette />);
+
+    // the input is reachable by its accessible name, which placeholders do not provide
+    const search = screen.getByRole("textbox", { name: "Command palette search" });
+    expect(search).toBe(input());
+  });
+
+  it("exposes the shortcut in a hinted command's accessible name", () => {
+    open();
+    render(<CommandPalette />);
+
+    // a hinted row announces label + shortcut to screen readers, not a bare glyph
+    expect(screen.getByRole("button", { name: "New chat, Ctrl+N" })).toBeInTheDocument();
+    // a hintless row falls back to just its label
+    expect(screen.getByRole("button", { name: "Open folder…" })).toBeInTheDocument();
+  });
 });
 
 describe("filtering", () => {
@@ -107,44 +126,60 @@ describe("filtering", () => {
 });
 
 describe("keyboard navigation", () => {
-  it("ArrowDown moves the highlight down and clamps at the last item", () => {
+  it("ArrowDown moves the highlight down through the list", () => {
     open();
     render(<CommandPalette />);
     const el = input();
 
     // first item highlighted initially
-    expect(commandButtons()[0].className).toContain("bg-accent-dim");
+    expect(commandButtons()[0]).toHaveAttribute("aria-selected", "true");
 
     fireEvent.keyDown(el, { key: "ArrowDown" });
-    let buttons = commandButtons();
-    expect(buttons[0].className).not.toContain("bg-accent-dim");
-    expect(buttons[1].className).toContain("bg-accent-dim");
-
-    // press far past the end -> clamps on the last command, never out of range
-    for (let i = 0; i < TOTAL_COMMANDS + 3; i++) {
-      fireEvent.keyDown(el, { key: "ArrowDown" });
-    }
-    buttons = commandButtons();
-    expect(buttons[TOTAL_COMMANDS - 1].className).toContain("bg-accent-dim");
+    const buttons = commandButtons();
+    expect(buttons[0]).toHaveAttribute("aria-selected", "false");
+    expect(buttons[1]).toHaveAttribute("aria-selected", "true");
   });
 
-  it("ArrowUp moves the highlight up and clamps at the first item", () => {
+  it("ArrowDown at the last item wraps around to the first", () => {
+    open();
+    render(<CommandPalette />);
+    const el = input();
+
+    // walk to the last row
+    for (let i = 0; i < TOTAL_COMMANDS - 1; i++) {
+      fireEvent.keyDown(el, { key: "ArrowDown" });
+    }
+    expect(commandButtons()[TOTAL_COMMANDS - 1]).toHaveAttribute("aria-selected", "true");
+
+    // one more ArrowDown wraps back to the top
+    fireEvent.keyDown(el, { key: "ArrowDown" });
+    expect(commandButtons()[0]).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("ArrowUp moves the highlight up through the list", () => {
     open();
     render(<CommandPalette />);
     const el = input();
 
     fireEvent.keyDown(el, { key: "ArrowDown" });
     fireEvent.keyDown(el, { key: "ArrowDown" });
-    expect(commandButtons()[2].className).toContain("bg-accent-dim");
+    expect(commandButtons()[2]).toHaveAttribute("aria-selected", "true");
 
     fireEvent.keyDown(el, { key: "ArrowUp" });
-    expect(commandButtons()[1].className).toContain("bg-accent-dim");
+    expect(commandButtons()[1]).toHaveAttribute("aria-selected", "true");
+  });
 
-    // press past the top -> clamps on the first command
-    for (let i = 0; i < TOTAL_COMMANDS + 3; i++) {
-      fireEvent.keyDown(el, { key: "ArrowUp" });
-    }
-    expect(commandButtons()[0].className).toContain("bg-accent-dim");
+  it("ArrowUp at the first item wraps around to the last", () => {
+    open();
+    render(<CommandPalette />);
+    const el = input();
+
+    // first item highlighted initially
+    expect(commandButtons()[0]).toHaveAttribute("aria-selected", "true");
+
+    // one ArrowUp from the top wraps to the bottom
+    fireEvent.keyDown(el, { key: "ArrowUp" });
+    expect(commandButtons()[TOTAL_COMMANDS - 1]).toHaveAttribute("aria-selected", "true");
   });
 
   it("hovering an item makes it the highlighted selection", () => {
@@ -155,7 +190,7 @@ describe("keyboard navigation", () => {
     expect(settings).not.toBeNull();
     fireEvent.mouseEnter(settings as HTMLElement);
 
-    expect((settings as HTMLElement).className).toContain("bg-accent-dim");
+    expect(settings as HTMLElement).toHaveAttribute("aria-selected", "true");
   });
 });
 
@@ -192,6 +227,44 @@ describe("running commands", () => {
     fireEvent.keyDown(input(), { key: "Enter" });
 
     // still open, no action dispatched
+    expect(useStore.getState().showPalette).toBe(true);
+    expect(m.createSession).not.toHaveBeenCalled();
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("ArrowDown on an empty result set never drives selection negative (clamped at 0)", () => {
+    open();
+    render(<CommandPalette />);
+    const el = input();
+
+    // no matches: sel would otherwise be set to filtered.length - 1 === -1
+    fireEvent.change(el, { target: { value: "zzzzz-nope" } });
+    expect(screen.getByText("No matching commands")).toBeInTheDocument();
+
+    // pressing ArrowDown must not crash nor make a later Enter fire choose(-1)
+    expect(() => fireEvent.keyDown(el, { key: "ArrowDown" })).not.toThrow();
+
+    // a follow-up Enter stays a no-op (choose(sel) hits no real command)
+    fireEvent.keyDown(el, { key: "Enter" });
+    expect(useStore.getState().showPalette).toBe(true);
+    expect(m.createSession).not.toHaveBeenCalled();
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("arrow keys on an empty result set keep selection at 0 (modulo never yields NaN)", () => {
+    open();
+    render(<CommandPalette />);
+    const el = input();
+
+    fireEvent.change(el, { target: { value: "zzzzz-nope" } });
+    expect(screen.getByText("No matching commands")).toBeInTheDocument();
+
+    // wrapping over length 0 must not divide-by-zero into NaN; selection stays 0
+    fireEvent.keyDown(el, { key: "ArrowDown" });
+    fireEvent.keyDown(el, { key: "ArrowUp" });
+
+    // a follow-up Enter is still a no-op (choose(0) hits no command)
+    fireEvent.keyDown(el, { key: "Enter" });
     expect(useStore.getState().showPalette).toBe(true);
     expect(m.createSession).not.toHaveBeenCalled();
     expect(m.saveSettings).not.toHaveBeenCalled();
@@ -247,7 +320,7 @@ describe("closing", () => {
 
     // no navigation, no close
     expect(useStore.getState().showPalette).toBe(true);
-    expect(commandButtons()[0].className).toContain("bg-accent-dim");
+    expect(commandButtons()[0]).toHaveAttribute("aria-selected", "true");
   });
 
   it("clicking the backdrop closes the palette", () => {
@@ -287,6 +360,6 @@ describe("closing", () => {
     expect(input().value).toBe("");
     const buttons = commandButtons();
     expect(buttons).toHaveLength(TOTAL_COMMANDS);
-    expect(buttons[0].className).toContain("bg-accent-dim");
+    expect(buttons[0]).toHaveAttribute("aria-selected", "true");
   });
 });

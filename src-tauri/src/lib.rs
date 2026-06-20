@@ -56,6 +56,9 @@ fn save_settings(state: State<AppState>, settings: Value) -> Settings {
                 .and_then(|v| v.as_str())
                 .map(|x| x.to_string());
         }
+        if let Some(t) = settings.get("typingAnimation").and_then(|v| v.as_bool()) {
+            s.typing_animation = t;
+        }
         s.save(&state.config_dir);
     }
     get_settings(state)

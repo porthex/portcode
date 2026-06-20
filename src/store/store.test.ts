@@ -329,6 +329,25 @@ describe("resolvePermission", () => {
     expect(m.saveSettings).toHaveBeenCalledWith({ defaultPolicy: "allow" });
     expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
   });
+
+  it("does not resolve a superseding request when a stale click lands mid-await", async () => {
+    // allow-always awaits updateSettings; a newer permission request can arrive
+    // during that await. A stale click must not clear or answer the new prompt.
+    const newer = { id: "p2", tool: "fs_edit", summary: "newer", input: {} };
+    m.saveSettings.mockImplementationOnce(async (s) => {
+      useStore.setState({ pendingPermission: newer });
+      return { ...DEFAULT_SETTINGS, ...s };
+    });
+    useStore.setState({
+      pendingPermission: { id: "p1", tool: "fs_edit", summary: "stale", input: {} },
+    });
+
+    await useStore.getState().resolvePermission("allow", true);
+
+    // The stale p1 click is dropped; the newer prompt stays pending and unanswered.
+    expect(m.resolvePermission).not.toHaveBeenCalled();
+    expect(useStore.getState().pendingPermission).toEqual(newer);
+  });
 });
 
 describe("draft + UI setters", () => {

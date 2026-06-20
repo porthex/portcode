@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useStore } from "../store/store";
 import * as ipc from "../lib/ipc";
 import type { DirEntry } from "../types";
@@ -10,42 +10,49 @@ export function FileExplorer() {
 
   useEffect(() => {
     let alive = true;
-    ipc.listDir(undefined).then((r) => {
-      if (alive) setRoots(r);
-    });
+    ipc
+      .listDir(undefined)
+      .then((r) => {
+        if (alive) setRoots(r);
+      })
+      .catch(() => {
+        // A failed scan (no workspace, permissions, backend error) resolves to
+        // the empty state instead of hanging on a blank view / unhandled reject.
+        if (alive) setRoots([]);
+      });
     return () => {
       alive = false;
     };
   }, [workspace]);
 
-  const name = workspace
-    ? workspace
-        .replace(/[/\\]+$/, "")
-        .split(/[/\\]/)
-        .pop()
-    : null;
-
   return (
-    <aside className="flex h-full w-64 shrink-0 flex-col border-r border-border bg-panel">
-      <div className="flex items-center gap-2 border-b border-border px-3 py-2.5">
-        <span className="truncate text-xs font-medium uppercase tracking-wide text-muted">
-          {name ?? "Explorer"}
+    <aside className="flex h-full w-[236px] shrink-0 flex-col border-r border-border bg-panel/80">
+      <div className="flex items-center gap-2 border-b border-border px-3.5 py-[11px]">
+        <span
+          className="pc-eyebrow-mono text-[9.5px] tracking-[2px] text-accent-2"
+          style={{ filter: "drop-shadow(0 0 6px rgba(33, 230, 255, 0.55))" }}
+        >
+          ◧ PORTCODE
         </span>
         <button
           onClick={() => void openWorkspace()}
-          className="ml-auto rounded px-2 py-1 text-xs text-muted hover:bg-panel-2 hover:text-fg"
+          className="ml-auto font-mono text-[10px] text-faint hover:text-accent-2"
           title="Open folder"
+          aria-label="Open folder"
         >
-          Open…
+          OPEN…
         </button>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto py-1">
+      <div className="min-h-0 flex-1 overflow-y-auto py-1.5 font-mono text-[12px]">
         {roots.length === 0 ? (
-          <div className="px-3 py-6 text-center text-xs text-muted">
-            No files. <br />
+          <div className="px-3 py-6 text-center text-[11px] text-muted">
+            No workspace set
+            <br />
+            <span className="text-faint">Pick a folder to start browsing.</span>
+            <br />
             <button
               onClick={() => void openWorkspace()}
-              className="mt-2 rounded border border-border px-2 py-1 hover:border-accent hover:text-accent"
+              className="pc-btn-ghost mt-2 px-2 py-1 text-[11px]"
             >
               Open a folder
             </button>
@@ -61,34 +68,56 @@ export function FileExplorer() {
 function TreeNode({ entry, depth }: { entry: DirEntry; depth: number }) {
   const [open, setOpen] = useState(false);
   const [children, setChildren] = useState<DirEntry[] | null>(null);
+  // Synchronous in-flight guard: a ref (not state) so a second toggle in the
+  // same tick sees the latest value and cannot fire a duplicate listDir while
+  // the first is still pending.
+  const loading = useRef(false);
   const appendDraft = useStore((s) => s.appendDraft);
 
   const toggle = async () => {
     if (entry.isDir) {
       const next = !open;
       setOpen(next);
-      if (next && children === null) {
-        setChildren(await ipc.listDir(entry.path));
+      if (next && children === null && !loading.current) {
+        loading.current = true;
+        try {
+          setChildren(await ipc.listDir(entry.path));
+        } catch {
+          // A failed expand (permissions, backend error) must not leak an
+          // unhandled rejection or leave a stuck-open caret with no children:
+          // settle on an empty listing and collapse back to the closed state.
+          setChildren([]);
+          setOpen(false);
+        } finally {
+          loading.current = false;
+        }
       }
     } else {
       appendDraft(entry.path);
     }
   };
 
+  const glyph = entry.isDir ? null : fileGlyph(entry.name);
+  const rowColor = entry.isDir ? "text-fg" : (glyph!.rowClass ?? "text-muted");
+
   return (
     <div>
       <button
         onClick={() => void toggle()}
-        className="flex w-full items-center gap-1 py-1 pr-2 text-left text-[13px] text-muted hover:bg-panel-2 hover:text-fg"
-        style={{ paddingLeft: 8 + depth * 12 }}
+        className={`pc-row--file flex w-full items-center gap-1.5 py-1 pr-2 text-left ${rowColor}`}
+        style={{ paddingLeft: 10 + depth * 14 }}
         title={entry.isDir ? entry.name : `Insert ${entry.path} into composer`}
       >
         {entry.isDir ? (
-          <span className="w-3 shrink-0 text-[10px]">{open ? "▾" : "▸"}</span>
+          <span className="w-3 shrink-0 text-[10px] text-faint">{open ? "▾" : "▸"}</span>
         ) : (
           <span className="w-3 shrink-0" />
         )}
-        <span className="shrink-0">{entry.isDir ? "📁" : fileGlyph(entry.name)}</span>
+        {entry.isDir ? (
+          <span className="shrink-0 text-warn">▸</span>
+        ) : (
+          <span className={`shrink-0 ${glyph!.colorClass}`}>{glyph!.glyph}</span>
+        )}
         <span className="truncate">{entry.name}</span>
       </button>
       {open && children?.map((c) => <TreeNode key={c.path} entry={c} depth={depth + 1} />)}
@@ -96,11 +125,18 @@ function TreeNode({ entry, depth }: { entry: DirEntry; depth: number }) {
   );
 }
 
-function fileGlyph(name: string): string {
-  if (/\.(rs)$/.test(name)) return "🦀";
-  if (/\.(ts|tsx|js|jsx|mjs)$/.test(name)) return "📜";
-  if (/\.(json|toml|lock)$/.test(name)) return "⚙️";
-  if (/\.(md|txt)$/.test(name)) return "📄";
-  if (/\.(css|scss)$/.test(name)) return "🎨";
-  return "📄";
+interface FileType {
+  glyph: string;
+  /** color for the leading type-glyph */
+  colorClass: string;
+  /** optional override for the whole row's text color (e.g. .rs → amber) */
+  rowClass?: string;
+}
+
+function fileGlyph(name: string): FileType {
+  if (/\.tsx$/.test(name)) return { glyph: "◆", colorClass: "text-accent-2" };
+  if (/\.ts$/.test(name)) return { glyph: "◆", colorClass: "text-success" };
+  if (/\.css$/.test(name)) return { glyph: "◆", colorClass: "text-accent" };
+  if (/\.rs$/.test(name)) return { glyph: "🦀", colorClass: "text-warn", rowClass: "text-warn" };
+  return { glyph: "◇", colorClass: "text-faint" };
 }

@@ -2,31 +2,47 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import type { Message } from "../types";
+import { useStore } from "../store/store";
+import { usePrefersReducedMotion, useTypewriter } from "../lib/useTypewriter";
 import { ToolCall } from "./ToolCall";
 
-export function MessageView({ message }: { message: Message }) {
+export function MessageView({
+  message,
+  isActive = false,
+}: {
+  message: Message;
+  isActive?: boolean;
+}) {
   const isUser = message.role === "user";
+  const typingAnimation = useStore((s) => s.settings.typingAnimation);
+  const reducedMotion = usePrefersReducedMotion();
+  // Only the in-flight assistant turn types out. History, the "off" setting, and
+  // reduced-motion all render the finished markdown immediately.
+  const animate = !isUser && isActive && typingAnimation && !reducedMotion;
+
+  // The last text block is the one still being streamed — it carries the caret.
+  let lastTextIndex = -1;
+  message.blocks.forEach((b, i) => {
+    if (b.kind === "text") lastTextIndex = i;
+  });
+
   return (
-    <div className={`mb-5 flex gap-3 ${isUser ? "justify-end" : ""}`}>
+    <div className={`mb-5 flex gap-[11px] ${isUser ? "justify-end" : ""}`}>
       {!isUser && <Avatar />}
-      <div className={`min-w-0 ${isUser ? "max-w-[85%]" : "flex-1"}`}>
+      <div className={`min-w-0 ${isUser ? "" : "flex-1"}`}>
         {isUser ? (
-          <div className="whitespace-pre-wrap rounded-2xl rounded-tr-sm bg-accent-dim px-4 py-2.5 text-fg select-text">
-            {textOf(message)}
-          </div>
+          <div className="pc-bubble-user whitespace-pre-wrap select-text">{textOf(message)}</div>
         ) : (
           <div className="space-y-2">
             {message.blocks.map((b, i) => {
               if (b.kind === "text") {
                 return (
-                  <div key={i} className="prose-pc">
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm]}
-                      rehypePlugins={[[rehypeHighlight, { detect: true }]]}
-                    >
-                      {b.text}
-                    </ReactMarkdown>
-                  </div>
+                  <TextBlock
+                    key={i}
+                    text={b.text}
+                    animate={animate}
+                    caret={animate && i === lastTextIndex}
+                  />
                 );
               }
               if (b.kind === "tool_use") {
@@ -52,6 +68,34 @@ export function MessageView({ message }: { message: Message }) {
   );
 }
 
+/**
+ * A single assistant text block. While its turn is streaming it reveals
+ * character-by-character in monospace — a terminal "typing" feel — with an
+ * optional blinking caret; once the turn completes it re-renders as full
+ * Markdown.
+ */
+function TextBlock({ text, animate, caret }: { text: string; animate: boolean; caret: boolean }) {
+  const revealed = useTypewriter(text, animate);
+  if (animate) {
+    return (
+      <div className="prose-pc whitespace-pre-wrap break-words font-mono text-[13px]">
+        {revealed}
+        {caret && <span className="pc-caret" aria-hidden="true" />}
+      </div>
+    );
+  }
+  return (
+    <div className="prose-pc">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[[rehypeHighlight, { detect: true }]]}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 function textOf(m: Message): string {
   return m.blocks
     .filter((b) => b.kind === "text")
@@ -61,11 +105,11 @@ function textOf(m: Message): string {
 
 function Avatar() {
   return (
-    <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-accent-dim">
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
+    <div className="pc-avatar mt-0.5 text-accent-2">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
         <path
           d="M7 8l3 4-3 4M13 16h5"
-          stroke="var(--color-accent)"
+          stroke="currentColor"
           strokeWidth="1.9"
           strokeLinecap="round"
           strokeLinejoin="round"
@@ -77,10 +121,17 @@ function Avatar() {
 
 function Thinking() {
   return (
-    <div className="flex items-center gap-1 py-1 text-muted">
-      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.2s]" />
-      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.1s]" />
-      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted" />
+    <div role="status" aria-live="polite" className="flex items-center gap-1 py-1 text-muted">
+      <span className="sr-only">Agent is thinking</span>
+      <span
+        aria-hidden="true"
+        className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.2s]"
+      />
+      <span
+        aria-hidden="true"
+        className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.1s]"
+      />
+      <span aria-hidden="true" className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted" />
     </div>
   );
 }

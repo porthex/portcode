@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { ContentBlock } from "../types";
 
 type ResultBlock = Extract<ContentBlock, { kind: "tool_result" }>;
@@ -16,35 +16,53 @@ export function ToolCall({
   const summary = summarize(name, input);
   const pending = !result;
   const error = result?.isError;
+  const output = result?.output;
+  // Scanning the output for diff markers and tallying +/- counts is O(n) over
+  // potentially large tool output. Memoize so toggling open/collapse (or any
+  // unrelated re-render) doesn't re-scan unchanged output.
+  const { isDiff, counts } = useMemo(() => {
+    const diff = !error && output != null && looksLikeDiff(output);
+    return { isDiff: diff, counts: diff ? diffCounts(output) : null };
+  }, [output, error]);
 
   return (
-    <div className="overflow-hidden rounded-lg border border-border bg-panel">
+    <div className="pc-toolcall">
       <button
         onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] hover:bg-panel-2"
+        className="pc-toolcall__head"
+        aria-expanded={open}
+        aria-label={open ? "Collapse tool output" : "Expand tool output"}
       >
         <StatusDot pending={pending} error={error} />
-        <span className="font-mono text-accent">{name}</span>
-        <span className="truncate text-muted">{summary}</span>
-        <span className="ml-auto text-muted">{open ? "▾" : "▸"}</span>
+        <span className="pc-toolcall__name">{name}</span>
+        <span className="pc-toolcall__path">{summary}</span>
+        <span className="ml-auto flex items-center gap-2">
+          {counts && (counts.adds > 0 || counts.dels > 0) && (
+            <>
+              <span className="font-mono text-[10px] text-success">+{counts.adds}</span>
+              <span className="font-mono text-[10px] text-danger">-{counts.dels}</span>
+            </>
+          )}
+          <span className="text-faint">{open ? "▾" : "▸"}</span>
+        </span>
       </button>
       {open && (
-        <div className="border-t border-border px-3 py-2">
-          <div className="mb-1 text-[11px] uppercase tracking-wide text-muted">Input</div>
-          <pre className="mb-2 overflow-x-auto rounded bg-bg p-2 font-mono text-[12px] text-fg select-text">
+        <div className="pc-toolcall__body">
+          <div className="mb-1 text-[10px] uppercase tracking-wide text-faint">Input</div>
+          <pre className="mb-2 overflow-x-auto font-mono text-[11.5px] text-fg select-text">
             {JSON.stringify(input, null, 2)}
           </pre>
           {result && (
             <>
-              <div className="mb-1 text-[11px] uppercase tracking-wide text-muted">
+              <div className="mb-1 text-[10px] uppercase tracking-wide text-faint">
                 {error ? "Error" : "Result"}
               </div>
-              {!error && looksLikeDiff(result.output) ? (
+              {isDiff ? (
                 <DiffView text={result.output} />
               ) : (
                 <pre
-                  className={`max-h-72 overflow-auto rounded bg-bg p-2 font-mono text-[12px] select-text ${
-                    error ? "text-danger" : "text-fg"
+                  className={`max-h-72 overflow-auto font-mono text-[11.5px] select-text ${
+                    error ? "text-danger" : "text-muted"
                   }`}
                 >
                   {result.output}
@@ -59,33 +77,48 @@ export function ToolCall({
 }
 
 function StatusDot({ pending, error }: { pending: boolean; error?: boolean }) {
-  const color = error ? "bg-danger" : pending ? "bg-warn" : "bg-success";
-  return (
-    <span className={`h-2 w-2 shrink-0 rounded-full ${color} ${pending ? "animate-pulse" : ""}`} />
-  );
+  // done → success, running → warn (pulsing), pending input → accent.
+  const variant = pending ? "pc-dot--warn" : "pc-dot--success";
+  if (error) {
+    return (
+      <span className="pc-dot bg-danger" style={{ boxShadow: "0 0 8px var(--color-danger)" }} />
+    );
+  }
+  return <span className={`pc-dot ${variant}`} />;
 }
 
 function looksLikeDiff(text: string): boolean {
   return /(^|\n)@@ /.test(text) || /(^|\n)\+\+\+ /.test(text);
 }
 
+function diffCounts(text: string): { adds: number; dels: number } {
+  let adds = 0;
+  let dels = 0;
+  for (const line of text.split("\n")) {
+    if (line.startsWith("+++") || line.startsWith("---")) continue;
+    if (line.startsWith("+")) adds++;
+    else if (line.startsWith("-")) dels++;
+  }
+  return { adds, dels };
+}
+
 function DiffView({ text }: { text: string }) {
   const lines = text.split("\n");
   return (
-    <pre className="max-h-72 overflow-auto rounded bg-bg p-2 font-mono text-[12px] leading-[1.5] select-text">
+    <div className="pc-diff max-h-72 overflow-auto select-text">
       {lines.map((line, i) => {
-        let cls = "text-fg";
-        if (line.startsWith("@@")) cls = "text-accent";
-        else if (line.startsWith("+++") || line.startsWith("---")) cls = "text-muted";
-        else if (line.startsWith("+")) cls = "bg-success/10 text-success";
-        else if (line.startsWith("-")) cls = "bg-danger/10 text-danger";
+        let cls = "pc-diff-ctx";
+        if (line.startsWith("@@")) cls = "pc-diff-hunk";
+        else if (line.startsWith("+++") || line.startsWith("---")) cls = "pc-diff-file";
+        else if (line.startsWith("+")) cls = "pc-diff-add";
+        else if (line.startsWith("-")) cls = "pc-diff-del";
         return (
-          <div key={i} className={`${cls} -mx-2 px-2`}>
+          <div key={i} className={`pc-diff-line ${cls}`}>
             {line || " "}
           </div>
         );
       })}
-    </pre>
+    </div>
   );
 }
 

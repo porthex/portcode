@@ -58,16 +58,24 @@ describe("PermissionPrompt", () => {
     expect(screen.getByText("fs_read")).toBeInTheDocument();
     expect(screen.getByText("README.md")).toBeInTheDocument();
     // All three actions are offered.
-    expect(screen.getByRole("button", { name: "Allow" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "⏎ Allow" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Always allow" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Deny" })).toBeInTheDocument();
+  });
+
+  it("auto-focuses the safe Deny action so a reflexive Enter denies", () => {
+    useStore.setState({ pendingPermission: pending() });
+
+    render(<PermissionPrompt />);
+
+    expect(screen.getByRole("button", { name: "Deny" })).toHaveFocus();
   });
 
   it("Allow forwards an allow decision to the IPC layer and clears the prompt", async () => {
     useStore.setState({ pendingPermission: pending() });
 
     render(<PermissionPrompt />);
-    fireEvent.click(screen.getByRole("button", { name: "Allow" }));
+    fireEvent.click(screen.getByRole("button", { name: "⏎ Allow" }));
 
     await flush();
 
