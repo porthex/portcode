@@ -239,7 +239,7 @@ jobs:
       # ── Dry run (manual dispatch on a non-tag ref): keep artifacts to inspect ─
       - name: Upload build artifacts (dry run)
         if: github.ref_type != 'tag'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: portcode-unpublished
           if-no-files-found: warn
