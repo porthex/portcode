@@ -148,6 +148,24 @@ describe("deleteSession", () => {
     expect(m.createSession).toHaveBeenCalledTimes(1);
   });
 
+  it("lazily loads the surviving active session's history when it wasn't cached", async () => {
+    const msg: Message = { id: "m", role: "assistant", blocks: [], createdAt: 1 };
+    m.getMessages.mockResolvedValue([msg]);
+    // "a" stays active but has no cached messages; deleting the *other* session
+    // must trigger a lazy refetch of "a".
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      messages: {},
+    });
+
+    await useStore.getState().deleteSession("b");
+
+    expect(m.deleteSession).toHaveBeenCalledWith("b");
+    expect(useStore.getState().activeId).toBe("a");
+    expect(useStore.getState().messages.a).toEqual([msg]);
+  });
+
   it("is a no-op while streaming", async () => {
     useStore.setState({
       sessions: [session({ id: "a" })],

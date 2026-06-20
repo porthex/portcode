@@ -9,6 +9,7 @@ import type { StreamEvent } from "../types";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 
 const TAURI_KEY = "__TAURI_INTERNALS__";
 const win = window as unknown as Record<string, unknown>;
@@ -107,6 +108,28 @@ describe("Tauri command serialization", () => {
     invoke.mockResolvedValue([]);
     await ipc.listDir("src/components");
     expect(invoke).toHaveBeenCalledWith("list_dir", { sub: "src/components" });
+  });
+
+  it("list_sessions is invoked with no arguments", async () => {
+    const { ipc, invoke } = await load();
+    const sessions = [{ id: "s1" }];
+    invoke.mockResolvedValue(sessions);
+    await expect(ipc.listSessions()).resolves.toBe(sessions);
+    expect(invoke).toHaveBeenCalledWith("list_sessions");
+  });
+
+  it("openFolder returns the native picker's path, or null when cancelled", async () => {
+    const { ipc } = await load();
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const dialogOpen = vi.mocked(open);
+
+    dialogOpen.mockResolvedValue("C:/picked/dir");
+    await expect(ipc.openFolder()).resolves.toBe("C:/picked/dir");
+    expect(dialogOpen).toHaveBeenCalledWith({ directory: true, multiple: false });
+
+    // A cancelled picker (null) or a multi-select array is normalized to null.
+    dialogOpen.mockResolvedValue(null);
+    await expect(ipc.openFolder()).resolves.toBeNull();
   });
 
   it("run_agent wires the per-session channel and unwraps event payloads", async () => {
