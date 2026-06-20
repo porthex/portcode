@@ -20,6 +20,10 @@ vi.mock("../lib/ipc", () => ({
   openFolder: vi.fn(async () => "C:/work/repo" as string | null),
   // Footer reads this to label native vs. preview.
   isTauri: vi.fn(() => false),
+  // Subscription sign-in: reached via the store's loginWithClaude/logoutClaude.
+  startOauthLogin: vi.fn(),
+  oauthLogout: vi.fn(),
+  oauthStatus: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -44,6 +48,14 @@ beforeEach(() => {
   m.setApiKey.mockResolvedValue(undefined);
   m.openFolder.mockResolvedValue("C:/work/repo");
   m.isTauri.mockReturnValue(false);
+  m.startOauthLogin.mockResolvedValue({
+    signedIn: true,
+    expiresAt: 4102444800, // 2100-01-01 — stable, so the formatted expiry never flakes
+    account: "you@claude.ai",
+    tier: "Claude Max",
+  });
+  m.oauthLogout.mockResolvedValue(undefined);
+  m.oauthStatus.mockResolvedValue({ signedIn: false, expiresAt: null, account: null, tier: null });
 });
 
 describe("SettingsPanel — structure", () => {
@@ -172,6 +184,60 @@ describe("SettingsPanel — API key", () => {
       vi.advanceTimersByTime(1800);
     });
     expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
+  });
+});
+
+describe("SettingsPanel — Claude subscription sign-in", () => {
+  const signedInStatus = (over: Record<string, unknown> = {}) => ({
+    signedIn: true,
+    expiresAt: 4102444800, // 2100-01-01 — stable so the formatted expiry never flakes
+    account: "you@claude.ai",
+    tier: "Claude Max",
+    ...over,
+  });
+
+  it("shows the sign-in button when signed out and logs in via the store on click", async () => {
+    renderPanel(); // oauthStatus null -> signed out
+    const btn = screen.getByRole("button", { name: "Sign in with Claude" });
+
+    await act(async () => {
+      fireEvent.click(btn);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(m.startOauthLogin).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().oauthStatus?.signedIn).toBe(true);
+  });
+
+  it("renders the signed-in account, a Max tier badge and expiry, and logs out on click", async () => {
+    useStore.setState({ oauthStatus: signedInStatus() });
+    renderPanel();
+
+    expect(screen.getByText(/Signed in as you@claude\.ai/)).toBeInTheDocument();
+    expect(screen.getByText("Max").className).toContain("amber"); // "Claude " stripped; Max gradient
+    expect(screen.getByText(/Access expires/)).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Log out" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(m.oauthLogout).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().oauthStatus?.signedIn).toBe(false);
+  });
+
+  it("uses the non-Max badge styling for a Pro tier", () => {
+    useStore.setState({ oauthStatus: signedInStatus({ tier: "Claude Pro" }) });
+    renderPanel();
+    expect(screen.getByText("Pro").className).toContain("violet");
+  });
+
+  it("surfaces a sign-in error from the store", () => {
+    useStore.setState({ oauthError: "oauth denied" });
+    renderPanel();
+    expect(screen.getByText(/Sign-in failed: oauth denied/)).toBeInTheDocument();
   });
 });
 

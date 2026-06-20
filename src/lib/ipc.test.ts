@@ -76,6 +76,20 @@ describe("Tauri command serialization", () => {
     expect(invoke).toHaveBeenCalledWith("set_api_key", { key: "sk-123" });
   });
 
+  it("oauth commands invoke their core counterparts with no arguments", async () => {
+    const { ipc, invoke } = await load();
+    const status = { signedIn: true, expiresAt: 123, account: "a@b.co", tier: "Claude Max" };
+    invoke.mockResolvedValue(status);
+    await expect(ipc.startOauthLogin()).resolves.toBe(status);
+    expect(invoke).toHaveBeenCalledWith("start_oauth_login");
+    await expect(ipc.oauthStatus()).resolves.toBe(status);
+    expect(invoke).toHaveBeenCalledWith("oauth_status");
+
+    invoke.mockResolvedValue(undefined);
+    await expect(ipc.oauthLogout()).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("oauth_logout");
+  });
+
   it("resolve_permission forwards id + decision", async () => {
     const { ipc, invoke } = await load();
     invoke.mockResolvedValue(undefined);
@@ -219,6 +233,27 @@ describe("browser fallback (no Tauri core)", () => {
   it("resolvePermission is harmless when nothing is pending", async () => {
     const { ipc } = await load();
     await expect(ipc.resolvePermission("missing", "allow")).resolves.toBeUndefined();
+  });
+
+  it("oauth mock signs into a Claude Max subscription and logout clears it", async () => {
+    const { ipc } = await load();
+    expect((await ipc.oauthStatus()).signedIn).toBe(false);
+
+    const signedIn = await ipc.startOauthLogin();
+    expect(signedIn.signedIn).toBe(true);
+    expect(signedIn.tier).toBe("Claude Max");
+    expect(signedIn.account).toBe("preview@claude.local");
+    expect(typeof signedIn.expiresAt).toBe("number");
+    // The mock persists the state on its singleton until logout.
+    expect((await ipc.oauthStatus()).signedIn).toBe(true);
+
+    await ipc.oauthLogout();
+    expect(await ipc.oauthStatus()).toEqual({
+      signedIn: false,
+      expiresAt: null,
+      account: null,
+      tier: null,
+    });
   });
 });
 
