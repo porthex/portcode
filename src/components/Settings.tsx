@@ -119,7 +119,9 @@ export function SettingsPanel() {
               </div>
 
               <div>
-                <label className="mb-1.5 block text-[12.5px] font-medium text-fg">Model</label>
+                <label className="mb-1.5 block text-[12.5px] font-medium text-fg">
+                  Default model (new sessions)
+                </label>
                 <select
                   value={settings.model}
                   onChange={(e) => void updateSettings({ model: e.target.value })}
@@ -131,6 +133,10 @@ export function SettingsPanel() {
                     </option>
                   ))}
                 </select>
+                <p className="mt-1.5 text-[11px] text-faint">
+                  Used as the starting model for new chats. Change a chat&apos;s model from its
+                  composer.
+                </p>
               </div>
 
               <div>

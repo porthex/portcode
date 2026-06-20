@@ -27,6 +27,7 @@ pub struct SessionRow {
     pub id: String,
     pub title: String,
     pub workspace: Option<String>,
+    pub model: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -94,6 +95,7 @@ impl Db {
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 workspace TEXT,
+                model TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -107,6 +109,10 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);",
         )?;
+        // Migrate pre-existing databases: the CREATE-IF-NOT-EXISTS above won't add
+        // a column to a table that already exists, so add `model` in place. A
+        // duplicate-column error (column already present) is expected and ignored.
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT", []);
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -115,7 +121,7 @@ impl Db {
     pub fn list_sessions(&self) -> rusqlite::Result<Vec<SessionRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, title, workspace, created_at, updated_at
+            "SELECT id, title, workspace, model, created_at, updated_at
              FROM sessions ORDER BY updated_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -123,8 +129,9 @@ impl Db {
                 id: r.get(0)?,
                 title: r.get(1)?,
                 workspace: r.get(2)?,
-                created_at: r.get(3)?,
-                updated_at: r.get(4)?,
+                model: r.get(3)?,
+                created_at: r.get(4)?,
+                updated_at: r.get(5)?,
             })
         })?;
         rows.collect()
@@ -135,13 +142,14 @@ impl Db {
         id: &str,
         title: &str,
         workspace: Option<&str>,
+        model: Option<&str>,
         ts: i64,
     ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO sessions (id, title, workspace, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?4)",
-            params![id, title, workspace, ts],
+            "INSERT INTO sessions (id, title, workspace, model, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![id, title, workspace, model, ts],
         )?;
         Ok(())
     }

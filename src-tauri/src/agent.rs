@@ -109,6 +109,7 @@ pub async fn run(
     oauth_refresh: Arc<tokio::sync::Mutex<()>>,
     session_id: String,
     user_text: String,
+    model: Option<String>,
 ) {
     let channel = format!("agent://{session_id}");
 
@@ -137,6 +138,7 @@ pub async fn run(
         &channel,
         &session_id,
         user_text,
+        model,
     )
     .await;
 
@@ -163,8 +165,15 @@ async fn run_inner(
     channel: &str,
     session_id: &str,
     user_text: String,
+    model: Option<String>,
 ) -> Result<String, String> {
     let snapshot = { settings.lock().unwrap().clone() };
+
+    // Prefer the per-session model threaded from the frontend; fall back to the
+    // global settings default when it is absent or empty.
+    let active_model = model
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| snapshot.model.clone());
 
     let mut cred = secrets::load_credential().ok_or(
         "No credentials set. Sign in with your Claude subscription or add an Anthropic API key in Settings.",
@@ -212,7 +221,7 @@ async fn run_inner(
         let turn = llm::stream_turn(
             http,
             &cred,
-            &snapshot.model,
+            &active_model,
             &system,
             &messages,
             &tool_specs,

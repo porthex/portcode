@@ -17,7 +17,7 @@ export function CommandPalette() {
   const toggleFiles = useStore((s) => s.toggleFiles);
   const setShowSettings = useStore((s) => s.setShowSettings);
   const openWorkspace = useStore((s) => s.openWorkspace);
-  const updateSettings = useStore((s) => s.updateSettings);
+  const setSessionModel = useStore((s) => s.setSessionModel);
 
   const [query, setQuery] = useState("");
   const [sel, setSel] = useState(0);
@@ -38,10 +38,10 @@ export function CommandPalette() {
         id: "model-" + m.id,
         label: `Model: ${m.label}`,
         glyph: "◉",
-        run: () => void updateSettings({ model: m.id }),
+        run: () => void setSessionModel(m.id),
       })),
     ],
-    [newSession, toggleFiles, openWorkspace, setShowSettings, updateSettings],
+    [newSession, toggleFiles, openWorkspace, setShowSettings, setSessionModel],
   );
 
   const filtered = useMemo(() => {

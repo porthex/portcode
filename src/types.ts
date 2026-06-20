@@ -19,6 +19,8 @@ export interface Session {
   id: string;
   title: string;
   workspace: string | null;
+  /** The model this chat uses. Defaults to the last-used `settings.model`. */
+  model: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -88,11 +90,44 @@ export interface OAuthStatus {
   tier: string | null;
 }
 
-export const MODELS = [
-  { id: "claude-opus-4-8", label: "Claude Opus 4.8" },
-  { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
-  { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
+/** A single selectable model, tagged with the provider that serves it. */
+export interface ModelInfo {
+  id: string;
+  label: string;
+  provider: string;
+}
+
+/** A provider and the models it offers — the unit the picker groups by. */
+export interface ProviderGroup {
+  id: string;
+  label: string;
+  models: ModelInfo[];
+}
+
+/**
+ * Provider-grouped model catalogue. Only Anthropic is wired up and working
+ * today, so it is the only provider listed — we never surface providers that
+ * don't actually run (that would be dishonest UI). Adding a real provider later
+ * is a data change here, not a structural rewrite.
+ */
+export const PROVIDERS: ProviderGroup[] = [
+  {
+    id: "anthropic",
+    label: "Anthropic",
+    models: [
+      { id: "claude-opus-4-8", label: "Claude Opus 4.8", provider: "anthropic" },
+      { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: "anthropic" },
+      { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5", provider: "anthropic" },
+    ],
+  },
 ];
+
+/**
+ * Flat list of every model across all providers. Derived from PROVIDERS so the
+ * grouped catalogue stays the single source of truth. Each element carries the
+ * extra `provider` field, which is backward-compatible with `{id,label}` uses.
+ */
+export const MODELS: ModelInfo[] = PROVIDERS.flatMap((p) => p.models);
 
 export interface Usage {
   input: number;

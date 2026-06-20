@@ -124,6 +124,7 @@ describe("TitleBar", () => {
           id: "a",
           title: "Refactor the parser",
           workspace: null,
+          model: "claude-opus-4-8",
           createdAt: 1,
           updatedAt: 1,
         },

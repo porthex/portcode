@@ -38,6 +38,7 @@ interface AppState {
   newSession: () => Promise<void>;
   selectSession: (id: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
+  setSessionModel: (model: string) => Promise<void>;
   send: (text: string) => Promise<void>;
   stop: () => Promise<void>;
   setShowSettings: (v: boolean) => void;
@@ -76,12 +77,13 @@ const uid = () =>
     ? crypto.randomUUID()
     : Math.random().toString(36).slice(2);
 
-function makeSession(): Session {
+function makeSession(model: string): Session {
   const t = now();
   return {
     id: uid(),
     title: "New chat",
     workspace: null,
+    model,
     createdAt: t,
     updatedAt: t,
   };
@@ -112,21 +114,24 @@ export const useStore = create<AppState>((set, get) => ({
       ipc.getSettings(),
       ipc.oauthStatus().catch(() => null),
     ]);
-    const sessions = await ipc.listSessions();
-    if (sessions.length === 0) {
-      const s = makeSession();
-      await ipc.createSession(s.id, s.title, s.workspace);
+    const loaded = await ipc.listSessions();
+    if (loaded.length === 0) {
+      const s = makeSession(settings.model);
+      await ipc.createSession(s.id, s.title, s.workspace, s.model);
       set({ settings, oauthStatus, sessions: [s], activeId: s.id, messages: { [s.id]: [] } });
       return;
     }
+    // Old DB rows predate per-session model (null/absent) — coalesce to the
+    // last-used default so Session.model stays a non-null string.
+    const sessions = loaded.map((row) => ({ ...row, model: row.model ?? settings.model }));
     const activeId = sessions[0].id;
     const msgs = await ipc.getMessages(activeId);
     set({ settings, oauthStatus, sessions, activeId, messages: { [activeId]: msgs } });
   },
 
   async newSession() {
-    const s = makeSession();
-    await ipc.createSession(s.id, s.title, s.workspace);
+    const s = makeSession(get().settings.model);
+    await ipc.createSession(s.id, s.title, s.workspace, s.model);
     set((st) => ({
       sessions: [s, ...st.sessions],
       activeId: s.id,
@@ -162,6 +167,18 @@ export const useStore = create<AppState>((set, get) => ({
       const msgs = await ipc.getMessages(aid);
       set((st) => ({ messages: { ...st.messages, [aid]: msgs } }));
     }
+  },
+
+  async setSessionModel(model) {
+    // Point the active session at the chosen model, then mirror it into
+    // settings.model so it becomes the "last used / default for new sessions".
+    const activeId = get().activeId;
+    if (activeId) {
+      set((st) => ({
+        sessions: st.sessions.map((s) => (s.id === activeId ? { ...s, model } : s)),
+      }));
+    }
+    await get().updateSettings({ model });
   },
 
   async send(text) {
@@ -268,7 +285,9 @@ export const useStore = create<AppState>((set, get) => ({
     };
 
     try {
-      const handle = await ipc.runAgent(activeId, text, onEvent);
+      const session = get().sessions.find((s) => s.id === activeId);
+      const model = session?.model ?? get().settings.model;
+      const handle = await ipc.runAgent(activeId, text, model, onEvent);
       set({ cancel: handle.cancel });
     } catch (err) {
       onEvent({ type: "error", message: String(err) });

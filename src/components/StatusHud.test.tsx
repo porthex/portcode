@@ -29,6 +29,7 @@ const session = (over: Partial<Session> = {}): Session => ({
   id: "s1",
   title: "Chat",
   workspace: null,
+  model: "claude-opus-4-8",
   createdAt: 1,
   updatedAt: 1,
   ...over,
@@ -149,15 +150,16 @@ describe("StatusHud", () => {
     expect(live.queryByText(/LIVE/)).not.toBeInTheDocument();
   });
 
-  it("renders the model and policy from settings", () => {
+  it("renders the active session's model and the policy from settings", () => {
     useStore.setState({
-      sessions: [session()],
+      sessions: [session({ model: "claude-sonnet-4-6" })],
       activeId: "s1",
-      settings: settings({ model: "claude-sonnet-4-6", defaultPolicy: "deny" }),
+      settings: settings({ defaultPolicy: "deny" }),
     });
 
     render(<StatusHud />);
 
+    // The model segment now reads the ACTIVE SESSION's model, not settings.model.
     expect(screen.getByText("SONNET 4.6")).toBeInTheDocument();
     expect(screen.getByText("POLICY: DENY")).toBeInTheDocument();
   });

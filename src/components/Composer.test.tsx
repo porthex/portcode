@@ -3,7 +3,7 @@ import { render, screen, fireEvent, act } from "@testing-library/react";
 
 import { Composer } from "./Composer";
 import { useStore } from "../store/store";
-import type { Usage } from "../types";
+import { DEFAULT_SETTINGS, type Session, type Usage } from "../types";
 
 // The Composer is a thin view over the real store: it binds `draft` and calls
 // the store's send/stop actions, which reach the IPC bridge. We mock only the
@@ -13,6 +13,9 @@ import type { Usage } from "../types";
 vi.mock("../lib/ipc", () => ({
   runAgent: vi.fn(),
   openFolder: vi.fn(),
+  // setSessionModel (via updateSettings) lands here; echo the patch so the
+  // store's updateSettings resolves and commits the new settings.model.
+  saveSettings: vi.fn(),
 }));
 
 import * as ipc from "../lib/ipc";
@@ -33,6 +36,17 @@ beforeEach(() => {
   // without ever touching a real backend.
   m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}) });
   m.openFolder.mockResolvedValue(null);
+  m.saveSettings.mockImplementation(async (s) => ({ ...DEFAULT_SETTINGS, ...s }));
+});
+
+const session = (over: Partial<Session> = {}): Session => ({
+  id: "a",
+  title: "New chat",
+  workspace: null,
+  model: "claude-opus-4-8",
+  createdAt: 1,
+  updatedAt: 1,
+  ...over,
 });
 
 describe("Composer textarea", () => {
@@ -115,6 +129,7 @@ describe("Composer send button", () => {
           id: "a",
           title: "New chat",
           workspace: null,
+          model: "claude-opus-4-8",
           createdAt: 1,
           updatedAt: 1,
         },
@@ -132,7 +147,12 @@ describe("Composer send button", () => {
     // Let the awaited send() microtasks flush.
     await Promise.resolve();
     await Promise.resolve();
-    expect(m.runAgent).toHaveBeenCalledWith("a", "Refactor the parser", expect.any(Function));
+    expect(m.runAgent).toHaveBeenCalledWith(
+      "a",
+      "Refactor the parser",
+      "claude-opus-4-8",
+      expect.any(Function),
+    );
   });
 });
 
@@ -144,6 +164,7 @@ describe("Composer key handling", () => {
           id: "a",
           title: "New chat",
           workspace: null,
+          model: "claude-opus-4-8",
           createdAt: 1,
           updatedAt: 1,
         },
@@ -162,7 +183,12 @@ describe("Composer key handling", () => {
     expect(useStore.getState().draft).toBe("");
     await Promise.resolve();
     await Promise.resolve();
-    expect(m.runAgent).toHaveBeenCalledWith("a", "ship it", expect.any(Function));
+    expect(m.runAgent).toHaveBeenCalledWith(
+      "a",
+      "ship it",
+      "claude-opus-4-8",
+      expect.any(Function),
+    );
   });
 
   it("inserts a newline (does not submit) on Shift+Enter", () => {
@@ -311,5 +337,56 @@ describe("Composer UsageMeter", () => {
     expect(screen.getByText("5.0k tok")).toBeInTheDocument();
     expect(screen.getByText("$0.0000")).toBeInTheDocument();
     expect(screen.getByText("no-such-model")).toBeInTheDocument();
+  });
+});
+
+describe("Composer ModelPicker", () => {
+  it("reflects the active session's model and groups options by provider", () => {
+    useStore.setState({
+      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      activeId: "a",
+      messages: { a: [] },
+    });
+    render(<Composer />);
+
+    const picker = screen.getByRole("combobox", { name: "Model" }) as HTMLSelectElement;
+    expect(picker.value).toBe("claude-opus-4-8");
+    // Provider-grouped: the Anthropic <optgroup> wraps the model options.
+    const groups = picker.querySelectorAll("optgroup");
+    expect(groups).toHaveLength(1);
+    expect(groups[0].label).toBe("Anthropic");
+    expect(screen.getByRole("option", { name: "Claude Sonnet 4.6" })).toBeInTheDocument();
+  });
+
+  it("changing the model updates the active session AND the last-used default", async () => {
+    useStore.setState({
+      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      activeId: "a",
+      messages: { a: [] },
+    });
+    render(<Composer />);
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Model" }), {
+      target: { value: "claude-sonnet-4-6" },
+    });
+
+    // setSessionModel updates the session synchronously, then awaits the
+    // last-used sync into settings.model (updateSettings -> ipc.saveSettings).
+    expect(useStore.getState().sessions[0].model).toBe("claude-sonnet-4-6");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(m.saveSettings).toHaveBeenCalledWith({ model: "claude-sonnet-4-6" });
+    expect(useStore.getState().settings.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("is disabled while a turn is streaming", () => {
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: { a: [] },
+      streaming: true,
+    });
+    render(<Composer />);
+    expect(screen.getByRole("combobox", { name: "Model" })).toBeDisabled();
   });
 });
