@@ -1,0 +1,251 @@
+name: Release
+
+# Signed-release pipeline — the Phase 1 foundation referenced by ci.yml, plus
+# Phase 2 #1 (auto-updater + signed manifest) and #2 (CycloneDX SBOM).
+#
+# Triggers ONLY on version tags (v*) and manual dispatch. The heavy, signed
+# `tauri build` is intentionally kept OUT of per-PR CI (that stays in ci.yml) and
+# gated to tags so it runs once per release, not on every push.
+#
+# ── SECURITY ──────────────────────────────────────────────────────────────────
+# Every signing step is SECRET-GATED via job-level env mirrors of the secrets:
+# with no secrets configured the workflow still builds, produces a SBOM, and
+# computes checksums (an UNSIGNED dry run) — it never hard-fails for missing
+# secrets. A real signed release additionally requires the protected `release`
+# environment and owner-provisioned secrets — enumerated below and in the PR body
+# (a full release runbook lands separately as docs/RELEASE.md, Phase 2 #8).
+#
+# Owner-provisioned secrets (none are generated here):
+#   Azure Trusted Signing (Authenticode):
+#     AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET,
+#     AZURE_TS_ENDPOINT, AZURE_TS_ACCOUNT, AZURE_TS_CERT_PROFILE
+#   Tauri updater (Ed25519, from `tauri signer generate`):
+#     TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+# Least privilege by default; the release job opts up to `contents: write`.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build · sign · SBOM · publish (Windows)
+    runs-on: windows-latest
+    # Protected environment: the owner attaches the signing secrets here and adds
+    # required-reviewer / branch rules so releases can't be cut unreviewed.
+    environment: release
+    permissions:
+      contents: write # create the GitHub Release and upload assets
+    env:
+      # Secrets are mirrored to env so step-level `if:` can detect their presence
+      # WITHOUT ever interpolating the secret into a run-step (which could leak it
+      # into logs). Each is an empty string when the secret is unset.
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TS_ENDPOINT: ${{ secrets.AZURE_TS_ENDPOINT }}
+      AZURE_TS_ACCOUNT: ${{ secrets.AZURE_TS_ACCOUNT }}
+      AZURE_TS_CERT_PROFILE: ${{ secrets.AZURE_TS_CERT_PROFILE }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Enable Corepack (pnpm)
+        run: corepack enable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: pnpm
+
+      # Channel + MSVC target + rustfmt/clippy are pinned by rust-toolchain.toml.
+      - name: Materialize pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ── Supply-chain gate (Phase 2 #2): licenses · advisories · bans · sources ─
+      # Reads deny.toml at the repo root; fails fast before we spend build time.
+      - name: Supply-chain audit (cargo-deny)
+        uses: EmbarkStudios/cargo-deny-action@v2.0.20
+        with:
+          manifest-path: src-tauri/Cargo.toml
+          command: check
+          # `arguments` are top-level flags (before the subcommand); `--config` is
+          # a `check` subcommand flag (after it) → command-arguments. Both verified
+          # against cargo-deny locally. The root deny.toml resolves from cwd.
+          arguments: "--all-features"
+          command-arguments: "--config deny.toml"
+
+      # ── Build the NSIS installer (UNSIGNED) ───────────────────────────────────
+      # createUpdaterArtifacts is NOT enabled, so this never needs a signing key
+      # and works in forks / dry runs. For NSIS the updater target IS the
+      # setup.exe, which we Authenticode-sign first and updater-sign afterwards.
+      - name: Build app (tauri build → NSIS)
+        run: pnpm app:build
+
+      - name: Locate installer + read version
+        id: artifact
+        shell: pwsh
+        run: |
+          $dir = "src-tauri/target/release/bundle/nsis"
+          $exe = Get-ChildItem -Path $dir -Filter *-setup.exe -ErrorAction Stop | Select-Object -First 1
+          if (-not $exe) { throw "No NSIS *-setup.exe found under $dir" }
+          $ver = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          "path=$($exe.FullName)"   >> $env:GITHUB_OUTPUT
+          "name=$($exe.Name)"       >> $env:GITHUB_OUTPUT
+          "dir=$dir"                >> $env:GITHUB_OUTPUT
+          "version=$ver"            >> $env:GITHUB_OUTPUT
+          Write-Host "Installer: $($exe.FullName)  (v$ver)"
+
+      # ── Authenticode signing via Azure Trusted Signing (SECRET-GATED) ─────────
+      # Signs the installer in place so SmartScreen / Defender trust it. Skipped
+      # cleanly when the Azure service-principal secrets are absent.
+      - name: Azure Trusted Signing (Authenticode)
+        if: env.AZURE_CLIENT_ID != '' && env.AZURE_TS_ENDPOINT != ''
+        uses: Azure/trusted-signing-action@v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_CERT_PROFILE }}
+          files-folder: ${{ steps.artifact.outputs.dir }}
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Note — Authenticode signing skipped (no Azure secrets)
+        if: env.AZURE_CLIENT_ID == '' || env.AZURE_TS_ENDPOINT == ''
+        shell: pwsh
+        run: Write-Host "::warning title=Unsigned build::Azure Trusted Signing secrets absent — installer is NOT Authenticode-signed. Expected for dry runs."
+
+      # ── Updater signature (SECRET-GATED) — MUST run AFTER Authenticode ────────
+      # `tauri signer sign` writes an Ed25519 detached signature (<file>.sig) over
+      # the FINAL installer bytes. Authenticode embeds a certificate into the
+      # binary, so the updater signature has to be taken afterwards or the updater
+      # would reject the download. The key + password are read from env (never
+      # passed on argv, so they can't surface in the process list or logs).
+      - name: Sign updater artifact (tauri signer sign)
+        if: env.TAURI_SIGNING_PRIVATE_KEY != ''
+        shell: pwsh
+        run: pnpm tauri signer sign "${{ steps.artifact.outputs.path }}"
+
+      - name: Note — updater signature skipped (no updater key)
+        if: env.TAURI_SIGNING_PRIVATE_KEY == ''
+        shell: pwsh
+        run: Write-Host "::warning title=No updater manifest::TAURI_SIGNING_PRIVATE_KEY absent — skipping updater signature + latest.json. Auto-update won't be offered for this build."
+
+      # ── SHA-256 checksums (over the FINAL bytes, post-Authenticode) ───────────
+      - name: Compute SHA-256 checksums
+        shell: pwsh
+        run: |
+          $dir = "${{ steps.artifact.outputs.dir }}"
+          $lines = foreach ($f in Get-ChildItem -Path $dir -Filter *-setup.exe) {
+            $h = (Get-FileHash -Algorithm SHA256 -Path $f.FullName).Hash.ToLower()
+            "$h  $($f.Name)"
+          }
+          $lines | Set-Content -Encoding ascii "$dir/SHA256SUMS.txt"
+          Get-Content "$dir/SHA256SUMS.txt"
+
+      # ── Updater manifest latest.json (SECRET-GATED; needs the .sig above) ─────
+      - name: Generate updater manifest (latest.json)
+        if: env.TAURI_SIGNING_PRIVATE_KEY != ''
+        shell: pwsh
+        run: |
+          $exe  = "${{ steps.artifact.outputs.path }}"
+          $name = "${{ steps.artifact.outputs.name }}"
+          $ver  = "${{ steps.artifact.outputs.version }}"
+          $dir  = "${{ steps.artifact.outputs.dir }}"
+          if (-not (Test-Path "$exe.sig")) { throw "Expected updater signature $exe.sig not found" }
+          $sig = (Get-Content "$exe.sig" -Raw).Trim()
+          $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$name"
+          $manifest = [ordered]@{
+            version   = $ver
+            notes     = "Portcode $ver. See the release page for full notes."
+            pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{ signature = $sig; url = $url }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8 "$dir/latest.json"
+          Get-Content "$dir/latest.json"
+
+      # ── CycloneDX SBOM (Phase 2 #2) — one BOM covering pnpm + cargo ───────────
+      # cdxgen natively parses pnpm-lock.yaml AND Cargo.lock, so a single tool
+      # produces a combined SBOM. (cyclonedx-npm only understands npm's
+      # package-lock.json — the documented reason it isn't used for the JS side.)
+      - name: Generate CycloneDX SBOM (cdxgen)
+        shell: pwsh
+        env:
+          FETCH_LICENSE: "false" # no network license enrichment; reproducible
+        run: |
+          npx -y @cyclonedx/cdxgen@12.6.0 -r -o portcode.cdx.json `
+            --project-name portcode --project-version "${{ steps.artifact.outputs.version }}" .
+          if (-not (Test-Path portcode.cdx.json)) { throw "SBOM not generated" }
+
+      - name: Validate SBOM is parseable CycloneDX JSON
+        shell: pwsh
+        run: |
+          $bom = Get-Content portcode.cdx.json -Raw | ConvertFrom-Json
+          if ($bom.bomFormat -ne "CycloneDX") { throw "Unexpected bomFormat: $($bom.bomFormat)" }
+          Write-Host "SBOM OK: $($bom.bomFormat) $($bom.specVersion); components: $($bom.components.Count)"
+
+      # ── Publish to GitHub Releases (tag refs only) ────────────────────────────
+      - name: Publish release assets
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $dir = "${{ steps.artifact.outputs.dir }}"
+          $assets = @()
+          $assets += (Get-ChildItem -Path $dir -Filter *-setup.exe).FullName
+          if (Test-Path "$dir/SHA256SUMS.txt") { $assets += "$dir/SHA256SUMS.txt" }
+          Get-ChildItem -Path $dir -Filter *.sig -ErrorAction SilentlyContinue | ForEach-Object { $assets += $_.FullName }
+          if (Test-Path "$dir/latest.json")    { $assets += "$dir/latest.json" }
+          if (Test-Path "portcode.cdx.json")   { $assets += "portcode.cdx.json" }
+          Write-Host "Assets:"; $assets | ForEach-Object { Write-Host "  $_" }
+          # Idempotent: create the release if it doesn't exist yet, else upload.
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag @assets --title $tag --generate-notes --verify-tag
+          } else {
+            gh release upload $tag @assets --clobber
+          }
+
+      # ── Dry run (manual dispatch on a non-tag ref): keep artifacts to inspect ─
+      - name: Upload build artifacts (dry run)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: portcode-unpublished
+          if-no-files-found: warn
+          path: |
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/nsis/SHA256SUMS.txt
+            src-tauri/target/release/bundle/nsis/*.sig
+            src-tauri/target/release/bundle/nsis/latest.json
+            portcode.cdx.json
