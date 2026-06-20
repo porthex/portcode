@@ -24,6 +24,8 @@ interface AppState {
   showSettings: boolean;
   showFiles: boolean;
   showPalette: boolean;
+  ambientRain: boolean; // decorative neon-rain backdrop (off by default)
+  scanlines: boolean; // CRT scanline overlay (off by default)
   draft: string;
   cancel: (() => Promise<void>) | null;
   pendingPermission: PendingPermission | null;
@@ -40,6 +42,8 @@ interface AppState {
   stop: () => Promise<void>;
   setShowSettings: (v: boolean) => void;
   setShowPalette: (v: boolean) => void;
+  setAmbientRain: (v: boolean) => void;
+  setScanlines: (v: boolean) => void;
   updateSettings: (s: Partial<Settings>) => Promise<void>;
   refreshOAuthStatus: () => Promise<void>;
   loginWithClaude: () => Promise<void>;
@@ -48,6 +52,25 @@ interface AppState {
 }
 
 const now = () => Date.now();
+
+// Frontend-only UI preferences (decorative overlays). Cosmetic client state,
+// not the Rust core's Settings — persisted in localStorage so they work the
+// same in preview and native without an IPC round-trip.
+const readPref = (k: string): boolean => {
+  try {
+    return localStorage.getItem(k) === "1";
+  } catch {
+    return false;
+  }
+};
+const writePref = (k: string, v: boolean): void => {
+  try {
+    localStorage.setItem(k, v ? "1" : "0");
+  } catch {
+    /* storage disabled / over quota — ignore */
+  }
+};
+
 const uid = () =>
   typeof crypto !== "undefined" && crypto.randomUUID
     ? crypto.randomUUID()
@@ -76,6 +99,8 @@ export const useStore = create<AppState>((set, get) => ({
   showSettings: false,
   showFiles: false,
   showPalette: false,
+  ambientRain: readPref("pc.ambientRain"),
+  scanlines: readPref("pc.scanlines"),
   draft: "",
   cancel: null,
   pendingPermission: null,
@@ -259,11 +284,17 @@ export const useStore = create<AppState>((set, get) => ({
   async resolvePermission(decision, always) {
     const p = get().pendingPermission;
     if (!p) return;
+    const id = p.id;
     if (always && decision === "allow") {
       await get().updateSettings({ defaultPolicy: "allow" });
     }
+    // A superseding request may have replaced the prompt while we awaited
+    // (or between render and click); only resolve the request we captured so a
+    // stale click can't clear/answer a newer one.
+    const current = get().pendingPermission;
+    if (current && current.id !== id) return;
     set({ pendingPermission: null });
-    await ipc.resolvePermission(p.id, decision);
+    await ipc.resolvePermission(id, decision);
   },
 
   setShowSettings(v) {
@@ -272,6 +303,16 @@ export const useStore = create<AppState>((set, get) => ({
 
   setShowPalette(v) {
     set({ showPalette: v });
+  },
+
+  setAmbientRain(v) {
+    writePref("pc.ambientRain", v);
+    set({ ambientRain: v });
+  },
+
+  setScanlines(v) {
+    writePref("pc.scanlines", v);
+    set({ scanlines: v });
   },
 
   toggleFiles() {

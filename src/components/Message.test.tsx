@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 
 import { MessageView } from "./Message";
@@ -172,6 +172,14 @@ describe("MessageView — assistant role", () => {
     expect(screen.queryByRole("button")).toBeNull();
     const dots = container.querySelectorAll(".animate-bounce");
     expect(dots).toHaveLength(3);
+
+    // The indicator is announced to assistive tech: a polite live status region
+    // carrying a visually-hidden "Agent is thinking" label, while the decorative
+    // dots are hidden from the accessibility tree.
+    const status = screen.getByRole("status");
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(status).toHaveTextContent("Agent is thinking");
+    dots.forEach((dot) => expect(dot).toHaveAttribute("aria-hidden", "true"));
   });
 
   it("renders multiple text blocks and a tool pair together", () => {
@@ -191,5 +199,40 @@ describe("MessageView — assistant role", () => {
     // summarize() prefers the pattern field for the collapsed summary.
     expect(screen.getByText("grep")).toBeInTheDocument();
     expect(screen.getByText("TODO")).toBeInTheDocument();
+  });
+});
+
+describe("MessageView — typing animation", () => {
+  // Freeze requestAnimationFrame so the reveal never advances during the test:
+  // assertions stay deterministic and no setState escapes React's act().
+  beforeEach(() => {
+    vi.stubGlobal("requestAnimationFrame", () => 0);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("types the in-flight assistant turn in monospace with a blinking caret", () => {
+    const { container } = render(
+      <MessageView
+        message={message("assistant", [{ kind: "text", text: "**bold** text" }])}
+        isActive
+      />,
+    );
+
+    // The active turn shows the mono typing view + caret, not formatted markdown.
+    expect(container.querySelector(".pc-caret")).not.toBeNull();
+    expect(container.querySelector(".font-mono")).not.toBeNull();
+    expect(container.querySelector("strong")).toBeNull();
+  });
+
+  it("renders a finished (inactive) turn as markdown with no caret", () => {
+    const { container } = render(
+      <MessageView message={message("assistant", [{ kind: "text", text: "**bold** text" }])} />,
+    );
+
+    expect(container.querySelector(".pc-caret")).toBeNull();
+    expect(container.querySelector("strong")).not.toBeNull();
   });
 });

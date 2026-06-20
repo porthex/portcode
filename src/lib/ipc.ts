@@ -179,6 +179,7 @@ const mock = (() => {
     apiKeySet: false,
     defaultPolicy: "ask",
     workspace: null,
+    typingAnimation: true,
   };
 
   // Fake subscription-auth state so the sign-in UX is testable without Tauri.

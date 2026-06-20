@@ -41,22 +41,24 @@ beforeEach(() => {
 });
 
 describe("FileExplorer header", () => {
-  it("shows 'Explorer' when no workspace is set", async () => {
+  it("shows the PORTCODE eyebrow regardless of workspace", async () => {
     render(<FileExplorer />);
-    expect(screen.getByText("Explorer")).toBeInTheDocument();
+    // Neon-Noir header: a fixed "◧ PORTCODE" eyebrow (no workspace basename).
+    expect(screen.getByText("◧ PORTCODE")).toBeInTheDocument();
     // Initial load resolves to [] -> the effect's setRoots runs.
     await waitFor(() => expect(m.listDir).toHaveBeenCalledWith(undefined));
   });
 
-  it("derives the basename from the workspace path (trailing slashes stripped)", async () => {
+  it("keeps the fixed eyebrow even when a workspace path is set", async () => {
     useStore.setState({
       settings: { ...initialState.settings, workspace: "C:/dev/porthex/portcode//" },
     });
 
     render(<FileExplorer />);
 
-    // basename of the workspace, ignoring trailing separators
-    expect(await screen.findByText("portcode")).toBeInTheDocument();
+    // The header no longer derives a basename; it stays the static eyebrow.
+    expect(await screen.findByText("◧ PORTCODE")).toBeInTheDocument();
+    await waitFor(() => expect(m.listDir).toHaveBeenCalledWith(undefined));
   });
 
   it("reloads the directory listing when the workspace changes", async () => {
@@ -96,7 +98,9 @@ describe("FileExplorer empty state", () => {
     render(<FileExplorer />);
 
     // Two distinct 'open' affordances exist when empty: header + placeholder.
-    expect(await screen.findByText(/No files/)).toBeInTheDocument();
+    // The empty state spells out that no workspace is set and hints at the fix.
+    expect(await screen.findByText("No workspace set")).toBeInTheDocument();
+    expect(screen.getByText("Pick a folder to start browsing.")).toBeInTheDocument();
     const placeholderBtn = screen.getByRole("button", { name: "Open a folder" });
 
     fireEvent.click(placeholderBtn);
@@ -107,9 +111,25 @@ describe("FileExplorer empty state", () => {
     );
   });
 
+  it("falls back to the empty placeholder when listDir rejects", async () => {
+    // A failed directory scan must not hang on a blank view or leak an
+    // unhandled rejection; the .catch() guard resolves roots to [] so the
+    // empty-state placeholder still renders.
+    m.listDir.mockRejectedValueOnce(new Error("scan failed"));
+
+    render(<FileExplorer />);
+
+    expect(await screen.findByText("No workspace set")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open a folder" })).toBeInTheDocument();
+    await waitFor(() => expect(m.listDir).toHaveBeenCalledWith(undefined));
+  });
+
   it("invokes openWorkspace from the header button", async () => {
     render(<FileExplorer />);
-    const headerBtn = screen.getByRole("button", { name: "Open…" });
+    // Header affordance shows "OPEN…" but is labelled "Open folder" for
+    // screen readers, so its accessible name is the aria-label.
+    const headerBtn = screen.getByRole("button", { name: "Open folder" });
+    expect(headerBtn).toHaveTextContent("OPEN…");
 
     fireEvent.click(headerBtn);
 
@@ -128,9 +148,11 @@ describe("FileExplorer tree", () => {
 
     expect(await screen.findByText("src")).toBeInTheDocument();
     expect(screen.getByText("README.md")).toBeInTheDocument();
-    // A directory shows the collapsed caret + folder glyph.
-    expect(screen.getByText("▸")).toBeInTheDocument();
-    expect(screen.getByText("📁")).toBeInTheDocument();
+    // A collapsed directory shows both the caret "▸" and the amber folder
+    // glyph "▸" (two distinct spans share the same right-pointing triangle).
+    expect(screen.getAllByText("▸")).toHaveLength(2);
+    // README.md is the extension-less-of-interest fallback "◇" (text-faint).
+    expect(screen.getByText("◇")).toBeInTheDocument();
   });
 
   it("expands a directory, fetching and rendering its children with the sub-path", async () => {
@@ -171,6 +193,60 @@ describe("FileExplorer tree", () => {
     // re-expand -> served from cache (children !== null), still no extra fetch
     fireEvent.click(dirBtn);
     expect(await screen.findByText("App.tsx")).toBeInTheDocument();
+    expect(m.listDir).toHaveBeenCalledTimes(2);
+  });
+
+  it("dedupes rapid toggles while expanding: listDir fires once for the folder", async () => {
+    let resolveChildren!: (entries: DirEntry[]) => void;
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })])
+      .mockReturnValueOnce(
+        // Keep the expand pending so the in-flight guard is active for the
+        // toggles that land before the children resolve.
+        new Promise<DirEntry[]>((res) => {
+          resolveChildren = res;
+        }),
+      );
+
+    render(<FileExplorer />);
+    const dirBtn = await screen.findByRole("button", { name: /src/ });
+
+    // First click kicks off the (still-pending) child fetch.
+    fireEvent.click(dirBtn);
+    await waitFor(() => expect(m.listDir).toHaveBeenNthCalledWith(2, "src"));
+
+    // Two more toggles while the first listDir is in flight (collapse, then a
+    // re-expand attempt) must not fire a duplicate fetch: children is still
+    // null, but the loading ref short-circuits the guarded branch.
+    fireEvent.click(dirBtn);
+    fireEvent.click(dirBtn);
+
+    // Settle the pending fetch; exactly one child listDir ran for "src".
+    resolveChildren([entry({ name: "App.tsx", path: "src/App.tsx", isDir: false })]);
+    await waitFor(() => expect(m.listDir.mock.calls.filter((c) => c[0] === "src")).toHaveLength(1));
+    expect(m.listDir).toHaveBeenCalledTimes(2);
+  });
+
+  it("recovers from a failed expand: collapses the caret and renders no children", async () => {
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "locked", path: "locked", isDir: true })])
+      .mockRejectedValueOnce(new Error("permission denied"));
+
+    render(<FileExplorer />);
+    const dirBtn = await screen.findByRole("button", { name: /locked/ });
+
+    fireEvent.click(dirBtn);
+
+    // The sub-path was queried but rejected; the catch resets the node so the
+    // caret collapses back to "▸" and no stuck-open empty directory remains.
+    await waitFor(() => expect(m.listDir).toHaveBeenNthCalledWith(2, "locked"));
+    await waitFor(() => expect(screen.queryByText("▾")).not.toBeInTheDocument());
+    expect(screen.getAllByText("▸")).toHaveLength(2);
+
+    // children settled to [] (not null), so re-expanding serves the cache
+    // without re-hitting the failing backend.
+    fireEvent.click(dirBtn);
+    await waitFor(() => expect(screen.getByText("▾")).toBeInTheDocument());
     expect(m.listDir).toHaveBeenCalledTimes(2);
   });
 
@@ -219,12 +295,13 @@ describe("fileGlyph (via rendered file rows)", () => {
     render(<FileExplorer />);
 
     await screen.findByText("core.rs");
+    // Neon-Noir type glyphs: a crab for Rust, an amber/cyan/green diamond
+    // "◆" for the source families, and a hollow "◇" fallback otherwise.
     expect(screen.getByText("🦀")).toBeInTheDocument(); // .rs
-    expect(screen.getByText("📜")).toBeInTheDocument(); // .tsx (ts/js family)
-    expect(screen.getByText("⚙️")).toBeInTheDocument(); // .toml (config family)
-    expect(screen.getByText("🎨")).toBeInTheDocument(); // .css
+    // .tsx (text-accent-2) and .css (text-accent) both render the filled "◆".
+    expect(screen.getAllByText("◆")).toHaveLength(2);
 
-    // .md and the extension-less fallback both render the document glyph.
-    expect(screen.getAllByText("📄").length).toBeGreaterThanOrEqual(2);
+    // .toml, .md and the extension-less Makefile all fall back to "◇".
+    expect(screen.getAllByText("◇")).toHaveLength(3);
   });
 });

@@ -40,6 +40,7 @@ vi.mock("./lib/ipc", () => ({
   listSessions: vi.fn(),
   createSession: vi.fn(),
   getMessages: vi.fn(),
+  // store.init() restores subscription sign-in via ipc.oauthStatus() on mount.
   oauthStatus: vi.fn(),
   startOauthLogin: vi.fn(),
   oauthLogout: vi.fn(),
@@ -106,12 +107,14 @@ describe("App layout", () => {
 });
 
 describe("TitleBar", () => {
-  it("falls back to 'Portcode' when there is no active session", () => {
+  it("falls back to 'New chat' when there is no active session", () => {
     useStore.setState({ sessions: [], activeId: null });
 
     render(<App />);
 
-    expect(screen.getByText("Portcode")).toBeInTheDocument();
+    // The breadcrumb is "portcode / {title}"; with no active session the title
+    // segment falls back to "New chat".
+    expect(screen.getByText("New chat")).toBeInTheDocument();
   });
 
   it("shows the active session's title when one is active", () => {
@@ -138,7 +141,7 @@ describe("TitleBar", () => {
 
     render(<App />);
 
-    expect(screen.getByText("preview mode")).toBeInTheDocument();
+    expect(screen.getByText("PREVIEW MODE")).toBeInTheDocument();
   });
 
   it("hides the preview-mode badge when running inside Tauri", () => {
@@ -146,7 +149,7 @@ describe("TitleBar", () => {
 
     render(<App />);
 
-    expect(screen.queryByText("preview mode")).not.toBeInTheDocument();
+    expect(screen.queryByText("PREVIEW MODE")).not.toBeInTheDocument();
   });
 
   it("toggles the file explorer via the TitleBar button", () => {
@@ -154,10 +157,26 @@ describe("TitleBar", () => {
 
     expect(screen.queryByTestId("file-explorer")).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByTitle("Toggle file explorer"));
+    fireEvent.click(screen.getByTitle("Toggle file explorer (Ctrl+B)"));
 
     expect(screen.getByTestId("file-explorer")).toBeInTheDocument();
     expect(useStore.getState().showFiles).toBe(true);
+  });
+
+  it("exposes an accessible name on the toggle-files button", () => {
+    render(<App />);
+
+    expect(
+      screen.getByRole("button", { name: "Toggle file explorer (Ctrl+B)" }),
+    ).toBeInTheDocument();
+  });
+
+  it("exposes an accessible name on the command-palette button", () => {
+    render(<App />);
+
+    expect(
+      screen.getByRole("button", { name: "Open command palette (Ctrl+K)" }),
+    ).toBeInTheDocument();
   });
 });
 

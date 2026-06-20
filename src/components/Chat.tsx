@@ -14,20 +14,44 @@ export function Chat() {
   const messages = useStore((s) => (activeId && s.messages[activeId]) || EMPTY);
   const streaming = useStore((s) => s.streaming);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, streaming]);
 
+  // The typewriter reveal grows the transcript height between store updates, so
+  // follow it to the bottom while a turn streams in. (ResizeObserver is absent in
+  // jsdom — guard so tests don't choke.)
+  useEffect(() => {
+    if (!streaming) return;
+    const el = scrollRef.current;
+    const content = contentRef.current;
+    if (!el || !content || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => {
+      el.scrollTop = el.scrollHeight;
+    });
+    ro.observe(content);
+    return () => ro.disconnect();
+  }, [streaming]);
+
+  const lastIndex = messages.length - 1;
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto w-full max-w-3xl px-5 py-6">
+        <div ref={contentRef} className="mx-auto w-full max-w-3xl px-5 py-6">
           {messages.length === 0 ? (
             <EmptyState />
           ) : (
-            messages.map((m) => <MessageView key={m.id} message={m} />)
+            messages.map((m, i) => (
+              <MessageView
+                key={m.id}
+                message={m}
+                isActive={streaming && i === lastIndex && m.role === "assistant"}
+              />
+            ))
           )}
         </div>
       </div>

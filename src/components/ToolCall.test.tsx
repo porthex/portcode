@@ -21,9 +21,9 @@ const result = (over: Partial<ResultBlock> = {}): ResultBlock => ({
   ...over,
 });
 
-// The single status dot is the only <span> carrying a status color class.
+// The single status dot is the .pc-dot span at the start of the header button.
 const dot = (container: HTMLElement): HTMLElement => {
-  const el = container.querySelector("button > span");
+  const el = container.querySelector("button .pc-dot");
   if (!el) throw new Error("status dot not found");
   return el as HTMLElement;
 };
@@ -66,20 +66,21 @@ describe("summarize (header summary)", () => {
 });
 
 describe("StatusDot", () => {
-  it("is amber and pulsing while pending (no result)", () => {
+  it("is the warn variant (amber, pulsing) while pending (no result)", () => {
     const { container } = render(<ToolCall name="t" input={{}} />);
     const d = dot(container);
-    expect(d.className).toContain("bg-warn");
-    expect(d.className).toContain("animate-pulse");
+    // The warn modifier carries the amber color + pulse animation in CSS.
+    expect(d.className).toContain("pc-dot--warn");
+    expect(d.className).not.toContain("pc-dot--success");
   });
 
-  it("is green and not pulsing for a successful result", () => {
+  it("is the success variant (green, not pulsing) for a successful result", () => {
     const { container } = render(
       <ToolCall name="t" input={{}} result={result({ isError: false })} />,
     );
     const d = dot(container);
-    expect(d.className).toContain("bg-success");
-    expect(d.className).not.toContain("animate-pulse");
+    expect(d.className).toContain("pc-dot--success");
+    expect(d.className).not.toContain("pc-dot--warn");
   });
 
   it("is red for an error result", () => {
@@ -88,7 +89,9 @@ describe("StatusDot", () => {
     );
     const d = dot(container);
     expect(d.className).toContain("bg-danger");
-    expect(d.className).not.toContain("animate-pulse");
+    // The error dot is neither the warn nor success status variant.
+    expect(d.className).not.toContain("pc-dot--warn");
+    expect(d.className).not.toContain("pc-dot--success");
   });
 });
 
@@ -112,6 +115,21 @@ describe("collapse / expand toggle", () => {
     fireEvent.click(toggle);
     expect(screen.getByText("▸")).toBeInTheDocument();
     expect(screen.queryByText("Input")).not.toBeInTheDocument();
+  });
+
+  it("exposes aria-expanded/aria-label that flip false→true for screen readers", () => {
+    render(<ToolCall name="t" input={{ path: "a.ts" }} result={result()} />);
+    const toggle = screen.getByRole("button");
+
+    // Collapsed: button advertises a closed region and an "expand" action.
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveAttribute("aria-label", "Expand tool output");
+
+    fireEvent.click(toggle);
+
+    // Expanded: aria-expanded flips and the label describes the collapse action.
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle).toHaveAttribute("aria-label", "Collapse tool output");
   });
 });
 
@@ -153,12 +171,12 @@ describe("result block rendering", () => {
 
 describe("looksLikeDiff / DiffView", () => {
   // A diff that exercises every classification branch:
-  //   "+++ " and "--- " file headers (muted)
-  //   "@@ "  hunk header (accent)
-  //   " ctx" context line (default text-fg)
-  //   ""     blank line (rendered as a single space)
-  //   "+add" added line (success)
-  //   "-rem" removed line (danger)
+  //   "+++ " and "--- " file headers (.pc-diff-file)
+  //   "@@ "  hunk header (.pc-diff-hunk)
+  //   " ctx" context line (.pc-diff-ctx)
+  //   ""     blank line (rendered as a single space, .pc-diff-ctx)
+  //   "+add" added line (.pc-diff-add)
+  //   "-rem" removed line (.pc-diff-del)
   const fullDiff = [
     "--- a/x",
     "+++ b/x",
@@ -177,9 +195,10 @@ describe("looksLikeDiff / DiffView", () => {
     return container;
   };
 
-  // Find the per-line <div> whose text content equals the given line.
+  // Find the per-line diff <div> whose text content equals the given line.
+  // DiffView renders each line as a `.pc-diff-line` inside the `.pc-diff` box.
   const lineDiv = (container: HTMLElement, text: string): HTMLElement => {
-    const divs = Array.from(container.querySelectorAll("pre > div"));
+    const divs = Array.from(container.querySelectorAll(".pc-diff .pc-diff-line"));
     const match = divs.find((d) => d.textContent === text);
     if (!match) throw new Error(`diff line not found: ${JSON.stringify(text)}`);
     return match as HTMLElement;
@@ -187,55 +206,90 @@ describe("looksLikeDiff / DiffView", () => {
 
   it("detects a diff via an @@ hunk header and renders per-line divs", () => {
     const container = diffContainer("@@ -1 +1 @@\n context");
-    // DiffView emits a <div> per line rather than a single text node.
-    expect(container.querySelectorAll("pre > div").length).toBeGreaterThan(0);
+    // DiffView emits a .pc-diff container with a .pc-diff-line per line
+    // rather than a single <pre> text node.
+    expect(container.querySelector(".pc-diff")).not.toBeNull();
+    expect(container.querySelectorAll(".pc-diff .pc-diff-line").length).toBeGreaterThan(0);
   });
 
   it("also detects a diff that only has a +++ header", () => {
     const container = diffContainer("+++ b/file\nplain body");
     const header = lineDiv(container, "+++ b/file");
-    expect(header.className).toContain("text-muted");
+    expect(header.className).toContain("pc-diff-file");
   });
 
-  it("classifies @@ hunk headers as accent", () => {
+  it("classifies @@ hunk headers as the hunk class", () => {
     const container = diffContainer(fullDiff);
-    expect(lineDiv(container, "@@ -1,3 +1,3 @@").className).toContain("text-accent");
+    expect(lineDiv(container, "@@ -1,3 +1,3 @@").className).toContain("pc-diff-hunk");
   });
 
-  it("classifies +++ and --- file headers as muted (not as add/remove)", () => {
+  it("classifies +++ and --- file headers as file headers (not as add/remove)", () => {
     const container = diffContainer(fullDiff);
-    expect(lineDiv(container, "+++ b/x").className).toContain("text-muted");
-    expect(lineDiv(container, "--- a/x").className).toContain("text-muted");
+    const plus = lineDiv(container, "+++ b/x");
+    const minus = lineDiv(container, "--- a/x");
+    expect(plus.className).toContain("pc-diff-file");
+    expect(plus.className).not.toContain("pc-diff-add");
+    expect(minus.className).toContain("pc-diff-file");
+    expect(minus.className).not.toContain("pc-diff-del");
   });
 
-  it("classifies added lines as success and removed lines as danger", () => {
+  it("classifies added lines as add and removed lines as del", () => {
     const container = diffContainer(fullDiff);
     const added = lineDiv(container, "+added");
     const removed = lineDiv(container, "-removed");
-    expect(added.className).toContain("text-success");
-    expect(added.className).toContain("bg-success/10");
-    expect(removed.className).toContain("text-danger");
-    expect(removed.className).toContain("bg-danger/10");
+    expect(added.className).toContain("pc-diff-add");
+    expect(removed.className).toContain("pc-diff-del");
   });
 
-  it("classifies context lines as default foreground", () => {
+  it("classifies context lines as the context class", () => {
     const container = diffContainer(fullDiff);
     const ctx = lineDiv(container, " context");
-    expect(ctx.className).toContain("text-fg");
-    expect(ctx.className).not.toContain("text-success");
-    expect(ctx.className).not.toContain("text-danger");
+    expect(ctx.className).toContain("pc-diff-ctx");
+    expect(ctx.className).not.toContain("pc-diff-add");
+    expect(ctx.className).not.toContain("pc-diff-del");
   });
 
   it("renders a blank diff line as a single space placeholder", () => {
     const container = diffContainer(fullDiff);
-    // The empty line collapses to " " (line || " ").
+    // The empty line collapses to " " (line || " ") and stays a context line.
     const blank = lineDiv(container, " ");
-    expect(blank.className).toContain("text-fg");
+    expect(blank.className).toContain("pc-diff-ctx");
   });
 
-  it("does NOT use DiffView for ordinary output (single text node, no per-line divs)", () => {
+  it("does NOT use DiffView for ordinary output (plain <pre>, no diff container)", () => {
     const container = diffContainer("just a normal\nmulti-line result");
-    expect(container.querySelectorAll("pre > div").length).toBe(0);
+    expect(container.querySelector(".pc-diff")).toBeNull();
+    expect(container.querySelectorAll(".pc-diff-line").length).toBe(0);
     expect(screen.getByText(/just a normal/)).toBeInTheDocument();
+  });
+
+  it("keeps the diff render and +/- counts stable across open/collapse toggles", () => {
+    // The diff scan (looksLikeDiff) and count tally (diffCounts) are memoized on
+    // [output, error], so toggling the body open and closed must not change the
+    // detected diff structure or the header counts.
+    const { container } = render(
+      <ToolCall name="edit" input={{ path: "x" }} result={result({ output: fullDiff })} />,
+    );
+    const toggle = screen.getByRole("button");
+
+    // Header counts are derived from the memoized scan even while collapsed:
+    // fullDiff has one "+added" / one "-removed" (file headers excluded).
+    expect(screen.getByText("+1")).toBeInTheDocument();
+    expect(screen.getByText("-1")).toBeInTheDocument();
+
+    fireEvent.click(toggle); // open
+    const openHtml = (container.querySelector(".pc-diff") as HTMLElement).innerHTML;
+    const openLineCount = container.querySelectorAll(".pc-diff .pc-diff-line").length;
+
+    fireEvent.click(toggle); // collapse — body unmounts, counts must persist
+    expect(screen.getByText("+1")).toBeInTheDocument();
+    expect(screen.getByText("-1")).toBeInTheDocument();
+
+    fireEvent.click(toggle); // re-open — identical diff render, no re-scan drift
+    const reopenHtml = (container.querySelector(".pc-diff") as HTMLElement).innerHTML;
+    const reopenLineCount = container.querySelectorAll(".pc-diff .pc-diff-line").length;
+
+    expect(reopenHtml).toBe(openHtml);
+    expect(reopenLineCount).toBe(openLineCount);
   });
 });

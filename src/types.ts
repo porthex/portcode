@@ -61,6 +61,8 @@ export interface Settings {
   apiKeySet: boolean;
   defaultPolicy: ToolPolicy;
   workspace: string | null;
+  /** Reveal the agent's reply with a terminal-style typing animation. */
+  typingAnimation: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -69,6 +71,7 @@ export const DEFAULT_SETTINGS: Settings = {
   apiKeySet: false,
   defaultPolicy: "ask",
   workspace: null,
+  typingAnimation: true,
 };
 
 /**
