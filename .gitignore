@@ -60,3 +60,10 @@ graphify-out/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
 
 # Generated knowledge graph - regenerate locally; not committed (it can embed doc content)
 graphify-out/
+
+# ruflo / claude-flow agent state — local, machine-specific tooling artifacts (never committed)
+.swarm/
+.hive-mind/
+.claude-flow/
+ruvector.db
+ruvector.db-*
