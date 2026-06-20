@@ -62,16 +62,6 @@ zeroize = "1"
 # rust-version bump above).
 iroh = "1"
 
-# iroh pulls `wmi` transitively (netwatch/portmapper) on Windows. `wmi` accepts
-# the windows crates in the range 0.59–0.63 and, left alone, cargo greedily picks
-# 0.62 — which conflicts with tauri's pinned 0.61 and skews windows-core vs
-# windows-result, breaking `wmi`'s compile on Windows. Pin the ecosystem to
-# tauri's 0.61 line (which `wmi` also supports) so the whole tree unifies. These
-# are version-only pins; Portcode doesn't use the `windows`/`windows-core` APIs
-# directly.
-windows = "=0.61.3"
-windows-core = "=0.61.2"
-
 # search / matching for tools
 regex = "1"
 globset = "0.4"
