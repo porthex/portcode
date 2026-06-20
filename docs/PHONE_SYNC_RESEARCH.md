@@ -20,7 +20,7 @@
 2. **Re-frame the architecture.** The phone is **not** an equal peer that runs the agent. The
    desktop keeps the files, the shell, and the agent loop; it **stays running at home**. The phone
    is a **secure remote-control + session-continuation surface**. That means the core problem is a
-   **secure real-time relay**, *not* offline-first multi-writer data sync.
+   **secure real-time relay**, _not_ offline-first multi-writer data sync.
 
 3. **A full CRDT (Automerge/Yjs) is overkill here.** The session is a 1-writer-at-a-time,
    1-to-1, append-mostly log (transcript + tool-call events + diffs). A plain **append-only event
@@ -32,7 +32,7 @@
      hole-punching and a self-hostable relay fallback).
    - **E2E crypto:** application-layer **Noise** via the [`snow`](https://docs.rs/snow) crate
      (`Noise_*_25519_ChaChaPoly_BLAKE2s`), QR/SAS pairing.
-   - **Mobile app:** **Tauri v2 mobile** first (reuses *both* the Rust core and the React/TS UI),
+   - **Mobile app:** **Tauri v2 mobile** first (reuses _both_ the Rust core and the React/TS UI),
      with native background plugins; fall back to **uniffi**-exposed Rust core + native/RN UI if
      background robustness demands it.
    - **Wake-from-AFK:** **FCM high-priority** (free) or self-hosted **ntfy/UnifiedPush** on
@@ -54,9 +54,13 @@ files and shell** — the phone literally cannot run `shell`/`fs_edit` against y
 **Model B — True local-first state sync (CRDTs).** Replicate the session log to a phone replica so
 the phone has a full copy and can edit offline. CRDTs (Automerge/Yjs) auto-merge concurrent edits.
 
-**Verdict: Model A.** Model B solves a problem you don't have. Your topology is the *easy* case for
-sync — **one writer at a time, 1-to-1, append-mostly** — where CRDTs are "largely unused machinery"
-and an append-only log "often needs no CRDT at all." [jackson.dev](https://jackson.dev/post/crdts_as_database/)
+**Verdict: Model A.** Model B solves a problem you don't have. Your topology is the _easy_ case for
+sync — **one writer at a time, 1-to-1, append-mostly** — exactly where the simpler
+server-authoritative / append-log approaches are sufficient and CRDTs' conflict-resolution
+machinery goes unused. CRDTs earn their cost only with genuine concurrent multi-writer editing of
+the same data; for everything else, simpler designs win.
+[mattweidner.com](https://mattweidner.com/2024/06/04/server-architectures.html) ·
+[Ably: you don't need CRDTs](https://dev.to/ably/you-dont-need-crdts-for-collaborative-experiences-emj)
 The session transcript, tool-call events, and diffs are immutable once written, so the delta to
 sync is computable directly from the log. Use Model A for the live drive-the-session path, and a
 simple append-only log replication for catching the phone up after it reconnects.
@@ -65,11 +69,11 @@ simple append-only log replication for catching the phone up after it reconnects
 
 ## 2. Transport — what's fastest + most reliable on flaky mobile networks
 
-| Transport | HOL blocking | Survives Wi-Fi↔cellular handoff | Self-host cost | Rust maturity |
-|---|---|---|---|---|
-| **WebSocket (TCP)** | Yes — one lost packet stalls the whole stream | **No** — connection breaks on IP change, app must reconnect & restore state | Trivial (just TLS+TCP) | High (`tokio-tungstenite`) |
-| **WebRTC DataChannel** | No (configurable reliability/order) | Partial (ICE restart) | Needs STUN+**TURN** (coturn) | Pre-production (`webrtc-rs` v0.17 final Tokio release; ~109 KiB leak/conn; Sans-I/O `rtc` rewrite ongoing) or `datachannel` (libdatachannel) |
-| **QUIC (HTTP/3, WebTransport)** | **No** — independent streams | **Yes** — Connection ID persists across IP/port change (connection migration) | Self-hostable | High (`quinn`) |
+| Transport                       | HOL blocking                                  | Survives Wi-Fi↔cellular handoff                                               | Self-host cost               | Rust maturity                                                                                                                                |
+| ------------------------------- | --------------------------------------------- | ----------------------------------------------------------------------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| **WebSocket (TCP)**             | Yes — one lost packet stalls the whole stream | **No** — connection breaks on IP change, app must reconnect & restore state   | Trivial (just TLS+TCP)       | High (`tokio-tungstenite`)                                                                                                                   |
+| **WebRTC DataChannel**          | No (configurable reliability/order)           | Partial (ICE restart)                                                         | Needs STUN+**TURN** (coturn) | Pre-production (`webrtc-rs` v0.17 final Tokio release; ~109 KiB leak/conn; Sans-I/O `rtc` rewrite ongoing) or `datachannel` (libdatachannel) |
+| **QUIC (HTTP/3, WebTransport)** | **No** — independent streams                  | **Yes** — Connection ID persists across IP/port change (connection migration) | Self-hostable                | High (`quinn`)                                                                                                                               |
 
 Key facts:
 
@@ -134,7 +138,7 @@ end-to-end**.
 - **Cipher choice:** prefer **ChaCha20-Poly1305** — it's faster than AES-GCM on phone CPUs lacking
   AES hardware, and is what WireGuard mandates.
   [chacha20poly1305 crate](https://docs.rs/chacha20poly1305) · [WireGuard](https://www.wireguard.com/protocol/)
-- **WebRTC note:** a *plain TURN relay* keeps DTLS-SRTP end-to-end (relay sees only ciphertext),
+- **WebRTC note:** a _plain TURN relay_ keeps DTLS-SRTP end-to-end (relay sees only ciphertext),
   but the moment you add an **SFU/middlebox** that terminates DTLS, you must add SFrame / Insertable
   Streams app-layer encryption to keep true E2EE.
   [webrtcHacks](https://webrtchacks.com/true-end-to-end-encryption-with-webrtc-insertable-streams/)
@@ -172,7 +176,7 @@ You already ship **Tauri v2 (Rust core + React/TS UI)**. Reuse options, most-reu
    RN) UI.** uniffi is Mozilla's production-proven bindings generator (Firefox, hundreds of millions
    of users) with **Swift + Kotlin** output and **async** support (`async fn` ↔ Swift `async`/Kotlin
    `suspend`). [uniffi futures](https://mozilla.github.io/uniffi-rs/next/futures.html) Caveats: no
-   cross-FFI **cancellation** (build your own cancel channel — matters for aborting in-flight
+   cross-FFI **cancellation** (build your own cancel channel — essential for aborting in-flight
    network ops), and uniffi is "a long way from 1.0" so expect binding churn. There's also an
    early-stage [uniffi for React Native](https://hacks.mozilla.org/2024/12/introducing-uniffi-for-react-native-rust-powered-turbo-modules/)
    if you want an RN UI over the same Rust.
@@ -197,6 +201,7 @@ core and re-exposing it via **uniffi** under a native UI, with no rewrite of you
 This is the crux of "work from phone when AFK," and where the free constraint breaks on iOS.
 
 **iOS:**
+
 - iOS **does not allow arbitrary apps to hold long-lived TCP/WebSocket connections in the
   background**; a backgrounded app is suspended and its sockets torn down — **APNs push is
   effectively the only sanctioned way to wake it.**
@@ -204,8 +209,8 @@ This is the crux of "work from phone when AFK," and where the free constraint br
 - A silent/background push (`content-available:1`) grants only a **~30-second** window before
   re-suspension. [appsonair](https://www.appsonair.com/blogs/background-execution-limits-in-ios-what-every-developer-must-know)
 - Silent-push delivery is **best-effort and throttled** (battery/usage/frequency). Practical ceiling
-  is roughly **2–3/hour per device** (some report fewer). ⚠️ *Apple does not publish a hard number —
-  treat this as observed guidance, not a guarantee.*
+  is roughly **2–3/hour per device** (some report fewer). ⚠️ _Apple does not publish a hard number —
+  treat this as observed guidance, not a guarantee._
   [Pushwoosh](https://help.pushwoosh.com/hc/en-us/articles/26713265335581-Understanding-Silent-Push-Notification-Behavior-and-Limits-on-iOS)
 - **APNs requires a paid Apple Developer Program membership ($99/year)** — **no free tier**; and the
   fee waiver is **only** for nonprofits/accredited-edu/government — **individuals/hobbyists are
@@ -214,6 +219,7 @@ This is the crux of "work from phone when AFK," and where the free constraint br
   (Token-based `.p8` keys don't expire, unlike `.p12` certs — but you still need the paid account.)
 
 **Android (fully free + self-hostable):**
+
 - In **Doze mode** Android suspends network, ignores wakelocks, and defers alarms/jobs/syncs until a
   maintenance window. [Android Doze](https://developer.android.com/training/monitoring-device-state/doze-standby)
 - **FCM high-priority messages bypass Doze** (immediate delivery + temp network + wakelock); normal
@@ -232,7 +238,7 @@ Tailscale/headscale) **keeps a connection alive only while the app is awake/fore
 them can wake a suspended iOS app or bypass Doze.** That always requires APNs (iOS) or
 FCM/UnifiedPush (Android). [Apple](https://developer.apple.com/forums/thread/757385)
 
-**Pattern:** push is a *doorbell*, not a *pipe*. On wake-up, the push tells the phone "there's new
+**Pattern:** push is a _doorbell_, not a _pipe_. On wake-up, the push tells the phone "there's new
 session activity"; the app then opens the iroh/Noise channel during its brief window to pull the
 delta and/or show a notification. Heavy lifting stays on the always-on desktop.
 
@@ -242,17 +248,17 @@ delta and/or show a notification. Heavy lifting stays on the always-on desktop.
 
 Surveyed for free / self-hostable / OSS / E2E:
 
-| Framework | OSS | Self-host | Free | E2E encryption | Fit for us |
-|---|---|---|---|---|---|
-| Automerge + automerge-repo | MIT | Yes (ref server is "unsecured Express app") | Yes | **No** built-in; DIY | CRDT overkill; no auth/E2E yet |
-| Yjs / Yrs | MIT | Yes | Yes | DIY (relay can carry ciphertext) | CRDT overkill |
-| ElectricSQL | Apache-2.0 | Yes | Cloud free beta | Yes (sync ciphertext as JSON) | Read-path only; you build writes |
-| PowerSync | OSS + Cloud | Yes | $0 tier (idle-deactivated) | Planned (Enterprise) | E2E not GA |
-| Jazz | MIT | Yes (own server) | Free tier + $9–79/mo | **Yes, by default** | Strong if you want turnkey E2E |
-| Triplit | OSS | Yes | Cloud free tier | Not a headline | Acquired by Supabase 2025 |
-| Evolu | OSS | Yes (**blind relay**) | Free | **Yes, by default** (RBSR, not CRDT) | Closest philosophy match |
-| Turso / libSQL | OSS (`sqld`) | Yes | Usage-based | No built-in | Server-authoritative; no E2E |
-| Ditto | **Closed SDK** | On-prem (paid) | Sales-led | Yes (commercial) | Not free/OSS |
+| Framework                  | OSS            | Self-host                                   | Free                       | E2E encryption                       | Fit for us                       |
+| -------------------------- | -------------- | ------------------------------------------- | -------------------------- | ------------------------------------ | -------------------------------- |
+| Automerge + automerge-repo | MIT            | Yes (ref server is "unsecured Express app") | Yes                        | **No** built-in; DIY                 | CRDT overkill; no auth/E2E yet   |
+| Yjs / Yrs                  | MIT            | Yes                                         | Yes                        | DIY (relay can carry ciphertext)     | CRDT overkill                    |
+| ElectricSQL                | Apache-2.0     | Yes                                         | Cloud free beta            | Yes (sync ciphertext as JSON)        | Read-path only; you build writes |
+| PowerSync                  | OSS + Cloud    | Yes                                         | $0 tier (idle-deactivated) | Planned (Enterprise)                 | E2E not GA                       |
+| Jazz                       | MIT            | Yes (own server)                            | Free tier + $9–79/mo       | **Yes, by default**                  | Strong if you want turnkey E2E   |
+| Triplit                    | OSS            | Yes                                         | Cloud free tier            | Not a headline                       | Acquired by Supabase 2025        |
+| Evolu                      | OSS            | Yes (**blind relay**)                       | Free                       | **Yes, by default** (RBSR, not CRDT) | Closest philosophy match         |
+| Turso / libSQL             | OSS (`sqld`)   | Yes                                         | Usage-based                | No built-in                          | Server-authoritative; no E2E     |
+| Ditto                      | **Closed SDK** | On-prem (paid)                              | Sales-led                  | Yes (commercial)                     | Not free/OSS                     |
 
 Sources: [Automerge 2.0](https://automerge.org/blog/automerge-2/) ·
 [automerge-repo](https://automerge.org/blog/automerge-repo/) ·
@@ -267,7 +273,7 @@ Sources: [Automerge 2.0](https://automerge.org/blog/automerge-2/) ·
 
 **Verdict: roll your own append-only encrypted log.** For a 1-writer, 1-to-1, append-mostly session,
 the turnkey CRDT/sync frameworks add machinery you won't use, and most don't do E2E by default. Your
-existing **SQLite-WAL session store already *is* the log** — replicating its new rows over the
+existing **SQLite-WAL session store already _is_ the log** — replicating its new rows over the
 iroh+Noise channel is a small, well-understood problem. If you ever want it off-the-shelf with
 E2E-by-default and a blind relay, **Evolu** (philosophy-aligned: blind relay, E2E, free,
 self-hostable, RBSR not CRDT) or **Jazz** (MIT, E2E by default, self-hostable) are the strongest
@@ -277,17 +283,18 @@ fallbacks.
 
 ## 7. Recommended concrete stack
 
-| Layer | Pick | Why | Cost |
-|---|---|---|---|
-| **Topology** | Always-on desktop = brain; phone = remote-control + continuation | Execution needs desktop files/shell | — |
-| **Transport** | **iroh** (QUIC, dial-by-key, hole-punch + self-host relay) | HOL-immune, survives handoff, P2P, Rust + Swift/Kotlin bindings | Free (self-host relay) |
-| **E2E crypto** | **Noise via `snow`** (`Noise_XX→KK_25519_ChaChaPoly_BLAKE2s`) + **QR/SAS pairing** | Blind relay, forward secrecy, phone-friendly cipher | Free |
-| **Sync model** | **Roll-your-own append-only encrypted event log** (replicate new SQLite-WAL rows) | CRDT overkill for 1-writer 1-to-1 | Free |
-| **Phone app** | **Tauri v2 mobile** first; **uniffi** + native UI as escape hatch | Reuse Rust core (+ React UI in Tauri) | Free |
-| **Wake (Android)** | **FCM high-priority** or self-hosted **ntfy/UnifiedPush** | Bypasses Doze; fully free | Free |
-| **Wake (iOS)** | **APNs** (mandatory) | Only sanctioned background wake on iOS | **$99/yr** |
+| Layer              | Pick                                                                               | Why                                                             | Cost                   |
+| ------------------ | ---------------------------------------------------------------------------------- | --------------------------------------------------------------- | ---------------------- |
+| **Topology**       | Always-on desktop = brain; phone = remote-control + continuation                   | Execution needs desktop files/shell                             | —                      |
+| **Transport**      | **iroh** (QUIC, dial-by-key, hole-punch + self-host relay)                         | HOL-immune, survives handoff, P2P, Rust + Swift/Kotlin bindings | Free (self-host relay) |
+| **E2E crypto**     | **Noise via `snow`** (`Noise_XX→KK_25519_ChaChaPoly_BLAKE2s`) + **QR/SAS pairing** | Blind relay, forward secrecy, phone-friendly cipher             | Free                   |
+| **Sync model**     | **Roll-your-own append-only encrypted event log** (replicate new SQLite-WAL rows)  | CRDT overkill for 1-writer 1-to-1                               | Free                   |
+| **Phone app**      | **Tauri v2 mobile** first; **uniffi** + native UI as escape hatch                  | Reuse Rust core (+ React UI in Tauri)                           | Free                   |
+| **Wake (Android)** | **FCM high-priority** or self-hosted **ntfy/UnifiedPush**                          | Bypasses Doze; fully free                                       | Free                   |
+| **Wake (iOS)**     | **APNs** (mandatory)                                                               | Only sanctioned background wake on iOS                          | **$99/yr**             |
 
 **Suggested build order:**
+
 1. Desktop-side: expose the SQLite-WAL session log as an append-only event stream + a command intake.
 2. Stand up iroh transport with a self-hosted relay; prove desktop↔desktop first.
 3. Layer Noise (`snow`) on top; implement QR/SAS pairing + persisted device keys.
@@ -297,7 +304,7 @@ fallbacks.
 
 ---
 
-## 8. What money *can't* buy around
+## 8. What money _can't_ buy around
 
 Be upfront with users (it fits Portcode's "don't blur what's real" ethos): **the iOS background
 story costs $99/yr and is throttled by Apple no matter what you build.** Android can be 100% free and
