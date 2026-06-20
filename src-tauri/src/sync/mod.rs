@@ -87,8 +87,7 @@ impl SyncHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::StreamEvent;
-    use protocol::SyncFrame;
+    // StreamEvent/SyncFrame come via `use super::*`; only TryRecvError is new.
     use tokio::sync::broadcast::error::TryRecvError;
 
     fn delta() -> StreamEvent {

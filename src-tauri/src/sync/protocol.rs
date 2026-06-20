@@ -72,8 +72,8 @@ pub enum SyncFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{MessageRow, SessionRow};
-    use crate::llm::{Block, StreamEvent};
+    // SessionRow/MessageRow/StreamEvent come via `use super::*`; only Block is new.
+    use crate::llm::Block;
 
     /// Round-trip a frame through JSON and assert the decoded value re-encodes to
     /// the same JSON — the property both ends rely on.

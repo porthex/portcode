@@ -21,7 +21,7 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRow {
     pub id: String,
@@ -534,7 +534,7 @@ mod tests {
         // after_seq=0 must return seq 1 and 2, NOT seq 0 (boundary is `>`, not `>=`)
         let rows = db.messages_since("s", 0);
         let seqs: Vec<i64> = rows.iter().map(|r| r.seq).collect();
-        assert_eq!(seqs, vec![1, 2]);
+        assert_eq!(seqs, [1, 2]);
     }
 
     #[test]
@@ -556,7 +556,7 @@ mod tests {
         db.append_message("s", &text("c"), 4);
 
         let seqs: Vec<i64> = db.messages_since("s", -1).iter().map(|r| r.seq).collect();
-        assert_eq!(seqs, vec![0, 1, 2]);
+        assert_eq!(seqs, [0, 1, 2]);
     }
 
     #[test]
