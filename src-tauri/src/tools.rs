@@ -564,3 +564,97 @@ impl Tool for Shell {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn base() -> PathBuf {
+        // Absolute on Windows + Linux; `resolve_for_write` is lexical, so the dir
+        // does not need to exist.
+        std::env::temp_dir().join("portcode_sandbox_test_base")
+    }
+
+    #[test]
+    fn resolve_for_write_accepts_paths_inside_the_workspace() {
+        let b = base();
+        let p = resolve_for_write(&b, "sub/file.txt").unwrap();
+        assert!(p.starts_with(&b));
+        assert!(p.ends_with("file.txt"));
+    }
+
+    #[test]
+    fn resolve_for_write_normalizes_dot_and_dotdot_within_base() {
+        let b = base();
+        assert_eq!(
+            resolve_for_write(&b, "a/../b/./c.txt").unwrap(),
+            b.join("b").join("c.txt")
+        );
+    }
+
+    #[test]
+    fn resolve_for_write_rejects_a_parent_escape() {
+        let b = base();
+        assert!(resolve_for_write(&b, "../escape.txt")
+            .unwrap_err()
+            .contains("outside the workspace"));
+    }
+
+    #[test]
+    fn resolve_for_write_rejects_an_absolute_path_outside_base() {
+        let b = base();
+        let outside = b.parent().unwrap().join("other.txt");
+        assert!(resolve_for_write(&b, outside.to_str().unwrap())
+            .unwrap_err()
+            .contains("outside the workspace"));
+    }
+
+    #[test]
+    fn str_arg_extracts_a_string_or_reports_missing_and_wrong_type() {
+        let v = json!({ "path": "x", "n": 3 });
+        assert_eq!(str_arg(&v, "path").unwrap(), "x");
+        assert!(str_arg(&v, "absent")
+            .unwrap_err()
+            .contains("missing required argument"));
+        assert!(str_arg(&v, "n").is_err()); // present but not a string
+    }
+
+    #[test]
+    fn truncate_chars_passes_short_input_and_caps_long_input() {
+        assert_eq!(truncate_chars("hello".into(), 10), "hello");
+        let out = truncate_chars("x".repeat(20), 5);
+        assert!(out.starts_with("xxxxx"));
+        assert!(out.contains("[output truncated at 5 characters]"));
+    }
+
+    #[test]
+    fn shell_invocation_maps_known_shells_and_rejects_unknown() {
+        let (prog, args) = shell_invocation("powershell").unwrap();
+        assert_eq!(prog, "powershell");
+        assert!(args.contains(&"-NonInteractive"));
+        assert_eq!(shell_invocation("pwsh").unwrap().0, "pwsh");
+        let (cprog, cargs) = shell_invocation("cmd").unwrap();
+        assert_eq!(cprog, "cmd");
+        assert_eq!(cargs.len(), 1);
+        assert_eq!(cargs[0], "/C");
+        assert!(shell_invocation("bash")
+            .unwrap_err()
+            .contains("unknown shell"));
+    }
+
+    #[test]
+    fn unified_diff_marks_added_and_removed_lines() {
+        let d = unified_diff("a\nb\n", "a\nc\n");
+        assert!(d.contains("-b"));
+        assert!(d.contains("+c"));
+    }
+
+    #[test]
+    fn summarize_prefers_path_command_pattern_then_falls_back_to_name() {
+        assert_eq!(FsRead.summarize(&json!({ "path": "src/x.rs" })), "src/x.rs");
+        assert_eq!(Shell.summarize(&json!({ "command": "ls" })), "ls");
+        assert_eq!(GrepTool.summarize(&json!({ "pattern": "foo" })), "foo");
+        assert_eq!(FsRead.summarize(&json!({})), "fs_read"); // no recognized key → tool name
+    }
+}
