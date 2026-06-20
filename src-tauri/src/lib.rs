@@ -68,15 +68,25 @@ fn set_api_key(key: String) -> Result<(), String> {
 
 // ── subscription OAuth ───────────────────────────────────────────────────────
 
-/// Sign-in state for the frontend. `expires_at` is unix seconds; `account` is a
-/// reserved label (always `None` for now — Anthropic's token response carries no
-/// stable account identifier we surface yet).
+/// Sign-in state for the frontend. `expires_at` is unix seconds; `account` is the
+/// signed-in email and `tier` a display label ("Claude Max" / "Claude Pro") —
+/// both best-effort from the OAuth profile, so either may be `None`.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OAuthStatus {
     signed_in: bool,
     expires_at: Option<i64>,
     account: Option<String>,
+    tier: Option<String>,
+}
+
+/// Map a stored plan code (`"max"` / `"pro"`) to a user-facing tier label.
+fn tier_label(plan: Option<&str>) -> Option<String> {
+    match plan {
+        Some("max") => Some("Claude Max".to_string()),
+        Some("pro") => Some("Claude Pro".to_string()),
+        _ => None,
+    }
 }
 
 fn current_oauth_status() -> OAuthStatus {
@@ -84,12 +94,14 @@ fn current_oauth_status() -> OAuthStatus {
         Some(t) => OAuthStatus {
             signed_in: true,
             expires_at: Some(t.expires_at),
-            account: None,
+            account: t.email,
+            tier: tier_label(t.plan.as_deref()),
         },
         None => OAuthStatus {
             signed_in: false,
             expires_at: None,
             account: None,
+            tier: None,
         },
     }
 }
@@ -101,11 +113,7 @@ async fn start_oauth_login(state: State<'_, AppState>) -> Result<OAuthStatus, St
     let http = state.http.clone();
     let tokens = oauth::run_loopback_login(&http).await?;
     secrets::set_oauth(&tokens)?;
-    Ok(OAuthStatus {
-        signed_in: true,
-        expires_at: Some(tokens.expires_at),
-        account: None,
-    })
+    Ok(current_oauth_status())
 }
 
 /// Report whether a subscription sign-in is currently stored.

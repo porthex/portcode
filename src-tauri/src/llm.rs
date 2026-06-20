@@ -333,6 +333,8 @@ mod tests {
             access_token: "access".into(),
             refresh_token: "refresh".into(),
             expires_at: 0,
+            email: None,
+            plan: None,
         })
     }
 

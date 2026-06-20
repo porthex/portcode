@@ -30,6 +30,9 @@ const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 const TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 /// Space-separated OAuth scopes required for subscription inference.
 const SCOPES: &str = "org:create_api_key user:profile user:inference";
+/// Account-profile endpoint — returns the signed-in account's email + plan tier.
+/// Display-only; endpoint verified against multiple public OAuth clients.
+const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 
 /// How long the whole interactive login may take before we give up.
 const LOGIN_TIMEOUT_SECS: u64 = 180;
@@ -189,6 +192,8 @@ async fn post_tokens(
         access_token: tr.access_token,
         refresh_token,
         expires_at: now_secs() + tr.expires_in,
+        email: None,
+        plan: None,
     })
 }
 
@@ -219,7 +224,67 @@ pub async fn run_loopback_login(http: &reqwest::Client) -> Result<OAuthTokens, S
     .await
     .map_err(|_| "Timed out waiting for the browser sign-in to finish.".to_string())??;
 
-    exchange_code(http, &code, &state, &pkce.verifier, &redirect_uri).await
+    let mut tokens = exchange_code(http, &code, &state, &pkce.verifier, &redirect_uri).await?;
+    // Best-effort: enrich the tokens with the account profile (email + plan
+    // tier) for display. A profile hiccup must never fail a successful sign-in.
+    if let Some(profile) = fetch_profile(http, &tokens.access_token).await {
+        tokens.email = profile.email;
+        tokens.plan = profile.plan;
+    }
+    Ok(tokens)
+}
+
+// ── account profile (display only) ───────────────────────────────────────────
+
+/// Minimal view of the `account` object from `/api/oauth/profile`.
+#[derive(Deserialize)]
+struct ProfileAccount {
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    has_claude_max: bool,
+    #[serde(default)]
+    has_claude_pro: bool,
+}
+
+#[derive(Deserialize)]
+struct ProfileResponse {
+    #[serde(default)]
+    account: Option<ProfileAccount>,
+}
+
+/// The signed-in account's display metadata. `plan` is `"max"` / `"pro"` / `None`.
+pub struct Profile {
+    pub email: Option<String>,
+    pub plan: Option<String>,
+}
+
+/// Fetch the account email + plan tier from `/api/oauth/profile`. Returns `None`
+/// on ANY failure (network, auth, parse) — this is display-only metadata and
+/// must never block sign-in or inference.
+pub async fn fetch_profile(http: &reqwest::Client, access_token: &str) -> Option<Profile> {
+    let resp = http
+        .get(PROFILE_URL)
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let account = resp.json::<ProfileResponse>().await.ok()?.account?;
+    let plan = if account.has_claude_max {
+        Some("max".to_string())
+    } else if account.has_claude_pro {
+        Some("pro".to_string())
+    } else {
+        None
+    };
+    Some(Profile {
+        email: account.email,
+        plan,
+    })
 }
 
 /// Accept connections until the OAuth callback arrives, ignoring speculative

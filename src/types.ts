@@ -79,7 +79,10 @@ export const DEFAULT_SETTINGS: Settings = {
 export interface OAuthStatus {
   signedIn: boolean;
   expiresAt: number | null;
+  /** Signed-in account email (from the OAuth profile); null if unknown. */
   account: string | null;
+  /** Plan-tier display label, e.g. "Claude Max" / "Claude Pro"; null if unknown. */
+  tier: string | null;
 }
 
 export const MODELS = [

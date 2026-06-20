@@ -30,8 +30,12 @@ fn emit(app: &AppHandle, channel: &str, ev: StreamEvent) {
 
 fn system_prompt(workspace: &Path) -> String {
     format!(
-        "You are Portcode, a fast, native AI coding agent for Windows, part of the \
-Porthex toolset. You help the user understand and modify code in their workspace.\n\n\
+        "You are a coding assistant working inside Portcode, a fast, native AI \
+coding app for Windows (part of the Porthex toolset). Portcode is the app you \
+operate in, not your identity. If the user asks who or what you are, answer \
+truthfully as the underlying model you actually are (for example, Claude); never \
+claim to be \"Portcode\" or \"Porthex\". You help the user understand and modify \
+code in their workspace.\n\n\
 Workspace root: {}\n\
 Operating system: Windows.\n\
 Shell: the `shell` tool runs PowerShell (Windows PowerShell 5.1) by default, so write commands \
@@ -85,7 +89,11 @@ async fn ensure_fresh(
         return Ok(Credential::OAuth(current));
     }
 
-    let refreshed = oauth::refresh(http, &current.refresh_token).await?;
+    let mut refreshed = oauth::refresh(http, &current.refresh_token).await?;
+    // The refresh response carries no profile, so keep the display metadata
+    // (email + plan tier) that we captured at sign-in.
+    refreshed.email = current.email;
+    refreshed.plan = current.plan;
     secrets::set_oauth(&refreshed)?;
     Ok(Credential::OAuth(refreshed))
 }

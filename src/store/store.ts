@@ -322,7 +322,7 @@ export const useStore = create<AppState>((set, get) => ({
     set({ oauthError: null });
     try {
       await ipc.oauthLogout();
-      set({ oauthStatus: { signedIn: false, expiresAt: null, account: null } });
+      set({ oauthStatus: { signedIn: false, expiresAt: null, account: null, tier: null } });
     } catch (err) {
       set({ oauthError: errMessage(err) });
     }

@@ -20,6 +20,13 @@ pub struct OAuthTokens {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at: i64,
+    /// Account email from the OAuth profile (display only). Optional: the token
+    /// endpoint doesn't return it, and older stored blobs predate this field.
+    #[serde(default)]
+    pub email: Option<String>,
+    /// Subscription plan tier: `"max"` / `"pro"` (display only).
+    #[serde(default)]
+    pub plan: Option<String>,
 }
 
 /// The credential the agent should authenticate with for a given request.
@@ -102,6 +109,8 @@ mod tests {
             access_token: "access-123".into(),
             refresh_token: "refresh-456".into(),
             expires_at: 1_700_000_000,
+            email: Some("user@example.com".into()),
+            plan: Some("max".into()),
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: OAuthTokens = serde_json::from_str(&json).unwrap();

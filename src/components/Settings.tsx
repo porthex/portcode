@@ -88,9 +88,21 @@ export function SettingsPanel() {
                 <div className="min-w-0 text-sm">
                   <div className="flex items-center gap-1.5">
                     <span className="h-2 w-2 shrink-0 rounded-full bg-success" />
-                    <span className="truncate">
+                    <span className="min-w-0 truncate">
                       Signed in{oauthStatus?.account ? ` as ${oauthStatus.account}` : ""}
                     </span>
+                    {oauthStatus?.tier && (
+                      <span
+                        title={oauthStatus.tier}
+                        className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wider shadow-sm ${
+                          /max/i.test(oauthStatus.tier)
+                            ? "bg-gradient-to-r from-amber-300 to-amber-500 text-black"
+                            : "bg-gradient-to-r from-violet-400 to-indigo-500 text-white"
+                        }`}
+                      >
+                        {oauthStatus.tier.replace(/^Claude\s+/, "")}
+                      </span>
+                    )}
                   </div>
                   {oauthStatus?.expiresAt != null && (
                     <div className="mt-0.5 text-xs text-muted">

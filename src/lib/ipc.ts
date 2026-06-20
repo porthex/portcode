@@ -182,7 +182,7 @@ const mock = (() => {
   };
 
   // Fake subscription-auth state so the sign-in UX is testable without Tauri.
-  let oauth: OAuthStatus = { signedIn: false, expiresAt: null, account: null };
+  let oauth: OAuthStatus = { signedIn: false, expiresAt: null, account: null, tier: null };
 
   const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const resolvers = new Map<string, (d: "allow" | "deny") => void>();
@@ -204,6 +204,7 @@ const mock = (() => {
         signedIn: true,
         expiresAt: Math.floor(Date.now() / 1000) + 8 * 60 * 60,
         account: "preview@claude.local",
+        tier: "Claude Max",
       };
       return { ...oauth };
     },
@@ -211,7 +212,7 @@ const mock = (() => {
       return { ...oauth };
     },
     async oauthLogout() {
-      oauth = { signedIn: false, expiresAt: null, account: null };
+      oauth = { signedIn: false, expiresAt: null, account: null, tier: null };
     },
     async resolvePermission(id: string, decision: "allow" | "deny") {
       resolvers.get(id)?.(decision);
