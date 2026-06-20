@@ -5,6 +5,7 @@ mod oauth;
 mod permissions;
 mod secrets;
 mod settings;
+mod sync;
 mod tools;
 
 use std::collections::HashMap;
@@ -325,6 +326,10 @@ pub fn run() {
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 oauth_refresh: Arc::new(tokio::sync::Mutex::new(())),
             });
+            // Phone Sync fan-out hub (Phase 0). The agent/llm `emit` helpers look
+            // this up via `app.try_state` to mirror events; absent until managed,
+            // so this must be registered during setup.
+            app.manage(sync::SyncHub::new());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

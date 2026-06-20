@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::llm::{Block, ChatMessage};
@@ -21,7 +21,7 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRow {
     pub id: String,
@@ -29,6 +29,21 @@ pub struct SessionRow {
     pub workspace: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// One persisted message, with its raw append-only `seq`. Unlike [`UiMessage`]
+/// (the grouped frontend view), this is the flat row Phone Sync replicates: the
+/// `MessageDelta` catch-up frame ships these verbatim. `content` is the typed
+/// block list (same shape as [`ChatMessage::content`]).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageRow {
+    pub id: String,
+    pub session_id: String,
+    pub seq: i64,
+    pub role: String,
+    pub content: Vec<Block>,
+    pub created_at: i64,
 }
 
 #[derive(Serialize)]
@@ -224,6 +239,49 @@ impl Db {
             .collect()
     }
 
+    /// Append-only catch-up delta for Phone Sync: every message in `session_id`
+    /// whose `seq` is **strictly greater** than `after_seq`, in ascending `seq`
+    /// order. Pass `after_seq = -1` to get the whole session (seq starts at 0).
+    ///
+    /// Backed by the `idx_messages_session(session_id, seq)` index. An unknown
+    /// session yields an empty vec (not an error) — a reconnecting phone may ask
+    /// about a session it doesn't yet know.
+    pub fn messages_since(&self, session_id: &str, after_seq: i64) -> Vec<MessageRow> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, session_id, seq, role, content, created_at
+             FROM messages WHERE session_id = ?1 AND seq > ?2 ORDER BY seq",
+        ) else {
+            return Vec::new();
+        };
+        let rows = stmt.query_map(params![session_id, after_seq], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        });
+        let Ok(rows) = rows else { return Vec::new() };
+        rows.filter_map(|res| res.ok())
+            .map(
+                |(id, session_id, seq, role, content, created_at)| MessageRow {
+                    id,
+                    session_id,
+                    seq,
+                    role,
+                    // Same lenient parse as load_chat_messages/ui_messages: corrupt
+                    // content degrades to an empty block list rather than dropping the
+                    // row. TODO(phase-2): surface a warning instead of swallowing it.
+                    content: serde_json::from_str(&content).unwrap_or_default(),
+                    created_at,
+                },
+            )
+            .collect()
+    }
+
     /// Grouped view for the frontend (tool results folded under their assistant).
     pub fn ui_messages(&self, session_id: &str) -> Vec<UiMessage> {
         let conn = self.conn.lock().unwrap();
@@ -293,6 +351,13 @@ mod tests {
     fn text(t: &str) -> ChatMessage {
         ChatMessage {
             role: "user".into(),
+            content: vec![Block::Text { text: t.into() }],
+        }
+    }
+
+    fn assistant(t: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
             content: vec![Block::Text { text: t.into() }],
         }
     }
@@ -437,5 +502,94 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0]["kind"], "tool_use");
         assert_eq!(blocks[1]["kind"], "tool_result");
+    }
+
+    // ── messages_since: the Phone Sync catch-up delta ────────────────────────
+    // Invariants protected here (ruflo tester, Phase 0 review): full pull,
+    // strictly-greater boundary, up-to-date emptiness, ascending order, and
+    // per-session isolation.
+
+    #[test]
+    fn messages_since_minus_one_returns_all_rows() {
+        let db = mem_db();
+        db.create_session("s", "S", None, 1).unwrap();
+        db.append_message("s", &text("first"), 2);
+        db.append_message("s", &assistant("second"), 3);
+        db.append_message("s", &text("third"), 4);
+
+        let rows = db.messages_since("s", -1);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].seq, 0); // seq starts at 0
+        assert_eq!(rows[0].session_id, "s");
+    }
+
+    #[test]
+    fn messages_since_returns_only_rows_strictly_after_the_cursor() {
+        let db = mem_db();
+        db.create_session("s", "S", None, 1).unwrap();
+        db.append_message("s", &text("msg0"), 2);
+        db.append_message("s", &text("msg1"), 3);
+        db.append_message("s", &text("msg2"), 4);
+
+        // after_seq=0 must return seq 1 and 2, NOT seq 0 (boundary is `>`, not `>=`)
+        let rows = db.messages_since("s", 0);
+        let seqs: Vec<i64> = rows.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![1, 2]);
+    }
+
+    #[test]
+    fn messages_since_highest_seq_returns_empty() {
+        let db = mem_db();
+        db.create_session("s", "S", None, 1).unwrap();
+        db.append_message("s", &text("only"), 2);
+
+        // 0 is the only/highest seq, so an up-to-date phone gets nothing back.
+        assert!(db.messages_since("s", 0).is_empty());
+    }
+
+    #[test]
+    fn messages_since_returns_rows_in_ascending_seq_order() {
+        let db = mem_db();
+        db.create_session("s", "S", None, 1).unwrap();
+        db.append_message("s", &text("a"), 2);
+        db.append_message("s", &assistant("b"), 3);
+        db.append_message("s", &text("c"), 4);
+
+        let seqs: Vec<i64> = db.messages_since("s", -1).iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn messages_since_is_isolated_between_sessions() {
+        let db = mem_db();
+        db.create_session("a", "A", None, 1).unwrap();
+        db.create_session("b", "B", None, 1).unwrap();
+        db.append_message("a", &text("in a"), 2);
+        db.append_message("b", &text("in b"), 3);
+
+        let rows_a = db.messages_since("a", -1);
+        assert_eq!(rows_a.len(), 1);
+        assert_eq!(rows_a[0].session_id, "a");
+        assert_eq!(db.messages_since("b", -1).len(), 1);
+    }
+
+    #[test]
+    fn messages_since_unknown_session_returns_empty_not_error() {
+        let db = mem_db();
+        assert!(db.messages_since("no-such-session", -1).is_empty());
+    }
+
+    #[test]
+    fn messages_since_parses_content_back_into_typed_blocks() {
+        // Protects the SyncFrame::MessageDelta payload: content stored by
+        // append_message must re-read as the same Block variant.
+        let db = mem_db();
+        db.create_session("s", "S", None, 1).unwrap();
+        db.append_message("s", &assistant("hello phone"), 2);
+
+        let rows = db.messages_since("s", -1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].role, "assistant");
+        assert!(matches!(&rows[0].content[0], Block::Text { text } if text == "hello phone"));
     }
 }

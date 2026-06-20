@@ -70,8 +70,9 @@ pub struct ChatMessage {
 }
 
 /// Events streamed to the frontend. Tagged + camelCased to match `StreamEvent`
-/// in `src/types.ts`.
-#[derive(Serialize, Clone, Debug)]
+/// in `src/types.ts`. `Deserialize` lets Phone Sync decode it on the phone side
+/// (it is forwarded verbatim inside `sync::protocol::SyncFrame::Live`).
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
     TurnStart {
@@ -143,6 +144,11 @@ enum Building {
 }
 
 fn emit(app: &AppHandle, channel: &str, ev: StreamEvent) {
+    use tauri::Manager;
+    // Mirror every streamed event to Phone Sync (no-op when no phone is attached).
+    if let Some(hub) = app.try_state::<crate::sync::SyncHub>() {
+        hub.publish(channel, ev.clone());
+    }
     let _ = app.emit(channel, ev);
 }
 
