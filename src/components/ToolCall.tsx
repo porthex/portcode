@@ -74,12 +74,11 @@ function DiffView({ text }: { text: string }) {
   return (
     <pre className="max-h-72 overflow-auto rounded bg-bg p-2 font-mono text-[12px] leading-[1.5] select-text">
       {lines.map((line, i) => {
-        let cls = "text-muted";
+        let cls = "text-fg";
         if (line.startsWith("@@")) cls = "text-accent";
         else if (line.startsWith("+++") || line.startsWith("---")) cls = "text-muted";
         else if (line.startsWith("+")) cls = "bg-success/10 text-success";
         else if (line.startsWith("-")) cls = "bg-danger/10 text-danger";
-        else cls = "text-fg";
         return (
           <div key={i} className={`${cls} -mx-2 px-2`}>
             {line || " "}
