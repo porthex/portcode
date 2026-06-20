@@ -9,15 +9,26 @@ name: Release (Linux)
 # the only token used is the workflow's built-in `GITHUB_TOKEN`, solely to
 # upload assets to the release.
 #
-# Trigger: pushing a version tag (`v*`) cuts a DRAFT release with the bundles
-# attached, so a maintainer reviews and publishes. `workflow_dispatch` lets you
-# build the bundles on demand without creating a release (handy for testing);
-# in both cases the bundles are also uploaded as workflow artifacts.
+# Trigger: publishing a GitHub Release (`release: published`) builds the bundles
+# and attaches them to that release. `workflow_dispatch` still lets you build the
+# bundles on demand without creating a release (handy for testing); in both cases
+# the bundles are also uploaded as workflow artifacts.
+#
+# CAVEAT — GITHUB_TOKEN does not trigger workflows: a Release (or tag) created by
+# the default GITHUB_TOKEN will NOT fire this `release: published` event, exactly
+# as it would not have fired the old `push: tags` trigger. So if release-please
+# publishes the Release using GITHUB_TOKEN, this workflow stays dormant. A
+# fully-automated Linux build therefore requires release-please to authenticate
+# with a PAT or GitHub App token (so the Release is attributed to a real identity
+# that triggers downstream workflows), OR a human to publish the Release manually
+# (which does fire `release: published`).
 
 on:
-  push:
-    tags:
-      - "v*"
+  # See the CAVEAT above: a Release published by the default GITHUB_TOKEN will NOT
+  # fire this event. Use a PAT / GitHub App token in release-please, or publish
+  # the Release by hand, to actually trigger this build.
+  release:
+    types: [published]
   workflow_dispatch:
 
 # `contents: write` is required for tauri-action to create the GitHub Release
