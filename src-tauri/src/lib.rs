@@ -5,6 +5,7 @@ mod oauth;
 mod permissions;
 mod secrets;
 mod settings;
+mod sync;
 mod tools;
 
 use std::collections::HashMap;
@@ -296,6 +297,44 @@ fn resolve_permission(state: State<AppState>, id: String, decision: String) {
     permissions::resolve(&state.pending, &id, d);
 }
 
+// ── Phone Sync (Phase 1b: identity + pairing surface) ────────────────────────
+
+/// Pairing/identity snapshot for the frontend.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PhoneSyncStatus {
+    /// base64 of this desktop's long-term Noise static public key.
+    device_public_key: String,
+    paired: Vec<db::PairedDevice>,
+}
+
+/// Report this device's identity (creating it on first call) plus paired devices.
+#[tauri::command]
+fn phone_sync_status(state: State<AppState>) -> Result<PhoneSyncStatus, String> {
+    use base64::Engine as _;
+    let identity = sync::pairing::device_identity()?;
+    Ok(PhoneSyncStatus {
+        device_public_key: base64::engine::general_purpose::STANDARD.encode(&identity.public),
+        paired: state.db.list_paired_devices(),
+    })
+}
+
+/// Begin a pairing attempt; returns the QR payload to display.
+#[tauri::command]
+fn phone_sync_begin_pairing() -> Result<sync::pairing::PairingPayload, String> {
+    sync::pairing::begin_pairing()
+}
+
+/// Forget a paired device by its base64 public key. Idempotent. (The device list
+/// itself comes from `phone_sync_status` — no separate list command.)
+#[tauri::command]
+fn phone_sync_unpair(state: State<AppState>, public_key: String) -> Result<(), String> {
+    state
+        .db
+        .remove_paired_device(&public_key)
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -328,6 +367,10 @@ pub fn run() {
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 oauth_refresh: Arc::new(tokio::sync::Mutex::new(())),
             });
+            // Phone Sync fan-out hub (Phase 0). The agent/llm `emit` helpers look
+            // this up via `app.try_state` to mirror events; absent until managed,
+            // so this must be registered during setup.
+            app.manage(sync::SyncHub::new());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -345,7 +388,10 @@ pub fn run() {
             list_dir,
             run_agent,
             cancel_agent,
-            resolve_permission
+            resolve_permission,
+            phone_sync_status,
+            phone_sync_begin_pairing,
+            phone_sync_unpair
         ])
         .run(tauri::generate_context!())
         .expect("error while running Portcode");

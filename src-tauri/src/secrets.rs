@@ -6,12 +6,15 @@
 //!   * `anthropic`        — a raw Anthropic API key (string).
 //!   * `anthropic-oauth`  — subscription OAuth tokens, serialized as JSON.
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 
 const SERVICE: &str = "dev.porthex.portcode";
 const ACCOUNT: &str = "anthropic";
 const OAUTH_ACCOUNT: &str = "anthropic-oauth";
+const DEVICE_ACCOUNT: &str = "phone-sync-device";
 
 /// Subscription OAuth tokens. `expires_at` is an absolute unix timestamp in
 /// **seconds** (not millis) marking when `access_token` stops being valid.
@@ -84,6 +87,42 @@ pub fn clear_oauth() -> Result<(), String> {
     }
 }
 
+// ── Phone Sync device identity ───────────────────────────────────────────────
+
+/// The device's long-term Noise static keypair, base64-encoded for the credential
+/// store (keyring stores strings). The private half must never be written to disk
+/// in any other form.
+#[derive(Serialize, Deserialize)]
+struct StoredDeviceKey {
+    public: String,
+    private: String,
+}
+
+fn device_entry() -> Result<Entry, String> {
+    Entry::new(SERVICE, DEVICE_ACCOUNT).map_err(|e| e.to_string())
+}
+
+/// Persist the device static keypair (raw bytes) in the credential store.
+pub fn set_device_key(public: &[u8], private: &[u8]) -> Result<(), String> {
+    let stored = StoredDeviceKey {
+        public: B64.encode(public),
+        private: B64.encode(private),
+    };
+    let json = serde_json::to_string(&stored).map_err(|e| e.to_string())?;
+    device_entry()?
+        .set_password(&json)
+        .map_err(|e| e.to_string())
+}
+
+/// Load the device static keypair as `(public, private)` raw bytes, if stored.
+pub fn get_device_key() -> Option<(Vec<u8>, Vec<u8>)> {
+    let json = device_entry().ok()?.get_password().ok()?;
+    let stored: StoredDeviceKey = serde_json::from_str(&json).ok()?;
+    let public = B64.decode(stored.public).ok()?;
+    let private = B64.decode(stored.private).ok()?;
+    Some((public, private))
+}
+
 // ── unified lookup ───────────────────────────────────────────────────────────
 
 /// Pick the credential to authenticate with. OAuth (a subscription sign-in)
@@ -117,5 +156,21 @@ mod tests {
         assert_eq!(back.access_token, "access-123");
         assert_eq!(back.refresh_token, "refresh-456");
         assert_eq!(back.expires_at, 1_700_000_000);
+    }
+
+    // Pure encoding test (no keyring I/O — that can't run on headless CI): binary
+    // key material survives base64 → JSON → base64 round-trip intact.
+    #[test]
+    fn device_key_bytes_round_trip_through_base64_json() {
+        let public = vec![1u8, 2, 3, 250, 251, 255];
+        let private = vec![9u8, 8, 7, 0, 128, 200];
+        let stored = StoredDeviceKey {
+            public: B64.encode(&public),
+            private: B64.encode(&private),
+        };
+        let json = serde_json::to_string(&stored).unwrap();
+        let back: StoredDeviceKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(B64.decode(back.public).unwrap(), public);
+        assert_eq!(B64.decode(back.private).unwrap(), private);
     }
 }

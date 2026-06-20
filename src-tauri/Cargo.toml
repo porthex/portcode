@@ -45,6 +45,15 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 
+# Phone Sync E2E crypto (Phase 1): application-layer Noise so the relay stays
+# blind. Default features give Noise_*_25519_ChaChaPoly_BLAKE2s (Curve25519 +
+# ChaCha20-Poly1305 + BLAKE2s) with getrandom — no extra flags needed. The
+# `unsafe_code = "deny"` lint below applies only to this crate, not to snow.
+snow = "0.10"
+# Zero the long-term Noise static private key on drop so it doesn't linger in
+# freed heap memory (snow uses zeroize internally for its own key material too).
+zeroize = "1"
+
 # search / matching for tools
 regex = "1"
 globset = "0.4"
