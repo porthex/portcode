@@ -167,6 +167,12 @@ cargo test --manifest-path src-tauri/Cargo.toml
 - **Add tests for new functionality**, especially around the security-sensitive
   boundaries (the permission gate, the workspace path sandbox, file edits, and
   the `shell` path).
+- **Coverage is not a merge gate.** Don't worry about your PR's test-coverage
+  numbers — there's no threshold to clear and your change won't be blocked for
+  low coverage, so never let it hold you back. That said, **high coverage is
+  much appreciated**: when a change is easily testable, adding tests genuinely
+  helps the project stay healthy, and maintainers are glad to help you write
+  them.
 - **Never make live LLM API calls in tests or CI.** Use a deterministic mock
   provider; tests must be reproducible offline and must not require an API key.
 
