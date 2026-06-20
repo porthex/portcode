@@ -54,6 +54,9 @@ impl SyncHub {
     /// after this call.
     // TODO(phase-2): the consuming sync session must handle `RecvError::Lagged(n)`
     // by re-syncing from the DB (`messages_since`) instead of unwrapping the recv.
+    // The real caller is the Phase 2 transport; only tests attach today, so the
+    // lib build sees this as unused.
+    #[allow(dead_code)]
     pub fn subscribe(&self) -> broadcast::Receiver<SyncFrame> {
         self.tx.subscribe()
     }
@@ -73,7 +76,7 @@ impl SyncHub {
     /// which is already `false` if every receiver dropped between the check and
     /// the send.
     pub fn publish(&self, channel: &str, event: StreamEvent) -> bool {
-        if self.tx.receiver_count() == 0 {
+        if self.subscriber_count() == 0 {
             return false;
         }
         let session_id = channel
