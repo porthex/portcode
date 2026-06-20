@@ -73,7 +73,10 @@ mod tests {
         }"#;
         let s: Settings = serde_json::from_str(json).expect("legacy settings should deserialize");
         assert_eq!(s.default_policy, "allow");
-        assert!(s.typing_animation, "missing typingAnimation defaults to true");
+        assert!(
+            s.typing_animation,
+            "missing typingAnimation defaults to true"
+        );
     }
 
     #[test]
