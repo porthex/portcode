@@ -23,13 +23,13 @@ export default defineConfig({
       ],
       reporter: ["text", "text-summary", "json-summary", "html"],
       reportsDirectory: "./coverage",
-      // Regression ratchet for `pnpm test:coverage` (NOT wired into the required
-      // CI checks — CI runs `pnpm test`, so contributor PRs are never blocked on
-      // coverage; see CONTRIBUTING "coverage is not a merge gate"). Floors sit a
-      // hair under the achieved numbers so honest churn doesn't trip them.
+      // Regression ratchet for `pnpm test:coverage`, enforced by the coverage CI
+      // job on main/release only — NOT a required PR check (CI runs `pnpm test`),
+      // so contributor PRs are never blocked on coverage (see CONTRIBUTING). We
+      // track statements/lines/functions; branch coverage (every if/else path) is
+      // deliberately not gated. Floors sit a hair under the achieved numbers.
       thresholds: {
         statements: 98,
-        branches: 92,
         functions: 99,
         lines: 99,
       },

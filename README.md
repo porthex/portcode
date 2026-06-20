@@ -13,6 +13,7 @@ without writing the code yourself: you direct and review, the AI does the work.
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![CI](https://github.com/porthex/portcode/actions/workflows/ci.yml/badge.svg)](https://github.com/porthex/portcode/actions/workflows/ci.yml)
+![Frontend coverage: 98.9%](https://img.shields.io/badge/frontend%20coverage-98.9%25-2ea043)
 ![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white)
 ![Status: early alpha](https://img.shields.io/badge/status-early%20alpha-orange)
 ![Built with Rust + Tauri](https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri-CE422B?logo=rust&logoColor=white)
@@ -224,6 +225,12 @@ The near-term engineering plan lives in [docs/ROADMAP.md](docs/ROADMAP.md). The 
 Contributions are welcome — Portcode is developed in the open. Start with
 [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the local quality gates, and a few
 Windows-specific gotchas worth knowing before your first build.
+
+<div align="center">
+  <img src="docs/coverage.svg" alt="Frontend test coverage: 98.9% statements, 100% lines and functions, across 177 tests" width="600" />
+  <br />
+  <sub>Frontend coverage — refreshed on every <code>main</code> / <code>release</code> build. Contributors are never gated on it; see <a href="CONTRIBUTING.md#quality-gates--run-before-you-push">Quality gates</a>.</sub>
+</div>
 
 - New contributors merge after a quick, one-time **[CLA](CLA.md)** signature (handled
   automatically by a bot on your first PR).

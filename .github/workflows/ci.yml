@@ -118,3 +118,36 @@ jobs:
 
       - name: Test (cargo test)
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  coverage:
+    name: Coverage (frontend · main/release only)
+    # Coverage is COUNTED only on the canonical branches — this job is gated to
+    # pushes (the workflow's push trigger is branches:[main, release]) and never
+    # runs on pull_request, so contributor PRs are never measured or gated on
+    # coverage. See CONTRIBUTING "coverage is not a merge gate".
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Enable Corepack (pnpm)
+        run: corepack enable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Coverage (Vitest + v8, enforces the threshold)
+        run: pnpm test:coverage
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-coverage
+          path: coverage/
