@@ -21,6 +21,9 @@ vi.mock("../lib/ipc", () => ({
   resolvePermission: vi.fn(),
   openFolder: vi.fn(),
   runAgent: vi.fn(),
+  oauthStatus: vi.fn(),
+  startOauthLogin: vi.fn(),
+  oauthLogout: vi.fn(),
 }));
 
 import * as ipc from "../lib/ipc";
@@ -202,14 +205,27 @@ describe("Sidebar", () => {
     expect(screen.queryByTitle("No API key")).not.toBeInTheDocument();
   });
 
-  it("shows the missing-API-key status dot when no key is configured", () => {
-    useStore.setState({ settings: settings({ apiKeySet: false }) });
+  it("shows the not-authenticated status dot when no key is configured and not signed in", () => {
+    useStore.setState({ settings: settings({ apiKeySet: false }), oauthStatus: null });
 
     render(<Sidebar />);
 
-    const dot = screen.getByTitle("No API key");
+    const dot = screen.getByTitle("Not authenticated");
     expect(dot).toBeInTheDocument();
     expect(dot.className).toContain("bg-warn");
     expect(screen.queryByTitle("API key set")).not.toBeInTheDocument();
+  });
+
+  it("shows the signed-in status dot when authenticated with Claude", () => {
+    useStore.setState({
+      settings: settings({ apiKeySet: false }),
+      oauthStatus: { signedIn: true, expiresAt: null, account: null, tier: null },
+    });
+
+    render(<Sidebar />);
+
+    const dot = screen.getByTitle("Signed in with Claude");
+    expect(dot).toBeInTheDocument();
+    expect(dot.className).toContain("bg-success");
   });
 });

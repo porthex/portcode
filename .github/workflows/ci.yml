@@ -130,6 +130,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Enable Corepack (pnpm)
         run: corepack enable
@@ -151,3 +153,42 @@ jobs:
         with:
           name: frontend-coverage
           path: coverage/
+
+  coverage-rust:
+    name: Rust coverage (main/release only)
+    # Same policy as the frontend coverage job: counted on the canonical branches
+    # only (the push trigger is branches:[main, release]); never on pull_request,
+    # so contributor PRs are never measured or gated.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Tauri v2 Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev patchelf build-essential libssl-dev
+          sudo apt-get install -y libayatana-appindicator3-dev || sudo apt-get install -y libappindicator3-dev
+
+      - name: Materialize pinned Rust toolchain + llvm-tools
+        run: |
+          rustup show
+          rustup component add llvm-tools-preview
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # Prebuilt binary — avoids compiling cargo-llvm-cov from source (which fails
+      # on the pinned toolchain's deps and is too heavy for low-RAM machines).
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Rust coverage (cargo llvm-cov)
+        run: cargo llvm-cov --manifest-path src-tauri/Cargo.toml --summary-only

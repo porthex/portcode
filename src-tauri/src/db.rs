@@ -280,3 +280,162 @@ impl Db {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn mem_db() -> Db {
+        Db::open(Path::new(":memory:")).expect("in-memory db")
+    }
+
+    fn text(t: &str) -> ChatMessage {
+        ChatMessage {
+            role: "user".into(),
+            content: vec![Block::Text { text: t.into() }],
+        }
+    }
+
+    #[test]
+    fn now_ms_returns_a_recent_unix_millis() {
+        let t = now_ms();
+        assert!(t > 1_577_836_800_000, "now_ms too small: {t}"); // > 2020-01-01
+        assert!(t < 4_102_444_800_000, "now_ms too large: {t}"); // < 2100-01-01
+    }
+
+    #[test]
+    fn to_ui_block_maps_each_variant_with_the_camelcase_serde_shape() {
+        assert_eq!(
+            serde_json::to_value(to_ui_block(&Block::Text { text: "hi".into() })).unwrap(),
+            json!({ "kind": "text", "text": "hi" })
+        );
+        assert_eq!(
+            serde_json::to_value(to_ui_block(&Block::ToolUse {
+                id: "t1".into(),
+                name: "fs_read".into(),
+                input: json!({ "path": "x" }),
+            }))
+            .unwrap(),
+            json!({ "kind": "tool_use", "id": "t1", "name": "fs_read", "input": { "path": "x" } })
+        );
+        assert_eq!(
+            serde_json::to_value(to_ui_block(&Block::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "ok".into(),
+                is_error: true,
+            }))
+            .unwrap(),
+            json!({ "kind": "tool_result", "toolUseId": "t1", "output": "ok", "isError": true })
+        );
+    }
+
+    #[test]
+    fn create_and_list_sessions_orders_by_updated_at_desc() {
+        let db = mem_db();
+        db.create_session("a", "Alpha", None, 100).unwrap();
+        db.create_session("b", "Beta", Some("C:/ws"), 200).unwrap();
+        let rows = db.list_sessions().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "b"); // newer updated_at first
+        assert_eq!(rows[0].workspace.as_deref(), Some("C:/ws"));
+        assert_eq!(rows[1].workspace, None);
+    }
+
+    #[test]
+    fn rename_touch_and_set_title_if_blank_behave() {
+        let db = mem_db();
+        db.create_session("a", "New chat", None, 100).unwrap();
+
+        db.rename_session("a", "Renamed").unwrap();
+        assert_eq!(db.list_sessions().unwrap()[0].title, "Renamed");
+
+        db.touch_session("a", 500);
+        assert_eq!(db.list_sessions().unwrap()[0].updated_at, 500);
+
+        // only overwrites a blank / "New chat" title — not a real one
+        db.set_title_if_blank("a", "should not apply");
+        assert_eq!(db.list_sessions().unwrap()[0].title, "Renamed");
+
+        db.create_session("b", "New chat", None, 50).unwrap();
+        db.set_title_if_blank("b", "Derived");
+        let b = db
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == "b")
+            .unwrap();
+        assert_eq!(b.title, "Derived");
+    }
+
+    #[test]
+    fn delete_session_removes_it_and_its_messages() {
+        let db = mem_db();
+        db.create_session("a", "A", None, 1).unwrap();
+        db.append_message("a", &text("hi"), 2);
+        db.delete_session("a").unwrap();
+        assert!(db.list_sessions().unwrap().is_empty());
+        assert!(db.load_chat_messages("a").is_empty());
+    }
+
+    #[test]
+    fn append_and_load_chat_messages_round_trips_in_seq_order() {
+        let db = mem_db();
+        db.create_session("a", "A", None, 1).unwrap();
+        db.append_message("a", &text("one"), 2);
+        db.append_message(
+            "a",
+            &ChatMessage {
+                role: "assistant".into(),
+                content: vec![Block::Text { text: "two".into() }],
+            },
+            3,
+        );
+        let msgs = db.load_chat_messages("a");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[1].role, "assistant");
+        assert!(matches!(&msgs[0].content[0], Block::Text { text } if text == "one"));
+    }
+
+    #[test]
+    fn ui_messages_folds_tool_results_under_the_requesting_assistant() {
+        let db = mem_db();
+        db.create_session("a", "A", None, 1).unwrap();
+        db.append_message("a", &text("do it"), 2);
+        db.append_message(
+            "a",
+            &ChatMessage {
+                role: "assistant".into(),
+                content: vec![Block::ToolUse {
+                    id: "t1".into(),
+                    name: "fs_read".into(),
+                    input: json!({}),
+                }],
+            },
+            3,
+        );
+        // a tool result arrives as a "user"-role message; it must fold under the assistant
+        db.append_message(
+            "a",
+            &ChatMessage {
+                role: "user".into(),
+                content: vec![Block::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "file".into(),
+                    is_error: false,
+                }],
+            },
+            4,
+        );
+
+        let ui = db.ui_messages("a");
+        assert_eq!(ui.len(), 2); // user text, then assistant (with the result folded in)
+        let assistant = serde_json::to_value(&ui[1]).unwrap();
+        assert_eq!(assistant["role"], "assistant");
+        let blocks = assistant["blocks"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["kind"], "tool_use");
+        assert_eq!(blocks[1]["kind"], "tool_result");
+    }
+}

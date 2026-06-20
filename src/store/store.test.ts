@@ -18,10 +18,17 @@ vi.mock("../lib/ipc", () => ({
   resolvePermission: vi.fn(),
   openFolder: vi.fn(),
   runAgent: vi.fn(),
+  oauthStatus: vi.fn(),
+  startOauthLogin: vi.fn(),
+  oauthLogout: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
 const initialState = useStore.getState();
+
+// A signed-out OAuth status: init() resolves this so the store never throws on
+// the OAuth bridge while these tests exercise unrelated behaviour.
+const signedOut = { signedIn: false, expiresAt: null, account: null, tier: null };
 
 const session = (over: Partial<Session> = {}): Session => ({
   id: "s1",
@@ -46,6 +53,9 @@ beforeEach(() => {
   m.resolvePermission.mockResolvedValue(undefined);
   m.openFolder.mockResolvedValue(null);
   m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}) });
+  m.oauthStatus.mockResolvedValue(signedOut);
+  m.startOauthLogin.mockResolvedValue(signedOut);
+  m.oauthLogout.mockResolvedValue(undefined);
 });
 
 describe("init", () => {

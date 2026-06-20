@@ -40,6 +40,9 @@ vi.mock("./lib/ipc", () => ({
   listSessions: vi.fn(),
   createSession: vi.fn(),
   getMessages: vi.fn(),
+  oauthStatus: vi.fn(),
+  startOauthLogin: vi.fn(),
+  oauthLogout: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -55,6 +58,7 @@ beforeEach(() => {
   m.listSessions.mockResolvedValue([]);
   m.createSession.mockResolvedValue(undefined);
   m.getMessages.mockResolvedValue([]);
+  m.oauthStatus.mockResolvedValue({ signedIn: false, expiresAt: null, account: null, tier: null });
 });
 
 describe("App layout", () => {
