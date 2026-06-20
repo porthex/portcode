@@ -16,6 +16,7 @@
 pub mod noise;
 pub mod pairing;
 pub mod protocol;
+pub mod transport;
 
 use tokio::sync::broadcast;
 

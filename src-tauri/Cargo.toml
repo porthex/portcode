@@ -4,7 +4,9 @@ version = "5.0.0"
 description = "Portcode — a fast, native Windows AI coding agent (Porthex)."
 authors = ["Porthex"]
 edition = "2021"
-rust-version = "1.77"
+# Bumped for `iroh` (Phone Sync transport), which requires Rust >= 1.91. CI pins
+# the `stable` channel, which is well past this.
+rust-version = "1.91"
 license = "Apache-2.0"
 publish = false
 
@@ -53,6 +55,12 @@ snow = "0.10"
 # Zero the long-term Noise static private key on drop so it doesn't linger in
 # freed heap memory (snow uses zeroize internally for its own key material too).
 zeroize = "1"
+
+# Phone Sync transport (Phase 2): iroh QUIC — dial-by-public-key P2P with
+# hole-punching and a self-hostable relay fallback. Carries the app-layer Noise
+# session so the relay only ever sees ciphertext. Requires Rust >= 1.91 (see the
+# rust-version bump above).
+iroh = "1"
 
 # search / matching for tools
 regex = "1"
