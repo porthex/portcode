@@ -39,6 +39,7 @@ vi.mock("../lib/ipc", () => ({
   phoneSyncSendCommand: vi.fn(),
   phoneSyncDisconnect: vi.fn(),
   onPhoneSyncFrame: vi.fn(),
+  onPhoneSyncDisconnected: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -87,6 +88,7 @@ beforeEach(() => {
   m.phoneSyncSendCommand.mockResolvedValue(undefined);
   m.phoneSyncDisconnect.mockResolvedValue(undefined);
   m.onPhoneSyncFrame.mockResolvedValue(() => {});
+  m.onPhoneSyncDisconnected.mockResolvedValue(() => {});
 });
 
 describe("init", () => {
@@ -923,6 +925,66 @@ describe("remote client", () => {
       expect(st.remoteUnlisten).toBeNull();
       expect(st.remoteError).toBe("dial failed");
       expect(m.onPhoneSyncFrame).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("drop detection + reconnect", () => {
+    it("remembers the pairing payload and clears the dropped flag on connect", async () => {
+      await useStore.getState().connectRemote("QR-XYZ");
+      const st = useStore.getState();
+      expect(st.lastPairingQr).toBe("QR-XYZ");
+      expect(st.remoteDropped).toBe(false);
+    });
+
+    it("flags a dropped session when the native disconnect event fires", async () => {
+      let dropCb!: () => void;
+      m.onPhoneSyncDisconnected.mockImplementation(async (cb) => {
+        dropCb = cb;
+        return () => {};
+      });
+      await useStore.getState().connectRemote("QR");
+      expect(useStore.getState().remoteConnected).toBe(true);
+
+      // The desktop closed the channel / the network dropped.
+      dropCb();
+
+      const st = useStore.getState();
+      expect(st.remoteConnected).toBe(false);
+      expect(st.remoteVerified).toBe(false);
+      expect(st.remoteDropped).toBe(true);
+      expect(st.lastPairingQr).toBe("QR"); // kept so a reconnect is possible
+    });
+
+    it("reconnectRemote re-dials the remembered pairing, pre-verified", async () => {
+      await useStore.getState().connectRemote("QR-1");
+      useStore.setState({ remoteConnected: false, remoteVerified: false, remoteDropped: true });
+      m.phoneSyncConnect.mockClear();
+
+      await useStore.getState().reconnectRemote();
+
+      expect(m.phoneSyncConnect).toHaveBeenCalledWith("QR-1");
+      const st = useStore.getState();
+      expect(st.remoteConnected).toBe(true);
+      // A pin-matched reconnect skips the SAS re-comparison.
+      expect(st.remoteVerified).toBe(true);
+      expect(st.remoteDropped).toBe(false);
+    });
+
+    it("reconnectRemote is a no-op without a remembered pairing", async () => {
+      expect(useStore.getState().lastPairingQr).toBeNull();
+      await useStore.getState().reconnectRemote();
+      expect(m.phoneSyncConnect).not.toHaveBeenCalled();
+    });
+
+    it("disconnectRemote forgets the pairing and clears the dropped flag", async () => {
+      await useStore.getState().connectRemote("QR");
+      useStore.setState({ remoteDropped: true });
+
+      await useStore.getState().disconnectRemote();
+
+      const st = useStore.getState();
+      expect(st.remoteDropped).toBe(false);
+      expect(st.lastPairingQr).toBeNull();
     });
   });
 

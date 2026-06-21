@@ -19,6 +19,13 @@ use crate::sync::transport::SecureChannel;
 /// Tauri event channel the UI listens on for forwarded frames.
 pub const FRAME_EVENT: &str = "phone-sync://frame";
 
+/// Tauri event emitted when the live session ends because the channel died
+/// unexpectedly (the desktop closed it, or the network dropped). A phone-INITIATED
+/// disconnect removes the UI listener before tearing down, so the UI only observes
+/// this for an unexpected drop — its cue to leave the dead session and offer a
+/// one-tap reconnect.
+pub const DISCONNECT_EVENT: &str = "phone-sync://disconnected";
+
 /// Live-connection holder stored in `AppState`. Dropping `commands` ends the
 /// send loop; aborting `task` ends the session.
 pub struct PhoneClientConn {
@@ -58,6 +65,9 @@ pub async fn run_client_session(
         return;
     }
     let (mut sender, mut receiver) = channel.split();
+    // Clone the handle for the frame-relay loop so the original `app` stays free to
+    // emit the disconnect event after the session ends.
+    let frame_app = app.clone();
 
     // recv loop: emit each inbound frame to the UI until the channel closes.
     //
@@ -72,7 +82,7 @@ pub async fn run_client_session(
     // tested primitive (and the headless test below drives it).
     let recv = async {
         while let Ok(frame) = receiver.recv_frame().await {
-            let _ = app.emit(FRAME_EVENT, frame);
+            let _ = frame_app.emit(FRAME_EVENT, frame);
         }
     };
     // send loop: drain commands until the UI drops the sender (or a send fails).
@@ -90,6 +100,11 @@ pub async fn run_client_session(
     // (a dropped ChannelSender tears the QUIC connection down, erroring the recv
     // stream → run_client_recv returns; a closed recv side errors the next send).
     tokio::join!(recv, send);
+
+    // The channel ended. Notify the UI so it can leave the now-dead session and
+    // offer a reconnect. (A phone-INITIATED disconnect removes the UI listener
+    // before tearing down, so this is only observed for an unexpected drop.)
+    let _ = app.emit(DISCONNECT_EVENT, ());
 
     // Self-clear — but ONLY if this session is still the installed one. A
     // concurrent reconnect may have aborted this task AND installed a new
