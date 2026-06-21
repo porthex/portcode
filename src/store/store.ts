@@ -16,6 +16,7 @@ import type {
 } from "../types";
 import { DEFAULT_SETTINGS } from "../types";
 import * as ipc from "../lib/ipc";
+import { isMobilePlatform } from "../lib/platform";
 
 interface AppState {
   sessions: Session[];
@@ -38,7 +39,9 @@ interface AppState {
   pendingPermission: PendingPermission | null;
 
   // ── Mobile remote client (this device is the phone driving a paired desktop) ──
+  remoteMode: boolean; // render the remote-client shell (pairing → remote session) instead of the desktop layout
   remoteConnected: boolean; // a live desktop session is established
+  remoteVerified: boolean; // the user confirmed the SAS matches; gates entry to the remote session
   remoteSas: string | null; // short-auth-string to compare out-of-band; null when not connected
   remoteError: string | null; // last connect failure, surfaced in the connect UI
   remoteUnlisten: (() => void) | null; // tears down the frame subscription (private; mirrors `cancel`)
@@ -66,6 +69,8 @@ interface AppState {
   unpair: (publicKey: string) => Promise<void>;
   clearPairing: () => void;
   resolvePermission: (decision: "allow" | "deny", always?: boolean) => Promise<void>;
+  setRemoteMode: (v: boolean) => void;
+  confirmRemoteSas: () => void;
   applyFrame: (frame: SyncFrame) => void;
   connectRemote: (qr: string) => Promise<void>;
   sendRemoteCommand: (command: RemoteCommand) => Promise<void>;
@@ -127,7 +132,11 @@ export const useStore = create<AppState>((set, get) => ({
   draft: "",
   cancel: null,
   pendingPermission: null,
+  // Default into remote mode on a phone; desktop/preview start in the normal
+  // layout and can opt in via setRemoteMode (e.g. the command palette) for testing.
+  remoteMode: isMobilePlatform(),
   remoteConnected: false,
+  remoteVerified: false,
   remoteSas: null,
   remoteError: null,
   remoteUnlisten: null,
@@ -203,6 +212,16 @@ export const useStore = create<AppState>((set, get) => ({
   async send(text) {
     const { activeId, streaming } = get();
     if (!activeId || streaming || !text.trim()) return;
+
+    // Remote mode: this device is the phone driving a paired desktop. Forward the
+    // turn as a `run` command instead of running the local agent — the desktop is
+    // authoritative and its reply streams back as live frames (which build the
+    // assistant message). sendRemoteCommand already appends the optimistic user
+    // message, so we neither pre-create messages nor flip `streaming` here.
+    if (get().remoteConnected) {
+      await get().sendRemoteCommand({ cmd: "run", session_id: activeId, text });
+      return;
+    }
 
     const userMsg: Message = {
       id: uid(),
@@ -429,6 +448,15 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   // ── Mobile remote client ──────────────────────────────────────────────────
+  setRemoteMode(v) {
+    set({ remoteMode: v });
+  },
+
+  // The user confirmed the SAS matches the desktop's — open the remote session.
+  confirmRemoteSas() {
+    set({ remoteVerified: true });
+  },
+
   applyFrame(frame) {
     switch (frame.t) {
       case "session_list":
@@ -467,7 +495,8 @@ export const useStore = create<AppState>((set, get) => ({
     // second connect can never leave two live subscriptions feeding applyFrame.
     const prev = get().remoteUnlisten;
     if (prev) prev();
-    set({ remoteUnlisten: null, remoteError: null });
+    // A fresh dial is unverified until the user compares the new SAS.
+    set({ remoteUnlisten: null, remoteError: null, remoteVerified: false });
     try {
       const info = await ipc.phoneSyncConnect(qr);
       // Subscribe only after a successful dial; route every frame through
@@ -516,7 +545,7 @@ export const useStore = create<AppState>((set, get) => ({
     const unlisten = get().remoteUnlisten;
     if (unlisten) unlisten();
     await ipc.phoneSyncDisconnect();
-    set({ remoteConnected: false, remoteSas: null, remoteUnlisten: null });
+    set({ remoteConnected: false, remoteVerified: false, remoteSas: null, remoteUnlisten: null });
   },
 }));
 

@@ -309,6 +309,33 @@ describe("send", () => {
     expect(text).toContain("Error");
     expect(text).toContain("boom");
   });
+
+  it("routes through the remote command path (not the local agent) when connected", async () => {
+    useStore.setState({
+      sessions: [session({ id: "a", title: "New chat" })],
+      activeId: "a",
+      messages: { a: [] },
+      remoteConnected: true,
+    });
+
+    await useStore.getState().send("do it remotely");
+
+    // The desktop is authoritative: we forward a `run` command and DON'T run the
+    // local agent or pre-create an assistant message / flip streaming.
+    expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({
+      cmd: "run",
+      session_id: "a",
+      text: "do it remotely",
+    });
+    expect(m.runAgent).not.toHaveBeenCalled();
+
+    const st = useStore.getState();
+    expect(st.streaming).toBe(false);
+    // Only the optimistic user echo from sendRemoteCommand — no assistant stub.
+    expect(st.messages.a).toHaveLength(1);
+    expect(st.messages.a[0].role).toBe("user");
+    expect(st.messages.a[0].blocks).toEqual([{ kind: "text", text: "do it remotely" }]);
+  });
 });
 
 describe("stop", () => {
@@ -775,6 +802,24 @@ describe("remote client", () => {
     });
   });
 
+  describe("remote mode + SAS verification", () => {
+    it("setRemoteMode toggles the remote-shell flag", () => {
+      useStore.getState().setRemoteMode(true);
+      expect(useStore.getState().remoteMode).toBe(true);
+
+      useStore.getState().setRemoteMode(false);
+      expect(useStore.getState().remoteMode).toBe(false);
+    });
+
+    it("confirmRemoteSas marks the connection verified", () => {
+      expect(useStore.getState().remoteVerified).toBe(false);
+
+      useStore.getState().confirmRemoteSas();
+
+      expect(useStore.getState().remoteVerified).toBe(true);
+    });
+  });
+
   describe("connectRemote", () => {
     it("connects, stores the SAS, and routes frames through applyFrame", async () => {
       let cb!: (frame: SyncFrame) => void;
@@ -804,6 +849,16 @@ describe("remote client", () => {
 
       expect(prev).toHaveBeenCalledTimes(1);
       expect(useStore.getState().remoteConnected).toBe(true);
+    });
+
+    it("clears a prior SAS verification on a fresh dial", async () => {
+      // A re-pair must force the user to compare the NEW SAS — a stale verified
+      // flag can't carry over and silently trust a different desktop.
+      useStore.setState({ remoteVerified: true });
+
+      await useStore.getState().connectRemote("QR");
+
+      expect(useStore.getState().remoteVerified).toBe(false);
     });
 
     it("records the error and stays disconnected when the dial fails", async () => {
@@ -846,7 +901,12 @@ describe("remote client", () => {
   describe("disconnectRemote", () => {
     it("tears down the subscription and resets connection flags", async () => {
       const unlisten = vi.fn();
-      useStore.setState({ remoteConnected: true, remoteSas: "SAS-1", remoteUnlisten: unlisten });
+      useStore.setState({
+        remoteConnected: true,
+        remoteVerified: true,
+        remoteSas: "SAS-1",
+        remoteUnlisten: unlisten,
+      });
 
       await useStore.getState().disconnectRemote();
 
@@ -854,6 +914,7 @@ describe("remote client", () => {
       expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(1);
       const st = useStore.getState();
       expect(st.remoteConnected).toBe(false);
+      expect(st.remoteVerified).toBe(false);
       expect(st.remoteSas).toBeNull();
       expect(st.remoteUnlisten).toBeNull();
     });
