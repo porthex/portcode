@@ -8,40 +8,75 @@
 //! phone is up to date; the live-stream + command-intake loop (Phase 2c) takes
 //! over.
 //!
-//! The protocol is written against a small [`FrameChannel`] trait rather than the
-//! concrete iroh transport, so it can be tested over an in-memory channel without
-//! standing up QUIC endpoints — the real [`SecureChannel`] implements the trait.
-//! Not yet wired to a command, so the module carries a `dead_code` allow until
-//! Phase 3 drives a live session. See docs/PHONE_SYNC_PLAN.md.
-#![allow(dead_code)]
+//! The protocol is written against split [`FrameSink`]/[`FrameSource`] traits
+//! (combined by [`FrameChannel`]) rather than the concrete iroh transport, so it
+//! can be tested over an in-memory channel without standing up QUIC endpoints.
+//! See docs/PHONE_SYNC_PLAN.md.
 
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use crate::db::{Db, MessageRow, SessionRow};
 use crate::sync::protocol::{Cursor, RemoteCommand, SyncFrame};
-use crate::sync::transport::SecureChannel;
+use crate::sync::transport::{ChannelReceiver, ChannelSender, SecureChannel};
 
-/// A bidirectional channel that carries whole [`SyncFrame`]s. Implemented by the
-/// encrypted [`SecureChannel`] in production and by an in-memory channel in tests.
+// ── frame-channel trait hierarchy ────────────────────────────────────────────
+
+/// The send half of a frame channel.
 #[async_trait]
-pub trait FrameChannel {
+pub trait FrameSink {
     async fn send(&mut self, frame: &SyncFrame) -> Result<(), String>;
+}
+
+/// The receive half of a frame channel.
+#[async_trait]
+pub trait FrameSource {
     async fn recv(&mut self) -> Result<SyncFrame, String>;
 }
 
+/// A bidirectional channel: both a [`FrameSink`] and a [`FrameSource`]. The
+/// blanket impl gives this to anything that is both, so catch-up keeps a single
+/// full-duplex bound while `forward_live` / `handle_commands` each need only one
+/// half (the split [`ChannelSender`]/[`ChannelReceiver`]).
+pub trait FrameChannel: FrameSink + FrameSource {}
+impl<T: FrameSink + FrameSource + ?Sized> FrameChannel for T {}
+
+// ── full-duplex: SecureChannel (production) ──────────────────────────────────
+
 #[async_trait]
-impl FrameChannel for SecureChannel {
+impl FrameSink for SecureChannel {
     async fn send(&mut self, frame: &SyncFrame) -> Result<(), String> {
         self.send_frame(frame).await
     }
+}
+#[async_trait]
+impl FrameSource for SecureChannel {
     async fn recv(&mut self) -> Result<SyncFrame, String> {
         self.recv_frame().await
     }
 }
 
+// ── split halves: send-only / recv-only ──────────────────────────────────────
+
+#[async_trait]
+impl FrameSink for ChannelSender {
+    async fn send(&mut self, frame: &SyncFrame) -> Result<(), String> {
+        self.send_frame(frame).await
+    }
+}
+#[async_trait]
+impl FrameSource for ChannelReceiver {
+    async fn recv(&mut self) -> Result<SyncFrame, String> {
+        self.recv_frame().await
+    }
+}
+
+// ── catch-up protocol ────────────────────────────────────────────────────────
+
 /// The result of a catch-up: the desktop's session list plus, per session the
 /// phone asked about, the messages newer than its cursor.
+/// Phone side only (`request_catch_up`); the desktop never holds one.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct CatchUp {
     pub sessions: Vec<SessionRow>,
     pub deltas: Vec<(String, Vec<MessageRow>)>,
@@ -86,7 +121,9 @@ pub async fn serve_catch_up<C: FrameChannel + ?Sized>(
 }
 
 /// Phone side: run a catch-up against the desktop. Sends `Hello` with `cursors`,
-/// then reads the session list and one delta per cursor.
+/// then reads the session list and one delta per cursor. Desktop only ever
+/// *serves* catch-up; this requester is exercised by tests + the future phone client.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn request_catch_up<C: FrameChannel + ?Sized>(
     channel: &mut C,
     device_id: &str,
@@ -131,9 +168,9 @@ pub async fn request_catch_up<C: FrameChannel + ?Sized>(
 /// hub is closed (all senders dropped) or a send fails. A `Lagged` (slow phone)
 /// is non-fatal: dropped frames are reconciled by the catch-up path, so we keep
 /// forwarding the live tail.
-pub async fn forward_live<C: FrameChannel + ?Sized>(
+pub async fn forward_live(
     hub: &mut broadcast::Receiver<SyncFrame>,
-    sink: &mut C,
+    sink: &mut impl FrameSink,
 ) -> Result<(), String> {
     use broadcast::error::RecvError;
     loop {
@@ -148,16 +185,21 @@ pub async fn forward_live<C: FrameChannel + ?Sized>(
 /// Executes the `RemoteCommand`s a phone sends. The real implementation wires to
 /// the desktop's `run_agent` / `cancel_agent` / `resolve_permission` /
 /// `create_session`; tests provide a recording fake.
+///
+/// `Send + Sync` are required because `handle_commands` is called from within
+/// a `tauri::async_runtime::spawn` task (multi-threaded runtime), so the future
+/// must be `Send`. `&dyn CommandHandler` is `Send` iff `dyn CommandHandler: Sync`,
+/// which requires the `Sync` supertrait here.
 #[async_trait]
-pub trait CommandHandler {
+pub trait CommandHandler: Send + Sync {
     async fn handle(&self, command: RemoteCommand) -> Result<(), String>;
 }
 
 /// Read frames from the phone and dispatch each `Command` to `handler`, until the
 /// channel closes. `Ack`s (phone progress) are accepted and ignored for now; any
 /// other frame in this position is a protocol error.
-pub async fn handle_commands<C: FrameChannel + ?Sized>(
-    source: &mut C,
+pub async fn handle_commands(
+    source: &mut impl FrameSource,
     handler: &dyn CommandHandler,
 ) -> Result<(), String> {
     loop {
@@ -177,19 +219,22 @@ mod tests {
     use std::path::Path;
     use tokio::sync::mpsc;
 
-    /// In-memory `FrameChannel` for testing the protocol without QUIC/Noise.
+    /// In-memory channel for testing the protocol without QUIC/Noise.
     struct MemChannel {
         tx: mpsc::UnboundedSender<SyncFrame>,
         rx: mpsc::UnboundedReceiver<SyncFrame>,
     }
 
     #[async_trait]
-    impl FrameChannel for MemChannel {
+    impl FrameSink for MemChannel {
         async fn send(&mut self, frame: &SyncFrame) -> Result<(), String> {
             self.tx
                 .send(frame.clone())
                 .map_err(|_| "closed".to_string())
         }
+    }
+    #[async_trait]
+    impl FrameSource for MemChannel {
         async fn recv(&mut self) -> Result<SyncFrame, String> {
             self.rx.recv().await.ok_or_else(|| "closed".to_string())
         }

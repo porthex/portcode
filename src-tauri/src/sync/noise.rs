@@ -12,12 +12,9 @@
 //! String (SAS) the user compares out-of-band (QR when co-present) to defeat a
 //! man-in-the-middle.
 //!
-//! No transport/network is wired here yet (Phase 2). `StaticKeypair::generate` is
-//! consumed by the Phase 1b pairing flow, but the `Handshake`/`Transport` halves
-//! aren't driven by non-test code until Phase 2 wires the transport — hence the
-//! module-wide `dead_code` allowance, which comes off then. See
-//! docs/PHONE_SYNC_PLAN.md.
-#![allow(dead_code)]
+//! The KK (reconnect) handshake path and `is_finished` are wired only to tests
+//! and the future fast-reconnect increment; they carry narrow per-item allows
+//! rather than a module-wide one. See docs/PHONE_SYNC_PLAN.md.
 
 use snow::params::NoiseParams;
 use snow::{Builder, HandshakeState, TransportState};
@@ -90,10 +87,14 @@ impl Handshake {
         Self::build(XX_PARAMS, local_private, None, false)
     }
     /// Reconnect initiator — the peer's static key must already be pinned.
+    /// KK fast-reconnect lands in a later phase; exercised only by tests today.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn kk_initiator(local_private: &[u8], remote_public: &[u8]) -> Result<Self, String> {
         Self::build(KK_PARAMS, local_private, Some(remote_public), true)
     }
     /// Reconnect responder — the peer's static key must already be pinned.
+    /// KK fast-reconnect lands in a later phase; exercised only by tests today.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn kk_responder(local_private: &[u8], remote_public: &[u8]) -> Result<Self, String> {
         Self::build(KK_PARAMS, local_private, Some(remote_public), false)
     }
@@ -136,6 +137,9 @@ impl Handshake {
         Ok(buf)
     }
 
+    /// Used by the handshake tests; the live `drive_xx` loop runs a fixed
+    /// 3-message sequence and doesn't poll this.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_finished(&self) -> bool {
         self.state.is_handshake_finished()
     }
