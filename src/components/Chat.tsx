@@ -62,6 +62,9 @@ export function Chat() {
 }
 
 function EmptyState() {
+  // Keyboard shortcuts are meaningless on the phone (no Ctrl key, and the file
+  // explorer is desktop-only), so the hint row is desktop-only.
+  const remoteMode = useStore((s) => s.remoteMode);
   return (
     <div className="mt-24 flex flex-col items-center text-center">
       <div className="mb-4 rounded-2xl border border-border bg-panel p-4">
@@ -80,15 +83,17 @@ function EmptyState() {
         A fast, native AI coding agent for Windows. Ask it to read, edit, and run code in your
         workspace. Describe a task to get started.
       </p>
-      <div className="mt-4 flex items-center gap-2 text-xs text-muted">
-        <Kbd>Ctrl</Kbd>
-        <Kbd>K</Kbd>
-        <span>for commands</span>
-        <span className="mx-1 text-border">·</span>
-        <Kbd>Ctrl</Kbd>
-        <Kbd>B</Kbd>
-        <span>for files</span>
-      </div>
+      {!remoteMode && (
+        <div className="mt-4 flex items-center gap-2 text-xs text-muted">
+          <Kbd>Ctrl</Kbd>
+          <Kbd>K</Kbd>
+          <span>for commands</span>
+          <span className="mx-1 text-border">·</span>
+          <Kbd>Ctrl</Kbd>
+          <Kbd>B</Kbd>
+          <span>for files</span>
+        </div>
+      )}
     </div>
   );
 }

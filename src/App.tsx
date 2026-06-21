@@ -196,14 +196,16 @@ function TitleBar() {
             PREVIEW MODE
           </span>
         )}
-        <button
-          onClick={() => setShowPalette(true)}
-          aria-label="Open command palette (Ctrl+K)"
-          title="Command palette (Ctrl+K)"
-          className="flex items-center gap-1.5 rounded-md border border-border-2 bg-panel-2/80 px-2.5 py-1 font-mono text-[11px] text-muted transition-colors hover:border-accent/50 hover:text-accent"
-        >
-          ⌘K <span className="text-faint">palette</span>
-        </button>
+        {!remoteMode && (
+          <button
+            onClick={() => setShowPalette(true)}
+            aria-label="Open command palette (Ctrl+K)"
+            title="Command palette (Ctrl+K)"
+            className="flex items-center gap-1.5 rounded-md border border-border-2 bg-panel-2/80 px-2.5 py-1 font-mono text-[11px] text-muted transition-colors hover:border-accent/50 hover:text-accent"
+          >
+            ⌘K <span className="text-faint">palette</span>
+          </button>
+        )}
       </div>
     </header>
   );

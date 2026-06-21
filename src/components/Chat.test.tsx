@@ -56,6 +56,18 @@ describe("Chat empty state", () => {
     expect(screen.getByText("B")).toBeInTheDocument();
   });
 
+  it("hides the desktop keyboard hints on the phone (remote mode)", () => {
+    useStore.setState({ activeId: null, messages: {}, streaming: false, remoteMode: true });
+
+    render(<Chat />);
+
+    // The welcome copy stays, but the Ctrl+K / Ctrl+B hints (no keyboard and no
+    // file explorer on a phone) are gone.
+    expect(screen.getByText(EMPTY_HINT)).toBeInTheDocument();
+    expect(screen.queryByText("for commands")).not.toBeInTheDocument();
+    expect(screen.queryByText("for files")).not.toBeInTheDocument();
+  });
+
   it("falls back to the empty state when the active session has no message entry", () => {
     // activeId is set, but `messages[activeId]` is undefined -> the `|| EMPTY`
     // fallback in the selector kicks in.

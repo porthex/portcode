@@ -192,6 +192,17 @@ describe("remote mode shell", () => {
     expect(useStore.getState().showSidebar).toBe(false);
   });
 
+  it("hides the desktop command-palette button on the phone", () => {
+    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+
+    render(<App />);
+
+    // ⌘K is a desktop keyboard affordance — gone on the phone.
+    expect(
+      screen.queryByRole("button", { name: "Open command palette (Ctrl+K)" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("disconnects from the desktop via the banner button", async () => {
     useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
 
