@@ -133,9 +133,11 @@ export interface PairingPayload {
   publicKey: string;
   nonce: string;
   /**
-   * The desktop's dialable iroh node address. The desktop always populates this;
-   * it is optional here only so a payload from an older desktop build still
-   * type-checks during rollout. The phone needs it to know where to connect.
+   * The desktop's dialable iroh node address — the phone needs it to know where to
+   * connect. The desktop ALWAYS populates this, and the Rust `phone_sync_connect`
+   * deserializer REQUIRES it, so a real payload never omits it. The `?` is only a
+   * defensive concession for a hand-pasted/partial payload, which the phone then
+   * surfaces as a connect error rather than dialing without an address.
    */
   nodeAddr?: PairingNodeAddr;
 }

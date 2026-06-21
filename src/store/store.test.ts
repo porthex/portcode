@@ -903,6 +903,41 @@ describe("remote client", () => {
     });
   });
 
+  describe("disconnectRemote", () => {
+    it("clears the connection flags before awaiting the channel teardown", async () => {
+      // remoteConnected is the routing source of truth for send/stop/permission, so
+      // it (and the listener) must be cleared SYNCHRONOUSLY, before the awaited
+      // phoneSyncDisconnect, so a command can't route onto the closing channel.
+      let release!: () => void;
+      m.phoneSyncDisconnect.mockReturnValue(
+        new Promise<void>((res) => {
+          release = res;
+        }),
+      );
+      const unlisten = vi.fn();
+      useStore.setState({
+        remoteConnected: true,
+        remoteVerified: true,
+        remoteSas: "SAS-1",
+        remoteUnlisten: unlisten,
+      });
+
+      const pending = useStore.getState().disconnectRemote();
+
+      // Synchronously after the call, before the teardown promise resolves:
+      const mid = useStore.getState();
+      expect(mid.remoteConnected).toBe(false);
+      expect(mid.remoteVerified).toBe(false);
+      expect(mid.remoteSas).toBeNull();
+      expect(mid.remoteUnlisten).toBeNull();
+      expect(unlisten).toHaveBeenCalledTimes(1);
+
+      release();
+      await pending;
+      expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("sendRemoteCommand", () => {
     it("optimistically appends the user message for a run command and forwards it", async () => {
       const command: RemoteCommand = { cmd: "run", session_id: "s1", text: "do it" };

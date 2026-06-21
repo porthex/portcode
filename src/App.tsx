@@ -24,6 +24,11 @@ export default function App() {
     void init();
   }, [init]);
 
+  // Release the live remote frame subscription if the app tree unmounts (HMR, a
+  // root remount) so a stale native listener can't survive into a new store
+  // instance and double-feed applyFrame.
+  useEffect(() => () => useStore.getState().remoteUnlisten?.(), []);
+
   // Global keyboard shortcuts.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
