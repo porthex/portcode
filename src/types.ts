@@ -116,14 +116,28 @@ export interface PhoneSyncStatus {
 }
 
 /**
+ * The desktop's dialable iroh node address, as carried in a {@link PairingPayload}.
+ * Opaque to the UI — the phone deserializes it back into an iroh `EndpointAddr`
+ * to dial; the desktop side never introspects it. Shape mirrors iroh's
+ * `EndpointAddr` JSON serialization (an `id` plus transport addresses).
+ */
+export type PairingNodeAddr = Record<string, unknown>;
+
+/**
  * The payload returned by `phone_sync_begin_pairing`. The contents should be
- * displayed as copyable text for the phone to scan / enter.
+ * displayed as copyable text (or a QR code) for the phone to scan / enter.
  * TODO: render as a QR code image in a later iteration.
  */
 export interface PairingPayload {
   version: number;
   publicKey: string;
   nonce: string;
+  /**
+   * The desktop's dialable iroh node address. The desktop always populates this;
+   * it is optional here only so a payload from an older desktop build still
+   * type-checks during rollout. The phone needs it to know where to connect.
+   */
+  nodeAddr?: PairingNodeAddr;
 }
 
 // Approximate Anthropic list prices, USD per million tokens (input / output).
