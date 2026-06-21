@@ -61,11 +61,10 @@ jobs:
           # updater artifacts are disabled (default), the key is simply unused. Either
           # way a signer-flag quirk must not fail the build, so this is non-fatal.
           if pnpm tauri signer generate -w "$RUNNER_TEMP/staging.key" -p "" --force; then
-            {
-              echo "TAURI_SIGNING_PRIVATE_KEY<<__EOF__"
-              cat "$RUNNER_TEMP/staging.key"
-              echo "__EOF__"
-            } >> "$GITHUB_ENV"
+            # Pass the key by PATH (Tauri supports TAURI_SIGNING_PRIVATE_KEY_PATH) to
+            # avoid a multiline GITHUB_ENV heredoc (the key file has no trailing
+            # newline, which broke the `<<__EOF__` delimiter).
+            echo "TAURI_SIGNING_PRIVATE_KEY_PATH=$RUNNER_TEMP/staging.key" >> "$GITHUB_ENV"
             echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
           else
             echo "::warning::tauri signer generate failed; building without an updater key"
