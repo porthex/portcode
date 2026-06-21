@@ -1,0 +1,101 @@
+name: Android
+
+# Cross-compile PROBE for the Tauri Android target.
+#
+# WHY THIS EXISTS (docs/ANDROID_APP_PLAN.md §5): the Tauri crate is too heavy to
+# build on low-RAM dev machines, and the Android cross-compile is heavier still.
+# This job runs the real `tauri android build` in CI to surface the concrete
+# build blockers (ANDROID_APP_PLAN.md §2) — primarily the desktop-only
+# dependencies (`keyring` `windows-native`, the agent/tools/shell) that must be
+# `cfg(mobile)`-excluded before the app can cross-compile for Android.
+#
+# STATUS — blocker probe, NON-BLOCKING. Until the platform split
+# (ANDROID_APP_PLAN.md §4, which needs owner architecture sign-off) lands, the
+# unmodified app is NOT expected to cross-compile. So the job is
+# `continue-on-error: true`: it captures the blockers in its step log without
+# gating any PR or reddening `main` (it is not one of the required status checks).
+# Once the split makes it pass, drop `continue-on-error` and broaden the `paths`
+# filter (to `src-tauri/**`, `src/**`, …) to promote this into a real merge gate.
+#
+# It triggers narrowly — this workflow file, the Android scaffold, or manual
+# dispatch — so it does NOT add a (currently-failing) check to every backend PR.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/android.yml"
+      - "src-tauri/gen/android/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-build:
+    name: Android (aarch64 cross-compile probe)
+    runs-on: ubuntu-latest
+    # NON-BLOCKING until the platform split (see header): captures the blockers,
+    # never fails the workflow or gates a PR.
+    continue-on-error: true
+    env:
+      # Match the NDK the dev box uses; Tauri's Gradle plugin resolves the NDK
+      # from NDK_HOME/ANDROID_NDK_ROOT (the app module pins no ndkVersion).
+      NDK_VERSION: "27.0.12077973"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Enable Corepack (pnpm)
+        run: corepack enable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # AGP 8 / the Tauri Gradle plugin need JDK 17 to run (the app targets Java 8
+      # bytecode, but the toolchain itself is 17).
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      # compileSdk/targetSdk = 36 (src-tauri/gen/android/app/build.gradle.kts) and
+      # the NDK the Rust cross-compile links against.
+      - name: Install Android platform + NDK
+        run: |
+          sdkmanager "platforms;android-36" "ndk;${NDK_VERSION}"
+          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      # Channel + components come from rust-toolchain.toml.
+      - name: Materialize pinned Rust toolchain
+        run: rustup show
+
+      - name: Add Android Rust targets
+        run: rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # The real cross-compile. A DEBUG apk needs no release keystore (signing is
+      # owner-only, a later phase). aarch64 alone keeps the probe fast — the Rust
+      # blockers are target-independent. `beforeBuildCommand` (pnpm build) runs the
+      # frontend first. Failure here is the EXPECTED signal until the platform
+      # split; the step log is the deliverable this job exists to produce.
+      - name: Android cross-compile (blocker probe)
+        run: pnpm tauri android build --apk --debug --target aarch64

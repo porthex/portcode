@@ -60,11 +60,39 @@ matches the research doc). The alternative (phone also runs an agent) is out of 
 
 ## 2. The concrete build blockers (why the unmodified app won't cross-compile)
 
-These are the things CI's android job (§5) will hit; fix them via `cfg`/features:
+These are the things CI's android job (§5) hits; fix them via `cfg`/features.
+
+> **CI-CONFIRMED (probe run #1, 2026-06-21):** the cross-compile dies at the
+> **very first** blocker below — `openssl-sys` — long before it reaches the
+> source-level ones (keyring, agent/tools). The probe stops at the first error,
+> so the rows marked _predicted_ are still expected but **not yet reached**. Each
+> fix lets the probe advance to the next blocker; the table is updated per run.
+
+### 2.0 Blocker #1 — `openssl-sys` native cross-compile (✅ CONFIRMED, architecture-neutral)
+
+```
+error: failed to run custom build command for `openssl-sys v0.9.117`
+  Could not find openssl via pkg-config: pkg-config has not been configured to
+  support cross-compilation. … $TARGET = aarch64-linux-android
+```
+
+`reqwest`'s **`native-tls`** feature (Cargo.toml:35) pulls `native-tls → openssl-sys`,
+the native OpenSSL **C** library — which can't cross-compile for Android without an
+Android OpenSSL sysroot. `cargo tree -i openssl-sys --target aarch64-linux-android`
+shows `reqwest` is shared by **our dep _and_ `iroh` _and_ `tauri`** (feature
+unification), so the real fix must remove `native-tls` from the **unified** graph,
+not just our line. **Fix:** switch the HTTP/TLS stack to pure-Rust **rustls**
+(`reqwest` `rustls-tls`), which needs no native OpenSSL and cross-compiles cleanly.
+This is **architecture-neutral** (no bearing on the phone=remote-client decision)
+and desktop-safe (rustls works on Windows + Linux), so it is being fixed
+autonomously ahead of the platform split. ⚠️ Watch the next probe for whether the
+chosen rustls backend pulls `aws-lc-rs` (needs cmake/C) vs `ring` (cross-compiles).
+
+### 2.1 Predicted blockers (not yet reached — build dies at #1 first)
 
 | Blocker                                                                                         | Where                                                                                          | Fix                                                                                                                                                                                                                                                                                                                                                 |
 | ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`keyring` `windows-native` feature won't compile for android**                                | `Cargo.toml` `keyring = { features = ["windows-native"] }`                                     | Make the feature per-target: `windows-native` only under `cfg(windows)`; on android use the **Android Keystore** (e.g. `keyring` with the `linux`/`secret-service` backends don't apply — use a small JNI bridge to `AndroidKeyStore`, or an encrypted-file fallback in app-private storage). Likely a `secrets.rs` trait with a per-platform impl. |
+| **`keyring` `windows-native` feature won't compile for android** _(predicted)_                  | `Cargo.toml` `keyring = { features = ["windows-native"] }`                                     | Make the feature per-target: `windows-native` only under `cfg(windows)`; on android use the **Android Keystore** (e.g. `keyring` with the `linux`/`secret-service` backends don't apply — use a small JNI bridge to `AndroidKeyStore`, or an encrypted-file fallback in app-private storage). Likely a `secrets.rs` trait with a per-platform impl. |
 | **Agent/tools/shell are desktop-only**                                                          | `agent.rs`, `tools.rs`, `llm.rs`, the `run_agent`/`cancel_agent`/`resolve_permission` commands | Gate behind `#[cfg(not(mobile))]` / a `desktop` feature. The mobile `run()` registers only the client + remote commands.                                                                                                                                                                                                                            |
 | **`shell` tool uses `tokio::process` (PowerShell)**                                             | `tools.rs`                                                                                     | Excluded with the tools (above).                                                                                                                                                                                                                                                                                                                    |
 | **The sync SERVER (`phone_sync_listen`, `DesktopCommandHandler`, `server.rs`) is desktop-only** | `sync/server.rs`, `lib.rs`                                                                     | Gate `#[cfg(not(mobile))]`; mobile gets the _client_ listener counterpart.                                                                                                                                                                                                                                                                          |
