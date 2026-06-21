@@ -721,6 +721,12 @@ textarea:focus-visible {
   box-shadow: 0 0 8px var(--color-accent);
   animation: pcBlink 1s step-end infinite;
 }
+/* The still-decoding tail of a streaming word (see useScramble): the flickering
+   glyphs glow in the accent until they resolve into the real characters. */
+.pc-scramble {
+  color: var(--color-accent-hi);
+  text-shadow: 0 0 6px var(--color-accent);
+}
 
 /* =========================================================================
    PERMISSION GATE (banner)
