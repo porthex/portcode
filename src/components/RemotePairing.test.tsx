@@ -312,6 +312,14 @@ describe("RemotePairing — reconnect after a drop", () => {
     render(<RemotePairing />);
     expect(screen.queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
   });
+
+  it("offers reconnect for a remembered desktop even without a drop (cross-launch)", () => {
+    useStore.setState({ remoteDropped: false, lastPairingQr: "QR-REMEMBERED" });
+    render(<RemotePairing />);
+    // No drop, but a remembered desktop → a calm "Paired desktop" reconnect card.
+    expect(screen.getByText("Paired desktop")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reconnect" })).toBeInTheDocument();
+  });
 });
 
 describe("RemotePairing — connect drives the live frame subscription", () => {
