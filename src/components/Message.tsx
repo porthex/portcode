@@ -3,7 +3,7 @@ import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import type { Message } from "../types";
 import { useStore } from "../store/store";
-import { usePrefersReducedMotion, useTypewriter } from "../lib/useTypewriter";
+import { usePrefersReducedMotion, useScramble } from "../lib/useScramble";
 import { ToolCall } from "./ToolCall";
 
 export function MessageView({
@@ -69,20 +69,13 @@ export function MessageView({
 }
 
 /**
- * A single assistant text block. While its turn is streaming it reveals
- * character-by-character in monospace — a terminal "typing" feel — with an
- * optional blinking caret; once the turn completes it re-renders as full
- * Markdown.
+ * A single assistant text block. While its turn is streaming it reveals one WORD
+ * at a time as a "decode" — each word flickers through random glyphs and resolves
+ * left-to-right; once the turn completes it re-renders as full Markdown.
  */
 function TextBlock({ text, animate, caret }: { text: string; animate: boolean; caret: boolean }) {
-  const revealed = useTypewriter(text, animate);
   if (animate) {
-    return (
-      <div className="prose-pc whitespace-pre-wrap break-words font-mono text-[13px]">
-        {revealed}
-        {caret && <span className="pc-caret" aria-hidden="true" />}
-      </div>
-    );
+    return <ScrambleText text={text} caret={caret} />;
   }
   return (
     <div className="prose-pc">
@@ -92,6 +85,25 @@ function TextBlock({ text, animate, caret }: { text: string; animate: boolean; c
       >
         {text}
       </ReactMarkdown>
+    </div>
+  );
+}
+
+/**
+ * The streaming assistant turn rendered as a per-word decode (see useScramble):
+ * settled text is plain monospace, and the still-decoding tail of the current
+ * word glows in the accent (.pc-scramble). A blinking caret trails the last
+ * block while it streams.
+ */
+function ScrambleText({ text, caret }: { text: string; caret: boolean }) {
+  const { display, scrambleStart } = useScramble(text, true);
+  const settled = display.slice(0, scrambleStart);
+  const decoding = display.slice(scrambleStart);
+  return (
+    <div className="prose-pc whitespace-pre-wrap break-words font-mono text-[13px]">
+      {settled}
+      {decoding && <span className="pc-scramble">{decoding}</span>}
+      {caret && <span className="pc-caret" aria-hidden="true" />}
     </div>
   );
 }

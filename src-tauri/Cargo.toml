@@ -76,6 +76,13 @@ similar = "3"
 [target."cfg(windows)".dependencies]
 keyring = { version = "3", features = ["windows-native"] }
 
+# Native QR scanner for the phone's pairing screen — built ONLY for the mobile
+# targets. The desktop advertises the pairing QR (it never scans one), so gating
+# the crate to android/iOS keeps it out of the Windows/Linux desktop binaries and
+# off the desktop/Linux CI legs entirely (it is registered under `#[cfg(mobile)]`).
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-barcode-scanner = "2"
+
 [profile.release]
 opt-level = "s"
 lto = true
