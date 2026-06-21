@@ -26,6 +26,11 @@ on:
     paths:
       - ".github/workflows/android.yml"
       - "src-tauri/gen/android/**"
+      # Dependency/manifest changes are exactly when android-buildability shifts
+      # (a new native-C dep can block the cross-compile), so re-run the probe to
+      # catch the next blocker. Still non-blocking — it never gates these PRs.
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
 
 permissions:
   contents: read
