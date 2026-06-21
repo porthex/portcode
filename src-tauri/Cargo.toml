@@ -38,7 +38,6 @@ async-trait = "0.1"
 anyhow = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
-keyring = { version = "3", features = ["windows-native"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Subscription OAuth (PKCE S256). All safe Rust. The OAuth constants and flow in
@@ -67,6 +66,15 @@ regex = "1"
 globset = "0.4"
 ignore = "0.4"
 similar = "3"
+
+# `keyring` (Windows Credential Manager) only has a working backend on Windows.
+# On Android/Linux there is no working keyring backend, so `src/secrets.rs` uses
+# an app-private file store instead and keyring is not a dependency there at all —
+# gating it to `cfg(windows)` means it is never compiled for the Android
+# cross-compile probe or the Linux CI leg. Relocating an already-resolved dep to
+# a target table does not change its version/features, so Cargo.lock stays valid.
+[target."cfg(windows)".dependencies]
+keyring = { version = "3", features = ["windows-native"] }
 
 [profile.release]
 opt-level = "s"

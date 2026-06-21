@@ -639,6 +639,10 @@ pub fn run() {
                 .app_config_dir()
                 .unwrap_or_else(|_| std::env::temp_dir());
             let _ = std::fs::create_dir_all(&dir);
+            // Point the per-target secret store at the app-private config dir before
+            // any AppState command can touch secrets. Inert no-op on Windows (keyring
+            // is used); on Android/Linux the file backend writes secrets.json here.
+            secrets::init_dir(dir.clone());
 
             let settings = Settings::load(&dir);
             let http = reqwest::Client::builder()
