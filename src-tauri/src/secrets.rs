@@ -129,17 +129,20 @@ mod backend {
     }
 
     // dir-scoped core (also driven directly by the tests with an isolated dir).
-    fn get_in(dir: &Path, account: &str) -> Option<String> {
+    // `pub(crate)` (not private) so the `#[cfg(test)]` re-exports below are legal
+    // (E0364: can't re-export a private item). Already called by get/set/delete
+    // in every build, so this widening adds no dead code.
+    pub(crate) fn get_in(dir: &Path, account: &str) -> Option<String> {
         read_map_in(dir).get(account).cloned()
     }
 
-    fn set_in(dir: &Path, account: &str, value: &str) -> Result<(), String> {
+    pub(crate) fn set_in(dir: &Path, account: &str, value: &str) -> Result<(), String> {
         let mut map = read_map_in(dir);
         map.insert(account.to_string(), value.to_string());
         write_map_in(dir, &map)
     }
 
-    fn delete_in(dir: &Path, account: &str) -> Result<(), String> {
+    pub(crate) fn delete_in(dir: &Path, account: &str) -> Result<(), String> {
         let mut map = read_map_in(dir);
         map.remove(account); // idempotent: removing an absent key is fine
         write_map_in(dir, &map) // re-write even if absent (cheap, keeps it simple)
