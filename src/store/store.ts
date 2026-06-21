@@ -557,7 +557,19 @@ export const useStore = create<AppState>((set, get) => ({
     const prev = get().remoteUnlisten;
     if (prev) prev();
     // A fresh dial is unverified until the user compares the new SAS.
-    set({ remoteUnlisten: null, remoteError: null, remoteVerified: false });
+    // Reset connection AND turn state. A fresh dial / reconnect must never inherit a
+    // stale `streaming`/`pendingPermission` from a turn the previous session left
+    // mid-flight — a drop can't deliver the `turn_end` that would have cleared them,
+    // so without this a reconnect lands in a disabled composer + a dead permission
+    // prompt. If the desktop turn is genuinely still live, its catch-up/live frames
+    // re-establish `streaming` after the dial.
+    set({
+      remoteUnlisten: null,
+      remoteError: null,
+      remoteVerified: false,
+      streaming: false,
+      pendingPermission: null,
+    });
     let unlistenFrame: (() => void) | null = null;
     let unlistenDrop: (() => void) | null = null;
     try {
@@ -569,7 +581,16 @@ export const useStore = create<AppState>((set, get) => ({
       // the UI can leave the dead session and offer a reconnect. A user-initiated
       // disconnect tears this listener down first, so it can't misfire as a drop.
       unlistenDrop = await ipc.onPhoneSyncDisconnected(() => {
-        set({ remoteConnected: false, remoteVerified: false, remoteDropped: true });
+        // The turn is dead when the channel drops — clear turn state too, not just
+        // connection flags, so neither the interim nor the reconnected session is
+        // stuck on a stale `streaming`/`pendingPermission`.
+        set({
+          remoteConnected: false,
+          remoteVerified: false,
+          remoteDropped: true,
+          streaming: false,
+          pendingPermission: null,
+        });
       });
       // Remember the desktop across launches (public payload — no secret).
       writeStr("pc.lastPairingQr", qr);
@@ -642,6 +663,8 @@ export const useStore = create<AppState>((set, get) => ({
       remoteDropped: false,
       lastPairingQr: null,
       remoteUnlisten: null,
+      streaming: false, // the turn is over — don't strand a stuck composer
+      pendingPermission: null,
     });
     writeStr("pc.lastPairingQr", null); // forget the remembered desktop too
     if (unlisten) unlisten();
