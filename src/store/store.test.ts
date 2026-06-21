@@ -1010,6 +1010,46 @@ describe("remote client", () => {
       await useStore.getState().disconnectRemote();
       expect(localStorage.getItem("pc.lastPairingQr")).toBeNull();
     });
+
+    it("clears stuck turn state (streaming + pendingPermission) on a mid-turn drop + reconnect", async () => {
+      let dropCb!: () => void;
+      m.onPhoneSyncDisconnected.mockImplementation(async (cb) => {
+        dropCb = cb;
+        return () => {};
+      });
+      await useStore.getState().connectRemote("QR");
+      // A turn is in flight when the channel dies.
+      useStore.setState({
+        streaming: true,
+        pendingPermission: { id: "p1", tool: "fs_edit", summary: "x", input: {} },
+      });
+
+      dropCb();
+
+      // The dead turn is cleared, not just the connection flags.
+      expect(useStore.getState().streaming).toBe(false);
+      expect(useStore.getState().pendingPermission).toBeNull();
+
+      // Reconnecting must NOT resurrect the stale turn (disabled composer / dead prompt).
+      await useStore.getState().reconnectRemote();
+      const st = useStore.getState();
+      expect(st.remoteConnected).toBe(true);
+      expect(st.streaming).toBe(false);
+      expect(st.pendingPermission).toBeNull();
+    });
+
+    it("clears stuck turn state when the user disconnects mid-turn", async () => {
+      await useStore.getState().connectRemote("QR");
+      useStore.setState({
+        streaming: true,
+        pendingPermission: { id: "p1", tool: "x", summary: "y", input: {} },
+      });
+
+      await useStore.getState().disconnectRemote();
+
+      expect(useStore.getState().streaming).toBe(false);
+      expect(useStore.getState().pendingPermission).toBeNull();
+    });
   });
 
   describe("disconnectRemote", () => {
