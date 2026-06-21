@@ -504,15 +504,24 @@ async fn serve_connection(
 
     let (mut sender, mut receiver) = paired.channel.split();
 
-    let live = tauri::async_runtime::spawn(async move {
+    let mut live = tauri::async_runtime::spawn(async move {
         let _ = sync::session::forward_live(&mut hub_rx, &mut sender).await;
     });
     // `handler` and `receiver` MUST share one task: handle_commands borrows `&handler`.
-    let cmds = tauri::async_runtime::spawn(async move {
+    let mut cmds = tauri::async_runtime::spawn(async move {
         let _ = sync::session::handle_commands(&mut receiver, &handler).await;
     });
 
-    let _ = tokio::join!(live, cmds);
+    // Run both halves until EITHER ends, then cancel the other. `handle_commands`
+    // reliably returns when the phone disconnects (its recv stream errors), but
+    // `forward_live` can be parked on `hub.recv()` with no traffic to reveal the
+    // dead connection — so `tokio::join!`-ing both would hang forever on an idle
+    // disconnect, leaking the live task and the QUIC connection it pins. Cancelling
+    // the survivor on the first completion frees the connection promptly.
+    tokio::select! {
+        _ = &mut live => { cmds.abort(); }
+        _ = &mut cmds => { live.abort(); }
+    }
 }
 
 /// Bind the iroh endpoint under this device's persisted node identity, publish the
@@ -666,9 +675,14 @@ async fn phone_sync_connect(
         sas: paired.sas.clone(),
         peer_public_key: payload.public_key.clone(),
     };
-    // 6. Spawn the live session. The task owns paired.channel (→ via split the
+    // 6. Spawn the live session, but GATE it on installation: the task waits for
+    //    `ready_rx` before doing any work, so it can never reach its self-clear tail
+    //    before step 7 installs it (closing the spawn↔install race that would
+    //    otherwise leave a dead connection installed = a permanent phantom
+    //    "connected"). The task owns paired.channel (→ via split the
     //    Endpoint/Connection keep-alives) + app + rx + the slot Arc for self-clear.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     // Identity token so the session task self-clears the slot only while it is
     // still the installed connection (guards the reconnect race).
     let token = Arc::new(());
@@ -678,6 +692,7 @@ async fn phone_sync_connect(
         rx,
         slot.clone(),
         token.clone(),
+        ready_rx,
     ));
     // 7. Install the new connection, tearing down any prior one. The lock scope is
     //    a `{ }` block with no await inside, and there is no await after it, so the
@@ -695,6 +710,11 @@ async fn phone_sync_connect(
             token,
         });
     }
+    // 8. Release the gated session task now that it is installed — the self-clear
+    //    can now only ever run against a slot that holds our token. A send error
+    //    means a concurrent disconnect/reconnect already took the slot and aborted
+    //    the task, which is harmless.
+    let _ = ready_tx.send(());
     Ok(info)
     // `endpoint` drops here; harmless — the channel's Endpoint clone (now in the
     // task's ChannelSender) keeps the socket alive for the session.
