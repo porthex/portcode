@@ -538,15 +538,17 @@ export const useStore = create<AppState>((set, get) => ({
     if (prev) prev();
     // A fresh dial is unverified until the user compares the new SAS.
     set({ remoteUnlisten: null, remoteError: null, remoteVerified: false });
+    let unlistenFrame: (() => void) | null = null;
+    let unlistenDrop: (() => void) | null = null;
     try {
       const info = await ipc.phoneSyncConnect(qr);
       // Subscribe only after a successful dial; route every frame through
       // get().applyFrame so the latest action closure folds against live state.
-      const unlistenFrame = await ipc.onPhoneSyncFrame((f) => get().applyFrame(f));
+      unlistenFrame = await ipc.onPhoneSyncFrame((f) => get().applyFrame(f));
       // Detect an UNEXPECTED drop (desktop closed the channel / network dropped) so
       // the UI can leave the dead session and offer a reconnect. A user-initiated
       // disconnect tears this listener down first, so it can't misfire as a drop.
-      const unlistenDrop = await ipc.onPhoneSyncDisconnected(() => {
+      unlistenDrop = await ipc.onPhoneSyncDisconnected(() => {
         set({ remoteConnected: false, remoteVerified: false, remoteDropped: true });
       });
       set({
@@ -559,11 +561,18 @@ export const useStore = create<AppState>((set, get) => ({
         remoteDropped: false,
         lastPairingQr: qr,
         remoteUnlisten: () => {
-          unlistenFrame();
-          unlistenDrop();
+          unlistenFrame?.();
+          unlistenDrop?.();
         },
       });
     } catch (err) {
+      // A listener may have registered before a later step threw (e.g. the dial
+      // succeeded but onPhoneSyncDisconnected rejected). Tear down any partial
+      // subscription AND the native session so nothing leaks. phoneSyncDisconnect
+      // is idempotent — a no-op when the dial itself failed.
+      unlistenDrop?.();
+      unlistenFrame?.();
+      await ipc.phoneSyncDisconnect().catch(() => {});
       set({
         remoteConnected: false,
         remoteSas: null,

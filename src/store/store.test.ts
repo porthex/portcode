@@ -986,6 +986,22 @@ describe("remote client", () => {
       expect(st.remoteDropped).toBe(false);
       expect(st.lastPairingQr).toBeNull();
     });
+
+    it("tears down a partial subscription if the disconnect listener fails to register", async () => {
+      const unlistenFrame = vi.fn();
+      m.onPhoneSyncFrame.mockResolvedValue(unlistenFrame);
+      m.onPhoneSyncDisconnected.mockRejectedValue(new Error("listen failed"));
+
+      await useStore.getState().connectRemote("QR");
+
+      // The already-registered frame listener is cleaned up and the native session
+      // is torn down, so nothing leaks on the partial-failure path.
+      expect(unlistenFrame).toHaveBeenCalledTimes(1);
+      expect(m.phoneSyncDisconnect).toHaveBeenCalled();
+      const st = useStore.getState();
+      expect(st.remoteConnected).toBe(false);
+      expect(st.remoteError).toBe("listen failed");
+    });
   });
 
   describe("disconnectRemote", () => {

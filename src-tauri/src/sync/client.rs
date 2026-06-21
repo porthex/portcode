@@ -101,24 +101,31 @@ pub async fn run_client_session(
     // stream → run_client_recv returns; a closed recv side errors the next send).
     tokio::join!(recv, send);
 
-    // The channel ended. Notify the UI so it can leave the now-dead session and
-    // offer a reconnect. (A phone-INITIATED disconnect removes the UI listener
-    // before tearing down, so this is only observed for an unexpected drop.)
-    let _ = app.emit(DISCONNECT_EVENT, ());
-
     // Self-clear — but ONLY if this session is still the installed one. A
     // concurrent reconnect may have aborted this task AND installed a new
     // `PhoneClientConn` before this tail runs (abort cannot cancel a task already
     // past its last await), so blindly clearing would wipe the live reconnect and
     // orphan its task. Compare identity tokens by pointer: clear only when the
     // slot still holds OUR token. `if let Ok` so a poisoned mutex never panics.
+    let mut was_installed = false;
     if let Ok(mut guard) = slot.lock() {
         if guard
             .as_ref()
             .is_some_and(|c| Arc::ptr_eq(&c.token, &token))
         {
+            was_installed = true;
             guard.take();
         }
+    }
+
+    // Notify the UI of the drop ONLY if THIS task was the installed session. A
+    // stale task (replaced by a concurrent reconnect, but already past its last
+    // await so abort couldn't cancel it) must not emit a FALSE drop that tears
+    // down the newer, live session. (A phone-INITIATED disconnect also removes the
+    // UI listener before tearing down, so even the real session's emit is ignored
+    // there — this only ever surfaces an UNEXPECTED drop of the active session.)
+    if was_installed {
+        let _ = app.emit(DISCONNECT_EVENT, ());
     }
 }
 
