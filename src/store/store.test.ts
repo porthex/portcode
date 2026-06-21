@@ -134,6 +134,12 @@ describe("newSession", () => {
     expect(st.sessions[0].id).toBe(st.activeId);
     expect(st.messages[st.activeId!]).toEqual([]);
   });
+
+  it("closes the mobile session drawer", async () => {
+    useStore.setState({ showSidebar: true });
+    await useStore.getState().newSession();
+    expect(useStore.getState().showSidebar).toBe(false);
+  });
 });
 
 describe("selectSession", () => {
@@ -158,6 +164,12 @@ describe("selectSession", () => {
     m.getMessages.mockClear();
     await useStore.getState().selectSession("b");
     expect(m.getMessages).not.toHaveBeenCalled();
+  });
+
+  it("closes the mobile session drawer on switch", async () => {
+    useStore.setState({ showSidebar: true });
+    await useStore.getState().selectSession("c");
+    expect(useStore.getState().showSidebar).toBe(false);
   });
 });
 
@@ -462,6 +474,17 @@ describe("draft + UI setters", () => {
     useStore.getState().setShowPalette(true);
     expect(useStore.getState().showSettings).toBe(true);
     expect(useStore.getState().showPalette).toBe(true);
+  });
+
+  it("toggleSidebar flips the mobile drawer and setShowSidebar sets it", () => {
+    expect(useStore.getState().showSidebar).toBe(false);
+    useStore.getState().toggleSidebar();
+    expect(useStore.getState().showSidebar).toBe(true);
+    useStore.getState().toggleSidebar();
+    expect(useStore.getState().showSidebar).toBe(false);
+
+    useStore.getState().setShowSidebar(true);
+    expect(useStore.getState().showSidebar).toBe(true);
   });
 });
 

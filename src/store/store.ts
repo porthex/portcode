@@ -31,6 +31,7 @@ interface AppState {
   streaming: boolean;
   showSettings: boolean;
   showFiles: boolean;
+  showSidebar: boolean; // mobile: the session-list drawer (overlay) is open
   showPalette: boolean;
   ambientRain: boolean; // decorative neon-rain backdrop (off by default)
   scanlines: boolean; // CRT scanline overlay (off by default)
@@ -48,6 +49,8 @@ interface AppState {
 
   init: () => Promise<void>;
   toggleFiles: () => void;
+  toggleSidebar: () => void;
+  setShowSidebar: (v: boolean) => void;
   setDraft: (v: string) => void;
   appendDraft: (v: string) => void;
   openWorkspace: () => Promise<void>;
@@ -126,6 +129,7 @@ export const useStore = create<AppState>((set, get) => ({
   streaming: false,
   showSettings: false,
   showFiles: false,
+  showSidebar: false,
   showPalette: false,
   ambientRain: readPref("pc.ambientRain"),
   scanlines: readPref("pc.scanlines"),
@@ -176,12 +180,13 @@ export const useStore = create<AppState>((set, get) => ({
       sessions: [s, ...st.sessions],
       activeId: s.id,
       messages: { ...st.messages, [s.id]: [] },
+      showSidebar: false, // close the mobile drawer on navigation
     }));
   },
 
   async selectSession(id) {
     if (get().streaming) return;
-    set({ activeId: id });
+    set({ activeId: id, showSidebar: false }); // close the mobile drawer on navigation
     if (!get().messages[id]) {
       const msgs = await ipc.getMessages(id);
       set((st) => ({ messages: { ...st.messages, [id]: msgs } }));
@@ -395,6 +400,14 @@ export const useStore = create<AppState>((set, get) => ({
 
   toggleFiles() {
     set((st) => ({ showFiles: !st.showFiles }));
+  },
+
+  toggleSidebar() {
+    set((st) => ({ showSidebar: !st.showSidebar }));
+  },
+
+  setShowSidebar(v) {
+    set({ showSidebar: v });
   },
 
   setDraft(v) {
