@@ -147,16 +147,26 @@ function ConnectPanel({
 
   return (
     <div>
-      {dropped && canReconnect && (
-        <div className="mb-4 rounded-xl border border-warn/40 bg-warn/5 px-4 py-3.5">
+      {canReconnect && (
+        <div
+          className={`mb-4 rounded-xl border px-4 py-3.5 ${
+            dropped ? "border-warn/40 bg-warn/5" : "border-accent-2/30 bg-accent-2/5"
+          }`}
+        >
           <div className="flex items-center gap-2">
-            <span className="pc-dot pc-dot--warn" />
-            <span className="font-mono text-[11px] uppercase tracking-[1.5px] text-warn">
-              Connection lost
+            <span className={`pc-dot ${dropped ? "pc-dot--warn" : "pc-dot--cyan"}`} />
+            <span
+              className={`font-mono text-[11px] uppercase tracking-[1.5px] ${
+                dropped ? "text-warn" : "text-accent-2"
+              }`}
+            >
+              {dropped ? "Connection lost" : "Paired desktop"}
             </span>
           </div>
           <p className="mt-1.5 text-[12px] leading-[1.5] text-muted">
-            The link to your desktop dropped. Reconnect without re-scanning.
+            {dropped
+              ? "The link to your desktop dropped. Reconnect without re-scanning."
+              : "Reconnect to the desktop you paired with — no need to re-scan."}
           </p>
           <button
             onClick={() => void onReconnect()}
