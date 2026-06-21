@@ -335,6 +335,119 @@ fn phone_sync_unpair(state: State<AppState>, public_key: String) -> Result<(), S
         .map_err(|e| e.to_string())
 }
 
+/// Start the Phone Sync listener: bind an iroh endpoint under this device's
+/// persisted node identity and accept inbound phone connections, pairing +
+/// serving each. Returns immediately; the accept loop runs in the background for
+/// the life of the app. The frontend gates this to a single call.
+#[tauri::command]
+fn phone_sync_listen(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    // App-layer (Noise) pairing identity — the key phones pin.
+    let device = sync::pairing::device_identity()?;
+    // Transport (iroh node) identity — persisted so the node id is stable.
+    let secret_key = secrets::get_or_create_iroh_key()?;
+
+    // Owned, Send + 'static clones for the per-connection handler. `State<'_>` is
+    // borrow-scoped to this command and must NOT be captured into the spawn.
+    let handler = sync::server::DesktopCommandHandler {
+        app: app.clone(),
+        http: state.http.clone(),
+        settings: state.settings.clone(),
+        db: state.db.clone(),
+        cancels: state.cancels.clone(),
+        pending: state.pending.clone(),
+        oauth_refresh: state.oauth_refresh.clone(),
+    };
+    let db = state.db.clone();
+    let device_private = device.private.clone();
+    let app_for_loop = app.clone();
+
+    tauri::async_runtime::spawn(async move {
+        // Build the endpoint INSIDE the task so it is owned here and outlives every
+        // `accept_and_pair(&endpoint, …)` borrow below.
+        let endpoint =
+            match sync::transport::build_endpoint(secret_key, iroh::RelayMode::Default).await {
+                Ok(ep) => ep,
+                Err(e) => {
+                    eprintln!("phone-sync: failed to bind endpoint: {e}");
+                    return;
+                }
+            };
+
+        loop {
+            let paired = match sync::transport::accept_and_pair(&endpoint, &device_private).await {
+                Ok(p) => p,
+                Err(e) => {
+                    if e == "endpoint closed" {
+                        return; // socket gone → stop listening
+                    }
+                    eprintln!("phone-sync: pairing failed: {e}");
+                    continue; // a transient/rejected pairing must not kill the loop
+                }
+            };
+
+            // Hand off to a per-connection task so the accept loop is free to take
+            // the next phone. `handler.clone()` is cheap (all Arc/AppHandle).
+            let handler = handler.clone();
+            let db = db.clone();
+            let app = app_for_loop.clone();
+            tauri::async_runtime::spawn(async move {
+                serve_connection(app, db, handler, paired).await;
+            });
+        }
+    });
+
+    Ok(())
+}
+
+/// Serve one paired phone: persist it, run catch-up over the full-duplex channel,
+/// then split and run live-forward + command-intake concurrently until either ends.
+async fn serve_connection(
+    app: AppHandle,
+    db: Arc<Db>,
+    handler: sync::server::DesktopCommandHandler,
+    mut paired: sync::transport::Paired,
+) {
+    use base64::Engine as _;
+
+    // Record / refresh the paired device by its pinned Noise static key.
+    if let Some(peer) = &paired.peer_static {
+        let pk = base64::engine::general_purpose::STANDARD.encode(peer);
+        let _ = db.add_paired_device(&pk, "Phone", db::now_ms());
+    }
+
+    // Subscribe BEFORE catch-up so no live event emitted during the catch-up
+    // window is lost. The broadcast ring (capacity 1024) buffers any frames
+    // published while catch-up is in progress; `forward_live` drains them after
+    // the full-duplex channel is split. Frames that are both in the catch-up
+    // delta AND in the live buffer are harmless duplicates (phone reconciles by
+    // seq). Resolve the hub from `app` here so no State borrow escapes this fn.
+    let mut hub_rx = match app.try_state::<sync::SyncHub>() {
+        Some(hub) => hub.subscribe(),
+        None => {
+            eprintln!("phone-sync: SyncHub missing from managed state");
+            return;
+        }
+    };
+
+    // Catch-up runs on the full-duplex channel (SecureChannel: FrameChannel).
+    if let Err(e) = sync::session::serve_catch_up(&mut paired.channel, &db).await {
+        eprintln!("phone-sync: catch-up failed: {e}");
+        return;
+    }
+
+    let (mut sender, mut receiver) = paired.channel.split();
+
+    let live = tauri::async_runtime::spawn(async move {
+        let _ = sync::session::forward_live(&mut hub_rx, &mut sender).await;
+    });
+    // `handler` and `receiver` MUST share one task: handle_commands borrows `&handler`.
+    let cmds = tauri::async_runtime::spawn(async move {
+        let _ = sync::session::handle_commands(&mut receiver, &handler).await;
+    });
+
+    let _ = tokio::join!(live, cmds);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -391,7 +504,8 @@ pub fn run() {
             resolve_permission,
             phone_sync_status,
             phone_sync_begin_pairing,
-            phone_sync_unpair
+            phone_sync_unpair,
+            phone_sync_listen
         ])
         .run(tauri::generate_context!())
         .expect("error while running Portcode");

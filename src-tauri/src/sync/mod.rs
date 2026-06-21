@@ -16,6 +16,7 @@
 pub mod noise;
 pub mod pairing;
 pub mod protocol;
+pub mod server;
 pub mod session;
 pub mod transport;
 
@@ -58,9 +59,6 @@ impl SyncHub {
     /// after this call.
     // TODO(phase-2): the consuming sync session must handle `RecvError::Lagged(n)`
     // by re-syncing from the DB (`messages_since`) instead of unwrapping the recv.
-    // The real caller is the Phase 2 transport; only tests attach today, so the
-    // lib build sees this as unused.
-    #[allow(dead_code)]
     pub fn subscribe(&self) -> broadcast::Receiver<SyncFrame> {
         self.tx.subscribe()
     }

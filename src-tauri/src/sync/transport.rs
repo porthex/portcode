@@ -12,10 +12,9 @@
 //!     the phone actually pins (`super::noise` / `super::pairing`).
 //!
 //! Handshake + every frame are length-prefixed (4-byte big-endian) over the QUIC
-//! stream. This module isn't wired to a Tauri command yet (that + the session
-//! drive loop is the next increment), so it carries a module `dead_code` allow.
-//! See docs/PHONE_SYNC_PLAN.md.
-#![allow(dead_code)]
+//! stream. See docs/PHONE_SYNC_PLAN.md.
+
+use std::sync::{Arc, Mutex};
 
 use iroh::endpoint::presets;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -54,9 +53,19 @@ pub async fn build_endpoint(secret_key: SecretKey, relay: RelayMode) -> Result<E
 /// needs (the SAS to compare out-of-band, the peer's pinned static key).
 pub struct Paired {
     pub channel: SecureChannel,
+    /// Short Authentication String — surfaced to the pairing UI in a later
+    /// increment; asserted in tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub sas: String,
     pub peer_static: Option<Vec<u8>>,
 }
+
+/// Shared Noise transport state. A `std::sync::Mutex` (not tokio) because the
+/// lock is held ONLY across the synchronous snow `write`/`read` and is always
+/// dropped before any stream `.await` (see `encrypt_frame`/`decrypt_frame`) — so
+/// the guard never crosses an await point (keeps the spawned forward/intake
+/// futures `Send`) and the two split halves can never both be inside snow at once.
+type SharedNoise = Arc<Mutex<noise::Transport>>;
 
 /// An established encrypted channel: a QUIC bi-stream wrapped in the Noise
 /// transport. Holds the `Connection` and `Endpoint` so they outlive the streams
@@ -64,7 +73,7 @@ pub struct Paired {
 pub struct SecureChannel {
     send: SendStream,
     recv: RecvStream,
-    noise: noise::Transport,
+    noise: SharedNoise,
     _conn: Connection,
     _endpoint: Endpoint,
 }
@@ -72,21 +81,91 @@ pub struct SecureChannel {
 impl SecureChannel {
     /// Encrypt + send one `SyncFrame`.
     pub async fn send_frame(&mut self, frame: &SyncFrame) -> Result<(), String> {
-        let plaintext = serde_json::to_vec(frame).map_err(|e| e.to_string())?;
-        let ciphertext = self.noise.write(&plaintext)?;
+        let ciphertext = encrypt_frame(&self.noise, frame)?;
         write_framed(&mut self.send, &ciphertext).await
     }
 
     /// Receive + decrypt one `SyncFrame`.
     pub async fn recv_frame(&mut self) -> Result<SyncFrame, String> {
         let ciphertext = read_framed(&mut self.recv).await?;
-        let plaintext = self.noise.read(&ciphertext)?;
-        serde_json::from_slice(&plaintext).map_err(|e| e.to_string())
+        decrypt_frame(&self.noise, &ciphertext)
+    }
+
+    /// Split into independent send/recv halves so live-forward and command-intake
+    /// run as two concurrent tasks. The halves share the Noise transport via the
+    /// `Arc<Mutex>`; the sender additionally keeps `Connection`/`Endpoint` alive
+    /// (dropping either tears the QUIC connection down), so the receiver stays
+    /// live as long as the sender does.
+    pub fn split(self) -> (ChannelSender, ChannelReceiver) {
+        (
+            ChannelSender {
+                send: self.send,
+                noise: Arc::clone(&self.noise),
+                _conn: self._conn,
+                _endpoint: self._endpoint,
+            },
+            ChannelReceiver {
+                recv: self.recv,
+                noise: self.noise,
+            },
+        )
     }
 }
 
+/// Send half of a split [`SecureChannel`]. Owns the connection/endpoint keep-alive.
+pub struct ChannelSender {
+    send: SendStream,
+    noise: SharedNoise,
+    _conn: Connection,
+    _endpoint: Endpoint,
+}
+
+impl ChannelSender {
+    pub async fn send_frame(&mut self, frame: &SyncFrame) -> Result<(), String> {
+        let ciphertext = encrypt_frame(&self.noise, frame)?;
+        write_framed(&mut self.send, &ciphertext).await
+    }
+}
+
+/// Receive half of a split [`SecureChannel`].
+pub struct ChannelReceiver {
+    recv: RecvStream,
+    noise: SharedNoise,
+}
+
+impl ChannelReceiver {
+    pub async fn recv_frame(&mut self) -> Result<SyncFrame, String> {
+        let ciphertext = read_framed(&mut self.recv).await?;
+        decrypt_frame(&self.noise, &ciphertext)
+    }
+}
+
+/// Serialize + Noise-encrypt one frame. The std-mutex guard is scoped to this
+/// (non-async) fn and dropped at its `}`, so it can never be held across an `.await`.
+fn encrypt_frame(noise: &SharedNoise, frame: &SyncFrame) -> Result<Vec<u8>, String> {
+    let plaintext = serde_json::to_vec(frame).map_err(|e| e.to_string())?;
+    let mut guard = noise
+        .lock()
+        .map_err(|_| "noise mutex poisoned".to_string())?;
+    guard.write(&plaintext)
+}
+
+/// Noise-decrypt + deserialize one frame. Guard dropped before `from_slice`.
+fn decrypt_frame(noise: &SharedNoise, ciphertext: &[u8]) -> Result<SyncFrame, String> {
+    let plaintext = {
+        let mut guard = noise
+            .lock()
+            .map_err(|_| "noise mutex poisoned".to_string())?;
+        guard.read(ciphertext)?
+    };
+    serde_json::from_slice(&plaintext).map_err(|e| e.to_string())
+}
+
 /// Dial a peer, run the XX pairing handshake as the initiator, and return the
-/// resulting encrypted channel.
+/// resulting encrypted channel. The desktop is always the responder
+/// (`accept_and_pair`); this initiator path is exercised only by the iroh
+/// integration tests (and the future phone-side client).
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn connect_and_pair(
     endpoint: &Endpoint,
     peer: EndpointAddr,
@@ -103,7 +182,7 @@ pub async fn connect_and_pair(
         channel: SecureChannel {
             send,
             recv,
-            noise,
+            noise: Arc::new(Mutex::new(noise)),
             _conn: conn,
             _endpoint: endpoint.clone(),
         },
@@ -127,7 +206,7 @@ pub async fn accept_and_pair(
         channel: SecureChannel {
             send,
             recv,
-            noise,
+            noise: Arc::new(Mutex::new(noise)),
             _conn: conn,
             _endpoint: endpoint.clone(),
         },
@@ -278,5 +357,95 @@ mod tests {
             SyncFrame::Live { session_id, .. } => assert_eq!(session_id, "s1"),
             other => panic!("expected Live, got {other:?}"),
         }
+    }
+
+    // End-to-end Phase 2c proof: pair two iroh endpoints, split BOTH channels,
+    // and run the real concurrent server loops (forward_live + handle_commands)
+    // against a client that issues one Command and reads forwarded Live frames.
+    // `multi_thread` for the same lazy-stream reason as the test above.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn split_channels_forward_live_and_dispatch_commands_over_iroh() {
+        use crate::sync::protocol::RemoteCommand;
+        use crate::sync::session::{forward_live, handle_commands, CommandHandler};
+        use crate::sync::SyncHub;
+        use async_trait::async_trait;
+
+        struct Recorder {
+            seen: Arc<Mutex<Vec<RemoteCommand>>>,
+        }
+        #[async_trait]
+        impl CommandHandler for Recorder {
+            async fn handle(&self, command: RemoteCommand) -> Result<(), String> {
+                self.seen.lock().unwrap().push(command);
+                Ok(())
+            }
+        }
+
+        let server_ep = build_endpoint(SecretKey::generate(), RelayMode::Disabled)
+            .await
+            .unwrap();
+        let client_ep = build_endpoint(SecretKey::generate(), RelayMode::Disabled)
+            .await
+            .unwrap();
+        let server_noise = StaticKeypair::generate().unwrap();
+        let client_noise = StaticKeypair::generate().unwrap();
+        let server_addr = server_ep.addr();
+
+        let server_priv = server_noise.private.clone();
+        let server_task =
+            tokio::spawn(async move { accept_and_pair(&server_ep, &server_priv).await });
+        let client = connect_and_pair(&client_ep, server_addr, &client_noise.private)
+            .await
+            .expect("client pairing");
+        let server = server_task.await.unwrap().expect("server pairing");
+
+        // ── server: split, run both loops concurrently ──
+        let hub = SyncHub::new();
+        let mut hub_rx = hub.subscribe(); // subscribe BEFORE publish
+        let (mut server_send, mut server_recv) = server.channel.split();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handler = Recorder { seen: seen.clone() };
+
+        let forward =
+            tokio::spawn(async move { forward_live(&mut hub_rx, &mut server_send).await });
+        let intake = tokio::spawn(async move { handle_commands(&mut server_recv, &handler).await });
+
+        // ── client: split, send one Command, read one forwarded Live ──
+        let (mut client_send, mut client_recv) = client.channel.split();
+        client_send
+            .send_frame(&SyncFrame::Command {
+                command: RemoteCommand::Run {
+                    session_id: "s1".into(),
+                    text: "hello from phone".into(),
+                },
+            })
+            .await
+            .expect("client sends command");
+
+        hub.publish("agent://s1", StreamEvent::TextDelta { text: "hi".into() });
+
+        match client_recv
+            .recv_frame()
+            .await
+            .expect("client receives live")
+        {
+            SyncFrame::Live { session_id, .. } => assert_eq!(session_id, "s1"),
+            other => panic!("expected Live, got {other:?}"),
+        }
+
+        // Close: drop hub (forward_live returns), drop client send (server recv
+        // ends → handle_commands returns). Join both before asserting `seen`.
+        drop(hub);
+        drop(client_send);
+        forward.await.unwrap().expect("forward_live ok");
+        intake.await.unwrap().expect("handle_commands ok");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(matches!(
+            &seen[0],
+            RemoteCommand::Run { session_id, text }
+                if session_id == "s1" && text == "hello from phone"
+        ));
     }
 }

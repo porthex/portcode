@@ -123,6 +123,34 @@ pub fn get_device_key() -> Option<(Vec<u8>, Vec<u8>)> {
     Some((public, private))
 }
 
+// ── Phone Sync iroh node key ─────────────────────────────────────────────────
+
+const IROH_ACCOUNT: &str = "phone-sync-iroh";
+
+fn iroh_entry() -> Result<Entry, String> {
+    Entry::new(SERVICE, IROH_ACCOUNT).map_err(|e| e.to_string())
+}
+
+/// Load the persisted iroh node secret key, generating + storing one on first
+/// run. Stored base64 (the keyring holds strings); the 32 raw bytes round-trip
+/// through `SecretKey::{to_bytes, from_bytes}`. Distinct from the Noise static
+/// identity (`device_*`): this is the transport/node key.
+pub fn get_or_create_iroh_key() -> Result<iroh::SecretKey, String> {
+    if let Ok(b64) = iroh_entry()?.get_password() {
+        if let Ok(bytes) = B64.decode(&b64) {
+            if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                return Ok(iroh::SecretKey::from_bytes(&arr));
+            }
+        }
+        // Corrupt/legacy blob → fall through and regenerate.
+    }
+    let key = iroh::SecretKey::generate();
+    iroh_entry()?
+        .set_password(&B64.encode(key.to_bytes()))
+        .map_err(|e| e.to_string())?;
+    Ok(key)
+}
+
 // ── unified lookup ───────────────────────────────────────────────────────────
 
 /// Pick the credential to authenticate with. OAuth (a subscription sign-in)
