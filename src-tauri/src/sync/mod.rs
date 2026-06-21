@@ -13,6 +13,7 @@
 //! hub taps that emit so a future transport can forward it untouched — the desktop
 //! keeps doing all the work; the phone is only ever a mirror + remote control.
 
+pub mod client;
 pub mod noise;
 pub mod pairing;
 pub mod protocol;

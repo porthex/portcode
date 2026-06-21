@@ -30,6 +30,12 @@ pub struct AppState {
     /// hit the token endpoint (single-flight). Guards no data — held only for
     /// the duration of a refresh.
     pub oauth_refresh: Arc<tokio::sync::Mutex<()>>,
+    /// The phone's live remote-control session, when connected. Holds the
+    /// command-injection sender + the session task handle; `None` when not
+    /// connected. The `std::sync::Mutex` guard is only ever held across cheap
+    /// synchronous ops (take/replace/send) and never across an await, so the
+    /// async commands stay `Send` (see transport.rs:63-68 for the discipline).
+    pub phone_client: Arc<Mutex<Option<sync::client::PhoneClientConn>>>,
 }
 
 // ── settings & secrets ───────────────────────────────────────────────────────
@@ -448,6 +454,133 @@ async fn serve_connection(
     let _ = tokio::join!(live, cmds);
 }
 
+// ── Phone Sync (mobile CLIENT: connect + drive a paired desktop) ─────────────
+//
+// These are the phone's side of the protocol — the dual of the desktop listener
+// above. They register for every target (inert on desktop) and are exercised by
+// the mobile app. No `cfg(mobile)` split here; that is a later increment.
+
+/// Result of a successful client connect: the SAS to compare out-of-band and the
+/// desktop's pinned public key the phone connected to.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectInfo {
+    sas: String,
+    peer_public_key: String,
+}
+
+/// Phone side: scan a desktop's pairing QR, dial + run the XX handshake, pin the
+/// desktop's static key, and spawn the live session (relay inbound frames to the
+/// UI via `phone-sync://frame`, forward UI commands to the desktop). Returns the
+/// SAS + pinned key so the UI can show the out-of-band comparison string.
+#[tauri::command]
+async fn phone_sync_connect(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    qr: String,
+) -> Result<ConnectInfo, String> {
+    use base64::Engine as _;
+    // Clone the Arc slot BEFORE any await: `State<'_>` must not be held across an
+    // await, and the spawned task needs an owned 'static handle to self-clear.
+    let slot = state.phone_client.clone();
+
+    // 1. Parse the QR payload (camelCase on the wire — serde handles it).
+    let payload: sync::pairing::PairingPayload =
+        serde_json::from_str(&qr).map_err(|e| e.to_string())?;
+    // 2. Identities: iroh node key (transport) + Noise static (app-layer pin).
+    let iroh_key = secrets::get_or_create_iroh_key()?;
+    let identity = sync::pairing::device_identity()?;
+    // 3. Bind a client endpoint (RelayMode::Default for hole-punch + relay).
+    let endpoint = sync::transport::build_endpoint(iroh_key, iroh::RelayMode::Default).await?;
+    // 4. Dial + run the XX initiator handshake.
+    let paired =
+        sync::transport::connect_and_pair(&endpoint, payload.node_addr.clone(), &identity.private)
+            .await?;
+    // 5. PIN CHECK: the paired peer's Noise static must equal the QR's key.
+    let expected = base64::engine::general_purpose::STANDARD
+        .decode(&payload.public_key)
+        .map_err(|e| e.to_string())?;
+    match &paired.peer_static {
+        Some(got) if *got == expected => {}
+        _ => return Err("key mismatch".to_string()),
+    }
+    let info = ConnectInfo {
+        sas: paired.sas.clone(),
+        peer_public_key: payload.public_key.clone(),
+    };
+    // 6. Spawn the live session. The task owns paired.channel (→ via split the
+    //    Endpoint/Connection keep-alives) + app + rx + the slot Arc for self-clear.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    // Identity token so the session task self-clears the slot only while it is
+    // still the installed connection (guards the reconnect race).
+    let token = Arc::new(());
+    let task = tauri::async_runtime::spawn(sync::client::run_client_session(
+        paired.channel,
+        app.clone(),
+        rx,
+        slot.clone(),
+        token.clone(),
+    ));
+    // 7. Install the new connection, tearing down any prior one. The lock scope is
+    //    a `{ }` block with no await inside, and there is no await after it, so the
+    //    std-mutex guard never crosses an await.
+    {
+        let mut guard = slot
+            .lock()
+            .map_err(|_| "phone client lock poisoned".to_string())?;
+        if let Some(old) = guard.take() {
+            old.task.abort();
+        }
+        *guard = Some(sync::client::PhoneClientConn {
+            commands: tx,
+            task,
+            token,
+        });
+    }
+    Ok(info)
+    // `endpoint` drops here; harmless — the channel's Endpoint clone (now in the
+    // task's ChannelSender) keeps the socket alive for the session.
+}
+
+/// Phone side: push one `RemoteCommand` to the live desktop session. Errors
+/// "not connected" when there is no active session.
+#[tauri::command]
+fn phone_sync_send_command(
+    state: State<AppState>,
+    command: sync::protocol::RemoteCommand,
+) -> Result<(), String> {
+    let guard = state
+        .phone_client
+        .lock()
+        .map_err(|_| "phone client lock poisoned".to_string())?;
+    match guard.as_ref() {
+        Some(conn) => conn
+            .commands
+            .send(command)
+            .map_err(|_| "not connected".to_string()),
+        None => Err("not connected".to_string()),
+    }
+}
+
+/// Phone side: tear down the live desktop session. Dropping the command sender
+/// ends the send loop → drops the `ChannelSender` → the QUIC connection closes →
+/// the recv loop ends. Aborting the task is a backstop. Idempotent.
+#[tauri::command]
+fn phone_sync_disconnect(state: State<AppState>) -> Result<(), String> {
+    let taken = {
+        let mut guard = state
+            .phone_client
+            .lock()
+            .map_err(|_| "phone client lock poisoned".to_string())?;
+        guard.take()
+    };
+    if let Some(conn) = taken {
+        drop(conn.commands); // ends send loop → drops ChannelSender → QUIC down
+        conn.task.abort(); // belt-and-suspenders: ensure the task is gone
+    }
+    Ok(()) // no-op when nothing was connected
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -479,6 +612,7 @@ pub fn run() {
                 cancels: Arc::new(Mutex::new(HashMap::new())),
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 oauth_refresh: Arc::new(tokio::sync::Mutex::new(())),
+                phone_client: Arc::new(Mutex::new(None)),
             });
             // Phone Sync fan-out hub (Phase 0). The agent/llm `emit` helpers look
             // this up via `app.try_state` to mirror events; absent until managed,
@@ -505,7 +639,10 @@ pub fn run() {
             phone_sync_status,
             phone_sync_begin_pairing,
             phone_sync_unpair,
-            phone_sync_listen
+            phone_sync_listen,
+            phone_sync_connect,
+            phone_sync_send_command,
+            phone_sync_disconnect
         ])
         .run(tauri::generate_context!())
         .expect("error while running Portcode");
