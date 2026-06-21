@@ -16,9 +16,6 @@ on:
   push:
     branches: [staging]
 
-permissions:
-  contents: write # create/update the pre-release + upload assets
-
 concurrency:
   group: staging-build-${{ github.ref }}
   cancel-in-progress: true
@@ -29,6 +26,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Enable Corepack (pnpm)
         run: corepack enable
@@ -87,6 +86,8 @@ jobs:
       NDK_VERSION: "27.0.12077973"
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Enable Corepack (pnpm)
         run: corepack enable
