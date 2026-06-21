@@ -355,6 +355,17 @@ describe("stop", () => {
     expect(st.cancel).toBeNull();
     expect(st.pendingPermission).toBeNull();
   });
+
+  it("stops a remote turn with a Cancel command, not the (absent) local cancel", async () => {
+    const cancel = vi.fn(async () => {});
+    useStore.setState({ remoteConnected: true, activeId: "s1", streaming: true, cancel });
+
+    await useStore.getState().stop();
+
+    expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({ cmd: "cancel", session_id: "s1" });
+    expect(cancel).not.toHaveBeenCalled();
+    expect(useStore.getState().streaming).toBe(false);
+  });
 });
 
 describe("resolvePermission", () => {
@@ -405,6 +416,23 @@ describe("resolvePermission", () => {
     // The stale p1 click is dropped; the newer prompt stays pending and unanswered.
     expect(m.resolvePermission).not.toHaveBeenCalled();
     expect(useStore.getState().pendingPermission).toEqual(newer);
+  });
+
+  it("answers as a Permission command in remote mode (not the desktop-only local resolve)", async () => {
+    useStore.setState({
+      remoteConnected: true,
+      pendingPermission: { id: "p1", tool: "fs_edit", summary: "x", input: {} },
+    });
+
+    await useStore.getState().resolvePermission("allow");
+
+    expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({
+      cmd: "permission",
+      id: "p1",
+      decision: "allow",
+    });
+    expect(m.resolvePermission).not.toHaveBeenCalled();
+    expect(useStore.getState().pendingPermission).toBeNull();
   });
 });
 

@@ -331,6 +331,14 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async stop() {
+    // Remote mode: the turn runs on the desktop, so stop it with a Cancel command
+    // over the link (there is no local `cancel` handle on the phone).
+    if (get().remoteConnected) {
+      const activeId = get().activeId;
+      if (activeId) await get().sendRemoteCommand({ cmd: "cancel", session_id: activeId });
+      set({ streaming: false, pendingPermission: null });
+      return;
+    }
     const c = get().cancel;
     if (c) await c();
     set({ streaming: false, cancel: null, pendingPermission: null });
@@ -340,6 +348,21 @@ export const useStore = create<AppState>((set, get) => ({
     const p = get().pendingPermission;
     if (!p) return;
     const id = p.id;
+
+    // Remote mode: the permission gate belongs to the desktop's agent run, so
+    // answer it as a Permission command over the link — the local
+    // `resolve_permission` is desktop-only and not registered on the phone. The
+    // "always" policy is a desktop-side setting the phone can't change through
+    // this command, so it's ignored on the remote path. The same stale-click
+    // guard applies (don't answer a request a newer one superseded).
+    if (get().remoteConnected) {
+      const current = get().pendingPermission;
+      if (current && current.id !== id) return;
+      set({ pendingPermission: null });
+      await get().sendRemoteCommand({ cmd: "permission", id, decision });
+      return;
+    }
+
     if (always && decision === "allow") {
       await get().updateSettings({ defaultPolicy: "allow" });
     }
