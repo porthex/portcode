@@ -50,6 +50,15 @@ pub struct AppState {
     /// synchronous ops (take/replace/send) and never across an await, so the
     /// async commands stay `Send` (see transport.rs:63-68 for the discipline).
     pub phone_client: Arc<Mutex<Option<sync::client::PhoneClientConn>>>,
+    /// The live iroh endpoint the desktop SYNC SERVER is listening on, shared so
+    /// `phone_sync_begin_pairing` can advertise its FULL current address (relay URL
+    /// + direct socket addrs, not just the node id). `None` until `start_listener`
+    /// binds it at startup (and on mobile, which never listens). Written once by
+    /// `start_listener`; read by the pairing command. The `std::sync::Mutex` guard
+    /// is only ever held across cheap synchronous ops (set / clone-out) and never
+    /// across an await — same discipline as `phone_client` (see transport.rs:63-68).
+    #[cfg_attr(mobile, allow(dead_code))]
+    pub listen_endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
 }
 
 // ── settings & secrets ───────────────────────────────────────────────────────
@@ -357,10 +366,51 @@ fn phone_sync_status(state: State<AppState>) -> Result<PhoneSyncStatus, String> 
     })
 }
 
-/// Begin a pairing attempt; returns the QR payload to display.
+/// Begin a pairing attempt; returns the QR payload to display. When the SYNC
+/// SERVER is already listening (the normal case — startup binds it), the QR carries
+/// the endpoint's FULL CURRENT address (node id + relay URL + discovered direct
+/// socket addrs), read fresh on each call, so a phone dials immediately, including
+/// from outside the home network. Falls back to the identity-only address (n0 DNS
+/// discovery) if pairing is requested before the listener has bound.
+// DESKTOP-ONLY: only the desktop advertises a QR. The phone SCANS it
+// (`phone_sync_connect`); it never begins pairing, so this is omitted from the
+// mobile handler.
+#[cfg(desktop)]
 #[tauri::command]
-fn phone_sync_begin_pairing() -> Result<sync::pairing::PairingPayload, String> {
-    sync::pairing::begin_pairing()
+fn phone_sync_begin_pairing(
+    state: State<AppState>,
+) -> Result<sync::pairing::PairingPayload, String> {
+    use rand::RngCore as _;
+
+    // Snapshot the live address under the lock, then DROP the guard before building
+    // the payload — keep the critical section to a synchronous `ep.addr()` call.
+    // `Endpoint::addr()` returns the CURRENT full EndpointAddr (sync — see
+    // transport.rs:304).
+    let live_addr: Option<iroh::EndpointAddr> = {
+        let slot = state
+            .listen_endpoint
+            .lock()
+            .map_err(|_| "listen_endpoint lock poisoned".to_string())?;
+        slot.as_ref().map(|ep| ep.addr())
+    };
+
+    match live_addr {
+        Some(addr) => {
+            // Mirror sync::pairing::begin_pairing: same identity + a fresh nonce,
+            // but the node_addr is the live full address instead of identity-only.
+            let identity = sync::pairing::device_identity()?;
+            let mut nonce = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut nonce);
+            Ok(sync::pairing::PairingPayload::new(
+                &identity.public,
+                &nonce,
+                addr,
+            ))
+        }
+        // Listener not bound yet (e.g. bind still in flight) → identity-only QR
+        // (still dialable via n0 discovery).
+        None => sync::pairing::begin_pairing(),
+    }
 }
 
 /// Forget a paired device by its base64 public key. Idempotent. (The device list
@@ -376,69 +426,40 @@ fn phone_sync_unpair(state: State<AppState>, public_key: String) -> Result<(), S
 /// Start the Phone Sync listener: bind an iroh endpoint under this device's
 /// persisted node identity and accept inbound phone connections, pairing +
 /// serving each. Returns immediately; the accept loop runs in the background for
-/// the life of the app. The frontend gates this to a single call.
+/// the life of the app.
+///
+/// Startup already starts the listener (see `start_listener` in `setup`), so this
+/// command is now an idempotent backstop — it no-ops if the endpoint is already
+/// bound, so a stray frontend `invoke("phone_sync_listen")` never double-binds the
+/// socket.
 // DESKTOP-ONLY: this is the always-on SYNC SERVER (accept loop). It builds
 // `sync::server::DesktopCommandHandler` (mobile-excluded with `agent`). The phone
 // is the CLIENT (`phone_sync_connect`), so it never listens/serves.
 #[cfg(desktop)]
 #[tauri::command]
 fn phone_sync_listen(app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    // App-layer (Noise) pairing identity — the key phones pin.
-    let device = sync::pairing::device_identity()?;
-    // Transport (iroh node) identity — persisted so the node id is stable.
-    let secret_key = secrets::get_or_create_iroh_key()?;
-
-    // Owned, Send + 'static clones for the per-connection handler. `State<'_>` is
-    // borrow-scoped to this command and must NOT be captured into the spawn.
-    let handler = sync::server::DesktopCommandHandler {
-        app: app.clone(),
-        http: state.http.clone(),
-        settings: state.settings.clone(),
-        db: state.db.clone(),
-        cancels: state.cancels.clone(),
-        pending: state.pending.clone(),
-        oauth_refresh: state.oauth_refresh.clone(),
-    };
-    let db = state.db.clone();
-    let device_private = device.private.clone();
-    let app_for_loop = app.clone();
-
-    tauri::async_runtime::spawn(async move {
-        // Build the endpoint INSIDE the task so it is owned here and outlives every
-        // `accept_and_pair(&endpoint, …)` borrow below.
-        let endpoint =
-            match sync::transport::build_endpoint(secret_key, iroh::RelayMode::Default).await {
-                Ok(ep) => ep,
-                Err(e) => {
-                    eprintln!("phone-sync: failed to bind endpoint: {e}");
-                    return;
-                }
-            };
-
-        loop {
-            let paired = match sync::transport::accept_and_pair(&endpoint, &device_private).await {
-                Ok(p) => p,
-                Err(e) => {
-                    if e == "endpoint closed" {
-                        return; // socket gone → stop listening
-                    }
-                    eprintln!("phone-sync: pairing failed: {e}");
-                    continue; // a transient/rejected pairing must not kill the loop
-                }
-            };
-
-            // Hand off to a per-connection task so the accept loop is free to take
-            // the next phone. `handler.clone()` is cheap (all Arc/AppHandle).
-            let handler = handler.clone();
-            let db = db.clone();
-            let app = app_for_loop.clone();
-            tauri::async_runtime::spawn(async move {
-                serve_connection(app, db, handler, paired).await;
-            });
+    // Already listening? No-op. Check the slot WITHOUT holding the guard across the
+    // start_listener call (lock-read-drop); the guard is released at the `}`.
+    {
+        if state
+            .listen_endpoint
+            .lock()
+            .map_err(|_| "listen_endpoint lock poisoned".to_string())?
+            .is_some()
+        {
+            return Ok(());
         }
-    });
-
-    Ok(())
+    }
+    start_listener(
+        app.clone(),
+        state.http.clone(),
+        state.settings.clone(),
+        state.db.clone(),
+        state.cancels.clone(),
+        state.pending.clone(),
+        state.oauth_refresh.clone(),
+        state.listen_endpoint.clone(),
+    )
 }
 
 /// Serve one paired phone: persist it, run catch-up over the full-duplex channel,
@@ -492,6 +513,101 @@ async fn serve_connection(
     });
 
     let _ = tokio::join!(live, cmds);
+}
+
+/// Bind the iroh endpoint under this device's persisted node identity, publish the
+/// live endpoint into `AppState.listen_endpoint` (so the pairing QR can advertise
+/// its full address), and run the accept loop, serving each paired phone. Spawns a
+/// detached background task and returns immediately.
+// DESKTOP-ONLY: the always-on SYNC SERVER. Builds `sync::server::DesktopCommandHandler`
+// (mobile-excluded). Takes OWNED clones — `State<'_>` is borrow-scoped and must not
+// cross into the spawn. Called once from `setup` (startup) and from the idempotent
+// `phone_sync_listen` backstop.
+#[cfg(desktop)]
+// 8 params (the AppState pieces the accept loop needs as owned clones, plus the
+// shared `listen_endpoint`) > clippy's 7-arg threshold; same pattern + allow as
+// `agent::run`. Bundling them into a struct buys nothing here — they are already
+// the `AppState` fields, threaded through once.
+#[allow(clippy::too_many_arguments)]
+fn start_listener(
+    app: AppHandle,
+    http: reqwest::Client,
+    settings: Arc<Mutex<Settings>>,
+    db: Arc<Db>,
+    cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    pending: permissions::Pending,
+    oauth_refresh: Arc<tokio::sync::Mutex<()>>,
+    listen_endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
+) -> Result<(), String> {
+    // App-layer (Noise) pairing identity — the key phones pin.
+    let device = sync::pairing::device_identity()?;
+    // Transport (iroh node) identity — persisted so the node id is stable.
+    let secret_key = secrets::get_or_create_iroh_key()?;
+
+    let handler = sync::server::DesktopCommandHandler {
+        app: app.clone(),
+        http,
+        settings,
+        db: db.clone(),
+        cancels,
+        pending,
+        oauth_refresh,
+    };
+    let device_private = device.private.clone();
+    let app_for_loop = app.clone();
+
+    tauri::async_runtime::spawn(async move {
+        // Build the endpoint INSIDE the task so it is owned here and outlives every
+        // `accept_and_pair(&endpoint, …)` borrow below. RelayMode::Default = relay +
+        // hole-punch, so a phone can reach us from outside the home network.
+        let endpoint =
+            match sync::transport::build_endpoint(secret_key, iroh::RelayMode::Default).await {
+                Ok(ep) => ep,
+                Err(e) => {
+                    eprintln!("phone-sync: failed to bind endpoint: {e}");
+                    return;
+                }
+            };
+
+        // Publish the live endpoint for the pairing command. Clone first (Endpoint
+        // is Arc-backed), store the CLONE, keep the ORIGINAL owned by this task for
+        // the accept loop. The guard lives in a `{}` with NO await inside and none
+        // touching it after, so the std-mutex guard never crosses an await (keeps
+        // this future Send).
+        {
+            match listen_endpoint.lock() {
+                Ok(mut slot) => *slot = Some(endpoint.clone()),
+                Err(_) => {
+                    eprintln!("phone-sync: listen_endpoint mutex poisoned");
+                    return;
+                }
+            }
+        }
+
+        loop {
+            let paired = match sync::transport::accept_and_pair(&endpoint, &device_private).await {
+                Ok(p) => p,
+                Err(e) => {
+                    if e == "endpoint closed" {
+                        return; // socket gone → stop listening
+                    }
+                    eprintln!("phone-sync: pairing failed: {e}");
+                    continue; // a transient/rejected pairing must not kill the loop
+                }
+            };
+
+            // Hand off to a per-connection task so the accept loop is free to take
+            // the next phone. `handler.clone()` is cheap (all Arc/AppHandle).
+            let handler = handler.clone();
+            let db = db.clone();
+            let app = app_for_loop.clone();
+            tauri::async_runtime::spawn(async move {
+                serve_connection(app, db, handler, paired).await;
+            });
+        }
+    });
+
+    Ok(())
 }
 
 // ── Phone Sync (mobile CLIENT: connect + drive a paired desktop) ─────────────
@@ -659,11 +775,34 @@ pub fn run() {
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 oauth_refresh: Arc::new(tokio::sync::Mutex::new(())),
                 phone_client: Arc::new(Mutex::new(None)),
+                listen_endpoint: Arc::new(Mutex::new(None)),
             });
             // Phone Sync fan-out hub (Phase 0). The agent/llm `emit` helpers look
             // this up via `app.try_state` to mirror events; absent until managed,
             // so this must be registered during setup.
             app.manage(sync::SyncHub::new());
+
+            // BUG 1 FIX: the desktop is the SYNC SERVER — auto-start the accept loop
+            // at launch so a paired phone has something to connect to. (Previously
+            // `phone_sync_listen` existed but was never invoked.) Desktop-only: the
+            // phone is the CLIENT and never listens. Must run AFTER both `manage`
+            // calls above — `serve_connection` resolves `SyncHub` via `app.try_state`.
+            #[cfg(desktop)]
+            {
+                let state = app.state::<AppState>();
+                if let Err(e) = start_listener(
+                    app.handle().clone(),
+                    state.http.clone(),
+                    state.settings.clone(),
+                    state.db.clone(),
+                    state.cancels.clone(),
+                    state.pending.clone(),
+                    state.oauth_refresh.clone(),
+                    state.listen_endpoint.clone(),
+                ) {
+                    eprintln!("phone-sync: listener failed to start: {e}");
+                }
+            }
             Ok(())
         });
 
@@ -700,10 +839,12 @@ pub fn run() {
     ]);
 
     // MOBILE — the remote-CLIENT subset. Shared settings/secrets/sessions +
-    // pairing-status/begin/unpair + the phone CLIENT trio. OMITS the desktop-only
+    // pairing-status/unpair + the phone CLIENT trio. OMITS the desktop-only
     // commands (the OAuth trio, list_dir, run_agent, cancel_agent,
-    // resolve_permission, phone_sync_listen) — none are compiled on mobile, so
-    // naming them here would be an unresolved-name error.
+    // resolve_permission, phone_sync_listen, phone_sync_begin_pairing) — none are
+    // compiled on mobile, so naming them here would be an unresolved-name error.
+    // (The phone SCANS a QR via `phone_sync_connect`; it never advertises one, so
+    // `phone_sync_begin_pairing` is desktop-only.)
     #[cfg(mobile)]
     let builder = builder.invoke_handler(tauri::generate_handler![
         get_settings,
@@ -715,7 +856,6 @@ pub fn run() {
         delete_session,
         get_messages,
         phone_sync_status,
-        phone_sync_begin_pairing,
         phone_sync_unpair,
         phone_sync_connect,
         phone_sync_send_command,
