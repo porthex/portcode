@@ -72,7 +72,9 @@ impl PairingPayload {
 /// resolves the live addresses from the `EndpointId`. Synchronous — no live
 /// endpoint needed, so it can be built at pairing time before the listener binds.
 pub fn iroh_node_addr() -> Result<EndpointAddr, String> {
-    Ok(EndpointAddr::new(secrets::get_or_create_iroh_key()?.public()))
+    Ok(EndpointAddr::new(
+        secrets::get_or_create_iroh_key()?.public(),
+    ))
 }
 
 /// Start a pairing attempt: load/create the device identity and advertise it with
