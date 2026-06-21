@@ -261,7 +261,11 @@ const mock = (() => {
       return { ...phoneSyncState, paired: [...phoneSyncState.paired] };
     },
     async phoneSyncBeginPairing(): Promise<PairingPayload> {
-      return { version: 1, publicKey: phoneSyncState.devicePublicKey, nonce: "MOCK_NONCE_BASE64==" };
+      return {
+        version: 1,
+        publicKey: phoneSyncState.devicePublicKey,
+        nonce: "MOCK_NONCE_BASE64==",
+      };
     },
     async phoneSyncUnpair(publicKey: string) {
       phoneSyncState = {

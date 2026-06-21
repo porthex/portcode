@@ -68,7 +68,11 @@ beforeEach(() => {
   m.oauthLogout.mockResolvedValue(undefined);
   m.oauthStatus.mockResolvedValue({ signedIn: false, expiresAt: null, account: null, tier: null });
   m.phoneSyncStatus.mockResolvedValue({ devicePublicKey: "DEVICE==", paired: [] });
-  m.phoneSyncBeginPairing.mockResolvedValue({ version: 1, publicKey: "DEVICE==", nonce: "NONCE==" });
+  m.phoneSyncBeginPairing.mockResolvedValue({
+    version: 1,
+    publicKey: "DEVICE==",
+    nonce: "NONCE==",
+  });
   m.phoneSyncUnpair.mockResolvedValue(undefined);
 });
 

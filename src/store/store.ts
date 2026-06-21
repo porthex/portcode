@@ -128,7 +128,14 @@ export const useStore = create<AppState>((set, get) => ({
     if (sessions.length === 0) {
       const s = makeSession();
       await ipc.createSession(s.id, s.title, s.workspace);
-      set({ settings, oauthStatus, phoneSync, sessions: [s], activeId: s.id, messages: { [s.id]: [] } });
+      set({
+        settings,
+        oauthStatus,
+        phoneSync,
+        sessions: [s],
+        activeId: s.id,
+        messages: { [s.id]: [] },
+      });
       return;
     }
     const activeId = sessions[0].id;

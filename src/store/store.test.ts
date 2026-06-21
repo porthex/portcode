@@ -70,7 +70,11 @@ beforeEach(() => {
   m.startOauthLogin.mockResolvedValue(signedOut);
   m.oauthLogout.mockResolvedValue(undefined);
   m.phoneSyncStatus.mockResolvedValue(noPhoneSync);
-  m.phoneSyncBeginPairing.mockResolvedValue({ version: 1, publicKey: "DEVICE==", nonce: "NONCE==" });
+  m.phoneSyncBeginPairing.mockResolvedValue({
+    version: 1,
+    publicKey: "DEVICE==",
+    nonce: "NONCE==",
+  });
   m.phoneSyncUnpair.mockResolvedValue(undefined);
 });
 
