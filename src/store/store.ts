@@ -566,9 +566,13 @@ export const useStore = create<AppState>((set, get) => ({
 
   async disconnectRemote() {
     const unlisten = get().remoteUnlisten;
+    // Flip the connection flags FIRST, before the async teardown. `remoteConnected`
+    // is the routing source of truth for send/stop/resolvePermission, so clearing it
+    // up front guarantees no command is dispatched onto the closing channel while
+    // `phoneSyncDisconnect` is in flight.
+    set({ remoteConnected: false, remoteVerified: false, remoteSas: null, remoteUnlisten: null });
     if (unlisten) unlisten();
     await ipc.phoneSyncDisconnect();
-    set({ remoteConnected: false, remoteVerified: false, remoteSas: null, remoteUnlisten: null });
   },
 }));
 

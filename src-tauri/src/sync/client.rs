@@ -44,7 +44,19 @@ pub async fn run_client_session(
     mut commands: UnboundedReceiver<RemoteCommand>,
     slot: Arc<Mutex<Option<PhoneClientConn>>>,
     token: Arc<()>,
+    installed: tokio::sync::oneshot::Receiver<()>,
 ) {
+    // Wait until `phone_sync_connect` has INSTALLED this connection (carrying our
+    // `token`) into `slot` before doing anything. Otherwise, if the freshly-paired
+    // channel dies in the window before install, the loops below would end and the
+    // self-clear tail would run against a slot that does NOT yet hold our token
+    // (ptr_eq false → no-op) — then install would publish a connection whose task
+    // has already exited and whose channel is dead, a permanent phantom "connected".
+    // A dropped sender (connect aborted before signalling) resolves `Err`, meaning
+    // nothing was installed, so we simply exit without touching the slot.
+    if installed.await.is_err() {
+        return;
+    }
     let (mut sender, mut receiver) = channel.split();
 
     // recv loop: emit each inbound frame to the UI until the channel closes.

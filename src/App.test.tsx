@@ -89,6 +89,20 @@ describe("App layout", () => {
     expect(screen.getByTestId("command-palette")).toBeInTheDocument();
   });
 
+  it("releases the remote frame subscription when the app unmounts", async () => {
+    const unlisten = vi.fn();
+    const { unmount } = render(<App />);
+    // Let init() settle so its async setState can't race the teardown assertion.
+    await waitFor(() => expect(useStore.getState().sessions).toHaveLength(1));
+    useStore.setState({ remoteUnlisten: unlisten });
+
+    unmount();
+
+    // App's unmount effect tears the live native frame listener down so it can't
+    // survive into a fresh store instance (HMR / root remount) and double-feed.
+    expect(unlisten).toHaveBeenCalledTimes(1);
+  });
+
   it("hides FileExplorer and SettingsPanel when their flags are false", () => {
     useStore.setState({ showFiles: false, showSettings: false });
 
