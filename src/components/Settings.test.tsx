@@ -474,23 +474,43 @@ describe("SettingsPanel — Phone Sync section", () => {
     });
 
     expect(m.phoneSyncBeginPairing).toHaveBeenCalledTimes(1);
-    // After beginPairing the store sets pairingPayload; the component shows the code.
+    // After beginPairing the store sets pairingPayload; the component shows the QR.
     useStore.setState({ pairingPayload: { version: 1, publicKey: "PUB==", nonce: "NON==" } });
     // Re-render to see the updated state.
     cleanup();
     renderPanel();
-    expect(screen.getByText("PUB==")).toBeInTheDocument();
-    expect(screen.getByText("NON==")).toBeInTheDocument();
-    expect(screen.getByText(/Scan this from the Portcode phone app/)).toBeInTheDocument();
+    expect(screen.getByTestId("pairing-qr")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Done" })).toBeInTheDocument();
   });
 
-  it("shows the pairing code when pairingPayload is set in the store", () => {
+  it("renders the pairing payload as a scannable QR with a copyable text fallback", () => {
     useStore.setState({ pairingPayload: { version: 1, publicKey: "PUB==", nonce: "NON==" } });
     renderPanel();
 
-    expect(screen.getByText("PUB==")).toBeInTheDocument();
-    expect(screen.getByText("NON==")).toBeInTheDocument();
+    // The QR (which the phone scans) and Done are shown up front; the raw code is
+    // tucked behind a "show" toggle for the can't-scan fallback.
+    expect(screen.getByTestId("pairing-qr")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Done" })).toBeInTheDocument();
+    expect(screen.queryByText(/"publicKey":"PUB=="/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Show pairing code/ }));
+    // The revealed text is the exact JSON the phone parses.
+    expect(screen.getByText(/"publicKey":"PUB=="/)).toBeInTheDocument();
+  });
+
+  it("copies the full pairing payload to the clipboard", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    useStore.setState({ pairingPayload: { version: 1, publicKey: "PUB==", nonce: "NON==" } });
+    renderPanel();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Copy code/ }));
+      await Promise.resolve();
+    });
+
+    expect(writeText).toHaveBeenCalledWith('{"version":1,"publicKey":"PUB==","nonce":"NON=="}');
+    expect(screen.getByRole("button", { name: /Copied/ })).toBeInTheDocument();
   });
 
   it("Done button clears the pairing payload", () => {

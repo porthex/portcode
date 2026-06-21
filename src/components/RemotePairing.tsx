@@ -1,36 +1,70 @@
 import { useState } from "react";
+import { createPortal } from "react-dom";
 import { useStore } from "../store/store";
+import { isScannerAvailable, scanQrPayload, cancelScan } from "../lib/scanner";
 
 // The remote-mode pairing screen. Shown on the phone (or any client in remote
 // mode) until a live desktop session is both established AND its SAS verified.
 // Two visual states:
 //
-//   1. CONNECT  — paste the desktop's QR payload (JSON) and dial.
+//   1. CONNECT  — scan the desktop's QR with the camera (native phone client) or
+//                 paste the QR payload (JSON) as a fallback, then dial.
 //   2. VERIFY   — once connected, show the SAS prominently for out-of-band
 //                 comparison; "Continue" confirms it and hands off to the session.
 //
-// Camera/QR scanning is intentionally out of scope here (no QR dependency yet);
-// the "Scan QR" control is a clearly-labelled disabled affordance and paste is
-// the working path. Styled with the Neon-Noir utility classes, mirroring the
-// desktop pairing UI in Settings.
+// The camera path uses the native barcode scanner (see lib/scanner); it is only
+// offered where it exists (the phone), and paste always works as a fallback.
+// Styled with the Neon-Noir utility classes, mirroring the desktop pairing UI in
+// Settings.
 export function RemotePairing() {
   const connectRemote = useStore((s) => s.connectRemote);
   const remoteConnected = useStore((s) => s.remoteConnected);
 
   const [qr, setQr] = useState("");
   const [connecting, setConnecting] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
 
-  const connect = async () => {
-    if (!qr.trim() || connecting) return;
+  // Dial a payload. connectRemote never throws — it folds failures into
+  // store.remoteError, which the connect panel surfaces inline. On success it
+  // flips remoteConnected and this screen swaps to the VERIFY state.
+  const connectWith = async (payload: string) => {
+    const v = payload.trim();
+    if (!v || connecting) return;
     setConnecting(true);
     try {
-      // connectRemote never throws — it folds failures into store.remoteError,
-      // which the connect panel surfaces inline. On success it flips
-      // remoteConnected and this screen swaps to the VERIFY state.
-      await connectRemote(qr.trim());
+      await connectRemote(v);
     } finally {
       setConnecting(false);
     }
+  };
+
+  const connect = () => connectWith(qr);
+
+  // Scan the desktop's QR with the camera, then dial the decoded payload. The
+  // payload also lands in the textarea so a failed dial can be retried/edited.
+  const onScan = async () => {
+    if (scanning || connecting) return;
+    setScanError(null);
+    setScanning(true);
+    const outcome = await scanQrPayload();
+    setScanning(false);
+    if (outcome.ok) {
+      setQr(outcome.value);
+      await connectWith(outcome.value);
+    } else if (outcome.reason === "denied") {
+      setScanError(
+        "Camera access was denied. Enable it in your phone's settings, or paste the code below.",
+      );
+    } else if (outcome.reason === "error") {
+      setScanError(outcome.message || "Couldn’t start the camera. Paste the code below instead.");
+    }
+    // "cancelled" / "unavailable": the user backed out — nothing to surface.
+  };
+
+  const onCancelScan = async () => {
+    await cancelScan();
+    setScanning(false);
   };
 
   return (
@@ -51,7 +85,15 @@ export function RemotePairing() {
           {remoteConnected ? (
             <VerifyPanel />
           ) : (
-            <ConnectPanel qr={qr} setQr={setQr} connect={connect} connecting={connecting} />
+            <ConnectPanel
+              qr={qr}
+              setQr={setQr}
+              connect={connect}
+              connecting={connecting}
+              onScan={onScan}
+              scanning={scanning}
+              scanError={scanError}
+            />
           )}
         </div>
       </div>
@@ -59,31 +101,70 @@ export function RemotePairing() {
       <p className="mt-5 text-center font-mono text-[10.5px] tracking-wide text-faint">
         End-to-end encrypted · paired over your local network
       </p>
+
+      {/* The camera preview renders behind a transparented webview; this overlay
+          (outside the hidden app shell, via a body portal) is the only painted UI. */}
+      {scanning &&
+        createPortal(<ScanOverlay onCancel={() => void onCancelScan()} />, document.body)}
     </div>
   );
 }
 
-/** State 1 — paste the desktop's pairing payload and dial. */
+/** State 1 — scan the desktop's QR (phone) or paste its payload, then dial. */
 function ConnectPanel({
   qr,
   setQr,
   connect,
   connecting,
+  onScan,
+  scanning,
+  scanError,
 }: {
   qr: string;
   setQr: (v: string) => void;
   connect: () => void | Promise<void>;
   connecting: boolean;
+  onScan: () => void | Promise<void>;
+  scanning: boolean;
+  scanError: string | null;
 }) {
   const error = useStore((s) => s.remoteError);
+  const canScan = isScannerAvailable();
 
   return (
     <div>
       <div className="pc-eyebrow pc-eyebrow--accent">CONNECT TO DESKTOP</div>
       <p className="mb-3 text-[12px] leading-[1.5] text-muted">
         On your desktop, open <span className="text-fg">Settings → Phone Sync</span> and choose{" "}
-        <span className="text-fg">Pair a phone</span>. Paste the pairing code below.
+        <span className="text-fg">Pair a phone</span>
+        {canScan ? ", then scan the QR it shows." : ". Paste the pairing code below."}
       </p>
+
+      {canScan && (
+        <>
+          <button
+            type="button"
+            onClick={() => void onScan()}
+            disabled={scanning || connecting}
+            aria-busy={scanning}
+            className="pc-btn-accent mb-2 flex w-full items-center justify-center gap-2 px-3 py-2.5 text-[13px] disabled:opacity-40"
+          >
+            <CameraIcon />
+            {scanning ? "Scanning…" : "Scan QR code"}
+          </button>
+          {scanError && (
+            <p role="alert" className="mb-2 flex items-start gap-1.5 text-[11.5px] text-danger">
+              <span aria-hidden="true">⚠</span>
+              <span>{scanError}</span>
+            </p>
+          )}
+          <div className="my-3 flex items-center gap-3 font-mono text-[10px] uppercase tracking-[1.5px] text-faint">
+            <span className="h-px flex-1 bg-border" />
+            or enter manually
+            <span className="h-px flex-1 bg-border" />
+          </div>
+        </>
+      )}
 
       <label htmlFor="pc-remote-qr" className="mb-1.5 block text-[12.5px] font-medium text-fg">
         Pairing code
@@ -113,19 +194,6 @@ function ConnectPanel({
         className="pc-btn-accent mt-3.5 w-full px-3 py-2.5 text-[13px] disabled:opacity-30"
       >
         {connecting ? "Connecting…" : "Connect"}
-      </button>
-
-      {/* Camera QR scan is not wired yet — a labelled, disabled affordance so the
-          intent is visible without pulling in a QR/camera dependency. */}
-      <button
-        type="button"
-        disabled
-        aria-disabled="true"
-        title="Camera scanning is coming in a future update"
-        className="mt-2 flex w-full cursor-not-allowed items-center justify-center gap-2 rounded-lg border border-border bg-panel-2/60 px-3 py-2.5 text-[12.5px] text-faint"
-      >
-        <CameraIcon />
-        Scan QR (coming soon)
       </button>
     </div>
   );
@@ -173,6 +241,27 @@ function VerifyPanel() {
         className="mt-2 w-full rounded-lg border border-border bg-panel px-3 py-2.5 text-[12.5px] text-muted transition-colors hover:border-danger/50 hover:text-danger"
       >
         Codes don’t match — Disconnect
+      </button>
+    </div>
+  );
+}
+
+/** Full-screen overlay shown while the native camera is scanning. The page chrome
+ *  goes transparent (see the `pc-scanning` class in index.css + lib/scanner) so the
+ *  camera preview shows through; this paints only a viewfinder + a Cancel control.
+ *  Portaled to <body> so it sits outside the hidden app shell and stays visible. */
+function ScanOverlay({ onCancel }: { onCancel: () => void }) {
+  return (
+    <div
+      className="pc-scan-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Scanning for a pairing QR code"
+    >
+      <div className="pc-scan-frame" aria-hidden="true" />
+      <p className="pc-scan-hint">Point your camera at the QR code on your desktop</p>
+      <button type="button" onClick={onCancel} className="pc-scan-cancel">
+        Cancel
       </button>
     </div>
   );

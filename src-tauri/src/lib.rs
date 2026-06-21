@@ -806,6 +806,12 @@ pub fn run() {
             Ok(())
         });
 
+    // Native QR scanner for the phone's pairing screen (mobile only). Mirrors the
+    // dialog/opener plugins above; the crate is gated to mobile in Cargo.toml
+    // because the desktop advertises the pairing QR rather than scanning one.
+    #[cfg(mobile)]
+    let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
+
     // The command surface differs by target, and `generate_handler!` cannot carry
     // per-item `cfg`, so shadow-rebind `builder` per target: EXACTLY ONE arm
     // compiles (tauri-build sets exactly one of `cfg(desktop)`/`cfg(mobile)`).

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
+import { QRCodeSVG } from "qrcode.react";
 import { useStore } from "../store/store";
-import { MODELS, type ToolPolicy } from "../types";
+import { MODELS, type PairingPayload, type ToolPolicy } from "../types";
 import * as ipc from "../lib/ipc";
 
 export function SettingsPanel() {
@@ -321,31 +322,7 @@ export function SettingsPanel() {
               )}
 
               {pairingPayload ? (
-                <div>
-                  <label className="mb-1.5 block text-[12.5px] font-medium text-fg">
-                    Pairing code
-                  </label>
-                  <p className="mb-2 text-[11px] text-faint">
-                    Scan this from the Portcode phone app to pair.
-                    {/* TODO: render as a QR code image in a later iteration */}
-                  </p>
-                  <div className="rounded-lg border border-accent/40 bg-panel-2 px-3 py-2.5 font-mono text-[11px] text-accent-2 select-text break-all">
-                    <div>
-                      <span className="text-muted">key: </span>
-                      {pairingPayload.publicKey}
-                    </div>
-                    <div className="mt-1">
-                      <span className="text-muted">nonce: </span>
-                      {pairingPayload.nonce}
-                    </div>
-                  </div>
-                  <button
-                    onClick={clearPairing}
-                    className="mt-2 rounded-lg border border-border bg-panel px-3 py-2 text-[12.5px] text-muted hover:text-fg"
-                  >
-                    Done
-                  </button>
-                </div>
+                <PairingCode payload={pairingPayload} onDone={clearPairing} />
               ) : (
                 <button
                   onClick={() => void beginPairing()}
@@ -380,6 +357,83 @@ function formatExpiry(expiresAt: number): string {
     dateStyle: "medium",
     timeStyle: "short",
   });
+}
+
+/** The desktop pairing affordance: the live PairingPayload rendered as a scannable
+ *  QR (the phone scans it) with a copyable text fallback for manual entry. The QR
+ *  encodes the exact JSON `phone_sync_connect` parses, so a scan dials directly. */
+function PairingCode({ payload, onDone }: { payload: PairingPayload; onDone: () => void }) {
+  const json = JSON.stringify(payload);
+  const [copied, setCopied] = useState(false);
+  const [showRaw, setShowRaw] = useState(false);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(json);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard may be unavailable (no permission / older webview); the raw text
+      // below is always selectable as a fallback.
+    }
+  };
+
+  return (
+    <div>
+      <label className="mb-1.5 block text-[12.5px] font-medium text-fg">Pairing code</label>
+      <p className="mb-3 text-[11px] leading-[1.5] text-faint">
+        On your phone, open Portcode and tap <span className="text-muted">Scan QR</span>, then point
+        the camera at this code.
+      </p>
+
+      <div className="flex flex-col items-center gap-3">
+        {/* Dark-on-white: cameras read high-contrast QRs most reliably, regardless
+            of the app's dark theme. */}
+        <div
+          className="rounded-xl border border-accent/40 bg-white p-3 shadow-[0_0_24px_rgba(255,46,126,0.18)]"
+          data-testid="pairing-qr"
+        >
+          <QRCodeSVG
+            value={json}
+            size={256}
+            level="M"
+            marginSize={4}
+            bgColor="#ffffff"
+            fgColor="#0a0a12"
+            title="Portcode pairing QR code"
+          />
+        </div>
+
+        <div className="flex w-full items-center gap-2">
+          <button
+            onClick={() => void copy()}
+            className="flex-1 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12.5px] text-fg transition-colors hover:border-accent/50"
+          >
+            {copied ? "Copied ✓" : "Copy code"}
+          </button>
+          <button
+            onClick={onDone}
+            className="flex-1 rounded-lg border border-border bg-panel px-3 py-2 text-[12.5px] text-muted hover:text-fg"
+          >
+            Done
+          </button>
+        </div>
+
+        <button
+          onClick={() => setShowRaw((v) => !v)}
+          className="self-start text-[11px] text-faint underline-offset-2 hover:text-muted hover:underline"
+          aria-expanded={showRaw}
+        >
+          {showRaw ? "Hide pairing code" : "Can’t scan? Show pairing code"}
+        </button>
+        {showRaw && (
+          <div className="w-full rounded-lg border border-border bg-panel-2 px-3 py-2.5 font-mono text-[10.5px] leading-[1.5] text-accent-2 select-text break-all">
+            {json}
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 function ToggleRow({

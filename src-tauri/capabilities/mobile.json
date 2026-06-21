@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "mobile",
+  "description": "Mobile-only capabilities for the phone remote client: camera access to scan the desktop's pairing QR. Scoped to android/iOS so the desktop build never resolves these (the barcode-scanner plugin is not compiled there).",
+  "platforms": ["android", "iOS"],
+  "windows": ["main"],
+  "permissions": [
+    "barcode-scanner:allow-scan",
+    "barcode-scanner:allow-cancel",
+    "barcode-scanner:allow-check-permissions",
+    "barcode-scanner:allow-request-permissions"
+  ]
+}
