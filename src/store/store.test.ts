@@ -1,6 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { DEFAULT_SETTINGS, type Message, type Session, type StreamEvent } from "../types";
+import {
+  DEFAULT_SETTINGS,
+  type Message,
+  type PairedDevice,
+  type PairingPayload,
+  type PhoneSyncStatus,
+  type Session,
+  type StreamEvent,
+} from "../types";
 import * as ipc from "../lib/ipc";
 import { useStore } from "./store";
 
@@ -21,6 +29,9 @@ vi.mock("../lib/ipc", () => ({
   oauthStatus: vi.fn(),
   startOauthLogin: vi.fn(),
   oauthLogout: vi.fn(),
+  phoneSyncStatus: vi.fn(),
+  phoneSyncBeginPairing: vi.fn(),
+  phoneSyncUnpair: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -29,6 +40,8 @@ const initialState = useStore.getState();
 // A signed-out OAuth status: init() resolves this so the store never throws on
 // the OAuth bridge while these tests exercise unrelated behaviour.
 const signedOut = { signedIn: false, expiresAt: null, account: null, tier: null };
+
+const noPhoneSync: PhoneSyncStatus = { devicePublicKey: "DEVICE==", paired: [] };
 
 const session = (over: Partial<Session> = {}): Session => ({
   id: "s1",
@@ -56,6 +69,9 @@ beforeEach(() => {
   m.oauthStatus.mockResolvedValue(signedOut);
   m.startOauthLogin.mockResolvedValue(signedOut);
   m.oauthLogout.mockResolvedValue(undefined);
+  m.phoneSyncStatus.mockResolvedValue(noPhoneSync);
+  m.phoneSyncBeginPairing.mockResolvedValue({ version: 1, publicKey: "DEVICE==", nonce: "NONCE==" });
+  m.phoneSyncUnpair.mockResolvedValue(undefined);
 });
 
 describe("init", () => {
@@ -468,5 +484,76 @@ describe("settings + workspace", () => {
     m.openFolder.mockResolvedValueOnce(null);
     await useStore.getState().openWorkspace();
     expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+});
+
+describe("phone sync", () => {
+  const paired = (): PairedDevice => ({
+    publicKey: "PHONE==",
+    name: "My Phone",
+    pairedAt: 1000,
+    lastSeen: 2000,
+  });
+
+  it("init fetches phone sync status alongside settings", async () => {
+    const status: PhoneSyncStatus = { devicePublicKey: "DEVICE==", paired: [paired()] };
+    m.phoneSyncStatus.mockResolvedValue(status);
+
+    await useStore.getState().init();
+
+    expect(m.phoneSyncStatus).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().phoneSync).toEqual(status);
+  });
+
+  it("init keeps phoneSync null when the phone sync bridge rejects", async () => {
+    m.phoneSyncStatus.mockRejectedValue(new Error("core not ready"));
+
+    await useStore.getState().init();
+
+    expect(useStore.getState().phoneSync).toBeNull();
+  });
+
+  it("refreshPhoneSync updates state and swallows a transient failure", async () => {
+    const status: PhoneSyncStatus = { devicePublicKey: "DEVICE==", paired: [] };
+    m.phoneSyncStatus.mockResolvedValue(status);
+
+    await useStore.getState().refreshPhoneSync();
+
+    expect(useStore.getState().phoneSync).toEqual(status);
+
+    // A later failure must not clobber the last-known status.
+    m.phoneSyncStatus.mockRejectedValue(new Error("blip"));
+    await useStore.getState().refreshPhoneSync();
+    expect(useStore.getState().phoneSync).toEqual(status);
+  });
+
+  it("beginPairing calls ipc and stores the resulting payload", async () => {
+    const payload: PairingPayload = { version: 1, publicKey: "DEVICE==", nonce: "NONCE==" };
+    m.phoneSyncBeginPairing.mockResolvedValue(payload);
+
+    await useStore.getState().beginPairing();
+
+    expect(m.phoneSyncBeginPairing).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().pairingPayload).toEqual(payload);
+  });
+
+  it("clearPairing removes the pairing payload from state", () => {
+    useStore.setState({ pairingPayload: { version: 1, publicKey: "DEVICE==", nonce: "NONCE==" } });
+
+    useStore.getState().clearPairing();
+
+    expect(useStore.getState().pairingPayload).toBeNull();
+  });
+
+  it("unpair calls ipc with the publicKey then refreshes phone sync state", async () => {
+    const refreshed: PhoneSyncStatus = { devicePublicKey: "DEVICE==", paired: [] };
+    m.phoneSyncUnpair.mockResolvedValue(undefined);
+    m.phoneSyncStatus.mockResolvedValue(refreshed);
+
+    await useStore.getState().unpair("PHONE==");
+
+    expect(m.phoneSyncUnpair).toHaveBeenCalledWith("PHONE==");
+    expect(m.phoneSyncStatus).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().phoneSync).toEqual(refreshed);
   });
 });

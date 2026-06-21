@@ -44,6 +44,10 @@ vi.mock("./lib/ipc", () => ({
   oauthStatus: vi.fn(),
   startOauthLogin: vi.fn(),
   oauthLogout: vi.fn(),
+  // store.init() also fetches phone sync status.
+  phoneSyncStatus: vi.fn(),
+  phoneSyncBeginPairing: vi.fn(),
+  phoneSyncUnpair: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -60,6 +64,7 @@ beforeEach(() => {
   m.createSession.mockResolvedValue(undefined);
   m.getMessages.mockResolvedValue([]);
   m.oauthStatus.mockResolvedValue({ signedIn: false, expiresAt: null, account: null, tier: null });
+  m.phoneSyncStatus.mockResolvedValue({ devicePublicKey: "DEVICE==", paired: [] });
 });
 
 describe("App layout", () => {

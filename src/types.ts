@@ -99,6 +99,33 @@ export interface Usage {
   output: number;
 }
 
+// ── Phone Sync ────────────────────────────────────────────────────────────────
+
+/** A phone that has been paired with this desktop device. */
+export interface PairedDevice {
+  publicKey: string;
+  name: string;
+  pairedAt: number;
+  lastSeen: number;
+}
+
+/** Returned by `phone_sync_status`: this device's identity + all paired phones. */
+export interface PhoneSyncStatus {
+  devicePublicKey: string;
+  paired: PairedDevice[];
+}
+
+/**
+ * The payload returned by `phone_sync_begin_pairing`. The contents should be
+ * displayed as copyable text for the phone to scan / enter.
+ * TODO: render as a QR code image in a later iteration.
+ */
+export interface PairingPayload {
+  version: number;
+  publicKey: string;
+  nonce: string;
+}
+
 // Approximate Anthropic list prices, USD per million tokens (input / output).
 export const MODEL_PRICING: Record<string, { in: number; out: number }> = {
   "claude-opus-4-8": { in: 15, out: 75 },
