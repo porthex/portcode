@@ -126,14 +126,42 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: Build the debug APK
-        run: pnpm tauri android build --apk --debug
+      # RELEASE + arm64-only keeps the APK ~50-80 MB. A debug universal build is
+      # ~1.2 GB (4 ABIs x an unstripped native lib); release strips symbols (see the
+      # Cargo.toml [profile.release]) and one ABI covers all modern phones.
+      - name: Build the release APK (arm64)
+        run: pnpm tauri android build --apk --target aarch64
+
+      - name: Sign the APK with an ephemeral keystore
+        shell: bash
+        run: |
+          # `tauri android build` leaves the release APK UNSIGNED, so it won't install.
+          # Mint a throwaway keystore and zipalign + sign it so it sideloads.
+          keytool -genkeypair -v -keystore "$RUNNER_TEMP/staging.jks" \
+            -alias staging -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass changeit -keypass changeit \
+            -dname "CN=Portcode Staging, O=Porthex"
+          bt="$(ls -d "$ANDROID_SDK_ROOT"/build-tools/* | sort -V | tail -1)"
+          unsigned="$(find src-tauri/gen/android/app/build/outputs -name '*-release-unsigned.apk' | head -1)"
+          if [ -z "$unsigned" ]; then
+            echo "no unsigned release apk found; available apks:"
+            find src-tauri/gen/android/app/build/outputs -name '*.apk'
+            exit 1
+          fi
+          echo "Unsigned APK: $unsigned"
+          mkdir -p signed-apk
+          out="signed-apk/portcode-arm64-release.apk"
+          "$bt/zipalign" -f 4 "$unsigned" "$out"
+          "$bt/apksigner" sign --ks "$RUNNER_TEMP/staging.jks" \
+            --ks-pass pass:changeit --ks-key-alias staging --key-pass pass:changeit "$out"
+          "$bt/apksigner" verify "$out"
+          ls -lh signed-apk/
 
       - name: Upload the APK
         uses: actions/upload-artifact@v7
         with:
           name: portcode-android-staging
-          path: src-tauri/gen/android/app/build/outputs/**/*.apk
+          path: signed-apk/*.apk
           if-no-files-found: error
 
   publish:
