@@ -212,6 +212,35 @@ pub async fn handle_commands(
     }
 }
 
+// ── phone (client) side — the dual of forward_live + handle_commands ─────────
+//
+// After pairing + catch-up, the phone RECEIVES forwarded frames (live events) and
+// SENDS commands. These are what the mobile app drives. Protocol-level + tested on
+// the desktop CI (no android needed); their consumer is the mobile sync-client
+// commands (android plan increment #4). See docs/ANDROID_APP_PLAN.md.
+
+/// Phone side: receive forwarded frames until the channel closes, handing each to
+/// `on_frame` (the UI applies it). The dual of the desktop's `forward_live`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn run_client_recv(
+    source: &mut impl FrameSource,
+    on_frame: &mut dyn FnMut(SyncFrame),
+) -> Result<(), String> {
+    loop {
+        match source.recv().await {
+            Ok(frame) => on_frame(frame),
+            Err(_) => return Ok(()), // channel closed → done
+        }
+    }
+}
+
+/// Phone side: send one `RemoteCommand` to the desktop — the frames
+/// `handle_commands` consumes.
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn send_command(sink: &mut impl FrameSink, command: RemoteCommand) -> Result<(), String> {
+    sink.send(&SyncFrame::Command { command }).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +420,60 @@ mod tests {
             &seen[0],
             RemoteCommand::Run { session_id, .. } if session_id == "s1"
         ));
+    }
+
+    #[tokio::test]
+    async fn client_recv_relays_frames_to_the_callback_until_closed() {
+        use crate::llm::StreamEvent;
+
+        let (mut desktop, mut phone) = mem_pair();
+        desktop
+            .send(&SyncFrame::Live {
+                session_id: "s1".into(),
+                event: StreamEvent::TextDelta { text: "hi".into() },
+            })
+            .await
+            .unwrap();
+        desktop
+            .send(&SyncFrame::Ack {
+                session_id: "s1".into(),
+                seq: 1,
+            })
+            .await
+            .unwrap();
+        drop(desktop); // close → run_client_recv drains then returns
+
+        let mut got: Vec<SyncFrame> = Vec::new();
+        {
+            let mut on_frame = |f: SyncFrame| got.push(f);
+            run_client_recv(&mut phone, &mut on_frame).await.unwrap();
+        }
+
+        assert_eq!(got.len(), 2);
+        assert!(matches!(
+            &got[0],
+            SyncFrame::Live { session_id, .. } if session_id == "s1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_command_emits_a_command_frame() {
+        let (mut phone, mut desktop) = mem_pair();
+        send_command(
+            &mut phone,
+            RemoteCommand::Run {
+                session_id: "s1".into(),
+                text: "hi".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        match desktop.recv().await.unwrap() {
+            SyncFrame::Command {
+                command: RemoteCommand::Run { session_id, .. },
+            } => assert_eq!(session_id, "s1"),
+            other => panic!("expected Command::Run, got {other:?}"),
+        }
     }
 }
