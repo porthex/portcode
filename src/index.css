@@ -1028,3 +1028,69 @@ textarea:focus-visible {
 .hljs-addition {
   color: var(--color-success);
 }
+
+/* =========================================================================
+   QR SCAN OVERLAY (mobile pairing)
+   While the native barcode scanner runs, it renders the camera preview BEHIND
+   a transparented webview. `lib/scanner` toggles `pc-scanning` on <html> for
+   the duration: we drop the page background to transparent and hide the opaque
+   app shell (#root) so the camera shows through, then paint only a viewfinder +
+   Cancel button — portaled to <body> so they sit outside the hidden shell.
+   ========================================================================= */
+html.pc-scanning,
+html.pc-scanning body {
+  background: transparent !important;
+}
+html.pc-scanning #root {
+  visibility: hidden;
+}
+
+.pc-scan-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1.5rem;
+  background: transparent;
+  /* Let camera-region taps fall through; children opt back in below. */
+  pointer-events: none;
+}
+.pc-scan-frame {
+  width: min(68vw, 280px);
+  aspect-ratio: 1;
+  border: 2px solid var(--color-accent);
+  border-radius: 18px;
+  /* The huge spread dims everything outside the rounded viewfinder cutout. */
+  box-shadow:
+    0 0 0 100vmax rgba(0, 0, 0, 0.5),
+    0 0 24px rgba(255, 46, 126, 0.55),
+    inset 0 0 22px rgba(255, 46, 126, 0.22);
+}
+.pc-scan-hint {
+  max-width: 80vw;
+  text-align: center;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 12.5px;
+  color: #fff;
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.9);
+}
+.pc-scan-cancel {
+  pointer-events: auto;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.55);
+  padding: 0.55rem 1.4rem;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 13px;
+  color: #fff;
+  transition:
+    color 0.15s ease,
+    border-color 0.15s ease;
+}
+.pc-scan-cancel:hover {
+  border-color: var(--color-danger);
+  color: var(--color-danger);
+}

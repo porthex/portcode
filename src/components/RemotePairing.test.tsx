@@ -4,12 +4,14 @@ import { render, screen, fireEvent, act } from "@testing-library/react";
 import { RemotePairing } from "./RemotePairing";
 import { useStore } from "../store/store";
 import * as ipc from "../lib/ipc";
+import * as scanner from "../lib/scanner";
 import type { ConnectInfo, SyncFrame } from "../types";
 
 // RemotePairing is the remote-mode entry screen. It reads remote state from the
 // real store and drives it through connectRemote / confirmRemoteSas /
-// disconnectRemote. We mock only the IPC layer (TDD London style) so connect can
-// resolve a deterministic SAS without a real desktop, and assert on observable
+// disconnectRemote. We mock the IPC layer and the camera scanner (TDD London
+// style) so connect can resolve a deterministic SAS without a real desktop, and a
+// scan can resolve a payload without a real camera; then we assert on observable
 // DOM + store state. House style mirrors Settings.test.tsx / store.test.ts.
 vi.mock("../lib/ipc", () => ({
   phoneSyncConnect: vi.fn(),
@@ -17,12 +19,19 @@ vi.mock("../lib/ipc", () => ({
   phoneSyncDisconnect: vi.fn(),
   onPhoneSyncFrame: vi.fn(),
 }));
+vi.mock("../lib/scanner", () => ({
+  isScannerAvailable: vi.fn(),
+  scanQrPayload: vi.fn(),
+  cancelScan: vi.fn(),
+}));
 
 const m = vi.mocked(ipc);
+const s = vi.mocked(scanner);
 const initial = useStore.getState();
 
 const qrBox = () => screen.getByLabelText("Pairing code") as HTMLTextAreaElement;
 const connectBtn = () => screen.getByRole("button", { name: "Connect" });
+const scanBtn = () => screen.getByRole("button", { name: "Scan QR code" });
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -34,18 +43,20 @@ beforeEach(() => {
   m.phoneSyncSendCommand.mockResolvedValue(undefined);
   m.phoneSyncDisconnect.mockResolvedValue(undefined);
   m.onPhoneSyncFrame.mockResolvedValue(() => {});
+  // Default to the non-phone host (preview/desktop): paste only, no camera button.
+  s.isScannerAvailable.mockReturnValue(false);
+  s.cancelScan.mockResolvedValue(undefined);
 });
 
 describe("RemotePairing — connect panel", () => {
-  it("renders the paste affordance and a disabled coming-soon QR scan", () => {
+  it("renders the paste affordance and hides the camera button off-phone", () => {
     render(<RemotePairing />);
 
     expect(screen.getByText("CONNECT TO DESKTOP")).toBeInTheDocument();
     expect(qrBox()).toBeInTheDocument();
 
-    // The camera path is deliberately not wired yet: present but disabled.
-    const scan = screen.getByRole("button", { name: /Scan QR \(coming soon\)/ });
-    expect(scan).toBeDisabled();
+    // No camera scanner in the preview/desktop host — paste is the only path.
+    expect(screen.queryByRole("button", { name: /Scan QR/ })).not.toBeInTheDocument();
   });
 
   it("disables Connect until the pairing code has content", () => {
@@ -124,6 +135,109 @@ describe("RemotePairing — connect panel", () => {
     expect(useStore.getState().remoteConnected).toBe(false);
     // The textarea keeps the payload so the user can retry without re-pasting.
     expect(qrBox().value).toBe("{payload}");
+  });
+});
+
+describe("RemotePairing — camera scan (phone)", () => {
+  beforeEach(() => {
+    s.isScannerAvailable.mockReturnValue(true);
+  });
+
+  it("offers an enabled Scan QR button on the phone", () => {
+    render(<RemotePairing />);
+    expect(scanBtn()).toBeEnabled();
+  });
+
+  it("dials the scanned payload on a successful scan", async () => {
+    s.scanQrPayload.mockResolvedValue({ ok: true, value: "{scanned}" });
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(scanBtn());
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(m.phoneSyncConnect).toHaveBeenCalledWith("{scanned}");
+    expect(useStore.getState().remoteConnected).toBe(true);
+    expect(useStore.getState().remoteSas).toBe("TANGO-42");
+  });
+
+  it("surfaces a denied-camera scan as an inline hint, staying on connect", async () => {
+    s.scanQrPayload.mockResolvedValue({ ok: false, reason: "denied" });
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(scanBtn());
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(/Camera access was denied/);
+    expect(useStore.getState().remoteConnected).toBe(false);
+    expect(m.phoneSyncConnect).not.toHaveBeenCalled();
+  });
+
+  it("surfaces an unexpected scanner failure inline", async () => {
+    s.scanQrPayload.mockResolvedValue({ ok: false, reason: "error", message: "camera busy" });
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(scanBtn());
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent("camera busy");
+    expect(useStore.getState().remoteConnected).toBe(false);
+  });
+
+  it("stays silent when the user cancels the scan", async () => {
+    s.scanQrPayload.mockResolvedValue({ ok: false, reason: "cancelled" });
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(scanBtn());
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(m.phoneSyncConnect).not.toHaveBeenCalled();
+  });
+
+  it("shows the scanning overlay while the camera is open and cancels it", async () => {
+    let release!: (o: scanner.ScanOutcome) => void;
+    s.scanQrPayload.mockReturnValue(
+      new Promise<scanner.ScanOutcome>((res) => {
+        release = res;
+      }),
+    );
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(scanBtn());
+      await Promise.resolve();
+    });
+
+    // The button reads "Scanning…" and the viewfinder overlay (portaled to body)
+    // is visible with a Cancel control.
+    expect(screen.getByRole("button", { name: "Scanning…" })).toBeDisabled();
+    expect(screen.getByRole("dialog", { name: /Scanning for a pairing QR/ })).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      await Promise.resolve();
+    });
+    expect(s.cancelScan).toHaveBeenCalledTimes(1);
+
+    // Settle the underlying scan promise so nothing dangles.
+    await act(async () => {
+      release({ ok: false, reason: "cancelled" });
+      await Promise.resolve();
+    });
+    expect(
+      screen.queryByRole("dialog", { name: /Scanning for a pairing QR/ }),
+    ).not.toBeInTheDocument();
   });
 });
 
