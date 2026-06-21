@@ -16,9 +16,10 @@
 #![allow(dead_code)]
 
 use async_trait::async_trait;
+use tokio::sync::broadcast;
 
 use crate::db::{Db, MessageRow, SessionRow};
-use crate::sync::protocol::{Cursor, SyncFrame};
+use crate::sync::protocol::{Cursor, RemoteCommand, SyncFrame};
 use crate::sync::transport::SecureChannel;
 
 /// A bidirectional channel that carries whole [`SyncFrame`]s. Implemented by the
@@ -114,6 +115,59 @@ pub async fn request_catch_up<C: FrameChannel + ?Sized>(
         }
     }
     Ok(CatchUp { sessions, deltas })
+}
+
+// ── live stream + command intake (Phase 2c) ─────────────────────────────────
+//
+// After catch-up, two halves run concurrently over the (split) channel: live
+// agent events are forwarded to the phone, and the phone's commands are read +
+// dispatched. They're written as independent uni-directional loops so each is
+// testable on its own; the real wiring splits the `SecureChannel` into a send
+// half (for `forward_live`) and a recv half (for `handle_commands`) and spawns
+// both — that split + the concrete `CommandHandler` (which calls `run_agent`
+// etc. through `AppState`) is the integration step.
+
+/// Forward live agent events from the desktop's `SyncHub` to the phone until the
+/// hub is closed (all senders dropped) or a send fails. A `Lagged` (slow phone)
+/// is non-fatal: dropped frames are reconciled by the catch-up path, so we keep
+/// forwarding the live tail.
+pub async fn forward_live<C: FrameChannel + ?Sized>(
+    hub: &mut broadcast::Receiver<SyncFrame>,
+    sink: &mut C,
+) -> Result<(), String> {
+    use broadcast::error::RecvError;
+    loop {
+        match hub.recv().await {
+            Ok(frame) => sink.send(&frame).await?,
+            Err(RecvError::Closed) => return Ok(()),
+            Err(RecvError::Lagged(_)) => continue,
+        }
+    }
+}
+
+/// Executes the `RemoteCommand`s a phone sends. The real implementation wires to
+/// the desktop's `run_agent` / `cancel_agent` / `resolve_permission` /
+/// `create_session`; tests provide a recording fake.
+#[async_trait]
+pub trait CommandHandler {
+    async fn handle(&self, command: RemoteCommand) -> Result<(), String>;
+}
+
+/// Read frames from the phone and dispatch each `Command` to `handler`, until the
+/// channel closes. `Ack`s (phone progress) are accepted and ignored for now; any
+/// other frame in this position is a protocol error.
+pub async fn handle_commands<C: FrameChannel + ?Sized>(
+    source: &mut C,
+    handler: &dyn CommandHandler,
+) -> Result<(), String> {
+    loop {
+        match source.recv().await {
+            Ok(SyncFrame::Command { command }) => handler.handle(command).await?,
+            Ok(SyncFrame::Ack { .. }) => {}
+            Ok(other) => return Err(format!("unexpected frame in command loop: {other:?}")),
+            Err(_) => return Ok(()), // channel closed → done
+        }
+    }
 }
 
 #[cfg(test)]
@@ -217,5 +271,80 @@ mod tests {
 
         assert_eq!(catch_up.deltas.len(), 1);
         assert!(catch_up.deltas[0].1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forward_live_relays_hub_events_to_the_channel() {
+        use crate::llm::StreamEvent;
+        use crate::sync::SyncHub;
+
+        let hub = SyncHub::new();
+        let mut hub_rx = hub.subscribe();
+        let (mut desktop, mut phone) = mem_pair();
+
+        hub.publish("agent://s1", StreamEvent::TextDelta { text: "a".into() });
+        hub.publish("agent://s1", StreamEvent::TextDelta { text: "b".into() });
+        drop(hub); // close the broadcast so forward_live drains then returns
+
+        let (fwd, frames) = tokio::join!(forward_live(&mut hub_rx, &mut desktop), async {
+            let mut got = Vec::new();
+            got.push(phone.recv().await.unwrap());
+            got.push(phone.recv().await.unwrap());
+            got
+        });
+        fwd.unwrap();
+
+        assert_eq!(frames.len(), 2);
+        assert!(matches!(
+            &frames[0],
+            SyncFrame::Live { session_id, .. } if session_id == "s1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn handle_commands_dispatches_commands_and_ignores_acks() {
+        use std::sync::{Arc, Mutex};
+
+        struct Recorder {
+            seen: Arc<Mutex<Vec<RemoteCommand>>>,
+        }
+        #[async_trait]
+        impl CommandHandler for Recorder {
+            async fn handle(&self, command: RemoteCommand) -> Result<(), String> {
+                self.seen.lock().unwrap().push(command);
+                Ok(())
+            }
+        }
+
+        let (mut desktop, mut phone) = mem_pair();
+        phone
+            .send(&SyncFrame::Command {
+                command: RemoteCommand::Run {
+                    session_id: "s1".into(),
+                    text: "do it".into(),
+                },
+            })
+            .await
+            .unwrap();
+        phone
+            .send(&SyncFrame::Ack {
+                session_id: "s1".into(),
+                seq: 3,
+            })
+            .await
+            .unwrap();
+        drop(phone); // close → handle_commands drains then returns
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        handle_commands(&mut desktop, &Recorder { seen: seen.clone() })
+            .await
+            .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1); // the Ack was ignored, not dispatched
+        assert!(matches!(
+            &seen[0],
+            RemoteCommand::Run { session_id, .. } if session_id == "s1"
+        ));
     }
 }
