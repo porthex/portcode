@@ -46,6 +46,8 @@ interface AppState {
   remoteSas: string | null; // short-auth-string to compare out-of-band; null when not connected
   remoteError: string | null; // last connect failure, surfaced in the connect UI
   remoteUnlisten: (() => void) | null; // tears down the frame subscription (private; mirrors `cancel`)
+  remoteDropped: boolean; // the live session ended unexpectedly — the UI offers a reconnect
+  lastPairingQr: string | null; // last successful pairing payload, kept for one-tap reconnect
 
   init: () => Promise<void>;
   toggleFiles: () => void;
@@ -75,9 +77,10 @@ interface AppState {
   setRemoteMode: (v: boolean) => void;
   confirmRemoteSas: () => void;
   applyFrame: (frame: SyncFrame) => void;
-  connectRemote: (qr: string) => Promise<void>;
+  connectRemote: (qr: string, verified?: boolean) => Promise<void>;
   sendRemoteCommand: (command: RemoteCommand) => Promise<void>;
   disconnectRemote: () => Promise<void>;
+  reconnectRemote: () => Promise<void>;
 }
 
 const now = () => Date.now();
@@ -144,6 +147,8 @@ export const useStore = create<AppState>((set, get) => ({
   remoteSas: null,
   remoteError: null,
   remoteUnlisten: null,
+  remoteDropped: false,
+  lastPairingQr: null,
 
   async init() {
     // Fetch settings, subscription status, and phone sync status together.
@@ -526,25 +531,48 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  async connectRemote(qr) {
-    // Clean reconnect: tear down any prior frame subscription before dialing so a
-    // second connect can never leave two live subscriptions feeding applyFrame.
+  async connectRemote(qr, verified = false) {
+    // Clean reconnect: tear down any prior subscriptions before dialing so a second
+    // connect can never leave two live listeners feeding the store.
     const prev = get().remoteUnlisten;
     if (prev) prev();
     // A fresh dial is unverified until the user compares the new SAS.
     set({ remoteUnlisten: null, remoteError: null, remoteVerified: false });
+    let unlistenFrame: (() => void) | null = null;
+    let unlistenDrop: (() => void) | null = null;
     try {
       const info = await ipc.phoneSyncConnect(qr);
       // Subscribe only after a successful dial; route every frame through
       // get().applyFrame so the latest action closure folds against live state.
-      const unlisten = await ipc.onPhoneSyncFrame((f) => get().applyFrame(f));
+      unlistenFrame = await ipc.onPhoneSyncFrame((f) => get().applyFrame(f));
+      // Detect an UNEXPECTED drop (desktop closed the channel / network dropped) so
+      // the UI can leave the dead session and offer a reconnect. A user-initiated
+      // disconnect tears this listener down first, so it can't misfire as a drop.
+      unlistenDrop = await ipc.onPhoneSyncDisconnected(() => {
+        set({ remoteConnected: false, remoteVerified: false, remoteDropped: true });
+      });
       set({
         remoteConnected: true,
+        // A pin-matched reconnect is pre-verified (the native pin check
+        // re-authenticated the same desktop key); a first dial never is.
+        remoteVerified: verified,
         remoteSas: info.sas,
         remoteError: null,
-        remoteUnlisten: unlisten,
+        remoteDropped: false,
+        lastPairingQr: qr,
+        remoteUnlisten: () => {
+          unlistenFrame?.();
+          unlistenDrop?.();
+        },
       });
     } catch (err) {
+      // A listener may have registered before a later step threw (e.g. the dial
+      // succeeded but onPhoneSyncDisconnected rejected). Tear down any partial
+      // subscription AND the native session so nothing leaks. phoneSyncDisconnect
+      // is idempotent — a no-op when the dial itself failed.
+      unlistenDrop?.();
+      unlistenFrame?.();
+      await ipc.phoneSyncDisconnect().catch(() => {});
       set({
         remoteConnected: false,
         remoteSas: null,
@@ -583,9 +611,28 @@ export const useStore = create<AppState>((set, get) => ({
     // is the routing source of truth for send/stop/resolvePermission, so clearing it
     // up front guarantees no command is dispatched onto the closing channel while
     // `phoneSyncDisconnect` is in flight.
-    set({ remoteConnected: false, remoteVerified: false, remoteSas: null, remoteUnlisten: null });
+    // User-initiated, so also clear the dropped flag and forget the pairing — the
+    // reconnect prompt is for an unexpected drop, not an intentional teardown.
+    set({
+      remoteConnected: false,
+      remoteVerified: false,
+      remoteSas: null,
+      remoteDropped: false,
+      lastPairingQr: null,
+      remoteUnlisten: null,
+    });
     if (unlisten) unlisten();
     await ipc.phoneSyncDisconnect();
+  },
+
+  async reconnectRemote() {
+    const qr = get().lastPairingQr;
+    if (!qr) return;
+    set({ remoteDropped: false });
+    // Re-dial the remembered desktop, PRE-VERIFIED: the native pin check
+    // re-authenticates the same static key the user already trusted at first
+    // pairing, so no fresh SAS comparison is needed.
+    await get().connectRemote(qr, true);
   },
 }));
 

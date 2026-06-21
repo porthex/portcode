@@ -130,9 +130,44 @@ function ConnectPanel({
 }) {
   const error = useStore((s) => s.remoteError);
   const canScan = isScannerAvailable();
+  const dropped = useStore((s) => s.remoteDropped);
+  const canReconnect = useStore((s) => s.lastPairingQr !== null);
+  const reconnectRemote = useStore((s) => s.reconnectRemote);
+  const [reconnecting, setReconnecting] = useState(false);
+
+  const onReconnect = async () => {
+    if (reconnecting) return;
+    setReconnecting(true);
+    try {
+      await reconnectRemote();
+    } finally {
+      setReconnecting(false);
+    }
+  };
 
   return (
     <div>
+      {dropped && canReconnect && (
+        <div className="mb-4 rounded-xl border border-warn/40 bg-warn/5 px-4 py-3.5">
+          <div className="flex items-center gap-2">
+            <span className="pc-dot pc-dot--warn" />
+            <span className="font-mono text-[11px] uppercase tracking-[1.5px] text-warn">
+              Connection lost
+            </span>
+          </div>
+          <p className="mt-1.5 text-[12px] leading-[1.5] text-muted">
+            The link to your desktop dropped. Reconnect without re-scanning.
+          </p>
+          <button
+            onClick={() => void onReconnect()}
+            disabled={reconnecting}
+            aria-busy={reconnecting}
+            className="pc-btn-accent mt-2.5 w-full px-3 py-2.5 text-[13px] disabled:opacity-40"
+          >
+            {reconnecting ? "Reconnecting…" : "Reconnect"}
+          </button>
+        </div>
+      )}
       <div className="pc-eyebrow pc-eyebrow--accent">CONNECT TO DESKTOP</div>
       <p className="mb-3 text-[12px] leading-[1.5] text-muted">
         On your desktop, open <span className="text-fg">Settings → Phone Sync</span> and choose{" "}

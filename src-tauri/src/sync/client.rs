@@ -19,6 +19,13 @@ use crate::sync::transport::SecureChannel;
 /// Tauri event channel the UI listens on for forwarded frames.
 pub const FRAME_EVENT: &str = "phone-sync://frame";
 
+/// Tauri event emitted when the live session ends because the channel died
+/// unexpectedly (the desktop closed it, or the network dropped). A phone-INITIATED
+/// disconnect removes the UI listener before tearing down, so the UI only observes
+/// this for an unexpected drop — its cue to leave the dead session and offer a
+/// one-tap reconnect.
+pub const DISCONNECT_EVENT: &str = "phone-sync://disconnected";
+
 /// Live-connection holder stored in `AppState`. Dropping `commands` ends the
 /// send loop; aborting `task` ends the session.
 pub struct PhoneClientConn {
@@ -58,6 +65,9 @@ pub async fn run_client_session(
         return;
     }
     let (mut sender, mut receiver) = channel.split();
+    // Clone the handle for the frame-relay loop so the original `app` stays free to
+    // emit the disconnect event after the session ends.
+    let frame_app = app.clone();
 
     // recv loop: emit each inbound frame to the UI until the channel closes.
     //
@@ -72,7 +82,7 @@ pub async fn run_client_session(
     // tested primitive (and the headless test below drives it).
     let recv = async {
         while let Ok(frame) = receiver.recv_frame().await {
-            let _ = app.emit(FRAME_EVENT, frame);
+            let _ = frame_app.emit(FRAME_EVENT, frame);
         }
     };
     // send loop: drain commands until the UI drops the sender (or a send fails).
@@ -97,13 +107,25 @@ pub async fn run_client_session(
     // past its last await), so blindly clearing would wipe the live reconnect and
     // orphan its task. Compare identity tokens by pointer: clear only when the
     // slot still holds OUR token. `if let Ok` so a poisoned mutex never panics.
+    let mut was_installed = false;
     if let Ok(mut guard) = slot.lock() {
         if guard
             .as_ref()
             .is_some_and(|c| Arc::ptr_eq(&c.token, &token))
         {
+            was_installed = true;
             guard.take();
         }
+    }
+
+    // Notify the UI of the drop ONLY if THIS task was the installed session. A
+    // stale task (replaced by a concurrent reconnect, but already past its last
+    // await so abort couldn't cancel it) must not emit a FALSE drop that tears
+    // down the newer, live session. (A phone-INITIATED disconnect also removes the
+    // UI listener before tearing down, so even the real session's emit is ignored
+    // there — this only ever surfaces an UNEXPECTED drop of the active session.)
+    if was_installed {
+        let _ = app.emit(DISCONNECT_EVENT, ());
     }
 }
 
