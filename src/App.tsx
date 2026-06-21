@@ -14,6 +14,7 @@ export default function App() {
   const init = useStore((s) => s.init);
   const showSettings = useStore((s) => s.showSettings);
   const showFiles = useStore((s) => s.showFiles);
+  const showSidebar = useStore((s) => s.showSidebar);
   const ambientRain = useStore((s) => s.ambientRain);
   const scanlines = useStore((s) => s.scanlines);
   const remoteMode = useStore((s) => s.remoteMode);
@@ -70,7 +71,10 @@ export default function App() {
         <>
           {remoteMode && <RemoteBanner />}
           <div className="flex min-h-0 flex-1 overflow-hidden">
-            <Sidebar />
+            {/* Desktop: the session list is an inline rail. On the phone that rail
+                would eat the narrow viewport, so there it becomes a drawer (below)
+                and the chat takes the full width. */}
+            {!remoteMode && <Sidebar />}
             {showFiles && <FileExplorer />}
             <main className="flex min-w-0 flex-1 flex-col">
               <TitleBar />
@@ -78,12 +82,34 @@ export default function App() {
             </main>
           </div>
 
+          {remoteMode && showSidebar && <SidebarDrawer />}
+
           <StatusHud />
 
           {showSettings && <SettingsPanel />}
           <CommandPalette />
         </>
       )}
+    </div>
+  );
+}
+
+/** The session list as a slide-in overlay — the phone's equivalent of the
+ *  desktop's inline sidebar rail. Tapping the backdrop closes it; selecting or
+ *  creating a session closes it too (handled in the store). */
+function SidebarDrawer() {
+  const setShowSidebar = useStore((s) => s.setShowSidebar);
+  return (
+    <div className="fixed inset-0 z-50 flex">
+      <div className="pc-drawer h-full shrink-0">
+        <Sidebar />
+      </div>
+      <button
+        type="button"
+        aria-label="Close sessions"
+        onClick={() => setShowSidebar(false)}
+        className="h-full flex-1 bg-black/60 backdrop-blur-[1px]"
+      />
     </div>
   );
 }
@@ -114,6 +140,7 @@ function TitleBar() {
   const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
   const showFiles = useStore((s) => s.showFiles);
   const toggleFiles = useStore((s) => s.toggleFiles);
+  const toggleSidebar = useStore((s) => s.toggleSidebar);
   const setShowPalette = useStore((s) => s.setShowPalette);
   // The file explorer browses the desktop's workspace (`list_dir` is desktop-only),
   // so the phone hides the toggle.
@@ -121,6 +148,23 @@ function TitleBar() {
   return (
     <header className="flex h-[46px] shrink-0 items-center justify-between border-b border-border bg-panel/70 px-3.5 backdrop-blur-sm">
       <div className="flex min-w-0 items-center gap-2.5">
+        {remoteMode && (
+          <button
+            onClick={toggleSidebar}
+            aria-label="Toggle sessions"
+            title="Sessions"
+            className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[7px] border border-transparent text-muted transition-colors hover:text-accent-2"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+              <path
+                d="M4 6h16M4 12h16M4 18h16"
+                stroke="currentColor"
+                strokeWidth="1.7"
+                strokeLinecap="round"
+              />
+            </svg>
+          </button>
+        )}
         <button
           onClick={toggleFiles}
           aria-label="Toggle file explorer (Ctrl+B)"

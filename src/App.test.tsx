@@ -168,9 +168,28 @@ describe("remote mode shell", () => {
     render(<App />);
 
     expect(screen.queryByTestId("remote-pairing")).not.toBeInTheDocument();
-    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+    // On the phone the session list is a drawer, not an inline rail — reached via
+    // the TitleBar "Sessions" menu button.
+    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Toggle sessions" })).toBeInTheDocument();
     expect(screen.getByTestId("chat")).toBeInTheDocument();
     expect(screen.getByText("Remote · connected")).toBeInTheDocument();
+  });
+
+  it("opens the session drawer from the menu button and closes it on the backdrop", () => {
+    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+
+    render(<App />);
+    // Drawer closed initially: the sidebar isn't mounted.
+    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Toggle sessions" }));
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+    expect(useStore.getState().showSidebar).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Close sessions" }));
+    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
+    expect(useStore.getState().showSidebar).toBe(false);
   });
 
   it("disconnects from the desktop via the banner button", async () => {
