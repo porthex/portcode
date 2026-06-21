@@ -52,7 +52,7 @@ pub struct AppState {
     pub phone_client: Arc<Mutex<Option<sync::client::PhoneClientConn>>>,
     /// The live iroh endpoint the desktop SYNC SERVER is listening on, shared so
     /// `phone_sync_begin_pairing` can advertise its FULL current address (relay URL
-    /// + direct socket addrs, not just the node id). `None` until `start_listener`
+    /// and direct socket addrs, not just the node id). `None` until `start_listener`
     /// binds it at startup (and on mobile, which never listens). Written once by
     /// `start_listener`; read by the pairing command. The `std::sync::Mutex` guard
     /// is only ever held across cheap synchronous ops (set / clone-out) and never
