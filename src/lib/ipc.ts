@@ -152,6 +152,17 @@ export async function onPhoneSyncFrame(cb: (frame: SyncFrame) => void): Promise<
   return mock.onPhoneSyncFrame(cb);
 }
 
+/** Subscribe to the "session dropped unexpectedly" signal from the native client
+ *  (the desktop closed the channel, or the network dropped). Returns an unlisten
+ *  handle. */
+export async function onPhoneSyncDisconnected(cb: () => void): Promise<Unlisten> {
+  if (isTauri()) {
+    const { event } = await tauri();
+    return event.listen("phone-sync://disconnected", () => cb());
+  }
+  return mock.onPhoneSyncDisconnected(cb);
+}
+
 export async function resolvePermission(id: string, decision: "allow" | "deny"): Promise<void> {
   if (isTauri()) {
     const { core } = await tauri();
@@ -334,6 +345,9 @@ const mock = (() => {
     },
     async onPhoneSyncFrame(_cb: (frame: SyncFrame) => void): Promise<Unlisten> {
       return () => {}; // inert subscription; the preview never emits frames.
+    },
+    async onPhoneSyncDisconnected(_cb: () => void): Promise<Unlisten> {
+      return () => {}; // inert: the preview never drops a (nonexistent) session.
     },
     async resolvePermission(id: string, decision: "allow" | "deny") {
       resolvers.get(id)?.(decision);

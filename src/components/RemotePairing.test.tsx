@@ -18,6 +18,7 @@ vi.mock("../lib/ipc", () => ({
   phoneSyncSendCommand: vi.fn(),
   phoneSyncDisconnect: vi.fn(),
   onPhoneSyncFrame: vi.fn(),
+  onPhoneSyncDisconnected: vi.fn(),
 }));
 vi.mock("../lib/scanner", () => ({
   isScannerAvailable: vi.fn(),
@@ -43,6 +44,7 @@ beforeEach(() => {
   m.phoneSyncSendCommand.mockResolvedValue(undefined);
   m.phoneSyncDisconnect.mockResolvedValue(undefined);
   m.onPhoneSyncFrame.mockResolvedValue(() => {});
+  m.onPhoneSyncDisconnected.mockResolvedValue(() => {});
   // Default to the non-phone host (preview/desktop): paste only, no camera button.
   s.isScannerAvailable.mockReturnValue(false);
   s.cancelScan.mockResolvedValue(undefined);
@@ -280,6 +282,35 @@ describe("RemotePairing — verify panel", () => {
 
     expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(1);
     expect(useStore.getState().remoteConnected).toBe(false);
+  });
+});
+
+describe("RemotePairing — reconnect after a drop", () => {
+  it("offers a one-tap reconnect that re-dials the remembered pairing", async () => {
+    useStore.setState({ remoteDropped: true, lastPairingQr: "QR-REMEMBERED" });
+    render(<RemotePairing />);
+
+    expect(screen.getByText("Connection lost")).toBeInTheDocument();
+    const reconnect = screen.getByRole("button", { name: "Reconnect" });
+
+    await act(async () => {
+      fireEvent.click(reconnect);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Re-dials the remembered desktop, pre-verified (no SAS re-comparison needed).
+    expect(m.phoneSyncConnect).toHaveBeenCalledWith("QR-REMEMBERED");
+    const st = useStore.getState();
+    expect(st.remoteConnected).toBe(true);
+    expect(st.remoteVerified).toBe(true);
+  });
+
+  it("shows no reconnect affordance without a remembered pairing", () => {
+    useStore.setState({ remoteDropped: true, lastPairingQr: null });
+    render(<RemotePairing />);
+    expect(screen.queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
   });
 });
 
