@@ -132,6 +132,29 @@ describe("Tauri command serialization", () => {
     expect(invoke).toHaveBeenCalledWith("list_sessions");
   });
 
+  it("phone_sync_status is invoked with no arguments and returns the status", async () => {
+    const { ipc, invoke } = await load();
+    const status = { devicePublicKey: "abc==", paired: [] };
+    invoke.mockResolvedValue(status);
+    await expect(ipc.phoneSyncStatus()).resolves.toBe(status);
+    expect(invoke).toHaveBeenCalledWith("phone_sync_status");
+  });
+
+  it("phone_sync_begin_pairing is invoked with no arguments and returns the payload", async () => {
+    const { ipc, invoke } = await load();
+    const payload = { version: 1, publicKey: "abc==", nonce: "nonce==" };
+    invoke.mockResolvedValue(payload);
+    await expect(ipc.phoneSyncBeginPairing()).resolves.toBe(payload);
+    expect(invoke).toHaveBeenCalledWith("phone_sync_begin_pairing");
+  });
+
+  it("phone_sync_unpair forwards the publicKey and resolves void", async () => {
+    const { ipc, invoke } = await load();
+    invoke.mockResolvedValue(undefined);
+    await expect(ipc.phoneSyncUnpair("abc==")).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("phone_sync_unpair", { publicKey: "abc==" });
+  });
+
   it("openFolder returns the native picker's path, or null when cancelled", async () => {
     const { ipc } = await load();
     const { open } = await import("@tauri-apps/plugin-dialog");
@@ -234,6 +257,35 @@ describe("browser fallback (no Tauri core)", () => {
   it("resolvePermission is harmless when nothing is pending", async () => {
     const { ipc } = await load();
     await expect(ipc.resolvePermission("missing", "allow")).resolves.toBeUndefined();
+  });
+
+  it("phoneSyncStatus returns a stable mock identity with no paired devices initially", async () => {
+    const { ipc } = await load();
+    const status = await ipc.phoneSyncStatus();
+    expect(typeof status.devicePublicKey).toBe("string");
+    expect(status.devicePublicKey.length).toBeGreaterThan(0);
+    expect(status.paired).toEqual([]);
+  });
+
+  it("phoneSyncBeginPairing returns a payload containing the device's public key and a nonce", async () => {
+    const { ipc } = await load();
+    const payload = await ipc.phoneSyncBeginPairing();
+    expect(payload.version).toBe(1);
+    expect(typeof payload.publicKey).toBe("string");
+    expect(typeof payload.nonce).toBe("string");
+    // The mock payload's publicKey should match the device key from status.
+    const status = await ipc.phoneSyncStatus();
+    expect(payload.publicKey).toBe(status.devicePublicKey);
+  });
+
+  it("phoneSyncUnpair removes a paired device from the mock state", async () => {
+    const { ipc } = await load();
+    // Confirm initially empty, then unpair a non-existent key is harmless.
+    const before = await ipc.phoneSyncStatus();
+    expect(before.paired).toEqual([]);
+    await expect(ipc.phoneSyncUnpair("unknown==")).resolves.toBeUndefined();
+    const after = await ipc.phoneSyncStatus();
+    expect(after.paired).toEqual([]);
   });
 
   it("oauth mock signs into a Claude Max subscription and logout clears it", async () => {

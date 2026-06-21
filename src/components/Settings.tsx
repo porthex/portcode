@@ -17,6 +17,12 @@ export function SettingsPanel() {
   const setAmbientRain = useStore((s) => s.setAmbientRain);
   const setScanlines = useStore((s) => s.setScanlines);
 
+  const phoneSync = useStore((s) => s.phoneSync);
+  const pairingPayload = useStore((s) => s.pairingPayload);
+  const beginPairing = useStore((s) => s.beginPairing);
+  const unpair = useStore((s) => s.unpair);
+  const clearPairing = useStore((s) => s.clearPairing);
+
   const [apiKey, setApiKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [savedKey, setSavedKey] = useState(false);
@@ -261,6 +267,91 @@ export function SettingsPanel() {
               />
             </div>
           </section>
+
+          {/* PHONE SYNC */}
+          <section>
+            <div className="pc-eyebrow">PHONE SYNC</div>
+            <div className="flex flex-col gap-3.5">
+              {phoneSync && (
+                <div>
+                  <label className="mb-1.5 block text-[12.5px] font-medium text-fg">
+                    This device
+                  </label>
+                  <div className="rounded-lg border border-border bg-panel-2 px-3 py-2.5 font-mono text-[11.5px] text-muted select-text">
+                    {truncateKey(phoneSync.devicePublicKey)}
+                  </div>
+                </div>
+              )}
+
+              {phoneSync && phoneSync.paired.length > 0 && (
+                <div>
+                  <label className="mb-1.5 block text-[12.5px] font-medium text-fg">
+                    Paired phones
+                  </label>
+                  <div className="flex flex-col gap-1.5">
+                    {phoneSync.paired.map((device) => (
+                      <div
+                        key={device.publicKey}
+                        className="flex items-center justify-between gap-3 rounded-lg border border-border bg-panel-2 px-3 py-2"
+                      >
+                        <div className="min-w-0 text-[12.5px]">
+                          <div className="flex items-center gap-1.5">
+                            <span className="pc-dot pc-dot--success" />
+                            <span className="min-w-0 truncate text-fg">{device.name}</span>
+                          </div>
+                          <div className="mt-0.5 font-mono text-[11px] text-muted">
+                            {truncateKey(device.publicKey)}
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => void unpair(device.publicKey)}
+                          className="shrink-0 rounded-lg border border-border bg-panel px-3 py-2 text-[12.5px] text-muted hover:text-danger"
+                          aria-label={`Unpair ${device.name}`}
+                        >
+                          Unpair
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {pairingPayload ? (
+                <div>
+                  <label className="mb-1.5 block text-[12.5px] font-medium text-fg">
+                    Pairing code
+                  </label>
+                  <p className="mb-2 text-[11px] text-faint">
+                    Scan this from the Portcode phone app to pair.
+                    {/* TODO: render as a QR code image in a later iteration */}
+                  </p>
+                  <div className="rounded-lg border border-accent/40 bg-panel-2 px-3 py-2.5 font-mono text-[11px] text-accent-2 select-text break-all">
+                    <div>
+                      <span className="text-muted">key: </span>
+                      {pairingPayload.publicKey}
+                    </div>
+                    <div className="mt-1">
+                      <span className="text-muted">nonce: </span>
+                      {pairingPayload.nonce}
+                    </div>
+                  </div>
+                  <button
+                    onClick={clearPairing}
+                    className="mt-2 rounded-lg border border-border bg-panel px-3 py-2 text-[12.5px] text-muted hover:text-fg"
+                  >
+                    Done
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => void beginPairing()}
+                  className="pc-btn-accent w-full px-3 py-2.5 text-[12.5px]"
+                >
+                  Pair a phone
+                </button>
+              )}
+            </div>
+          </section>
         </div>
 
         {/* FOOTER */}
@@ -271,6 +362,12 @@ export function SettingsPanel() {
       </div>
     </div>
   );
+}
+
+/** Show only the first 8 and last 4 chars of a base64 key to keep the UI compact. */
+function truncateKey(key: string): string {
+  if (key.length <= 16) return key;
+  return `${key.slice(0, 8)}…${key.slice(-4)}`;
 }
 
 function formatExpiry(expiresAt: number): string {

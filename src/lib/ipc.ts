@@ -1,7 +1,16 @@
 // IPC bridge. Talks to the Rust core when running under Tauri; otherwise falls
 // back to an in-browser mock so the UI is fully runnable via `vite` alone.
 
-import type { DirEntry, Message, OAuthStatus, Session, Settings, StreamEvent } from "../types";
+import type {
+  DirEntry,
+  Message,
+  OAuthStatus,
+  PairingPayload,
+  PhoneSyncStatus,
+  Session,
+  Settings,
+  StreamEvent,
+} from "../types";
 
 export const isTauri = (): boolean =>
   typeof window !== "undefined" &&
@@ -69,6 +78,33 @@ export async function oauthLogout(): Promise<void> {
     return;
   }
   return mock.oauthLogout();
+}
+
+// ── Phone Sync ────────────────────────────────────────────────────────────────
+
+export async function phoneSyncStatus(): Promise<PhoneSyncStatus> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<PhoneSyncStatus>("phone_sync_status");
+  }
+  return mock.phoneSyncStatus();
+}
+
+export async function phoneSyncBeginPairing(): Promise<PairingPayload> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<PairingPayload>("phone_sync_begin_pairing");
+  }
+  return mock.phoneSyncBeginPairing();
+}
+
+export async function phoneSyncUnpair(publicKey: string): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("phone_sync_unpair", { publicKey });
+    return;
+  }
+  return mock.phoneSyncUnpair(publicKey);
 }
 
 export async function resolvePermission(id: string, decision: "allow" | "deny"): Promise<void> {
@@ -185,6 +221,12 @@ const mock = (() => {
   // Fake subscription-auth state so the sign-in UX is testable without Tauri.
   let oauth: OAuthStatus = { signedIn: false, expiresAt: null, account: null, tier: null };
 
+  // Fake phone sync state: a stable mock identity + no paired phones by default.
+  let phoneSyncState: PhoneSyncStatus = {
+    devicePublicKey: "MOCK_DEVICE_PUBLIC_KEY_BASE64==",
+    paired: [],
+  };
+
   const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const resolvers = new Map<string, (d: "allow" | "deny") => void>();
 
@@ -214,6 +256,22 @@ const mock = (() => {
     },
     async oauthLogout() {
       oauth = { signedIn: false, expiresAt: null, account: null, tier: null };
+    },
+    async phoneSyncStatus() {
+      return { ...phoneSyncState, paired: [...phoneSyncState.paired] };
+    },
+    async phoneSyncBeginPairing(): Promise<PairingPayload> {
+      return {
+        version: 1,
+        publicKey: phoneSyncState.devicePublicKey,
+        nonce: "MOCK_NONCE_BASE64==",
+      };
+    },
+    async phoneSyncUnpair(publicKey: string) {
+      phoneSyncState = {
+        ...phoneSyncState,
+        paired: phoneSyncState.paired.filter((d) => d.publicKey !== publicKey),
+      };
     },
     async resolvePermission(id: string, decision: "allow" | "deny") {
       resolvers.get(id)?.(decision);

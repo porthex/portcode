@@ -3,7 +3,9 @@ import type {
   ContentBlock,
   Message,
   OAuthStatus,
+  PairingPayload,
   PendingPermission,
+  PhoneSyncStatus,
   Session,
   Settings,
   StreamEvent,
@@ -20,6 +22,8 @@ interface AppState {
   settings: Settings;
   oauthStatus: OAuthStatus | null; // Claude subscription sign-in state
   oauthError: string | null; // last sign-in/out failure, surfaced in Settings
+  phoneSync: PhoneSyncStatus | null; // phone sync device identity + paired devices
+  pairingPayload: PairingPayload | null; // in-progress pairing code to display
   streaming: boolean;
   showSettings: boolean;
   showFiles: boolean;
@@ -48,6 +52,10 @@ interface AppState {
   refreshOAuthStatus: () => Promise<void>;
   loginWithClaude: () => Promise<void>;
   logoutClaude: () => Promise<void>;
+  refreshPhoneSync: () => Promise<void>;
+  beginPairing: () => Promise<void>;
+  unpair: (publicKey: string) => Promise<void>;
+  clearPairing: () => void;
   resolvePermission: (decision: "allow" | "deny", always?: boolean) => Promise<void>;
 }
 
@@ -95,6 +103,8 @@ export const useStore = create<AppState>((set, get) => ({
   settings: DEFAULT_SETTINGS,
   oauthStatus: null,
   oauthError: null,
+  phoneSync: null,
+  pairingPayload: null,
   streaming: false,
   showSettings: false,
   showFiles: false,
@@ -106,22 +116,31 @@ export const useStore = create<AppState>((set, get) => ({
   pendingPermission: null,
 
   async init() {
-    // Fetch settings and subscription status together. The oauth call is kept
-    // resilient so an unwired/older core can't block startup.
-    const [settings, oauthStatus] = await Promise.all([
+    // Fetch settings, subscription status, and phone sync status together.
+    // The oauth and phoneSync calls are kept resilient so an unwired/older
+    // core can't block startup.
+    const [settings, oauthStatus, phoneSync] = await Promise.all([
       ipc.getSettings(),
       ipc.oauthStatus().catch(() => null),
+      ipc.phoneSyncStatus().catch(() => null),
     ]);
     const sessions = await ipc.listSessions();
     if (sessions.length === 0) {
       const s = makeSession();
       await ipc.createSession(s.id, s.title, s.workspace);
-      set({ settings, oauthStatus, sessions: [s], activeId: s.id, messages: { [s.id]: [] } });
+      set({
+        settings,
+        oauthStatus,
+        phoneSync,
+        sessions: [s],
+        activeId: s.id,
+        messages: { [s.id]: [] },
+      });
       return;
     }
     const activeId = sessions[0].id;
     const msgs = await ipc.getMessages(activeId);
-    set({ settings, oauthStatus, sessions, activeId, messages: { [activeId]: msgs } });
+    set({ settings, oauthStatus, phoneSync, sessions, activeId, messages: { [activeId]: msgs } });
   },
 
   async newSession() {
@@ -367,6 +386,29 @@ export const useStore = create<AppState>((set, get) => ({
     } catch (err) {
       set({ oauthError: errMessage(err) });
     }
+  },
+
+  async refreshPhoneSync() {
+    try {
+      const phoneSync = await ipc.phoneSyncStatus();
+      set({ phoneSync });
+    } catch {
+      // Transient / core not ready — keep whatever we last knew.
+    }
+  },
+
+  async beginPairing() {
+    const pairingPayload = await ipc.phoneSyncBeginPairing();
+    set({ pairingPayload });
+  },
+
+  async unpair(publicKey) {
+    await ipc.phoneSyncUnpair(publicKey);
+    await get().refreshPhoneSync();
+  },
+
+  clearPairing() {
+    set({ pairingPayload: null });
   },
 }));
 
