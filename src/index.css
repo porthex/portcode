@@ -1100,3 +1100,20 @@ html.pc-scanning #root {
   border-color: var(--color-danger);
   color: var(--color-danger);
 }
+
+/* =========================================================================
+   MOBILE SESSION DRAWER
+   The session-list rail slides in as an overlay on the phone (where an inline
+   rail would eat the narrow viewport). Desktop keeps the inline sidebar.
+   ========================================================================= */
+.pc-drawer {
+  animation: pcDrawerIn 0.18s ease-out;
+}
+@keyframes pcDrawerIn {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
