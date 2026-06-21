@@ -265,6 +265,9 @@ const mock = (() => {
         version: 1,
         publicKey: phoneSyncState.devicePublicKey,
         nonce: "MOCK_NONCE_BASE64==",
+        // Mirrors the real desktop payload: an opaque iroh node address the phone
+        // would dial. Shaped like iroh's EndpointAddr serialization.
+        nodeAddr: { id: "mock-endpoint-id", addrs: [] },
       };
     },
     async phoneSyncUnpair(publicKey: string) {
