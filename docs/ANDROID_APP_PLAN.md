@@ -2,7 +2,7 @@
 
 > Status: **planning + scaffolded.** The Tauri v2 Android project is generated
 > (`src-tauri/gen/android`, committed). This doc grounds the rest of the build in
-> Portcode's *actual* code + the real blockers, and sequences it into shippable,
+> Portcode's _actual_ code + the real blockers, and sequences it into shippable,
 > CI-verifiable increments. Companion to [`PHONE_SYNC_PLAN.md`](./PHONE_SYNC_PLAN.md)
 > (the now-merged Sync Engine).
 >
@@ -28,7 +28,7 @@
   `NDK_HOME`/`ANDROID_NDK_ROOT` exported — they were empty; point them at
   `…\Sdk\ndk\27.0.12077973`.)
 
-So the **shell builds**; the app's *behaviour* is the work.
+So the **shell builds**; the app's _behaviour_ is the work.
 
 ---
 
@@ -39,7 +39,7 @@ the agent loop (`agent.rs`), the **tools** (`tools.rs` — `fs_read/write/edit`,
 `glob`, `grep`, **`shell`** running PowerShell), and `keyring` secrets. **None of
 that belongs on a phone:** there's no workspace, no PowerShell, no API key on the
 device, and shipping the shell/file tools in a mobile binary is wrong + a security
-smell. The phone should **only** speak the sync *client* side of the protocol and
+smell. The phone should **only** speak the sync _client_ side of the protocol and
 render the session.
 
 This means the mobile build is **not** "the desktop app compiled for android." It
@@ -53,7 +53,8 @@ mobile build   =  sync CLIENT (connect/pair/catch-up/live/command send) + remote
 
 **Decision needed from the owner:** confirm "phone = pure remote client" (recommended;
 matches the research doc). The alternative (phone also runs an agent) is out of scope
-+ infeasible (no LLM key/workspace on device).
+
+- infeasible (no LLM key/workspace on device).
 
 ---
 
@@ -61,13 +62,13 @@ matches the research doc). The alternative (phone also runs an agent) is out of 
 
 These are the things CI's android job (§5) will hit; fix them via `cfg`/features:
 
-| Blocker | Where | Fix |
-|---|---|---|
-| **`keyring` `windows-native` feature won't compile for android** | `Cargo.toml` `keyring = { features = ["windows-native"] }` | Make the feature per-target: `windows-native` only under `cfg(windows)`; on android use the **Android Keystore** (e.g. `keyring` with the `linux`/`secret-service` backends don't apply — use a small JNI bridge to `AndroidKeyStore`, or an encrypted-file fallback in app-private storage). Likely a `secrets.rs` trait with a per-platform impl. |
-| **Agent/tools/shell are desktop-only** | `agent.rs`, `tools.rs`, `llm.rs`, the `run_agent`/`cancel_agent`/`resolve_permission` commands | Gate behind `#[cfg(not(mobile))]` / a `desktop` feature. The mobile `run()` registers only the client + remote commands. |
-| **`shell` tool uses `tokio::process` (PowerShell)** | `tools.rs` | Excluded with the tools (above). |
-| **The sync SERVER (`phone_sync_listen`, `DesktopCommandHandler`, `server.rs`) is desktop-only** | `sync/server.rs`, `lib.rs` | Gate `#[cfg(not(mobile))]`; mobile gets the *client* listener counterpart. |
-| **Windows-only deps in the tree** (the iroh/tauri `windows-*` crates) | resolved via target-gating already | iroh/snow/tokio/serde are cross-platform; the `windows-*` crates are `cfg(windows)` so they drop out for android automatically. Verify in CI. |
+| Blocker                                                                                         | Where                                                                                          | Fix                                                                                                                                                                                                                                                                                                                                                 |
+| ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`keyring` `windows-native` feature won't compile for android**                                | `Cargo.toml` `keyring = { features = ["windows-native"] }`                                     | Make the feature per-target: `windows-native` only under `cfg(windows)`; on android use the **Android Keystore** (e.g. `keyring` with the `linux`/`secret-service` backends don't apply — use a small JNI bridge to `AndroidKeyStore`, or an encrypted-file fallback in app-private storage). Likely a `secrets.rs` trait with a per-platform impl. |
+| **Agent/tools/shell are desktop-only**                                                          | `agent.rs`, `tools.rs`, `llm.rs`, the `run_agent`/`cancel_agent`/`resolve_permission` commands | Gate behind `#[cfg(not(mobile))]` / a `desktop` feature. The mobile `run()` registers only the client + remote commands.                                                                                                                                                                                                                            |
+| **`shell` tool uses `tokio::process` (PowerShell)**                                             | `tools.rs`                                                                                     | Excluded with the tools (above).                                                                                                                                                                                                                                                                                                                    |
+| **The sync SERVER (`phone_sync_listen`, `DesktopCommandHandler`, `server.rs`) is desktop-only** | `sync/server.rs`, `lib.rs`                                                                     | Gate `#[cfg(not(mobile))]`; mobile gets the _client_ listener counterpart.                                                                                                                                                                                                                                                                          |
+| **Windows-only deps in the tree** (the iroh/tauri `windows-*` crates)                           | resolved via target-gating already                                                             | iroh/snow/tokio/serde are cross-platform; the `windows-*` crates are `cfg(windows)` so they drop out for android automatically. Verify in CI.                                                                                                                                                                                                       |
 
 The **sync protocol core is already cross-platform** (`sync/{protocol,noise,transport,session,pairing,mod}.rs` use only iroh/snow/tokio/serde/base64) — it compiles for android as-is. That's the big win: the hard part (the encrypted session protocol) is reusable on the phone unchanged.
 
@@ -76,6 +77,7 @@ The **sync protocol core is already cross-platform** (`sync/{protocol,noise,tran
 ## 3. The mobile sync CLIENT (the new Rust)
 
 Mirror of the desktop server, on the phone side. Most primitives already exist:
+
 - `transport::connect_and_pair(endpoint, peer_addr, local_noise_private)` — **already
   built** (the initiator side; currently carries a narrow `dead_code` allow — it
   becomes live here).
@@ -86,7 +88,7 @@ Mirror of the desktop server, on the phone side. Most primitives already exist:
   Tauri event, e.g. `phone-sync://session`), and (b) a send path that turns UI
   actions into `SyncFrame::Command` (`Run`/`Cancel`/`Permission`/`CreateSession`).
   This is protocol-level + **CI-verifiable on the desktop Rust job** (no android
-  needed) — a good *first* increment.
+  needed) — a good _first_ increment.
 - New mobile commands (`#[cfg(mobile)]`): `phone_sync_connect(qr_payload)` (decode
   the QR, dial the desktop's `EndpointAddr`, run the XX pairing as initiator, show
   the SAS for the user to compare, persist the pinned key), `phone_sync_send(command)`,
@@ -105,7 +107,7 @@ include the iroh node addr. (Small protocol addition.)
 - **`ipc.ts` third path.** Today: Tauri-local (desktop) or browser-mock. Add a
   **remote** path: under `mobile`, `runAgent`/sessions/messages proxy to the desktop
   via the mobile commands + the `phone-sync://session` event stream (fold `Live`
-  `StreamEvent`s with the *same reducer* the desktop store uses — already factored).
+  `StreamEvent`s with the _same reducer_ the desktop store uses — already factored).
 - **QR-scan pairing screen.** The phone scans the desktop's QR (from the desktop's
   PHONE SYNC settings). Use a Tauri mobile camera/QR plugin (or a JS QR lib +
   `getUserMedia`), then call `phone_sync_connect`. Show the **SAS** for out-of-band
@@ -120,10 +122,11 @@ include the iroh node addr. (Small protocol addition.)
 The desktop crate already can't build on the 8GB dev box; android is heavier.
 **Add an `android-build` CI job** (separate workflow, `workflow_dispatch` +
 `pull_request` touching mobile paths, so it doesn't slow every PR):
+
 - ubuntu runner (has the Android SDK pre-installed), set up JDK 17, pnpm install,
   `rustup target add aarch64-linux-android` (+ others), export `NDK_HOME`, then
   `pnpm tauri android build --apk --target aarch64` (or `cargo ndk`/`cargo build
-  --target aarch64-linux-android` for a faster compile-only check).
+--target aarch64-linux-android` for a faster compile-only check).
 - This is where the §2 blockers surface concretely — fix them iteratively against
   this job. **Verify the cross-compile in CI, not on the dev box.**
 
@@ -143,10 +146,10 @@ The desktop crate already can't build on the 8GB dev box; android is heavier.
 ## 7. Suggested increment order (each CI-verifiable where noted)
 
 1. **Client session loop** in `sync/session.rs` (the recv-live + send-command dual)
-   + a test over the in-memory channel. ✅ desktop-CI-verifiable. *(No android needed.)*
+   - a test over the in-memory channel. ✅ desktop-CI-verifiable. _(No android needed.)_
 2. **`PairingPayload` carries the iroh node addr** + desktop `begin_pairing` fills it;
    round-trip test. ✅ desktop-CI-verifiable.
-3. **`android-build` CI job** (§5) against the *unmodified* app → capture the exact
+3. **`android-build` CI job** (§5) against the _unmodified_ app → capture the exact
    blockers.
 4. **Platform split** (§2): `secrets.rs` per-target keyring; `#[cfg(mobile)]` to
    exclude agent/tools/server; the mobile `run()` + client commands. Iterate vs the
