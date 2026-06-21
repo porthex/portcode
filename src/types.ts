@@ -140,6 +140,53 @@ export interface PairingPayload {
   nodeAddr?: PairingNodeAddr;
 }
 
+// ── Mobile remote client (the phone drives a paired desktop) ───────────────────
+
+/** Result of `phone_sync_connect` — mirrors the Rust `ConnectInfo` (camelCase).
+ *  `sas` is the short authentication string the user compares out-of-band; the
+ *  `peerPublicKey` is the desktop key the phone pinned. */
+export interface ConnectInfo {
+  sas: string;
+  peerPublicKey: string;
+}
+
+/**
+ * A command the phone issues to drive the always-on desktop. The wire shape is
+ * **snake_case** (serde internally-tagged on `cmd`) — it mirrors the Rust
+ * `RemoteCommand` exactly, so it is sent to `phone_sync_send_command` verbatim.
+ */
+export type RemoteCommand =
+  | { cmd: "run"; session_id: string; text: string }
+  | { cmd: "cancel"; session_id: string }
+  | { cmd: "permission"; id: string; decision: string }
+  | { cmd: "create_session"; title?: string | null };
+
+/** A catch-up message row from the desktop (camelCase; mirrors Rust `MessageRow`).
+ *  Distinct from {@link Message}: it carries the session id + monotonic `seq`. */
+export interface MessageRow {
+  id: string;
+  sessionId: string;
+  seq: number;
+  role: Role;
+  content: ContentBlock[];
+  createdAt: number;
+}
+
+/**
+ * A frame on the phone↔desktop channel, delivered to the phone via the
+ * `phone-sync://frame` event. Mirrors the Rust `SyncFrame` (serde tag `t`,
+ * snake_case variants). The phone receives `sessionList`/`messageDelta`/`live`;
+ * the others exist for completeness. Frame-level fields stay snake_case; the
+ * nested rows (`Session`/`MessageRow`/`Cursor`) are camelCase.
+ */
+export type SyncFrame =
+  | { t: "session_list"; sessions: Session[] }
+  | { t: "message_delta"; session_id: string; messages: MessageRow[] }
+  | { t: "live"; session_id: string; event: StreamEvent }
+  | { t: "command"; command: RemoteCommand }
+  | { t: "ack"; session_id: string; seq: number }
+  | { t: "hello"; device_id: string; cursors: { sessionId: string; seq: number }[] };
+
 // Approximate Anthropic list prices, USD per million tokens (input / output).
 export const MODEL_PRICING: Record<string, { in: number; out: number }> = {
   "claude-opus-4-8": { in: 15, out: 75 },
