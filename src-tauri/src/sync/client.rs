@@ -201,6 +201,20 @@ mod tests {
         // The one Live frame was already consumed inline above, so the drain loop
         // sees nothing more before the channel closes and returns cleanly.
         assert!(got.is_empty());
+
+        // Wait until the desktop has actually PROCESSED the command before tearing
+        // the send half down. Dropping `c_send` resets its QUIC stream, which on a
+        // slow/loaded runner can discard a not-yet-delivered command frame — that
+        // race flaked `seen.len() == 1` on CI. Polling `seen` (handle_commands runs
+        // concurrently and records each command) makes delivery deterministic; the
+        // 2s budget still fails fast if a command genuinely never arrives.
+        for _ in 0..200 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
         drop(c_send);
         forward.await.unwrap().expect("forward_live ok");
         intake.await.unwrap().expect("handle_commands ok");
