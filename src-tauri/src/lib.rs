@@ -1,16 +1,30 @@
+// DESKTOP-ONLY executable-capability cluster — excluded from the mobile (phone =
+// pure remote CLIENT) binary so no agent loop / shell+fs tools / OAuth loopback
+// code ships on the phone. `llm` stays SHARED: db/permissions/sync(protocol,mod)
+// `use crate::llm::{Block, ChatMessage, StreamEvent}` in production code — those
+// are the wire types the phone must decode — so gating `llm` would break mobile.
+#[cfg(desktop)]
 mod agent;
 mod db;
 mod llm;
+#[cfg(desktop)]
 mod oauth;
 mod permissions;
 mod secrets;
 mod settings;
 mod sync;
+#[cfg(desktop)]
 mod tools;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+// `Ordering` is referenced ONLY by `cancel_agent` (desktop-gated); `AtomicBool`
+// stays shared as the `AppState.cancels` value type. Split so mobile has no unused
+// import. Inert on desktop (both names stay used). NB: list_dir uses the unrelated
+// `std::cmp::Ordering` fully-qualified, so it does not keep this import alive.
+#[cfg(desktop)]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -81,6 +95,8 @@ fn set_api_key(key: String) -> Result<(), String> {
 /// Sign-in state for the frontend. `expires_at` is unix seconds; `account` is the
 /// signed-in email and `tier` a display label ("Claude Max" / "Claude Pro") —
 /// both best-effort from the OAuth profile, so either may be `None`.
+// DESKTOP-ONLY: the subscription-OAuth surface (`oauth.rs` is mobile-excluded).
+#[cfg(desktop)]
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OAuthStatus {
@@ -91,6 +107,7 @@ struct OAuthStatus {
 }
 
 /// Map a stored plan code (`"max"` / `"pro"`) to a user-facing tier label.
+#[cfg(desktop)]
 fn tier_label(plan: Option<&str>) -> Option<String> {
     match plan {
         Some("max") => Some("Claude Max".to_string()),
@@ -99,6 +116,7 @@ fn tier_label(plan: Option<&str>) -> Option<String> {
     }
 }
 
+#[cfg(desktop)]
 fn current_oauth_status() -> OAuthStatus {
     match secrets::get_oauth() {
         Some(t) => OAuthStatus {
@@ -118,6 +136,7 @@ fn current_oauth_status() -> OAuthStatus {
 
 /// Run the interactive subscription sign-in (loopback OAuth + PKCE), store the
 /// resulting tokens, and return the new status.
+#[cfg(desktop)]
 #[tauri::command]
 async fn start_oauth_login(state: State<'_, AppState>) -> Result<OAuthStatus, String> {
     let http = state.http.clone();
@@ -127,12 +146,14 @@ async fn start_oauth_login(state: State<'_, AppState>) -> Result<OAuthStatus, St
 }
 
 /// Report whether a subscription sign-in is currently stored.
+#[cfg(desktop)]
 #[tauri::command]
 fn oauth_status() -> Result<OAuthStatus, String> {
     Ok(current_oauth_status())
 }
 
 /// Forget the stored subscription tokens (sign out). Idempotent.
+#[cfg(desktop)]
 #[tauri::command]
 fn oauth_logout() -> Result<(), String> {
     secrets::clear_oauth()
@@ -183,6 +204,9 @@ fn get_messages(state: State<AppState>, session_id: String) -> Vec<UiMessage> {
 
 // ── workspace file tree ──────────────────────────────────────────────────────
 
+// DESKTOP-ONLY: the workspace file-tree capability must not exist on the phone
+// (no filesystem browsing of the desktop's workspace from a remote client).
+#[cfg(desktop)]
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DirEntry {
@@ -191,6 +215,7 @@ struct DirEntry {
     is_dir: bool,
 }
 
+#[cfg(desktop)]
 const IGNORED: &[&str] = &[
     ".git",
     "node_modules",
@@ -202,6 +227,7 @@ const IGNORED: &[&str] = &[
 ];
 
 /// List immediate children of a workspace-relative directory (lazy tree).
+#[cfg(desktop)]
 #[tauri::command]
 fn list_dir(state: State<AppState>, sub: Option<String>) -> Result<Vec<DirEntry>, String> {
     let ws = state.settings.lock().unwrap().workspace.clone();
@@ -252,6 +278,10 @@ fn list_dir(state: State<AppState>, sub: Option<String>) -> Result<Vec<DirEntry>
 
 // ── agent ────────────────────────────────────────────────────────────────────
 
+// DESKTOP-ONLY: drives `agent::run` (the agent loop + shell/fs tools), which is
+// mobile-excluded. The phone issues turns via `phone_sync_send_command` over the
+// encrypted channel to a paired desktop; it never runs the agent locally.
+#[cfg(desktop)]
 #[tauri::command]
 async fn run_agent(
     app: AppHandle,
@@ -285,6 +315,7 @@ async fn run_agent(
     Ok(())
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 fn cancel_agent(state: State<AppState>, session_id: String) {
     if let Some(flag) = state.cancels.lock().unwrap().get(&session_id) {
@@ -293,6 +324,7 @@ fn cancel_agent(state: State<AppState>, session_id: String) {
     permissions::deny_all(&state.pending);
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 fn resolve_permission(state: State<AppState>, id: String, decision: String) {
     let d = if decision == "allow" {
@@ -345,6 +377,10 @@ fn phone_sync_unpair(state: State<AppState>, public_key: String) -> Result<(), S
 /// persisted node identity and accept inbound phone connections, pairing +
 /// serving each. Returns immediately; the accept loop runs in the background for
 /// the life of the app. The frontend gates this to a single call.
+// DESKTOP-ONLY: this is the always-on SYNC SERVER (accept loop). It builds
+// `sync::server::DesktopCommandHandler` (mobile-excluded with `agent`). The phone
+// is the CLIENT (`phone_sync_connect`), so it never listens/serves.
+#[cfg(desktop)]
 #[tauri::command]
 fn phone_sync_listen(app: AppHandle, state: State<AppState>) -> Result<(), String> {
     // App-layer (Noise) pairing identity — the key phones pin.
@@ -407,6 +443,10 @@ fn phone_sync_listen(app: AppHandle, state: State<AppState>) -> Result<(), Strin
 
 /// Serve one paired phone: persist it, run catch-up over the full-duplex channel,
 /// then split and run live-forward + command-intake concurrently until either ends.
+// DESKTOP-ONLY: not a command — the per-connection task body for `phone_sync_listen`
+// (its only caller). References `sync::server::DesktopCommandHandler`, so it is
+// gated together with the server.
+#[cfg(desktop)]
 async fn serve_connection(
     app: AppHandle,
     db: Arc<Db>,
@@ -457,8 +497,10 @@ async fn serve_connection(
 // ── Phone Sync (mobile CLIENT: connect + drive a paired desktop) ─────────────
 //
 // These are the phone's side of the protocol — the dual of the desktop listener
-// above. They register for every target (inert on desktop) and are exercised by
-// the mobile app. No `cfg(mobile)` split here; that is a later increment.
+// above. They are SHARED (registered on both targets): the desktop can also act
+// as a client, and they are exactly the commands the mobile app drives. Every
+// path they touch (sync::client/pairing/transport/protocol + secrets/db) compiles
+// on both targets, so they carry no `cfg` — only the handler list selects them.
 
 /// Result of a successful client connect: the SAS to compare out-of-band and the
 /// desktop's pinned public key the phone connected to.
@@ -583,7 +625,7 @@ fn phone_sync_disconnect(state: State<AppState>) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         // Auto-updater (Phase 2 #1). Update checks are pull-only and verify the
@@ -619,31 +661,64 @@ pub fn run() {
             // so this must be registered during setup.
             app.manage(sync::SyncHub::new());
             Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
-            get_settings,
-            save_settings,
-            set_api_key,
-            start_oauth_login,
-            oauth_status,
-            oauth_logout,
-            list_sessions,
-            create_session,
-            rename_session,
-            delete_session,
-            get_messages,
-            list_dir,
-            run_agent,
-            cancel_agent,
-            resolve_permission,
-            phone_sync_status,
-            phone_sync_begin_pairing,
-            phone_sync_unpair,
-            phone_sync_listen,
-            phone_sync_connect,
-            phone_sync_send_command,
-            phone_sync_disconnect
-        ])
+        });
+
+    // The command surface differs by target, and `generate_handler!` cannot carry
+    // per-item `cfg`, so shadow-rebind `builder` per target: EXACTLY ONE arm
+    // compiles (tauri-build sets exactly one of `cfg(desktop)`/`cfg(mobile)`).
+    //
+    // DESKTOP — the full surface (byte-identical to the pre-split list): all
+    // settings/sessions + OAuth + workspace file-tree + agent + the sync SERVER.
+    #[cfg(desktop)]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        get_settings,
+        save_settings,
+        set_api_key,
+        start_oauth_login,
+        oauth_status,
+        oauth_logout,
+        list_sessions,
+        create_session,
+        rename_session,
+        delete_session,
+        get_messages,
+        list_dir,
+        run_agent,
+        cancel_agent,
+        resolve_permission,
+        phone_sync_status,
+        phone_sync_begin_pairing,
+        phone_sync_unpair,
+        phone_sync_listen,
+        phone_sync_connect,
+        phone_sync_send_command,
+        phone_sync_disconnect
+    ]);
+
+    // MOBILE — the remote-CLIENT subset. Shared settings/secrets/sessions +
+    // pairing-status/begin/unpair + the phone CLIENT trio. OMITS the desktop-only
+    // commands (the OAuth trio, list_dir, run_agent, cancel_agent,
+    // resolve_permission, phone_sync_listen) — none are compiled on mobile, so
+    // naming them here would be an unresolved-name error.
+    #[cfg(mobile)]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        get_settings,
+        save_settings,
+        set_api_key,
+        list_sessions,
+        create_session,
+        rename_session,
+        delete_session,
+        get_messages,
+        phone_sync_status,
+        phone_sync_begin_pairing,
+        phone_sync_unpair,
+        phone_sync_connect,
+        phone_sync_send_command,
+        phone_sync_disconnect
+    ]);
+
+    builder
         .run(tauri::generate_context!())
         .expect("error while running Portcode");
 }

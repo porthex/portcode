@@ -17,6 +17,11 @@ pub mod client;
 pub mod noise;
 pub mod pairing;
 pub mod protocol;
+// DESKTOP-ONLY: the accept-loop sync SERVER. `server.rs` does `use crate::agent`
+// (the agent loop), which is `#[cfg(desktop)]`-excluded on mobile; gating the
+// module here keeps that import resolvable and drops the server from the phone
+// (a pure remote CLIENT). `client`/`protocol`/`transport`/etc. stay cross-platform.
+#[cfg(desktop)]
 pub mod server;
 pub mod session;
 pub mod transport;
