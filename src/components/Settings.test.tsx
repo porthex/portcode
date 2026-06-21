@@ -501,4 +501,20 @@ describe("SettingsPanel — Phone Sync section", () => {
 
     expect(useStore.getState().pairingPayload).toBeNull();
   });
+
+  it("hides the desktop-only sections on a phone (remote mode)", () => {
+    // The agent's config (model/key/sign-in), the tool policy, and the desktop's
+    // show-a-QR pairing flow all live on the desktop — several of their commands
+    // are desktop-only and would error — so the phone hides those sections.
+    useStore.setState({ remoteMode: true });
+    renderPanel();
+
+    expect(screen.getByText("CONNECTION").closest("section")).toHaveClass("hidden");
+    expect(screen.getByText("PERMISSIONS").closest("section")).toHaveClass("hidden");
+    expect(screen.getByText("PHONE SYNC").closest("section")).toHaveClass("hidden");
+    // Appearance (purely client-side UI prefs) stays available.
+    expect(screen.getByText("APPEARANCE").closest("section")).not.toHaveClass("hidden");
+
+    useStore.setState({ remoteMode: false }); // don't leak into other tests
+  });
 });

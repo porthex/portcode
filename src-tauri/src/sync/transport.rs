@@ -433,6 +433,17 @@ mod tests {
             other => panic!("expected Live, got {other:?}"),
         }
 
+        // Wait until the command is actually PROCESSED before dropping the send
+        // half — dropping `client_send` resets its QUIC stream, which on a slow
+        // runner can discard a not-yet-delivered command frame (the same race that
+        // flaked the client.rs integration test). 2s budget; fails fast otherwise.
+        for _ in 0..200 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
         // Close: drop hub (forward_live returns), drop client send (server recv
         // ends → handle_commands returns). Join both before asserting `seen`.
         drop(hub);

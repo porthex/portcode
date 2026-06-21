@@ -2,14 +2,17 @@
 // back to an in-browser mock so the UI is fully runnable via `vite` alone.
 
 import type {
+  ConnectInfo,
   DirEntry,
   Message,
   OAuthStatus,
   PairingPayload,
   PhoneSyncStatus,
+  RemoteCommand,
   Session,
   Settings,
   StreamEvent,
+  SyncFrame,
 } from "../types";
 
 export const isTauri = (): boolean =>
@@ -105,6 +108,48 @@ export async function phoneSyncUnpair(publicKey: string): Promise<void> {
     return;
   }
   return mock.phoneSyncUnpair(publicKey);
+}
+
+// ── Phone Sync — mobile CLIENT (the phone drives a paired desktop) ─────────────
+
+/** Dial + pair with a desktop from its scanned QR payload (JSON). Returns the SAS
+ *  to compare out-of-band plus the pinned desktop key. */
+export async function phoneSyncConnect(qr: string): Promise<ConnectInfo> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<ConnectInfo>("phone_sync_connect", { qr });
+  }
+  return mock.phoneSyncConnect(qr);
+}
+
+/** Send one command to the live desktop session. */
+export async function phoneSyncSendCommand(command: RemoteCommand): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("phone_sync_send_command", { command });
+    return;
+  }
+  return mock.phoneSyncSendCommand(command);
+}
+
+/** Tear down the live desktop session. Idempotent. */
+export async function phoneSyncDisconnect(): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("phone_sync_disconnect");
+    return;
+  }
+  return mock.phoneSyncDisconnect();
+}
+
+/** Subscribe to frames forwarded from the paired desktop (live events + catch-up).
+ *  Returns an unlisten handle. */
+export async function onPhoneSyncFrame(cb: (frame: SyncFrame) => void): Promise<Unlisten> {
+  if (isTauri()) {
+    const { event } = await tauri();
+    return event.listen<SyncFrame>("phone-sync://frame", (ev) => cb(ev.payload));
+  }
+  return mock.onPhoneSyncFrame(cb);
 }
 
 export async function resolvePermission(id: string, decision: "allow" | "deny"): Promise<void> {
@@ -275,6 +320,20 @@ const mock = (() => {
         ...phoneSyncState,
         paired: phoneSyncState.paired.filter((d) => d.publicKey !== publicKey),
       };
+    },
+    // Mobile remote client — no real desktop in the browser preview, so connect
+    // returns a deterministic SAS and the frame stream is inert.
+    async phoneSyncConnect(_qr: string): Promise<ConnectInfo> {
+      return { sas: "MOCK-SAS-1234", peerPublicKey: "MOCK_DESKTOP_KEY_BASE64==" };
+    },
+    async phoneSyncSendCommand(_command: RemoteCommand) {
+      // no-op: the preview has no paired desktop to receive commands.
+    },
+    async phoneSyncDisconnect() {
+      // no-op: nothing to tear down in the preview.
+    },
+    async onPhoneSyncFrame(_cb: (frame: SyncFrame) => void): Promise<Unlisten> {
+      return () => {}; // inert subscription; the preview never emits frames.
     },
     async resolvePermission(id: string, decision: "allow" | "deny") {
       resolvers.get(id)?.(decision);

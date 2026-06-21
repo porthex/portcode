@@ -7,6 +7,7 @@ import { SettingsPanel } from "./components/Settings";
 import { CommandPalette } from "./components/CommandPalette";
 import { StatusHud } from "./components/StatusHud";
 import { NeonRain } from "./components/NeonRain";
+import { RemotePairing } from "./components/RemotePairing";
 import { isTauri } from "./lib/ipc";
 
 export default function App() {
@@ -15,6 +16,9 @@ export default function App() {
   const showFiles = useStore((s) => s.showFiles);
   const ambientRain = useStore((s) => s.ambientRain);
   const scanlines = useStore((s) => s.scanlines);
+  const remoteMode = useStore((s) => s.remoteMode);
+  const remoteConnected = useStore((s) => s.remoteConnected);
+  const remoteVerified = useStore((s) => s.remoteVerified);
 
   useEffect(() => {
     void init();
@@ -44,6 +48,10 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // Remote mode (the phone, or any client that opted in): until a desktop session
+  // is connected AND its SAS verified, the pairing screen takes over the shell.
+  const remoteGate = remoteMode && !(remoteConnected && remoteVerified);
+
   return (
     <div className="relative flex h-full w-full flex-col overflow-hidden bg-bg text-fg">
       {/* Ambient layers — vignette always on; rain/scanlines are user-opt-in. */}
@@ -51,19 +59,48 @@ export default function App() {
       {scanlines && <div className="pc-scanlines" aria-hidden="true" />}
       <div className="pc-vignette" aria-hidden="true" />
 
-      <div className="flex min-h-0 flex-1 overflow-hidden">
-        <Sidebar />
-        {showFiles && <FileExplorer />}
-        <main className="flex min-w-0 flex-1 flex-col">
-          <TitleBar />
-          <Chat />
-        </main>
-      </div>
+      {remoteGate ? (
+        <RemotePairing />
+      ) : (
+        <>
+          {remoteMode && <RemoteBanner />}
+          <div className="flex min-h-0 flex-1 overflow-hidden">
+            <Sidebar />
+            {showFiles && <FileExplorer />}
+            <main className="flex min-w-0 flex-1 flex-col">
+              <TitleBar />
+              <Chat />
+            </main>
+          </div>
 
-      <StatusHud />
+          <StatusHud />
 
-      {showSettings && <SettingsPanel />}
-      <CommandPalette />
+          {showSettings && <SettingsPanel />}
+          <CommandPalette />
+        </>
+      )}
+    </div>
+  );
+}
+
+/** A slim banner atop the remote session: shows the live link and lets the user
+ *  drop it. Only rendered in remote mode once connected + verified. */
+function RemoteBanner() {
+  const disconnectRemote = useStore((s) => s.disconnectRemote);
+  return (
+    <div className="flex shrink-0 items-center justify-between gap-3 border-b border-accent-2/25 bg-accent-2/5 px-4 py-2">
+      <span className="flex items-center gap-2 font-mono text-[10.5px] uppercase tracking-[1.5px] text-accent-2">
+        <span className="pc-dot pc-dot--cyan" />
+        Remote · connected
+      </span>
+      <button
+        onClick={() => void disconnectRemote()}
+        className="rounded-md border border-border-2 bg-panel-2/80 px-2.5 py-1 font-mono text-[11px] text-muted transition-colors hover:border-danger/50 hover:text-danger"
+        aria-label="Disconnect from desktop"
+        title="Disconnect from desktop"
+      >
+        Disconnect
+      </button>
     </div>
   );
 }
@@ -73,6 +110,9 @@ function TitleBar() {
   const showFiles = useStore((s) => s.showFiles);
   const toggleFiles = useStore((s) => s.toggleFiles);
   const setShowPalette = useStore((s) => s.setShowPalette);
+  // The file explorer browses the desktop's workspace (`list_dir` is desktop-only),
+  // so the phone hides the toggle.
+  const remoteMode = useStore((s) => s.remoteMode);
   return (
     <header className="flex h-[46px] shrink-0 items-center justify-between border-b border-border bg-panel/70 px-3.5 backdrop-blur-sm">
       <div className="flex min-w-0 items-center gap-2.5">
@@ -80,7 +120,7 @@ function TitleBar() {
           onClick={toggleFiles}
           aria-label="Toggle file explorer (Ctrl+B)"
           title="Toggle file explorer (Ctrl+B)"
-          className={`flex h-[30px] w-[30px] items-center justify-center rounded-[7px] border transition-colors ${
+          className={`${remoteMode ? "hidden " : ""}flex h-[30px] w-[30px] items-center justify-center rounded-[7px] border transition-colors ${
             showFiles
               ? "border-accent-2/30 bg-accent-2/10 text-accent-2"
               : "border-transparent text-muted hover:text-accent-2"

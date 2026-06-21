@@ -155,6 +155,55 @@ describe("Tauri command serialization", () => {
     expect(invoke).toHaveBeenCalledWith("phone_sync_unpair", { publicKey: "abc==" });
   });
 
+  it("phone_sync_connect forwards the qr string and returns the ConnectInfo", async () => {
+    const { ipc, invoke } = await load();
+    const info = { sas: "AB-12-CD", peerPublicKey: "KEY==" };
+    invoke.mockResolvedValue(info);
+    await expect(ipc.phoneSyncConnect('{"version":1}')).resolves.toBe(info);
+    expect(invoke).toHaveBeenCalledWith("phone_sync_connect", { qr: '{"version":1}' });
+  });
+
+  it("phone_sync_send_command wraps the command under a `command` key", async () => {
+    const { ipc, invoke } = await load();
+    invoke.mockResolvedValue(undefined);
+    const command = { cmd: "run", session_id: "s1", text: "go" } as const;
+    await expect(ipc.phoneSyncSendCommand(command)).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("phone_sync_send_command", { command });
+  });
+
+  it("phone_sync_disconnect is invoked with no arguments", async () => {
+    const { ipc, invoke } = await load();
+    invoke.mockResolvedValue(undefined);
+    await expect(ipc.phoneSyncDisconnect()).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("phone_sync_disconnect");
+  });
+
+  it("onPhoneSyncFrame listens on the frame channel and unwraps payloads", async () => {
+    const { ipc, listen } = await load();
+    const unlisten = vi.fn();
+    let registered!: (ev: { payload: unknown }) => void;
+    listen.mockImplementation(async (_channel, cb) => {
+      registered = cb as typeof registered;
+      return unlisten;
+    });
+
+    const onFrame = vi.fn();
+    const off = await ipc.onPhoneSyncFrame(onFrame);
+    expect(listen).toHaveBeenCalledWith("phone-sync://frame", expect.any(Function));
+
+    registered({
+      payload: { t: "live", session_id: "s1", event: { type: "text_delta", text: "hi" } },
+    });
+    expect(onFrame).toHaveBeenCalledWith({
+      t: "live",
+      session_id: "s1",
+      event: { type: "text_delta", text: "hi" },
+    });
+
+    off();
+    expect(unlisten).toHaveBeenCalledTimes(1);
+  });
+
   it("openFolder returns the native picker's path, or null when cancelled", async () => {
     const { ipc } = await load();
     const { open } = await import("@tauri-apps/plugin-dialog");
@@ -286,6 +335,33 @@ describe("browser fallback (no Tauri core)", () => {
     await expect(ipc.phoneSyncUnpair("unknown==")).resolves.toBeUndefined();
     const after = await ipc.phoneSyncStatus();
     expect(after.paired).toEqual([]);
+  });
+
+  it("phoneSyncConnect returns a deterministic SAS + pinned key", async () => {
+    const { ipc, invoke } = await load();
+    const info = await ipc.phoneSyncConnect("any-qr");
+    expect(typeof info.sas).toBe("string");
+    expect(info.sas.length).toBeGreaterThan(0);
+    expect(typeof info.peerPublicKey).toBe("string");
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("phoneSyncSendCommand and phoneSyncDisconnect are harmless no-ops", async () => {
+    const { ipc, invoke } = await load();
+    await expect(
+      ipc.phoneSyncSendCommand({ cmd: "cancel", session_id: "s1" }),
+    ).resolves.toBeUndefined();
+    await expect(ipc.phoneSyncDisconnect()).resolves.toBeUndefined();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("onPhoneSyncFrame yields an inert unlisten that never emits", async () => {
+    const { ipc } = await load();
+    const onFrame = vi.fn();
+    const off = await ipc.onPhoneSyncFrame(onFrame);
+    expect(typeof off).toBe("function");
+    off(); // must not throw
+    expect(onFrame).not.toHaveBeenCalled();
   });
 
   it("oauth mock signs into a Claude Max subscription and logout clears it", async () => {

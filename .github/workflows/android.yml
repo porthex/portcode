@@ -31,6 +31,10 @@ on:
       # catch the next blocker. Still non-blocking — it never gates these PRs.
       - "src-tauri/Cargo.toml"
       - "src-tauri/Cargo.lock"
+      # Rust source: during the active Android remote-client build, every src
+      # change can affect the cross-compile (new commands, cfg gating, deps used),
+      # so verify each one. Narrow this back once the mobile app is stable.
+      - "src-tauri/src/**"
 
 permissions:
   contents: read
