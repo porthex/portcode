@@ -103,6 +103,24 @@ const writePref = (k: string, v: boolean): void => {
   }
 };
 
+// String prefs (e.g. the remembered pairing payload — public connection info, not
+// a secret). Same best-effort localStorage discipline as the boolean prefs.
+const readStr = (k: string): string | null => {
+  try {
+    return localStorage.getItem(k);
+  } catch {
+    return null;
+  }
+};
+const writeStr = (k: string, v: string | null): void => {
+  try {
+    if (v === null) localStorage.removeItem(k);
+    else localStorage.setItem(k, v);
+  } catch {
+    /* storage disabled / over quota — ignore */
+  }
+};
+
 const uid = () =>
   typeof crypto !== "undefined" && crypto.randomUUID
     ? crypto.randomUUID()
@@ -148,7 +166,9 @@ export const useStore = create<AppState>((set, get) => ({
   remoteError: null,
   remoteUnlisten: null,
   remoteDropped: false,
-  lastPairingQr: null,
+  // Remembered across launches so the phone can reconnect without re-scanning the
+  // QR (Android frequently kills backgrounded apps). Public payload — no secret.
+  lastPairingQr: readStr("pc.lastPairingQr"),
 
   async init() {
     // Fetch settings, subscription status, and phone sync status together.
@@ -551,6 +571,8 @@ export const useStore = create<AppState>((set, get) => ({
       unlistenDrop = await ipc.onPhoneSyncDisconnected(() => {
         set({ remoteConnected: false, remoteVerified: false, remoteDropped: true });
       });
+      // Remember the desktop across launches (public payload — no secret).
+      writeStr("pc.lastPairingQr", qr);
       set({
         remoteConnected: true,
         // A pin-matched reconnect is pre-verified (the native pin check
@@ -621,6 +643,7 @@ export const useStore = create<AppState>((set, get) => ({
       lastPairingQr: null,
       remoteUnlisten: null,
     });
+    writeStr("pc.lastPairingQr", null); // forget the remembered desktop too
     if (unlisten) unlisten();
     await ipc.phoneSyncDisconnect();
   },

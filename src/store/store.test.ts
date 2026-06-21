@@ -1002,6 +1002,14 @@ describe("remote client", () => {
       expect(st.remoteConnected).toBe(false);
       expect(st.remoteError).toBe("listen failed");
     });
+
+    it("persists the remembered pairing across launches and forgets it on disconnect", async () => {
+      await useStore.getState().connectRemote("QR-PERSIST");
+      expect(localStorage.getItem("pc.lastPairingQr")).toBe("QR-PERSIST");
+
+      await useStore.getState().disconnectRemote();
+      expect(localStorage.getItem("pc.lastPairingQr")).toBeNull();
+    });
   });
 
   describe("disconnectRemote", () => {
