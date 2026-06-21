@@ -110,6 +110,9 @@ function TitleBar() {
   const showFiles = useStore((s) => s.showFiles);
   const toggleFiles = useStore((s) => s.toggleFiles);
   const setShowPalette = useStore((s) => s.setShowPalette);
+  // The file explorer browses the desktop's workspace (`list_dir` is desktop-only),
+  // so the phone hides the toggle.
+  const remoteMode = useStore((s) => s.remoteMode);
   return (
     <header className="flex h-[46px] shrink-0 items-center justify-between border-b border-border bg-panel/70 px-3.5 backdrop-blur-sm">
       <div className="flex min-w-0 items-center gap-2.5">
@@ -117,7 +120,7 @@ function TitleBar() {
           onClick={toggleFiles}
           aria-label="Toggle file explorer (Ctrl+B)"
           title="Toggle file explorer (Ctrl+B)"
-          className={`flex h-[30px] w-[30px] items-center justify-center rounded-[7px] border transition-colors ${
+          className={`${remoteMode ? "hidden " : ""}flex h-[30px] w-[30px] items-center justify-center rounded-[7px] border transition-colors ${
             showFiles
               ? "border-accent-2/30 bg-accent-2/10 text-accent-2"
               : "border-transparent text-muted hover:text-accent-2"

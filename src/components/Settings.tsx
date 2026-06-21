@@ -22,6 +22,10 @@ export function SettingsPanel() {
   const beginPairing = useStore((s) => s.beginPairing);
   const unpair = useStore((s) => s.unpair);
   const clearPairing = useStore((s) => s.clearPairing);
+  // On the phone (remote client) the agent — its model, key, sign-in, tool policy —
+  // and the desktop's "show a QR to pair" flow all live on the DESKTOP, so those
+  // sections are hidden here (several of their commands are desktop-only).
+  const remoteMode = useStore((s) => s.remoteMode);
 
   const [apiKey, setApiKey] = useState("");
   const [saving, setSaving] = useState(false);
@@ -113,7 +117,7 @@ export function SettingsPanel() {
         {/* BODY */}
         <div className="flex flex-col gap-6 p-5 max-h-[72vh] overflow-y-auto">
           {/* CONNECTION */}
-          <section>
+          <section className={remoteMode ? "hidden" : undefined}>
             <div className="pc-eyebrow">CONNECTION</div>
             <div className="flex flex-col gap-3.5">
               <div>
@@ -221,7 +225,7 @@ export function SettingsPanel() {
           </section>
 
           {/* PERMISSIONS */}
-          <section>
+          <section className={remoteMode ? "hidden" : undefined}>
             <div className="pc-eyebrow pc-eyebrow--amber">PERMISSIONS</div>
             <div className="flex gap-2">
               {(["allow", "ask", "deny"] as ToolPolicy[]).map((p) => (
@@ -269,7 +273,7 @@ export function SettingsPanel() {
           </section>
 
           {/* PHONE SYNC */}
-          <section>
+          <section className={remoteMode ? "hidden" : undefined}>
             <div className="pc-eyebrow">PHONE SYNC</div>
             <div className="flex flex-col gap-3.5">
               {phoneSync && (
