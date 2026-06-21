@@ -98,9 +98,23 @@ jobs:
           workspaces: src-tauri
 
       # The real cross-compile. A DEBUG apk needs no release keystore (signing is
-      # owner-only, a later phase). aarch64 alone keeps the probe fast — the Rust
-      # blockers are target-independent. `beforeBuildCommand` (pnpm build) runs the
-      # frontend first. Failure here is the EXPECTED signal until the platform
-      # split; the step log is the deliverable this job exists to produce.
-      - name: Android cross-compile (blocker probe)
+      # owner-only, a later phase). aarch64 alone keeps the build fast.
+      # `beforeBuildCommand` (pnpm build) runs the frontend first.
+      #
+      # As of the rustls switch (#37, dropping the openssl-sys native dep) this
+      # SUCCEEDS: the whole app cross-compiles for Android. The job stays
+      # non-blocking for now (it is not yet a required check); promote it once the
+      # owner confirms the mobile architecture (ANDROID_APP_PLAN §1/§4).
+      - name: Android cross-compile (debug apk)
         run: pnpm tauri android build --apk --debug --target aarch64
+
+      # Publish the debug APK so the owner can sideload a real build onto a phone
+      # (Settings → install unknown apps). Debug-signed only — not for the Play
+      # Store. The exact output path varies by Tauri/Gradle version, so glob it.
+      - name: Upload debug APK
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: portcode-android-debug-apk
+          path: src-tauri/gen/android/app/build/outputs/**/*.apk
+          if-no-files-found: warn
