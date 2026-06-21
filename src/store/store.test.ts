@@ -3,11 +3,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_SETTINGS,
   type Message,
+  type MessageRow,
   type PairedDevice,
   type PairingPayload,
   type PhoneSyncStatus,
+  type RemoteCommand,
   type Session,
   type StreamEvent,
+  type SyncFrame,
 } from "../types";
 import * as ipc from "../lib/ipc";
 import { useStore } from "./store";
@@ -32,6 +35,10 @@ vi.mock("../lib/ipc", () => ({
   phoneSyncStatus: vi.fn(),
   phoneSyncBeginPairing: vi.fn(),
   phoneSyncUnpair: vi.fn(),
+  phoneSyncConnect: vi.fn(),
+  phoneSyncSendCommand: vi.fn(),
+  phoneSyncDisconnect: vi.fn(),
+  onPhoneSyncFrame: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -76,6 +83,10 @@ beforeEach(() => {
     nonce: "NONCE==",
   });
   m.phoneSyncUnpair.mockResolvedValue(undefined);
+  m.phoneSyncConnect.mockResolvedValue({ sas: "SAS-1", peerPublicKey: "PEER==" });
+  m.phoneSyncSendCommand.mockResolvedValue(undefined);
+  m.phoneSyncDisconnect.mockResolvedValue(undefined);
+  m.onPhoneSyncFrame.mockResolvedValue(() => {});
 });
 
 describe("init", () => {
@@ -559,5 +570,301 @@ describe("phone sync", () => {
     expect(m.phoneSyncUnpair).toHaveBeenCalledWith("PHONE==");
     expect(m.phoneSyncStatus).toHaveBeenCalledTimes(1);
     expect(useStore.getState().phoneSync).toEqual(refreshed);
+  });
+});
+
+describe("remote client", () => {
+  const row = (over: Partial<MessageRow> = {}): MessageRow => ({
+    id: "r1",
+    sessionId: "s1",
+    seq: 1,
+    role: "user",
+    content: [{ kind: "text", text: "hi" }],
+    createdAt: 7,
+    ...over,
+  });
+
+  // Seed a live assistant message so the per-event reducer has a "last" message
+  // to fold into (the dual of send pre-creating the assistant message).
+  const seedTurn = (sid = "s1", id = "a1") => {
+    useStore.getState().applyFrame({
+      t: "live",
+      session_id: sid,
+      event: { type: "turn_start", messageId: id },
+    });
+  };
+
+  describe("applyFrame", () => {
+    it("session_list replaces sessions and seeds activeId when none is set", () => {
+      const s1 = session({ id: "a" });
+      const s2 = session({ id: "b" });
+
+      useStore.getState().applyFrame({ t: "session_list", sessions: [s1, s2] });
+
+      const st = useStore.getState();
+      expect(st.sessions).toEqual([s1, s2]);
+      expect(st.activeId).toBe("a");
+    });
+
+    it("session_list keeps a still-present activeId", () => {
+      useStore.setState({ activeId: "b" });
+
+      useStore
+        .getState()
+        .applyFrame({ t: "session_list", sessions: [session({ id: "a" }), session({ id: "b" })] });
+
+      expect(useStore.getState().activeId).toBe("b");
+    });
+
+    it("session_list re-points activeId to the first session when the active one vanished", () => {
+      useStore.setState({ activeId: "gone" });
+
+      useStore.getState().applyFrame({ t: "session_list", sessions: [session({ id: "a" })] });
+
+      expect(useStore.getState().activeId).toBe("a");
+    });
+
+    it("session_list re-points activeId to null when the list is empty", () => {
+      useStore.setState({ activeId: "gone" });
+
+      useStore.getState().applyFrame({ t: "session_list", sessions: [] });
+
+      const st = useStore.getState();
+      expect(st.sessions).toEqual([]);
+      expect(st.activeId).toBeNull();
+    });
+
+    it("message_delta converts rows and replaces the session's message list", () => {
+      useStore.setState({
+        messages: { s1: [{ id: "stale", role: "user", blocks: [], createdAt: 1 }] },
+      });
+
+      useStore.getState().applyFrame({
+        t: "message_delta",
+        session_id: "s1",
+        messages: [row({ id: "r1", role: "assistant", content: [{ kind: "text", text: "ok" }] })],
+      });
+
+      const msgs = useStore.getState().messages.s1;
+      expect(msgs).toEqual([
+        { id: "r1", role: "assistant", blocks: [{ kind: "text", text: "ok" }], createdAt: 7 },
+      ]);
+    });
+
+    it("message_delta seeds activeId when none is set", () => {
+      useStore.setState({ activeId: null });
+
+      useStore.getState().applyFrame({ t: "message_delta", session_id: "s1", messages: [] });
+
+      expect(useStore.getState().activeId).toBe("s1");
+    });
+
+    it("ignores command / ack / hello frames", () => {
+      const before = useStore.getState();
+
+      useStore
+        .getState()
+        .applyFrame({ t: "command", command: { cmd: "cancel", session_id: "s1" } });
+      useStore.getState().applyFrame({ t: "ack", session_id: "s1", seq: 3 });
+      useStore.getState().applyFrame({ t: "hello", device_id: "d1", cursors: [] });
+
+      const after = useStore.getState();
+      expect(after.sessions).toBe(before.sessions);
+      expect(after.messages).toBe(before.messages);
+      expect(after.activeId).toBe(before.activeId);
+    });
+  });
+
+  describe("live stream reducer", () => {
+    it("turn_start pushes an empty assistant message and starts streaming", () => {
+      seedTurn("s1", "a1");
+
+      const st = useStore.getState();
+      expect(st.streaming).toBe(true);
+      expect(st.messages.s1).toEqual([
+        { id: "a1", role: "assistant", blocks: [], createdAt: expect.any(Number) },
+      ]);
+    });
+
+    it("text_delta / tool_use / tool_result fold into the last message", () => {
+      seedTurn("s1", "a1");
+
+      const live = (event: StreamEvent) =>
+        useStore.getState().applyFrame({ t: "live", session_id: "s1", event });
+
+      live({ type: "text_delta", text: "Hello " });
+      live({ type: "text_delta", text: "world" });
+      live({ type: "tool_use", id: "t1", name: "fs_read", input: { path: "x" } });
+      live({ type: "tool_result", id: "t1", output: "ok", isError: false });
+
+      const blocks = useStore.getState().messages.s1[0].blocks;
+      expect(blocks).toEqual([
+        { kind: "text", text: "Hello world" },
+        { kind: "tool_use", id: "t1", name: "fs_read", input: { path: "x" } },
+        { kind: "tool_result", toolUseId: "t1", output: "ok", isError: false },
+      ]);
+    });
+
+    it("a stray delta before any turn_start is a no-op (empty-session guard)", () => {
+      useStore.getState().applyFrame({
+        t: "live",
+        session_id: "s1",
+        event: { type: "text_delta", text: "lost" },
+      });
+
+      expect(useStore.getState().messages.s1).toBeUndefined();
+    });
+
+    it("permission_request surfaces a pending prompt", () => {
+      useStore.getState().applyFrame({
+        t: "live",
+        session_id: "s1",
+        event: { type: "permission_request", id: "p1", tool: "fs_edit", summary: "x", input: {} },
+      });
+
+      expect(useStore.getState().pendingPermission).toEqual({
+        id: "p1",
+        tool: "fs_edit",
+        summary: "x",
+        input: {},
+      });
+    });
+
+    it("usage accumulates per session across frames", () => {
+      const live = (event: StreamEvent) =>
+        useStore.getState().applyFrame({ t: "live", session_id: "s1", event });
+
+      live({ type: "usage", inputTokens: 100, outputTokens: 40 });
+      live({ type: "usage", inputTokens: 10, outputTokens: 5 });
+
+      expect(useStore.getState().usage.s1).toEqual({ input: 110, output: 45 });
+    });
+
+    it("turn_end clears streaming and any pending prompt", () => {
+      useStore.setState({
+        streaming: true,
+        pendingPermission: { id: "p", tool: "t", summary: "s", input: {} },
+      });
+
+      useStore.getState().applyFrame({
+        t: "live",
+        session_id: "s1",
+        event: { type: "turn_end", stopReason: "end_turn" },
+      });
+
+      const st = useStore.getState();
+      expect(st.streaming).toBe(false);
+      expect(st.pendingPermission).toBeNull();
+    });
+
+    it("error appends an inline error to the last message and stops streaming", () => {
+      seedTurn("s1", "a1");
+      useStore.setState({ streaming: true });
+
+      useStore.getState().applyFrame({
+        t: "live",
+        session_id: "s1",
+        event: { type: "error", message: "boom" },
+      });
+
+      const st = useStore.getState();
+      expect(st.streaming).toBe(false);
+      const text = st.messages.s1[0].blocks.map((b) => (b.kind === "text" ? b.text : "")).join("");
+      expect(text).toContain("Error");
+      expect(text).toContain("boom");
+    });
+  });
+
+  describe("connectRemote", () => {
+    it("connects, stores the SAS, and routes frames through applyFrame", async () => {
+      let cb!: (frame: SyncFrame) => void;
+      m.onPhoneSyncFrame.mockImplementation(async (fn) => {
+        cb = fn;
+        return () => {};
+      });
+
+      await useStore.getState().connectRemote("QR-PAYLOAD");
+
+      const st = useStore.getState();
+      expect(m.phoneSyncConnect).toHaveBeenCalledWith("QR-PAYLOAD");
+      expect(st.remoteConnected).toBe(true);
+      expect(st.remoteSas).toBe("SAS-1");
+      expect(st.remoteError).toBeNull();
+
+      // The captured callback must drive applyFrame.
+      cb({ t: "session_list", sessions: [session({ id: "x" })] });
+      expect(useStore.getState().sessions.map((s) => s.id)).toEqual(["x"]);
+    });
+
+    it("tears down a prior subscription before reconnecting", async () => {
+      const prev = vi.fn();
+      useStore.setState({ remoteUnlisten: prev });
+
+      await useStore.getState().connectRemote("QR");
+
+      expect(prev).toHaveBeenCalledTimes(1);
+      expect(useStore.getState().remoteConnected).toBe(true);
+    });
+
+    it("records the error and stays disconnected when the dial fails", async () => {
+      m.phoneSyncConnect.mockRejectedValue(new Error("dial failed"));
+
+      await useStore.getState().connectRemote("QR");
+
+      const st = useStore.getState();
+      expect(st.remoteConnected).toBe(false);
+      expect(st.remoteSas).toBeNull();
+      expect(st.remoteUnlisten).toBeNull();
+      expect(st.remoteError).toBe("dial failed");
+      expect(m.onPhoneSyncFrame).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("sendRemoteCommand", () => {
+    it("optimistically appends the user message for a run command and forwards it", async () => {
+      const command: RemoteCommand = { cmd: "run", session_id: "s1", text: "do it" };
+
+      await useStore.getState().sendRemoteCommand(command);
+
+      const msgs = useStore.getState().messages.s1;
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0].role).toBe("user");
+      expect(msgs[0].blocks).toEqual([{ kind: "text", text: "do it" }]);
+      expect(m.phoneSyncSendCommand).toHaveBeenCalledWith(command);
+    });
+
+    it("does not echo a non-run command but still forwards it", async () => {
+      const command: RemoteCommand = { cmd: "cancel", session_id: "s1" };
+
+      await useStore.getState().sendRemoteCommand(command);
+
+      expect(useStore.getState().messages.s1).toBeUndefined();
+      expect(m.phoneSyncSendCommand).toHaveBeenCalledWith(command);
+    });
+  });
+
+  describe("disconnectRemote", () => {
+    it("tears down the subscription and resets connection flags", async () => {
+      const unlisten = vi.fn();
+      useStore.setState({ remoteConnected: true, remoteSas: "SAS-1", remoteUnlisten: unlisten });
+
+      await useStore.getState().disconnectRemote();
+
+      expect(unlisten).toHaveBeenCalledTimes(1);
+      expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(1);
+      const st = useStore.getState();
+      expect(st.remoteConnected).toBe(false);
+      expect(st.remoteSas).toBeNull();
+      expect(st.remoteUnlisten).toBeNull();
+    });
+
+    it("still disconnects when there is no stored subscription", async () => {
+      useStore.setState({ remoteUnlisten: null });
+
+      await useStore.getState().disconnectRemote();
+
+      expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(1);
+      expect(useStore.getState().remoteConnected).toBe(false);
+    });
   });
 });
