@@ -479,8 +479,8 @@ mod tests {
     #[test]
     fn create_and_list_sessions_orders_by_updated_at_desc() {
         let db = mem_db();
-        db.create_session("a", "Alpha", None, 100).unwrap();
-        db.create_session("b", "Beta", Some("C:/ws"), 200).unwrap();
+        db.create_session("a", "Alpha", None, None, 100).unwrap();
+        db.create_session("b", "Beta", Some("C:/ws"), None, 200).unwrap();
         let rows = db.list_sessions().unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, "b"); // newer updated_at first
@@ -491,7 +491,7 @@ mod tests {
     #[test]
     fn rename_touch_and_set_title_if_blank_behave() {
         let db = mem_db();
-        db.create_session("a", "New chat", None, 100).unwrap();
+        db.create_session("a", "New chat", None, None, 100).unwrap();
 
         db.rename_session("a", "Renamed").unwrap();
         assert_eq!(db.list_sessions().unwrap()[0].title, "Renamed");
@@ -503,7 +503,7 @@ mod tests {
         db.set_title_if_blank("a", "should not apply");
         assert_eq!(db.list_sessions().unwrap()[0].title, "Renamed");
 
-        db.create_session("b", "New chat", None, 50).unwrap();
+        db.create_session("b", "New chat", None, None, 50).unwrap();
         db.set_title_if_blank("b", "Derived");
         let b = db
             .list_sessions()
@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn delete_session_removes_it_and_its_messages() {
         let db = mem_db();
-        db.create_session("a", "A", None, 1).unwrap();
+        db.create_session("a", "A", None, None, 1).unwrap();
         db.append_message("a", &text("hi"), 2);
         db.delete_session("a").unwrap();
         assert!(db.list_sessions().unwrap().is_empty());
@@ -527,7 +527,7 @@ mod tests {
     #[test]
     fn append_and_load_chat_messages_round_trips_in_seq_order() {
         let db = mem_db();
-        db.create_session("a", "A", None, 1).unwrap();
+        db.create_session("a", "A", None, None, 1).unwrap();
         db.append_message("a", &text("one"), 2);
         db.append_message(
             "a",
@@ -547,7 +547,7 @@ mod tests {
     #[test]
     fn ui_messages_folds_tool_results_under_the_requesting_assistant() {
         let db = mem_db();
-        db.create_session("a", "A", None, 1).unwrap();
+        db.create_session("a", "A", None, None, 1).unwrap();
         db.append_message("a", &text("do it"), 2);
         db.append_message(
             "a",
@@ -593,7 +593,7 @@ mod tests {
     #[test]
     fn messages_since_minus_one_returns_all_rows() {
         let db = mem_db();
-        db.create_session("s", "S", None, 1).unwrap();
+        db.create_session("s", "S", None, None, 1).unwrap();
         db.append_message("s", &text("first"), 2);
         db.append_message("s", &assistant("second"), 3);
         db.append_message("s", &text("third"), 4);
@@ -607,7 +607,7 @@ mod tests {
     #[test]
     fn messages_since_returns_only_rows_strictly_after_the_cursor() {
         let db = mem_db();
-        db.create_session("s", "S", None, 1).unwrap();
+        db.create_session("s", "S", None, None, 1).unwrap();
         db.append_message("s", &text("msg0"), 2);
         db.append_message("s", &text("msg1"), 3);
         db.append_message("s", &text("msg2"), 4);
@@ -621,7 +621,7 @@ mod tests {
     #[test]
     fn messages_since_highest_seq_returns_empty() {
         let db = mem_db();
-        db.create_session("s", "S", None, 1).unwrap();
+        db.create_session("s", "S", None, None, 1).unwrap();
         db.append_message("s", &text("only"), 2);
 
         // 0 is the only/highest seq, so an up-to-date phone gets nothing back.
@@ -631,7 +631,7 @@ mod tests {
     #[test]
     fn messages_since_returns_rows_in_ascending_seq_order() {
         let db = mem_db();
-        db.create_session("s", "S", None, 1).unwrap();
+        db.create_session("s", "S", None, None, 1).unwrap();
         db.append_message("s", &text("a"), 2);
         db.append_message("s", &assistant("b"), 3);
         db.append_message("s", &text("c"), 4);
@@ -643,8 +643,8 @@ mod tests {
     #[test]
     fn messages_since_is_isolated_between_sessions() {
         let db = mem_db();
-        db.create_session("a", "A", None, 1).unwrap();
-        db.create_session("b", "B", None, 1).unwrap();
+        db.create_session("a", "A", None, None, 1).unwrap();
+        db.create_session("b", "B", None, None, 1).unwrap();
         db.append_message("a", &text("in a"), 2);
         db.append_message("b", &text("in b"), 3);
 
@@ -665,7 +665,7 @@ mod tests {
         // Protects the SyncFrame::MessageDelta payload: content stored by
         // append_message must re-read as the same Block variant.
         let db = mem_db();
-        db.create_session("s", "S", None, 1).unwrap();
+        db.create_session("s", "S", None, None, 1).unwrap();
         db.append_message("s", &assistant("hello phone"), 2);
 
         let rows = db.messages_since("s", -1);
