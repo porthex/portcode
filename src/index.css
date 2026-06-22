@@ -687,7 +687,11 @@ textarea:focus-visible {
    MESSAGE BUBBLES
    ========================================================================= */
 .pc-bubble-user {
-  max-width: 82%;
+  /* The 82% cap lives on the wrapper (see Message.tsx) so it resolves against the
+     conversation width. A `max-width: %` here would resolve against the shrink-to-
+     fit flex wrapper instead, capping the bubble far too narrow and wrapping short
+     messages onto two cramped lines. The bubble hugs its content up to that wrapper. */
+  max-width: 100%;
   padding: 11px 15px;
   border-radius: 14px 14px 4px 14px;
   background: rgba(255, 46, 126, 0.1);
