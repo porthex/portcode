@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "../store/store";
 import { MODELS } from "../types";
 
@@ -50,6 +50,30 @@ export function CommandPalette() {
     return commands.filter((c) => c.label.toLowerCase().includes(q));
   }, [commands, query]);
 
+  const selRef = useRef<HTMLButtonElement>(null);
+
+  // Escape closes the palette no matter where focus is — once focus leaves the
+  // input (e.g. after hovering a row), the input's own keydown wouldn't fire.
+  // Active only while the palette is open.
+  useEffect(() => {
+    if (!show) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setShow(false);
+        setQuery("");
+        setSel(0);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [show, setShow]);
+
+  // Keep the keyboard-selected row visible when arrowing past the scroll edge.
+  useEffect(() => {
+    selRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [sel]);
+
   if (!show) return null;
 
   const close = () => {
@@ -78,10 +102,9 @@ export function CommandPalette() {
     } else if (e.key === "Enter") {
       e.preventDefault();
       choose(sel);
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      close();
     }
+    // Escape is handled at the window level (effect above) so it closes the palette
+    // even when focus has moved off the input.
   };
 
   return (
@@ -113,6 +136,7 @@ export function CommandPalette() {
             filtered.map((c, i) => (
               <button
                 key={c.id}
+                ref={i === sel ? selRef : null}
                 aria-label={c.hint ? `${c.label}, ${c.hint}` : c.label}
                 aria-selected={i === sel}
                 onMouseEnter={() => setSel(i)}

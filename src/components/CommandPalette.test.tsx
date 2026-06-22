@@ -312,6 +312,17 @@ describe("closing", () => {
     expect(useStore.getState().showPalette).toBe(false);
   });
 
+  it("Escape closes the palette even when focus has left the input", () => {
+    open();
+    render(<CommandPalette />);
+
+    // Focus may sit on a row (after hovering/clicking) rather than the input; the
+    // input's own keydown wouldn't fire, so a window-level handler must catch Escape.
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    expect(useStore.getState().showPalette).toBe(false);
+  });
+
   it("ignores unrelated keys", () => {
     open();
     render(<CommandPalette />);
