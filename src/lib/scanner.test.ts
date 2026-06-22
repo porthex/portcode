@@ -72,7 +72,10 @@ describe("scanQrPayload", () => {
   it("returns the trimmed scanned payload on success", async () => {
     mPlugin.scan.mockResolvedValue(scanResult("  PAYLOAD  "));
     expect(await scanQrPayload()).toEqual({ ok: true, value: "PAYLOAD" });
-    expect(mPlugin.scan).toHaveBeenCalledWith({ windowed: false, formats: ["QR_CODE"] });
+    // `windowed: true` keeps the camera behind a transparented webview so our own
+    // overlay (incl. Cancel) stays on top — `false` would full-screen the native
+    // camera and bury the overlay. See lib/scanner for the rationale.
+    expect(mPlugin.scan).toHaveBeenCalledWith({ windowed: true, formats: ["QR_CODE"] });
   });
 
   it("prompts for camera permission when not yet granted, then scans", async () => {
