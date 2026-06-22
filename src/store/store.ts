@@ -35,6 +35,7 @@ interface AppState {
   showPalette: boolean;
   ambientRain: boolean; // decorative neon-rain backdrop (off by default)
   scanlines: boolean; // CRT scanline overlay (off by default)
+  crashReporting: boolean | null; // opt-in crash/error reporting; null = not yet asked (show first-run prompt)
   draft: string;
   cancel: (() => Promise<void>) | null;
   pendingPermission: PendingPermission | null;
@@ -65,6 +66,7 @@ interface AppState {
   setShowPalette: (v: boolean) => void;
   setAmbientRain: (v: boolean) => void;
   setScanlines: (v: boolean) => void;
+  setCrashReporting: (v: boolean) => void;
   updateSettings: (s: Partial<Settings>) => Promise<void>;
   refreshOAuthStatus: () => Promise<void>;
   loginWithClaude: () => Promise<void>;
@@ -107,6 +109,18 @@ const writePref = (k: string, v: boolean): void => {
     localStorage.setItem(k, v ? "1" : "0");
   } catch {
     /* storage disabled / over quota — ignore */
+  }
+};
+
+// Tri-state pref: null when never set (e.g. crash-reporting consent not yet
+// asked), otherwise the stored boolean. Lets a first-run prompt distinguish
+// "declined" from "not yet decided".
+const readTriPref = (k: string): boolean | null => {
+  try {
+    const v = localStorage.getItem(k);
+    return v === null ? null : v === "1";
+  } catch {
+    return null;
   }
 };
 
@@ -161,6 +175,7 @@ export const useStore = create<AppState>((set, get) => ({
   showPalette: false,
   ambientRain: readPref("pc.ambientRain"),
   scanlines: readPref("pc.scanlines"),
+  crashReporting: readTriPref("pc.crashReporting"),
   draft: "",
   cancel: null,
   pendingPermission: null,
@@ -489,6 +504,14 @@ export const useStore = create<AppState>((set, get) => ({
   setScanlines(v) {
     writePref("pc.scanlines", v);
     set({ scanlines: v });
+  },
+
+  // Persist the consent choice; the actual SDK init/shutdown is driven by an
+  // effect in App watching `crashReporting`, so the store stays free of any
+  // telemetry-SDK import (keeps it pure + its tests lightweight).
+  setCrashReporting(v) {
+    writePref("pc.crashReporting", v);
+    set({ crashReporting: v });
   },
 
   toggleFiles() {

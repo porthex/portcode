@@ -17,6 +17,8 @@ export function SettingsPanel() {
   const scanlines = useStore((s) => s.scanlines);
   const setAmbientRain = useStore((s) => s.setAmbientRain);
   const setScanlines = useStore((s) => s.setScanlines);
+  const crashReporting = useStore((s) => s.crashReporting);
+  const setCrashReporting = useStore((s) => s.setCrashReporting);
 
   const phoneSync = useStore((s) => s.phoneSync);
   const pairingPayload = useStore((s) => s.pairingPayload);
@@ -269,6 +271,19 @@ export function SettingsPanel() {
                 hint="CRT-style scanline overlay and vignette."
                 on={scanlines}
                 onToggle={() => setScanlines(!scanlines)}
+              />
+            </div>
+          </section>
+
+          {/* PRIVACY */}
+          <section>
+            <div className="pc-eyebrow pc-eyebrow--violet">PRIVACY</div>
+            <div>
+              <ToggleRow
+                label="Crash & performance reports"
+                hint="Send anonymous, scrubbed crash + basic performance reports — never your prompts, code, files, or keys. Off by default."
+                on={crashReporting === true}
+                onToggle={() => setCrashReporting(crashReporting !== true)}
               />
             </div>
           </section>
