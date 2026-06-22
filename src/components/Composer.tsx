@@ -8,6 +8,7 @@ export function Composer() {
   const streaming = useStore((s) => s.streaming);
   const send = useStore((s) => s.send);
   const stop = useStore((s) => s.stop);
+  const remoteMode = useStore((s) => s.remoteMode);
   const ref = useRef<HTMLTextAreaElement>(null);
 
   // Keep the textarea height in sync when the draft changes externally
@@ -18,6 +19,16 @@ export function Composer() {
     el.style.height = "auto";
     el.style.height = Math.min(el.scrollHeight, 220) + "px";
   }, [text]);
+
+  // Return focus to the composer when a turn finishes — the textarea blurs when it
+  // goes disabled at turn start, which otherwise breaks the keyboard flow (you'd have
+  // to click back in). Only when nothing else grabbed focus (a permission button, the
+  // palette, another input), and never on mobile/remote where it would pop the keyboard.
+  useEffect(() => {
+    if (streaming || remoteMode) return;
+    const el = ref.current;
+    if (el && !el.disabled && document.activeElement === document.body) el.focus();
+  }, [streaming, remoteMode]);
 
   const submit = async () => {
     const t = text;
@@ -43,7 +54,7 @@ export function Composer() {
 
   return (
     <div className="border-t border-border bg-panel/80 px-6 pb-3 pt-3.5">
-      <div className="pc-neon-frame mx-auto w-full max-w-[760px]">
+      <div className="pc-neon-frame w-full max-w-none">
         <div className="flex items-end gap-2.5 rounded-[12px] bg-panel px-3 py-2.5">
           <textarea
             ref={ref}
@@ -88,7 +99,7 @@ export function Composer() {
           )}
         </div>
       </div>
-      <div className="mx-auto mt-[7px] flex w-full max-w-[760px] items-center justify-between font-mono text-[10.5px] text-faint">
+      <div className="mt-[7px] flex w-full max-w-none items-center justify-between font-mono text-[10.5px] text-faint">
         <span>
           <span className="text-muted">ENTER</span> send ·{" "}
           <span className="text-muted">SHIFT+ENTER</span> newline

@@ -96,25 +96,34 @@ describe("StatusDot", () => {
 });
 
 describe("collapse / expand toggle", () => {
-  it("hides the body and shows the ▸ caret when collapsed", () => {
+  it("keeps the body mounted but collapsed + hidden, with the ▸ caret, when not expanded", () => {
     render(<ToolCall name="t" input={{ path: "a.ts" }} result={result()} />);
     expect(screen.getByText("▸")).toBeInTheDocument();
-    expect(screen.queryByText("Input")).not.toBeInTheDocument();
+    expect(screen.getByRole("button")).toHaveAttribute("aria-expanded", "false");
+    // The body stays mounted so it can animate open/closed, but is hidden from
+    // assistive tech (and visually clipped by the grid 0fr accordion) while collapsed.
+    expect(screen.getByText("Input").closest("[aria-hidden]")).toHaveAttribute(
+      "aria-hidden",
+      "true",
+    );
   });
 
-  it("reveals the JSON input and ▾ caret when expanded, and hides again on a second click", () => {
+  it("reveals the input + ▾ caret when expanded, and re-collapses on a second click", () => {
     render(<ToolCall name="t" input={{ path: "a.ts" }} result={result()} />);
     const toggle = screen.getByRole("button");
+    const body = () => screen.getByText("Input").closest("[aria-hidden]");
 
     fireEvent.click(toggle);
     expect(screen.getByText("▾")).toBeInTheDocument();
-    expect(screen.getByText("Input")).toBeInTheDocument();
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(body()).toHaveAttribute("aria-hidden", "false");
     // input serialized as pretty JSON
     expect(screen.getByText(/"path": "a\.ts"/)).toBeInTheDocument();
 
     fireEvent.click(toggle);
     expect(screen.getByText("▸")).toBeInTheDocument();
-    expect(screen.queryByText("Input")).not.toBeInTheDocument();
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(body()).toHaveAttribute("aria-hidden", "true");
   });
 
   it("exposes aria-expanded/aria-label that flip false→true for screen readers", () => {

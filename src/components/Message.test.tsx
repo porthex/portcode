@@ -214,7 +214,7 @@ describe("MessageView — typing animation", () => {
     vi.unstubAllGlobals();
   });
 
-  it("types the in-flight assistant turn in monospace with a blinking caret", () => {
+  it("renders the in-flight assistant turn in the body typography with a blinking caret", () => {
     const { container } = render(
       <MessageView
         message={message("assistant", [{ kind: "text", text: "**bold** text" }])}
@@ -222,9 +222,10 @@ describe("MessageView — typing animation", () => {
       />,
     );
 
-    // The active turn shows the mono typing view + caret, not formatted markdown.
+    // The active turn shows the decode view in the SAME .prose-pc body typography as
+    // the settled markdown (so it resolves in place) + a caret, not formatted markdown.
     expect(container.querySelector(".pc-caret")).not.toBeNull();
-    expect(container.querySelector(".font-mono")).not.toBeNull();
+    expect(container.querySelector(".prose-pc")).not.toBeNull();
     expect(container.querySelector("strong")).toBeNull();
   });
 
@@ -284,10 +285,11 @@ describe("MessageView — scramble decode (active turn)", () => {
     prime();
     step(1);
 
-    // The decoding tail is wrapped in .pc-scramble (the accent glow); the turn is
-    // monospace with a caret and is NOT yet rendered as Markdown.
+    // The decoding tail is wrapped in .pc-scramble (the accent glow), in the same
+    // .prose-pc body typography as settled markdown, with a caret, and is NOT yet
+    // rendered as Markdown.
     expect(container.querySelector(".pc-scramble")).not.toBeNull();
-    expect(container.querySelector(".font-mono")).not.toBeNull();
+    expect(container.querySelector(".prose-pc")).not.toBeNull();
     expect(container.querySelector(".pc-caret")).not.toBeNull();
     expect(container.querySelector("strong")).toBeNull();
   });

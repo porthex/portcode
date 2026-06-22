@@ -19,7 +19,7 @@ export function PermissionPrompt() {
 
   return (
     <div className="pc-gate px-6 py-3.5">
-      <div className="mx-auto flex max-w-[760px] flex-col gap-[11px]">
+      <div className="flex flex-col gap-[11px]">
         <div className="flex items-center gap-[9px] text-[13px] text-fg">
           <span className="pc-gate__icon">!</span>
           <span>

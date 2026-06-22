@@ -1,3 +1,4 @@
+import { memo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -6,7 +7,10 @@ import { useStore } from "../store/store";
 import { usePrefersReducedMotion, useScramble } from "../lib/useScramble";
 import { ToolCall } from "./ToolCall";
 
-export function MessageView({
+// Memoised: while a turn streams, only the active assistant message's props change,
+// so history rows (incl. their markdown + syntax highlighting) don't re-render on
+// every delta — which kept the whole transcript re-highlighting ~45x/sec.
+export const MessageView = memo(function MessageView({
   message,
   isActive = false,
 }: {
@@ -66,7 +70,7 @@ export function MessageView({
       </div>
     </div>
   );
-}
+});
 
 /**
  * A single assistant text block. While its turn is streaming it reveals one WORD
@@ -99,11 +103,16 @@ function ScrambleText({ text, caret }: { text: string; caret: boolean }) {
   const { display, scrambleStart } = useScramble(text, true);
   const settled = display.slice(0, scrambleStart);
   const decoding = display.slice(scrambleStart);
+  // Render the decode in the SAME typography as the settled markdown body (.prose-pc,
+  // a <p>) so that when the turn finishes and ReactMarkdown takes over, the text
+  // resolves in place — no font/size/line-height swap reflowing the whole reply.
   return (
-    <div className="prose-pc whitespace-pre-wrap break-words font-mono text-[13px]">
-      {settled}
-      {decoding && <span className="pc-scramble">{decoding}</span>}
-      {caret && <span className="pc-caret" aria-hidden="true" />}
+    <div className="prose-pc">
+      <p className="whitespace-pre-wrap break-words">
+        {settled}
+        {decoding && <span className="pc-scramble">{decoding}</span>}
+        {caret && <span className="pc-caret" aria-hidden="true" />}
+      </p>
     </div>
   );
 }

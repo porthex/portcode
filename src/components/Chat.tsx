@@ -15,22 +15,46 @@ export function Chat() {
   const streaming = useStore((s) => s.streaming);
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  // Whether the viewport is pinned to the bottom. We only auto-follow new content
+  // while the user is already at the bottom — otherwise scrolling up to read history
+  // (especially mid-stream, when the decode grows the transcript ~45x/sec) would
+  // yank the view back down on every frame and wrestle scroll away from the user.
+  const stuckToBottom = useRef(true);
+
+  // Track whether the user is near the bottom; a programmatic scroll keeps it true.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      stuckToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+
+  // A freshly-selected session starts pinned to its latest message.
+  useEffect(() => {
+    stuckToBottom.current = true;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [activeId]);
 
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el && stuckToBottom.current) el.scrollTop = el.scrollHeight;
   }, [messages, streaming]);
 
-  // The typewriter reveal grows the transcript height between store updates, so
-  // follow it to the bottom while a turn streams in. (ResizeObserver is absent in
-  // jsdom — guard so tests don't choke.)
+  // The decode reveal grows the transcript height between store updates, so follow
+  // it to the bottom while a turn streams — but only while the user is still pinned
+  // to the bottom (never fight a user who scrolled up). ResizeObserver is absent in
+  // jsdom — guard so tests don't choke.
   useEffect(() => {
     if (!streaming) return;
     const el = scrollRef.current;
     const content = contentRef.current;
     if (!el || !content || typeof ResizeObserver === "undefined") return;
     const ro = new ResizeObserver(() => {
-      el.scrollTop = el.scrollHeight;
+      if (stuckToBottom.current) el.scrollTop = el.scrollHeight;
     });
     ro.observe(content);
     return () => ro.disconnect();
@@ -41,7 +65,7 @@ export function Chat() {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
-        <div ref={contentRef} className="mx-auto w-full max-w-3xl px-5 py-6">
+        <div ref={contentRef} className="w-full max-w-none px-6 py-6">
           {messages.length === 0 ? (
             <EmptyState />
           ) : (
