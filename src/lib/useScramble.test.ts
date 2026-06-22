@@ -145,6 +145,18 @@ describe("useScramble", () => {
     expect(result.current.display).toBe("Hi");
     expect(result.current.scrambleStart).toBe(2);
   });
+
+  it("snaps to the final text after a long pause instead of grinding catch-up frames", () => {
+    // A backgrounded tab pauses rAF, then resumes with a huge timestamp jump. Without
+    // the snap, the one tick would grind tens of thousands of catch-up frames and
+    // freeze the UI. Instead it jumps straight to the finished text.
+    const text = "aa bb cc dd ee ff gg hh ii jj ";
+    const { result } = renderHook(() => useScramble(text, true));
+    prime();
+    tick(T0 + 10 * 60 * 1000); // ~10 minutes later
+    expect(result.current.display).toBe(text);
+    expect(result.current.scrambleStart).toBe(text.length);
+  });
 });
 
 describe("usePrefersReducedMotion", () => {
