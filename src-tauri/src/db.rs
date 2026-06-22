@@ -480,7 +480,8 @@ mod tests {
     fn create_and_list_sessions_orders_by_updated_at_desc() {
         let db = mem_db();
         db.create_session("a", "Alpha", None, None, 100).unwrap();
-        db.create_session("b", "Beta", Some("C:/ws"), None, 200).unwrap();
+        db.create_session("b", "Beta", Some("C:/ws"), None, 200)
+            .unwrap();
         let rows = db.list_sessions().unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, "b"); // newer updated_at first
