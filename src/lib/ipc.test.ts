@@ -242,6 +242,20 @@ describe("Tauri command serialization", () => {
     expect(invoke).toHaveBeenCalledWith("cancel_agent", { sessionId: "sess-1" });
     expect(unlisten).toHaveBeenCalledTimes(1);
   });
+
+  it("run_agent's dispose() stops listening WITHOUT cancelling the run", async () => {
+    const { ipc, invoke, listen } = await load();
+    const unlisten = vi.fn();
+    listen.mockImplementation(async () => unlisten);
+    invoke.mockResolvedValue(undefined);
+
+    const handle = await ipc.runAgent("sess-2", "hi", vi.fn());
+    handle.dispose();
+
+    // A normal turn end just stops listening — it must NOT fire cancel_agent.
+    expect(unlisten).toHaveBeenCalledTimes(1);
+    expect(invoke).not.toHaveBeenCalledWith("cancel_agent", { sessionId: "sess-2" });
+  });
 });
 
 describe("browser fallback (no Tauri core)", () => {

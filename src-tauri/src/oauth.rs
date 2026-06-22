@@ -162,13 +162,19 @@ async fn post_tokens(
     body: &serde_json::Value,
     fallback_refresh: Option<&str>,
 ) -> Result<OAuthTokens, String> {
-    let resp = http
-        .post(TOKEN_URL)
-        .header("content-type", "application/json")
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| format!("Token request failed: {e}"))?;
+    // Bound the whole token request: a stalled token endpoint here would hang a turn
+    // BEFORE the stream starts (a refresh runs first), showing "thinking" with zero
+    // output and no terminal event. Fail fast so it surfaces as a normal error.
+    let resp = tokio::time::timeout(
+        Duration::from_secs(30),
+        http.post(TOKEN_URL)
+            .header("content-type", "application/json")
+            .json(body)
+            .send(),
+    )
+    .await
+    .map_err(|_| "Token request timed out.".to_string())?
+    .map_err(|e| format!("Token request failed: {e}"))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
