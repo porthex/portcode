@@ -488,6 +488,16 @@ describe("draft + UI setters", () => {
     useStore.getState().setShowSidebar(true);
     expect(useStore.getState().showSidebar).toBe(true);
   });
+
+  it("setCrashReporting persists the consent choice as a tri-state pref", () => {
+    useStore.getState().setCrashReporting(true);
+    expect(useStore.getState().crashReporting).toBe(true);
+    expect(localStorage.getItem("pc.crashReporting")).toBe("1");
+
+    useStore.getState().setCrashReporting(false);
+    expect(useStore.getState().crashReporting).toBe(false);
+    expect(localStorage.getItem("pc.crashReporting")).toBe("0");
+  });
 });
 
 describe("oauth (Claude subscription sign-in)", () => {
