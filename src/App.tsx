@@ -194,11 +194,13 @@ function SidebarDrawer() {
   const drawerRef = useRef<HTMLDivElement>(null);
   // Escape closes the drawer (the App keydown effect only handles modified keys,
   // so plain Escape would otherwise strand focus inside the overlay). Bail while
-  // Settings is open: it stacks on top of the drawer (z-58 > z-50), so the first
-  // Escape must dismiss only the topmost layer (Settings) and leave the drawer.
+  // Settings (z-58) or the command palette (z-60) is open: both stack on top of
+  // the drawer (z-50), so the first Escape must dismiss only the topmost layer.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !useStore.getState().showSettings) setShowSidebar(false);
+      if (e.key !== "Escape") return;
+      const s = useStore.getState();
+      if (!s.showSettings && !s.showPalette) setShowSidebar(false);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -314,6 +316,7 @@ function TitleBar({ fileToggleRef }: { fileToggleRef?: React.Ref<HTMLButtonEleme
           ref={fileToggleRef}
           onClick={toggleFiles}
           aria-label="Toggle file explorer (Ctrl+B)"
+          aria-pressed={showFiles}
           title="Toggle file explorer (Ctrl+B)"
           className={`${remoteMode ? "hidden " : ""}flex h-[30px] w-[30px] items-center justify-center rounded-[7px] border transition-colors ${
             showFiles

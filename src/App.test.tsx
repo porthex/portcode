@@ -249,6 +249,29 @@ describe("remote mode shell", () => {
     expect(document.activeElement).toBe(opener);
   });
 
+  it("Escape closes only the topmost layer when the command palette stacks over the drawer", () => {
+    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+
+    render(<App />);
+    const opener = screen.getByRole("button", { name: "Toggle sessions" });
+    opener.focus();
+    fireEvent.click(opener);
+    // The palette (z-60) stacks above the drawer (z-50) and is reachable in remote
+    // mode via Ctrl+K. With both open, the drawer's Escape handler must bail so a
+    // single Escape dismisses only the palette layer, not the drawer underneath.
+    act(() => useStore.setState({ showPalette: true }));
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(useStore.getState().showSidebar).toBe(true);
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+
+    // Once the palette layer is gone, a second Escape collapses the drawer.
+    act(() => useStore.setState({ showPalette: false }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(useStore.getState().showSidebar).toBe(false);
+  });
+
   it("moves focus into the drawer on open and restores it to the opener on close", () => {
     useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
 
@@ -395,16 +418,20 @@ describe("TitleBar", () => {
   it("toggles the file explorer via the TitleBar button", () => {
     render(<App />);
 
-    // The rail is mounted but collapsed (0fr / inert) before the toggle.
+    // The rail is mounted but collapsed (0fr / inert) before the toggle, and the
+    // toggle button reports its off state to assistive tech via aria-pressed.
     const rail = screen.getByTestId("file-rail");
     expect(rail).toHaveStyle({ gridTemplateColumns: "0fr" });
     expect(rail).toHaveAttribute("inert");
+    const toggle = screen.getByRole("button", { name: "Toggle file explorer (Ctrl+B)" });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
 
-    fireEvent.click(screen.getByTitle("Toggle file explorer (Ctrl+B)"));
+    fireEvent.click(toggle);
 
-    // After the toggle it expands to 1fr and drops inert/aria-hidden.
+    // After the toggle it expands to 1fr, drops inert, and flips aria-pressed on.
     expect(screen.getByTestId("file-rail")).toHaveStyle({ gridTemplateColumns: "1fr" });
     expect(screen.getByTestId("file-rail")).not.toHaveAttribute("inert");
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
     expect(useStore.getState().showFiles).toBe(true);
   });
 
