@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use std::time::Duration;
+use tauri::AppHandle;
 
 use futures_util::StreamExt;
 
@@ -144,12 +145,8 @@ enum Building {
 }
 
 fn emit(app: &AppHandle, channel: &str, ev: StreamEvent) {
-    use tauri::Manager;
-    // Mirror every streamed event to Phone Sync (no-op when no phone is attached).
-    if let Some(hub) = app.try_state::<crate::sync::SyncHub>() {
-        hub.publish(channel, ev.clone());
-    }
-    let _ = app.emit(channel, ev);
+    // Canonical chokepoint: delivers to the desktop UI and mirrors to the phone.
+    crate::sync::emit_event(app, channel, ev);
 }
 
 /// Stream a single assistant turn. Emits text/tool events as they arrive and
@@ -219,11 +216,26 @@ pub async fn stream_turn(
     let mut input_tokens: u32 = 0;
     let mut output_tokens: u32 = 0;
 
-    while let Some(chunk) = stream.next().await {
+    loop {
         if cancel.load(Ordering::Relaxed) {
             stop_reason = "cancelled".into();
             break;
         }
+        // Bound each read so a stalled connection can't park the turn forever with no
+        // terminal event — that would leave the UI's `streaming` flag stuck true and
+        // silently no-op every later message. 120s of total silence = a dead stream.
+        // This also makes the cancel check above reachable within <=120s, so Stop
+        // takes effect even when the connection is hung mid-read.
+        let next = match tokio::time::timeout(Duration::from_secs(120), stream.next()).await {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                return Err(
+                    "Stream stalled: no data from Anthropic for 120s. Please try again."
+                        .to_string(),
+                )
+            }
+        };
+        let Some(chunk) = next else { break };
         let bytes = chunk.map_err(|e| format!("Stream error: {e}"))?;
         buf.extend_from_slice(&bytes);
 
@@ -265,9 +277,12 @@ pub async fn stream_turn(
                     match d["type"].as_str() {
                         Some("text_delta") => {
                             if let Some(t) = d["text"].as_str() {
-                                emit(app, channel, StreamEvent::TextDelta { text: t.into() });
+                                // Only surface text we also accumulate into the current
+                                // text block, so the live UI can never show text that the
+                                // persisted message ends up missing.
                                 if let Some(Building::Text(s)) = current.as_mut() {
                                     s.push_str(t);
+                                    emit(app, channel, StreamEvent::TextDelta { text: t.into() });
                                 }
                             }
                         }
@@ -319,6 +334,13 @@ pub async fn stream_turn(
                 _ => {}
             }
         }
+    }
+
+    // If the stream ended while a content block was still open (no content_block_stop),
+    // the response was truncated — surface it instead of silently dropping the block.
+    // A half-built tool call would otherwise just vanish and the turn would look fine.
+    if current.is_some() && stop_reason != "cancelled" {
+        return Err("The response was cut off before it finished. Please try again.".to_string());
     }
 
     Ok(TurnResult {

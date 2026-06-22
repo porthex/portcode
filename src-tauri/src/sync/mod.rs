@@ -26,6 +26,7 @@ pub mod server;
 pub mod session;
 pub mod transport;
 
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::broadcast;
 
 use crate::llm::StreamEvent;
@@ -93,6 +94,21 @@ impl SyncHub {
             .to_string();
         self.tx.send(SyncFrame::Live { session_id, event }).is_ok()
     }
+}
+
+/// The single sanctioned way to emit a live agent event.
+///
+/// Delivers `event` to the desktop UI on `channel` **and** mirrors it to any
+/// attached phone via [`SyncHub`] (`publish` is a cheap no-op when none is
+/// connected). Every `StreamEvent` MUST go out through here: emitting with
+/// `AppHandle::emit` directly reaches only the desktop, so a paired phone would
+/// never see it — which is exactly how a permission prompt once went missing and
+/// hung a remote turn indefinitely.
+pub fn emit_event(app: &AppHandle, channel: &str, event: StreamEvent) {
+    if let Some(hub) = app.try_state::<SyncHub>() {
+        hub.publish(channel, event.clone());
+    }
+    let _ = app.emit(channel, event);
 }
 
 #[cfg(test)]

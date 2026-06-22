@@ -40,6 +40,11 @@ const DIGITS = "0123456789";
 export const STEP_MS = 22;
 const FRAMES_PER_CHAR = 1.5;
 const MIN_FRAMES = 3;
+// A backgrounded tab pauses requestAnimationFrame, then resumes with the timestamp
+// jumped forward by seconds or minutes. Past this gap we snap straight to the final
+// text instead of grinding through thousands of catch-up frames (which would freeze
+// the UI) — the turn is almost certainly finished by the time the tab returns anyway.
+const MAX_CATCHUP_MS = 1000;
 
 const isSpace = (c: string): boolean => c === " " || c === "\n" || c === "\t" || c === "\r";
 
@@ -167,9 +172,18 @@ export function useScramble(full: string, enabled: boolean): ScrambleView {
     let lastTs = 0;
     const tick = (ts: number) => {
       if (lastTs === 0) lastTs = ts;
+      // Long pause (backgrounded tab): snap to the final text instead of animating
+      // thousands of missed frames in one tick, which would freeze the UI on return.
+      if (ts - lastTs > MAX_CATCHUP_MS) {
+        progressRef.current = { settled: fullRef.current.length, active: null };
+        setV(view(fullRef.current, progressRef.current));
+        lastTs = ts;
+        raf = requestAnimationFrame(tick);
+        return;
+      }
       let changed = false;
       // Advance whole frames for the elapsed time so the cadence stays steady
-      // regardless of the display's refresh rate (and so a paused tab catches up).
+      // regardless of the display's refresh rate.
       while (ts - lastTs >= STEP_MS) {
         lastTs += STEP_MS;
         if (stepFrame(fullRef.current, progressRef.current)) changed = true;

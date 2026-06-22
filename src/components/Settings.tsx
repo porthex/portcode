@@ -381,12 +381,23 @@ function PairingCode({ payload, onDone }: { payload: PairingPayload; onDone: () 
   const json = JSON.stringify(payload);
   const [copied, setCopied] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Clear the "Copied ✓" reset timer on unmount. PairingCode is dismissed (Done)
+  // well within the 1.5s window, so an uncleared timer would setState after unmount.
+  useEffect(
+    () => () => {
+      if (copiedTimer.current !== null) clearTimeout(copiedTimer.current);
+    },
+    [],
+  );
 
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(json);
       setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      if (copiedTimer.current !== null) clearTimeout(copiedTimer.current);
+      copiedTimer.current = setTimeout(() => setCopied(false), 1500);
     } catch {
       // Clipboard may be unavailable (no permission / older webview); the raw text
       // below is always selectable as a fallback.
