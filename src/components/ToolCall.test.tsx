@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { useState } from "react";
 import { render, screen, fireEvent } from "@testing-library/react";
 
 import { ToolCall } from "./ToolCall";
@@ -49,19 +50,50 @@ describe("summarize (header summary)", () => {
   });
 
   it("uses the tool name when input is an object without summarizable keys", () => {
-    render(<ToolCall name="custom_tool" input={{ other: 1 }} />);
-    // name appears twice: the mono accent label and the summary span.
-    expect(screen.getAllByText("custom_tool")).toHaveLength(2);
+    // summarize() falls back to the name; the path span is suppressed so the
+    // name renders exactly once (the mono accent label) rather than twice.
+    const { container } = render(<ToolCall name="custom_tool" input={{ other: 1 }} />);
+    expect(screen.getAllByText("custom_tool")).toHaveLength(1);
+    expect(container.querySelector(".pc-toolcall__path")).toBeNull();
   });
 
   it("uses the tool name when input is not an object", () => {
-    render(<ToolCall name="noop" input={null} />);
-    expect(screen.getAllByText("noop")).toHaveLength(2);
+    const { container } = render(<ToolCall name="noop" input={null} />);
+    expect(screen.getAllByText("noop")).toHaveLength(1);
+    expect(container.querySelector(".pc-toolcall__path")).toBeNull();
   });
 
   it("ignores non-string path/command/pattern values and uses the name", () => {
-    render(<ToolCall name="weird" input={{ path: 42, command: true, pattern: [] }} />);
-    expect(screen.getAllByText("weird")).toHaveLength(2);
+    const { container } = render(
+      <ToolCall name="weird" input={{ path: 42, command: true, pattern: [] }} />,
+    );
+    expect(screen.getAllByText("weird")).toHaveLength(1);
+    expect(container.querySelector(".pc-toolcall__path")).toBeNull();
+  });
+
+  it("renders the tool name once (no duplicate path span) for non-summarizable input", () => {
+    // A tool like list_sessions invoked with {} has no path/command/pattern, so
+    // summarize() returns the name. The header must not print "list_sessions
+    // list_sessions" — only the mono label, with the faint path span omitted.
+    render(<ToolCall name="list_sessions" input={{}} />);
+    const head = screen.getByRole("button");
+    expect(screen.getAllByText("list_sessions")).toHaveLength(1);
+    expect(head.querySelector(".pc-toolcall__name")?.textContent).toBe("list_sessions");
+    expect(head.querySelector(".pc-toolcall__path")).toBeNull();
+  });
+
+  it("lets the summary span shrink + ellipsize so a long command never clips the chevron/counts", () => {
+    // The path span must carry min-w-0 + flex-1 so, as a flex child, it can
+    // shrink below its content width (engaging its CSS text-overflow:ellipsis)
+    // and absorb the free space — keeping the right-aligned ml-auto group
+    // (the +/- diff counts and the ▸/▾ chevron) visible for an unbroken command.
+    const longCommand = "x".repeat(400);
+    const { container } = render(<ToolCall name="shell" input={{ command: longCommand }} />);
+    const path = container.querySelector(".pc-toolcall__path") as HTMLElement;
+    expect(path).not.toBeNull();
+    expect(path.textContent).toBe(longCommand);
+    expect(path.className).toContain("min-w-0");
+    expect(path.className).toContain("flex-1");
   });
 });
 
@@ -131,14 +163,52 @@ describe("collapse / expand toggle", () => {
     const toggle = screen.getByRole("button");
 
     // Collapsed: button advertises a closed region and an "expand" action.
+    // The accessible name now folds in the tool name, target, and run state
+    // so a screen-reader user gets what the colored dot conveys visually.
     expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(toggle).toHaveAttribute("aria-label", "Expand tool output");
+    expect(toggle.getAttribute("aria-label")).toMatch(/^t a\.ts, completed, expand output$/);
 
     fireEvent.click(toggle);
 
     // Expanded: aria-expanded flips and the label describes the collapse action.
     expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(toggle).toHaveAttribute("aria-label", "Collapse tool output");
+    expect(toggle.getAttribute("aria-label")).toMatch(/completed, collapse output$/);
+  });
+
+  it("folds the run state into the accessible name for all three branches", () => {
+    // Pending (no result) → "running".
+    const { rerender } = render(<ToolCall name="t" input={{ path: "a.ts" }} />);
+    expect(screen.getByRole("button").getAttribute("aria-label")).toMatch(
+      /running.*expand output/i,
+    );
+
+    // Error result → "failed".
+    rerender(<ToolCall name="t" input={{ path: "a.ts" }} result={result({ isError: true })} />);
+    expect(screen.getByRole("button").getAttribute("aria-label")).toMatch(/failed.*expand output/i);
+
+    // Successful result → "completed".
+    rerender(<ToolCall name="t" input={{ path: "a.ts" }} result={result({ isError: false })} />);
+    expect(screen.getByRole("button").getAttribute("aria-label")).toMatch(
+      /completed.*expand output/i,
+    );
+  });
+
+  it("announces the tool name once when summarize() falls back to it", () => {
+    // When the input has no summarizable field, summarize() returns the name,
+    // which the visible UI shows twice (mono label + summary span). The label
+    // must NOT double it — a screen reader should hear "custom_tool" once.
+    render(<ToolCall name="custom_tool" input={{ other: 1 }} />);
+    const label = screen.getByRole("button").getAttribute("aria-label");
+    expect(label).not.toMatch(/custom_tool custom_tool/);
+    expect(label).toMatch(/^custom_tool, running, expand output$/);
+  });
+
+  it("marks the decorative status dot aria-hidden so it isn't announced", () => {
+    const { container, rerender } = render(<ToolCall name="t" input={{}} result={result()} />);
+    expect(dot(container)).toHaveAttribute("aria-hidden", "true");
+    // The error-variant dot is a different element but must also be hidden.
+    rerender(<ToolCall name="t" input={{}} result={result({ isError: true })} />);
+    expect(dot(container)).toHaveAttribute("aria-hidden", "true");
   });
 });
 
@@ -300,5 +370,119 @@ describe("looksLikeDiff / DiffView", () => {
 
     expect(reopenHtml).toBe(openHtml);
     expect(reopenLineCount).toBe(openLineCount);
+  });
+
+  it("caps a huge diff at MAX_DIFF_LINES rendered rows plus a truncation footer", () => {
+    // A diff well past the 500-line cap: the @@ header makes it a diff, then
+    // a long run of added lines. DiffView must render a bounded node count and
+    // a single static footer for the remainder rather than one div per line.
+    const MAX = 500;
+    const extra = 250;
+    const big = [
+      "@@ -1 +1 @@",
+      ...Array.from({ length: MAX + extra }, (_, i) => `+line ${i}`),
+    ].join("\n");
+    const container = diffContainer(big);
+    const linesRendered = container.querySelectorAll(".pc-diff .pc-diff-line");
+    // Exactly the cap of real lines plus the one footer row — never one node
+    // per source line.
+    expect(linesRendered.length).toBe(MAX + 1);
+    expect(screen.getByText(new RegExp(`more lines \\(truncated\\)`))).toBeInTheDocument();
+    // The footer reports how many lines were hidden (total source lines = MAX +
+    // extra + 1 header; the cap keeps the first MAX, so the rest are hidden).
+    const totalLines = MAX + extra + 1;
+    expect(screen.getByText(`… ${totalLines - MAX} more lines (truncated)`)).toBeInTheDocument();
+  });
+
+  it("does not truncate a diff at or under the cap (no footer)", () => {
+    const container = diffContainer(fullDiff);
+    expect(container.textContent).not.toMatch(/truncated/);
+  });
+});
+
+describe("memoization (React.memo)", () => {
+  it("is exported as a React.memo component (skips reconciles on stable props)", () => {
+    // Wrapping ToolCall in React.memo is the fix that stops every visible tool
+    // card from reconciling on every streaming delta (~45x/sec) when name/input/
+    // result are referentially stable. A memo() component is an object whose
+    // $$typeof is the react.memo symbol — assert that directly so the wrapper
+    // can't be silently dropped back to a plain function.
+    const memoType = (ToolCall as unknown as { $$typeof?: symbol }).$$typeof;
+    expect(memoType).toBe(Symbol.for("react.memo"));
+  });
+
+  it("renders correctly when a parent re-renders with referentially-stable props", () => {
+    // Sanity-check that the memo wrapper doesn't break ordinary behavior: the
+    // card keeps its own open state and renders the same content across a forced
+    // parent re-render that passes the SAME name/input/result references.
+    const input = { path: "a.ts" };
+    const res = result();
+
+    function Parent() {
+      const [, setTick] = useState(0);
+      return (
+        <>
+          <button data-testid="rerender" onClick={() => setTick((t) => t + 1)}>
+            rerender
+          </button>
+          <ToolCall name="t" input={input} result={res} />
+        </>
+      );
+    }
+
+    const { container } = render(<Parent />);
+    const toggle = screen.getByRole("button", { name: /expand output/i });
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    const bodyBefore = container.querySelector(".pc-toolcall__body");
+
+    fireEvent.click(screen.getByTestId("rerender"));
+
+    expect(screen.getByRole("button", { name: /collapse output/i })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(container.querySelector(".pc-toolcall__body")).toBe(bodyBefore);
+  });
+});
+
+describe("diff stat chips (+N / -N)", () => {
+  // The chips are gated independently so a pure-add / pure-del diff never shows
+  // a phantom "-0" / "+0" alongside the real count.
+  it("shows only +N for a pure-addition diff (no -0 phantom)", () => {
+    render(
+      <ToolCall
+        name="edit"
+        input={{ path: "x" }}
+        result={result({ output: "@@ -0,0 +1,2 @@\n+one\n+two" })}
+      />,
+    );
+    expect(screen.getByText("+2")).toBeInTheDocument();
+    expect(screen.queryByText("-0")).not.toBeInTheDocument();
+  });
+
+  it("shows only -N for a pure-deletion diff (no +0 phantom)", () => {
+    render(
+      <ToolCall
+        name="edit"
+        input={{ path: "x" }}
+        result={result({ output: "@@ -1,2 +0,0 @@\n-one\n-two" })}
+      />,
+    );
+    expect(screen.getByText("-2")).toBeInTheDocument();
+    expect(screen.queryByText("+0")).not.toBeInTheDocument();
+  });
+
+  it("shows both chips when the diff has additions and deletions", () => {
+    render(
+      <ToolCall
+        name="edit"
+        input={{ path: "x" }}
+        result={result({ output: "@@ -1 +1 @@\n-old\n+new" })}
+      />,
+    );
+    expect(screen.getByText("+1")).toBeInTheDocument();
+    expect(screen.getByText("-1")).toBeInTheDocument();
   });
 });

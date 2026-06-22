@@ -28,6 +28,8 @@ interface AppState {
   oauthError: string | null; // last sign-in/out failure, surfaced in Settings
   phoneSync: PhoneSyncStatus | null; // phone sync device identity + paired devices
   pairingPayload: PairingPayload | null; // in-progress pairing code to display
+  pairingError: string | null; // last begin-pairing/unpair failure, surfaced in Settings
+  creatingSession: boolean; // a newSession() create is in flight (re-entry guard)
   streaming: boolean;
   showSettings: boolean;
   showFiles: boolean;
@@ -39,6 +41,12 @@ interface AppState {
   cancel: (() => Promise<void>) | null;
   pendingPermission: PendingPermission | null;
 
+  // ── Error surfacing ─────────────────────────────────────────────────────────
+  initError: string | null; // startup (init) failure — Chat shows an error/retry panel
+  loadErrors: Record<string, boolean>; // sessionId -> a getMessages load failed; Chat offers retry
+  settingsError: string | null; // last saveSettings failure, surfaced in Settings
+  workspaceError: string | null; // last openWorkspace (picker/save) failure, surfaced in FileExplorer
+
   // ── Mobile remote client (this device is the phone driving a paired desktop) ──
   remoteMode: boolean; // render the remote-client shell (pairing → remote session) instead of the desktop layout
   remoteConnected: boolean; // a live desktop session is established
@@ -47,9 +55,12 @@ interface AppState {
   remoteError: string | null; // last connect failure, surfaced in the connect UI
   remoteUnlisten: (() => void) | null; // tears down the frame subscription (private; mirrors `cancel`)
   remoteDropped: boolean; // the live session ended unexpectedly — the UI offers a reconnect
+  remoteConnecting: boolean; // a connectRemote dial is in flight (private re-entry guard)
   lastPairingQr: string | null; // last successful pairing payload, kept for one-tap reconnect
 
   init: () => Promise<void>;
+  retryInit: () => Promise<void>;
+  retryLoad: (id: string) => Promise<void>;
   toggleFiles: () => void;
   toggleSidebar: () => void;
   setShowSidebar: (v: boolean) => void;
@@ -91,6 +102,23 @@ const now = () => Date.now();
 // otherwise silently no-op every later send). Kept above the backend's own idle
 // timeout so the backend's specific error wins in the normal stalled-network case.
 const TURN_IDLE_TIMEOUT_MS = 150_000;
+
+// Remote-turn idle watchdog (symmetric with the local one in send()). In remote
+// mode the turn runs on the desktop and only a desktop-originated live frame can
+// clear `streaming`; if the channel stays alive but the desktop's agent dies/hangs
+// without emitting turn_end/error (no drop, the send resolved), the phone is stuck
+// with a disabled composer forever. This module-scoped handle drives a force-end on
+// idle. Module-scoped (not closure-scoped like the local watchdog) so the remote
+// frame handler, drop listener, stop(), and disconnect can all reset/clear it.
+let remoteWatchdog: ReturnType<typeof setInterval> | null = null;
+let remoteLastActivity = 0;
+
+const clearRemoteWatchdog = (): void => {
+  if (remoteWatchdog !== null) {
+    clearInterval(remoteWatchdog);
+    remoteWatchdog = null;
+  }
+};
 
 // Frontend-only UI preferences (decorative overlays). Cosmetic client state,
 // not the Rust core's Settings — persisted in localStorage so they work the
@@ -154,6 +182,8 @@ export const useStore = create<AppState>((set, get) => ({
   oauthError: null,
   phoneSync: null,
   pairingPayload: null,
+  pairingError: null,
+  creatingSession: false,
   streaming: false,
   showSettings: false,
   showFiles: false,
@@ -164,6 +194,10 @@ export const useStore = create<AppState>((set, get) => ({
   draft: "",
   cancel: null,
   pendingPermission: null,
+  initError: null,
+  loadErrors: {},
+  settingsError: null,
+  workspaceError: null,
   // Default into remote mode on a phone; desktop/preview start in the normal
   // layout and can opt in via setRemoteMode (e.g. the command palette) for testing.
   remoteMode: isMobilePlatform(),
@@ -173,65 +207,152 @@ export const useStore = create<AppState>((set, get) => ({
   remoteError: null,
   remoteUnlisten: null,
   remoteDropped: false,
+  remoteConnecting: false,
   // Remembered across launches so the phone can reconnect without re-scanning the
   // QR (Android frequently kills backgrounded apps). Public payload — no secret.
   lastPairingQr: readStr("pc.lastPairingQr"),
 
   async init() {
+    // The phone/remote client has no local sessions DB or settings — its session
+    // and message state arrive authoritatively from the desktop's frames — and the
+    // desktop-only Tauri commands below would reject on a real mobile build, leaving
+    // a stale initError that paints a spurious "Couldn't start Portcode" panel over
+    // the connected remote session. So init() is a no-op there (mirrors newSession).
+    if (get().remoteMode) {
+      set({ initError: null });
+      return;
+    }
     // Fetch settings, subscription status, and phone sync status together.
     // The oauth and phoneSync calls are kept resilient so an unwired/older
-    // core can't block startup.
-    const [settings, oauthStatus, phoneSync] = await Promise.all([
-      ipc.getSettings(),
-      ipc.oauthStatus().catch(() => null),
-      ipc.phoneSyncStatus().catch(() => null),
-    ]);
-    const sessions = await ipc.listSessions();
-    if (sessions.length === 0) {
-      const s = makeSession();
-      await ipc.createSession(s.id, s.title, s.workspace);
+    // core can't block startup. The load-bearing calls (getSettings/listSessions/
+    // createSession/getMessages) are guarded so a failed startup surfaces an
+    // error+retry panel instead of a permanently blank welcome shell.
+    try {
+      const [settings, oauthStatus, phoneSync] = await Promise.all([
+        ipc.getSettings(),
+        ipc.oauthStatus().catch(() => null),
+        ipc.phoneSyncStatus().catch(() => null),
+      ]);
+      const sessions = await ipc.listSessions();
+      if (sessions.length === 0) {
+        const s = makeSession();
+        await ipc.createSession(s.id, s.title, s.workspace);
+        set({
+          settings,
+          oauthStatus,
+          phoneSync,
+          sessions: [s],
+          activeId: s.id,
+          messages: { [s.id]: [] },
+          initError: null,
+        });
+        return;
+      }
+      const activeId = sessions[0].id;
+      const msgs = await ipc.getMessages(activeId);
       set({
         settings,
         oauthStatus,
         phoneSync,
-        sessions: [s],
-        activeId: s.id,
-        messages: { [s.id]: [] },
+        sessions,
+        activeId,
+        messages: { [activeId]: msgs },
+        initError: null,
       });
-      return;
+    } catch (err) {
+      set({ initError: errMessage(err) });
     }
-    const activeId = sessions[0].id;
-    const msgs = await ipc.getMessages(activeId);
-    set({ settings, oauthStatus, phoneSync, sessions, activeId, messages: { [activeId]: msgs } });
+  },
+
+  async retryInit() {
+    set({ initError: null });
+    await get().init();
+  },
+
+  async retryLoad(id) {
+    try {
+      const msgs = await ipc.getMessages(id);
+      set((st) => ({
+        messages: { ...st.messages, [id]: msgs },
+        loadErrors: { ...st.loadErrors, [id]: false },
+      }));
+    } catch {
+      set((st) => ({ loadErrors: { ...st.loadErrors, [id]: true } }));
+    }
   },
 
   async newSession() {
     // Don't strand a live turn: switching activeId mid-stream would leave the old
     // session's run folding events into a session the user can no longer see while
     // the new one shows a disabled composer. Mirrors selectSession/deleteSession.
-    if (get().streaming) return;
-    const s = makeSession();
-    await ipc.createSession(s.id, s.title, s.workspace);
-    set((st) => ({
-      sessions: [s, ...st.sessions],
-      activeId: s.id,
-      messages: { ...st.messages, [s.id]: [] },
-      showSidebar: false, // close the mobile drawer on navigation
-    }));
+    // Re-entry guard (mirrors connectRemote's remoteConnecting): createSession is
+    // async, so two fast clicks would both pass the streaming check and each create
+    // a distinct empty session. The synchronous set() below makes the second
+    // same-tick call bail, so only one create runs.
+    if (get().streaming || get().creatingSession) return;
+    set({ creatingSession: true });
+    // Remote mode: the agent-side `create_session` command is desktop-only (the
+    // local Tauri invoke isn't registered on the phone and would reject as an
+    // unhandled rejection). Route through the link instead and let the desktop's
+    // authoritative `session_list` frame reconcile + activate the new session,
+    // rather than optimistically inserting a phantom local one the desktop never
+    // knows about (and that send() couldn't run a turn in).
+    if (get().remoteConnected) {
+      try {
+        await get().sendRemoteCommand({ cmd: "create_session" });
+      } finally {
+        set({ creatingSession: false, showSidebar: false });
+      }
+      return;
+    }
+    try {
+      const s = makeSession();
+      await ipc.createSession(s.id, s.title, s.workspace);
+      set((st) => ({
+        sessions: [s, ...st.sessions],
+        activeId: s.id,
+        messages: { ...st.messages, [s.id]: [] },
+        showSidebar: false, // close the mobile drawer on navigation
+      }));
+    } catch (err) {
+      // A failed create (locked DB / core not ready) must surface instead of being a
+      // swallowed unhandled rejection — callers use bare `onClick={newSession}` /
+      // `void newSession()`. Reuse initError so Chat's existing error/retry panel shows it.
+      set({ initError: errMessage(err) });
+    } finally {
+      set({ creatingSession: false });
+    }
   },
 
   async selectSession(id) {
     if (get().streaming) return;
     set({ activeId: id, showSidebar: false }); // close the mobile drawer on navigation
     if (!get().messages[id]) {
-      const msgs = await ipc.getMessages(id);
-      set((st) => ({ messages: { ...st.messages, [id]: msgs } }));
+      // Guard the load: a getMessages reject must not leave messages[id] undefined
+      // (the welcome EmptyState would then win for a session with real history).
+      try {
+        const msgs = await ipc.getMessages(id);
+        set((st) => ({
+          messages: { ...st.messages, [id]: msgs },
+          loadErrors: { ...st.loadErrors, [id]: false },
+        }));
+      } catch {
+        set((st) => ({ loadErrors: { ...st.loadErrors, [id]: true } }));
+      }
     }
   },
 
   async deleteSession(id) {
     if (get().streaming) return;
-    await ipc.deleteSession(id);
+    try {
+      await ipc.deleteSession(id);
+    } catch (err) {
+      // A failed delete (locked DB / core not ready) must surface instead of being a
+      // swallowed unhandled rejection — caller is a bare onClick={() => deleteSession(s.id)}.
+      // Reuse initError so Chat's existing error/retry panel shows it; leave the list untouched.
+      set({ initError: errMessage(err) });
+      return;
+    }
     set((st) => {
       const sessions = st.sessions.filter((s) => s.id !== id);
       const messages = { ...st.messages };
@@ -245,8 +366,15 @@ export const useStore = create<AppState>((set, get) => ({
     }
     const aid = get().activeId;
     if (aid && !get().messages[aid]) {
-      const msgs = await ipc.getMessages(aid);
-      set((st) => ({ messages: { ...st.messages, [aid]: msgs } }));
+      try {
+        const msgs = await ipc.getMessages(aid);
+        set((st) => ({
+          messages: { ...st.messages, [aid]: msgs },
+          loadErrors: { ...st.loadErrors, [aid]: false },
+        }));
+      } catch {
+        set((st) => ({ loadErrors: { ...st.loadErrors, [aid]: true } }));
+      }
     }
   },
 
@@ -254,20 +382,62 @@ export const useStore = create<AppState>((set, get) => ({
     const { activeId, streaming } = get();
     if (!activeId || streaming || !text.trim()) return;
 
+    // Trim once so the stored user bubble and the forwarded command match the
+    // derived (trimmed) title — a padded draft otherwise renders odd blank lines.
+    const body = text.trim();
+
     // Remote mode: this device is the phone driving a paired desktop. Forward the
     // turn as a `run` command instead of running the local agent — the desktop is
     // authoritative and its reply streams back as live frames (which build the
     // assistant message). sendRemoteCommand already appends the optimistic user
-    // message, so we neither pre-create messages nor flip `streaming` here.
+    // message, so we don't pre-create messages. We DO flip `streaming` optimistically
+    // (rather than waiting for the desktop's turn_start frame) to close the
+    // double-submit window: the round-trip can be slow or dropped, and an enabled
+    // composer would let a second Enter fire a duplicate `run`. Every terminal/drop
+    // path (turn_end/error, the drop listener, the send catch, disconnectRemote)
+    // already clears streaming:false, so the composer can't get stranded.
     if (get().remoteConnected) {
-      await get().sendRemoteCommand({ cmd: "run", session_id: activeId, text });
+      set({ streaming: true });
+      // Remote idle watchdog (symmetric with the local one below). The desktop is
+      // authoritative, but if its agent dies/hangs without ever emitting
+      // turn_end/error AND the channel stays up (no drop fires), nothing would clear
+      // `streaming` and the composer would be stranded. Arm a timer that force-ends a
+      // silent remote turn; every live frame for the active session resets it (see
+      // applyFrame), and every terminal/teardown path clears it (turn_end/error in
+      // applyRemoteEvent, the drop listener, the send-command catch, stop(),
+      // disconnectRemote).
+      clearRemoteWatchdog();
+      remoteLastActivity = now();
+      remoteWatchdog = setInterval(() => {
+        // The turn already ended or was stopped elsewhere — just clean up.
+        if (!get().streaming) {
+          clearRemoteWatchdog();
+          return;
+        }
+        if (now() - remoteLastActivity < TURN_IDLE_TIMEOUT_MS) return;
+        // No live frame for the whole idle window → treat the desktop as hung and
+        // recover, so the composer can't stay disabled forever.
+        clearRemoteWatchdog();
+        const sid = get().activeId;
+        set((st) => ({
+          streaming: false,
+          pendingPermission: null,
+          messages:
+            sid !== null
+              ? patchLast(st.messages, sid, (b) =>
+                  appendText(b, "\n\n**The desktop stopped responding (timed out).**"),
+                )
+              : st.messages,
+        }));
+      }, 1000);
+      await get().sendRemoteCommand({ cmd: "run", session_id: activeId, text: body });
       return;
     }
 
     const userMsg: Message = {
       id: uid(),
       role: "user",
-      blocks: [{ kind: "text", text }],
+      blocks: [{ kind: "text", text: body }],
       createdAt: now(),
     };
     const assistant: Message = {
@@ -284,7 +454,7 @@ export const useStore = create<AppState>((set, get) => ({
           ? {
               ...s,
               updatedAt: now(),
-              title: msgs.length === 0 ? deriveTitle(text) : s.title,
+              title: msgs.length === 0 ? deriveTitle(body) : s.title,
             }
           : s,
       );
@@ -408,12 +578,22 @@ export const useStore = create<AppState>((set, get) => ({
     }, 1000);
 
     try {
-      const handle = await ipc.runAgent(activeId, text, onEvent);
+      const handle = await ipc.runAgent(activeId, body, onEvent);
       run = handle;
       if (settled) {
-        // A terminal event (or the watchdog) fired before the handle resolved —
-        // don't leave the listener subscribed or re-arm a stale Stop.
+        // A terminal event (or the watchdog) settled the turn before the handle
+        // resolved. settle() already ran with run===null (a no-op), so the now-resolved
+        // handle still needs its listener torn down. The terminal event already issued
+        // any backend cancel it needed, so just dispose — no spurious cancel_agent.
         handle.dispose();
+      } else if (!get().streaming) {
+        // The turn isn't settled, but streaming already flipped false — the user
+        // pressed Stop DURING the await window, when the cancel handle was still null
+        // so stop() couldn't abort the backend. Honor that Stop authoritatively now:
+        // settle(true) cancels the still-pending backend turn (cancel_agent) AND
+        // disposes the listener, so no further deltas can fold in and no stale Stop is
+        // re-armed.
+        settle(true);
       } else {
         // Stop aborts the run AND clears this turn's watchdog (owned by this closure).
         set({
@@ -432,14 +612,20 @@ export const useStore = create<AppState>((set, get) => ({
     // Remote mode: the turn runs on the desktop, so stop it with a Cancel command
     // over the link (there is no local `cancel` handle on the phone).
     if (get().remoteConnected) {
+      clearRemoteWatchdog(); // the turn is over — stop the idle watchdog
       const activeId = get().activeId;
       if (activeId) await get().sendRemoteCommand({ cmd: "cancel", session_id: activeId });
       set({ streaming: false, pendingPermission: null });
       return;
     }
     const c = get().cancel;
-    if (c) await c();
-    set({ streaming: false, cancel: null, pendingPermission: null });
+    try {
+      if (c) await c();
+    } catch {
+      /* the cancel_agent IPC failed; recover the UI anyway so the composer isn't stuck */
+    } finally {
+      set({ streaming: false, cancel: null, pendingPermission: null });
+    }
   },
 
   async resolvePermission(decision, always) {
@@ -461,16 +647,19 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
-    if (always && decision === "allow") {
-      await get().updateSettings({ defaultPolicy: "allow" });
-    }
     // A superseding request may have replaced the prompt while we awaited
     // (or between render and click); only resolve the request we captured so a
     // stale click can't clear/answer a newer one.
     const current = get().pendingPermission;
     if (current && current.id !== id) return;
+    // Answer the backend gate FIRST (and clear the banner), so a later
+    // best-effort policy save can't strand the prompt or leave the gate
+    // unanswered if updateSettings rejects.
     set({ pendingPermission: null });
     await ipc.resolvePermission(id, decision);
+    if (always && decision === "allow") {
+      await get().updateSettings({ defaultPolicy: "allow" });
+    }
   },
 
   setShowSettings(v) {
@@ -515,13 +704,32 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async openWorkspace() {
-    const dir = await ipc.openFolder();
-    if (dir) await get().updateSettings({ workspace: dir });
+    // Guard the picker + save: a dialog/save reject must surface in the explorer
+    // instead of being a silent unhandled rejection (all callers use `void`).
+    // Persist directly (not via updateSettings, which swallows into settingsError)
+    // so a save failure lands in workspaceError, the explorer's own surface.
+    set({ workspaceError: null });
+    try {
+      const dir = await ipc.openFolder();
+      if (dir) {
+        const next = await ipc.saveSettings({ workspace: dir });
+        set({ settings: next });
+      }
+    } catch (err) {
+      set({ workspaceError: errMessage(err) });
+    }
   },
 
   async updateSettings(s) {
-    const next = await ipc.saveSettings(s);
-    set({ settings: next });
+    // Fail loudly: a saveSettings reject must surface (so the controlled UI doesn't
+    // silently snap back to the old value) instead of being a swallowed rejection.
+    set({ settingsError: null });
+    try {
+      const next = await ipc.saveSettings(s);
+      set({ settings: next });
+    } catch (err) {
+      set({ settingsError: errMessage(err) });
+    }
   },
 
   async refreshOAuthStatus() {
@@ -563,13 +771,26 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async beginPairing() {
-    const pairingPayload = await ipc.phoneSyncBeginPairing();
-    set({ pairingPayload });
+    // Fail loudly: phoneSyncBeginPairing is fallible (lock poison / identity / begin)
+    // and the Settings UI calls this via `void`, so a swallowed rejection would leave
+    // the user stranded with no QR and no feedback. Surface it via pairingError.
+    set({ pairingError: null });
+    try {
+      const pairingPayload = await ipc.phoneSyncBeginPairing();
+      set({ pairingPayload });
+    } catch (err) {
+      set({ pairingError: errMessage(err) });
+    }
   },
 
   async unpair(publicKey) {
-    await ipc.phoneSyncUnpair(publicKey);
-    await get().refreshPhoneSync();
+    set({ pairingError: null });
+    try {
+      await ipc.phoneSyncUnpair(publicKey);
+      await get().refreshPhoneSync();
+    } catch (err) {
+      set({ pairingError: errMessage(err) });
+    }
   },
 
   clearPairing() {
@@ -609,6 +830,9 @@ export const useStore = create<AppState>((set, get) => ({
         }));
         break;
       case "live":
+        // Keep the remote idle watchdog alive: any live frame for the active session
+        // is proof the desktop is still talking, so reset its last-activity clock.
+        if (frame.session_id === get().activeId) remoteLastActivity = now();
         applyRemoteEvent(set, frame.session_id, frame.event);
         break;
       // command / ack / hello are phone-originated or not actionable inbound.
@@ -620,6 +844,12 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async connectRemote(qr, verified = false) {
+    // Re-entry guard: two interleaved dials (e.g. Reconnect + Scan/Connect) would
+    // each register a fresh onPhoneSyncFrame listener across the awaits below,
+    // orphaning one subscription that keeps double-feeding applyFrame. Serialize so
+    // only one dial runs at a time.
+    if (get().remoteConnecting) return;
+    set({ remoteConnecting: true });
     // Clean reconnect: tear down any prior subscriptions before dialing so a second
     // connect can never leave two live listeners feeding the store.
     const prev = get().remoteUnlisten;
@@ -642,6 +872,17 @@ export const useStore = create<AppState>((set, get) => ({
     let unlistenDrop: (() => void) | null = null;
     try {
       const info = await ipc.phoneSyncConnect(qr);
+      // A disconnectRemote that landed mid-dial cleared remoteConnecting as an abort
+      // sentinel. Honor it: bail BEFORE registering the frame/drop listeners (so no
+      // orphaned subscription is ever created) and tear down the native session the
+      // dial just opened, otherwise connectRemote's success set() would silently
+      // override the user's explicit disconnect and resurrect a connection they ended.
+      // (unlistenFrame/unlistenDrop are still null here — they're only created below —
+      // so there is nothing to unsubscribe, just the native channel to close.)
+      if (!get().remoteConnecting) {
+        await ipc.phoneSyncDisconnect().catch(() => {});
+        return;
+      }
       // Subscribe only after a successful dial; route every frame through
       // get().applyFrame so the latest action closure folds against live state.
       unlistenFrame = await ipc.onPhoneSyncFrame((f) => get().applyFrame(f));
@@ -652,6 +893,7 @@ export const useStore = create<AppState>((set, get) => ({
         // The turn is dead when the channel drops — clear turn state too, not just
         // connection flags, so neither the interim nor the reconnected session is
         // stuck on a stale `streaming`/`pendingPermission`.
+        clearRemoteWatchdog();
         set({
           remoteConnected: false,
           remoteVerified: false,
@@ -690,6 +932,10 @@ export const useStore = create<AppState>((set, get) => ({
         remoteUnlisten: null,
         remoteError: errMessage(err),
       });
+    } finally {
+      // Release the re-entry lock whether the dial succeeded or failed, so a later
+      // connect can proceed.
+      set({ remoteConnecting: false });
     }
   },
 
@@ -713,10 +959,28 @@ export const useStore = create<AppState>((set, get) => ({
         },
       }));
     }
-    await ipc.phoneSyncSendCommand(command);
+    // The channel often drops between frames (Android kills backgrounded apps).
+    // Callers swallow the rejection (`void send`/`stop`), so a dropped link would
+    // silently strand the optimistic message. Handle it here: annotate the message
+    // and surface the existing reconnect UI via remoteDropped.
+    try {
+      await ipc.phoneSyncSendCommand(command);
+    } catch {
+      if (command.cmd === "run") {
+        const sid = command.session_id;
+        set((st) => ({
+          messages: patchLast(st.messages, sid, (b) =>
+            appendText(b, "\n\n**Couldn't reach your desktop — the link may have dropped.**"),
+          ),
+        }));
+      }
+      clearRemoteWatchdog(); // the turn can't proceed on a dropped link
+      set({ remoteDropped: true, streaming: false });
+    }
   },
 
   async disconnectRemote() {
+    clearRemoteWatchdog(); // user-initiated teardown — the turn is over
     const unlisten = get().remoteUnlisten;
     // Flip the connection flags FIRST, before the async teardown. `remoteConnected`
     // is the routing source of truth for send/stop/resolvePermission, so clearing it
@@ -731,6 +995,13 @@ export const useStore = create<AppState>((set, get) => ({
       remoteDropped: false,
       lastPairingQr: null,
       remoteUnlisten: null,
+      // Doubles as an abort sentinel for an in-flight connectRemote dial: a dial that
+      // resolves after this re-reads remoteConnecting, sees false, and bails before
+      // registering its frame/drop listeners (instead of overriding this disconnect
+      // and leaking the about-to-register subscriptions onto a torn-down channel).
+      // connectRemote's own finally clears this in steady state, so this is a no-op
+      // when no dial is in flight.
+      remoteConnecting: false,
       streaming: false, // the turn is over — don't strand a stuck composer
       pendingPermission: null,
     });
@@ -794,12 +1065,19 @@ type RemoteSetter = (fn: (st: AppState) => Partial<AppState>) => void;
 // Fold one live StreamEvent (forwarded from the paired desktop) into store state
 // for `sessionId`. Mirrors `send`'s local onEvent, but the phone BUILDS the
 // assistant message from turn_start rather than pre-creating it. Does NOT touch
-// `cancel` (that handle belongs to a local desktop run); it does set/clear
-// `streaming` + `pendingPermission` so the phone UI stays honest.
+// `cancel` (that handle belongs to a local desktop run).
+//
+// Per-session message patching is always applied (a background session must still
+// build its history). But the GLOBAL UI flags — `streaming` and `pendingPermission`
+// — drive the visible composer/HUD and the permission gate, so they are only
+// touched when the frame's session is the one on screen. Otherwise a background
+// session's turn would flip the visible composer or pop a permission prompt the
+// user has no context for (and would answer blind).
 function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent): void {
   switch (e.type) {
     case "turn_start":
       set((st) => {
+        const isActive = st.activeId === sessionId;
         const msgs = st.messages[sessionId] ?? [];
         const assistant: Message = {
           id: e.messageId,
@@ -808,7 +1086,8 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
           createdAt: now(),
         };
         return {
-          streaming: true,
+          // Only flip the visible streaming indicator for the active session.
+          ...(isActive ? { streaming: true } : {}),
           messages: { ...st.messages, [sessionId]: [...msgs, assistant] },
         };
       });
@@ -835,9 +1114,11 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       }));
       break;
     case "permission_request":
-      set(() => ({
-        pendingPermission: { id: e.id, tool: e.tool, summary: e.summary, input: e.input },
-      }));
+      set((st) =>
+        st.activeId === sessionId
+          ? { pendingPermission: { id: e.id, tool: e.tool, summary: e.summary, input: e.input } }
+          : {},
+      );
       break;
     case "usage":
       set((st) => {
@@ -854,16 +1135,21 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       });
       break;
     case "error":
+      // A terminal frame for the active session ends the turn — stop the remote idle
+      // watchdog (it self-clears on its next tick once streaming is false, but clear
+      // it eagerly so it can't fire a spurious timeout in the meantime).
+      if (useStore.getState().activeId === sessionId) clearRemoteWatchdog();
       set((st) => ({
         messages: patchLast(st.messages, sessionId, (b) =>
           appendText(b, `\n\n**Error:** ${e.message}`),
         ),
-        streaming: false,
-        pendingPermission: null,
+        // Only clear the visible turn flags when this is the active session.
+        ...(st.activeId === sessionId ? { streaming: false, pendingPermission: null } : {}),
       }));
       break;
     case "turn_end":
-      set(() => ({ streaming: false, pendingPermission: null }));
+      if (useStore.getState().activeId === sessionId) clearRemoteWatchdog();
+      set((st) => (st.activeId === sessionId ? { streaming: false, pendingPermission: null } : {}));
       break;
   }
 }

@@ -103,31 +103,42 @@ describe("App layout", () => {
     expect(unlisten).toHaveBeenCalledTimes(1);
   });
 
-  it("hides FileExplorer and SettingsPanel when their flags are false", () => {
+  it("collapses the file rail and hides SettingsPanel when their flags are false", () => {
     useStore.setState({ showFiles: false, showSettings: false });
 
     render(<App />);
 
-    expect(screen.queryByTestId("file-explorer")).not.toBeInTheDocument();
+    // The rail stays mounted (so its width can animate) but collapses to a 0fr
+    // grid column and goes inert/aria-hidden so it's out of the tab order and AT.
+    const rail = screen.getByTestId("file-rail");
+    expect(rail).toHaveStyle({ gridTemplateColumns: "0fr" });
+    expect(rail).toHaveAttribute("aria-hidden", "true");
+    expect(rail).toHaveAttribute("inert");
     expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
   });
 
-  it("shows FileExplorer only when showFiles is true", () => {
+  it("expands the file rail (1fr, not inert) when showFiles is true", () => {
     useStore.setState({ showFiles: true });
 
     render(<App />);
 
+    const rail = screen.getByTestId("file-rail");
     expect(screen.getByTestId("file-explorer")).toBeInTheDocument();
+    expect(rail).toHaveStyle({ gridTemplateColumns: "1fr" });
+    // Open: it's reachable — no inert, no aria-hidden masking the tree.
+    expect(rail).not.toHaveAttribute("inert");
+    expect(rail).not.toHaveAttribute("aria-hidden");
     expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
   });
 
   it("shows SettingsPanel only when showSettings is true", () => {
-    useStore.setState({ showSettings: true });
+    useStore.setState({ showSettings: true, showFiles: false });
 
     render(<App />);
 
     expect(screen.getByTestId("settings-panel")).toBeInTheDocument();
-    expect(screen.queryByTestId("file-explorer")).not.toBeInTheDocument();
+    // The file rail is mounted but collapsed when showFiles is false.
+    expect(screen.getByTestId("file-rail")).toHaveStyle({ gridTemplateColumns: "0fr" });
   });
 });
 
@@ -192,6 +203,121 @@ describe("remote mode shell", () => {
     expect(useStore.getState().showSidebar).toBe(false);
   });
 
+  it("closes the session drawer with Escape", () => {
+    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Toggle sessions" }));
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+
+    // Plain Escape isn't caught by App's modified-key shortcut effect; the drawer
+    // installs its own handler so focus isn't stranded inside the overlay.
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
+    expect(useStore.getState().showSidebar).toBe(false);
+  });
+
+  it("Escape closes only the topmost layer when Settings stacks over the drawer", () => {
+    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+
+    render(<App />);
+    const opener = screen.getByRole("button", { name: "Toggle sessions" });
+    opener.focus();
+    fireEvent.click(opener);
+    // Both overlays are open: the drawer renders <Sidebar/>, whose footer Settings
+    // button opens Settings without closing the drawer (it stacks on top, z-58 > z-50).
+    // SettingsPanel is stubbed here, so its own unconditional Escape handler isn't
+    // present — this case targets the drawer's new bail branch, leaving the topmost
+    // layer (Settings) to dismiss itself (covered in Settings.test).
+    act(() => useStore.setState({ showSettings: true }));
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+    expect(screen.getByTestId("settings-panel")).toBeInTheDocument();
+
+    // First Escape: the drawer's handler bails while Settings is open, so the drawer
+    // stays mounted instead of collapsing both layers at once.
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(useStore.getState().showSidebar).toBe(true);
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+
+    // Once the top layer (Settings) is gone, focus returns to the drawer and a
+    // second Escape closes it, restoring focus to the hamburger.
+    act(() => useStore.setState({ showSettings: false }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(useStore.getState().showSidebar).toBe(false);
+    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(opener);
+  });
+
+  it("Escape closes only the topmost layer when the command palette stacks over the drawer", () => {
+    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+
+    render(<App />);
+    const opener = screen.getByRole("button", { name: "Toggle sessions" });
+    opener.focus();
+    fireEvent.click(opener);
+    // The palette (z-60) stacks above the drawer (z-50) and is reachable in remote
+    // mode via Ctrl+K. With both open, the drawer's Escape handler must bail so a
+    // single Escape dismisses only the palette layer, not the drawer underneath.
+    act(() => useStore.setState({ showPalette: true }));
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(useStore.getState().showSidebar).toBe(true);
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+
+    // Once the palette layer is gone, a second Escape collapses the drawer.
+    act(() => useStore.setState({ showPalette: false }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(useStore.getState().showSidebar).toBe(false);
+  });
+
+  it("moves focus into the drawer on open and restores it to the opener on close", () => {
+    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+
+    render(<App />);
+    const opener = screen.getByRole("button", { name: "Toggle sessions" });
+    // The opener is the focused trigger when the drawer opens.
+    opener.focus();
+    expect(document.activeElement).toBe(opener);
+
+    fireEvent.click(opener);
+
+    // Focus moves onto the dialog container (a non-input element, so the phone
+    // soft keyboard doesn't pop), not left on the now-occluded hamburger.
+    const dialog = screen.getByRole("dialog", { name: "Sessions" });
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    expect(document.activeElement).toBe(dialog);
+
+    // Closing restores focus to the opener that launched the drawer.
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(opener);
+  });
+
+  it("traps Tab within the drawer (wraps from the last focusable back to the first)", () => {
+    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Toggle sessions" }));
+
+    const dialog = screen.getByRole("dialog", { name: "Sessions" });
+    // With the Sidebar stubbed, the only tabbable descendant is the backdrop
+    // Close button — it's both the first and last focusable in the trap.
+    const close = screen.getByRole("button", { name: "Close sessions" });
+    close.focus();
+    expect(document.activeElement).toBe(close);
+
+    // Tab from the last focusable wraps to the first (still the Close button),
+    // so focus never escapes the modal into the chat behind the backdrop.
+    fireEvent.keyDown(dialog, { key: "Tab" });
+    expect(document.activeElement).toBe(close);
+
+    // Shift+Tab from the first focusable wraps back to the last (also Close).
+    fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(close);
+  });
+
   it("hides the desktop command-palette button on the phone", () => {
     useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
 
@@ -251,6 +377,28 @@ describe("TitleBar", () => {
     expect(screen.getByText("Refactor the parser")).toBeInTheDocument();
   });
 
+  it("shows the active session title in the title-bar breadcrumb (not as a competing heading)", () => {
+    useStore.setState({
+      sessions: [
+        {
+          id: "a",
+          title: "Refactor the parser",
+          workspace: null,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+      activeId: "a",
+    });
+
+    render(<App />);
+
+    // The breadcrumb shows the title as plain text. It is deliberately NOT a
+    // heading, so it never competes with Chat's single empty-state/error <h1>.
+    expect(screen.getByText("Refactor the parser")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Refactor the parser" })).not.toBeInTheDocument();
+  });
+
   it("renders the preview-mode badge outside Tauri", () => {
     m.isTauri.mockReturnValue(false);
 
@@ -270,11 +418,20 @@ describe("TitleBar", () => {
   it("toggles the file explorer via the TitleBar button", () => {
     render(<App />);
 
-    expect(screen.queryByTestId("file-explorer")).not.toBeInTheDocument();
+    // The rail is mounted but collapsed (0fr / inert) before the toggle, and the
+    // toggle button reports its off state to assistive tech via aria-pressed.
+    const rail = screen.getByTestId("file-rail");
+    expect(rail).toHaveStyle({ gridTemplateColumns: "0fr" });
+    expect(rail).toHaveAttribute("inert");
+    const toggle = screen.getByRole("button", { name: "Toggle file explorer (Ctrl+B)" });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
 
-    fireEvent.click(screen.getByTitle("Toggle file explorer (Ctrl+B)"));
+    fireEvent.click(toggle);
 
-    expect(screen.getByTestId("file-explorer")).toBeInTheDocument();
+    // After the toggle it expands to 1fr, drops inert, and flips aria-pressed on.
+    expect(screen.getByTestId("file-rail")).toHaveStyle({ gridTemplateColumns: "1fr" });
+    expect(screen.getByTestId("file-rail")).not.toHaveAttribute("inert");
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
     expect(useStore.getState().showFiles).toBe(true);
   });
 
@@ -335,6 +492,29 @@ describe("global keyboard shortcuts", () => {
 
     expect(useStore.getState().showFiles).toBe(true);
     expect(screen.getByTestId("file-explorer")).toBeInTheDocument();
+    // Toggling on expands the rail's grid column from 0fr to 1fr.
+    expect(screen.getByTestId("file-rail")).toHaveStyle({ gridTemplateColumns: "1fr" });
+  });
+
+  it("rescues focus to the file-toggle button when Ctrl+B collapses the rail", () => {
+    // Open the rail first so the toggle is a true->false (collapse) transition.
+    useStore.setState({ showFiles: true });
+    render(<App />);
+
+    // Simulate the inert-collapse blur: when the rail goes inert the browser
+    // blurs the focused tree row and focus falls to <body>. We can't focus a
+    // real treeitem (FileExplorer is stubbed), so we reproduce the end state.
+    act(() => (document.body as HTMLElement).focus());
+    expect(document.activeElement).toBe(document.body);
+
+    fireEvent.keyDown(window, { key: "b", ctrlKey: true });
+
+    // The collapse-edge effect rescues focus to the still-visible, still-tabbable
+    // toggle button instead of leaving the keyboard user stranded on <body>.
+    expect(useStore.getState().showFiles).toBe(false);
+    const toggle = screen.getByRole("button", { name: "Toggle file explorer (Ctrl+B)" });
+    expect(document.activeElement).toBe(toggle);
+    expect(document.activeElement).not.toBe(document.body);
   });
 
   it("Ctrl+, opens settings", () => {
@@ -354,6 +534,143 @@ describe("global keyboard shortcuts", () => {
 
     const st = useStore.getState();
     expect(st.showPalette).toBe(false);
+    expect(st.showFiles).toBe(false);
+    expect(st.showSettings).toBe(false);
+  });
+
+  it("ignores shell shortcuts (except Ctrl+K) while typing in an input", () => {
+    render(<App />);
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.focus();
+
+    // A real event so e.target is the focused input (fireEvent.keyDown(window)
+    // would target window, defeating the guard). Ctrl+, must NOT open Settings
+    // while the user is typing.
+    act(() => {
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: ",", ctrlKey: true, bubbles: true }));
+    });
+
+    const st = useStore.getState();
+    expect(st.showPalette).toBe(false);
+    expect(st.showSettings).toBe(false);
+    document.body.removeChild(input);
+  });
+
+  it("ignores shell shortcuts while typing in a textarea", () => {
+    render(<App />);
+    const ta = document.createElement("textarea");
+    document.body.appendChild(ta);
+    ta.focus();
+
+    act(() => {
+      ta.dispatchEvent(new KeyboardEvent("keydown", { key: ",", ctrlKey: true, bubbles: true }));
+    });
+
+    expect(useStore.getState().showSettings).toBe(false);
+    document.body.removeChild(ta);
+  });
+
+  it("keeps Ctrl+K live from a focused field (it's the advertised palette toggle)", () => {
+    render(<App />);
+    const ta = document.createElement("textarea");
+    document.body.appendChild(ta);
+    ta.focus();
+
+    act(() => {
+      ta.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
+    });
+
+    // Unlike the other shortcuts, Ctrl+K is not suppressed while typing — it must
+    // open the command palette straight from the composer textarea.
+    expect(useStore.getState().showPalette).toBe(true);
+    document.body.removeChild(ta);
+  });
+
+  it("announces a dropped remote link via a persistent App-level live region", () => {
+    useStore.setState({
+      remoteMode: true,
+      remoteConnected: true,
+      remoteVerified: true,
+      remoteDropped: false,
+    });
+    render(<App />);
+
+    // No drop message while the link is healthy — the region is mounted but empty.
+    expect(screen.queryByText(/Connection to desktop lost/)).not.toBeInTheDocument();
+
+    act(() => useStore.setState({ remoteDropped: true }));
+
+    // The persistent region (mounted before the drop) now carries the message, so
+    // the empty->message change is announced (role=status / aria-live=polite).
+    const status = screen.getByText(/Connection to desktop lost/);
+    expect(status).toHaveAttribute("role", "status");
+    expect(status).toHaveAttribute("aria-live", "polite");
+  });
+
+  it("announces a successful remote pairing on the connected+verified edge", () => {
+    vi.useFakeTimers();
+    try {
+      // Start in remote mode on the pairing screen (not yet connected/verified),
+      // so the live region is mounted empty and the success message is announced
+      // as an empty->message change once the SAS is confirmed.
+      useStore.setState({ remoteMode: true, remoteConnected: false, remoteVerified: false });
+      render(<App />);
+
+      expect(screen.queryByText(/Connected to your desktop/)).not.toBeInTheDocument();
+
+      // Confirm-SAS path: connected + verified flip true together, clearing the
+      // gate. The false->true edge sets the transient success announcement.
+      act(() => useStore.setState({ remoteConnected: true, remoteVerified: true }));
+
+      const status = screen.getByText(/Connected to your desktop/);
+      expect(status).toHaveAttribute("role", "status");
+      expect(status).toHaveAttribute("aria-live", "polite");
+
+      // The message is transient: it clears so a later re-announcement can fire.
+      act(() => vi.advanceTimersByTime(4000));
+      expect(screen.queryByText(/Connected to your desktop/)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not stack the palette over open Settings (Ctrl+K is a no-op)", () => {
+    useStore.setState({ showSettings: true });
+    render(<App />);
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+
+    // Settings is open: Ctrl+K must not open the palette on top of it.
+    expect(useStore.getState().showPalette).toBe(false);
+    expect(useStore.getState().showSettings).toBe(true);
+  });
+
+  it("ignores Ctrl+N/B/, while Settings is open", () => {
+    useStore.setState({ showSettings: true });
+    render(<App />);
+    const before = useStore.getState().sessions.length;
+
+    fireEvent.keyDown(window, { key: "n", ctrlKey: true });
+    fireEvent.keyDown(window, { key: "b", ctrlKey: true });
+    fireEvent.keyDown(window, { key: ",", ctrlKey: true });
+
+    const st = useStore.getState();
+    expect(st.sessions).toHaveLength(before);
+    expect(st.showFiles).toBe(false);
+  });
+
+  it("ignores Ctrl+N/B/, while the palette is open", () => {
+    useStore.setState({ showPalette: true });
+    render(<App />);
+    const before = useStore.getState().sessions.length;
+
+    fireEvent.keyDown(window, { key: "n", ctrlKey: true });
+    fireEvent.keyDown(window, { key: "b", ctrlKey: true });
+    fireEvent.keyDown(window, { key: ",", ctrlKey: true });
+
+    const st = useStore.getState();
+    expect(st.sessions).toHaveLength(before);
     expect(st.showFiles).toBe(false);
     expect(st.showSettings).toBe(false);
   });

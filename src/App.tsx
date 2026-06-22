@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useStore } from "./store/store";
 import { Sidebar } from "./components/Sidebar";
 import { Chat } from "./components/Chat";
@@ -20,10 +20,49 @@ export default function App() {
   const remoteMode = useStore((s) => s.remoteMode);
   const remoteConnected = useStore((s) => s.remoteConnected);
   const remoteVerified = useStore((s) => s.remoteVerified);
+  const remoteDropped = useStore((s) => s.remoteDropped);
+
+  // A stable target for keyboard focus after the file rail collapses: the
+  // TitleBar file-toggle button stays visible and tabbable, so it's where a
+  // keyboard user who was inside the (now-inert) tree should land.
+  const fileToggleRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     void init();
   }, [init]);
+
+  // Collapsing the file rail makes it inert, which blurs any focused tree row
+  // and drops focus to <body> (Ctrl+B / the toggle both fire over a focused
+  // <button> tree row — they're not caught by the typing guard). Mirror the
+  // PermissionPrompt focus-restore: on the open->closed edge, rescue focus to
+  // the still-visible toggle so the user keeps their place instead of being
+  // stranded on <body>. Gated on the transition so it never grabs focus on the
+  // initial collapsed mount.
+  const wasFilesOpen = useRef(showFiles);
+  useEffect(() => {
+    if (wasFilesOpen.current && !showFiles && document.activeElement === document.body) {
+      fileToggleRef.current?.focus();
+    }
+    wasFilesOpen.current = showFiles;
+  }, [showFiles]);
+
+  // Announce a successful remote pairing, mirroring the remoteDropped case. The
+  // confirm-SAS path flips remoteGate false and unmounts the pairing screen with
+  // no spoken feedback; track the prior connected+verified value and, on the
+  // false->true edge, set a transient message so the empty->message change is
+  // announced by AT, then clear it. No animation, so no reduced-motion concern.
+  const remoteLive = remoteConnected && remoteVerified;
+  const prevRemoteLive = useRef(remoteLive);
+  const [remoteConnectedMsg, setRemoteConnectedMsg] = useState("");
+  useEffect(() => {
+    if (remoteLive && !prevRemoteLive.current) {
+      setRemoteConnectedMsg("Connected to your desktop.");
+      const id = setTimeout(() => setRemoteConnectedMsg(""), 4000);
+      prevRemoteLive.current = remoteLive;
+      return () => clearTimeout(id);
+    }
+    prevRemoteLive.current = remoteLive;
+  }, [remoteLive]);
 
   // Release the live remote frame subscription if the app tree unmounts (HMR, a
   // root remount) so a stale native listener can't survive into a new store
@@ -35,17 +74,37 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
       if (!mod) return;
+      // Don't hijack keystrokes while the user is typing in a field (Settings
+      // API-key input, the pairing textarea, the palette search, etc.).
+      const t = e.target as HTMLElement | null;
+      const inField =
+        t?.tagName === "INPUT" || t?.tagName === "TEXTAREA" || t?.isContentEditable === true;
+      // Ctrl/Cmd+K stays live even from a field — it's the advertised palette
+      // toggle (e.g. straight from the composer textarea). The other shortcuts
+      // stay suppressed while typing so they don't hijack keystrokes.
+      if (inField && e.key !== "k") return;
       const s = useStore.getState();
+      // Don't stack shortcuts on top of an open modal. Ctrl+K stays live as the
+      // advertised palette toggle, but is a no-op over Settings (no stacking).
+      const modalOpen = s.showSettings || s.showPalette;
       if (e.key === "k") {
+        if (s.showSettings) {
+          e.preventDefault();
+          return;
+        }
         e.preventDefault();
         s.setShowPalette(!s.showPalette);
+        return;
       } else if (e.key === "n") {
+        if (modalOpen) return;
         e.preventDefault();
         void s.newSession();
       } else if (e.key === "b") {
+        if (modalOpen) return;
         e.preventDefault();
         s.toggleFiles();
       } else if (e.key === ",") {
+        if (modalOpen) return;
         e.preventDefault();
         s.setShowSettings(true);
       }
@@ -65,6 +124,16 @@ export default function App() {
       {scanlines && <div className="pc-scanlines" aria-hidden="true" />}
       <div className="pc-vignette" aria-hidden="true" />
 
+      {/* Persistent live region for the remote link status. It must stay mounted
+          across the connected<->pairing transition so a drop is announced as an
+          empty->message change — a region that mounts with its text already set
+          is never announced by screen readers. */}
+      {remoteMode && (
+        <span className="sr-only" role="status" aria-live="polite">
+          {remoteDropped ? "Connection to desktop lost. Reconnect available." : remoteConnectedMsg}
+        </span>
+      )}
+
       {remoteGate ? (
         <RemotePairing />
       ) : (
@@ -75,9 +144,27 @@ export default function App() {
                 would eat the narrow viewport, so there it becomes a drawer (below)
                 and the chat takes the full width. */}
             {!remoteMode && <Sidebar />}
-            {showFiles && <FileExplorer />}
+            {/* The file rail stays mounted and animates its inline width (0fr<->1fr
+                grid accordion, the same pattern ToolCall uses on rows) so toggling
+                it slides instead of jumping the main column sideways. The inner
+                overflow-hidden clips the 236px-wide content to zero; reduced-motion
+                users get the instant swap they had before. Collapsed, the rail is
+                inert + aria-hidden so its tree stays out of the tab order and AT. */}
+            {!remoteMode && (
+              <div
+                data-testid="file-rail"
+                className="grid shrink-0 transition-[grid-template-columns] duration-200 ease-out motion-reduce:transition-none"
+                style={{ gridTemplateColumns: showFiles ? "1fr" : "0fr" }}
+                aria-hidden={!showFiles || undefined}
+                inert={!showFiles}
+              >
+                <div className="overflow-hidden">
+                  <FileExplorer />
+                </div>
+              </div>
+            )}
             <main className="flex min-w-0 flex-1 flex-col">
-              <TitleBar />
+              <TitleBar fileToggleRef={fileToggleRef} />
               <Chat />
             </main>
           </div>
@@ -94,13 +181,73 @@ export default function App() {
   );
 }
 
+const FOCUSABLE =
+  'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+
 /** The session list as a slide-in overlay — the phone's equivalent of the
  *  desktop's inline sidebar rail. Tapping the backdrop closes it; selecting or
- *  creating a session closes it too (handled in the store). */
+ *  creating a session closes it too (handled in the store). Behaves as a modal
+ *  dialog: focus moves in on open, Tab is trapped, and focus returns to the
+ *  opener on close. */
 function SidebarDrawer() {
   const setShowSidebar = useStore((s) => s.setShowSidebar);
+  const drawerRef = useRef<HTMLDivElement>(null);
+  // Escape closes the drawer (the App keydown effect only handles modified keys,
+  // so plain Escape would otherwise strand focus inside the overlay). Bail while
+  // Settings (z-58) or the command palette (z-60) is open: both stack on top of
+  // the drawer (z-50), so the first Escape must dismiss only the topmost layer.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const s = useStore.getState();
+      if (!s.showSettings && !s.showPalette) setShowSidebar(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [setShowSidebar]);
+  // Treat the drawer as a modal dialog: move focus into it on open (onto the
+  // container, a non-input element, so the phone soft keyboard doesn't pop) and
+  // restore focus to the opener (the TitleBar hamburger) on close.
+  useEffect(() => {
+    const opener = document.activeElement as HTMLElement | null;
+    drawerRef.current?.focus();
+    return () => {
+      if (opener && opener.isConnected) opener.focus();
+    };
+  }, []);
+  // Trap Tab within the drawer so it can't walk into the chat behind the backdrop.
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== "Tab") return;
+    const container = drawerRef.current;
+    if (!container) return;
+    const focusable = [...container.querySelectorAll<HTMLElement>(FOCUSABLE)];
+    if (focusable.length === 0) {
+      // Nothing tabbable inside — keep focus pinned to the container.
+      e.preventDefault();
+      container.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+    if (e.shiftKey && (active === first || active === container)) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && active === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
   return (
-    <div className="fixed inset-0 z-50 flex">
+    <div
+      ref={drawerRef}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Sessions"
+      tabIndex={-1}
+      onKeyDown={onKeyDown}
+      className="fixed inset-0 z-50 flex outline-none"
+    >
       <div className="pc-drawer h-full shrink-0">
         <Sidebar />
       </div>
@@ -136,7 +283,7 @@ function RemoteBanner() {
   );
 }
 
-function TitleBar() {
+function TitleBar({ fileToggleRef }: { fileToggleRef?: React.Ref<HTMLButtonElement> }) {
   const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
   const showFiles = useStore((s) => s.showFiles);
   const toggleFiles = useStore((s) => s.toggleFiles);
@@ -166,8 +313,10 @@ function TitleBar() {
           </button>
         )}
         <button
+          ref={fileToggleRef}
           onClick={toggleFiles}
           aria-label="Toggle file explorer (Ctrl+B)"
+          aria-pressed={showFiles}
           title="Toggle file explorer (Ctrl+B)"
           className={`${remoteMode ? "hidden " : ""}flex h-[30px] w-[30px] items-center justify-center rounded-[7px] border transition-colors ${
             showFiles

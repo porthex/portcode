@@ -149,6 +149,25 @@ describe("StatusHud", () => {
     expect(live.queryByText(/LIVE/)).not.toBeInTheDocument();
   });
 
+  it("gives the link dot a stronger ring pulse while streaming, success when idle", () => {
+    useStore.setState({ sessions: [session()], activeId: "s1", streaming: true });
+    const { container, rerender } = render(<StatusHud />);
+
+    // The dot lives in the NEURAL LINK segment (the last right segment).
+    const liveDot = container.querySelector(".pc-hud-seg--right:last-child .pc-dot");
+    expect(liveDot).not.toBeNull();
+    expect(liveDot).toHaveClass("pc-dot--ring");
+    expect(liveDot).not.toHaveClass("pc-dot--success");
+    // Decorative — never voiced by a screen reader.
+    expect(liveDot).toHaveAttribute("aria-hidden", "true");
+
+    useStore.setState({ streaming: false });
+    rerender(<StatusHud />);
+    const idleDot = container.querySelector(".pc-hud-seg--right:last-child .pc-dot");
+    expect(idleDot).toHaveClass("pc-dot--success");
+    expect(idleDot).not.toHaveClass("pc-dot--ring");
+  });
+
   it("renders the model and policy from settings", () => {
     useStore.setState({
       sessions: [session()],

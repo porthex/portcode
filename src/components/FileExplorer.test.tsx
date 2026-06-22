@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 
 import { FileExplorer } from "./FileExplorer";
 import { useStore } from "../store/store";
@@ -148,9 +148,10 @@ describe("FileExplorer tree", () => {
 
     expect(await screen.findByText("src")).toBeInTheDocument();
     expect(screen.getByText("README.md")).toBeInTheDocument();
-    // A collapsed directory shows both the caret "▸" and the amber folder
-    // glyph "▸" (two distinct spans share the same right-pointing triangle).
-    expect(screen.getAllByText("▸")).toHaveLength(2);
+    // A collapsed directory shows the closed caret "▸" plus a neutral amber
+    // folder mark "▣" — so the caret is now the only right-pointing triangle.
+    expect(screen.getAllByText("▸")).toHaveLength(1);
+    expect(screen.getByText("▣")).toBeInTheDocument();
     // README.md is the extension-less-of-interest fallback "◇" (text-faint).
     expect(screen.getByText("◇")).toBeInTheDocument();
   });
@@ -162,14 +163,18 @@ describe("FileExplorer tree", () => {
 
     render(<FileExplorer />);
 
-    const dirBtn = await screen.findByRole("button", { name: /src/ });
+    // Rows are tree items (role="treeitem"); the dir's accessible name is its
+    // explicit "<name> folder" label, which the /src/ matcher still matches.
+    const dirBtn = await screen.findByRole("treeitem", { name: /src/ });
     fireEvent.click(dirBtn);
 
     // Second listDir call carries the directory's path.
     await waitFor(() => expect(m.listDir).toHaveBeenNthCalledWith(2, "src"));
     expect(await screen.findByText("App.tsx")).toBeInTheDocument();
-    // Caret flips to the expanded glyph.
+    // Caret flips to the expanded glyph and the folder mark flips to its open
+    // neutral form "▢" (no second triangle to contradict the open caret).
     expect(screen.getByText("▾")).toBeInTheDocument();
+    expect(screen.getByText("▢")).toBeInTheDocument();
   });
 
   it("collapses an expanded directory without refetching, then re-expands from cache", async () => {
@@ -178,21 +183,25 @@ describe("FileExplorer tree", () => {
       .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx", isDir: false })]);
 
     render(<FileExplorer />);
-    const dirBtn = await screen.findByRole("button", { name: /src/ });
+    const dirBtn = await screen.findByRole("treeitem", { name: /src/ });
 
     // expand -> children fetched
     fireEvent.click(dirBtn);
     expect(await screen.findByText("App.tsx")).toBeInTheDocument();
     expect(m.listDir).toHaveBeenCalledTimes(2);
 
-    // collapse -> child hidden, no extra fetch
+    // collapse -> the accordion keeps the once-opened group mounted (it animates
+    // the grid 0fr->1fr both ways), so the child stays in the DOM but the group
+    // is hidden from AT and the row reports collapsed. No extra fetch.
     fireEvent.click(dirBtn);
-    await waitFor(() => expect(screen.queryByText("App.tsx")).not.toBeInTheDocument());
+    await waitFor(() => expect(dirBtn).toHaveAttribute("aria-expanded", "false"));
+    expect(screen.getByRole("group", { hidden: true })).toHaveAttribute("aria-hidden", "true");
     expect(m.listDir).toHaveBeenCalledTimes(2);
 
     // re-expand -> served from cache (children !== null), still no extra fetch
     fireEvent.click(dirBtn);
-    expect(await screen.findByText("App.tsx")).toBeInTheDocument();
+    await waitFor(() => expect(dirBtn).toHaveAttribute("aria-expanded", "true"));
+    expect(screen.getByText("App.tsx")).toBeInTheDocument();
     expect(m.listDir).toHaveBeenCalledTimes(2);
   });
 
@@ -209,7 +218,7 @@ describe("FileExplorer tree", () => {
       );
 
     render(<FileExplorer />);
-    const dirBtn = await screen.findByRole("button", { name: /src/ });
+    const dirBtn = await screen.findByRole("treeitem", { name: /src/ });
 
     // First click kicks off the (still-pending) child fetch.
     fireEvent.click(dirBtn);
@@ -233,7 +242,7 @@ describe("FileExplorer tree", () => {
       .mockRejectedValueOnce(new Error("permission denied"));
 
     render(<FileExplorer />);
-    const dirBtn = await screen.findByRole("button", { name: /locked/ });
+    const dirBtn = await screen.findByRole("treeitem", { name: /locked/ });
 
     fireEvent.click(dirBtn);
 
@@ -241,7 +250,9 @@ describe("FileExplorer tree", () => {
     // caret collapses back to "▸" and no stuck-open empty directory remains.
     await waitFor(() => expect(m.listDir).toHaveBeenNthCalledWith(2, "locked"));
     await waitFor(() => expect(screen.queryByText("▾")).not.toBeInTheDocument());
-    expect(screen.getAllByText("▸")).toHaveLength(2);
+    // Collapsed again: the caret is the only "▸"; the folder mark reverts to "▣".
+    expect(screen.getAllByText("▸")).toHaveLength(1);
+    expect(screen.getByText("▣")).toBeInTheDocument();
 
     // children settled to [] (not null), so re-expanding serves the cache
     // without re-hitting the failing backend.
@@ -256,7 +267,7 @@ describe("FileExplorer tree", () => {
       .mockResolvedValueOnce([]);
 
     render(<FileExplorer />);
-    const dirBtn = await screen.findByRole("button", { name: /empty/ });
+    const dirBtn = await screen.findByRole("treeitem", { name: /empty/ });
 
     fireEvent.click(dirBtn);
 
@@ -271,13 +282,272 @@ describe("FileExplorer tree", () => {
     ]);
 
     render(<FileExplorer />);
-    const fileBtn = await screen.findByRole("button", { name: /notes\.md/ });
+    const fileBtn = await screen.findByRole("treeitem", { name: /notes\.md/ });
 
     fireEvent.click(fileBtn);
 
     // appendDraft folded the path into the real store; no second listDir.
     await waitFor(() => expect(useStore.getState().draft).toBe("docs/notes.md "));
     expect(m.listDir).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("FileExplorer accessibility", () => {
+  it("labels the <aside> landmark so it is a named complementary region", async () => {
+    render(<FileExplorer />);
+
+    expect(screen.getByRole("complementary", { name: "File explorer" })).toBeInTheDocument();
+    await waitFor(() => expect(m.listDir).toHaveBeenCalledWith(undefined));
+  });
+
+  it("exposes tree semantics: a tree container with treeitem rows", async () => {
+    m.listDir.mockResolvedValueOnce([
+      entry({ name: "src", path: "src", isDir: true }),
+      entry({ name: "README.md", path: "README.md", isDir: false }),
+    ]);
+
+    render(<FileExplorer />);
+
+    expect(await screen.findByText("src")).toBeInTheDocument();
+    expect(screen.getByRole("tree", { name: "File tree" })).toBeInTheDocument();
+    // Both rows are treeitems (one directory, one file).
+    expect(screen.getAllByRole("treeitem")).toHaveLength(2);
+  });
+
+  it("reflects directory open/closed state via aria-expanded", async () => {
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })])
+      .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx", isDir: false })]);
+
+    render(<FileExplorer />);
+
+    const dirBtn = await screen.findByRole("treeitem", { name: "src folder" });
+    // Collapsed directory advertises aria-expanded="false".
+    expect(dirBtn).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(dirBtn);
+
+    // After expanding, the same row flips to aria-expanded="true".
+    await waitFor(() => expect(dirBtn).toHaveAttribute("aria-expanded", "true"));
+  });
+
+  it("omits aria-expanded on file rows (only directories are expandable)", async () => {
+    m.listDir.mockResolvedValueOnce([
+      entry({ name: "notes.md", path: "docs/notes.md", isDir: false }),
+    ]);
+
+    render(<FileExplorer />);
+
+    const fileBtn = await screen.findByRole("treeitem", { name: "notes.md" });
+    expect(fileBtn).not.toHaveAttribute("aria-expanded");
+  });
+
+  it("gives a directory row the explicit accessible name '<name> folder'", async () => {
+    m.listDir.mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })]);
+
+    render(<FileExplorer />);
+
+    // The decorative caret/glyph spans are aria-hidden, so the row's accessible
+    // name comes solely from the explicit aria-label, not the leaked symbols.
+    expect(await screen.findByRole("treeitem", { name: "src folder" })).toBeInTheDocument();
+    // Decorative glyphs stay in the DOM (aria-hidden) so text assertions hold:
+    // a single closed caret "▸" plus the neutral closed folder mark "▣".
+    expect(screen.getAllByText("▸")).toHaveLength(1);
+    expect(screen.getByText("▣")).toBeInTheDocument();
+  });
+
+  it("surfaces a workspace open failure in an alert region", () => {
+    useStore.setState({ workspaceError: "permission denied" });
+
+    render(<FileExplorer />);
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Couldn’t open folder: permission denied");
+  });
+
+  it("owns expanded children in a role='group' so the tree levels are real", async () => {
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })])
+      .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx", isDir: false })]);
+
+    render(<FileExplorer />);
+
+    const dirBtn = await screen.findByRole("treeitem", { name: "src folder" });
+    // A collapsed directory owns nothing: no child group yet.
+    expect(screen.queryByRole("group")).not.toBeInTheDocument();
+
+    fireEvent.click(dirBtn);
+
+    // After expanding, the child treeitem lives inside a role="group" the tree
+    // owns — the parent/child ownership aria-expanded implies, not a flat list.
+    const tree = screen.getByRole("tree");
+    const group = await within(tree).findByRole("group");
+    expect(within(group).getByRole("treeitem", { name: /App\.tsx/ })).toBeInTheDocument();
+  });
+
+  it("annotates nesting depth with aria-level on each treeitem", async () => {
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })])
+      .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx", isDir: false })]);
+
+    render(<FileExplorer />);
+
+    const dirBtn = await screen.findByRole("treeitem", { name: "src folder" });
+    // Root rows are level 1.
+    expect(dirBtn).toHaveAttribute("aria-level", "1");
+
+    fireEvent.click(dirBtn);
+
+    // A child rendered inside the group is level 2.
+    const child = await screen.findByRole("treeitem", { name: /App\.tsx/ });
+    expect(child).toHaveAttribute("aria-level", "2");
+  });
+
+  it("uses roving tabindex: only one row is a tab stop at a time", async () => {
+    m.listDir.mockResolvedValueOnce([
+      entry({ name: "src", path: "src", isDir: true }),
+      entry({ name: "README.md", path: "README.md", isDir: false }),
+    ]);
+
+    render(<FileExplorer />);
+
+    const first = await screen.findByRole("treeitem", { name: "src folder" });
+    const second = screen.getByRole("treeitem", { name: "README.md" });
+    // The first root is the default tab stop; the rest leave the tab order.
+    expect(first).toHaveAttribute("tabindex", "0");
+    expect(second).toHaveAttribute("tabindex", "-1");
+
+    // Focusing a row promotes it to the active (tabIndex 0) row, demoting the
+    // prior one — one tab stop moves with focus.
+    second.focus();
+    await waitFor(() => expect(second).toHaveAttribute("tabindex", "0"));
+    expect(first).toHaveAttribute("tabindex", "-1");
+  });
+
+  it("navigates rows with ArrowDown / ArrowUp / Home / End", async () => {
+    m.listDir.mockResolvedValueOnce([
+      entry({ name: "a.ts", path: "a.ts", isDir: false }),
+      entry({ name: "b.ts", path: "b.ts", isDir: false }),
+      entry({ name: "c.ts", path: "c.ts", isDir: false }),
+    ]);
+
+    render(<FileExplorer />);
+    const tree = await screen.findByRole("tree");
+    const a = screen.getByRole("treeitem", { name: "a.ts" });
+    const b = screen.getByRole("treeitem", { name: "b.ts" });
+    const c = screen.getByRole("treeitem", { name: "c.ts" });
+
+    a.focus();
+    // ArrowDown walks to the next row and moves focus there.
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    expect(b).toHaveFocus();
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    expect(c).toHaveFocus();
+    // ArrowDown at the bottom is clamped (no wrap, no throw).
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    expect(c).toHaveFocus();
+
+    // ArrowUp walks back up.
+    fireEvent.keyDown(tree, { key: "ArrowUp" });
+    expect(b).toHaveFocus();
+
+    // Home jumps to the first row, End to the last.
+    fireEvent.keyDown(tree, { key: "Home" });
+    expect(a).toHaveFocus();
+    fireEvent.keyDown(tree, { key: "End" });
+    expect(c).toHaveFocus();
+  });
+
+  it("expands with ArrowRight and collapses with ArrowLeft on a directory", async () => {
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })])
+      .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx", isDir: false })]);
+
+    render(<FileExplorer />);
+    const tree = await screen.findByRole("tree");
+    const dir = screen.getByRole("treeitem", { name: "src folder" });
+
+    dir.focus();
+    // ArrowRight on a collapsed dir expands it (fetching children).
+    fireEvent.keyDown(tree, { key: "ArrowRight" });
+    await waitFor(() => expect(dir).toHaveAttribute("aria-expanded", "true"));
+    expect(await screen.findByRole("treeitem", { name: /App\.tsx/ })).toBeInTheDocument();
+
+    // ArrowRight on the already-open dir steps focus into its first child.
+    fireEvent.keyDown(tree, { key: "ArrowRight" });
+    expect(screen.getByRole("treeitem", { name: /App\.tsx/ })).toHaveFocus();
+
+    // ArrowLeft back on the dir collapses it.
+    dir.focus();
+    fireEvent.keyDown(tree, { key: "ArrowLeft" });
+    await waitFor(() => expect(dir).toHaveAttribute("aria-expanded", "false"));
+    // The accordion keeps the child group mounted (so it animates closed), but
+    // aria-hidden drops it from the accessibility tree, so the child treeitem is
+    // no longer exposed to AT even though it stays in the DOM.
+    expect(screen.queryByRole("treeitem", { name: /App\.tsx/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("group", { hidden: true })).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("ArrowDown after collapsing a folder skips the now-hidden mounted children", async () => {
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })])
+      .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx", isDir: false })]);
+
+    render(<FileExplorer />);
+    const tree = await screen.findByRole("tree");
+    const dir = screen.getByRole("treeitem", { name: "src folder" });
+
+    // Expand (mounts the child), then collapse (child stays mounted, aria-hidden).
+    dir.focus();
+    fireEvent.keyDown(tree, { key: "ArrowRight" });
+    await waitFor(() => expect(dir).toHaveAttribute("aria-expanded", "true"));
+    expect(await screen.findByRole("treeitem", { name: /App\.tsx/ })).toBeInTheDocument();
+    dir.focus();
+    fireEvent.keyDown(tree, { key: "ArrowLeft" });
+    await waitFor(() => expect(dir).toHaveAttribute("aria-expanded", "false"));
+
+    // ArrowDown must NOT move focus onto the invisible, aria-hidden child row —
+    // with only the dir visible, navigation clamps on it (focus never enters
+    // aria-hidden content).
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    expect(dir).toHaveFocus();
+  });
+});
+
+describe("FileExplorer workspace switch", () => {
+  it("remounts the tree on a workspace change, dropping stale subtree state", async () => {
+    // Workspace A: expand "src" -> children fetched once.
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })])
+      .mockResolvedValueOnce([entry({ name: "A.tsx", path: "src/A.tsx", isDir: false })]);
+
+    const { rerender } = render(<FileExplorer />);
+    const dirA = await screen.findByRole("treeitem", { name: "src folder" });
+    fireEvent.click(dirA);
+    expect(await screen.findByText("A.tsx")).toBeInTheDocument();
+    expect(m.listDir).toHaveBeenCalledTimes(2);
+
+    // Switch workspace: the keyed container remounts TreeNodes, so the new
+    // same-named "src" starts collapsed with no cached children.
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })])
+      .mockResolvedValueOnce([entry({ name: "B.tsx", path: "src/B.tsx", isDir: false })]);
+    useStore.setState({
+      settings: { ...initialState.settings, workspace: "C:/other/repo" },
+    });
+    rerender(<FileExplorer />);
+
+    // Root re-listed for the new workspace (call 3), and the prior child is gone.
+    await waitFor(() => expect(m.listDir).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.queryByText("A.tsx")).not.toBeInTheDocument());
+
+    // Re-expanding the same-named folder re-requests listDir for "src" instead
+    // of serving the previous workspace's stale cached children.
+    const dirB = await screen.findByRole("treeitem", { name: "src folder" });
+    fireEvent.click(dirB);
+    await waitFor(() => expect(m.listDir).toHaveBeenCalledTimes(4));
+    expect(await screen.findByText("B.tsx")).toBeInTheDocument();
+    expect(screen.queryByText("A.tsx")).not.toBeInTheDocument();
   });
 });
 

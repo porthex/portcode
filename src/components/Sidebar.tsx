@@ -1,3 +1,5 @@
+import { useRef, type KeyboardEvent } from "react";
+
 import { isTauri } from "../lib/ipc";
 import { useStore } from "../store/store";
 import type { Session } from "../types";
@@ -21,8 +23,44 @@ export function Sidebar() {
       ? "API key set"
       : "Not authenticated";
 
+  // Roving-tabindex stops for arrow-key navigation through the session list: each
+  // select button registers itself here so the nav handler can move focus.
+  const rowRefs = useRef<(HTMLButtonElement | null)[]>([]);
+
+  // Up/Down/Home/End move selection through the session list and follow focus to
+  // the newly active row. No-ops while a turn is streaming (selectSession is
+  // disabled then) or when there are no sessions.
+  const onListKeyDown = (e: KeyboardEvent<HTMLElement>) => {
+    if (streaming || sessions.length === 0) return;
+    const current = sessions.findIndex((s) => s.id === activeId);
+    const from = current === -1 ? 0 : current;
+    let next: number;
+    switch (e.key) {
+      case "ArrowDown":
+        next = Math.min(from + 1, sessions.length - 1);
+        break;
+      case "ArrowUp":
+        next = Math.max(from - 1, 0);
+        break;
+      case "Home":
+        next = 0;
+        break;
+      case "End":
+        next = sessions.length - 1;
+        break;
+      default:
+        return;
+    }
+    e.preventDefault();
+    void selectSession(sessions[next].id);
+    rowRefs.current[next]?.focus();
+  };
+
   return (
-    <aside className="flex h-full w-[248px] shrink-0 flex-col border-r border-border bg-panel">
+    <aside
+      aria-label="Sessions"
+      className="flex h-full w-[248px] shrink-0 flex-col border-r border-border bg-panel"
+    >
       {/* Header */}
       <div className="flex items-center gap-2.5 px-4 py-4">
         <div className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-lg border border-accent/60 bg-gradient-to-br from-accent/30 to-accent-2/25 shadow-[0_0_14px_rgba(255,46,126,0.4)]">
@@ -53,32 +91,45 @@ export function Sidebar() {
       </div>
 
       {/* Session rows */}
-      <nav className="min-h-0 flex-1 space-y-1 overflow-y-auto px-2">
-        {sessions.map((s) => {
+      <nav
+        aria-label="Session list"
+        onKeyDown={onListKeyDown}
+        className="min-h-0 flex-1 space-y-1 overflow-y-auto px-2"
+      >
+        {sessions.map((s, i) => {
           const active = s.id === activeId;
-          const meta = `⎇ ${workspaceLabel(s.workspace)} · ${relativeTime(s.updatedAt)}`;
           return (
             <div
               key={s.id}
               className={
                 active
-                  ? "group rounded-lg border border-accent/30 bg-accent/10 px-3 py-2 shadow-[inset_0_0_14px_rgba(255,46,126,0.12)]"
+                  ? "group rounded-lg border border-accent/30 bg-accent/10 px-3 py-2 shadow-[inset_0_0_14px_rgba(255,46,126,0.12)] transition-[background-color,border-color,box-shadow,color] duration-150 ease-out motion-reduce:transition-none"
                   : "pc-row group rounded-lg px-3 py-2"
               }
             >
               <div className="flex items-center">
                 <button
+                  ref={(el) => {
+                    rowRefs.current[i] = el;
+                  }}
                   onClick={() => selectSession(s.id)}
                   disabled={streaming}
+                  tabIndex={active ? 0 : -1}
+                  aria-current={active ? "true" : undefined}
                   className={`flex min-w-0 flex-1 flex-col text-left ${
                     streaming ? "cursor-not-allowed" : ""
                   }`}
                   title={streaming ? "Finish or stop the current turn first" : s.title}
                 >
-                  <span className="flex items-center gap-2">
-                    {active && <span className="pc-dot pc-dot--accent" />}
+                  <span className="relative flex items-center">
+                    {active && (
+                      <span
+                        className="pc-dot pc-dot--accent absolute left-[3px] top-1/2 -translate-y-1/2"
+                        aria-hidden="true"
+                      />
+                    )}
                     <span
-                      className={`truncate text-[13px] ${active ? "text-fg" : "pl-3 text-muted"}`}
+                      className={`truncate pl-3 text-[13px] ${active ? "text-fg" : "text-muted"}`}
                     >
                       {s.title}
                     </span>
@@ -88,13 +139,15 @@ export function Sidebar() {
                       active ? "text-muted" : "text-faint"
                     }`}
                   >
-                    {meta}
+                    <span aria-hidden="true">⎇</span> {workspaceLabel(s.workspace)} ·{" "}
+                    {relativeTime(s.updatedAt)}
                   </span>
                 </button>
                 <button
                   onClick={() => deleteSession(s.id)}
                   disabled={streaming}
-                  className={`ml-1 hidden h-6 w-6 shrink-0 items-center justify-center rounded text-faint hover:text-danger group-hover:flex ${
+                  tabIndex={active ? 0 : -1}
+                  className={`ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-danger/10 hover:text-danger group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none ${
                     streaming ? "cursor-not-allowed opacity-50" : ""
                   }`}
                   aria-label={`Delete session: ${s.title}`}
@@ -121,7 +174,7 @@ export function Sidebar() {
               <span className="font-mono text-[9px] tracking-wide text-success">
                 {signedInClaude ? "CLAUDE" : "KEY SET"}
               </span>
-              <span className="pc-dot pc-dot--ring" />
+              <span className="pc-dot pc-dot--ring" aria-hidden="true" />
             </span>
           )}
         </button>
@@ -129,9 +182,14 @@ export function Sidebar() {
             telemetry: the live session count, the backend stack identity, and
             whether the native Rust core is attached vs the browser preview mock. */}
         <div className="mt-2 flex justify-between px-2 font-mono text-[9px] tracking-wide text-faint">
-          <span>◴ {sessions.length === 1 ? "1 SESSION" : `${sessions.length} SESSIONS`}</span>
+          <span>
+            <span aria-hidden="true">◴</span>{" "}
+            {sessions.length === 1 ? "1 SESSION" : `${sessions.length} SESSIONS`}
+          </span>
           <span>RUST · TOKIO</span>
-          <span>◉ {isTauri() ? "CORE" : "PREVIEW"}</span>
+          <span>
+            <span aria-hidden="true">◉</span> {isTauri() ? "CORE" : "PREVIEW"}
+          </span>
         </div>
       </div>
     </aside>
