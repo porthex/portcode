@@ -157,6 +157,20 @@ describe("init", () => {
 
     expect(useStore.getState().initError).toBeNull();
   });
+
+  it("is a no-op for the remote client (no desktop IPCs, no stale initError)", async () => {
+    // On the phone the desktop-only session/settings commands would reject and
+    // strand a spurious crash panel over the connected remote session, so init()
+    // bails early — remote state arrives from the desktop's frames instead.
+    useStore.setState({ remoteMode: true, initError: "stale" });
+
+    await useStore.getState().init();
+
+    const st = useStore.getState();
+    expect(st.initError).toBeNull();
+    expect(m.listSessions).not.toHaveBeenCalled();
+    expect(m.getSettings).not.toHaveBeenCalled();
+  });
 });
 
 describe("newSession", () => {

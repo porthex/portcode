@@ -40,7 +40,12 @@ export function FileExplorer() {
   const onKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
     const tree = treeRef.current;
     if (!tree) return;
-    const rows = [...tree.querySelectorAll<HTMLButtonElement>('[role="treeitem"]')];
+    // Collapsed folders keep their children mounted (so the accordion can animate
+    // shut) but mark them aria-hidden; exclude those rows so arrow nav never lands
+    // focus on an invisible row inside an aria-hidden subtree.
+    const rows = [...tree.querySelectorAll<HTMLButtonElement>('[role="treeitem"]')].filter(
+      (r) => !r.closest('[aria-hidden="true"]'),
+    );
     if (rows.length === 0) return;
     const current = rows.indexOf(document.activeElement as HTMLButtonElement);
     // Focus on the container itself (tabbed in, not yet on a row) starts at the

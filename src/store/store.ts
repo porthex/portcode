@@ -213,6 +213,15 @@ export const useStore = create<AppState>((set, get) => ({
   lastPairingQr: readStr("pc.lastPairingQr"),
 
   async init() {
+    // The phone/remote client has no local sessions DB or settings — its session
+    // and message state arrive authoritatively from the desktop's frames — and the
+    // desktop-only Tauri commands below would reject on a real mobile build, leaving
+    // a stale initError that paints a spurious "Couldn't start Portcode" panel over
+    // the connected remote session. So init() is a no-op there (mirrors newSession).
+    if (get().remoteMode) {
+      set({ initError: null });
+      return;
+    }
     // Fetch settings, subscription status, and phone sync status together.
     // The oauth and phoneSync calls are kept resilient so an unwired/older
     // core can't block startup. The load-bearing calls (getSettings/listSessions/

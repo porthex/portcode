@@ -487,6 +487,31 @@ describe("FileExplorer accessibility", () => {
     expect(screen.queryByRole("treeitem", { name: /App\.tsx/ })).not.toBeInTheDocument();
     expect(screen.getByRole("group", { hidden: true })).toHaveAttribute("aria-hidden", "true");
   });
+
+  it("ArrowDown after collapsing a folder skips the now-hidden mounted children", async () => {
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })])
+      .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx", isDir: false })]);
+
+    render(<FileExplorer />);
+    const tree = await screen.findByRole("tree");
+    const dir = screen.getByRole("treeitem", { name: "src folder" });
+
+    // Expand (mounts the child), then collapse (child stays mounted, aria-hidden).
+    dir.focus();
+    fireEvent.keyDown(tree, { key: "ArrowRight" });
+    await waitFor(() => expect(dir).toHaveAttribute("aria-expanded", "true"));
+    expect(await screen.findByRole("treeitem", { name: /App\.tsx/ })).toBeInTheDocument();
+    dir.focus();
+    fireEvent.keyDown(tree, { key: "ArrowLeft" });
+    await waitFor(() => expect(dir).toHaveAttribute("aria-expanded", "false"));
+
+    // ArrowDown must NOT move focus onto the invisible, aria-hidden child row —
+    // with only the dir visible, navigation clamps on it (focus never enters
+    // aria-hidden content).
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    expect(dir).toHaveFocus();
+  });
 });
 
 describe("FileExplorer workspace switch", () => {
