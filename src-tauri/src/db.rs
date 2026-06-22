@@ -113,6 +113,9 @@ pub struct Db {
 impl Db {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
+        // Retry briefly on a transient lock instead of failing a write instantly —
+        // a swallowed write used to look like a successful persist.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(
@@ -220,18 +223,33 @@ impl Db {
         .unwrap_or(0)
     }
 
-    /// Append one canonical message; returns its row id.
-    pub fn append_message(&self, session_id: &str, msg: &ChatMessage, ts: i64) -> String {
+    /// Append one canonical message, returning its row id. Propagates the insert
+    /// failure (disk full, corruption, lock that outlived the busy-timeout) so a lost
+    /// write is surfaced as a turn error instead of silently desyncing the log.
+    pub fn try_append_message(
+        &self,
+        session_id: &str,
+        msg: &ChatMessage,
+        ts: i64,
+    ) -> rusqlite::Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let content = serde_json::to_string(&msg.content).unwrap_or_else(|_| "[]".into());
         let conn = self.conn.lock().unwrap();
         let seq = Self::next_seq(&conn, session_id);
-        let _ = conn.execute(
+        conn.execute(
             "INSERT INTO messages (id, session_id, seq, role, content, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, session_id, seq, msg.role, content, ts],
-        );
-        id
+        )?;
+        Ok(id)
+    }
+
+    /// Test-only convenience wrapper that panics on failure. Production code calls
+    /// `try_append_message` and propagates the error instead of fabricating an id.
+    #[cfg(test)]
+    pub fn append_message(&self, session_id: &str, msg: &ChatMessage, ts: i64) -> String {
+        self.try_append_message(session_id, msg, ts)
+            .expect("append_message: insert failed in test")
     }
 
     /// Canonical message list for feeding the model.
