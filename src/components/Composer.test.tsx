@@ -193,6 +193,7 @@ describe("Composer send button", () => {
           id: "a",
           title: "New chat",
           workspace: null,
+          model: "claude-opus-4-8",
           createdAt: 1,
           updatedAt: 1,
         },
@@ -225,6 +226,7 @@ describe("Composer send button", () => {
     expect(m.runAgent).toHaveBeenCalledWith(
       "a",
       "line one\nline two\nline three",
+      "claude-opus-4-8",
       expect.any(Function),
     );
   });
@@ -272,6 +274,7 @@ describe("Composer key handling", () => {
           id: "a",
           title: "New chat",
           workspace: null,
+          model: "claude-opus-4-8",
           createdAt: 1,
           updatedAt: 1,
         },

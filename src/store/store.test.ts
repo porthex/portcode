@@ -552,7 +552,7 @@ describe("send", () => {
 
   it("trims surrounding whitespace from the stored user bubble and derived title", async () => {
     let emit!: (e: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
       emit = onEvent;
       return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
     });
@@ -570,7 +570,7 @@ describe("send", () => {
     expect(st.sessions[0].title).toBe("hi");
     // The local agent is also prompted with the trimmed body (not the raw padded
     // draft), so what the user sees and what the model receives stay consistent.
-    expect(m.runAgent).toHaveBeenCalledWith("a", "hi", expect.any(Function));
+    expect(m.runAgent).toHaveBeenCalledWith("a", "hi", "claude-opus-4-8", expect.any(Function));
   });
 
   it("trims the forwarded run text in remote mode", async () => {
