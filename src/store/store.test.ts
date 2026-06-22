@@ -73,7 +73,7 @@ beforeEach(() => {
   m.saveSettings.mockImplementation(async (s) => ({ ...DEFAULT_SETTINGS, ...s }));
   m.resolvePermission.mockResolvedValue(undefined);
   m.openFolder.mockResolvedValue(null);
-  m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}) });
+  m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}), dispose: vi.fn() });
   m.oauthStatus.mockResolvedValue(signedOut);
   m.startOauthLogin.mockResolvedValue(signedOut);
   m.oauthLogout.mockResolvedValue(undefined);
@@ -141,6 +141,20 @@ describe("newSession", () => {
     useStore.setState({ showSidebar: true });
     await useStore.getState().newSession();
     expect(useStore.getState().showSidebar).toBe(false);
+  });
+
+  it("does nothing while a turn is streaming", async () => {
+    useStore.setState({
+      streaming: true,
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+    });
+
+    await useStore.getState().newSession();
+
+    expect(m.createSession).not.toHaveBeenCalled();
+    expect(useStore.getState().activeId).toBe("a");
+    expect(useStore.getState().sessions).toHaveLength(1);
   });
 });
 
@@ -253,7 +267,7 @@ describe("send", () => {
     let emit!: (e: StreamEvent) => void;
     m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
       emit = onEvent;
-      return { cancel: vi.fn(async () => {}) };
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
     });
     useStore.setState({
       sessions: [session({ id: "a", title: "New chat" })],
@@ -299,6 +313,11 @@ describe("send", () => {
   });
 
   it("keeps the existing title once a session already has messages", async () => {
+    let emit!: (e: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
     const existing: Message = { id: "m0", role: "user", blocks: [], createdAt: 1 };
     useStore.setState({
       sessions: [session({ id: "a", title: "Keep me" })],
@@ -307,6 +326,7 @@ describe("send", () => {
     });
 
     await useStore.getState().send("another message");
+    emit({ type: "turn_end", stopReason: "end_turn" }); // end the turn so the watchdog can't leak
 
     expect(useStore.getState().sessions[0].title).toBe("Keep me");
   });
@@ -349,6 +369,83 @@ describe("send", () => {
     expect(st.messages.a).toHaveLength(1);
     expect(st.messages.a[0].role).toBe("user");
     expect(st.messages.a[0].blocks).toEqual([{ kind: "text", text: "do it remotely" }]);
+  });
+
+  it("tears down the turn's listener on turn_end so a later turn can't edit this message", async () => {
+    const handles: { cancel: ReturnType<typeof vi.fn>; dispose: ReturnType<typeof vi.fn> }[] = [];
+    const emits: ((e: StreamEvent) => void)[] = [];
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      emits.push(onEvent);
+      const handle = { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+      handles.push(handle);
+      return handle;
+    });
+    useStore.setState({ sessions: [session({ id: "a" })], activeId: "a", messages: { a: [] } });
+
+    // Turn 1 finishes normally.
+    await useStore.getState().send("first");
+    emits[0]({ type: "text_delta", text: "one" });
+    emits[0]({ type: "turn_end", stopReason: "end_turn" });
+    // The listener is disposed on a normal end — not merely dropped — so it can't fire again.
+    expect(handles[0].dispose).toHaveBeenCalledTimes(1);
+
+    // Turn 2's deltas land on turn 2's message, never turn 1's (the reported bug).
+    await useStore.getState().send("second");
+    emits[1]({ type: "text_delta", text: "two" });
+    emits[1]({ type: "turn_end", stopReason: "end_turn" });
+
+    const msgs = useStore.getState().messages.a;
+    expect(msgs[1].blocks).toEqual([{ kind: "text", text: "one" }]); // turn-1 reply unchanged
+    expect(msgs[3].blocks).toEqual([{ kind: "text", text: "two" }]); // turn-2 reply
+    expect(handles[1].dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("disposes the listener when a turn ends in an error event", async () => {
+    const dispose = vi.fn();
+    let emit!: (e: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose };
+    });
+    useStore.setState({ sessions: [session({ id: "a" })], activeId: "a", messages: { a: [] } });
+
+    await useStore.getState().send("go");
+    emit({ type: "error", message: "kaboom" });
+
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().streaming).toBe(false);
+  });
+
+  it("recovers a hung turn via the idle watchdog so future sends aren't bricked", async () => {
+    vi.useFakeTimers();
+    try {
+      const cancel = vi.fn(async () => {});
+      m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+        // The turn starts streaming, then the backend goes silent — no turn_end/error.
+        onEvent({ type: "text_delta", text: "thinking" });
+        return { cancel, dispose: vi.fn() };
+      });
+      useStore.setState({ sessions: [session({ id: "a" })], activeId: "a", messages: { a: [] } });
+
+      await useStore.getState().send("hello?");
+      expect(useStore.getState().streaming).toBe(true);
+
+      // Idle past the watchdog window → the turn is force-ended and the hung run cancelled.
+      await vi.advanceTimersByTimeAsync(152_000);
+
+      const st = useStore.getState();
+      expect(st.streaming).toBe(false);
+      expect(cancel).toHaveBeenCalled();
+      const text = st.messages.a[1].blocks.map((b) => (b.kind === "text" ? b.text : "")).join("");
+      expect(text).toContain("timed out");
+
+      // The composer is usable again: the next send actually runs (not a silent no-op).
+      m.runAgent.mockClear();
+      await useStore.getState().send("retry");
+      expect(m.runAgent).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

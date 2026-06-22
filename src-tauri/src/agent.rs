@@ -24,12 +24,8 @@ type Cancels = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 const REFRESH_SKEW_SECS: i64 = 60;
 
 fn emit(app: &AppHandle, channel: &str, ev: StreamEvent) {
-    use tauri::{Emitter, Manager};
-    // Mirror every agent event to Phone Sync (no-op when no phone is attached).
-    if let Some(hub) = app.try_state::<crate::sync::SyncHub>() {
-        hub.publish(channel, ev.clone());
-    }
-    let _ = app.emit(channel, ev);
+    // Canonical chokepoint: delivers to the desktop UI and mirrors to the phone.
+    crate::sync::emit_event(app, channel, ev);
 }
 
 fn system_prompt(workspace: &Path) -> String {
@@ -66,6 +62,18 @@ fn derive_title(text: &str) -> String {
     }
 }
 
+/// Classify an OAuth refresh failure. A 4xx from the token endpoint (or an
+/// `invalid_grant`) means the refresh token is permanently rejected and the
+/// subscription session must be re-established; a network/timeout error is
+/// transient and worth retrying. `post_tokens` formats the HTTP status as
+/// `(<status>)` in the error string, so we classify on that.
+fn is_terminal_auth_error(err: &str) -> bool {
+    err.contains("(400")
+        || err.contains("(401")
+        || err.contains("(403")
+        || err.contains("invalid_grant")
+}
+
 /// Return the credential to authenticate the next request with, refreshing an
 /// OAuth token that is at/near expiry. Refreshes are single-flight: the shared
 /// `refresh_lock` serializes concurrent turns, and the stored token is re-read
@@ -93,7 +101,26 @@ async fn ensure_fresh(
         return Ok(Credential::OAuth(current));
     }
 
-    let mut refreshed = oauth::refresh(http, &current.refresh_token).await?;
+    let mut refreshed = match oauth::refresh(http, &current.refresh_token).await {
+        Ok(r) => r,
+        Err(e) => {
+            // A terminal auth failure (refresh token rejected) can never recover, and
+            // leaving the stale OAuth in place would fail EVERY future turn — even for
+            // a user who also has a valid API key, since OAuth shadows it in
+            // `load_credential`. Clear it so the API-key path takes over automatically
+            // and the user gets a clear "sign in again" instead of a permanent brick.
+            if is_terminal_auth_error(&e) {
+                let _ = secrets::clear_oauth();
+                return Err(
+                    "Your Claude subscription session expired. Please sign in again in \
+                     Settings (or add an Anthropic API key)."
+                        .to_string(),
+                );
+            }
+            // Transient (network / timeout): keep the tokens so a retry can succeed.
+            return Err(e);
+        }
+    };
     // The refresh response carries no profile, so keep the display metadata
     // (email + plan tier) that we captured at sign-in.
     refreshed.email = current.email;
@@ -116,10 +143,32 @@ pub async fn run(
 ) {
     let channel = format!("agent://{session_id}");
 
+    // Refuse a second concurrent run for the same session. Two runs would collide on
+    // the cancel flag (Stop could hit the wrong one), the first run's entry would be
+    // evicted, and their DB writes would interleave and corrupt the conversation
+    // history. The desktop UI already guards this; this also covers a phone driving
+    // the same session over Phone Sync.
     let cancel = Arc::new(AtomicBool::new(false));
-    {
+    let already_running = {
+        use std::collections::hash_map::Entry;
         let mut map = cancels.lock().unwrap();
-        map.insert(session_id.clone(), cancel.clone());
+        match map.entry(session_id.clone()) {
+            Entry::Occupied(_) => true,
+            Entry::Vacant(slot) => {
+                slot.insert(cancel.clone());
+                false
+            }
+        }
+    };
+    if already_running {
+        emit(
+            &app,
+            &channel,
+            StreamEvent::Error {
+                message: "A turn is already running for this session.".to_string(),
+            },
+        );
+        return;
     }
 
     emit(
@@ -174,11 +223,18 @@ async fn run_inner(
         "No credentials set. Sign in with your Claude subscription or add an Anthropic API key in Settings.",
     )?;
 
-    let workspace = snapshot
-        .workspace
-        .clone()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    // No configured workspace falls back to the process working directory — but
+    // never to an empty path (the old `unwrap_or_default()`), which would silently
+    // root every file/shell tool at "" and produce confusing errors.
+    let workspace = match snapshot.workspace.clone() {
+        Some(w) => PathBuf::from(w),
+        None => std::env::current_dir().map_err(|e| {
+            format!(
+                "No workspace is set and the current directory is unavailable ({e}). \
+                 Set a workspace in Settings."
+            )
+        })?,
+    };
 
     let registry = tools::default_registry();
     let tool_specs = registry.specs();
@@ -195,7 +251,8 @@ async fn run_inner(
             text: user_text.clone(),
         }],
     };
-    db.append_message(session_id, &user_msg, db::now_ms());
+    db.try_append_message(session_id, &user_msg, db::now_ms())
+        .map_err(|e| format!("Failed to save your message: {e}"))?;
     messages.push(user_msg);
     if is_first {
         db.set_title_if_blank(session_id, &derive_title(&user_text));
@@ -239,7 +296,8 @@ async fn run_inner(
             role: "assistant".into(),
             content: turn.content.clone(),
         };
-        db.append_message(session_id, &assistant, db::now_ms());
+        db.try_append_message(session_id, &assistant, db::now_ms())
+            .map_err(|e| format!("Failed to save the reply: {e}"))?;
         messages.push(assistant);
 
         if turn.stop_reason == "tool_use" {
@@ -292,11 +350,20 @@ async fn run_inner(
                     });
                 }
             }
+            // A tool_use turn that yields no usable tool result would post an
+            // empty-content user message, which Anthropic rejects (400) and which
+            // then poisons the persisted history so every later turn also 400s.
+            if results.is_empty() {
+                return Err("The model asked to use a tool but returned no usable tool \
+                            call. Please try again."
+                    .to_string());
+            }
             let tool_msg = ChatMessage {
                 role: "user".into(),
                 content: results,
             };
-            db.append_message(session_id, &tool_msg, db::now_ms());
+            db.try_append_message(session_id, &tool_msg, db::now_ms())
+                .map_err(|e| format!("Failed to save tool results: {e}"))?;
             messages.push(tool_msg);
             continue;
         } else {
@@ -311,7 +378,26 @@ async fn run_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::derive_title;
+    use super::{derive_title, is_terminal_auth_error};
+
+    #[test]
+    fn classifies_terminal_vs_transient_auth_errors() {
+        // 4xx / invalid_grant from the token endpoint → terminal (clear + re-auth).
+        assert!(is_terminal_auth_error(
+            "OAuth token request failed (401 Unauthorized): invalid_grant"
+        ));
+        assert!(is_terminal_auth_error(
+            "OAuth token request failed (400 Bad Request): bad refresh token"
+        ));
+        // Network / timeout / 5xx → transient (keep tokens, let the user retry).
+        assert!(!is_terminal_auth_error("Token request timed out."));
+        assert!(!is_terminal_auth_error(
+            "Token request failed: connection refused"
+        ));
+        assert!(!is_terminal_auth_error(
+            "OAuth token request failed (500 Internal Server Error): oops"
+        ));
+    }
 
     #[test]
     fn derive_title_truncates_long_input() {

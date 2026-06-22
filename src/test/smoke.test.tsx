@@ -16,8 +16,8 @@ describe("shared types", () => {
 
   it("estimate cost from per-million-token pricing", () => {
     const usage: Usage = { input: 1_000_000, output: 1_000_000 };
-    // Opus 4.8 list price: $15 in / $75 out per million tokens.
-    expect(estimateCost("claude-opus-4-8", usage)).toBeCloseTo(90);
+    // Opus 4.8 list price: $5 in / $25 out per million tokens.
+    expect(estimateCost("claude-opus-4-8", usage)).toBeCloseTo(30);
   });
 
   it("treat unknown models as free instead of throwing", () => {

@@ -189,9 +189,9 @@ export type SyncFrame =
   | { t: "ack"; session_id: string; seq: number }
   | { t: "hello"; device_id: string; cursors: { sessionId: string; seq: number }[] };
 
-// Approximate Anthropic list prices, USD per million tokens (input / output).
+// Anthropic list prices, USD per million tokens (input / output).
 export const MODEL_PRICING: Record<string, { in: number; out: number }> = {
-  "claude-opus-4-8": { in: 15, out: 75 },
+  "claude-opus-4-8": { in: 5, out: 25 },
   "claude-sonnet-4-6": { in: 3, out: 15 },
   "claude-haiku-4-5-20251001": { in: 1, out: 5 },
 };

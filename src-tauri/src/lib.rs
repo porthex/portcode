@@ -330,7 +330,7 @@ fn cancel_agent(state: State<AppState>, session_id: String) {
     if let Some(flag) = state.cancels.lock().unwrap().get(&session_id) {
         flag.store(true, Ordering::Relaxed);
     }
-    permissions::deny_all(&state.pending);
+    permissions::deny_all(&state.pending, &session_id);
 }
 
 #[cfg(desktop)]
@@ -781,7 +781,13 @@ pub fn run() {
             secrets::init_dir(dir.clone());
 
             let settings = Settings::load(&dir);
+            // Bound connection establishment (DNS + TCP + TLS) so a turn or a token
+            // refresh can't hang indefinitely before any byte arrives. We deliberately
+            // do NOT set a blanket request `.timeout()` — that would kill long but
+            // healthy streaming turns; the per-read idle timeout in `llm::stream_turn`
+            // handles a stream that connects and then stalls.
             let http = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("failed to build HTTP client");
             let db = Db::open(&dir.join("portcode.db")).expect("failed to open database");

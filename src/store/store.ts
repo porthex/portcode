@@ -85,6 +85,13 @@ interface AppState {
 
 const now = () => Date.now();
 
+// A turn must always reach a terminal state. If the backend hangs or dies without
+// emitting turn_end/error, this client-side watchdog force-ends the turn once the
+// run has been idle this long, so `streaming` can never get stuck true (which would
+// otherwise silently no-op every later send). Kept above the backend's own idle
+// timeout so the backend's specific error wins in the normal stalled-network case.
+const TURN_IDLE_TIMEOUT_MS = 150_000;
+
 // Frontend-only UI preferences (decorative overlays). Cosmetic client state,
 // not the Rust core's Settings — persisted in localStorage so they work the
 // same in preview and native without an IPC round-trip.
@@ -199,6 +206,10 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async newSession() {
+    // Don't strand a live turn: switching activeId mid-stream would leave the old
+    // session's run folding events into a session the user can no longer see while
+    // the new one shows a disabled composer. Mirrors selectSession/deleteSession.
+    if (get().streaming) return;
     const s = makeSession();
     await ipc.createSession(s.id, s.title, s.workspace);
     set((st) => ({
@@ -296,7 +307,33 @@ export const useStore = create<AppState>((set, get) => ({
         return { messages: { ...st.messages, [activeId]: updated } };
       });
 
+    // A turn must ALWAYS reach a terminal state. The Rust core emits turn_end/error,
+    // but if it ever hangs or dies silently nothing would clear `streaming` — and
+    // since send() no-ops while streaming, that would brick every future message.
+    // So we (a) tear the per-turn event listener down the instant a turn ends — a
+    // leaked listener folds the NEXT turn's deltas into this message — and (b) run a
+    // client-side watchdog that force-ends a silent turn so the app always recovers.
+    let run: Awaited<ReturnType<typeof ipc.runAgent>> | null = null;
+    let settled = false;
+    let lastActivity = now();
+    let watchdog: ReturnType<typeof setInterval> | null = null;
+
+    // Stop the watchdog + the per-turn listener exactly once. `cancelBackend` also
+    // aborts a still-running turn on the core (watchdog timeout); a normal terminal
+    // event only needs to stop listening (no spurious cancel_agent).
+    const settle = (cancelBackend: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (watchdog !== null) {
+        clearInterval(watchdog);
+        watchdog = null;
+      }
+      if (cancelBackend) void run?.cancel();
+      else run?.dispose();
+    };
+
     const onEvent = (e: StreamEvent) => {
+      lastActivity = now();
       switch (e.type) {
         case "text_delta":
           apply((blocks) => appendText(blocks, e.text));
@@ -344,17 +381,48 @@ export const useStore = create<AppState>((set, get) => ({
           break;
         case "error":
           apply((blocks) => appendText(blocks, `\n\n**Error:** ${e.message}`));
+          settle(false);
           set({ streaming: false, cancel: null, pendingPermission: null });
           break;
         case "turn_end":
+          settle(false);
           set({ streaming: false, cancel: null, pendingPermission: null });
           break;
       }
     };
 
+    watchdog = setInterval(() => {
+      // The turn already ended or was stopped elsewhere (e.g. Stop) — just clean up.
+      if (settled || !get().streaming) {
+        settle(false);
+        return;
+      }
+      // No event for the whole idle window → treat the turn as hung and recover, so
+      // the composer can't stay disabled forever.
+      if (now() - lastActivity < TURN_IDLE_TIMEOUT_MS) return;
+      settle(true);
+      onEvent({
+        type: "error",
+        message: "The agent stopped responding (timed out). Please try again.",
+      });
+    }, 1000);
+
     try {
       const handle = await ipc.runAgent(activeId, text, onEvent);
-      set({ cancel: handle.cancel });
+      run = handle;
+      if (settled) {
+        // A terminal event (or the watchdog) fired before the handle resolved —
+        // don't leave the listener subscribed or re-arm a stale Stop.
+        handle.dispose();
+      } else {
+        // Stop aborts the run AND clears this turn's watchdog (owned by this closure).
+        set({
+          cancel: async () => {
+            settle(false);
+            await handle.cancel();
+          },
+        });
+      }
     } catch (err) {
       onEvent({ type: "error", message: String(err) });
     }
