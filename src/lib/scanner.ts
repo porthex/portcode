@@ -69,8 +69,17 @@ export async function scanQrPayload(): Promise<ScanOutcome> {
     if (state !== "granted") return { ok: false, reason: "denied" };
 
     toggleScanningChrome(true);
+    // `windowed: true` is REQUIRED, not cosmetic. In windowed mode the native
+    // plugin renders the camera preview *behind* the webview and makes the webview
+    // transparent (`webView.bringToFront()` on Android), so our own `ScanOverlay`
+    // viewfinder + Cancel button paint ON TOP and stay tappable. With
+    // `windowed: false` the plugin instead stacks a full-screen camera view OVER
+    // the webview: the custom overlay is hidden behind it AND the only way out (our
+    // Cancel) becomes untappable — the user gets stuck on a chrome-less camera and
+    // has to force-kill the app. Keep this `true`; the `pc-scanning` chrome toggle
+    // and the whole overlay design assume it.
     const res = await plugin.scan({
-      windowed: false,
+      windowed: true,
       formats: [plugin.Format.QRCode],
     });
     const value = res?.content?.trim();
