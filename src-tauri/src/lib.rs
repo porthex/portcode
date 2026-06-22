@@ -10,9 +10,13 @@ mod llm;
 #[cfg(desktop)]
 mod oauth;
 mod permissions;
+#[cfg(desktop)]
+mod scrub;
 mod secrets;
 mod settings;
 mod sync;
+#[cfg(desktop)]
+mod telemetry;
 #[cfg(desktop)]
 mod tools;
 
@@ -342,6 +346,19 @@ fn resolve_permission(state: State<AppState>, id: String, decision: String) {
         permissions::Decision::Deny
     };
     permissions::resolve(&state.pending, &id, d);
+}
+
+// ── Opt-in crash reporting (Phase 1b) ────────────────────────────────────────
+
+/// Mirror the frontend's crash-reporting consent into the Rust host. Desktop-only:
+/// the phone is a pure remote client and ships no host crash reporter. The whole
+/// pipeline is inert without a build-time `SENTRY_DSN`, so this is a no-op on
+/// dev/contributor/fork builds (and the frontend swallows the error on builds where
+/// the command isn't registered). See `telemetry::set_consent`.
+#[cfg(desktop)]
+#[tauri::command]
+fn telemetry_set_consent(enabled: bool) {
+    telemetry::set_consent(enabled);
 }
 
 // ── Phone Sync (Phase 1b: identity + pairing surface) ────────────────────────
@@ -861,6 +878,7 @@ pub fn run() {
         run_agent,
         cancel_agent,
         resolve_permission,
+        telemetry_set_consent,
         phone_sync_status,
         phone_sync_begin_pairing,
         phone_sync_unpair,

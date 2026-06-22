@@ -506,12 +506,15 @@ export const useStore = create<AppState>((set, get) => ({
     set({ scanlines: v });
   },
 
-  // Persist the consent choice; the actual SDK init/shutdown is driven by an
+  // Persist the consent choice; the frontend SDK init/shutdown is driven by an
   // effect in App watching `crashReporting`, so the store stays free of any
-  // telemetry-SDK import (keeps it pure + its tests lightweight).
+  // telemetry-SDK import (keeps it pure + its tests lightweight). We ALSO mirror
+  // the choice to the Rust host (best-effort: swallow errors so the mobile build —
+  // where the command isn't registered — and DSN-less dev builds don't throw).
   setCrashReporting(v) {
     writePref("pc.crashReporting", v);
     set({ crashReporting: v });
+    void ipc.setTelemetryConsent(v).catch(() => {});
   },
 
   toggleFiles() {

@@ -83,6 +83,18 @@ keyring = { version = "3", features = ["windows-native"] }
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "2"
 
+# Opt-in crash/perf reporting (Phase 1b — Rust host). Gated to DESKTOP targets so
+# the crate is NEVER compiled for the Android/iOS cross-compile probe (the phone is
+# a pure remote client and ships no host crash reporter — `src/telemetry.rs` is
+# `#[cfg(desktop)]`). Mirrors the `keyring`/`tauri-plugin-barcode-scanner` target
+# tables above. `default-features = false` + `reqwest` + `rustls` keeps the
+# transport on rustls (matching this crate's `reqwest`) and avoids pulling
+# openssl/native-tls; `backtrace`/`contexts`/`panic` give the panic integration +
+# stack/OS contexts. The whole pipeline is compile-time-inert without a build-time
+# `SENTRY_DSN` (see `telemetry::dsn`), preserving "zero telemetry by default".
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+sentry = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+
 [profile.release]
 opt-level = "s"
 lto = true
