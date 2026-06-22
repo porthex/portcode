@@ -251,7 +251,8 @@ async fn run_inner(
             text: user_text.clone(),
         }],
     };
-    db.append_message(session_id, &user_msg, db::now_ms());
+    db.try_append_message(session_id, &user_msg, db::now_ms())
+        .map_err(|e| format!("Failed to save your message: {e}"))?;
     messages.push(user_msg);
     if is_first {
         db.set_title_if_blank(session_id, &derive_title(&user_text));
@@ -295,7 +296,8 @@ async fn run_inner(
             role: "assistant".into(),
             content: turn.content.clone(),
         };
-        db.append_message(session_id, &assistant, db::now_ms());
+        db.try_append_message(session_id, &assistant, db::now_ms())
+            .map_err(|e| format!("Failed to save the reply: {e}"))?;
         messages.push(assistant);
 
         if turn.stop_reason == "tool_use" {
@@ -360,7 +362,8 @@ async fn run_inner(
                 role: "user".into(),
                 content: results,
             };
-            db.append_message(session_id, &tool_msg, db::now_ms());
+            db.try_append_message(session_id, &tool_msg, db::now_ms())
+                .map_err(|e| format!("Failed to save tool results: {e}"))?;
             messages.push(tool_msg);
             continue;
         } else {
