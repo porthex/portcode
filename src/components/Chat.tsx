@@ -41,7 +41,7 @@ export function Chat() {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
-        <div ref={contentRef} className="mx-auto w-full max-w-3xl px-5 py-6">
+        <div ref={contentRef} className="w-full max-w-none px-6 py-6">
           {messages.length === 0 ? (
             <EmptyState />
           ) : (

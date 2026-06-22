@@ -43,7 +43,7 @@ export function Composer() {
 
   return (
     <div className="border-t border-border bg-panel/80 px-6 pb-3 pt-3.5">
-      <div className="pc-neon-frame mx-auto w-full max-w-[760px]">
+      <div className="pc-neon-frame w-full max-w-none">
         <div className="flex items-end gap-2.5 rounded-[12px] bg-panel px-3 py-2.5">
           <textarea
             ref={ref}
@@ -88,7 +88,7 @@ export function Composer() {
           )}
         </div>
       </div>
-      <div className="mx-auto mt-[7px] flex w-full max-w-[760px] items-center justify-between font-mono text-[10.5px] text-faint">
+      <div className="mt-[7px] flex w-full max-w-none items-center justify-between font-mono text-[10.5px] text-faint">
         <span>
           <span className="text-muted">ENTER</span> send ·{" "}
           <span className="text-muted">SHIFT+ENTER</span> newline
