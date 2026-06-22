@@ -35,17 +35,34 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
       if (!mod) return;
+      // Don't hijack keystrokes while the user is typing in a field (Settings
+      // API-key input, the pairing textarea, the palette search, etc.).
+      const t = e.target as HTMLElement | null;
+      if (t?.tagName === "INPUT" || t?.tagName === "TEXTAREA" || t?.isContentEditable === true) {
+        return;
+      }
       const s = useStore.getState();
+      // Don't stack shortcuts on top of an open modal. Ctrl+K stays live as the
+      // advertised palette toggle, but is a no-op over Settings (no stacking).
+      const modalOpen = s.showSettings || s.showPalette;
       if (e.key === "k") {
+        if (s.showSettings) {
+          e.preventDefault();
+          return;
+        }
         e.preventDefault();
         s.setShowPalette(!s.showPalette);
+        return;
       } else if (e.key === "n") {
+        if (modalOpen) return;
         e.preventDefault();
         void s.newSession();
       } else if (e.key === "b") {
+        if (modalOpen) return;
         e.preventDefault();
         s.toggleFiles();
       } else if (e.key === ",") {
+        if (modalOpen) return;
         e.preventDefault();
         s.setShowSettings(true);
       }
@@ -99,6 +116,15 @@ export default function App() {
  *  creating a session closes it too (handled in the store). */
 function SidebarDrawer() {
   const setShowSidebar = useStore((s) => s.setShowSidebar);
+  // Escape closes the drawer (the App keydown effect only handles modified keys,
+  // so plain Escape would otherwise strand focus inside the overlay).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setShowSidebar(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [setShowSidebar]);
   return (
     <div className="fixed inset-0 z-50 flex">
       <div className="pc-drawer h-full shrink-0">
@@ -186,7 +212,9 @@ function TitleBar() {
         </button>
         <span className="truncate font-mono text-[12px] text-muted">
           portcode<span className="text-faint"> / </span>
-          <span className="text-fg">{session?.title ?? "New chat"}</span>
+          <span role="heading" aria-level={1} className="text-fg">
+            {session?.title ?? "New chat"}
+          </span>
         </span>
       </div>
       <div className="flex shrink-0 items-center gap-2.5">

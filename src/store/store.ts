@@ -39,6 +39,12 @@ interface AppState {
   cancel: (() => Promise<void>) | null;
   pendingPermission: PendingPermission | null;
 
+  // ── Error surfacing ─────────────────────────────────────────────────────────
+  initError: string | null; // startup (init) failure — Chat shows an error/retry panel
+  loadErrors: Record<string, boolean>; // sessionId -> a getMessages load failed; Chat offers retry
+  settingsError: string | null; // last saveSettings failure, surfaced in Settings
+  workspaceError: string | null; // last openWorkspace (picker/save) failure, surfaced in FileExplorer
+
   // ── Mobile remote client (this device is the phone driving a paired desktop) ──
   remoteMode: boolean; // render the remote-client shell (pairing → remote session) instead of the desktop layout
   remoteConnected: boolean; // a live desktop session is established
@@ -47,9 +53,12 @@ interface AppState {
   remoteError: string | null; // last connect failure, surfaced in the connect UI
   remoteUnlisten: (() => void) | null; // tears down the frame subscription (private; mirrors `cancel`)
   remoteDropped: boolean; // the live session ended unexpectedly — the UI offers a reconnect
+  remoteConnecting: boolean; // a connectRemote dial is in flight (private re-entry guard)
   lastPairingQr: string | null; // last successful pairing payload, kept for one-tap reconnect
 
   init: () => Promise<void>;
+  retryInit: () => Promise<void>;
+  retryLoad: (id: string) => Promise<void>;
   toggleFiles: () => void;
   toggleSidebar: () => void;
   setShowSidebar: (v: boolean) => void;
@@ -164,6 +173,10 @@ export const useStore = create<AppState>((set, get) => ({
   draft: "",
   cancel: null,
   pendingPermission: null,
+  initError: null,
+  loadErrors: {},
+  settingsError: null,
+  workspaceError: null,
   // Default into remote mode on a phone; desktop/preview start in the normal
   // layout and can opt in via setRemoteMode (e.g. the command palette) for testing.
   remoteMode: isMobilePlatform(),
@@ -173,6 +186,7 @@ export const useStore = create<AppState>((set, get) => ({
   remoteError: null,
   remoteUnlisten: null,
   remoteDropped: false,
+  remoteConnecting: false,
   // Remembered across launches so the phone can reconnect without re-scanning the
   // QR (Android frequently kills backgrounded apps). Public payload — no secret.
   lastPairingQr: readStr("pc.lastPairingQr"),
@@ -180,29 +194,61 @@ export const useStore = create<AppState>((set, get) => ({
   async init() {
     // Fetch settings, subscription status, and phone sync status together.
     // The oauth and phoneSync calls are kept resilient so an unwired/older
-    // core can't block startup.
-    const [settings, oauthStatus, phoneSync] = await Promise.all([
-      ipc.getSettings(),
-      ipc.oauthStatus().catch(() => null),
-      ipc.phoneSyncStatus().catch(() => null),
-    ]);
-    const sessions = await ipc.listSessions();
-    if (sessions.length === 0) {
-      const s = makeSession();
-      await ipc.createSession(s.id, s.title, s.workspace);
+    // core can't block startup. The load-bearing calls (getSettings/listSessions/
+    // createSession/getMessages) are guarded so a failed startup surfaces an
+    // error+retry panel instead of a permanently blank welcome shell.
+    try {
+      const [settings, oauthStatus, phoneSync] = await Promise.all([
+        ipc.getSettings(),
+        ipc.oauthStatus().catch(() => null),
+        ipc.phoneSyncStatus().catch(() => null),
+      ]);
+      const sessions = await ipc.listSessions();
+      if (sessions.length === 0) {
+        const s = makeSession();
+        await ipc.createSession(s.id, s.title, s.workspace);
+        set({
+          settings,
+          oauthStatus,
+          phoneSync,
+          sessions: [s],
+          activeId: s.id,
+          messages: { [s.id]: [] },
+          initError: null,
+        });
+        return;
+      }
+      const activeId = sessions[0].id;
+      const msgs = await ipc.getMessages(activeId);
       set({
         settings,
         oauthStatus,
         phoneSync,
-        sessions: [s],
-        activeId: s.id,
-        messages: { [s.id]: [] },
+        sessions,
+        activeId,
+        messages: { [activeId]: msgs },
+        initError: null,
       });
-      return;
+    } catch (err) {
+      set({ initError: errMessage(err) });
     }
-    const activeId = sessions[0].id;
-    const msgs = await ipc.getMessages(activeId);
-    set({ settings, oauthStatus, phoneSync, sessions, activeId, messages: { [activeId]: msgs } });
+  },
+
+  async retryInit() {
+    set({ initError: null });
+    await get().init();
+  },
+
+  async retryLoad(id) {
+    try {
+      const msgs = await ipc.getMessages(id);
+      set((st) => ({
+        messages: { ...st.messages, [id]: msgs },
+        loadErrors: { ...st.loadErrors, [id]: false },
+      }));
+    } catch {
+      set((st) => ({ loadErrors: { ...st.loadErrors, [id]: true } }));
+    }
   },
 
   async newSession() {
@@ -224,8 +270,17 @@ export const useStore = create<AppState>((set, get) => ({
     if (get().streaming) return;
     set({ activeId: id, showSidebar: false }); // close the mobile drawer on navigation
     if (!get().messages[id]) {
-      const msgs = await ipc.getMessages(id);
-      set((st) => ({ messages: { ...st.messages, [id]: msgs } }));
+      // Guard the load: a getMessages reject must not leave messages[id] undefined
+      // (the welcome EmptyState would then win for a session with real history).
+      try {
+        const msgs = await ipc.getMessages(id);
+        set((st) => ({
+          messages: { ...st.messages, [id]: msgs },
+          loadErrors: { ...st.loadErrors, [id]: false },
+        }));
+      } catch {
+        set((st) => ({ loadErrors: { ...st.loadErrors, [id]: true } }));
+      }
     }
   },
 
@@ -245,8 +300,15 @@ export const useStore = create<AppState>((set, get) => ({
     }
     const aid = get().activeId;
     if (aid && !get().messages[aid]) {
-      const msgs = await ipc.getMessages(aid);
-      set((st) => ({ messages: { ...st.messages, [aid]: msgs } }));
+      try {
+        const msgs = await ipc.getMessages(aid);
+        set((st) => ({
+          messages: { ...st.messages, [aid]: msgs },
+          loadErrors: { ...st.loadErrors, [aid]: false },
+        }));
+      } catch {
+        set((st) => ({ loadErrors: { ...st.loadErrors, [aid]: true } }));
+      }
     }
   },
 
@@ -254,20 +316,24 @@ export const useStore = create<AppState>((set, get) => ({
     const { activeId, streaming } = get();
     if (!activeId || streaming || !text.trim()) return;
 
+    // Trim once so the stored user bubble and the forwarded command match the
+    // derived (trimmed) title — a padded draft otherwise renders odd blank lines.
+    const body = text.trim();
+
     // Remote mode: this device is the phone driving a paired desktop. Forward the
     // turn as a `run` command instead of running the local agent — the desktop is
     // authoritative and its reply streams back as live frames (which build the
     // assistant message). sendRemoteCommand already appends the optimistic user
     // message, so we neither pre-create messages nor flip `streaming` here.
     if (get().remoteConnected) {
-      await get().sendRemoteCommand({ cmd: "run", session_id: activeId, text });
+      await get().sendRemoteCommand({ cmd: "run", session_id: activeId, text: body });
       return;
     }
 
     const userMsg: Message = {
       id: uid(),
       role: "user",
-      blocks: [{ kind: "text", text }],
+      blocks: [{ kind: "text", text: body }],
       createdAt: now(),
     };
     const assistant: Message = {
@@ -284,7 +350,7 @@ export const useStore = create<AppState>((set, get) => ({
           ? {
               ...s,
               updatedAt: now(),
-              title: msgs.length === 0 ? deriveTitle(text) : s.title,
+              title: msgs.length === 0 ? deriveTitle(body) : s.title,
             }
           : s,
       );
@@ -461,16 +527,19 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
-    if (always && decision === "allow") {
-      await get().updateSettings({ defaultPolicy: "allow" });
-    }
     // A superseding request may have replaced the prompt while we awaited
     // (or between render and click); only resolve the request we captured so a
     // stale click can't clear/answer a newer one.
     const current = get().pendingPermission;
     if (current && current.id !== id) return;
+    // Answer the backend gate FIRST (and clear the banner), so a later
+    // best-effort policy save can't strand the prompt or leave the gate
+    // unanswered if updateSettings rejects.
     set({ pendingPermission: null });
     await ipc.resolvePermission(id, decision);
+    if (always && decision === "allow") {
+      await get().updateSettings({ defaultPolicy: "allow" });
+    }
   },
 
   setShowSettings(v) {
@@ -515,13 +584,32 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async openWorkspace() {
-    const dir = await ipc.openFolder();
-    if (dir) await get().updateSettings({ workspace: dir });
+    // Guard the picker + save: a dialog/save reject must surface in the explorer
+    // instead of being a silent unhandled rejection (all callers use `void`).
+    // Persist directly (not via updateSettings, which swallows into settingsError)
+    // so a save failure lands in workspaceError, the explorer's own surface.
+    set({ workspaceError: null });
+    try {
+      const dir = await ipc.openFolder();
+      if (dir) {
+        const next = await ipc.saveSettings({ workspace: dir });
+        set({ settings: next });
+      }
+    } catch (err) {
+      set({ workspaceError: errMessage(err) });
+    }
   },
 
   async updateSettings(s) {
-    const next = await ipc.saveSettings(s);
-    set({ settings: next });
+    // Fail loudly: a saveSettings reject must surface (so the controlled UI doesn't
+    // silently snap back to the old value) instead of being a swallowed rejection.
+    set({ settingsError: null });
+    try {
+      const next = await ipc.saveSettings(s);
+      set({ settings: next });
+    } catch (err) {
+      set({ settingsError: errMessage(err) });
+    }
   },
 
   async refreshOAuthStatus() {
@@ -620,6 +708,12 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async connectRemote(qr, verified = false) {
+    // Re-entry guard: two interleaved dials (e.g. Reconnect + Scan/Connect) would
+    // each register a fresh onPhoneSyncFrame listener across the awaits below,
+    // orphaning one subscription that keeps double-feeding applyFrame. Serialize so
+    // only one dial runs at a time.
+    if (get().remoteConnecting) return;
+    set({ remoteConnecting: true });
     // Clean reconnect: tear down any prior subscriptions before dialing so a second
     // connect can never leave two live listeners feeding the store.
     const prev = get().remoteUnlisten;
@@ -690,6 +784,10 @@ export const useStore = create<AppState>((set, get) => ({
         remoteUnlisten: null,
         remoteError: errMessage(err),
       });
+    } finally {
+      // Release the re-entry lock whether the dial succeeded or failed, so a later
+      // connect can proceed.
+      set({ remoteConnecting: false });
     }
   },
 
@@ -713,7 +811,23 @@ export const useStore = create<AppState>((set, get) => ({
         },
       }));
     }
-    await ipc.phoneSyncSendCommand(command);
+    // The channel often drops between frames (Android kills backgrounded apps).
+    // Callers swallow the rejection (`void send`/`stop`), so a dropped link would
+    // silently strand the optimistic message. Handle it here: annotate the message
+    // and surface the existing reconnect UI via remoteDropped.
+    try {
+      await ipc.phoneSyncSendCommand(command);
+    } catch {
+      if (command.cmd === "run") {
+        const sid = command.session_id;
+        set((st) => ({
+          messages: patchLast(st.messages, sid, (b) =>
+            appendText(b, "\n\n**Couldn't reach your desktop — the link may have dropped.**"),
+          ),
+        }));
+      }
+      set({ remoteDropped: true, streaming: false });
+    }
   },
 
   async disconnectRemote() {
@@ -794,12 +908,19 @@ type RemoteSetter = (fn: (st: AppState) => Partial<AppState>) => void;
 // Fold one live StreamEvent (forwarded from the paired desktop) into store state
 // for `sessionId`. Mirrors `send`'s local onEvent, but the phone BUILDS the
 // assistant message from turn_start rather than pre-creating it. Does NOT touch
-// `cancel` (that handle belongs to a local desktop run); it does set/clear
-// `streaming` + `pendingPermission` so the phone UI stays honest.
+// `cancel` (that handle belongs to a local desktop run).
+//
+// Per-session message patching is always applied (a background session must still
+// build its history). But the GLOBAL UI flags — `streaming` and `pendingPermission`
+// — drive the visible composer/HUD and the permission gate, so they are only
+// touched when the frame's session is the one on screen. Otherwise a background
+// session's turn would flip the visible composer or pop a permission prompt the
+// user has no context for (and would answer blind).
 function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent): void {
   switch (e.type) {
     case "turn_start":
       set((st) => {
+        const isActive = st.activeId === sessionId;
         const msgs = st.messages[sessionId] ?? [];
         const assistant: Message = {
           id: e.messageId,
@@ -808,7 +929,8 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
           createdAt: now(),
         };
         return {
-          streaming: true,
+          // Only flip the visible streaming indicator for the active session.
+          ...(isActive ? { streaming: true } : {}),
           messages: { ...st.messages, [sessionId]: [...msgs, assistant] },
         };
       });
@@ -835,9 +957,11 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       }));
       break;
     case "permission_request":
-      set(() => ({
-        pendingPermission: { id: e.id, tool: e.tool, summary: e.summary, input: e.input },
-      }));
+      set((st) =>
+        st.activeId === sessionId
+          ? { pendingPermission: { id: e.id, tool: e.tool, summary: e.summary, input: e.input } }
+          : {},
+      );
       break;
     case "usage":
       set((st) => {
@@ -858,12 +982,12 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
         messages: patchLast(st.messages, sessionId, (b) =>
           appendText(b, `\n\n**Error:** ${e.message}`),
         ),
-        streaming: false,
-        pendingPermission: null,
+        // Only clear the visible turn flags when this is the active session.
+        ...(st.activeId === sessionId ? { streaming: false, pendingPermission: null } : {}),
       }));
       break;
     case "turn_end":
-      set(() => ({ streaming: false, pendingPermission: null }));
+      set((st) => (st.activeId === sessionId ? { streaming: false, pendingPermission: null } : {}));
       break;
   }
 }

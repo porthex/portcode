@@ -122,6 +122,41 @@ describe("init", () => {
     expect(st.sessions).toEqual([s1, s2]);
     expect(st.messages["a"]).toEqual([msg]);
   });
+
+  it("records initError when a load-bearing startup call rejects", async () => {
+    // A failed core / locked DB rejects a guarded call; init must surface an error
+    // instead of leaving a permanently blank welcome shell with no feedback.
+    m.listSessions.mockRejectedValue(new Error("core not ready"));
+
+    await useStore.getState().init();
+
+    const st = useStore.getState();
+    expect(st.initError).toBe("core not ready");
+    expect(st.sessions).toEqual([]);
+    expect(st.activeId).toBeNull();
+  });
+
+  it("retryInit clears initError and re-runs init successfully", async () => {
+    m.listSessions.mockRejectedValueOnce(new Error("core not ready"));
+    await useStore.getState().init();
+    expect(useStore.getState().initError).toBe("core not ready");
+
+    // The core recovers; the retry succeeds and clears the error.
+    await useStore.getState().retryInit();
+
+    const st = useStore.getState();
+    expect(st.initError).toBeNull();
+    expect(st.sessions).toHaveLength(1);
+    expect(m.createSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears a prior initError on a later successful init", async () => {
+    useStore.setState({ initError: "stale failure" });
+
+    await useStore.getState().init();
+
+    expect(useStore.getState().initError).toBeNull();
+  });
 });
 
 describe("newSession", () => {
@@ -187,6 +222,39 @@ describe("selectSession", () => {
     await useStore.getState().selectSession("c");
     expect(useStore.getState().showSidebar).toBe(false);
   });
+
+  it("flags loadErrors[id] when getMessages rejects (no silent welcome screen)", async () => {
+    m.getMessages.mockRejectedValue(new Error("disk error"));
+
+    await useStore.getState().selectSession("b");
+
+    const st = useStore.getState();
+    expect(st.activeId).toBe("b");
+    expect(st.loadErrors.b).toBe(true);
+    expect(st.messages.b).toBeUndefined();
+  });
+
+  it("retryLoad re-fetches and clears loadErrors[id]", async () => {
+    const msg: Message = { id: "m", role: "assistant", blocks: [], createdAt: 1 };
+    m.getMessages.mockRejectedValueOnce(new Error("disk error"));
+    await useStore.getState().selectSession("b");
+    expect(useStore.getState().loadErrors.b).toBe(true);
+
+    m.getMessages.mockResolvedValue([msg]);
+    await useStore.getState().retryLoad("b");
+
+    const st = useStore.getState();
+    expect(st.loadErrors.b).toBe(false);
+    expect(st.messages.b).toEqual([msg]);
+  });
+
+  it("retryLoad keeps loadErrors[id] set when the refetch also rejects", async () => {
+    m.getMessages.mockRejectedValue(new Error("still down"));
+
+    await useStore.getState().retryLoad("b");
+
+    expect(useStore.getState().loadErrors.b).toBe(true);
+  });
 });
 
 describe("deleteSession", () => {
@@ -246,6 +314,22 @@ describe("deleteSession", () => {
 
     expect(m.deleteSession).not.toHaveBeenCalled();
     expect(useStore.getState().sessions).toHaveLength(1);
+  });
+
+  it("flags loadErrors when the surviving session's reload rejects", async () => {
+    m.getMessages.mockRejectedValue(new Error("reload failed"));
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      messages: {},
+    });
+
+    await useStore.getState().deleteSession("b");
+
+    const st = useStore.getState();
+    expect(st.activeId).toBe("a");
+    expect(st.loadErrors.a).toBe(true);
+    expect(st.messages.a).toBeUndefined();
   });
 });
 
@@ -310,6 +394,44 @@ describe("send", () => {
     st = useStore.getState();
     expect(st.streaming).toBe(false);
     expect(st.pendingPermission).toBeNull();
+  });
+
+  it("trims surrounding whitespace from the stored user bubble and derived title", async () => {
+    let emit!: (e: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
+    useStore.setState({
+      sessions: [session({ id: "a", title: "New chat" })],
+      activeId: "a",
+      messages: { a: [] },
+    });
+
+    await useStore.getState().send("  hi  ");
+    emit({ type: "turn_end", stopReason: "end_turn" }); // end the turn so the watchdog can't leak
+
+    const st = useStore.getState();
+    expect(st.messages.a[0].blocks).toEqual([{ kind: "text", text: "hi" }]);
+    expect(st.sessions[0].title).toBe("hi");
+  });
+
+  it("trims the forwarded run text in remote mode", async () => {
+    useStore.setState({
+      sessions: [session({ id: "a", title: "New chat" })],
+      activeId: "a",
+      messages: { a: [] },
+      remoteConnected: true,
+    });
+
+    await useStore.getState().send("  do it  ");
+
+    expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({
+      cmd: "run",
+      session_id: "a",
+      text: "do it",
+    });
+    expect(useStore.getState().messages.a[0].blocks).toEqual([{ kind: "text", text: "do it" }]);
   });
 
   it("keeps the existing title once a session already has messages", async () => {
@@ -510,22 +632,60 @@ describe("resolvePermission", () => {
     expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
   });
 
-  it("does not resolve a superseding request when a stale click lands mid-await", async () => {
-    // allow-always awaits updateSettings; a newer permission request can arrive
-    // during that await. A stale click must not clear or answer the new prompt.
-    const newer = { id: "p2", tool: "fs_edit", summary: "newer", input: {} };
+  it("answers the gate FIRST and persists allow-always after (ordered)", async () => {
+    // The backend gate must be answered before the best-effort policy save, so a
+    // failing save can never strand the prompt or leave the gate unanswered.
+    const calls: string[] = [];
+    m.resolvePermission.mockImplementationOnce(async () => {
+      calls.push("resolve");
+    });
     m.saveSettings.mockImplementationOnce(async (s) => {
-      useStore.setState({ pendingPermission: newer });
+      calls.push("save");
       return { ...DEFAULT_SETTINGS, ...s };
+    });
+    useStore.setState({
+      pendingPermission: { id: "p1", tool: "fs_edit", summary: "x", input: {} },
+    });
+
+    await useStore.getState().resolvePermission("allow", true);
+
+    expect(calls).toEqual(["resolve", "save"]);
+  });
+
+  it("still answers the gate and clears the prompt when the policy save rejects", async () => {
+    // saveSettings now runs AFTER the gate is answered, so its rejection can't
+    // strand the banner or leave the backend gate unanswered.
+    m.saveSettings.mockRejectedValueOnce(new Error("disk full"));
+    useStore.setState({
+      pendingPermission: { id: "p1", tool: "fs_edit", summary: "x", input: {} },
+    });
+
+    await useStore.getState().resolvePermission("allow", true);
+
+    expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
+    const st = useStore.getState();
+    expect(st.pendingPermission).toBeNull();
+    // The failed best-effort policy save surfaces via settingsError (updateSettings).
+    expect(st.settingsError).toBe("disk full");
+  });
+
+  it("does not resolve a superseding request when a stale click lands mid-await", async () => {
+    // A newer permission request can arrive while we await the backend resolve.
+    // A stale click must not then clear or answer the new prompt.
+    const newer = { id: "p2", tool: "fs_edit", summary: "newer", input: {} };
+    m.resolvePermission.mockImplementationOnce(async () => {
+      useStore.setState({ pendingPermission: newer });
     });
     useStore.setState({
       pendingPermission: { id: "p1", tool: "fs_edit", summary: "stale", input: {} },
     });
 
+    // The captured request (p1) is resolved; the guard then prevents the trailing
+    // allow-always save from acting on a prompt the user didn't act on.
     await useStore.getState().resolvePermission("allow", true);
 
-    // The stale p1 click is dropped; the newer prompt stays pending and unanswered.
-    expect(m.resolvePermission).not.toHaveBeenCalled();
+    // p1 was answered, but the newer prompt that arrived mid-await stays pending.
+    expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
     expect(useStore.getState().pendingPermission).toEqual(newer);
   });
 
@@ -677,6 +837,43 @@ describe("settings + workspace", () => {
     await useStore.getState().openWorkspace();
     expect(m.saveSettings).not.toHaveBeenCalled();
   });
+
+  it("updateSettings records settingsError and preserves prior settings when the save rejects", async () => {
+    const prior = useStore.getState().settings;
+    m.saveSettings.mockRejectedValueOnce(new Error("keyring locked"));
+
+    await useStore.getState().updateSettings({ model: "claude-sonnet-4-6" });
+
+    const st = useStore.getState();
+    expect(st.settingsError).toBe("keyring locked");
+    expect(st.settings).toEqual(prior); // controlled UI doesn't silently corrupt
+  });
+
+  it("updateSettings clears a prior settingsError on a successful save", async () => {
+    useStore.setState({ settingsError: "old failure" });
+
+    await useStore.getState().updateSettings({ model: "claude-sonnet-4-6" });
+
+    expect(useStore.getState().settingsError).toBeNull();
+  });
+
+  it("openWorkspace records workspaceError when the picker rejects", async () => {
+    m.openFolder.mockRejectedValueOnce(new Error("dialog failed"));
+
+    await useStore.getState().openWorkspace();
+
+    expect(useStore.getState().workspaceError).toBe("dialog failed");
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("openWorkspace records workspaceError when persisting the folder rejects", async () => {
+    m.openFolder.mockResolvedValueOnce("C:/work/repo");
+    m.saveSettings.mockRejectedValueOnce(new Error("save failed"));
+
+    await useStore.getState().openWorkspace();
+
+    expect(useStore.getState().workspaceError).toBe("save failed");
+  });
 });
 
 describe("phone sync", () => {
@@ -762,8 +959,11 @@ describe("remote client", () => {
   });
 
   // Seed a live assistant message so the per-event reducer has a "last" message
-  // to fold into (the dual of send pre-creating the assistant message).
+  // to fold into (the dual of send pre-creating the assistant message). The seeded
+  // session is made active so the global turn flags (streaming/pendingPermission)
+  // apply — those are now gated on the frame's session being the active one.
   const seedTurn = (sid = "s1", id = "a1") => {
+    useStore.setState({ activeId: sid });
     useStore.getState().applyFrame({
       t: "live",
       session_id: sid,
@@ -892,7 +1092,9 @@ describe("remote client", () => {
       expect(useStore.getState().messages.s1).toBeUndefined();
     });
 
-    it("permission_request surfaces a pending prompt", () => {
+    it("permission_request surfaces a pending prompt for the active session", () => {
+      useStore.setState({ activeId: "s1" });
+
       useStore.getState().applyFrame({
         t: "live",
         session_id: "s1",
@@ -917,8 +1119,9 @@ describe("remote client", () => {
       expect(useStore.getState().usage.s1).toEqual({ input: 110, output: 45 });
     });
 
-    it("turn_end clears streaming and any pending prompt", () => {
+    it("turn_end clears streaming and any pending prompt for the active session", () => {
       useStore.setState({
+        activeId: "s1",
         streaming: true,
         pendingPermission: { id: "p", tool: "t", summary: "s", input: {} },
       });
@@ -949,6 +1152,68 @@ describe("remote client", () => {
       const text = st.messages.s1[0].blocks.map((b) => (b.kind === "text" ? b.text : "")).join("");
       expect(text).toContain("Error");
       expect(text).toContain("boom");
+    });
+
+    describe("background-session frames don't hijack the visible UI", () => {
+      // The user is looking at "active"; frames for a different (background)
+      // session must still build that session's history, but must NOT flip the
+      // visible composer/HUD or pop a permission prompt with no context.
+      const bgLive = (event: StreamEvent) =>
+        useStore.getState().applyFrame({ t: "live", session_id: "bg", event });
+
+      it("turn_start for a background session appends its message but doesn't flip streaming", () => {
+        useStore.setState({ activeId: "active", streaming: false });
+
+        bgLive({ type: "turn_start", messageId: "b1" });
+
+        const st = useStore.getState();
+        expect(st.streaming).toBe(false); // visible composer untouched
+        expect(st.messages.bg).toEqual([
+          { id: "b1", role: "assistant", blocks: [], createdAt: expect.any(Number) },
+        ]);
+      });
+
+      it("permission_request for a background session does NOT pop a prompt", () => {
+        useStore.setState({ activeId: "active", pendingPermission: null });
+
+        bgLive({ type: "permission_request", id: "p9", tool: "fs_edit", summary: "x", input: {} });
+
+        expect(useStore.getState().pendingPermission).toBeNull();
+      });
+
+      it("text_delta still folds into the background session's message", () => {
+        useStore.setState({ activeId: "active" });
+        bgLive({ type: "turn_start", messageId: "b1" });
+
+        bgLive({ type: "text_delta", text: "hi" });
+
+        expect(useStore.getState().messages.bg[0].blocks).toEqual([{ kind: "text", text: "hi" }]);
+      });
+
+      it("turn_end / error for a background session leave the visible turn flags alone", () => {
+        useStore.setState({
+          activeId: "active",
+          streaming: true,
+          pendingPermission: { id: "p", tool: "t", summary: "s", input: {} },
+        });
+        bgLive({ type: "turn_start", messageId: "b1" });
+
+        bgLive({ type: "error", message: "boom" });
+        let st = useStore.getState();
+        // The visible turn flags belong to the active session, not the background one.
+        expect(st.streaming).toBe(true);
+        expect(st.pendingPermission).not.toBeNull();
+        // ...but the background message still got the inline error.
+        const text = st.messages.bg[0].blocks
+          .map((b) => (b.kind === "text" ? b.text : ""))
+          .join("");
+        expect(text).toContain("boom");
+
+        bgLive({ type: "turn_end", stopReason: "end_turn" });
+        st = useStore.getState();
+        expect(st.streaming).toBe(true);
+        expect(st.pendingPermission).not.toBeNull();
+      });
     });
   });
 
@@ -1022,6 +1287,47 @@ describe("remote client", () => {
       expect(st.remoteUnlisten).toBeNull();
       expect(st.remoteError).toBe("dial failed");
       expect(m.onPhoneSyncFrame).not.toHaveBeenCalled();
+    });
+
+    it("serializes concurrent dials so only one frame listener is registered", async () => {
+      // Two interleaved dials (Reconnect + Scan/Connect) must not each register a
+      // frame listener and orphan one that keeps double-feeding applyFrame.
+      let release!: () => void;
+      m.phoneSyncConnect.mockReturnValueOnce(
+        new Promise((res) => {
+          release = () => res({ sas: "SAS-1", peerPublicKey: "PEER==" });
+        }),
+      );
+
+      const first = useStore.getState().connectRemote("QR-A");
+      // Second call lands while the first dial is still in flight — the re-entry
+      // guard makes it a no-op.
+      const second = useStore.getState().connectRemote("QR-B");
+
+      release();
+      await Promise.all([first, second]);
+
+      expect(m.phoneSyncConnect).toHaveBeenCalledTimes(1);
+      expect(m.onPhoneSyncFrame).toHaveBeenCalledTimes(1);
+      expect(useStore.getState().remoteConnecting).toBe(false);
+    });
+
+    it("clears the re-entry lock so a later dial can proceed", async () => {
+      await useStore.getState().connectRemote("QR-1");
+      expect(useStore.getState().remoteConnecting).toBe(false);
+
+      m.phoneSyncConnect.mockClear();
+      await useStore.getState().connectRemote("QR-2");
+
+      expect(m.phoneSyncConnect).toHaveBeenCalledWith("QR-2");
+    });
+
+    it("releases the re-entry lock even when the dial fails", async () => {
+      m.phoneSyncConnect.mockRejectedValueOnce(new Error("dial failed"));
+
+      await useStore.getState().connectRemote("QR");
+
+      expect(useStore.getState().remoteConnecting).toBe(false);
     });
   });
 
@@ -1204,6 +1510,37 @@ describe("remote client", () => {
 
       expect(useStore.getState().messages.s1).toBeUndefined();
       expect(m.phoneSyncSendCommand).toHaveBeenCalledWith(command);
+    });
+
+    it("annotates the optimistic message and flags remoteDropped when a run send rejects", async () => {
+      m.phoneSyncSendCommand.mockRejectedValueOnce(new Error("link down"));
+      useStore.setState({ streaming: true });
+
+      // Must not throw (callers swallow the rejection).
+      await expect(
+        useStore.getState().sendRemoteCommand({ cmd: "run", session_id: "s1", text: "do it" }),
+      ).resolves.toBeUndefined();
+
+      const st = useStore.getState();
+      const text = st.messages.s1[0].blocks.map((b) => (b.kind === "text" ? b.text : "")).join("");
+      expect(text).toContain("do it");
+      expect(text).toContain("Couldn't reach your desktop");
+      expect(st.remoteDropped).toBe(true);
+      expect(st.streaming).toBe(false);
+    });
+
+    it("clears streaming on a rejecting cancel (stop) without annotating any message", async () => {
+      m.phoneSyncSendCommand.mockRejectedValueOnce(new Error("link down"));
+      useStore.setState({ streaming: true });
+
+      await expect(
+        useStore.getState().sendRemoteCommand({ cmd: "cancel", session_id: "s1" }),
+      ).resolves.toBeUndefined();
+
+      const st = useStore.getState();
+      expect(st.streaming).toBe(false);
+      expect(st.remoteDropped).toBe(true);
+      expect(st.messages.s1).toBeUndefined(); // nothing optimistic to annotate
     });
   });
 

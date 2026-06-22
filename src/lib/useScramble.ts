@@ -1,25 +1,41 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
 
-const prefersReducedMotion = (): boolean =>
-  typeof window !== "undefined" &&
-  typeof window.matchMedia === "function" &&
-  window.matchMedia(REDUCED_MOTION_QUERY).matches;
+// One shared matchMedia subscription for the whole app: every
+// usePrefersReducedMotion consumer registers a lightweight callback here instead
+// of attaching its own matchMedia "change" listener, so a long transcript of
+// memoized MessageViews costs a Set of callbacks rather than N media-query
+// listeners. The single module-level "change" listener lives for the app's life.
+let reducedMotionMql: MediaQueryList | null = null;
+const reducedMotionListeners = new Set<() => void>();
+
+function ensureReducedMotionMql(): MediaQueryList | null {
+  if (reducedMotionMql) return reducedMotionMql;
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return null;
+  reducedMotionMql = window.matchMedia(REDUCED_MOTION_QUERY);
+  reducedMotionMql.addEventListener("change", () => {
+    for (const listener of reducedMotionListeners) listener();
+  });
+  return reducedMotionMql;
+}
+
+function subscribeReducedMotion(onStoreChange: () => void): () => void {
+  ensureReducedMotionMql();
+  reducedMotionListeners.add(onStoreChange);
+  return () => {
+    reducedMotionListeners.delete(onStoreChange);
+  };
+}
+
+function getReducedMotionSnapshot(): boolean {
+  const mq = ensureReducedMotionMql();
+  return mq ? mq.matches : false;
+}
 
 /** Tracks the OS "reduce motion" accessibility setting, reactively. */
 export function usePrefersReducedMotion(): boolean {
-  const [reduced, setReduced] = useState(prefersReducedMotion);
-
-  useEffect(() => {
-    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
-    const mq = window.matchMedia(REDUCED_MOTION_QUERY);
-    const onChange = () => setReduced(mq.matches);
-    mq.addEventListener("change", onChange);
-    return () => mq.removeEventListener("change", onChange);
-  }, []);
-
-  return reduced;
+  return useSyncExternalStore(subscribeReducedMotion, getReducedMotionSnapshot, () => false);
 }
 
 // A per-word "decode" reveal for the in-flight assistant turn. The reply streams

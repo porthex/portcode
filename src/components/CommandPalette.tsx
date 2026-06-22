@@ -102,6 +102,10 @@ export function CommandPalette() {
     } else if (e.key === "Enter") {
       e.preventDefault();
       choose(sel);
+    } else if (e.key === "Tab") {
+      // Trap Tab/Shift+Tab so focus can't escape to the app chrome behind the
+      // scrim; the autoFocus input stays focused, where Arrow/Enter drive the list.
+      e.preventDefault();
     }
     // Escape is handled at the window level (effect above) so it closes the palette
     // even when focus has moved off the input.
@@ -109,13 +113,24 @@ export function CommandPalette() {
 
   return (
     <div className="pc-overlay z-[60] items-start justify-center pt-[14vh]" onClick={close}>
-      <div className="pc-palette" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="pc-palette"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Command palette"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="pc-sweep pc-sweep--cyan" />
         <div className="flex items-center gap-2.5 border-b border-border px-4 py-3.5">
           <span className="font-mono text-accent">⌘</span>
           <input
             autoFocus
             aria-label="Command palette search"
+            role="combobox"
+            aria-expanded={true}
+            aria-controls="pc-palette-list"
+            aria-haspopup="listbox"
+            aria-activedescendant={filtered[sel] ? `pc-cmd-${filtered[sel].id}` : undefined}
             value={query}
             onChange={(e) => {
               setQuery(e.target.value);
@@ -129,7 +144,12 @@ export function CommandPalette() {
             ESC
           </span>
         </div>
-        <div className="max-h-[340px] overflow-y-auto p-1.5">
+        <div
+          className="max-h-[340px] overflow-y-auto p-1.5"
+          role="listbox"
+          id="pc-palette-list"
+          aria-label="Commands"
+        >
           {filtered.length === 0 ? (
             <div className="px-5 py-5 text-center text-[13px] text-faint">No matching commands</div>
           ) : (
@@ -137,6 +157,8 @@ export function CommandPalette() {
               <button
                 key={c.id}
                 ref={i === sel ? selRef : null}
+                role="option"
+                id={`pc-cmd-${c.id}`}
                 aria-label={c.hint ? `${c.label}, ${c.hint}` : c.label}
                 aria-selected={i === sel}
                 onMouseEnter={() => setSel(i)}
@@ -144,7 +166,9 @@ export function CommandPalette() {
                 className="pc-palette-row flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-[13px] text-fg"
               >
                 <span className="flex gap-2.5">
-                  <span className="font-mono text-accent-2">{c.glyph}</span>
+                  <span className="inline-flex w-5 shrink-0 justify-center font-mono text-accent-2">
+                    {c.glyph}
+                  </span>
                   {c.label}
                 </span>
                 {c.hint && <span className="font-mono text-[10.5px] text-faint">{c.hint}</span>}

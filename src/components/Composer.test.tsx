@@ -78,11 +78,16 @@ describe("Composer textarea", () => {
 
     // Streaming: the textarea goes inert so keystrokes are visibly ignored,
     // mirroring submit()'s `streaming` early-return guard.
+    // Idle: not flagged busy to assistive tech.
+    expect(ta()).not.toHaveAttribute("aria-busy", "true");
+
     act(() => {
       useStore.setState({ streaming: true });
     });
     rerender(<Composer />);
     expect(ta()).toBeDisabled();
+    // Streaming: AT sees the input as busy for the duration of the turn.
+    expect(ta()).toHaveAttribute("aria-busy", "true");
   });
 });
 
@@ -163,6 +168,37 @@ describe("Composer key handling", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(m.runAgent).toHaveBeenCalledWith("a", "ship it", expect.any(Function));
+  });
+
+  it("does not submit on the Enter that commits an IME composition", async () => {
+    useStore.setState({
+      sessions: [
+        {
+          id: "a",
+          title: "New chat",
+          workspace: null,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+      activeId: "a",
+      messages: { a: [] },
+      draft: "日本語",
+    });
+    render(<Composer />);
+
+    const ta = screen.getByPlaceholderText(
+      "Describe a task, ask a question, or give an instruction…",
+    );
+    // The composition-commit Enter carries isComposing on the native event; the
+    // guard must let it pass through (commit the candidate) without sending.
+    fireEvent.keyDown(ta, { key: "Enter", isComposing: true });
+
+    // Draft is preserved (not cleared by submit) and no turn was started.
+    expect(useStore.getState().draft).toBe("日本語");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(m.runAgent).not.toHaveBeenCalled();
   });
 
   it("inserts a newline (does not submit) on Shift+Enter", () => {

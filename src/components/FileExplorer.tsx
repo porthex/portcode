@@ -6,6 +6,7 @@ import type { DirEntry } from "../types";
 export function FileExplorer() {
   const workspace = useStore((s) => s.settings.workspace);
   const openWorkspace = useStore((s) => s.openWorkspace);
+  const workspaceError = useStore((s) => s.workspaceError);
   const [roots, setRoots] = useState<DirEntry[]>([]);
 
   useEffect(() => {
@@ -26,7 +27,10 @@ export function FileExplorer() {
   }, [workspace]);
 
   return (
-    <aside className="flex h-full w-[236px] shrink-0 flex-col border-r border-border bg-panel/80">
+    <aside
+      aria-label="File explorer"
+      className="flex h-full w-[236px] shrink-0 flex-col border-r border-border bg-panel/80"
+    >
       <div className="flex items-center gap-2 border-b border-border px-3.5 py-[11px]">
         <span
           className="pc-eyebrow-mono text-[9.5px] tracking-[2px] text-accent-2"
@@ -43,7 +47,20 @@ export function FileExplorer() {
           OPEN…
         </button>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto py-1.5 font-mono text-[12px]">
+      {workspaceError && (
+        <p
+          role="alert"
+          className="flex items-start gap-1.5 border-b border-border px-3.5 py-2 text-[11px] text-danger"
+        >
+          <span aria-hidden="true">⚠</span>
+          <span>Couldn’t open folder: {workspaceError}</span>
+        </p>
+      )}
+      <div
+        role="tree"
+        aria-label="File tree"
+        className="min-h-0 flex-1 overflow-y-auto py-1.5 font-mono text-[12px]"
+      >
         {roots.length === 0 ? (
           <div className="px-3 py-6 text-center text-[11px] text-muted">
             No workspace set
@@ -58,7 +75,14 @@ export function FileExplorer() {
             </button>
           </div>
         ) : (
-          roots.map((e) => <TreeNode key={e.path} entry={e} depth={0} />)
+          // Key the rendered roots by workspace so a workspace switch remounts
+          // every TreeNode, clearing stale open/children state from a prior
+          // workspace whose paths could collide with the new one.
+          <div key={workspace ?? "__none__"}>
+            {roots.map((e) => (
+              <TreeNode key={e.path} entry={e} depth={0} />
+            ))}
+          </div>
         )}
       </div>
     </aside>
@@ -104,19 +128,31 @@ function TreeNode({ entry, depth }: { entry: DirEntry; depth: number }) {
     <div>
       <button
         onClick={() => void toggle()}
+        role="treeitem"
+        aria-expanded={entry.isDir ? open : undefined}
+        aria-label={entry.isDir ? `${entry.name} folder` : entry.name}
         className={`pc-row--file flex w-full items-center gap-1.5 py-1 pr-2 text-left ${rowColor}`}
         style={{ paddingLeft: 10 + depth * 14 }}
         title={entry.isDir ? entry.name : `Insert ${entry.path} into composer`}
       >
         {entry.isDir ? (
-          <span className="w-3 shrink-0 text-[10px] text-faint">{open ? "▾" : "▸"}</span>
+          <span aria-hidden="true" className="w-3 shrink-0 text-[10px] text-faint">
+            {open ? "▾" : "▸"}
+          </span>
         ) : (
-          <span className="w-3 shrink-0" />
+          <span aria-hidden="true" className="w-3 shrink-0" />
         )}
         {entry.isDir ? (
-          <span className="shrink-0 text-warn">▸</span>
+          <span aria-hidden="true" className="inline-flex w-4 shrink-0 justify-center text-warn">
+            ▸
+          </span>
         ) : (
-          <span className={`shrink-0 ${glyph!.colorClass}`}>{glyph!.glyph}</span>
+          <span
+            aria-hidden="true"
+            className={`inline-flex w-4 shrink-0 justify-center ${glyph!.colorClass}`}
+          >
+            {glyph!.glyph}
+          </span>
         )}
         <span className="truncate">{entry.name}</span>
       </button>

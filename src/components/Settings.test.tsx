@@ -80,6 +80,10 @@ describe("SettingsPanel — structure", () => {
   it("renders the modal chrome, provider, model select and footer", () => {
     renderPanel();
 
+    // The panel is an accessible modal: role="dialog"/aria-modal labelled by the
+    // SETTINGS title span (id="pc-settings-title").
+    expect(screen.getByRole("dialog", { name: /settings/i })).toBeInTheDocument();
+
     // The Neon-Noir header renders the title as a styled (font-display) span,
     // not a semantic heading; assert on its literal uppercase text instead.
     expect(screen.getByText("SETTINGS")).toBeInTheDocument();
@@ -189,6 +193,107 @@ describe("SettingsPanel — close affordances", () => {
   });
 });
 
+describe("SettingsPanel — focus management", () => {
+  // jsdom does no layout, so `offsetParent` is always null — which would make the
+  // component's visibility filter (offsetParent !== null) treat every control as
+  // hidden. Stub it to mirror a real browser: null only for elements inside a
+  // `.hidden` ancestor (the remoteMode sections), the body otherwise.
+  function installOffsetParentStub() {
+    const orig = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetParent");
+    Object.defineProperty(HTMLElement.prototype, "offsetParent", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this.closest(".hidden") ? null : document.body;
+      },
+    });
+    return () => {
+      if (orig) Object.defineProperty(HTMLElement.prototype, "offsetParent", orig);
+    };
+  }
+
+  /** Live-query the visible focusable controls inside the dialog (matches the component). */
+  function visibleFocusable(dialog: HTMLElement) {
+    return Array.from(
+      dialog.querySelectorAll<HTMLElement>(
+        'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter((el) => el.offsetParent !== null);
+  }
+
+  it("exposes dialog semantics and moves focus into the modal on open", () => {
+    renderPanel();
+
+    const dialog = screen.getByRole("dialog", { name: /settings/i });
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    // The first focusable descendant (the close ✕) receives focus on mount, so a
+    // keyboard user isn't left on a background control behind the scrim.
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Close settings" }));
+  });
+
+  it("traps Tab: from the last focusable wraps to the first", () => {
+    const restore = installOffsetParentStub();
+    try {
+      renderPanel();
+
+      const dialog = screen.getByRole("dialog", { name: /settings/i });
+      const focusable = visibleFocusable(dialog);
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+
+      last.focus();
+      fireEvent.keyDown(dialog, { key: "Tab" });
+      expect(document.activeElement).toBe(first);
+    } finally {
+      restore();
+    }
+  });
+
+  it("traps Shift+Tab: from the first focusable wraps to the last", () => {
+    const restore = installOffsetParentStub();
+    try {
+      renderPanel();
+
+      const dialog = screen.getByRole("dialog", { name: /settings/i });
+      const focusable = visibleFocusable(dialog);
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+
+      first.focus();
+      fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
+      expect(document.activeElement).toBe(last);
+    } finally {
+      restore();
+    }
+  });
+
+  it("ignores non-Tab keys in the trap handler", () => {
+    renderPanel();
+    const dialog = screen.getByRole("dialog", { name: /settings/i });
+    const before = document.activeElement;
+    // A bare key press must not move focus (only Tab is trapped).
+    fireEvent.keyDown(dialog, { key: "a" });
+    expect(document.activeElement).toBe(before);
+  });
+
+  it("restores focus to the opener when the modal unmounts", () => {
+    // Stub an opener that has focus before the modal mounts; closing the modal
+    // must return focus to it.
+    const trigger = document.createElement("button");
+    trigger.textContent = "open settings";
+    document.body.appendChild(trigger);
+    trigger.focus();
+    expect(document.activeElement).toBe(trigger);
+
+    const { unmount } = renderPanel();
+    // Focus moved into the dialog on open.
+    expect(document.activeElement).not.toBe(trigger);
+
+    unmount();
+    expect(document.activeElement).toBe(trigger);
+    trigger.remove();
+  });
+});
+
 describe("SettingsPanel — model picker", () => {
   it("persists a model change through ipc.saveSettings and updates the store", async () => {
     renderPanel();
@@ -201,6 +306,24 @@ describe("SettingsPanel — model picker", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(useStore.getState().settings.model).toBe("claude-haiku-4-5-20251001");
+  });
+
+  it("surfaces store.settingsError when a model save fails and preserves the prior value", async () => {
+    m.saveSettings.mockRejectedValueOnce(new Error("disk full"));
+    renderPanel({ model: MODELS[0].id });
+
+    const select = screen.getByRole("combobox") as HTMLSelectElement;
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "claude-haiku-4-5-20251001" } });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The store's updateSettings catches the reject into settingsError; the panel
+    // surfaces it and the persisted model is unchanged (controlled value preserved).
+    expect(screen.getByText(/Couldn't save settings: disk full/)).toBeInTheDocument();
+    expect(useStore.getState().settings.model).toBe(MODELS[0].id);
+    expect(useStore.getState().settingsError).toBe("disk full");
   });
 });
 
@@ -274,6 +397,48 @@ describe("SettingsPanel — API key", () => {
       vi.advanceTimersByTime(1800);
     });
     expect(screen.getByRole("button", { name: "Replace" })).toBeInTheDocument();
+  });
+
+  it("surfaces a setApiKey failure and retains the typed value", async () => {
+    m.setApiKey.mockRejectedValueOnce(new Error("keyring locked"));
+    renderPanel({ apiKeySet: false });
+
+    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The error is shown and the typed value is kept so the user can retry.
+    expect(screen.getByText(/Couldn't save key: keyring locked/)).toBeInTheDocument();
+    expect(input.value).toBe("sk-ant-secret");
+    // apiKeySet was never flipped, so the resting label is still "Save".
+    expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
+    expect(useStore.getState().settings.apiKeySet).toBe(false);
+  });
+
+  it("announces the saved key via a polite live region after a successful save", async () => {
+    vi.useFakeTimers();
+    renderPanel({ apiKeySet: false });
+
+    // Before saving, the status region is empty (rendered unconditionally).
+    const region = screen.getByRole("status");
+    expect(region).toHaveTextContent("");
+
+    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("status")).toHaveTextContent("API key saved");
   });
 
   it("clears the Saved-flash timer on unmount so it can't update state after close", async () => {
@@ -511,6 +676,10 @@ describe("SettingsPanel — Phone Sync section", () => {
 
     expect(writeText).toHaveBeenCalledWith('{"version":1,"publicKey":"PUB==","nonce":"NON=="}');
     expect(screen.getByRole("button", { name: /Copied/ })).toBeInTheDocument();
+    // A polite status region announces the copy for screen-reader users.
+    expect(
+      screen.getByText("Pairing code copied", { selector: '[role="status"]' }),
+    ).toBeInTheDocument();
   });
 
   it("Done button clears the pairing payload", () => {

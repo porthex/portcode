@@ -152,6 +152,12 @@ textarea:focus-visible {
   outline: none;
   box-shadow: none;
 }
+/* Opt-in cyan focus ring for selects that need a visible keyboard focus
+   (e.g. the Settings Model select); the rule above otherwise zeroes it. */
+.pc-select:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(33, 230, 255, 0.6);
+}
 
 /* =========================================================================
    MOTION
@@ -258,6 +264,17 @@ textarea:focus-visible {
     transform: translateY(100vh);
   }
 }
+@keyframes pcFlash {
+  0% {
+    box-shadow: 0 0 0 0 rgba(52, 255, 158, 0);
+  }
+  35% {
+    box-shadow: 0 0 18px 2px rgba(52, 255, 158, 0.55);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(52, 255, 158, 0);
+  }
+}
 
 @media (prefers-reduced-motion: reduce) {
   /* Reduced-motion: gate only large/ambient MOVEMENT. The digital rain
@@ -272,6 +289,21 @@ textarea:focus-visible {
   }
   .pc-sweep {
     animation: none !important;
+  }
+  /* pcRise-based enters slide-up (geometry) — neutralize them. Base rules
+     declare no opacity, so each element renders fully visible without motion. */
+  .pc-modal,
+  .pc-palette {
+    animation: none !important;
+  }
+  .pc-gate {
+    animation: none !important;
+  }
+  .pc-msg-enter {
+    animation: none;
+  }
+  .pc-flash {
+    animation: none;
   }
 }
 
@@ -456,6 +488,12 @@ textarea:focus-visible {
   box-shadow: 0 0 22px rgba(255, 46, 126, 0.28);
 }
 
+/* One-shot success-accent pulse for Settings Save / Copy confirmations
+   (pcFlash box-shadow; neutralized under prefers-reduced-motion). */
+.pc-flash {
+  animation: pcFlash 360ms ease-out;
+}
+
 /* =========================================================================
    PILLS + DOTS
    ========================================================================= */
@@ -565,6 +603,7 @@ textarea:focus-visible {
   align-items: center;
   height: 27px;
   flex-shrink: 0;
+  overflow: hidden;
   border-top: 1px solid #141a29;
   background: rgba(7, 8, 13, 0.92);
   font-family: var(--font-mono);
@@ -581,9 +620,23 @@ textarea:focus-visible {
   border-right: 1px solid #141a29;
   white-space: nowrap;
 }
+/* Only the variable-length left segments shrink + truncate so the HUD never
+   overflows at narrow widths; the live right group keeps its full content. */
+.pc-hud-seg--left {
+  min-width: 0;
+  flex-shrink: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .pc-hud-seg--right {
+  flex-shrink: 0;
   border-right: 0;
   border-left: 1px solid #141a29;
+}
+/* The last left segment abuts the spacer gap — drop its divider so the
+   border rhythm isn't broken by a hairline floating against empty space. */
+.pc-hud-seg:has(+ .pc-hud-spacer) {
+  border-right: 0;
 }
 .pc-hud-spacer {
   margin-left: auto;
@@ -731,6 +784,12 @@ textarea:focus-visible {
   color: var(--color-accent-hi);
   text-shadow: 0 0 6px var(--color-accent);
 }
+/* New message rows ease in once on mount (reused pcRise keyframe). The global
+   reduced-motion block does NOT cover pcRise, so an explicit guard above
+   neutralizes this under prefers-reduced-motion. */
+.pc-msg-enter {
+  animation: pcRise 0.18s ease both;
+}
 
 /* =========================================================================
    PERMISSION GATE (banner)
@@ -738,6 +797,9 @@ textarea:focus-visible {
 .pc-gate {
   border-top: 1px solid rgba(255, 176, 46, 0.4);
   background: rgba(255, 176, 46, 0.07);
+  /* Eases in once when the permission banner mounts (reused pcRise keyframe;
+     neutralized under prefers-reduced-motion). */
+  animation: pcRise 0.18s ease both;
 }
 .pc-gate__icon {
   display: flex;
@@ -943,6 +1005,17 @@ textarea:focus-visible {
 .prose-pc p {
   margin: 0.4em 0;
 }
+/* Break long unbroken strings (URLs / paths / tokens) so settled markdown wraps
+   at the full conversation width instead of overflowing. (No measure cap — the
+   conversation is intentionally near-full-width.) */
+.prose-pc p,
+.prose-pc li,
+.prose-pc h1,
+.prose-pc h2,
+.prose-pc h3 {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 .prose-pc pre {
   background: #050609;
   border: 1px solid var(--color-border);
@@ -962,6 +1035,7 @@ textarea:focus-visible {
   color: var(--color-accent-2);
   padding: 1px 5px;
   border-radius: 4px;
+  overflow-wrap: anywhere;
 }
 .prose-pc ul,
 .prose-pc ol {
@@ -988,6 +1062,26 @@ textarea:focus-visible {
 }
 .prose-pc a {
   color: var(--color-accent-2);
+}
+/* GFM tables (remark-gfm) get a horizontal-scroll container + borders instead
+   of overflowing the conversation. No white-space:nowrap — cells still wrap. */
+.prose-pc table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 0.6em 0;
+  font-size: 0.92em;
+}
+.prose-pc th,
+.prose-pc td {
+  border: 1px solid var(--color-border);
+  padding: 5px 9px;
+  text-align: left;
+}
+.prose-pc th {
+  background: rgba(33, 230, 255, 0.06);
+  font-weight: 600;
 }
 
 /* =========================================================================

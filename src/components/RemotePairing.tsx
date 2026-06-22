@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useStore } from "../store/store";
 import { isScannerAvailable, scanQrPayload, cancelScan } from "../lib/scanner";
@@ -135,6 +135,19 @@ function ConnectPanel({
   const reconnectRemote = useStore((s) => s.reconnectRemote);
   const [reconnecting, setReconnecting] = useState(false);
 
+  // Place initial focus on the primary action: the Scan button on the phone,
+  // otherwise the pairing textarea — so the panel is operable from the keyboard
+  // without a hunt.
+  const scanRef = useRef<HTMLButtonElement>(null);
+  const pasteRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    if (canScan && !(scanning || connecting)) scanRef.current?.focus();
+    else if (!connecting) pasteRef.current?.focus();
+    // Run once on mount; the connecting/scanning guards just avoid focusing a
+    // disabled control if the panel happens to mount mid-flight.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const onReconnect = async () => {
     if (reconnecting) return;
     setReconnecting(true);
@@ -147,6 +160,12 @@ function ConnectPanel({
 
   return (
     <div>
+      {/* Persistent live region so the drop transition is announced. We keep it
+          mounted (rather than reusing the warn block, which only renders once a
+          pairing is remembered) so screen readers catch the change to dropped. */}
+      <span className="sr-only" role="status" aria-live="polite">
+        {dropped ? "Connection to desktop lost. Reconnect available." : ""}
+      </span>
       {canReconnect && (
         <div
           className={`mb-4 rounded-xl border px-4 py-3.5 ${
@@ -188,6 +207,7 @@ function ConnectPanel({
       {canScan && (
         <>
           <button
+            ref={scanRef}
             type="button"
             onClick={() => void onScan()}
             disabled={scanning || connecting}
@@ -215,6 +235,7 @@ function ConnectPanel({
         Pairing code
       </label>
       <textarea
+        ref={pasteRef}
         id="pc-remote-qr"
         value={qr}
         onChange={(e) => setQr(e.target.value)}
@@ -250,6 +271,13 @@ function VerifyPanel() {
   const confirmRemoteSas = useStore((s) => s.confirmRemoteSas);
   const disconnectRemote = useStore((s) => s.disconnectRemote);
 
+  // Focus the primary "Codes match — Continue" action on mount so the
+  // security-critical confirm is one keystroke away once the panel appears.
+  const continueRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    continueRef.current?.focus();
+  }, []);
+
   return (
     <div>
       <div className="mb-3 flex items-center gap-2">
@@ -276,6 +304,7 @@ function VerifyPanel() {
       </div>
 
       <button
+        ref={continueRef}
         onClick={() => confirmRemoteSas()}
         className="pc-btn-accent mt-4 w-full px-3 py-2.5 text-[13px]"
       >

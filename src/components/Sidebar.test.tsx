@@ -286,14 +286,16 @@ describe("Sidebar", () => {
     it("surfaces the live session count with correct pluralization", () => {
       m.isTauri.mockReturnValue(false);
 
+      // The decorative ◴ glyph is now an aria-hidden span, so the count text node
+      // reads e.g. " 0 SESSIONS"; match on the count text rather than the glyph.
       useStore.setState({ sessions: [], activeId: null });
       const zero = render(<Sidebar />);
-      expect(zero.getByText(/^◴ 0 SESSIONS$/)).toBeInTheDocument();
+      expect(zero.getByText(/0 SESSIONS/)).toBeInTheDocument();
       zero.unmount();
 
       useStore.setState({ sessions: [session({ id: "a" })], activeId: "a" });
       const one = render(<Sidebar />);
-      expect(one.getByText(/^◴ 1 SESSION$/)).toBeInTheDocument();
+      expect(one.getByText(/1 SESSION/)).toBeInTheDocument();
       one.unmount();
 
       useStore.setState({
@@ -301,22 +303,148 @@ describe("Sidebar", () => {
         activeId: "a",
       });
       const many = render(<Sidebar />);
-      expect(many.getByText(/^◴ 3 SESSIONS$/)).toBeInTheDocument();
+      expect(many.getByText(/3 SESSIONS/)).toBeInTheDocument();
     });
 
     it("honestly reports whether the native core is attached", () => {
       useStore.setState({ sessions: [session()], activeId: "s1" });
 
+      // The decorative ◉ glyph is aria-hidden in its own span, so the visible text
+      // node is just "PREVIEW"/"CORE"; match on that.
       m.isTauri.mockReturnValue(false);
       const preview = render(<Sidebar />);
-      expect(preview.getByText("◉ PREVIEW")).toBeInTheDocument();
-      expect(preview.queryByText("◉ CORE")).not.toBeInTheDocument();
+      expect(preview.getByText("PREVIEW")).toBeInTheDocument();
+      expect(preview.queryByText("CORE")).not.toBeInTheDocument();
       preview.unmount();
 
       m.isTauri.mockReturnValue(true);
       const core = render(<Sidebar />);
-      expect(core.getByText("◉ CORE")).toBeInTheDocument();
-      expect(core.queryByText("◉ PREVIEW")).not.toBeInTheDocument();
+      expect(core.getByText("CORE")).toBeInTheDocument();
+      expect(core.queryByText("PREVIEW")).not.toBeInTheDocument();
+    });
+  });
+
+  describe("landmarks & keyboard navigation", () => {
+    it("labels the complementary and navigation landmarks", () => {
+      useStore.setState({ sessions: [session()], activeId: "s1" });
+
+      render(<Sidebar />);
+
+      // Screen-reader users can jump to the sidebar and its session list by name.
+      expect(screen.getByRole("complementary", { name: "Sessions" })).toBeInTheDocument();
+      expect(screen.getByRole("navigation", { name: "Session list" })).toBeInTheDocument();
+    });
+
+    it("makes only the active row a tab stop (roving tabindex)", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "First" }), session({ id: "b", title: "Second" })],
+        activeId: "b",
+      });
+
+      render(<Sidebar />);
+
+      const inactive = screen.getByRole("button", { name: /^First/ });
+      const active = screen.getByRole("button", { name: /^Second/ });
+      expect(active).toHaveAttribute("tabindex", "0");
+      expect(inactive).toHaveAttribute("tabindex", "-1");
+    });
+
+    it("ArrowDown/ArrowUp move selection and follow focus", () => {
+      useStore.setState({
+        sessions: [
+          session({ id: "a", title: "First" }),
+          session({ id: "b", title: "Second" }),
+          session({ id: "c", title: "Third" }),
+        ],
+        activeId: "a",
+      });
+
+      render(<Sidebar />);
+      const nav = screen.getByRole("navigation", { name: "Session list" });
+
+      fireEvent.keyDown(nav, { key: "ArrowDown" });
+      expect(useStore.getState().activeId).toBe("b");
+
+      fireEvent.keyDown(nav, { key: "ArrowUp" });
+      expect(useStore.getState().activeId).toBe("a");
+    });
+
+    it("Home/End jump to the first and last sessions", () => {
+      useStore.setState({
+        sessions: [
+          session({ id: "a", title: "First" }),
+          session({ id: "b", title: "Second" }),
+          session({ id: "c", title: "Third" }),
+        ],
+        activeId: "b",
+      });
+
+      render(<Sidebar />);
+      const nav = screen.getByRole("navigation", { name: "Session list" });
+
+      fireEvent.keyDown(nav, { key: "End" });
+      expect(useStore.getState().activeId).toBe("c");
+
+      fireEvent.keyDown(nav, { key: "Home" });
+      expect(useStore.getState().activeId).toBe("a");
+    });
+
+    it("clamps ArrowUp at the first row and ArrowDown at the last", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "First" }), session({ id: "b", title: "Second" })],
+        activeId: "a",
+      });
+
+      render(<Sidebar />);
+      const nav = screen.getByRole("navigation", { name: "Session list" });
+
+      // Already at the top — ArrowUp keeps the first session active.
+      fireEvent.keyDown(nav, { key: "ArrowUp" });
+      expect(useStore.getState().activeId).toBe("a");
+
+      // Walk to the bottom, then ArrowDown again stays on the last session.
+      fireEvent.keyDown(nav, { key: "ArrowDown" });
+      fireEvent.keyDown(nav, { key: "ArrowDown" });
+      expect(useStore.getState().activeId).toBe("b");
+    });
+
+    it("ignores unrelated keys without changing selection", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "First" }), session({ id: "b", title: "Second" })],
+        activeId: "a",
+      });
+
+      render(<Sidebar />);
+      const nav = screen.getByRole("navigation", { name: "Session list" });
+
+      fireEvent.keyDown(nav, { key: "a" });
+      expect(useStore.getState().activeId).toBe("a");
+    });
+
+    it("does not navigate the list while a turn is streaming", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "First" }), session({ id: "b", title: "Second" })],
+        activeId: "a",
+        streaming: true,
+      });
+
+      render(<Sidebar />);
+      const nav = screen.getByRole("navigation", { name: "Session list" });
+
+      fireEvent.keyDown(nav, { key: "ArrowDown" });
+      // selectSession no-ops while streaming, so the active session is unchanged.
+      expect(useStore.getState().activeId).toBe("a");
+    });
+
+    it("no-ops arrow navigation when there are no sessions", () => {
+      useStore.setState({ sessions: [], activeId: null });
+
+      render(<Sidebar />);
+      const nav = screen.getByRole("navigation", { name: "Session list" });
+
+      // The empty list has no rows to move between; the handler must not throw.
+      expect(() => fireEvent.keyDown(nav, { key: "ArrowDown" })).not.toThrow();
+      expect(useStore.getState().activeId).toBeNull();
     });
   });
 });

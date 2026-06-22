@@ -160,37 +160,49 @@ describe("useScramble", () => {
 });
 
 describe("usePrefersReducedMotion", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it("returns false when matchMedia is unavailable", () => {
     vi.stubGlobal("matchMedia", undefined);
     const { result } = renderHook(() => usePrefersReducedMotion());
     expect(result.current).toBe(false);
   });
 
-  it("reflects the setting, reacts to changes, and unsubscribes on unmount", () => {
+  it("shares one matchMedia subscription across consumers and reacts to changes", () => {
     let handler: (() => void) | null = null;
-    const removeEventListener = vi.fn();
     const mq = {
       matches: true,
       addEventListener: (_type: string, h: () => void) => {
         handler = h;
       },
-      removeEventListener,
+      removeEventListener: vi.fn(),
     };
-    vi.stubGlobal(
-      "matchMedia",
-      vi.fn(() => mq),
-    );
+    const matchMedia = vi.fn(() => mq);
+    vi.stubGlobal("matchMedia", matchMedia);
 
-    const { result, unmount } = renderHook(() => usePrefersReducedMotion());
-    expect(result.current).toBe(true);
+    // Two consumers (e.g. two MessageViews) share a SINGLE media-query listener.
+    const a = renderHook(() => usePrefersReducedMotion());
+    const b = renderHook(() => usePrefersReducedMotion());
+    expect(a.result.current).toBe(true);
+    expect(b.result.current).toBe(true);
+    expect(matchMedia).toHaveBeenCalledTimes(1);
 
+    // A change fans out to every consumer.
     act(() => {
       mq.matches = false;
       handler?.();
     });
-    expect(result.current).toBe(false);
+    expect(a.result.current).toBe(false);
+    expect(b.result.current).toBe(false);
 
-    unmount();
-    expect(removeEventListener).toHaveBeenCalledTimes(1);
+    // Unsubscribing one consumer leaves the others subscribed and updating.
+    a.unmount();
+    act(() => {
+      mq.matches = true;
+      handler?.();
+    });
+    expect(b.result.current).toBe(true);
   });
 });

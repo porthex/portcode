@@ -192,6 +192,21 @@ describe("remote mode shell", () => {
     expect(useStore.getState().showSidebar).toBe(false);
   });
 
+  it("closes the session drawer with Escape", () => {
+    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Toggle sessions" }));
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+
+    // Plain Escape isn't caught by App's modified-key shortcut effect; the drawer
+    // installs its own handler so focus isn't stranded inside the overlay.
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
+    expect(useStore.getState().showSidebar).toBe(false);
+  });
+
   it("hides the desktop command-palette button on the phone", () => {
     useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
 
@@ -249,6 +264,29 @@ describe("TitleBar", () => {
     render(<App />);
 
     expect(screen.getByText("Refactor the parser")).toBeInTheDocument();
+  });
+
+  it("exposes the active session title as a level-1 heading", () => {
+    useStore.setState({
+      sessions: [
+        {
+          id: "a",
+          title: "Refactor the parser",
+          workspace: null,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+      activeId: "a",
+    });
+
+    render(<App />);
+
+    // The breadcrumb title carries heading semantics (role=heading aria-level=1)
+    // so a populated conversation has a document heading.
+    expect(
+      screen.getByRole("heading", { level: 1, name: "Refactor the parser" }),
+    ).toBeInTheDocument();
   });
 
   it("renders the preview-mode badge outside Tauri", () => {
@@ -354,6 +392,78 @@ describe("global keyboard shortcuts", () => {
 
     const st = useStore.getState();
     expect(st.showPalette).toBe(false);
+    expect(st.showFiles).toBe(false);
+    expect(st.showSettings).toBe(false);
+  });
+
+  it("ignores shell shortcuts while typing in an input", () => {
+    render(<App />);
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.focus();
+
+    // A real event so e.target is the focused input (fireEvent.keyDown(window)
+    // would target window, defeating the guard).
+    act(() => {
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
+    });
+
+    const st = useStore.getState();
+    expect(st.showPalette).toBe(false);
+    expect(st.showSettings).toBe(false);
+    document.body.removeChild(input);
+  });
+
+  it("ignores shell shortcuts while typing in a textarea", () => {
+    render(<App />);
+    const ta = document.createElement("textarea");
+    document.body.appendChild(ta);
+    ta.focus();
+
+    act(() => {
+      ta.dispatchEvent(new KeyboardEvent("keydown", { key: ",", ctrlKey: true, bubbles: true }));
+    });
+
+    expect(useStore.getState().showSettings).toBe(false);
+    document.body.removeChild(ta);
+  });
+
+  it("does not stack the palette over open Settings (Ctrl+K is a no-op)", () => {
+    useStore.setState({ showSettings: true });
+    render(<App />);
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+
+    // Settings is open: Ctrl+K must not open the palette on top of it.
+    expect(useStore.getState().showPalette).toBe(false);
+    expect(useStore.getState().showSettings).toBe(true);
+  });
+
+  it("ignores Ctrl+N/B/, while Settings is open", () => {
+    useStore.setState({ showSettings: true });
+    render(<App />);
+    const before = useStore.getState().sessions.length;
+
+    fireEvent.keyDown(window, { key: "n", ctrlKey: true });
+    fireEvent.keyDown(window, { key: "b", ctrlKey: true });
+    fireEvent.keyDown(window, { key: ",", ctrlKey: true });
+
+    const st = useStore.getState();
+    expect(st.sessions).toHaveLength(before);
+    expect(st.showFiles).toBe(false);
+  });
+
+  it("ignores Ctrl+N/B/, while the palette is open", () => {
+    useStore.setState({ showPalette: true });
+    render(<App />);
+    const before = useStore.getState().sessions.length;
+
+    fireEvent.keyDown(window, { key: "n", ctrlKey: true });
+    fireEvent.keyDown(window, { key: "b", ctrlKey: true });
+    fireEvent.keyDown(window, { key: ",", ctrlKey: true });
+
+    const st = useStore.getState();
+    expect(st.sessions).toHaveLength(before);
     expect(st.showFiles).toBe(false);
     expect(st.showSettings).toBe(false);
   });

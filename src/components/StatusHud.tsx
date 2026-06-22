@@ -1,3 +1,5 @@
+import { useMemo } from "react";
+
 import { useStore } from "../store/store";
 import { MODELS, type Message } from "../types";
 
@@ -46,22 +48,24 @@ export function StatusHud() {
   const tokens = usage ? usage.input + usage.output : 0;
 
   const workspaceConnected = Boolean(session?.workspace);
-  const toolUses = countToolUses(messages);
+  // Memoized so the transcript isn't re-scanned on every streaming delta — the
+  // count only changes when `messages` does, not on each token/usage update.
+  const toolUses = useMemo(() => countToolUses(messages), [messages]);
 
   return (
     <footer className="pc-hud">
-      <div className="pc-hud-seg text-accent">
-        <span className="pc-dot pc-dot--success" />
-        {"⎇"} {workspaceLabel(session?.workspace)}
+      <div className="pc-hud-seg pc-hud-seg--left text-accent">
+        <span className="pc-dot pc-dot--success" aria-hidden="true" />
+        <span aria-hidden="true">{"⎇"}</span> {workspaceLabel(session?.workspace)}
       </div>
-      <div className="pc-hud-seg text-accent-2">{modelLabel(model)}</div>
+      <div className="pc-hud-seg pc-hud-seg--left text-accent-2">{modelLabel(model)}</div>
       {/* The phone trims the HUD to essentials so the 7 desktop segments don't
           overflow a narrow screen — policy and the redundant workspace segment
           (the ⎇ branch above already names the workspace) are desktop-only. */}
       {!remoteMode && <div className="pc-hud-seg text-warn">POLICY: {policy.toUpperCase()}</div>}
       {!remoteMode && (
         <div className="pc-hud-seg text-violet">
-          {"◆"} WORKSPACE {workspaceConnected ? "LINKED" : "LOCAL"}
+          <span aria-hidden="true">{"◆"}</span> WORKSPACE {workspaceConnected ? "LINKED" : "LOCAL"}
         </div>
       )}
 
@@ -74,7 +78,10 @@ export function StatusHud() {
       )}
       <div className="pc-hud-seg pc-hud-seg--right text-faint">{tokens.toLocaleString()} tok</div>
       <div className="pc-hud-seg pc-hud-seg--right text-success">
-        <span className="pc-dot pc-dot--success" />
+        <span
+          className={`pc-dot ${streaming ? "pc-dot--ring" : "pc-dot--success"}`}
+          aria-hidden="true"
+        />
         NEURAL LINK · {streaming ? "LIVE" : "IDLE"}
       </div>
     </footer>

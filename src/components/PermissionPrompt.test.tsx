@@ -57,10 +57,51 @@ describe("PermissionPrompt", () => {
 
     expect(screen.getByText("fs_read")).toBeInTheDocument();
     expect(screen.getByText("README.md")).toBeInTheDocument();
-    // All three actions are offered.
-    expect(screen.getByRole("button", { name: "⏎ Allow" })).toBeInTheDocument();
+    // All three actions are offered. The ⏎ hint lives on Deny (the focused,
+    // safe default) so the affordance matches what Enter actually does.
+    expect(screen.getByRole("button", { name: "Allow" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Always allow" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Deny" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "⏎ Deny" })).toBeInTheDocument();
+  });
+
+  it("announces the banner via role='alert' including the tool and summary", () => {
+    useStore.setState({
+      pendingPermission: pending({ tool: "fs_write", summary: "src/secret.ts" }),
+    });
+
+    render(<PermissionPrompt />);
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("fs_write");
+    expect(alert).toHaveTextContent("src/secret.ts");
+  });
+
+  it("puts the ⏎ keyboard hint on the focused Deny action, not Allow", () => {
+    useStore.setState({ pendingPermission: pending() });
+
+    render(<PermissionPrompt />);
+
+    const deny = screen.getByRole("button", { name: "⏎ Deny" });
+    expect(deny).toHaveFocus();
+    expect(deny).toHaveAttribute("aria-keyshortcuts", "Enter");
+    // The Allow label must not claim the Enter affordance.
+    expect(screen.getByRole("button", { name: "Allow" })).not.toHaveFocus();
+  });
+
+  it("wraps a pathological summary without dropping the action row", () => {
+    const summary = "/very/long/" + "deep/".repeat(40) + "path/to/file.ts";
+    useStore.setState({ pendingPermission: pending({ summary }) });
+
+    render(<PermissionPrompt />);
+
+    // The full path is preserved in a title for hover/inspection even though
+    // it is visually clamped to two lines.
+    const span = screen.getByText(summary);
+    expect(span).toHaveAttribute("title", summary);
+
+    // All three actions still render, in order, anchored below the summary.
+    const buttons = screen.getAllByRole("button");
+    expect(buttons.map((b) => b.textContent)).toEqual(["Allow", "Always allow", "⏎ Deny"]);
   });
 
   it("auto-focuses the safe Deny action so a reflexive Enter denies", () => {
@@ -68,14 +109,14 @@ describe("PermissionPrompt", () => {
 
     render(<PermissionPrompt />);
 
-    expect(screen.getByRole("button", { name: "Deny" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "⏎ Deny" })).toHaveFocus();
   });
 
   it("Allow forwards an allow decision to the IPC layer and clears the prompt", async () => {
     useStore.setState({ pendingPermission: pending() });
 
     render(<PermissionPrompt />);
-    fireEvent.click(screen.getByRole("button", { name: "⏎ Allow" }));
+    fireEvent.click(screen.getByRole("button", { name: "Allow" }));
 
     await flush();
 
@@ -101,7 +142,7 @@ describe("PermissionPrompt", () => {
     useStore.setState({ pendingPermission: pending({ id: "p9" }) });
 
     render(<PermissionPrompt />);
-    fireEvent.click(screen.getByRole("button", { name: "Deny" }));
+    fireEvent.click(screen.getByRole("button", { name: "⏎ Deny" }));
 
     await flush();
 

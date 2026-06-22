@@ -34,7 +34,9 @@ const TOTAL_COMMANDS = FIXED_COMMANDS + MODELS.length;
 
 const open = () => useStore.setState({ showPalette: true });
 const input = () => screen.getByPlaceholderText("Type a command…") as HTMLInputElement;
-const commandButtons = () => screen.queryAllByRole("button").filter((b) => b.querySelector("span"));
+// Rows are role="option" under the role="listbox" results container (their
+// implicit <button> role is overridden), so query them by the option role.
+const commandButtons = () => screen.queryAllByRole("option");
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -76,8 +78,9 @@ describe("visibility", () => {
     open();
     render(<CommandPalette />);
 
-    // the input is reachable by its accessible name, which placeholders do not provide
-    const search = screen.getByRole("textbox", { name: "Command palette search" });
+    // the input is reachable by its accessible name, which placeholders do not provide.
+    // It carries role="combobox" (overriding the implicit textbox role) for the listbox.
+    const search = screen.getByRole("combobox", { name: "Command palette search" });
     expect(search).toBe(input());
   });
 
@@ -86,9 +89,51 @@ describe("visibility", () => {
     render(<CommandPalette />);
 
     // a hinted row announces label + shortcut to screen readers, not a bare glyph
-    expect(screen.getByRole("button", { name: "New chat, Ctrl+N" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "New chat, Ctrl+N" })).toBeInTheDocument();
     // a hintless row falls back to just its label
-    expect(screen.getByRole("button", { name: "Open folder…" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Open folder…" })).toBeInTheDocument();
+  });
+});
+
+describe("accessibility roles", () => {
+  it("exposes the palette as a modal dialog and the input as a combobox", () => {
+    open();
+    render(<CommandPalette />);
+
+    const dialog = screen.getByRole("dialog", { name: "Command palette" });
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+
+    const combobox = screen.getByRole("combobox", { name: "Command palette search" });
+    expect(combobox).toBe(input());
+    expect(combobox).toHaveAttribute("aria-controls", "pc-palette-list");
+    expect(combobox).toHaveAttribute("aria-haspopup", "listbox");
+
+    // the results container is the listbox the combobox controls
+    const listbox = screen.getByRole("listbox", { name: "Commands" });
+    expect(listbox).toHaveAttribute("id", "pc-palette-list");
+  });
+
+  it("tracks the active option via aria-activedescendant as the highlight moves", () => {
+    open();
+    render(<CommandPalette />);
+    const el = input();
+
+    // first command ("New chat") is active initially
+    expect(el).toHaveAttribute("aria-activedescendant", "pc-cmd-new");
+
+    // arrowing down moves the active descendant to the next row
+    fireEvent.keyDown(el, { key: "ArrowDown" });
+    expect(el).toHaveAttribute("aria-activedescendant", "pc-cmd-files");
+  });
+
+  it("clears aria-activedescendant when nothing matches", () => {
+    open();
+    render(<CommandPalette />);
+    const el = input();
+
+    fireEvent.change(el, { target: { value: "zzzzz-nope" } });
+    expect(screen.getByText("No matching commands")).toBeInTheDocument();
+    expect(el).not.toHaveAttribute("aria-activedescendant");
   });
 });
 
@@ -330,6 +375,19 @@ describe("closing", () => {
     fireEvent.keyDown(input(), { key: "a" });
 
     // no navigation, no close
+    expect(useStore.getState().showPalette).toBe(true);
+    expect(commandButtons()[0]).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("traps Tab so focus stays in the palette (default prevented, list unchanged)", () => {
+    open();
+    render(<CommandPalette />);
+
+    // Tab/Shift+Tab must not move focus to app chrome behind the scrim
+    const tab = fireEvent.keyDown(input(), { key: "Tab" });
+    expect(tab).toBe(false); // returns false when preventDefault() was called
+
+    // the palette stays open with the first row still selected
     expect(useStore.getState().showPalette).toBe(true);
     expect(commandButtons()[0]).toHaveAttribute("aria-selected", "true");
   });

@@ -162,7 +162,9 @@ describe("FileExplorer tree", () => {
 
     render(<FileExplorer />);
 
-    const dirBtn = await screen.findByRole("button", { name: /src/ });
+    // Rows are tree items (role="treeitem"); the dir's accessible name is its
+    // explicit "<name> folder" label, which the /src/ matcher still matches.
+    const dirBtn = await screen.findByRole("treeitem", { name: /src/ });
     fireEvent.click(dirBtn);
 
     // Second listDir call carries the directory's path.
@@ -178,7 +180,7 @@ describe("FileExplorer tree", () => {
       .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx", isDir: false })]);
 
     render(<FileExplorer />);
-    const dirBtn = await screen.findByRole("button", { name: /src/ });
+    const dirBtn = await screen.findByRole("treeitem", { name: /src/ });
 
     // expand -> children fetched
     fireEvent.click(dirBtn);
@@ -209,7 +211,7 @@ describe("FileExplorer tree", () => {
       );
 
     render(<FileExplorer />);
-    const dirBtn = await screen.findByRole("button", { name: /src/ });
+    const dirBtn = await screen.findByRole("treeitem", { name: /src/ });
 
     // First click kicks off the (still-pending) child fetch.
     fireEvent.click(dirBtn);
@@ -233,7 +235,7 @@ describe("FileExplorer tree", () => {
       .mockRejectedValueOnce(new Error("permission denied"));
 
     render(<FileExplorer />);
-    const dirBtn = await screen.findByRole("button", { name: /locked/ });
+    const dirBtn = await screen.findByRole("treeitem", { name: /locked/ });
 
     fireEvent.click(dirBtn);
 
@@ -256,7 +258,7 @@ describe("FileExplorer tree", () => {
       .mockResolvedValueOnce([]);
 
     render(<FileExplorer />);
-    const dirBtn = await screen.findByRole("button", { name: /empty/ });
+    const dirBtn = await screen.findByRole("treeitem", { name: /empty/ });
 
     fireEvent.click(dirBtn);
 
@@ -271,13 +273,122 @@ describe("FileExplorer tree", () => {
     ]);
 
     render(<FileExplorer />);
-    const fileBtn = await screen.findByRole("button", { name: /notes\.md/ });
+    const fileBtn = await screen.findByRole("treeitem", { name: /notes\.md/ });
 
     fireEvent.click(fileBtn);
 
     // appendDraft folded the path into the real store; no second listDir.
     await waitFor(() => expect(useStore.getState().draft).toBe("docs/notes.md "));
     expect(m.listDir).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("FileExplorer accessibility", () => {
+  it("labels the <aside> landmark so it is a named complementary region", async () => {
+    render(<FileExplorer />);
+
+    expect(screen.getByRole("complementary", { name: "File explorer" })).toBeInTheDocument();
+    await waitFor(() => expect(m.listDir).toHaveBeenCalledWith(undefined));
+  });
+
+  it("exposes tree semantics: a tree container with treeitem rows", async () => {
+    m.listDir.mockResolvedValueOnce([
+      entry({ name: "src", path: "src", isDir: true }),
+      entry({ name: "README.md", path: "README.md", isDir: false }),
+    ]);
+
+    render(<FileExplorer />);
+
+    expect(await screen.findByText("src")).toBeInTheDocument();
+    expect(screen.getByRole("tree", { name: "File tree" })).toBeInTheDocument();
+    // Both rows are treeitems (one directory, one file).
+    expect(screen.getAllByRole("treeitem")).toHaveLength(2);
+  });
+
+  it("reflects directory open/closed state via aria-expanded", async () => {
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })])
+      .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx", isDir: false })]);
+
+    render(<FileExplorer />);
+
+    const dirBtn = await screen.findByRole("treeitem", { name: "src folder" });
+    // Collapsed directory advertises aria-expanded="false".
+    expect(dirBtn).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(dirBtn);
+
+    // After expanding, the same row flips to aria-expanded="true".
+    await waitFor(() => expect(dirBtn).toHaveAttribute("aria-expanded", "true"));
+  });
+
+  it("omits aria-expanded on file rows (only directories are expandable)", async () => {
+    m.listDir.mockResolvedValueOnce([
+      entry({ name: "notes.md", path: "docs/notes.md", isDir: false }),
+    ]);
+
+    render(<FileExplorer />);
+
+    const fileBtn = await screen.findByRole("treeitem", { name: "notes.md" });
+    expect(fileBtn).not.toHaveAttribute("aria-expanded");
+  });
+
+  it("gives a directory row the explicit accessible name '<name> folder'", async () => {
+    m.listDir.mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })]);
+
+    render(<FileExplorer />);
+
+    // The decorative caret/glyph spans are aria-hidden, so the row's accessible
+    // name comes solely from the explicit aria-label, not the leaked symbols.
+    expect(await screen.findByRole("treeitem", { name: "src folder" })).toBeInTheDocument();
+    // Decorative glyphs stay in the DOM (aria-hidden) so text assertions hold.
+    expect(screen.getAllByText("▸")).toHaveLength(2);
+  });
+
+  it("surfaces a workspace open failure in an alert region", () => {
+    useStore.setState({ workspaceError: "permission denied" });
+
+    render(<FileExplorer />);
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Couldn’t open folder: permission denied");
+  });
+});
+
+describe("FileExplorer workspace switch", () => {
+  it("remounts the tree on a workspace change, dropping stale subtree state", async () => {
+    // Workspace A: expand "src" -> children fetched once.
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })])
+      .mockResolvedValueOnce([entry({ name: "A.tsx", path: "src/A.tsx", isDir: false })]);
+
+    const { rerender } = render(<FileExplorer />);
+    const dirA = await screen.findByRole("treeitem", { name: "src folder" });
+    fireEvent.click(dirA);
+    expect(await screen.findByText("A.tsx")).toBeInTheDocument();
+    expect(m.listDir).toHaveBeenCalledTimes(2);
+
+    // Switch workspace: the keyed container remounts TreeNodes, so the new
+    // same-named "src" starts collapsed with no cached children.
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })])
+      .mockResolvedValueOnce([entry({ name: "B.tsx", path: "src/B.tsx", isDir: false })]);
+    useStore.setState({
+      settings: { ...initialState.settings, workspace: "C:/other/repo" },
+    });
+    rerender(<FileExplorer />);
+
+    // Root re-listed for the new workspace (call 3), and the prior child is gone.
+    await waitFor(() => expect(m.listDir).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(screen.queryByText("A.tsx")).not.toBeInTheDocument());
+
+    // Re-expanding the same-named folder re-requests listDir for "src" instead
+    // of serving the previous workspace's stale cached children.
+    const dirB = await screen.findByRole("treeitem", { name: "src folder" });
+    fireEvent.click(dirB);
+    await waitFor(() => expect(m.listDir).toHaveBeenCalledTimes(4));
+    expect(await screen.findByText("B.tsx")).toBeInTheDocument();
+    expect(screen.queryByText("A.tsx")).not.toBeInTheDocument();
   });
 });
 

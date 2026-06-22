@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { useStore } from "../store/store";
 import { MODELS, type PairingPayload, type ToolPolicy } from "../types";
@@ -8,6 +8,7 @@ export function SettingsPanel() {
   const settings = useStore((s) => s.settings);
   const updateSettings = useStore((s) => s.updateSettings);
   const setShowSettings = useStore((s) => s.setShowSettings);
+  const settingsError = useStore((s) => s.settingsError);
   const oauthStatus = useStore((s) => s.oauthStatus);
   const oauthError = useStore((s) => s.oauthError);
   const loginWithClaude = useStore((s) => s.loginWithClaude);
@@ -31,8 +32,10 @@ export function SettingsPanel() {
   const [apiKey, setApiKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [savedKey, setSavedKey] = useState(false);
+  const [keyError, setKeyError] = useState<string | null>(null);
   const [signingIn, setSigningIn] = useState(false);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const modalRef = useRef<HTMLDivElement | null>(null);
 
   const signedIn = !!oauthStatus?.signedIn;
 
@@ -45,6 +48,20 @@ export function SettingsPanel() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [setShowSettings]);
 
+  // Move focus into the dialog on open and restore it to the opener on close, so a
+  // keyboard user isn't left on a background control behind the scrim.
+  useEffect(() => {
+    const opener = document.activeElement as HTMLElement | null;
+    const modal = modalRef.current;
+    const first = modal?.querySelector<HTMLElement>(
+      'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])',
+    );
+    (first ?? modal)?.focus();
+    return () => {
+      if (opener && opener.isConnected) opener.focus();
+    };
+  }, []);
+
   // Clear the "Saved" toast timer on unmount so it can't update state after close.
   useEffect(() => {
     return () => {
@@ -52,16 +69,46 @@ export function SettingsPanel() {
     };
   }, []);
 
+  // Trap Tab within the dialog: query focusable descendants live (sections toggle
+  // `hidden` in remoteMode), skip hidden ones, and wrap at the first/last element.
+  const onModalKeyDown = (e: ReactKeyboardEvent) => {
+    if (e.key !== "Tab") return;
+    const modal = modalRef.current;
+    if (!modal) return;
+    const focusable = Array.from(
+      modal.querySelectorAll<HTMLElement>(
+        'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter((el) => el.offsetParent !== null);
+    if (focusable.length === 0) return;
+    const firstEl = focusable[0];
+    const lastEl = focusable[focusable.length - 1];
+    const active = document.activeElement as HTMLElement | null;
+    if (e.shiftKey) {
+      if (active === firstEl || !active || !focusable.includes(active)) {
+        e.preventDefault();
+        lastEl.focus();
+      }
+    } else if (active === lastEl) {
+      e.preventDefault();
+      firstEl.focus();
+    }
+  };
+
   const saveKey = async () => {
     if (!apiKey.trim()) return;
     setSaving(true);
     try {
+      setKeyError(null);
       await ipc.setApiKey(apiKey.trim());
       await updateSettings({ apiKeySet: true });
       setApiKey("");
       setSavedKey(true);
       if (savedTimer.current !== null) clearTimeout(savedTimer.current);
       savedTimer.current = setTimeout(() => setSavedKey(false), 1800);
+    } catch (err) {
+      // Surface the failure and keep the typed value so the user can retry.
+      setKeyError(err instanceof Error ? err.message : String(err));
     } finally {
       setSaving(false);
     }
@@ -83,7 +130,16 @@ export function SettingsPanel() {
       className="pc-overlay items-center justify-center z-[58] p-6"
       onClick={() => setShowSettings(false)}
     >
-      <div className="pc-modal" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="pc-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="pc-settings-title"
+        tabIndex={-1}
+        ref={modalRef}
+        onKeyDown={onModalKeyDown}
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="pc-sweep pc-sweep--accent" />
 
         {/* HEADER */}
@@ -104,7 +160,12 @@ export function SettingsPanel() {
               <circle cx="12" cy="12" r="3" />
               <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
             </svg>
-            <span className="font-display font-semibold text-[16px] tracking-[1px]">SETTINGS</span>
+            <span
+              id="pc-settings-title"
+              className="font-display font-semibold text-[16px] tracking-[1px]"
+            >
+              SETTINGS
+            </span>
           </div>
           <button
             onClick={() => setShowSettings(false)}
@@ -134,7 +195,7 @@ export function SettingsPanel() {
                 <select
                   value={settings.model}
                   onChange={(e) => void updateSettings({ model: e.target.value })}
-                  className="w-full rounded-lg border border-border bg-panel-2 px-3 py-2.5 text-[12.5px] text-fg outline-none"
+                  className="pc-select w-full rounded-lg border border-border bg-panel-2 px-3 py-2.5 text-[12.5px] text-fg outline-none"
                 >
                   {MODELS.map((m) => (
                     <option key={m.id} value={m.id}>
@@ -207,13 +268,22 @@ export function SettingsPanel() {
                     className="flex-1 rounded-lg border border-border bg-panel-2 px-3 py-2.5 font-mono text-[12.5px] text-muted outline-none select-text"
                   />
                   <button
+                    key={savedKey ? "saved" : "idle"}
                     onClick={() => void saveKey()}
                     disabled={saving || !apiKey.trim()}
-                    className="pc-btn-accent px-4 py-2.5 text-[12.5px] disabled:opacity-30"
+                    className={`pc-btn-accent px-4 py-2.5 text-[12.5px] disabled:opacity-30 ${
+                      savedKey ? "pc-flash" : ""
+                    }`}
                   >
                     {saveLabel}
                   </button>
                 </div>
+                {keyError && (
+                  <p className="mt-1.5 text-[11px] text-danger">Couldn't save key: {keyError}</p>
+                )}
+                <span role="status" aria-live="polite" className="sr-only">
+                  {savedKey ? "API key saved" : ""}
+                </span>
                 <p className="mt-1.5 text-[11px] text-faint">
                   {signedIn
                     ? "Signed in with Claude — Portcode uses your subscription; an API key is optional."
@@ -246,6 +316,11 @@ export function SettingsPanel() {
             <p className="mt-1.5 text-[11px] text-faint">
               Controls write / edit / shell tools. Read-only tools always run.
             </p>
+            {settingsError && (
+              <p className="mt-1.5 text-[11px] text-danger">
+                Couldn't save settings: {settingsError}
+              </p>
+            )}
           </section>
 
           {/* APPEARANCE */}
@@ -417,8 +492,11 @@ function PairingCode({ payload, onDone }: { payload: PairingPayload; onDone: () 
 
         <div className="flex w-full items-center gap-2">
           <button
+            key={copied ? "copied" : "idle"}
             onClick={() => void copy()}
-            className="flex-1 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12.5px] text-fg transition-colors hover:border-accent/50"
+            className={`flex-1 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12.5px] text-fg transition-colors hover:border-accent/50 ${
+              copied ? "pc-flash" : ""
+            }`}
           >
             {copied ? "Copied ✓" : "Copy code"}
           </button>
@@ -429,6 +507,9 @@ function PairingCode({ payload, onDone }: { payload: PairingPayload; onDone: () 
             Done
           </button>
         </div>
+        <span role="status" aria-live="polite" className="sr-only">
+          {copied ? "Pairing code copied" : ""}
+        </span>
 
         <button
           onClick={() => setShowRaw((v) => !v)}

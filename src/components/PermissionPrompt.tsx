@@ -18,7 +18,7 @@ export function PermissionPrompt() {
   if (!pending) return null;
 
   return (
-    <div className="pc-gate px-6 py-3.5">
+    <div role="alert" className="pc-gate px-6 py-3.5">
       <div className="flex flex-col gap-[11px]">
         <div className="flex items-center gap-[9px] text-[13px] text-fg">
           <span className="pc-gate__icon">!</span>
@@ -27,15 +27,21 @@ export function PermissionPrompt() {
             <code className="rounded bg-warn/10 px-1.5 py-0.5 font-mono text-warn">
               {pending.tool}
             </code>{" "}
-            on <span className="font-mono text-fg">{pending.summary}</span>
+            on{" "}
+            <span
+              className="font-mono text-fg break-words line-clamp-2 [overflow-wrap:anywhere]"
+              title={pending.summary}
+            >
+              {pending.summary}
+            </span>
           </span>
         </div>
         <div className="flex gap-[9px]">
           <button
             onClick={() => void resolve("allow")}
-            className="pc-btn-allow px-4 py-1.5 text-[12.5px]"
+            className="pc-btn-allow px-3.5 py-1.5 text-[12.5px]"
           >
-            ⏎ Allow
+            Allow
           </button>
           <button
             onClick={() => void resolve("allow", true)}
@@ -46,9 +52,10 @@ export function PermissionPrompt() {
           <button
             ref={denyRef}
             onClick={() => void resolve("deny")}
+            aria-keyshortcuts="Enter"
             className="pc-btn-deny px-3.5 py-1.5 text-[12.5px]"
           >
-            Deny
+            ⏎ Deny
           </button>
         </div>
       </div>

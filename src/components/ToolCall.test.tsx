@@ -131,14 +131,42 @@ describe("collapse / expand toggle", () => {
     const toggle = screen.getByRole("button");
 
     // Collapsed: button advertises a closed region and an "expand" action.
+    // The accessible name now folds in the tool name, target, and run state
+    // so a screen-reader user gets what the colored dot conveys visually.
     expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(toggle).toHaveAttribute("aria-label", "Expand tool output");
+    expect(toggle.getAttribute("aria-label")).toMatch(/^t a\.ts, completed, expand output$/);
 
     fireEvent.click(toggle);
 
     // Expanded: aria-expanded flips and the label describes the collapse action.
     expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(toggle).toHaveAttribute("aria-label", "Collapse tool output");
+    expect(toggle.getAttribute("aria-label")).toMatch(/completed, collapse output$/);
+  });
+
+  it("folds the run state into the accessible name for all three branches", () => {
+    // Pending (no result) → "running".
+    const { rerender } = render(<ToolCall name="t" input={{ path: "a.ts" }} />);
+    expect(screen.getByRole("button").getAttribute("aria-label")).toMatch(
+      /running.*expand output/i,
+    );
+
+    // Error result → "failed".
+    rerender(<ToolCall name="t" input={{ path: "a.ts" }} result={result({ isError: true })} />);
+    expect(screen.getByRole("button").getAttribute("aria-label")).toMatch(/failed.*expand output/i);
+
+    // Successful result → "completed".
+    rerender(<ToolCall name="t" input={{ path: "a.ts" }} result={result({ isError: false })} />);
+    expect(screen.getByRole("button").getAttribute("aria-label")).toMatch(
+      /completed.*expand output/i,
+    );
+  });
+
+  it("marks the decorative status dot aria-hidden so it isn't announced", () => {
+    const { container, rerender } = render(<ToolCall name="t" input={{}} result={result()} />);
+    expect(dot(container)).toHaveAttribute("aria-hidden", "true");
+    // The error-variant dot is a different element but must also be hidden.
+    rerender(<ToolCall name="t" input={{}} result={result({ isError: true })} />);
+    expect(dot(container)).toHaveAttribute("aria-hidden", "true");
   });
 });
 
@@ -300,5 +328,72 @@ describe("looksLikeDiff / DiffView", () => {
 
     expect(reopenHtml).toBe(openHtml);
     expect(reopenLineCount).toBe(openLineCount);
+  });
+
+  it("caps a huge diff at MAX_DIFF_LINES rendered rows plus a truncation footer", () => {
+    // A diff well past the 500-line cap: the @@ header makes it a diff, then
+    // a long run of added lines. DiffView must render a bounded node count and
+    // a single static footer for the remainder rather than one div per line.
+    const MAX = 500;
+    const extra = 250;
+    const big = [
+      "@@ -1 +1 @@",
+      ...Array.from({ length: MAX + extra }, (_, i) => `+line ${i}`),
+    ].join("\n");
+    const container = diffContainer(big);
+    const linesRendered = container.querySelectorAll(".pc-diff .pc-diff-line");
+    // Exactly the cap of real lines plus the one footer row — never one node
+    // per source line.
+    expect(linesRendered.length).toBe(MAX + 1);
+    expect(screen.getByText(new RegExp(`more lines \\(truncated\\)`))).toBeInTheDocument();
+    // The footer reports how many lines were hidden (total source lines = MAX +
+    // extra + 1 header; the cap keeps the first MAX, so the rest are hidden).
+    const totalLines = MAX + extra + 1;
+    expect(screen.getByText(`… ${totalLines - MAX} more lines (truncated)`)).toBeInTheDocument();
+  });
+
+  it("does not truncate a diff at or under the cap (no footer)", () => {
+    const container = diffContainer(fullDiff);
+    expect(container.textContent).not.toMatch(/truncated/);
+  });
+});
+
+describe("diff stat chips (+N / -N)", () => {
+  // The chips are gated independently so a pure-add / pure-del diff never shows
+  // a phantom "-0" / "+0" alongside the real count.
+  it("shows only +N for a pure-addition diff (no -0 phantom)", () => {
+    render(
+      <ToolCall
+        name="edit"
+        input={{ path: "x" }}
+        result={result({ output: "@@ -0,0 +1,2 @@\n+one\n+two" })}
+      />,
+    );
+    expect(screen.getByText("+2")).toBeInTheDocument();
+    expect(screen.queryByText("-0")).not.toBeInTheDocument();
+  });
+
+  it("shows only -N for a pure-deletion diff (no +0 phantom)", () => {
+    render(
+      <ToolCall
+        name="edit"
+        input={{ path: "x" }}
+        result={result({ output: "@@ -1,2 +0,0 @@\n-one\n-two" })}
+      />,
+    );
+    expect(screen.getByText("-2")).toBeInTheDocument();
+    expect(screen.queryByText("+0")).not.toBeInTheDocument();
+  });
+
+  it("shows both chips when the diff has additions and deletions", () => {
+    render(
+      <ToolCall
+        name="edit"
+        input={{ path: "x" }}
+        result={result({ output: "@@ -1 +1 @@\n-old\n+new" })}
+      />,
+    );
+    expect(screen.getByText("+1")).toBeInTheDocument();
+    expect(screen.getByText("-1")).toBeInTheDocument();
   });
 });
