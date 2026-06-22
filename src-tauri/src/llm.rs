@@ -277,9 +277,12 @@ pub async fn stream_turn(
                     match d["type"].as_str() {
                         Some("text_delta") => {
                             if let Some(t) = d["text"].as_str() {
-                                emit(app, channel, StreamEvent::TextDelta { text: t.into() });
+                                // Only surface text we also accumulate into the current
+                                // text block, so the live UI can never show text that the
+                                // persisted message ends up missing.
                                 if let Some(Building::Text(s)) = current.as_mut() {
                                     s.push_str(t);
+                                    emit(app, channel, StreamEvent::TextDelta { text: t.into() });
                                 }
                             }
                         }
@@ -331,6 +334,13 @@ pub async fn stream_turn(
                 _ => {}
             }
         }
+    }
+
+    // If the stream ended while a content block was still open (no content_block_stop),
+    // the response was truncated — surface it instead of silently dropping the block.
+    // A half-built tool call would otherwise just vanish and the turn would look fine.
+    if current.is_some() && stop_reason != "cancelled" {
+        return Err("The response was cut off before it finished. Please try again.".to_string());
     }
 
     Ok(TurnResult {
