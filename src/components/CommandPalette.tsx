@@ -52,6 +52,16 @@ export function CommandPalette() {
 
   const selRef = useRef<HTMLButtonElement>(null);
 
+  // Capture the opener (the ⌘K button or composer that triggered the palette) on
+  // the rising edge of `show`, during render — BEFORE the search input's autoFocus
+  // runs in commit and steals document.activeElement. A passive effect would
+  // capture the input instead, so the restore below would no-op (the input is gone
+  // by then). The restore effect refocuses it on the falling edge.
+  const openerRef = useRef<HTMLElement | null>(null);
+  const wasShown = useRef(false);
+  if (show && !wasShown.current) openerRef.current = document.activeElement as HTMLElement | null;
+  wasShown.current = show;
+
   // Escape closes the palette no matter where focus is — once focus leaves the
   // input (e.g. after hovering a row), the input's own keydown wouldn't fire.
   // Active only while the palette is open.
@@ -73,6 +83,17 @@ export function CommandPalette() {
   useEffect(() => {
     selRef.current?.scrollIntoView?.({ block: "nearest" });
   }, [sel]);
+
+  // Restore focus to the opener on close, mirroring SettingsPanel: on the cleanup —
+  // when `show` flips false — refocus the captured opener if it's still connected.
+  // Otherwise focus falls to document.body and the keyboard user loses their place.
+  useEffect(() => {
+    if (!show) return;
+    return () => {
+      const opener = openerRef.current;
+      if (opener && opener.isConnected) opener.focus();
+    };
+  }, [show]);
 
   if (!show) return null;
 

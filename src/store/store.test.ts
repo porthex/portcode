@@ -191,6 +191,30 @@ describe("newSession", () => {
     expect(useStore.getState().activeId).toBe("a");
     expect(useStore.getState().sessions).toHaveLength(1);
   });
+
+  it("re-entry guard: a rapid double-call creates exactly one session", async () => {
+    // createSession is async; the synchronous creatingSession lock must make the
+    // second same-tick call bail so two fast clicks (or Ctrl+N + click) can't create
+    // two orphan empty sessions.
+    let release!: () => void;
+    m.createSession.mockReturnValueOnce(
+      new Promise<void>((res) => {
+        release = res;
+      }),
+    );
+    useStore.setState({ sessions: [session({ id: "old" })] });
+
+    const first = useStore.getState().newSession();
+    // Second call lands while the first create is still in flight.
+    const second = useStore.getState().newSession();
+
+    release();
+    await Promise.all([first, second]);
+
+    expect(m.createSession).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().sessions).toHaveLength(2); // old + one new, not two new
+    expect(useStore.getState().creatingSession).toBe(false); // lock released
+  });
 });
 
 describe("selectSession", () => {
@@ -480,7 +504,9 @@ describe("send", () => {
     await useStore.getState().send("do it remotely");
 
     // The desktop is authoritative: we forward a `run` command and DON'T run the
-    // local agent or pre-create an assistant message / flip streaming.
+    // local agent or pre-create an assistant message. We DO flip streaming
+    // optimistically (closing the double-submit window) rather than waiting for the
+    // desktop's turn_start frame.
     expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({
       cmd: "run",
       session_id: "a",
@@ -489,11 +515,39 @@ describe("send", () => {
     expect(m.runAgent).not.toHaveBeenCalled();
 
     const st = useStore.getState();
-    expect(st.streaming).toBe(false);
+    expect(st.streaming).toBe(true);
     // Only the optimistic user echo from sendRemoteCommand — no assistant stub.
     expect(st.messages.a).toHaveLength(1);
     expect(st.messages.a[0].role).toBe("user");
     expect(st.messages.a[0].blocks).toEqual([{ kind: "text", text: "do it remotely" }]);
+  });
+
+  it("remote send flips streaming optimistically so a second send can't double-dispatch", async () => {
+    // streaming used to stay false until the desktop's turn_start frame returned,
+    // leaving the composer enabled across the round-trip — a second Enter would fire
+    // a duplicate `run`. Flipping streaming up front closes that window: the second
+    // send() is a no-op (the streaming guard at the top of send catches it).
+    useStore.setState({
+      sessions: [session({ id: "a", title: "New chat" })],
+      activeId: "a",
+      messages: { a: [] },
+      remoteConnected: true,
+    });
+
+    await useStore.getState().send("first");
+    expect(useStore.getState().streaming).toBe(true);
+
+    // A follow-up before turn_start arrives must NOT fire a second command.
+    await useStore.getState().send("second");
+
+    expect(m.phoneSyncSendCommand).toHaveBeenCalledTimes(1);
+    expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({
+      cmd: "run",
+      session_id: "a",
+      text: "first",
+    });
+    // Only the first optimistic user echo — no duplicate user bubble.
+    expect(useStore.getState().messages.a).toHaveLength(1);
   });
 
   it("tears down the turn's listener on turn_end so a later turn can't edit this message", async () => {
@@ -571,6 +625,41 @@ describe("send", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("Stop pressed during the runAgent await window aborts the backend and disposes the listener", async () => {
+    // The cancel handle is only armed AFTER runAgent resolves. If the user presses
+    // Stop in that window, stop() can't invoke a (null) cancel — so the post-await
+    // block must honor the already-flipped streaming:false by cancelling the
+    // still-pending backend turn and disposing the listener (no stale Stop re-armed,
+    // no further deltas folded in).
+    const cancel = vi.fn(async () => {});
+    const dispose = vi.fn();
+    let resolveRun!: (h: { cancel: typeof cancel; dispose: typeof dispose }) => void;
+    m.runAgent.mockImplementation(
+      async () =>
+        new Promise((res) => {
+          resolveRun = res;
+        }),
+    );
+    useStore.setState({ sessions: [session({ id: "a" })], activeId: "a", messages: { a: [] } });
+
+    // Kick off the turn; runAgent stays pending (cancel handle not yet armed).
+    const sending = useStore.getState().send("hello");
+    expect(useStore.getState().streaming).toBe(true);
+    expect(useStore.getState().cancel).toBeNull(); // handle not armed during the await
+
+    // User presses Stop mid-await — there's no cancel handle to invoke yet.
+    await useStore.getState().stop();
+    expect(useStore.getState().streaming).toBe(false);
+
+    // Now the backend handle resolves. The post-await block must cancel it
+    // (cancel_agent + unlisten), since Stop couldn't reach it earlier.
+    resolveRun({ cancel, dispose });
+    await sending;
+
+    expect(cancel).toHaveBeenCalledTimes(1); // backend turn actually aborted
+    expect(useStore.getState().cancel).toBeNull(); // no stale Stop re-armed
   });
 });
 
@@ -929,6 +1018,35 @@ describe("phone sync", () => {
 
     expect(m.phoneSyncBeginPairing).toHaveBeenCalledTimes(1);
     expect(useStore.getState().pairingPayload).toEqual(payload);
+  });
+
+  it("beginPairing surfaces a rejection via pairingError and shows no QR", async () => {
+    // phoneSyncBeginPairing is fallible; the Settings UI calls it via `void`, so a
+    // swallowed rejection would leave the user with no QR and no feedback.
+    m.phoneSyncBeginPairing.mockRejectedValueOnce(new Error("lock poisoned"));
+    useStore.setState({ pairingError: "stale" });
+
+    await useStore.getState().beginPairing();
+
+    const st = useStore.getState();
+    expect(st.pairingError).toBe("lock poisoned");
+    expect(st.pairingPayload).toBeNull(); // no QR shown on failure
+  });
+
+  it("beginPairing clears a prior pairingError on a successful pairing", async () => {
+    useStore.setState({ pairingError: "old failure" });
+
+    await useStore.getState().beginPairing();
+
+    expect(useStore.getState().pairingError).toBeNull();
+  });
+
+  it("unpair surfaces a rejection via pairingError", async () => {
+    m.phoneSyncUnpair.mockRejectedValueOnce(new Error("db remove failed"));
+
+    await useStore.getState().unpair("PHONE==");
+
+    expect(useStore.getState().pairingError).toBe("db remove failed");
   });
 
   it("clearPairing removes the pairing payload from state", () => {
@@ -1333,6 +1451,42 @@ describe("remote client", () => {
       await useStore.getState().connectRemote("QR");
 
       expect(useStore.getState().remoteConnecting).toBe(false);
+    });
+
+    it("honors a disconnect that lands mid-dial: stays disconnected, leaks no listener", async () => {
+      // disconnectRemote during an in-flight dial clears remoteConnecting as an abort
+      // sentinel. When the (slow) dial finally resolves, connectRemote must bail
+      // BEFORE registering its frame/drop listeners and tear down the native session,
+      // instead of overriding the user's disconnect and resurrecting the connection.
+      const unlistenFrame = vi.fn();
+      let release!: () => void;
+      m.phoneSyncConnect.mockReturnValueOnce(
+        new Promise((res) => {
+          release = () => res({ sas: "SAS-1", peerPublicKey: "PEER==" });
+        }),
+      );
+      m.onPhoneSyncFrame.mockResolvedValue(unlistenFrame);
+
+      const connecting = useStore.getState().connectRemote("QR");
+      // The user disconnects while the dial is still pending.
+      await useStore.getState().disconnectRemote();
+      expect(useStore.getState().remoteConnecting).toBe(false); // abort sentinel set
+
+      // The dial resolves late — connectRemote must NOT register listeners or connect.
+      release();
+      await connecting;
+
+      const st = useStore.getState();
+      expect(st.remoteConnected).toBe(false); // disconnect honored, not overridden
+      expect(st.remoteUnlisten).toBeNull(); // no live subscription stored
+      // No frame listener was registered (we bailed before subscribing), so the only
+      // leak risk — an orphaned subscription — is avoided, and the native session the
+      // dial opened was torn down.
+      expect(m.onPhoneSyncFrame).not.toHaveBeenCalled();
+      expect(unlistenFrame).not.toHaveBeenCalled();
+      // phoneSyncDisconnect ran once for the user's disconnect and once for the
+      // abort-path teardown of the just-opened native session.
+      expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(2);
     });
   });
 

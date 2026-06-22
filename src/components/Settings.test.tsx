@@ -89,13 +89,18 @@ describe("SettingsPanel — structure", () => {
     expect(screen.getByText("SETTINGS")).toBeInTheDocument();
     expect(screen.getByText("Anthropic (Claude)")).toBeInTheDocument();
 
-    // Model select reflects the store's current model.
-    const select = screen.getByRole("combobox") as HTMLSelectElement;
+    // Model select reflects the store's current model. Query by its accessible
+    // name (the visible "Model" label is associated via htmlFor/id), which both
+    // locks in the accessible-name wiring and finds the same <select>.
+    const select = screen.getByLabelText("Model") as HTMLSelectElement;
     expect(select.value).toBe(DEFAULT_SETTINGS.model);
     // Every model from the catalogue is offered as an option.
     for (const model of MODELS) {
       expect(screen.getByRole("option", { name: model.label })).toBeInTheDocument();
     }
+
+    // The API-key field also has an accessible name from its associated label.
+    expect(screen.getByLabelText("API key")).toBeInTheDocument();
   });
 });
 
@@ -298,7 +303,7 @@ describe("SettingsPanel — model picker", () => {
   it("persists a model change through ipc.saveSettings and updates the store", async () => {
     renderPanel();
 
-    const select = screen.getByRole("combobox");
+    const select = screen.getByLabelText("Model");
     fireEvent.change(select, { target: { value: "claude-haiku-4-5-20251001" } });
 
     // updateSettings -> ipc.saveSettings; flush the microtask the action awaits.
@@ -312,7 +317,7 @@ describe("SettingsPanel — model picker", () => {
     m.saveSettings.mockRejectedValueOnce(new Error("disk full"));
     renderPanel({ model: MODELS[0].id });
 
-    const select = screen.getByRole("combobox") as HTMLSelectElement;
+    const select = screen.getByLabelText("Model") as HTMLSelectElement;
     await act(async () => {
       fireEvent.change(select, { target: { value: "claude-haiku-4-5-20251001" } });
       await Promise.resolve();
@@ -676,6 +681,14 @@ describe("SettingsPanel — Phone Sync section", () => {
     useStore.setState({ pairingPayload: null });
     renderPanel();
     expect(screen.getByRole("button", { name: "Pair a phone" })).toBeInTheDocument();
+  });
+
+  it("surfaces store.pairingError when begin-pairing or unpair fails", () => {
+    useStore.setState({ pairingPayload: null, pairingError: "keyring locked" });
+    renderPanel();
+    const alert = screen.getByText(/Pairing failed: keyring locked/);
+    expect(alert).toBeInTheDocument();
+    expect(alert).toHaveAttribute("role", "alert");
   });
 
   it("calls beginPairing and shows the pairing code when Pair a phone is clicked", async () => {

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { useState } from "react";
 import { render, screen, fireEvent } from "@testing-library/react";
 
 import { ToolCall } from "./ToolCall";
@@ -62,6 +63,20 @@ describe("summarize (header summary)", () => {
   it("ignores non-string path/command/pattern values and uses the name", () => {
     render(<ToolCall name="weird" input={{ path: 42, command: true, pattern: [] }} />);
     expect(screen.getAllByText("weird")).toHaveLength(2);
+  });
+
+  it("lets the summary span shrink + ellipsize so a long command never clips the chevron/counts", () => {
+    // The path span must carry min-w-0 + flex-1 so, as a flex child, it can
+    // shrink below its content width (engaging its CSS text-overflow:ellipsis)
+    // and absorb the free space — keeping the right-aligned ml-auto group
+    // (the +/- diff counts and the ▸/▾ chevron) visible for an unbroken command.
+    const longCommand = "x".repeat(400);
+    const { container } = render(<ToolCall name="shell" input={{ command: longCommand }} />);
+    const path = container.querySelector(".pc-toolcall__path") as HTMLElement;
+    expect(path).not.toBeNull();
+    expect(path.textContent).toBe(longCommand);
+    expect(path.className).toContain("min-w-0");
+    expect(path.className).toContain("flex-1");
   });
 });
 
@@ -365,6 +380,53 @@ describe("looksLikeDiff / DiffView", () => {
   it("does not truncate a diff at or under the cap (no footer)", () => {
     const container = diffContainer(fullDiff);
     expect(container.textContent).not.toMatch(/truncated/);
+  });
+});
+
+describe("memoization (React.memo)", () => {
+  it("is exported as a React.memo component (skips reconciles on stable props)", () => {
+    // Wrapping ToolCall in React.memo is the fix that stops every visible tool
+    // card from reconciling on every streaming delta (~45x/sec) when name/input/
+    // result are referentially stable. A memo() component is an object whose
+    // $$typeof is the react.memo symbol — assert that directly so the wrapper
+    // can't be silently dropped back to a plain function.
+    const memoType = (ToolCall as unknown as { $$typeof?: symbol }).$$typeof;
+    expect(memoType).toBe(Symbol.for("react.memo"));
+  });
+
+  it("renders correctly when a parent re-renders with referentially-stable props", () => {
+    // Sanity-check that the memo wrapper doesn't break ordinary behavior: the
+    // card keeps its own open state and renders the same content across a forced
+    // parent re-render that passes the SAME name/input/result references.
+    const input = { path: "a.ts" };
+    const res = result();
+
+    function Parent() {
+      const [, setTick] = useState(0);
+      return (
+        <>
+          <button data-testid="rerender" onClick={() => setTick((t) => t + 1)}>
+            rerender
+          </button>
+          <ToolCall name="t" input={input} result={res} />
+        </>
+      );
+    }
+
+    const { container } = render(<Parent />);
+    const toggle = screen.getByRole("button", { name: /expand output/i });
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    const bodyBefore = container.querySelector(".pc-toolcall__body");
+
+    fireEvent.click(screen.getByTestId("rerender"));
+
+    expect(screen.getByRole("button", { name: /collapse output/i })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(container.querySelector(".pc-toolcall__body")).toBe(bodyBefore);
   });
 });
 

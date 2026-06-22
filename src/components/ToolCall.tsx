@@ -3,7 +3,7 @@ import type { ContentBlock } from "../types";
 
 type ResultBlock = Extract<ContentBlock, { kind: "tool_result" }>;
 
-export function ToolCall({
+export const ToolCall = memo(function ToolCall({
   name,
   input,
   result,
@@ -44,7 +44,7 @@ export function ToolCall({
       >
         <StatusDot pending={pending} error={error} />
         <span className="pc-toolcall__name">{name}</span>
-        <span className="pc-toolcall__path">{summary}</span>
+        <span className="pc-toolcall__path min-w-0 flex-1">{summary}</span>
         <span className="ml-auto flex items-center gap-2">
           {counts && (counts.adds > 0 || counts.dels > 0) && (
             <>
@@ -94,7 +94,7 @@ export function ToolCall({
       </div>
     </div>
   );
-}
+});
 
 function StatusDot({ pending, error }: { pending: boolean; error?: boolean }) {
   // done → success, running → warn (pulsing), pending input → accent.

@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, render, screen, fireEvent } from "@testing-library/react";
 
 import { type PendingPermission } from "../types";
 import { useStore } from "../store/store";
@@ -39,6 +39,23 @@ beforeEach(() => {
   m.resolvePermission.mockResolvedValue(undefined);
   m.saveSettings.mockResolvedValue({ ...initialState.settings, defaultPolicy: "allow" });
 });
+
+afterEach(() => {
+  // Tear down any role="log" stand-in mounted by the focus-restore tests so it
+  // doesn't leak into sibling tests (jsdom doesn't reset document.body).
+  document.getElementById("log-stub")?.remove();
+});
+
+// Mount a focusable stand-in for the Chat scroll region (role="log", tabIndex=-1),
+// the focus target the prompt reaches for when it clears mid-turn.
+const mountLogRegion = () => {
+  const log = document.createElement("div");
+  log.id = "log-stub";
+  log.setAttribute("role", "log");
+  log.tabIndex = -1;
+  document.body.appendChild(log);
+  return log;
+};
 
 describe("PermissionPrompt", () => {
   it("renders nothing when no permission is pending", () => {
@@ -153,5 +170,78 @@ describe("PermissionPrompt", () => {
     expect(m.resolvePermission).toHaveBeenCalledWith("p9", "deny");
     expect(m.saveSettings).not.toHaveBeenCalled();
     expect(useStore.getState().pendingPermission).toBeNull();
+  });
+
+  it("restores focus to the Chat log region when the prompt clears mid-turn", () => {
+    const log = mountLogRegion();
+    useStore.setState({ pendingPermission: pending(), remoteMode: false });
+
+    render(<PermissionPrompt />);
+    // The prompt grabbed focus onto Deny; simulate it unmounting (focus would
+    // otherwise fall to <body>, where the keyboard user gets stranded).
+    expect(screen.getByRole("button", { name: "⏎ Deny" })).toHaveFocus();
+    (document.activeElement as HTMLElement | null)?.blur();
+    expect(document.body).toHaveFocus();
+
+    // The gate is answered but the turn keeps streaming — only pendingPermission
+    // clears. The effect should rescue focus to the log region, not leave <body>.
+    act(() => {
+      useStore.setState({ pendingPermission: null });
+    });
+
+    expect(document.activeElement).toBe(log);
+    expect(document.body).not.toHaveFocus();
+  });
+
+  it("does not move focus on clear when in remote mode (keeps the mobile keyboard down)", () => {
+    const log = mountLogRegion();
+    useStore.setState({ pendingPermission: pending(), remoteMode: true });
+
+    render(<PermissionPrompt />);
+    (document.activeElement as HTMLElement | null)?.blur();
+    expect(document.body).toHaveFocus();
+
+    act(() => {
+      useStore.setState({ pendingPermission: null });
+    });
+
+    // Remote/phone: leave focus alone so the soft keyboard doesn't pop.
+    expect(document.activeElement).not.toBe(log);
+    expect(document.body).toHaveFocus();
+  });
+
+  it("leaves a deliberately-moved focus alone when the prompt clears", () => {
+    const log = mountLogRegion();
+    // Something else (e.g. the user clicking into the composer) holds focus on a
+    // still-mounted element outside the prompt before the gate clears.
+    const elsewhere = document.createElement("button");
+    elsewhere.id = "focus-elsewhere";
+    document.body.appendChild(elsewhere);
+    useStore.setState({ pendingPermission: pending(), remoteMode: false });
+
+    render(<PermissionPrompt />);
+    elsewhere.focus();
+    expect(elsewhere).toHaveFocus();
+
+    act(() => {
+      useStore.setState({ pendingPermission: null });
+    });
+
+    // The rescue only fires when focus fell to <body>; focus held elsewhere must
+    // not be hijacked into the log region.
+    expect(document.activeElement).toBe(elsewhere);
+    expect(document.activeElement).not.toBe(log);
+    elsewhere.remove();
+  });
+
+  it("wraps the action row so the buttons reflow instead of clipping at narrow widths", () => {
+    useStore.setState({ pendingPermission: pending() });
+
+    render(<PermissionPrompt />);
+
+    // The three actions share a flex row; flex-wrap is the only fallback that
+    // keeps "Deny" reachable below ~320px (the panel is overflow-hidden).
+    const row = screen.getByRole("button", { name: "Allow" }).parentElement;
+    expect(row).toHaveClass("flex", "flex-wrap");
   });
 });

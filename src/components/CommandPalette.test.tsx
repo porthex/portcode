@@ -430,6 +430,43 @@ describe("closing", () => {
     expect(useStore.getState().showPalette).toBe(false);
   });
 
+  it("restores focus to the opener when closed via Escape", () => {
+    // The palette is always mounted; render it closed with an opener focused, then
+    // open (captures the opener) and close (cleanup refocuses it) — so a keyboard
+    // user isn't dropped onto document.body.
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    opener.focus();
+    expect(document.activeElement).toBe(opener);
+
+    const view = render(<CommandPalette />);
+    open();
+    view.rerender(<CommandPalette />);
+
+    fireEvent.keyDown(input(), { key: "Escape" });
+    view.rerender(<CommandPalette />);
+
+    expect(document.activeElement).toBe(opener);
+    document.body.removeChild(opener);
+  });
+
+  it("restores focus to the opener when closed via the backdrop", () => {
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    opener.focus();
+
+    const view = render(<CommandPalette />);
+    open();
+    view.rerender(<CommandPalette />);
+
+    const overlay = view.container.firstChild as HTMLElement;
+    fireEvent.click(overlay);
+    view.rerender(<CommandPalette />);
+
+    expect(document.activeElement).toBe(opener);
+    document.body.removeChild(opener);
+  });
+
   it("clicking inside the dialog does not close the palette (stopPropagation)", () => {
     open();
     render(<CommandPalette />);

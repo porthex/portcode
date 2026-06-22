@@ -5,7 +5,9 @@ import { useStore } from "../store/store";
 export function PermissionPrompt() {
   const pending = useStore((s) => s.pendingPermission);
   const resolve = useStore((s) => s.resolvePermission);
+  const remoteMode = useStore((s) => s.remoteMode);
   const denyRef = useRef<HTMLButtonElement>(null);
+  const wasPending = useRef(false);
 
   // Focus the safe "Deny" action whenever a new request appears, so a reflexive
   // Enter denies rather than allows. Keyed on the request id so re-renders that
@@ -14,6 +16,26 @@ export function PermissionPrompt() {
   useEffect(() => {
     if (pendingId) denyRef.current?.focus();
   }, [pendingId]);
+
+  // When the prompt clears, the focused Deny button unmounts and focus falls to
+  // <body>. Answering a gate leaves the turn streaming (the agent keeps running),
+  // and the Composer's refocus only fires on [streaming, remoteMode] transitions —
+  // neither changes here, and its textarea is disabled mid-stream anyway. Reclaim
+  // focus to the Chat scroll region (role="log", made focusable with tabIndex=-1)
+  // so a keyboard user can scroll/Tab from a sensible place instead of being
+  // stranded on <body> for the streaming tail. Skip on remote so the mobile
+  // keyboard/viewport isn't disturbed (mirrors the Composer guard).
+  useEffect(() => {
+    if (pendingId) {
+      wasPending.current = true;
+    } else if (wasPending.current) {
+      wasPending.current = false;
+      if (!remoteMode && document.activeElement === document.body) {
+        const log = document.querySelector<HTMLElement>('[role="log"]');
+        log?.focus();
+      }
+    }
+  }, [pendingId, remoteMode]);
 
   if (!pending) return null;
 
@@ -36,7 +58,7 @@ export function PermissionPrompt() {
             </span>
           </span>
         </div>
-        <div className="flex gap-[9px]">
+        <div className="flex flex-wrap gap-[9px]">
           <button
             onClick={() => void resolve("allow")}
             className="pc-btn-allow px-3.5 py-1.5 text-[12.5px]"

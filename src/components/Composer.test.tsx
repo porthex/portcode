@@ -100,6 +100,16 @@ describe("Composer textarea", () => {
     expect(ta.className).toContain("disabled:opacity-60");
     expect(ta.className).toContain("disabled:saturate-[0.6]");
   });
+
+  it("exposes an explicit accessible name (not just the placeholder)", () => {
+    render(<Composer />);
+    // The placeholder is an unreliable accessible name (dropped once a draft is
+    // present; not exposed by some AT). The aria-label is the stable name, so
+    // the field is reachable by accessible name regardless of draft state.
+    expect(screen.getByRole("textbox", { name: "Message Portcode" })).toBe(
+      screen.getByPlaceholderText("Describe a task, ask a question, or give an instruction…"),
+    );
+  });
 });
 
 describe("Composer send button", () => {
@@ -149,6 +159,49 @@ describe("Composer send button", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(m.runAgent).toHaveBeenCalledWith("a", "Refactor the parser", expect.any(Function));
+  });
+
+  it("collapses the textarea to an explicit px height on submit (not 'auto')", async () => {
+    useStore.setState({
+      sessions: [
+        {
+          id: "a",
+          title: "New chat",
+          workspace: null,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+      activeId: "a",
+      messages: { a: [] },
+    });
+    // Mount with an empty draft so the [text] effect captures the single-row
+    // height first; only then does submit() have a px target to collapse to.
+    render(<Composer />);
+    const ta = screen.getByPlaceholderText(
+      "Describe a task, ask a question, or give an instruction…",
+    ) as HTMLTextAreaElement;
+
+    // Seed a tall multi-line draft (drives the [text] effect to grow the field).
+    act(() => {
+      useStore.setState({ draft: "line one\nline two\nline three" });
+    });
+
+    fireEvent.click(sendButton());
+
+    // The collapse sets an interpolatable px value (CSS can't ease to/from
+    // "auto"). jsdom reports scrollHeight 0, so the concrete value is "0px" —
+    // what matters is it's a px string, not "auto".
+    expect(ta.style.height).toMatch(/px$/);
+    expect(ta.style.height).not.toBe("auto");
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(m.runAgent).toHaveBeenCalledWith(
+      "a",
+      "line one\nline two\nline three",
+      expect.any(Function),
+    );
   });
 });
 

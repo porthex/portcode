@@ -94,6 +94,10 @@ export function Chat() {
             aria-live="polite"
             aria-relevant="additions text"
             aria-busy={streaming}
+            // Programmatically focusable (not in the Tab order) so the
+            // PermissionPrompt can route focus back here when a gated turn clears
+            // mid-stream and its Deny button unmounts.
+            tabIndex={-1}
           >
             {initError ? (
               <InitErrorPanel message={initError} onRetry={() => void retryInit()} />
@@ -117,7 +121,7 @@ export function Chat() {
             type="button"
             aria-label="Scroll to latest"
             onClick={scrollToBottom}
-            className="absolute bottom-4 right-4 flex h-9 w-9 items-center justify-center rounded-full border border-border bg-panel text-fg shadow transition-opacity hover:border-accent motion-reduce:transition-none"
+            className="pc-fab-enter absolute bottom-4 right-4 flex h-9 w-9 items-center justify-center rounded-full border border-border bg-panel text-fg shadow transition-opacity hover:border-accent motion-reduce:transition-none"
           >
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
               <path
@@ -219,7 +223,7 @@ function EmptyState() {
           <Kbd>Ctrl</Kbd>
           <Kbd>K</Kbd>
           <span>for commands</span>
-          <span className="mx-1 text-border">·</span>
+          <span className="mx-1 text-faint">·</span>
           <Kbd>Ctrl</Kbd>
           <Kbd>B</Kbd>
           <span>for files</span>

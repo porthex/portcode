@@ -14,6 +14,11 @@ export function Composer() {
   const stop = useStore((s) => s.stop);
   const remoteMode = useStore((s) => s.remoteMode);
   const ref = useRef<HTMLTextAreaElement>(null);
+  // The pixel height of a single, empty row. Captured lazily from a collapsed
+  // textarea so the post-submit collapse has a concrete target to ease toward —
+  // CSS height transitions can't interpolate to/from "auto" (the browser
+  // resolves it instantly), which otherwise kills the collapse animation.
+  const rowHeightRef = useRef<number | null>(null);
 
   // Keep the textarea height in sync when the draft changes externally
   // (e.g. a file path inserted from the explorer).
@@ -21,7 +26,11 @@ export function Composer() {
     const el = ref.current;
     if (!el) return;
     el.style.height = "auto";
-    el.style.height = Math.min(el.scrollHeight, MAX_TEXTAREA_H) + "px";
+    const next = Math.min(el.scrollHeight, MAX_TEXTAREA_H);
+    // Memoize the single-row height the first time we see a collapsed textarea,
+    // so submit() can animate down to a px value instead of snapping via "auto".
+    if (rowHeightRef.current == null && !text) rowHeightRef.current = el.scrollHeight;
+    el.style.height = next + "px";
   }, [text]);
 
   // Return focus to the composer when a turn finishes — the textarea blurs when it
@@ -38,7 +47,12 @@ export function Composer() {
     const t = text;
     if (!t.trim() || streaming) return;
     setText("");
-    if (ref.current) ref.current.style.height = "auto";
+    // Collapse to the measured single-row height (a px target) so the declared
+    // transition-[height] can ease the shrink; fall back to "auto" only if we
+    // never captured a row height (e.g. submit before the first layout pass).
+    if (ref.current)
+      ref.current.style.height =
+        rowHeightRef.current != null ? rowHeightRef.current + "px" : "auto";
     await send(t);
   };
 
@@ -73,6 +87,7 @@ export function Composer() {
             onKeyDown={onKeyDown}
             disabled={streaming}
             aria-busy={streaming}
+            aria-label="Message Portcode"
             rows={1}
             placeholder="Describe a task, ask a question, or give an instruction…"
             style={{ maxHeight: MAX_TEXTAREA_H }}

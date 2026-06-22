@@ -96,6 +96,10 @@ body,
 #root {
   height: 100%;
   margin: 0;
+  /* Render native form controls (the Settings Model <select> dropdown popup,
+     password input, autofill UI, default scrollbars) with the dark system
+     palette so they don't flash a light-mode popup against the Neon-Noir UI. */
+  color-scheme: dark;
 }
 
 body {
@@ -302,6 +306,15 @@ textarea:focus-visible {
   .pc-msg-enter {
     animation: none !important;
   }
+  .pc-fab-enter {
+    animation: none !important;
+  }
+  /* The mobile session drawer slides across the full viewport (translateX
+     -100% -> 0) — the largest geometry enter in the app. The base rule sets no
+     opacity/transform, so with the animation removed it renders in place. */
+  .pc-drawer {
+    animation: none !important;
+  }
   .pc-flash {
     animation: none !important;
   }
@@ -390,7 +403,7 @@ textarea:focus-visible {
     box-shadow 0.18s ease,
     filter 0.18s ease;
 }
-.pc-btn-accent:hover {
+.pc-btn-accent:not(:disabled):hover {
   box-shadow: 0 0 30px rgba(255, 46, 126, 0.85);
   filter: brightness(1.12);
 }
@@ -413,7 +426,7 @@ textarea:focus-visible {
     background 0.18s ease,
     border-color 0.18s ease;
 }
-.pc-btn-ghost:hover {
+.pc-btn-ghost:not(:disabled):hover {
   background: rgba(33, 230, 255, 0.12);
   border-color: rgba(33, 230, 255, 0.6);
   box-shadow: var(--shadow-glow-cyan);
@@ -435,9 +448,20 @@ textarea:focus-visible {
     background 0.18s ease,
     box-shadow 0.18s ease;
 }
-.pc-btn-allow:hover {
+.pc-btn-allow:not(:disabled):hover {
   background: rgba(52, 255, 158, 0.22);
   box-shadow: 0 0 22px rgba(52, 255, 158, 0.3);
+}
+
+/* Disabled neon buttons must stay dim under the cursor (matching .pc-send:disabled):
+   the :hover pseudo still matches disabled <button>s, so kill the glow/brightness. */
+.pc-btn-accent:disabled,
+.pc-newsession:disabled,
+.pc-btn-allow:disabled,
+.pc-btn-ghost:disabled {
+  box-shadow: none;
+  filter: none;
+  cursor: default;
 }
 
 .pc-btn-deny {
@@ -483,7 +507,7 @@ textarea:focus-visible {
     background 0.18s ease,
     box-shadow 0.18s ease;
 }
-.pc-newsession:hover {
+.pc-newsession:not(:disabled):hover {
   background: rgba(255, 46, 126, 0.16);
   box-shadow: 0 0 22px rgba(255, 46, 126, 0.28);
 }
@@ -797,6 +821,14 @@ textarea:focus-visible {
    reduced-motion block does NOT cover pcRise, so an explicit guard above
    neutralizes this under prefers-reduced-motion. */
 .pc-msg-enter {
+  animation: pcRise 0.18s ease both;
+}
+
+/* The scroll-to-latest FAB is conditionally mounted (no prior opacity-0 state for
+   transition-opacity to interpolate from), so give it the same pcRise entrance as
+   message rows rather than letting it snap in. Neutralized under reduced motion via
+   the guard above. */
+.pc-fab-enter {
   animation: pcRise 0.18s ease both;
 }
 

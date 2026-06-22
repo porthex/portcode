@@ -335,6 +335,22 @@ describe("Sidebar", () => {
       expect(screen.getByRole("navigation", { name: "Session list" })).toBeInTheDocument();
     });
 
+    it("marks the active session row with aria-current for screen readers", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "First" }), session({ id: "b", title: "Second" })],
+        activeId: "b",
+      });
+
+      render(<Sidebar />);
+
+      // The active row's select button announces itself as current; inactive
+      // rows carry no aria-current, so AT can tell which session is open.
+      const active = screen.getByRole("button", { name: /^Second/ });
+      const inactive = screen.getByRole("button", { name: /^First/ });
+      expect(active).toHaveAttribute("aria-current", "true");
+      expect(inactive).not.toHaveAttribute("aria-current");
+    });
+
     it("makes only the active row a tab stop (roving tabindex)", () => {
       useStore.setState({
         sessions: [session({ id: "a", title: "First" }), session({ id: "b", title: "Second" })],

@@ -115,6 +115,7 @@ export function Sidebar() {
                   onClick={() => selectSession(s.id)}
                   disabled={streaming}
                   tabIndex={active ? 0 : -1}
+                  aria-current={active ? "true" : undefined}
                   className={`flex min-w-0 flex-1 flex-col text-left ${
                     streaming ? "cursor-not-allowed" : ""
                   }`}

@@ -241,6 +241,25 @@ describe("Chat live region (screen-reader announcements)", () => {
     const { container } = render(<Chat />);
     expect(container.querySelector('[role="log"]')).toHaveAttribute("aria-busy", "false");
   });
+
+  it("makes the transcript programmatically focusable (tabIndex -1) so focus can be routed there", () => {
+    // The scroll region is focusable out of the Tab order so the PermissionPrompt
+    // can move focus back to it when a gated turn clears mid-stream and the Deny
+    // button unmounts (otherwise focus would fall back to <body>).
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "hi")] },
+      streaming: false,
+    });
+
+    const { container } = render(<Chat />);
+    const log = container.querySelector('[role="log"]') as HTMLElement;
+    expect(log).toHaveAttribute("tabindex", "-1");
+    // It actually accepts focus.
+    log.focus();
+    expect(log).toHaveFocus();
+  });
 });
 
 describe("Chat init-error panel", () => {
@@ -364,6 +383,9 @@ describe("Chat scroll-to-latest affordance", () => {
 
     const btn = screen.getByRole("button", { name: "Scroll to latest" });
     expect(btn).toBeInTheDocument();
+    // Carries the pcRise entrance class (gated for reduced motion in index.css)
+    // so it eases in instead of snapping, since it mounts only when scrolled up.
+    expect(btn).toHaveClass("pc-fab-enter");
 
     fireEvent.click(btn);
     expect(screen.queryByRole("button", { name: "Scroll to latest" })).not.toBeInTheDocument();

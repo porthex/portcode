@@ -103,31 +103,42 @@ describe("App layout", () => {
     expect(unlisten).toHaveBeenCalledTimes(1);
   });
 
-  it("hides FileExplorer and SettingsPanel when their flags are false", () => {
+  it("collapses the file rail and hides SettingsPanel when their flags are false", () => {
     useStore.setState({ showFiles: false, showSettings: false });
 
     render(<App />);
 
-    expect(screen.queryByTestId("file-explorer")).not.toBeInTheDocument();
+    // The rail stays mounted (so its width can animate) but collapses to a 0fr
+    // grid column and goes inert/aria-hidden so it's out of the tab order and AT.
+    const rail = screen.getByTestId("file-rail");
+    expect(rail).toHaveStyle({ gridTemplateColumns: "0fr" });
+    expect(rail).toHaveAttribute("aria-hidden", "true");
+    expect(rail).toHaveAttribute("inert");
     expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
   });
 
-  it("shows FileExplorer only when showFiles is true", () => {
+  it("expands the file rail (1fr, not inert) when showFiles is true", () => {
     useStore.setState({ showFiles: true });
 
     render(<App />);
 
+    const rail = screen.getByTestId("file-rail");
     expect(screen.getByTestId("file-explorer")).toBeInTheDocument();
+    expect(rail).toHaveStyle({ gridTemplateColumns: "1fr" });
+    // Open: it's reachable — no inert, no aria-hidden masking the tree.
+    expect(rail).not.toHaveAttribute("inert");
+    expect(rail).not.toHaveAttribute("aria-hidden");
     expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
   });
 
   it("shows SettingsPanel only when showSettings is true", () => {
-    useStore.setState({ showSettings: true });
+    useStore.setState({ showSettings: true, showFiles: false });
 
     render(<App />);
 
     expect(screen.getByTestId("settings-panel")).toBeInTheDocument();
-    expect(screen.queryByTestId("file-explorer")).not.toBeInTheDocument();
+    // The file rail is mounted but collapsed when showFiles is false.
+    expect(screen.getByTestId("file-rail")).toHaveStyle({ gridTemplateColumns: "0fr" });
   });
 });
 
@@ -205,6 +216,52 @@ describe("remote mode shell", () => {
 
     expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
     expect(useStore.getState().showSidebar).toBe(false);
+  });
+
+  it("moves focus into the drawer on open and restores it to the opener on close", () => {
+    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+
+    render(<App />);
+    const opener = screen.getByRole("button", { name: "Toggle sessions" });
+    // The opener is the focused trigger when the drawer opens.
+    opener.focus();
+    expect(document.activeElement).toBe(opener);
+
+    fireEvent.click(opener);
+
+    // Focus moves onto the dialog container (a non-input element, so the phone
+    // soft keyboard doesn't pop), not left on the now-occluded hamburger.
+    const dialog = screen.getByRole("dialog", { name: "Sessions" });
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    expect(document.activeElement).toBe(dialog);
+
+    // Closing restores focus to the opener that launched the drawer.
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(opener);
+  });
+
+  it("traps Tab within the drawer (wraps from the last focusable back to the first)", () => {
+    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Toggle sessions" }));
+
+    const dialog = screen.getByRole("dialog", { name: "Sessions" });
+    // With the Sidebar stubbed, the only tabbable descendant is the backdrop
+    // Close button — it's both the first and last focusable in the trap.
+    const close = screen.getByRole("button", { name: "Close sessions" });
+    close.focus();
+    expect(document.activeElement).toBe(close);
+
+    // Tab from the last focusable wraps to the first (still the Close button),
+    // so focus never escapes the modal into the chat behind the backdrop.
+    fireEvent.keyDown(dialog, { key: "Tab" });
+    expect(document.activeElement).toBe(close);
+
+    // Shift+Tab from the first focusable wraps back to the last (also Close).
+    fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(close);
   });
 
   it("hides the desktop command-palette button on the phone", () => {
@@ -307,11 +364,16 @@ describe("TitleBar", () => {
   it("toggles the file explorer via the TitleBar button", () => {
     render(<App />);
 
-    expect(screen.queryByTestId("file-explorer")).not.toBeInTheDocument();
+    // The rail is mounted but collapsed (0fr / inert) before the toggle.
+    const rail = screen.getByTestId("file-rail");
+    expect(rail).toHaveStyle({ gridTemplateColumns: "0fr" });
+    expect(rail).toHaveAttribute("inert");
 
     fireEvent.click(screen.getByTitle("Toggle file explorer (Ctrl+B)"));
 
-    expect(screen.getByTestId("file-explorer")).toBeInTheDocument();
+    // After the toggle it expands to 1fr and drops inert/aria-hidden.
+    expect(screen.getByTestId("file-rail")).toHaveStyle({ gridTemplateColumns: "1fr" });
+    expect(screen.getByTestId("file-rail")).not.toHaveAttribute("inert");
     expect(useStore.getState().showFiles).toBe(true);
   });
 
@@ -372,6 +434,8 @@ describe("global keyboard shortcuts", () => {
 
     expect(useStore.getState().showFiles).toBe(true);
     expect(screen.getByTestId("file-explorer")).toBeInTheDocument();
+    // Toggling on expands the rail's grid column from 0fr to 1fr.
+    expect(screen.getByTestId("file-rail")).toHaveStyle({ gridTemplateColumns: "1fr" });
   });
 
   it("Ctrl+, opens settings", () => {

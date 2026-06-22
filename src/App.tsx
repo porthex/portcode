@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useStore } from "./store/store";
 import { Sidebar } from "./components/Sidebar";
 import { Chat } from "./components/Chat";
@@ -106,7 +106,25 @@ export default function App() {
                 would eat the narrow viewport, so there it becomes a drawer (below)
                 and the chat takes the full width. */}
             {!remoteMode && <Sidebar />}
-            {showFiles && <FileExplorer />}
+            {/* The file rail stays mounted and animates its inline width (0fr<->1fr
+                grid accordion, the same pattern ToolCall uses on rows) so toggling
+                it slides instead of jumping the main column sideways. The inner
+                overflow-hidden clips the 236px-wide content to zero; reduced-motion
+                users get the instant swap they had before. Collapsed, the rail is
+                inert + aria-hidden so its tree stays out of the tab order and AT. */}
+            {!remoteMode && (
+              <div
+                data-testid="file-rail"
+                className="grid shrink-0 transition-[grid-template-columns] duration-200 ease-out motion-reduce:transition-none"
+                style={{ gridTemplateColumns: showFiles ? "1fr" : "0fr" }}
+                aria-hidden={!showFiles || undefined}
+                inert={!showFiles}
+              >
+                <div className="overflow-hidden">
+                  <FileExplorer />
+                </div>
+              </div>
+            )}
             <main className="flex min-w-0 flex-1 flex-col">
               <TitleBar />
               <Chat />
@@ -125,11 +143,17 @@ export default function App() {
   );
 }
 
+const FOCUSABLE =
+  'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+
 /** The session list as a slide-in overlay — the phone's equivalent of the
  *  desktop's inline sidebar rail. Tapping the backdrop closes it; selecting or
- *  creating a session closes it too (handled in the store). */
+ *  creating a session closes it too (handled in the store). Behaves as a modal
+ *  dialog: focus moves in on open, Tab is trapped, and focus returns to the
+ *  opener on close. */
 function SidebarDrawer() {
   const setShowSidebar = useStore((s) => s.setShowSidebar);
+  const drawerRef = useRef<HTMLDivElement>(null);
   // Escape closes the drawer (the App keydown effect only handles modified keys,
   // so plain Escape would otherwise strand focus inside the overlay).
   useEffect(() => {
@@ -139,8 +163,49 @@ function SidebarDrawer() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [setShowSidebar]);
+  // Treat the drawer as a modal dialog: move focus into it on open (onto the
+  // container, a non-input element, so the phone soft keyboard doesn't pop) and
+  // restore focus to the opener (the TitleBar hamburger) on close.
+  useEffect(() => {
+    const opener = document.activeElement as HTMLElement | null;
+    drawerRef.current?.focus();
+    return () => {
+      if (opener && opener.isConnected) opener.focus();
+    };
+  }, []);
+  // Trap Tab within the drawer so it can't walk into the chat behind the backdrop.
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== "Tab") return;
+    const container = drawerRef.current;
+    if (!container) return;
+    const focusable = [...container.querySelectorAll<HTMLElement>(FOCUSABLE)];
+    if (focusable.length === 0) {
+      // Nothing tabbable inside — keep focus pinned to the container.
+      e.preventDefault();
+      container.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+    if (e.shiftKey && (active === first || active === container)) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && active === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
   return (
-    <div className="fixed inset-0 z-50 flex">
+    <div
+      ref={drawerRef}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Sessions"
+      tabIndex={-1}
+      onKeyDown={onKeyDown}
+      className="fixed inset-0 z-50 flex outline-none"
+    >
       <div className="pc-drawer h-full shrink-0">
         <Sidebar />
       </div>

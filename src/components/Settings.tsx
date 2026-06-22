@@ -9,6 +9,7 @@ export function SettingsPanel() {
   const updateSettings = useStore((s) => s.updateSettings);
   const setShowSettings = useStore((s) => s.setShowSettings);
   const settingsError = useStore((s) => s.settingsError);
+  const pairingError = useStore((s) => s.pairingError);
   const oauthStatus = useStore((s) => s.oauthStatus);
   const oauthError = useStore((s) => s.oauthError);
   const loginWithClaude = useStore((s) => s.loginWithClaude);
@@ -200,8 +201,14 @@ export function SettingsPanel() {
               </div>
 
               <div>
-                <label className="mb-1.5 block text-[12.5px] font-medium text-fg">Model</label>
+                <label
+                  htmlFor="pc-settings-model"
+                  className="mb-1.5 block text-[12.5px] font-medium text-fg"
+                >
+                  Model
+                </label>
                 <select
+                  id="pc-settings-model"
                   value={settings.model}
                   onChange={(e) => void updateSettings({ model: e.target.value })}
                   className="pc-select w-full rounded-lg border border-border bg-panel-2 px-3 py-2.5 text-[12.5px] text-fg outline-none"
@@ -274,9 +281,15 @@ export function SettingsPanel() {
               </div>
 
               <div>
-                <label className="mb-1.5 block text-[12.5px] font-medium text-fg">API key</label>
+                <label
+                  htmlFor="pc-settings-apikey"
+                  className="mb-1.5 block text-[12.5px] font-medium text-fg"
+                >
+                  API key
+                </label>
                 <div className="flex gap-2">
                   <input
+                    id="pc-settings-apikey"
                     type="password"
                     value={apiKey}
                     onChange={(e) => {
@@ -418,6 +431,11 @@ export function SettingsPanel() {
                 >
                   Pair a phone
                 </button>
+              )}
+              {pairingError && (
+                <p className="mt-1.5 text-[11px] text-danger" role="alert">
+                  Pairing failed: {pairingError}
+                </p>
               )}
             </div>
           </section>
