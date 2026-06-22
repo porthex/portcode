@@ -325,16 +325,49 @@ function VerifyPanel() {
  *  camera preview shows through; this paints only a viewfinder + a Cancel control.
  *  Portaled to <body> so it sits outside the hidden app shell and stays visible. */
 function ScanOverlay({ onCancel }: { onCancel: () => void }) {
+  const cancelRef = useRef<HTMLButtonElement>(null);
+
+  // Give this aria-modal dialog the keyboard affordances every other overlay has.
+  // While scanning, `pc-scanning` sets `#root { visibility: hidden }`, dropping the
+  // opener (the Scan button) out of the focus order — so without this, activeElement
+  // is stranded on <body> with no keyboard path to Cancel.
+  useEffect(() => {
+    // Remember the opener so focus can return to it once the overlay unmounts.
+    const opener = document.activeElement as HTMLElement | null;
+    // (1) Move focus into the dialog so it isn't stranded on the hidden shell.
+    cancelRef.current?.focus();
+    // (2) Escape cancels the scan no matter where focus sits.
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onCancel();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      if (opener && opener.isConnected) opener.focus();
+    };
+  }, [onCancel]);
+
   return (
     <div
       className="pc-scan-overlay"
       role="dialog"
       aria-modal="true"
       aria-label="Scanning for a pairing QR code"
+      // (3) Trap Tab: the dialog has a single focusable control, so keep focus on
+      // Cancel rather than letting it walk into the visibility:hidden #root.
+      onKeyDown={(e) => {
+        if (e.key === "Tab") {
+          e.preventDefault();
+          cancelRef.current?.focus();
+        }
+      }}
     >
       <div className="pc-scan-frame" aria-hidden="true" />
       <p className="pc-scan-hint">Point your camera at the QR code on your desktop</p>
-      <button type="button" onClick={onCancel} className="pc-scan-cancel">
+      <button ref={cancelRef} type="button" onClick={onCancel} className="pc-scan-cancel">
         Cancel
       </button>
     </div>

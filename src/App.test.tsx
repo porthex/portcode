@@ -469,6 +469,27 @@ describe("global keyboard shortcuts", () => {
     expect(screen.getByTestId("file-rail")).toHaveStyle({ gridTemplateColumns: "1fr" });
   });
 
+  it("rescues focus to the file-toggle button when Ctrl+B collapses the rail", () => {
+    // Open the rail first so the toggle is a true->false (collapse) transition.
+    useStore.setState({ showFiles: true });
+    render(<App />);
+
+    // Simulate the inert-collapse blur: when the rail goes inert the browser
+    // blurs the focused tree row and focus falls to <body>. We can't focus a
+    // real treeitem (FileExplorer is stubbed), so we reproduce the end state.
+    act(() => (document.body as HTMLElement).focus());
+    expect(document.activeElement).toBe(document.body);
+
+    fireEvent.keyDown(window, { key: "b", ctrlKey: true });
+
+    // The collapse-edge effect rescues focus to the still-visible, still-tabbable
+    // toggle button instead of leaving the keyboard user stranded on <body>.
+    expect(useStore.getState().showFiles).toBe(false);
+    const toggle = screen.getByRole("button", { name: "Toggle file explorer (Ctrl+B)" });
+    expect(document.activeElement).toBe(toggle);
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
   it("Ctrl+, opens settings", () => {
     render(<App />);
     expect(useStore.getState().showSettings).toBe(false);
@@ -558,6 +579,33 @@ describe("global keyboard shortcuts", () => {
     const status = screen.getByText(/Connection to desktop lost/);
     expect(status).toHaveAttribute("role", "status");
     expect(status).toHaveAttribute("aria-live", "polite");
+  });
+
+  it("announces a successful remote pairing on the connected+verified edge", () => {
+    vi.useFakeTimers();
+    try {
+      // Start in remote mode on the pairing screen (not yet connected/verified),
+      // so the live region is mounted empty and the success message is announced
+      // as an empty->message change once the SAS is confirmed.
+      useStore.setState({ remoteMode: true, remoteConnected: false, remoteVerified: false });
+      render(<App />);
+
+      expect(screen.queryByText(/Connected to your desktop/)).not.toBeInTheDocument();
+
+      // Confirm-SAS path: connected + verified flip true together, clearing the
+      // gate. The false->true edge sets the transient success announcement.
+      act(() => useStore.setState({ remoteConnected: true, remoteVerified: true }));
+
+      const status = screen.getByText(/Connected to your desktop/);
+      expect(status).toHaveAttribute("role", "status");
+      expect(status).toHaveAttribute("aria-live", "polite");
+
+      // The message is transient: it clears so a later re-announcement can fire.
+      act(() => vi.advanceTimersByTime(4000));
+      expect(screen.queryByText(/Connected to your desktop/)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not stack the palette over open Settings (Ctrl+K is a no-op)", () => {

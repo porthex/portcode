@@ -304,7 +304,7 @@ export function SettingsPanel() {
                       if (keyError) setKeyError(null);
                     }}
                     placeholder={settings.apiKeySet ? "••••••••  (replace)" : "sk-ant-…"}
-                    className="flex-1 rounded-lg border border-border bg-panel-2 px-3 py-2.5 font-mono text-[12.5px] text-muted outline-none select-text"
+                    className="flex-1 rounded-lg border border-border bg-panel-2 px-3 py-2.5 font-mono text-[12.5px] text-muted outline-none transition-colors focus:border-accent/50 select-text"
                   />
                   <button
                     ref={saveBtnRef}

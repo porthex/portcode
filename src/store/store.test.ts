@@ -387,6 +387,26 @@ describe("deleteSession", () => {
     expect(st.loadErrors.a).toBe(true);
     expect(st.messages.a).toBeUndefined();
   });
+
+  it("surfaces a deleteSession IPC rejection and leaves the list untouched", async () => {
+    // A failed delete (locked DB / core not ready) must surface via initError instead
+    // of escaping as an unhandled rejection (caller is a bare onClick). The guard runs
+    // BEFORE the optimistic mutation, so the row correctly stays — it wasn't deleted.
+    m.deleteSession.mockRejectedValue(new Error("locked"));
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      messages: { a: [], b: [] },
+    });
+
+    await expect(useStore.getState().deleteSession("a")).resolves.toBeUndefined();
+
+    const st = useStore.getState();
+    expect(st.initError).toBe("locked");
+    expect(st.sessions).toHaveLength(2); // the row stays — it wasn't deleted
+    expect(st.activeId).toBe("a"); // unchanged
+    expect(st.messages.a).toEqual([]); // not removed
+  });
 });
 
 describe("send", () => {
@@ -815,6 +835,28 @@ describe("stop", () => {
     });
 
     await useStore.getState().stop();
+
+    expect(cancel).toHaveBeenCalledTimes(1);
+    const st = useStore.getState();
+    expect(st.streaming).toBe(false);
+    expect(st.cancel).toBeNull();
+    expect(st.pendingPermission).toBeNull();
+  });
+
+  it("clears the composer even when the cancel_agent IPC rejects (never bricks the UI)", async () => {
+    // A rejecting cancel (core busy/locked/dead) must not strand the composer: stop()
+    // wraps the cancel call so streaming/cancel/pendingPermission are always cleared
+    // and the rejection never escapes as an unhandled promise rejection.
+    const cancel = vi.fn(async () => {
+      throw new Error("cancel failed");
+    });
+    useStore.setState({
+      streaming: true,
+      cancel,
+      pendingPermission: { id: "p", tool: "t", summary: "s", input: {} },
+    });
+
+    await expect(useStore.getState().stop()).resolves.toBeUndefined();
 
     expect(cancel).toHaveBeenCalledTimes(1);
     const st = useStore.getState();

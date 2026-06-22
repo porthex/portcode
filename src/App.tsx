@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useStore } from "./store/store";
 import { Sidebar } from "./components/Sidebar";
 import { Chat } from "./components/Chat";
@@ -22,9 +22,47 @@ export default function App() {
   const remoteVerified = useStore((s) => s.remoteVerified);
   const remoteDropped = useStore((s) => s.remoteDropped);
 
+  // A stable target for keyboard focus after the file rail collapses: the
+  // TitleBar file-toggle button stays visible and tabbable, so it's where a
+  // keyboard user who was inside the (now-inert) tree should land.
+  const fileToggleRef = useRef<HTMLButtonElement>(null);
+
   useEffect(() => {
     void init();
   }, [init]);
+
+  // Collapsing the file rail makes it inert, which blurs any focused tree row
+  // and drops focus to <body> (Ctrl+B / the toggle both fire over a focused
+  // <button> tree row — they're not caught by the typing guard). Mirror the
+  // PermissionPrompt focus-restore: on the open->closed edge, rescue focus to
+  // the still-visible toggle so the user keeps their place instead of being
+  // stranded on <body>. Gated on the transition so it never grabs focus on the
+  // initial collapsed mount.
+  const wasFilesOpen = useRef(showFiles);
+  useEffect(() => {
+    if (wasFilesOpen.current && !showFiles && document.activeElement === document.body) {
+      fileToggleRef.current?.focus();
+    }
+    wasFilesOpen.current = showFiles;
+  }, [showFiles]);
+
+  // Announce a successful remote pairing, mirroring the remoteDropped case. The
+  // confirm-SAS path flips remoteGate false and unmounts the pairing screen with
+  // no spoken feedback; track the prior connected+verified value and, on the
+  // false->true edge, set a transient message so the empty->message change is
+  // announced by AT, then clear it. No animation, so no reduced-motion concern.
+  const remoteLive = remoteConnected && remoteVerified;
+  const prevRemoteLive = useRef(remoteLive);
+  const [remoteConnectedMsg, setRemoteConnectedMsg] = useState("");
+  useEffect(() => {
+    if (remoteLive && !prevRemoteLive.current) {
+      setRemoteConnectedMsg("Connected to your desktop.");
+      const id = setTimeout(() => setRemoteConnectedMsg(""), 4000);
+      prevRemoteLive.current = remoteLive;
+      return () => clearTimeout(id);
+    }
+    prevRemoteLive.current = remoteLive;
+  }, [remoteLive]);
 
   // Release the live remote frame subscription if the app tree unmounts (HMR, a
   // root remount) so a stale native listener can't survive into a new store
@@ -92,7 +130,7 @@ export default function App() {
           is never announced by screen readers. */}
       {remoteMode && (
         <span className="sr-only" role="status" aria-live="polite">
-          {remoteDropped ? "Connection to desktop lost. Reconnect available." : ""}
+          {remoteDropped ? "Connection to desktop lost. Reconnect available." : remoteConnectedMsg}
         </span>
       )}
 
@@ -126,7 +164,7 @@ export default function App() {
               </div>
             )}
             <main className="flex min-w-0 flex-1 flex-col">
-              <TitleBar />
+              <TitleBar fileToggleRef={fileToggleRef} />
               <Chat />
             </main>
           </div>
@@ -243,7 +281,7 @@ function RemoteBanner() {
   );
 }
 
-function TitleBar() {
+function TitleBar({ fileToggleRef }: { fileToggleRef?: React.Ref<HTMLButtonElement> }) {
   const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
   const showFiles = useStore((s) => s.showFiles);
   const toggleFiles = useStore((s) => s.toggleFiles);
@@ -273,6 +311,7 @@ function TitleBar() {
           </button>
         )}
         <button
+          ref={fileToggleRef}
           onClick={toggleFiles}
           aria-label="Toggle file explorer (Ctrl+B)"
           title="Toggle file explorer (Ctrl+B)"

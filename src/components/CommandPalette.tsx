@@ -165,6 +165,12 @@ export function CommandPalette() {
             ESC
           </span>
         </div>
+        {/* Persistent polite live region: announces "No matching commands" when the
+            results vanish. Always mounted so the live region exists before its text
+            changes, which AT announces more reliably than a region that appears. */}
+        <span role="status" aria-live="polite" className="sr-only">
+          {filtered.length === 0 ? "No matching commands" : ""}
+        </span>
         <div
           className="max-h-[min(340px,60vh)] overflow-y-auto p-1.5"
           role="listbox"

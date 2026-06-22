@@ -244,21 +244,34 @@ function TreeNode({
         )}
         <span className="truncate">{entry.name}</span>
       </button>
-      {open && children && (
-        // The expandable treeitem owns its contents via a child role="group",
-        // so AT reports the parent/child level the aria-expanded above implies.
-        <div role="group">
-          {children.map((c) => (
-            <TreeNode
-              key={c.path}
-              entry={c}
-              depth={depth + 1}
-              activeRow={activeRow}
-              onActivate={onActivate}
-            />
-          ))}
+      {/* Smooth expand/collapse via the same grid 0fr->1fr accordion the app uses
+          for ToolCall bodies and the file rail (the overflow-hidden child shrinks
+          to 0). children stays null until first expand, so the group mounts only
+          once data exists, then animates on every subsequent toggle. */}
+      <div
+        className="grid transition-[grid-template-rows] duration-200 ease-out motion-reduce:transition-none"
+        style={{ gridTemplateRows: open ? "1fr" : "0fr" }}
+      >
+        <div className="overflow-hidden">
+          {children && (
+            // The expandable treeitem owns its contents via a child role="group",
+            // so AT reports the parent/child level the aria-expanded above implies.
+            // Once opened the group persists while collapsed (to animate), so
+            // aria-hidden drops it from AT when the directory is closed.
+            <div role="group" aria-hidden={!open || undefined}>
+              {children.map((c) => (
+                <TreeNode
+                  key={c.path}
+                  entry={c}
+                  depth={depth + 1}
+                  activeRow={activeRow}
+                  onActivate={onActivate}
+                />
+              ))}
+            </div>
+          )}
         </div>
-      )}
+      </div>
     </div>
   );
 }

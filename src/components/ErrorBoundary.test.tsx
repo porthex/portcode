@@ -47,7 +47,11 @@ describe("ErrorBoundary", () => {
       </ErrorBoundary>,
     );
     expect(screen.getByText("Something went wrong")).toBeInTheDocument();
-    expect(screen.getByText("render exploded")).toBeInTheDocument();
+    const message = screen.getByText("render exploded");
+    expect(message).toBeInTheDocument();
+    // A long unbroken error token (path/URL/serialized object) must wrap inside
+    // max-w-md instead of overflowing the crash card horizontally.
+    expect(message).toHaveClass("break-words", "[overflow-wrap:anywhere]");
     expect(screen.getByRole("button", { name: "Reload" })).toBeInTheDocument();
     // componentDidCatch logged the throw.
     expect(errSpy).toHaveBeenCalled();

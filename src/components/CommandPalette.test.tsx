@@ -37,6 +37,10 @@ const input = () => screen.getByPlaceholderText("Type a command…") as HTMLInpu
 // Rows are role="option" under the role="listbox" results container (their
 // implicit <button> role is overridden), so query them by the option role.
 const commandButtons = () => screen.queryAllByRole("option");
+// The empty-state text exists twice when nothing matches: the visible message in
+// the listbox and a persistent sr-only live region. Scope queries to the visible
+// listbox copy to avoid an ambiguous getByText match.
+const emptyState = () => screen.getByRole("listbox", { name: "Commands" }).querySelector("div");
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -132,8 +136,28 @@ describe("accessibility roles", () => {
     const el = input();
 
     fireEvent.change(el, { target: { value: "zzzzz-nope" } });
-    expect(screen.getByText("No matching commands")).toBeInTheDocument();
+    expect(emptyState()).toHaveTextContent("No matching commands");
     expect(el).not.toHaveAttribute("aria-activedescendant");
+  });
+
+  it("announces the empty result set through a persistent polite live region", () => {
+    open();
+    render(<CommandPalette />);
+    const el = input();
+
+    // the status region is always mounted, but empty while results exist — so no
+    // spurious announcement fires on open
+    const status = screen.getByRole("status");
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(status).toHaveTextContent("");
+
+    // typing a non-matching query populates it, which AT speaks as "no results"
+    fireEvent.change(el, { target: { value: "zzz" } });
+    expect(screen.getByRole("status")).toHaveTextContent("No matching commands");
+
+    // returning to a matching state empties the region again
+    fireEvent.change(el, { target: { value: "" } });
+    expect(screen.getByRole("status")).toHaveTextContent("");
   });
 });
 
@@ -165,7 +189,7 @@ describe("filtering", () => {
 
     fireEvent.change(input(), { target: { value: "zzzzz-nope" } });
 
-    expect(screen.getByText("No matching commands")).toBeInTheDocument();
+    expect(emptyState()).toHaveTextContent("No matching commands");
     expect(commandButtons()).toHaveLength(0);
   });
 });
@@ -284,7 +308,7 @@ describe("running commands", () => {
 
     // no matches: sel would otherwise be set to filtered.length - 1 === -1
     fireEvent.change(el, { target: { value: "zzzzz-nope" } });
-    expect(screen.getByText("No matching commands")).toBeInTheDocument();
+    expect(emptyState()).toHaveTextContent("No matching commands");
 
     // pressing ArrowDown must not crash nor make a later Enter fire choose(-1)
     expect(() => fireEvent.keyDown(el, { key: "ArrowDown" })).not.toThrow();
@@ -302,7 +326,7 @@ describe("running commands", () => {
     const el = input();
 
     fireEvent.change(el, { target: { value: "zzzzz-nope" } });
-    expect(screen.getByText("No matching commands")).toBeInTheDocument();
+    expect(emptyState()).toHaveTextContent("No matching commands");
 
     // wrapping over length 0 must not divide-by-zero into NaN; selection stays 0
     fireEvent.keyDown(el, { key: "ArrowDown" });

@@ -48,7 +48,7 @@ export class ErrorBoundary extends React.Component<Props, State> {
           <h1 className="font-display text-lg font-semibold tracking-wide text-accent">
             Something went wrong
           </h1>
-          <p className="max-w-md text-center font-mono text-[12px] text-muted">
+          <p className="max-w-md text-center font-mono text-[12px] text-muted break-words [overflow-wrap:anywhere]">
             {error.message || "An unexpected error crashed the view."}
           </p>
           <button

@@ -50,19 +50,36 @@ describe("summarize (header summary)", () => {
   });
 
   it("uses the tool name when input is an object without summarizable keys", () => {
-    render(<ToolCall name="custom_tool" input={{ other: 1 }} />);
-    // name appears twice: the mono accent label and the summary span.
-    expect(screen.getAllByText("custom_tool")).toHaveLength(2);
+    // summarize() falls back to the name; the path span is suppressed so the
+    // name renders exactly once (the mono accent label) rather than twice.
+    const { container } = render(<ToolCall name="custom_tool" input={{ other: 1 }} />);
+    expect(screen.getAllByText("custom_tool")).toHaveLength(1);
+    expect(container.querySelector(".pc-toolcall__path")).toBeNull();
   });
 
   it("uses the tool name when input is not an object", () => {
-    render(<ToolCall name="noop" input={null} />);
-    expect(screen.getAllByText("noop")).toHaveLength(2);
+    const { container } = render(<ToolCall name="noop" input={null} />);
+    expect(screen.getAllByText("noop")).toHaveLength(1);
+    expect(container.querySelector(".pc-toolcall__path")).toBeNull();
   });
 
   it("ignores non-string path/command/pattern values and uses the name", () => {
-    render(<ToolCall name="weird" input={{ path: 42, command: true, pattern: [] }} />);
-    expect(screen.getAllByText("weird")).toHaveLength(2);
+    const { container } = render(
+      <ToolCall name="weird" input={{ path: 42, command: true, pattern: [] }} />,
+    );
+    expect(screen.getAllByText("weird")).toHaveLength(1);
+    expect(container.querySelector(".pc-toolcall__path")).toBeNull();
+  });
+
+  it("renders the tool name once (no duplicate path span) for non-summarizable input", () => {
+    // A tool like list_sessions invoked with {} has no path/command/pattern, so
+    // summarize() returns the name. The header must not print "list_sessions
+    // list_sessions" — only the mono label, with the faint path span omitted.
+    render(<ToolCall name="list_sessions" input={{}} />);
+    const head = screen.getByRole("button");
+    expect(screen.getAllByText("list_sessions")).toHaveLength(1);
+    expect(head.querySelector(".pc-toolcall__name")?.textContent).toBe("list_sessions");
+    expect(head.querySelector(".pc-toolcall__path")).toBeNull();
   });
 
   it("lets the summary span shrink + ellipsize so a long command never clips the chevron/counts", () => {

@@ -351,6 +351,17 @@ describe("SettingsPanel — API key", () => {
     expect(input).toBeInTheDocument();
   });
 
+  it("gives the API-key input a keyboard-focus border affordance that survives the global box-shadow reset", () => {
+    renderPanel({ apiKeySet: false });
+
+    // The dialog is a focus trap whose only Tab-reachable text control is this
+    // input; the global `input:focus { box-shadow: none }` rule zeroes any ring,
+    // so the focus indicator must be a border change (focus:border-accent/50),
+    // mirroring the RemotePairing textarea. WCAG 2.4.7 (Focus Visible).
+    const input = screen.getByLabelText("API key");
+    expect(input.className).toContain("focus:border-accent/50");
+  });
+
   it("shows the 'key stored' hint and replace placeholder when a key exists", () => {
     renderPanel({ apiKeySet: true });
 

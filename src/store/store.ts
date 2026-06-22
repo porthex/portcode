@@ -335,7 +335,15 @@ export const useStore = create<AppState>((set, get) => ({
 
   async deleteSession(id) {
     if (get().streaming) return;
-    await ipc.deleteSession(id);
+    try {
+      await ipc.deleteSession(id);
+    } catch (err) {
+      // A failed delete (locked DB / core not ready) must surface instead of being a
+      // swallowed unhandled rejection — caller is a bare onClick={() => deleteSession(s.id)}.
+      // Reuse initError so Chat's existing error/retry panel shows it; leave the list untouched.
+      set({ initError: errMessage(err) });
+      return;
+    }
     set((st) => {
       const sessions = st.sessions.filter((s) => s.id !== id);
       const messages = { ...st.messages };
@@ -602,8 +610,13 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
     const c = get().cancel;
-    if (c) await c();
-    set({ streaming: false, cancel: null, pendingPermission: null });
+    try {
+      if (c) await c();
+    } catch {
+      /* the cancel_agent IPC failed; recover the UI anyway so the composer isn't stuck */
+    } finally {
+      set({ streaming: false, cancel: null, pendingPermission: null });
+    }
   },
 
   async resolvePermission(decision, always) {

@@ -190,14 +190,18 @@ describe("FileExplorer tree", () => {
     expect(await screen.findByText("App.tsx")).toBeInTheDocument();
     expect(m.listDir).toHaveBeenCalledTimes(2);
 
-    // collapse -> child hidden, no extra fetch
+    // collapse -> the accordion keeps the once-opened group mounted (it animates
+    // the grid 0fr->1fr both ways), so the child stays in the DOM but the group
+    // is hidden from AT and the row reports collapsed. No extra fetch.
     fireEvent.click(dirBtn);
-    await waitFor(() => expect(screen.queryByText("App.tsx")).not.toBeInTheDocument());
+    await waitFor(() => expect(dirBtn).toHaveAttribute("aria-expanded", "false"));
+    expect(screen.getByRole("group", { hidden: true })).toHaveAttribute("aria-hidden", "true");
     expect(m.listDir).toHaveBeenCalledTimes(2);
 
     // re-expand -> served from cache (children !== null), still no extra fetch
     fireEvent.click(dirBtn);
-    expect(await screen.findByText("App.tsx")).toBeInTheDocument();
+    await waitFor(() => expect(dirBtn).toHaveAttribute("aria-expanded", "true"));
+    expect(screen.getByText("App.tsx")).toBeInTheDocument();
     expect(m.listDir).toHaveBeenCalledTimes(2);
   });
 
@@ -477,7 +481,11 @@ describe("FileExplorer accessibility", () => {
     dir.focus();
     fireEvent.keyDown(tree, { key: "ArrowLeft" });
     await waitFor(() => expect(dir).toHaveAttribute("aria-expanded", "false"));
+    // The accordion keeps the child group mounted (so it animates closed), but
+    // aria-hidden drops it from the accessibility tree, so the child treeitem is
+    // no longer exposed to AT even though it stays in the DOM.
     expect(screen.queryByRole("treeitem", { name: /App\.tsx/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("group", { hidden: true })).toHaveAttribute("aria-hidden", "true");
   });
 });
 

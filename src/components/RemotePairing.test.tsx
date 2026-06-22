@@ -253,6 +253,29 @@ describe("RemotePairing — camera scan (phone)", () => {
       screen.queryByRole("dialog", { name: /Scanning for a pairing QR/ }),
     ).not.toBeInTheDocument();
   });
+
+  it("moves focus to Cancel and cancels on Escape (modal keyboard affordances)", async () => {
+    // Hold the scan open so the overlay stays mounted. While scanning, the app
+    // shell goes visibility:hidden, so the dialog must take focus itself and offer
+    // a keyboard path to Cancel — assert focus lands on Cancel and Escape cancels.
+    s.scanQrPayload.mockReturnValue(new Promise<scanner.ScanOutcome>(() => {}));
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(scanBtn());
+      await Promise.resolve();
+    });
+
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    expect(cancel).toHaveFocus();
+
+    // Escape (handled at the window level) cancels the scan, mirroring the click path.
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Escape" });
+      await Promise.resolve();
+    });
+    expect(s.cancelScan).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("RemotePairing — verify panel", () => {

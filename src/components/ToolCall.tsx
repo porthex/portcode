@@ -44,7 +44,7 @@ export const ToolCall = memo(function ToolCall({
       >
         <StatusDot pending={pending} error={error} />
         <span className="pc-toolcall__name">{name}</span>
-        <span className="pc-toolcall__path min-w-0 flex-1">{summary}</span>
+        {summary !== name && <span className="pc-toolcall__path min-w-0 flex-1">{summary}</span>}
         <span className="ml-auto flex items-center gap-2">
           {counts && (counts.adds > 0 || counts.dels > 0) && (
             <>
