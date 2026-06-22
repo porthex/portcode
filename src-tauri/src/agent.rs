@@ -388,7 +388,9 @@ mod tests {
         ));
         // Network / timeout / 5xx → transient (keep tokens, let the user retry).
         assert!(!is_terminal_auth_error("Token request timed out."));
-        assert!(!is_terminal_auth_error("Token request failed: connection refused"));
+        assert!(!is_terminal_auth_error(
+            "Token request failed: connection refused"
+        ));
         assert!(!is_terminal_auth_error(
             "OAuth token request failed (500 Internal Server Error): oops"
         ));
