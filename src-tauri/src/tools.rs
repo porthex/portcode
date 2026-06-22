@@ -535,11 +535,11 @@ impl Tool for Shell {
         // Windows: stop a console window from flashing open every time the agent runs
         // a shell command. Spawning a console-subsystem exe (powershell/pwsh/cmd) from
         // the GUI app otherwise allocates a new console; CREATE_NO_WINDOW suppresses it.
-        // `creation_flags` is a SAFE std method, so this respects the crate's
-        // `unsafe_code = "deny"` lint; the cfg-gate compiles to nothing on Linux CI.
+        // `creation_flags` is tokio's own inherent (safe) Command method — no trait
+        // import needed — so this respects `unsafe_code = "deny"` and the cfg-gate
+        // compiles to nothing on Linux CI.
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
