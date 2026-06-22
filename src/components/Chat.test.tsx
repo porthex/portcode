@@ -366,8 +366,13 @@ describe("Chat scroll-to-latest affordance", () => {
     expect(btn).toBeInTheDocument();
 
     fireEvent.click(btn);
-    // The click jumps to the bottom (scrollTop === scrollHeight) and re-pins.
-    expect(scroller.scrollTop).toBe(scroller.scrollHeight);
+    expect(screen.queryByRole("button", { name: "Scroll to latest" })).not.toBeInTheDocument();
+
+    // After re-pinning, a real scroll with bottom geometry must keep it hidden via
+    // the `scrollHeight - scrollTop - clientHeight < 80` recompute, not just the
+    // direct setPinned in the click handler.
+    scroller.scrollTop = scroller.scrollHeight - 300; // 1000 - clientHeight(300) => delta 0 < 80
+    fireEvent.scroll(scroller);
     expect(screen.queryByRole("button", { name: "Scroll to latest" })).not.toBeInTheDocument();
   });
 

@@ -163,7 +163,7 @@ function Avatar() {
 
 function Thinking() {
   return (
-    <div role="status" aria-live="polite" className="flex items-center gap-1 py-1 text-muted">
+    <div className="flex items-center gap-1 py-1 text-muted">
       <span className="sr-only">Agent is thinking</span>
       <span
         aria-hidden="true"

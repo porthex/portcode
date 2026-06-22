@@ -267,10 +267,13 @@ describe("RemotePairing — verify panel", () => {
     expect(screen.queryByText("CONNECT TO DESKTOP")).not.toBeInTheDocument();
   });
 
-  it("autofocuses the Continue button on mount", () => {
+  it("lands initial focus on the SAS code, not the affirmative confirm", () => {
     useStore.setState({ remoteConnected: true, remoteSas: "TANGO-42" });
     render(<RemotePairing />);
-    expect(screen.getByRole("button", { name: /Codes match/ })).toHaveFocus();
+    // Focus must NOT sit on the trust-granting button (a queued Enter would
+    // bypass the SAS comparison); it lands on the code region instead.
+    expect(screen.getByLabelText("Pairing verification code")).toHaveFocus();
+    expect(screen.getByRole("button", { name: /Codes match/ })).not.toHaveFocus();
   });
 
   it("renders a placeholder when the SAS is somehow absent", () => {
@@ -325,23 +328,14 @@ describe("RemotePairing — reconnect after a drop", () => {
     expect(st.remoteVerified).toBe(true);
   });
 
-  it("announces the dropped link through a persistent polite live region", () => {
+  // The drop announcement now lives in a persistent live region at the App shell
+  // (it must survive the connected↔pairing remount to fire as an empty→filled
+  // change), so it is covered in App's tests — not here. RemotePairing no longer
+  // renders its own role="status" region.
+  it("renders no in-panel live region for the drop (announced at the App shell)", () => {
     useStore.setState({ remoteDropped: true, lastPairingQr: "QR-REMEMBERED" });
     render(<RemotePairing />);
-
-    // A persistent status region carries the drop notice (the visible warn block
-    // mounts only with a remembered pairing, so it can't reliably announce the
-    // transition on its own).
-    const status = screen.getByRole("status");
-    expect(status).toHaveAttribute("aria-live", "polite");
-    expect(status).toHaveTextContent(/Connection to desktop lost/);
-  });
-
-  it("keeps the live region silent when the link is healthy", () => {
-    useStore.setState({ remoteDropped: false, lastPairingQr: "QR-REMEMBERED" });
-    render(<RemotePairing />);
-    // Region stays mounted but empty so a later drop is announced as a change.
-    expect(screen.getByRole("status")).toHaveTextContent("");
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
 
   it("shows no reconnect affordance without a remembered pairing", () => {

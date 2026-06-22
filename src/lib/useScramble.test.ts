@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook } from "@testing-library/react";
 
-import { STEP_MS, usePrefersReducedMotion, useScramble } from "./useScramble";
+import {
+  STEP_MS,
+  __resetReducedMotionForTests,
+  usePrefersReducedMotion,
+  useScramble,
+} from "./useScramble";
 
 // useScramble drives a per-word decode off requestAnimationFrame. We replace rAF
 // with a manual queue so the animation advances by an exact number of frames and
@@ -162,6 +167,8 @@ describe("useScramble", () => {
 describe("usePrefersReducedMotion", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    // Reset the shared module singleton so these tests are order-independent.
+    __resetReducedMotionForTests();
   });
 
   it("returns false when matchMedia is unavailable", () => {
@@ -197,12 +204,14 @@ describe("usePrefersReducedMotion", () => {
     expect(a.result.current).toBe(false);
     expect(b.result.current).toBe(false);
 
-    // Unsubscribing one consumer leaves the others subscribed and updating.
+    // Unsubscribing one consumer leaves the others subscribed and updating, while
+    // the unmounted consumer no longer receives changes (its listener was removed).
     a.unmount();
     act(() => {
       mq.matches = true;
       handler?.();
     });
     expect(b.result.current).toBe(true);
+    expect(a.result.current).toBe(false);
   });
 });

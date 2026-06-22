@@ -160,12 +160,9 @@ function ConnectPanel({
 
   return (
     <div>
-      {/* Persistent live region so the drop transition is announced. We keep it
-          mounted (rather than reusing the warn block, which only renders once a
-          pairing is remembered) so screen readers catch the change to dropped. */}
-      <span className="sr-only" role="status" aria-live="polite">
-        {dropped ? "Connection to desktop lost. Reconnect available." : ""}
-      </span>
+      {/* The drop is announced by a persistent live region at the App shell (it
+          survives the connected↔pairing remount); a region inside this panel can't,
+          since the panel only mounts on the drop and so is born with content set. */}
       {canReconnect && (
         <div
           className={`mb-4 rounded-xl border px-4 py-3.5 ${
@@ -271,11 +268,12 @@ function VerifyPanel() {
   const confirmRemoteSas = useStore((s) => s.confirmRemoteSas);
   const disconnectRemote = useStore((s) => s.disconnectRemote);
 
-  // Focus the primary "Codes match — Continue" action on mount so the
-  // security-critical confirm is one keystroke away once the panel appears.
-  const continueRef = useRef<HTMLButtonElement>(null);
+  // Land initial focus on the SAS code, NOT the affirmative confirm: focusing
+  // "Codes match — Continue" would let a queued/habitual Enter verify the
+  // connection without the user comparing codes, defeating the SAS check.
+  const sasRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    continueRef.current?.focus();
+    sasRef.current?.focus();
   }, []);
 
   return (
@@ -293,10 +291,13 @@ function VerifyPanel() {
         connection.
       </p>
 
-      {/* The SAS, large and unmissable — the one security-critical artifact. */}
+      {/* The SAS, large and unmissable — the one security-critical artifact.
+          Takes initial focus (tabIndex=-1) so the user reads the code first. */}
       <div
+        ref={sasRef}
+        tabIndex={-1}
         aria-label="Pairing verification code"
-        className="rounded-xl border border-accent/40 bg-panel-2 px-4 py-5 text-center shadow-[0_0_24px_rgba(255,46,126,0.16)]"
+        className="rounded-xl border border-accent/40 bg-panel-2 px-4 py-5 text-center shadow-[0_0_24px_rgba(255,46,126,0.16)] outline-none"
       >
         <div className="select-text break-all font-mono text-[26px] font-bold leading-tight tracking-[3px] text-accent-2">
           {sas ?? "—"}
@@ -304,7 +305,6 @@ function VerifyPanel() {
       </div>
 
       <button
-        ref={continueRef}
         onClick={() => confirmRemoteSas()}
         className="pc-btn-accent mt-4 w-full px-3 py-2.5 text-[13px]"
       >

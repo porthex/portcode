@@ -266,7 +266,7 @@ describe("TitleBar", () => {
     expect(screen.getByText("Refactor the parser")).toBeInTheDocument();
   });
 
-  it("exposes the active session title as a level-1 heading", () => {
+  it("shows the active session title in the title-bar breadcrumb (not as a competing heading)", () => {
     useStore.setState({
       sessions: [
         {
@@ -282,11 +282,10 @@ describe("TitleBar", () => {
 
     render(<App />);
 
-    // The breadcrumb title carries heading semantics (role=heading aria-level=1)
-    // so a populated conversation has a document heading.
-    expect(
-      screen.getByRole("heading", { level: 1, name: "Refactor the parser" }),
-    ).toBeInTheDocument();
+    // The breadcrumb shows the title as plain text. It is deliberately NOT a
+    // heading, so it never competes with Chat's single empty-state/error <h1>.
+    expect(screen.getByText("Refactor the parser")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Refactor the parser" })).not.toBeInTheDocument();
   });
 
   it("renders the preview-mode badge outside Tauri", () => {
@@ -396,16 +395,17 @@ describe("global keyboard shortcuts", () => {
     expect(st.showSettings).toBe(false);
   });
 
-  it("ignores shell shortcuts while typing in an input", () => {
+  it("ignores shell shortcuts (except Ctrl+K) while typing in an input", () => {
     render(<App />);
     const input = document.createElement("input");
     document.body.appendChild(input);
     input.focus();
 
     // A real event so e.target is the focused input (fireEvent.keyDown(window)
-    // would target window, defeating the guard).
+    // would target window, defeating the guard). Ctrl+, must NOT open Settings
+    // while the user is typing.
     act(() => {
-      input.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: ",", ctrlKey: true, bubbles: true }));
     });
 
     const st = useStore.getState();
@@ -426,6 +426,43 @@ describe("global keyboard shortcuts", () => {
 
     expect(useStore.getState().showSettings).toBe(false);
     document.body.removeChild(ta);
+  });
+
+  it("keeps Ctrl+K live from a focused field (it's the advertised palette toggle)", () => {
+    render(<App />);
+    const ta = document.createElement("textarea");
+    document.body.appendChild(ta);
+    ta.focus();
+
+    act(() => {
+      ta.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
+    });
+
+    // Unlike the other shortcuts, Ctrl+K is not suppressed while typing — it must
+    // open the command palette straight from the composer textarea.
+    expect(useStore.getState().showPalette).toBe(true);
+    document.body.removeChild(ta);
+  });
+
+  it("announces a dropped remote link via a persistent App-level live region", () => {
+    useStore.setState({
+      remoteMode: true,
+      remoteConnected: true,
+      remoteVerified: true,
+      remoteDropped: false,
+    });
+    render(<App />);
+
+    // No drop message while the link is healthy — the region is mounted but empty.
+    expect(screen.queryByText(/Connection to desktop lost/)).not.toBeInTheDocument();
+
+    act(() => useStore.setState({ remoteDropped: true }));
+
+    // The persistent region (mounted before the drop) now carries the message, so
+    // the empty->message change is announced (role=status / aria-live=polite).
+    const status = screen.getByText(/Connection to desktop lost/);
+    expect(status).toHaveAttribute("role", "status");
+    expect(status).toHaveAttribute("aria-live", "polite");
   });
 
   it("does not stack the palette over open Settings (Ctrl+K is a no-op)", () => {

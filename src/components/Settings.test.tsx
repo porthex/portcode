@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, act, cleanup } from "@testing-library/react";
+import { render, screen, fireEvent, act, cleanup, within } from "@testing-library/react";
 
 import { SettingsPanel } from "./Settings";
 import { useStore } from "../store/store";
@@ -320,8 +320,10 @@ describe("SettingsPanel — model picker", () => {
     });
 
     // The store's updateSettings catches the reject into settingsError; the panel
-    // surfaces it and the persisted model is unchanged (controlled value preserved).
-    expect(screen.getByText(/Couldn't save settings: disk full/)).toBeInTheDocument();
+    // surfaces it adjacent to the Model select (in the CONNECTION section, not the
+    // far-away PERMISSIONS banner) and the persisted model is unchanged.
+    const conn = screen.getByText("CONNECTION").closest("section")!;
+    expect(within(conn).getByText(/Couldn't save settings: disk full/)).toBeInTheDocument();
     expect(useStore.getState().settings.model).toBe(MODELS[0].id);
     expect(useStore.getState().settingsError).toBe("disk full");
   });
@@ -397,6 +399,55 @@ describe("SettingsPanel — API key", () => {
       vi.advanceTimersByTime(1800);
     });
     expect(screen.getByRole("button", { name: "Replace" })).toBeInTheDocument();
+  });
+
+  it("keeps focus inside the dialog after a successful save (no flash remount)", async () => {
+    renderPanel({ apiKeySet: false });
+
+    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
+
+    // A keyboard user activates Save from the button itself; capture the node so we
+    // can prove the flash replay reuses it rather than remounting via a React key
+    // (which would drop focus to <body>, outside the focus trap).
+    const save = screen.getByRole("button", { name: "Save" }) as HTMLButtonElement;
+    save.focus();
+    expect(document.activeElement).toBe(save);
+
+    await act(async () => {
+      fireEvent.click(save);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Same DOM node survived the save (re-querying by its new "Saved" label returns
+    // the very element we held), so focus never left the focus-trapped dialog.
+    expect(screen.getByRole("button", { name: "Saved" })).toBe(save);
+    const dialog = screen.getByRole("dialog", { name: /settings/i });
+    expect(document.activeElement).not.toBe(document.body);
+    expect(dialog.contains(document.activeElement)).toBe(true);
+  });
+
+  it("clears a stale 'Couldn't save key' error as the user edits the field", async () => {
+    m.setApiKey.mockRejectedValueOnce(new Error("keyring locked"));
+    renderPanel({ apiKeySet: false });
+
+    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText(/Couldn't save key: keyring locked/)).toBeInTheDocument();
+
+    // Editing the key toward a correction clears the stale error immediately,
+    // rather than lingering until the next Save click.
+    fireEvent.change(input, { target: { value: "sk-ant-secret2" } });
+    expect(screen.queryByText(/Couldn't save key/)).not.toBeInTheDocument();
   });
 
   it("surfaces a setApiKey failure and retains the typed value", async () => {

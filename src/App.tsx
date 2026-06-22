@@ -20,6 +20,7 @@ export default function App() {
   const remoteMode = useStore((s) => s.remoteMode);
   const remoteConnected = useStore((s) => s.remoteConnected);
   const remoteVerified = useStore((s) => s.remoteVerified);
+  const remoteDropped = useStore((s) => s.remoteDropped);
 
   useEffect(() => {
     void init();
@@ -38,9 +39,12 @@ export default function App() {
       // Don't hijack keystrokes while the user is typing in a field (Settings
       // API-key input, the pairing textarea, the palette search, etc.).
       const t = e.target as HTMLElement | null;
-      if (t?.tagName === "INPUT" || t?.tagName === "TEXTAREA" || t?.isContentEditable === true) {
-        return;
-      }
+      const inField =
+        t?.tagName === "INPUT" || t?.tagName === "TEXTAREA" || t?.isContentEditable === true;
+      // Ctrl/Cmd+K stays live even from a field — it's the advertised palette
+      // toggle (e.g. straight from the composer textarea). The other shortcuts
+      // stay suppressed while typing so they don't hijack keystrokes.
+      if (inField && e.key !== "k") return;
       const s = useStore.getState();
       // Don't stack shortcuts on top of an open modal. Ctrl+K stays live as the
       // advertised palette toggle, but is a no-op over Settings (no stacking).
@@ -81,6 +85,16 @@ export default function App() {
       {ambientRain && <NeonRain />}
       {scanlines && <div className="pc-scanlines" aria-hidden="true" />}
       <div className="pc-vignette" aria-hidden="true" />
+
+      {/* Persistent live region for the remote link status. It must stay mounted
+          across the connected<->pairing transition so a drop is announced as an
+          empty->message change — a region that mounts with its text already set
+          is never announced by screen readers. */}
+      {remoteMode && (
+        <span className="sr-only" role="status" aria-live="polite">
+          {remoteDropped ? "Connection to desktop lost. Reconnect available." : ""}
+        </span>
+      )}
 
       {remoteGate ? (
         <RemotePairing />
@@ -212,9 +226,7 @@ function TitleBar() {
         </button>
         <span className="truncate font-mono text-[12px] text-muted">
           portcode<span className="text-faint"> / </span>
-          <span role="heading" aria-level={1} className="text-fg">
-            {session?.title ?? "New chat"}
-          </span>
+          <span className="text-fg">{session?.title ?? "New chat"}</span>
         </span>
       </div>
       <div className="flex shrink-0 items-center gap-2.5">

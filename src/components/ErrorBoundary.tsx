@@ -22,11 +22,14 @@ interface State {
 export class ErrorBoundary extends React.Component<Props, State> {
   state: State = { error: null };
 
-  static getDerivedStateFromError(error: Error): State {
-    return { error };
+  static getDerivedStateFromError(error: unknown): State {
+    // React catches whatever was thrown (a string/number/plain object from a
+    // third-party lib, not just an Error). Normalize so the Error contract the
+    // State/fallback types promise is actually honored at runtime.
+    return { error: error instanceof Error ? error : new Error(String(error)) };
   }
 
-  componentDidCatch(error: Error, info: React.ErrorInfo): void {
+  componentDidCatch(error: unknown, info: React.ErrorInfo): void {
     // No telemetry yet — log so the throw is at least visible in dev/devtools.
     console.error("ErrorBoundary caught a render error:", error, info.componentStack);
   }

@@ -383,13 +383,41 @@ describe("closing", () => {
     open();
     render(<CommandPalette />);
 
-    // Tab/Shift+Tab must not move focus to app chrome behind the scrim
+    // Tab/Shift+Tab on the input must not move focus to app chrome behind the scrim
     const tab = fireEvent.keyDown(input(), { key: "Tab" });
     expect(tab).toBe(false); // returns false when preventDefault() was called
 
     // the palette stays open with the first row still selected
     expect(useStore.getState().showPalette).toBe(true);
     expect(commandButtons()[0]).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("keeps option rows out of the tab order so the combobox is the only tab stop", () => {
+    open();
+    render(<CommandPalette />);
+
+    // every row carries tabindex="-1": the input owns DOM focus, aria-activedescendant
+    // marks the active option (combobox-with-listbox pattern), so rows aren't tab stops.
+    for (const row of commandButtons()) {
+      expect(row).toHaveAttribute("tabindex", "-1");
+    }
+  });
+
+  it("traps focus inside the dialog even when a row holds focus (Tab + Shift+Tab)", () => {
+    open();
+    render(<CommandPalette />);
+    const dialog = screen.getByRole("dialog", { name: "Command palette" });
+
+    // Even if focus somehow reaches a row (SR/spatial nav), Tab must not escape the modal.
+    const row = commandButtons()[0];
+    row.focus();
+    expect(dialog.contains(document.activeElement)).toBe(true);
+
+    fireEvent.keyDown(row, { key: "Tab" });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+
+    fireEvent.keyDown(row, { key: "Tab", shiftKey: true });
+    expect(dialog.contains(document.activeElement)).toBe(true);
   });
 
   it("clicking the backdrop closes the palette", () => {

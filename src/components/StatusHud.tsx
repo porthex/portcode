@@ -48,17 +48,21 @@ export function StatusHud() {
   const tokens = usage ? usage.input + usage.output : 0;
 
   const workspaceConnected = Boolean(session?.workspace);
-  // Memoized so the transcript isn't re-scanned on every streaming delta — the
-  // count only changes when `messages` does, not on each token/usage update.
+  // Memoized so a token/usage-only re-render (messages array reference stable)
+  // doesn't re-scan the transcript. A real message change — including each
+  // streaming text delta, since patchLast rebuilds the array — still recomputes.
   const toolUses = useMemo(() => countToolUses(messages), [messages]);
 
   return (
     <footer className="pc-hud">
       <div className="pc-hud-seg pc-hud-seg--left text-accent">
         <span className="pc-dot pc-dot--success" aria-hidden="true" />
-        <span aria-hidden="true">{"⎇"}</span> {workspaceLabel(session?.workspace)}
+        <span aria-hidden="true">{"⎇"}</span>{" "}
+        <span className="pc-hud-trunc">{workspaceLabel(session?.workspace)}</span>
       </div>
-      <div className="pc-hud-seg pc-hud-seg--left text-accent-2">{modelLabel(model)}</div>
+      <div className="pc-hud-seg pc-hud-seg--left text-accent-2">
+        <span className="pc-hud-trunc">{modelLabel(model)}</span>
+      </div>
       {/* The phone trims the HUD to essentials so the 7 desktop segments don't
           overflow a narrow screen — policy and the redundant workspace segment
           (the ⎇ branch above already names the workspace) are desktop-only. */}

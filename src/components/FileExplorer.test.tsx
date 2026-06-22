@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 
 import { FileExplorer } from "./FileExplorer";
 import { useStore } from "../store/store";
@@ -352,6 +352,125 @@ describe("FileExplorer accessibility", () => {
 
     const alert = screen.getByRole("alert");
     expect(alert).toHaveTextContent("Couldn’t open folder: permission denied");
+  });
+
+  it("owns expanded children in a role='group' so the tree levels are real", async () => {
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })])
+      .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx", isDir: false })]);
+
+    render(<FileExplorer />);
+
+    const dirBtn = await screen.findByRole("treeitem", { name: "src folder" });
+    // A collapsed directory owns nothing: no child group yet.
+    expect(screen.queryByRole("group")).not.toBeInTheDocument();
+
+    fireEvent.click(dirBtn);
+
+    // After expanding, the child treeitem lives inside a role="group" the tree
+    // owns — the parent/child ownership aria-expanded implies, not a flat list.
+    const tree = screen.getByRole("tree");
+    const group = await within(tree).findByRole("group");
+    expect(within(group).getByRole("treeitem", { name: /App\.tsx/ })).toBeInTheDocument();
+  });
+
+  it("annotates nesting depth with aria-level on each treeitem", async () => {
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })])
+      .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx", isDir: false })]);
+
+    render(<FileExplorer />);
+
+    const dirBtn = await screen.findByRole("treeitem", { name: "src folder" });
+    // Root rows are level 1.
+    expect(dirBtn).toHaveAttribute("aria-level", "1");
+
+    fireEvent.click(dirBtn);
+
+    // A child rendered inside the group is level 2.
+    const child = await screen.findByRole("treeitem", { name: /App\.tsx/ });
+    expect(child).toHaveAttribute("aria-level", "2");
+  });
+
+  it("uses roving tabindex: only one row is a tab stop at a time", async () => {
+    m.listDir.mockResolvedValueOnce([
+      entry({ name: "src", path: "src", isDir: true }),
+      entry({ name: "README.md", path: "README.md", isDir: false }),
+    ]);
+
+    render(<FileExplorer />);
+
+    const first = await screen.findByRole("treeitem", { name: "src folder" });
+    const second = screen.getByRole("treeitem", { name: "README.md" });
+    // The first root is the default tab stop; the rest leave the tab order.
+    expect(first).toHaveAttribute("tabindex", "0");
+    expect(second).toHaveAttribute("tabindex", "-1");
+
+    // Focusing a row promotes it to the active (tabIndex 0) row, demoting the
+    // prior one — one tab stop moves with focus.
+    second.focus();
+    await waitFor(() => expect(second).toHaveAttribute("tabindex", "0"));
+    expect(first).toHaveAttribute("tabindex", "-1");
+  });
+
+  it("navigates rows with ArrowDown / ArrowUp / Home / End", async () => {
+    m.listDir.mockResolvedValueOnce([
+      entry({ name: "a.ts", path: "a.ts", isDir: false }),
+      entry({ name: "b.ts", path: "b.ts", isDir: false }),
+      entry({ name: "c.ts", path: "c.ts", isDir: false }),
+    ]);
+
+    render(<FileExplorer />);
+    const tree = await screen.findByRole("tree");
+    const a = screen.getByRole("treeitem", { name: "a.ts" });
+    const b = screen.getByRole("treeitem", { name: "b.ts" });
+    const c = screen.getByRole("treeitem", { name: "c.ts" });
+
+    a.focus();
+    // ArrowDown walks to the next row and moves focus there.
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    expect(b).toHaveFocus();
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    expect(c).toHaveFocus();
+    // ArrowDown at the bottom is clamped (no wrap, no throw).
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    expect(c).toHaveFocus();
+
+    // ArrowUp walks back up.
+    fireEvent.keyDown(tree, { key: "ArrowUp" });
+    expect(b).toHaveFocus();
+
+    // Home jumps to the first row, End to the last.
+    fireEvent.keyDown(tree, { key: "Home" });
+    expect(a).toHaveFocus();
+    fireEvent.keyDown(tree, { key: "End" });
+    expect(c).toHaveFocus();
+  });
+
+  it("expands with ArrowRight and collapses with ArrowLeft on a directory", async () => {
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })])
+      .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx", isDir: false })]);
+
+    render(<FileExplorer />);
+    const tree = await screen.findByRole("tree");
+    const dir = screen.getByRole("treeitem", { name: "src folder" });
+
+    dir.focus();
+    // ArrowRight on a collapsed dir expands it (fetching children).
+    fireEvent.keyDown(tree, { key: "ArrowRight" });
+    await waitFor(() => expect(dir).toHaveAttribute("aria-expanded", "true"));
+    expect(await screen.findByRole("treeitem", { name: /App\.tsx/ })).toBeInTheDocument();
+
+    // ArrowRight on the already-open dir steps focus into its first child.
+    fireEvent.keyDown(tree, { key: "ArrowRight" });
+    expect(screen.getByRole("treeitem", { name: /App\.tsx/ })).toHaveFocus();
+
+    // ArrowLeft back on the dir collapses it.
+    dir.focus();
+    fireEvent.keyDown(tree, { key: "ArrowLeft" });
+    await waitFor(() => expect(dir).toHaveAttribute("aria-expanded", "false"));
+    expect(screen.queryByRole("treeitem", { name: /App\.tsx/ })).not.toBeInTheDocument();
   });
 });
 

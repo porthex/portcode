@@ -347,6 +347,13 @@ describe("Sidebar", () => {
       const active = screen.getByRole("button", { name: /^Second/ });
       expect(active).toHaveAttribute("tabindex", "0");
       expect(inactive).toHaveAttribute("tabindex", "-1");
+
+      // The per-row delete control follows the same roving scheme, so only the
+      // active row exposes its controls in the Tab order (one tab stop in).
+      const inactiveDelete = screen.getByRole("button", { name: "Delete session: First" });
+      const activeDelete = screen.getByRole("button", { name: "Delete session: Second" });
+      expect(activeDelete).toHaveAttribute("tabindex", "0");
+      expect(inactiveDelete).toHaveAttribute("tabindex", "-1");
     });
 
     it("ArrowDown/ArrowUp move selection and follow focus", () => {
@@ -362,11 +369,17 @@ describe("Sidebar", () => {
       render(<Sidebar />);
       const nav = screen.getByRole("navigation", { name: "Session list" });
 
+      // Focus the active row first so the keyDown mirrors the real focus-gated
+      // bubbling path, then assert focus follows the selection to the new row.
+      screen.getByRole("button", { name: /^First/ }).focus();
+
       fireEvent.keyDown(nav, { key: "ArrowDown" });
       expect(useStore.getState().activeId).toBe("b");
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: /^Second/ }));
 
       fireEvent.keyDown(nav, { key: "ArrowUp" });
       expect(useStore.getState().activeId).toBe("a");
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: /^First/ }));
     });
 
     it("Home/End jump to the first and last sessions", () => {
@@ -382,11 +395,17 @@ describe("Sidebar", () => {
       render(<Sidebar />);
       const nav = screen.getByRole("navigation", { name: "Session list" });
 
+      // Focus the active row first so the keyDown mirrors the real focus-gated
+      // bubbling path, then assert focus jumps with the selection.
+      screen.getByRole("button", { name: /^Second/ }).focus();
+
       fireEvent.keyDown(nav, { key: "End" });
       expect(useStore.getState().activeId).toBe("c");
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: /^Third/ }));
 
       fireEvent.keyDown(nav, { key: "Home" });
       expect(useStore.getState().activeId).toBe("a");
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: /^First/ }));
     });
 
     it("clamps ArrowUp at the first row and ArrowDown at the last", () => {

@@ -161,6 +161,16 @@ describe("collapse / expand toggle", () => {
     );
   });
 
+  it("announces the tool name once when summarize() falls back to it", () => {
+    // When the input has no summarizable field, summarize() returns the name,
+    // which the visible UI shows twice (mono label + summary span). The label
+    // must NOT double it — a screen reader should hear "custom_tool" once.
+    render(<ToolCall name="custom_tool" input={{ other: 1 }} />);
+    const label = screen.getByRole("button").getAttribute("aria-label");
+    expect(label).not.toMatch(/custom_tool custom_tool/);
+    expect(label).toMatch(/^custom_tool, running, expand output$/);
+  });
+
   it("marks the decorative status dot aria-hidden so it isn't announced", () => {
     const { container, rerender } = render(<ToolCall name="t" input={{}} result={result()} />);
     expect(dot(container)).toHaveAttribute("aria-hidden", "true");

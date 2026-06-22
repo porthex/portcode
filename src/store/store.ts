@@ -474,7 +474,7 @@ export const useStore = create<AppState>((set, get) => ({
     }, 1000);
 
     try {
-      const handle = await ipc.runAgent(activeId, text, onEvent);
+      const handle = await ipc.runAgent(activeId, body, onEvent);
       run = handle;
       if (settled) {
         // A terminal event (or the watchdog) fired before the handle resolved —

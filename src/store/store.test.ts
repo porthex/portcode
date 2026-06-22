@@ -414,6 +414,9 @@ describe("send", () => {
     const st = useStore.getState();
     expect(st.messages.a[0].blocks).toEqual([{ kind: "text", text: "hi" }]);
     expect(st.sessions[0].title).toBe("hi");
+    // The local agent is also prompted with the trimmed body (not the raw padded
+    // draft), so what the user sees and what the model receives stay consistent.
+    expect(m.runAgent).toHaveBeenCalledWith("a", "hi", expect.any(Function));
   });
 
   it("trims the forwarded run text in remote mode", async () => {
@@ -680,8 +683,10 @@ describe("resolvePermission", () => {
       pendingPermission: { id: "p1", tool: "fs_edit", summary: "stale", input: {} },
     });
 
-    // The captured request (p1) is resolved; the guard then prevents the trailing
-    // allow-always save from acting on a prompt the user didn't act on.
+    // The captured request (p1) is answered and the allow-always policy save still
+    // runs; it just never touches pendingPermission, so the newer prompt that
+    // arrived mid-await stays pending (the pre-await guard only blocks answering a
+    // request whose id changed before the await began).
     await useStore.getState().resolvePermission("allow", true);
 
     // p1 was answered, but the newer prompt that arrived mid-await stays pending.

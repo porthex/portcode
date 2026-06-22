@@ -10,13 +10,15 @@ const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
 let reducedMotionMql: MediaQueryList | null = null;
 const reducedMotionListeners = new Set<() => void>();
 
+function onReducedMotionChange(): void {
+  for (const listener of reducedMotionListeners) listener();
+}
+
 function ensureReducedMotionMql(): MediaQueryList | null {
   if (reducedMotionMql) return reducedMotionMql;
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") return null;
   reducedMotionMql = window.matchMedia(REDUCED_MOTION_QUERY);
-  reducedMotionMql.addEventListener("change", () => {
-    for (const listener of reducedMotionListeners) listener();
-  });
+  reducedMotionMql.addEventListener("change", onReducedMotionChange);
   return reducedMotionMql;
 }
 
@@ -36,6 +38,17 @@ function getReducedMotionSnapshot(): boolean {
 /** Tracks the OS "reduce motion" accessibility setting, reactively. */
 export function usePrefersReducedMotion(): boolean {
   return useSyncExternalStore(subscribeReducedMotion, getReducedMotionSnapshot, () => false);
+}
+
+/**
+ * Test-only: tear down the shared reduced-motion subscription so each test starts
+ * from a fresh singleton. The module-level matchMedia listener is otherwise created
+ * once and lives for the app's lifetime, which would leak state across tests.
+ */
+export function __resetReducedMotionForTests(): void {
+  reducedMotionMql?.removeEventListener("change", onReducedMotionChange);
+  reducedMotionMql = null;
+  reducedMotionListeners.clear();
 }
 
 // A per-word "decode" reveal for the in-flight assistant turn. The reply streams

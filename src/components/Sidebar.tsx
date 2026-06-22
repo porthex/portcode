@@ -145,6 +145,7 @@ export function Sidebar() {
                 <button
                   onClick={() => deleteSession(s.id)}
                   disabled={streaming}
+                  tabIndex={active ? 0 : -1}
                   className={`ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-danger/10 hover:text-danger group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none ${
                     streaming ? "cursor-not-allowed opacity-50" : ""
                   }`}

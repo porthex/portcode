@@ -81,51 +81,56 @@ export function Chat() {
   };
 
   return (
-    <div className="relative flex min-h-0 flex-1 flex-col">
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]">
-        <div
-          ref={contentRef}
-          className="w-full max-w-none px-6 py-6"
-          role="log"
-          aria-live="polite"
-          aria-relevant="additions text"
-          aria-busy={streaming}
-        >
-          {initError ? (
-            <InitErrorPanel message={initError} onRetry={() => void retryInit()} />
-          ) : messages.length === 0 && loadError ? (
-            <LoadErrorPanel onRetry={() => activeId && void retryLoad(activeId)} />
-          ) : messages.length === 0 ? (
-            <EmptyState />
-          ) : (
-            messages.map((m, i) => (
-              <MessageView
-                key={m.id}
-                message={m}
-                isActive={streaming && i === lastIndex && m.role === "assistant"}
-              />
-            ))
-          )}
+    <div className="flex min-h-0 flex-1 flex-col">
+      {/* The relative context lives on the scroll region (not the whole panel) so the
+          scroll-to-latest FAB's `bottom-4` is measured from the transcript's bottom
+          edge — floating it 16px above the Composer instead of on top of it. */}
+      <div className="relative min-h-0 flex-1">
+        <div ref={scrollRef} className="absolute inset-0 overflow-y-auto [scrollbar-gutter:stable]">
+          <div
+            ref={contentRef}
+            className="w-full max-w-none px-6 py-6"
+            role="log"
+            aria-live="polite"
+            aria-relevant="additions text"
+            aria-busy={streaming}
+          >
+            {initError ? (
+              <InitErrorPanel message={initError} onRetry={() => void retryInit()} />
+            ) : messages.length === 0 && loadError ? (
+              <LoadErrorPanel onRetry={() => activeId && void retryLoad(activeId)} />
+            ) : messages.length === 0 ? (
+              <EmptyState />
+            ) : (
+              messages.map((m, i) => (
+                <MessageView
+                  key={m.id}
+                  message={m}
+                  isActive={streaming && i === lastIndex && m.role === "assistant"}
+                />
+              ))
+            )}
+          </div>
         </div>
+        {!pinned && messages.length > 0 && (
+          <button
+            type="button"
+            aria-label="Scroll to latest"
+            onClick={scrollToBottom}
+            className="absolute bottom-4 right-4 flex h-9 w-9 items-center justify-center rounded-full border border-border bg-panel text-fg shadow transition-opacity hover:border-accent motion-reduce:transition-none"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+              <path
+                d="M6 9l6 6 6-6"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+          </button>
+        )}
       </div>
-      {!pinned && messages.length > 0 && (
-        <button
-          type="button"
-          aria-label="Scroll to latest"
-          onClick={scrollToBottom}
-          className="absolute bottom-4 right-4 flex h-9 w-9 items-center justify-center rounded-full border border-border bg-panel text-fg shadow transition-opacity hover:border-accent motion-reduce:transition-none"
-        >
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-            <path
-              d="M6 9l6 6 6-6"
-              stroke="currentColor"
-              strokeWidth="1.8"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
-        </button>
-      )}
       <PermissionPrompt />
       <Composer />
     </div>

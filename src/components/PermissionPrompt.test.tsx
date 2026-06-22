@@ -83,23 +83,27 @@ describe("PermissionPrompt", () => {
 
     const deny = screen.getByRole("button", { name: "⏎ Deny" });
     expect(deny).toHaveFocus();
-    expect(deny).toHaveAttribute("aria-keyshortcuts", "Enter");
-    // The Allow label must not claim the Enter affordance.
+    // The Allow label must not claim the Enter affordance, and Deny advertises
+    // it only via the ⏎ label — native focused-button Enter needs no ARIA.
     expect(screen.getByRole("button", { name: "Allow" })).not.toHaveFocus();
   });
 
-  it("wraps a pathological summary without dropping the action row", () => {
+  it("preserves the full path in a title attribute and keeps all three actions in order", () => {
     const summary = "/very/long/" + "deep/".repeat(40) + "path/to/file.ts";
     useStore.setState({ pendingPermission: pending({ summary }) });
 
     render(<PermissionPrompt />);
 
-    // The full path is preserved in a title for hover/inspection even though
-    // it is visually clamped to two lines.
+    // The full path is preserved in a title for hover/inspection. The visual
+    // two-line clamp / overflow guard lives in CSS (line-clamp-2, break-words,
+    // overflow-wrap:anywhere) and jsdom does no layout, so we only assert the
+    // class-presence proxy here — the rendered height is checked in the preview
+    // harness, not jsdom.
     const span = screen.getByText(summary);
     expect(span).toHaveAttribute("title", summary);
+    expect(span).toHaveClass("line-clamp-2", "break-words");
 
-    // All three actions still render, in order, anchored below the summary.
+    // All three actions still render, in DOM order, anchored below the summary.
     const buttons = screen.getAllByRole("button");
     expect(buttons.map((b) => b.textContent)).toEqual(["Allow", "Always allow", "⏎ Deny"]);
   });

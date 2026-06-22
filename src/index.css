@@ -300,10 +300,10 @@ textarea:focus-visible {
     animation: none !important;
   }
   .pc-msg-enter {
-    animation: none;
+    animation: none !important;
   }
   .pc-flash {
-    animation: none;
+    animation: none !important;
   }
 }
 
@@ -626,7 +626,16 @@ textarea:focus-visible {
   min-width: 0;
   flex-shrink: 1;
   overflow: hidden;
+}
+/* The variable text inside a left segment truncates with an ellipsis. The
+   segment is itself a flex container, so the ellipsis must live on a block
+   child rather than the container. */
+.pc-hud-trunc {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .pc-hud-seg--right {
   flex-shrink: 0;

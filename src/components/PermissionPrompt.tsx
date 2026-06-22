@@ -52,7 +52,6 @@ export function PermissionPrompt() {
           <button
             ref={denyRef}
             onClick={() => void resolve("deny")}
-            aria-keyshortcuts="Enter"
             className="pc-btn-deny px-3.5 py-1.5 text-[12.5px]"
           >
             ⏎ Deny

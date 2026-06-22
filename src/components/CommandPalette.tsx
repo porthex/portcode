@@ -159,6 +159,7 @@ export function CommandPalette() {
                 ref={i === sel ? selRef : null}
                 role="option"
                 id={`pc-cmd-${c.id}`}
+                tabIndex={-1}
                 aria-label={c.hint ? `${c.label}, ${c.hint}` : c.label}
                 aria-selected={i === sel}
                 onMouseEnter={() => setSel(i)}

@@ -222,12 +222,12 @@ describe("MessageView — assistant role", () => {
     const dots = container.querySelectorAll(".animate-bounce");
     expect(dots).toHaveLength(3);
 
-    // The indicator is announced to assistive tech: a polite live status region
-    // carrying a visually-hidden "Agent is thinking" label, while the decorative
-    // dots are hidden from the accessibility tree.
-    const status = screen.getByRole("status");
-    expect(status).toHaveAttribute("aria-live", "polite");
-    expect(status).toHaveTextContent("Agent is thinking");
+    // The indicator carries a visually-hidden "Agent is thinking" label that the
+    // outer transcript log region announces when this row is inserted; it is NOT
+    // its own live region (no nested role="status"/aria-live inside role="log"),
+    // while the decorative dots are hidden from the accessibility tree.
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByText("Agent is thinking")).toBeInTheDocument();
     dots.forEach((dot) => expect(dot).toHaveAttribute("aria-hidden", "true"));
     // The geometric bounce stops under prefers-reduced-motion (ON on the dev OS).
     dots.forEach((dot) => expect(dot.className).toContain("motion-reduce:animate-none"));

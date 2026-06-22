@@ -36,6 +36,7 @@ export function SettingsPanel() {
   const [signingIn, setSigningIn] = useState(false);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const modalRef = useRef<HTMLDivElement | null>(null);
+  const saveBtnRef = useRef<HTMLButtonElement | null>(null);
 
   const signedIn = !!oauthStatus?.signedIn;
 
@@ -68,6 +69,14 @@ export function SettingsPanel() {
       if (savedTimer.current !== null) clearTimeout(savedTimer.current);
     };
   }, []);
+
+  // Replay the one-shot pc-flash on the SAME Save node when a save succeeds —
+  // restart the CSS animation by toggling the class across a forced reflow rather
+  // than remounting via a React key, which would drop focus out of the focus trap.
+  useEffect(() => {
+    if (!savedKey) return;
+    replayFlash(saveBtnRef.current);
+  }, [savedKey]);
 
   // Trap Tab within the dialog: query focusable descendants live (sections toggle
   // `hidden` in remoteMode), skip hidden ones, and wrap at the first/last element.
@@ -203,6 +212,13 @@ export function SettingsPanel() {
                     </option>
                   ))}
                 </select>
+                {/* settingsError is shared by the model select and the permission
+                    policy buttons; surface it next to its higher control here. */}
+                {settingsError && (
+                  <p className="mt-1.5 text-[11px] text-danger">
+                    Couldn't save settings: {settingsError}
+                  </p>
+                )}
               </div>
 
               <div>
@@ -263,17 +279,19 @@ export function SettingsPanel() {
                   <input
                     type="password"
                     value={apiKey}
-                    onChange={(e) => setApiKey(e.target.value)}
+                    onChange={(e) => {
+                      setApiKey(e.target.value);
+                      // Clear a stale "Couldn't save key" as the user corrects it.
+                      if (keyError) setKeyError(null);
+                    }}
                     placeholder={settings.apiKeySet ? "••••••••  (replace)" : "sk-ant-…"}
                     className="flex-1 rounded-lg border border-border bg-panel-2 px-3 py-2.5 font-mono text-[12.5px] text-muted outline-none select-text"
                   />
                   <button
-                    key={savedKey ? "saved" : "idle"}
+                    ref={saveBtnRef}
                     onClick={() => void saveKey()}
                     disabled={saving || !apiKey.trim()}
-                    className={`pc-btn-accent px-4 py-2.5 text-[12.5px] disabled:opacity-30 ${
-                      savedKey ? "pc-flash" : ""
-                    }`}
+                    className="pc-btn-accent px-4 py-2.5 text-[12.5px] disabled:opacity-30"
                   >
                     {saveLabel}
                   </button>
@@ -316,11 +334,6 @@ export function SettingsPanel() {
             <p className="mt-1.5 text-[11px] text-faint">
               Controls write / edit / shell tools. Read-only tools always run.
             </p>
-            {settingsError && (
-              <p className="mt-1.5 text-[11px] text-danger">
-                Couldn't save settings: {settingsError}
-              </p>
-            )}
           </section>
 
           {/* APPEARANCE */}
@@ -420,6 +433,16 @@ export function SettingsPanel() {
   );
 }
 
+/** Restart the one-shot pc-flash on a persistent node: drop the class, force a
+ *  reflow so the browser registers the removal, then re-add it. Replays the CSS
+ *  animation without remounting (which would yank focus out of the focus trap). */
+function replayFlash(node: HTMLElement | null) {
+  if (!node) return;
+  node.classList.remove("pc-flash");
+  void node.offsetWidth; // force reflow so the re-added class restarts the animation
+  node.classList.add("pc-flash");
+}
+
 /** Show only the first 8 and last 4 chars of a base64 key to keep the UI compact. */
 function truncateKey(key: string): string {
   if (key.length <= 16) return key;
@@ -442,6 +465,7 @@ function PairingCode({ payload, onDone }: { payload: PairingPayload; onDone: () 
   const [copied, setCopied] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
   const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyBtnRef = useRef<HTMLButtonElement | null>(null);
 
   // Clear the "Copied ✓" reset timer on unmount. PairingCode is dismissed (Done)
   // well within the 1.5s window, so an uncleared timer would setState after unmount.
@@ -451,6 +475,13 @@ function PairingCode({ payload, onDone }: { payload: PairingPayload; onDone: () 
     },
     [],
   );
+
+  // Replay the one-shot pc-flash on the SAME Copy node when a copy succeeds,
+  // restarting the CSS animation without remounting (which would drop focus).
+  useEffect(() => {
+    if (!copied) return;
+    replayFlash(copyBtnRef.current);
+  }, [copied]);
 
   const copy = async () => {
     try {
@@ -492,11 +523,9 @@ function PairingCode({ payload, onDone }: { payload: PairingPayload; onDone: () 
 
         <div className="flex w-full items-center gap-2">
           <button
-            key={copied ? "copied" : "idle"}
+            ref={copyBtnRef}
             onClick={() => void copy()}
-            className={`flex-1 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12.5px] text-fg transition-colors hover:border-accent/50 ${
-              copied ? "pc-flash" : ""
-            }`}
+            className="flex-1 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12.5px] text-fg transition-colors hover:border-accent/50"
           >
             {copied ? "Copied ✓" : "Copy code"}
           </button>

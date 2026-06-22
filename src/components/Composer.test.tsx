@@ -89,6 +89,17 @@ describe("Composer textarea", () => {
     // Streaming: AT sees the input as busy for the duration of the turn.
     expect(ta()).toHaveAttribute("aria-busy", "true");
   });
+
+  it("carries the streaming dim on the input itself, not the frame", () => {
+    render(<Composer />);
+    // The disabled-state dim lives on the textarea so it greys only the inert
+    // input while leaving the Stop button (rendered in the same frame) bright.
+    const ta = screen.getByPlaceholderText(
+      "Describe a task, ask a question, or give an instruction…",
+    );
+    expect(ta.className).toContain("disabled:opacity-60");
+    expect(ta.className).toContain("disabled:saturate-[0.6]");
+  });
 });
 
 describe("Composer send button", () => {
@@ -285,6 +296,25 @@ describe("Composer stop button", () => {
     // The stop control is a bare red square with no text; the aria-label is the
     // only thing announcing its purpose to assistive tech.
     expect(screen.getByRole("button", { name: "Stop generating" })).toBe(stopButton());
+  });
+
+  it("guards its glow transition under prefers-reduced-motion", () => {
+    useStore.setState({ streaming: true });
+    render(<Composer />);
+    // The Stop button animates box-shadow/filter on hover/active; without the
+    // guard that would still play under reduced-motion (the global CSS doesn't
+    // cover Tailwind transition utilities).
+    expect(stopButton().className).toContain("motion-reduce:transition-none");
+  });
+
+  it("stays at full strength while streaming (the dim is scoped to the input)", () => {
+    useStore.setState({ streaming: true });
+    render(<Composer />);
+    // The streaming dim must NOT live on the pc-neon-frame wrapper, or it would
+    // de-emphasize the Stop button — the only available action during a run.
+    const frame = stopButton().closest(".pc-neon-frame")!;
+    expect(frame.className).not.toContain("opacity-70");
+    expect(frame.className).not.toContain("saturate-[0.6]");
   });
 });
 

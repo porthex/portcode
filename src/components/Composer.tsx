@@ -61,11 +61,7 @@ export function Composer() {
 
   return (
     <div className="border-t border-border bg-panel/80 px-6 pb-3 pt-3.5">
-      <div
-        className={`pc-neon-frame w-full max-w-none transition-[opacity,filter] duration-200 ${
-          streaming ? "opacity-70 saturate-[0.6]" : ""
-        }`}
-      >
+      <div className="pc-neon-frame w-full max-w-none transition-[opacity,filter] duration-200 motion-reduce:transition-none">
         <div className="flex items-end gap-2.5 rounded-[12px] bg-panel px-3 py-2.5">
           <textarea
             ref={ref}
@@ -80,12 +76,12 @@ export function Composer() {
             rows={1}
             placeholder="Describe a task, ask a question, or give an instruction…"
             style={{ maxHeight: MAX_TEXTAREA_H }}
-            className="flex-1 resize-none bg-transparent text-[13.5px] leading-[1.5] text-fg outline-none transition-[height] duration-150 ease-out motion-reduce:transition-none placeholder:text-faint select-text disabled:cursor-not-allowed disabled:opacity-60"
+            className="flex-1 resize-none bg-transparent text-[13.5px] leading-[1.5] text-fg outline-none transition-[height] duration-150 ease-out motion-reduce:transition-none placeholder:text-faint select-text disabled:cursor-not-allowed disabled:opacity-60 disabled:saturate-[0.6]"
           />
           {streaming ? (
             <button
               onClick={() => void stop()}
-              className="flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-[9px] bg-danger/20 text-danger shadow-[0_0_16px_rgba(255,77,87,0.3)] hover:bg-danger/30 hover:shadow-[0_0_26px_rgba(255,77,87,0.55)] active:brightness-90 transition-[box-shadow,background-color,filter] duration-200"
+              className="flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-[9px] bg-danger/20 text-danger shadow-[0_0_16px_rgba(255,77,87,0.3)] hover:bg-danger/30 hover:shadow-[0_0_26px_rgba(255,77,87,0.55)] active:brightness-90 transition-[box-shadow,background-color,filter] duration-200 motion-reduce:transition-none"
               title="Stop"
               aria-label="Stop generating"
             >

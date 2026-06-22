@@ -27,6 +27,10 @@ export function ToolCall({
   // Pretty-printing the input is pure on `input`; memoize so unrelated
   // re-renders (e.g. toggling open/collapse) don't re-stringify it.
   const inputJson = useMemo(() => JSON.stringify(input, null, 2), [input]);
+  // summarize() falls back to the tool name when there's no summarizable input,
+  // so only fold the summary into the spoken label when it adds a distinct
+  // target — otherwise a screen reader hears the name twice.
+  const target = summary === name ? "" : ` ${summary}`;
 
   return (
     <div className="pc-toolcall">
@@ -34,7 +38,7 @@ export function ToolCall({
         onClick={() => setOpen((o) => !o)}
         className="pc-toolcall__head"
         aria-expanded={open}
-        aria-label={`${name} ${summary}${
+        aria-label={`${name}${target}${
           error ? ", failed" : pending ? ", running" : ", completed"
         }, ${open ? "collapse" : "expand"} output`}
       >
