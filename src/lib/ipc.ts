@@ -236,14 +236,31 @@ export async function openFolder(): Promise<string | null> {
 }
 
 /**
- * Send a user message and stream the agent run. Returns an unlisten/cancel
- * handle. Events arrive via `onEvent`.
+ * A handle to a single running agent turn.
+ *
+ * `dispose()` stops listening for this turn's events WITHOUT cancelling the run —
+ * call it the instant a turn reaches a terminal state (turn_end/error) so the
+ * per-turn listener can't leak. A leaked listener keeps folding the NEXT turn's
+ * deltas into this turn's message (the "second reply edits the first" bug).
+ *
+ * `cancel()` additionally tells the Rust core to abort an in-flight turn, then
+ * stops listening — used by Stop and the client-side idle watchdog.
+ */
+export interface AgentRunHandle {
+  cancel: () => Promise<void>;
+  dispose: () => void;
+}
+
+/**
+ * Send a user message and stream the agent run. Returns a handle to stop the run
+ * (`cancel`) or just stop listening on a normal end (`dispose`). Events arrive
+ * via `onEvent`.
  */
 export async function runAgent(
   sessionId: string,
   text: string,
   onEvent: (e: StreamEvent) => void,
-): Promise<{ cancel: () => Promise<void> }> {
+): Promise<AgentRunHandle> {
   if (isTauri()) {
     const { core, event } = await tauri();
     const channel = `agent://${sessionId}`;
@@ -256,6 +273,7 @@ export async function runAgent(
         await core.invoke("cancel_agent", { sessionId });
         unlisten();
       },
+      dispose: unlisten,
     };
   }
   return mock.runAgent(sessionId, text, onEvent);
@@ -453,6 +471,10 @@ const mock = (() => {
           cancelled = true;
           resolvers.forEach((r) => r("deny"));
           resolvers.clear();
+        },
+        // Stop delivering this turn's events without the cancel/deny side effects.
+        dispose: () => {
+          cancelled = true;
         },
       };
     },

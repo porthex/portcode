@@ -24,12 +24,8 @@ type Cancels = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 const REFRESH_SKEW_SECS: i64 = 60;
 
 fn emit(app: &AppHandle, channel: &str, ev: StreamEvent) {
-    use tauri::{Emitter, Manager};
-    // Mirror every agent event to Phone Sync (no-op when no phone is attached).
-    if let Some(hub) = app.try_state::<crate::sync::SyncHub>() {
-        hub.publish(channel, ev.clone());
-    }
-    let _ = app.emit(channel, ev);
+    // Canonical chokepoint: delivers to the desktop UI and mirrors to the phone.
+    crate::sync::emit_event(app, channel, ev);
 }
 
 fn system_prompt(workspace: &Path) -> String {

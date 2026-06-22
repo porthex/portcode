@@ -781,7 +781,13 @@ pub fn run() {
             secrets::init_dir(dir.clone());
 
             let settings = Settings::load(&dir);
+            // Bound connection establishment (DNS + TCP + TLS) so a turn or a token
+            // refresh can't hang indefinitely before any byte arrives. We deliberately
+            // do NOT set a blanket request `.timeout()` — that would kill long but
+            // healthy streaming turns; the per-read idle timeout in `llm::stream_turn`
+            // handles a stream that connects and then stalls.
             let http = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("failed to build HTTP client");
             let db = Db::open(&dir.join("portcode.db")).expect("failed to open database");

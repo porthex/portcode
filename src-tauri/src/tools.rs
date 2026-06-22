@@ -532,6 +532,18 @@ impl Tool for Shell {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
+        // Windows: stop a console window from flashing open every time the agent runs
+        // a shell command. Spawning a console-subsystem exe (powershell/pwsh/cmd) from
+        // the GUI app otherwise allocates a new console; CREATE_NO_WINDOW suppresses it.
+        // `creation_flags` is a SAFE std method, so this respects the crate's
+        // `unsafe_code = "deny"` lint; the cfg-gate compiles to nothing on Linux CI.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
         let child = cmd
             .spawn()
             .map_err(|e| format!("failed to start {shell}: {e}"))?;
