@@ -103,6 +103,23 @@ const now = () => Date.now();
 // timeout so the backend's specific error wins in the normal stalled-network case.
 const TURN_IDLE_TIMEOUT_MS = 150_000;
 
+// Remote-turn idle watchdog (symmetric with the local one in send()). In remote
+// mode the turn runs on the desktop and only a desktop-originated live frame can
+// clear `streaming`; if the channel stays alive but the desktop's agent dies/hangs
+// without emitting turn_end/error (no drop, the send resolved), the phone is stuck
+// with a disabled composer forever. This module-scoped handle drives a force-end on
+// idle. Module-scoped (not closure-scoped like the local watchdog) so the remote
+// frame handler, drop listener, stop(), and disconnect can all reset/clear it.
+let remoteWatchdog: ReturnType<typeof setInterval> | null = null;
+let remoteLastActivity = 0;
+
+const clearRemoteWatchdog = (): void => {
+  if (remoteWatchdog !== null) {
+    clearInterval(remoteWatchdog);
+    remoteWatchdog = null;
+  }
+};
+
 // Frontend-only UI preferences (decorative overlays). Cosmetic client state,
 // not the Rust core's Settings — persisted in localStorage so they work the
 // same in preview and native without an IPC round-trip.
@@ -265,6 +282,20 @@ export const useStore = create<AppState>((set, get) => ({
     // same-tick call bail, so only one create runs.
     if (get().streaming || get().creatingSession) return;
     set({ creatingSession: true });
+    // Remote mode: the agent-side `create_session` command is desktop-only (the
+    // local Tauri invoke isn't registered on the phone and would reject as an
+    // unhandled rejection). Route through the link instead and let the desktop's
+    // authoritative `session_list` frame reconcile + activate the new session,
+    // rather than optimistically inserting a phantom local one the desktop never
+    // knows about (and that send() couldn't run a turn in).
+    if (get().remoteConnected) {
+      try {
+        await get().sendRemoteCommand({ cmd: "create_session" });
+      } finally {
+        set({ creatingSession: false, showSidebar: false });
+      }
+      return;
+    }
     try {
       const s = makeSession();
       await ipc.createSession(s.id, s.title, s.workspace);
@@ -274,6 +305,11 @@ export const useStore = create<AppState>((set, get) => ({
         messages: { ...st.messages, [s.id]: [] },
         showSidebar: false, // close the mobile drawer on navigation
       }));
+    } catch (err) {
+      // A failed create (locked DB / core not ready) must surface instead of being a
+      // swallowed unhandled rejection — callers use bare `onClick={newSession}` /
+      // `void newSession()`. Reuse initError so Chat's existing error/retry panel shows it.
+      set({ initError: errMessage(err) });
     } finally {
       set({ creatingSession: false });
     }
@@ -345,6 +381,38 @@ export const useStore = create<AppState>((set, get) => ({
     // already clears streaming:false, so the composer can't get stranded.
     if (get().remoteConnected) {
       set({ streaming: true });
+      // Remote idle watchdog (symmetric with the local one below). The desktop is
+      // authoritative, but if its agent dies/hangs without ever emitting
+      // turn_end/error AND the channel stays up (no drop fires), nothing would clear
+      // `streaming` and the composer would be stranded. Arm a timer that force-ends a
+      // silent remote turn; every live frame for the active session resets it (see
+      // applyFrame), and every terminal/teardown path clears it (turn_end/error in
+      // applyRemoteEvent, the drop listener, the send-command catch, stop(),
+      // disconnectRemote).
+      clearRemoteWatchdog();
+      remoteLastActivity = now();
+      remoteWatchdog = setInterval(() => {
+        // The turn already ended or was stopped elsewhere — just clean up.
+        if (!get().streaming) {
+          clearRemoteWatchdog();
+          return;
+        }
+        if (now() - remoteLastActivity < TURN_IDLE_TIMEOUT_MS) return;
+        // No live frame for the whole idle window → treat the desktop as hung and
+        // recover, so the composer can't stay disabled forever.
+        clearRemoteWatchdog();
+        const sid = get().activeId;
+        set((st) => ({
+          streaming: false,
+          pendingPermission: null,
+          messages:
+            sid !== null
+              ? patchLast(st.messages, sid, (b) =>
+                  appendText(b, "\n\n**The desktop stopped responding (timed out).**"),
+                )
+              : st.messages,
+        }));
+      }, 1000);
       await get().sendRemoteCommand({ cmd: "run", session_id: activeId, text: body });
       return;
     }
@@ -527,6 +595,7 @@ export const useStore = create<AppState>((set, get) => ({
     // Remote mode: the turn runs on the desktop, so stop it with a Cancel command
     // over the link (there is no local `cancel` handle on the phone).
     if (get().remoteConnected) {
+      clearRemoteWatchdog(); // the turn is over — stop the idle watchdog
       const activeId = get().activeId;
       if (activeId) await get().sendRemoteCommand({ cmd: "cancel", session_id: activeId });
       set({ streaming: false, pendingPermission: null });
@@ -739,6 +808,9 @@ export const useStore = create<AppState>((set, get) => ({
         }));
         break;
       case "live":
+        // Keep the remote idle watchdog alive: any live frame for the active session
+        // is proof the desktop is still talking, so reset its last-activity clock.
+        if (frame.session_id === get().activeId) remoteLastActivity = now();
         applyRemoteEvent(set, frame.session_id, frame.event);
         break;
       // command / ack / hello are phone-originated or not actionable inbound.
@@ -799,6 +871,7 @@ export const useStore = create<AppState>((set, get) => ({
         // The turn is dead when the channel drops — clear turn state too, not just
         // connection flags, so neither the interim nor the reconnected session is
         // stuck on a stale `streaming`/`pendingPermission`.
+        clearRemoteWatchdog();
         set({
           remoteConnected: false,
           remoteVerified: false,
@@ -879,11 +952,13 @@ export const useStore = create<AppState>((set, get) => ({
           ),
         }));
       }
+      clearRemoteWatchdog(); // the turn can't proceed on a dropped link
       set({ remoteDropped: true, streaming: false });
     }
   },
 
   async disconnectRemote() {
+    clearRemoteWatchdog(); // user-initiated teardown — the turn is over
     const unlisten = get().remoteUnlisten;
     // Flip the connection flags FIRST, before the async teardown. `remoteConnected`
     // is the routing source of truth for send/stop/resolvePermission, so clearing it
@@ -1038,6 +1113,10 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       });
       break;
     case "error":
+      // A terminal frame for the active session ends the turn — stop the remote idle
+      // watchdog (it self-clears on its next tick once streaming is false, but clear
+      // it eagerly so it can't fire a spurious timeout in the meantime).
+      if (useStore.getState().activeId === sessionId) clearRemoteWatchdog();
       set((st) => ({
         messages: patchLast(st.messages, sessionId, (b) =>
           appendText(b, `\n\n**Error:** ${e.message}`),
@@ -1047,6 +1126,7 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       }));
       break;
     case "turn_end":
+      if (useStore.getState().activeId === sessionId) clearRemoteWatchdog();
       set((st) => (st.activeId === sessionId ? { streaming: false, pendingPermission: null } : {}));
       break;
   }

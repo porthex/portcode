@@ -864,6 +864,7 @@ textarea:focus-visible {
   position: fixed;
   inset: 0;
   display: flex;
+  overflow-y: auto;
   background: rgba(3, 4, 8, 0.66);
   backdrop-filter: blur(3px);
 }

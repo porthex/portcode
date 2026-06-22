@@ -111,7 +111,11 @@ export function SettingsPanel() {
     try {
       setKeyError(null);
       await ipc.setApiKey(apiKey.trim());
-      await updateSettings({ apiKeySet: true });
+      // Persist the apiKeySet flag directly (not via updateSettings, which swallows
+      // a reject into settingsError and resolves anyway) so a save failure hits this
+      // catch — "Saved" is never shown and the typed value is kept for retry.
+      const next = await ipc.saveSettings({ apiKeySet: true });
+      useStore.setState({ settings: next });
       setApiKey("");
       setSavedKey(true);
       if (savedTimer.current !== null) clearTimeout(savedTimer.current);
@@ -137,11 +141,11 @@ export function SettingsPanel() {
 
   return (
     <div
-      className="pc-overlay items-center justify-center z-[58] p-6"
+      className="pc-overlay items-start justify-center z-[58] p-6"
       onClick={() => setShowSettings(false)}
     >
       <div
-        className="pc-modal"
+        className="pc-modal my-auto"
         role="dialog"
         aria-modal="true"
         aria-labelledby="pc-settings-title"
@@ -222,7 +226,7 @@ export function SettingsPanel() {
                 {/* settingsError is shared by the model select and the permission
                     policy buttons; surface it next to its higher control here. */}
                 {settingsError && (
-                  <p className="mt-1.5 text-[11px] text-danger">
+                  <p className="mt-1.5 text-[11px] text-danger" role="alert">
                     Couldn't save settings: {settingsError}
                   </p>
                 )}
@@ -276,7 +280,9 @@ export function SettingsPanel() {
                   </button>
                 )}
                 {oauthError && (
-                  <p className="mt-1.5 text-[11px] text-danger">Sign-in failed: {oauthError}</p>
+                  <p className="mt-1.5 text-[11px] text-danger" role="alert">
+                    Sign-in failed: {oauthError}
+                  </p>
                 )}
               </div>
 
@@ -310,7 +316,9 @@ export function SettingsPanel() {
                   </button>
                 </div>
                 {keyError && (
-                  <p className="mt-1.5 text-[11px] text-danger">Couldn't save key: {keyError}</p>
+                  <p className="mt-1.5 text-[11px] text-danger" role="alert">
+                    Couldn't save key: {keyError}
+                  </p>
                 )}
                 <span role="status" aria-live="polite" className="sr-only">
                   {savedKey ? "API key saved" : ""}

@@ -3,6 +3,7 @@ import { render, screen, fireEvent, act } from "@testing-library/react";
 
 import { MessageView } from "./Message";
 import { STEP_MS } from "../lib/useScramble";
+import { useStore } from "../store/store";
 import type { ContentBlock, Message, Role } from "../types";
 
 // MessageView is a pure, props-driven presentational component: it folds a
@@ -286,6 +287,58 @@ describe("MessageView — typing animation", () => {
 
     expect(container.querySelector(".pc-caret")).toBeNull();
     expect(container.querySelector("strong")).not.toBeNull();
+  });
+
+  it("renders the active turn as cheap plain text (no markdown) when the decode is off", () => {
+    // typingAnimation off (also the reduced-motion default) means the active row
+    // does not animate — instead of re-running ReactMarkdown + rehype-highlight on
+    // every streaming delta, it renders static plain text in the .prose-pc body
+    // typography so it resolves in place when the turn settles.
+    const prev = useStore.getState().settings;
+    useStore.setState({ settings: { ...prev, typingAnimation: false } });
+    try {
+      const { container } = render(
+        <MessageView
+          message={message("assistant", [{ kind: "text", text: "**bold** and plain" }])}
+          isActive
+        />,
+      );
+
+      // The growing reply is plain text in a .prose-pc <p> — NOT highlighted markdown.
+      const prose = container.querySelector(".prose-pc");
+      expect(prose).not.toBeNull();
+      const p = prose!.querySelector("p");
+      expect(p).not.toBeNull();
+      expect(p!.className).toContain("whitespace-pre-wrap");
+      expect(p!.textContent).toBe("**bold** and plain");
+      // No markdown parse and no syntax highlighting ran on the streaming row.
+      expect(container.querySelector("strong")).toBeNull();
+      expect(container.querySelector("code.hljs")).toBeNull();
+      // It is the static path, not the animated decode — no caret/scramble.
+      expect(container.querySelector(".pc-caret")).toBeNull();
+      expect(container.querySelector(".pc-scramble")).toBeNull();
+    } finally {
+      useStore.setState({ settings: prev });
+    }
+  });
+
+  it("renders the SAME content as markdown once the turn is inactive (decode off)", () => {
+    // The plain streaming branch only applies while active; once the row settles
+    // (isActive false), the same text re-renders through ReactMarkdown.
+    const prev = useStore.getState().settings;
+    useStore.setState({ settings: { ...prev, typingAnimation: false } });
+    try {
+      const { container } = render(
+        <MessageView
+          message={message("assistant", [{ kind: "text", text: "**bold** and plain" }])}
+        />,
+      );
+
+      expect(container.querySelector("strong")).not.toBeNull();
+      expect(container.querySelector(".prose-pc")).not.toBeNull();
+    } finally {
+      useStore.setState({ settings: prev });
+    }
   });
 });
 

@@ -166,7 +166,7 @@ export function CommandPalette() {
           </span>
         </div>
         <div
-          className="max-h-[340px] overflow-y-auto p-1.5"
+          className="max-h-[min(340px,60vh)] overflow-y-auto p-1.5"
           role="listbox"
           id="pc-palette-list"
           aria-label="Commands"

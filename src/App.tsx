@@ -155,10 +155,12 @@ function SidebarDrawer() {
   const setShowSidebar = useStore((s) => s.setShowSidebar);
   const drawerRef = useRef<HTMLDivElement>(null);
   // Escape closes the drawer (the App keydown effect only handles modified keys,
-  // so plain Escape would otherwise strand focus inside the overlay).
+  // so plain Escape would otherwise strand focus inside the overlay). Bail while
+  // Settings is open: it stacks on top of the drawer (z-58 > z-50), so the first
+  // Escape must dismiss only the topmost layer (Settings) and leave the drawer.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setShowSidebar(false);
+      if (e.key === "Escape" && !useStore.getState().showSettings) setShowSidebar(false);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);

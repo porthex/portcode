@@ -99,6 +99,11 @@ describe("Composer textarea", () => {
     );
     expect(ta.className).toContain("disabled:opacity-60");
     expect(ta.className).toContain("disabled:saturate-[0.6]");
+    // The dim/undim eases instead of snapping at turn boundaries: opacity and
+    // filter are in the transition list (not just height), and the
+    // reduced-motion guard still neutralizes it.
+    expect(ta.className).toContain("transition-[height,opacity,filter]");
+    expect(ta.className).toContain("motion-reduce:transition-none");
   });
 
   it("exposes an explicit accessible name (not just the placeholder)", () => {

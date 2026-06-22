@@ -232,7 +232,7 @@ function TreeNode({
         )}
         {entry.isDir ? (
           <span aria-hidden="true" className="inline-flex w-4 shrink-0 justify-center text-warn">
-            ▸
+            {open ? "▢" : "▣"}
           </span>
         ) : (
           <span

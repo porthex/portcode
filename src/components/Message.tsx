@@ -67,6 +67,7 @@ export const MessageView = memo(function MessageView({
                     key={i}
                     text={b.text}
                     animate={animate}
+                    active={isActive}
                     caret={animate && i === lastTextIndex}
                   />
                 );
@@ -93,14 +94,28 @@ export const MessageView = memo(function MessageView({
 const TextBlock = memo(function TextBlock({
   text,
   animate,
+  active,
   caret,
 }: {
   text: string;
   animate: boolean;
+  active: boolean;
   caret: boolean;
 }) {
   if (animate) {
     return <ScrambleText text={text} caret={caret} />;
+  }
+  // Active but NOT animating (reduced-motion ON, or typingAnimation off): render
+  // cheap static plain text in the SAME .prose-pc body typography as the settled
+  // markdown, so the body resolves in place when ReactMarkdown takes over. This
+  // avoids re-running remark/rehype + syntax highlighting on every streaming
+  // delta — the whole accumulated reply was otherwise re-highlighted per chunk.
+  if (active) {
+    return (
+      <div className="prose-pc">
+        <p className="whitespace-pre-wrap break-words">{text}</p>
+      </div>
+    );
   }
   return (
     <div className="prose-pc">

@@ -215,6 +215,38 @@ describe("newSession", () => {
     expect(useStore.getState().sessions).toHaveLength(2); // old + one new, not two new
     expect(useStore.getState().creatingSession).toBe(false); // lock released
   });
+
+  it("routes through the remote command (not the desktop-only local create) when connected", async () => {
+    // On the phone the agent-side create_session is desktop-only; calling the local
+    // Tauri invoke would reject. newSession must forward a `create_session` command
+    // and let the desktop's session_list frame reconcile — not optimistically insert
+    // a phantom local session.
+    useStore.setState({ remoteConnected: true, sessions: [session({ id: "old" })] });
+
+    await useStore.getState().newSession();
+
+    expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({ cmd: "create_session" });
+    expect(m.createSession).not.toHaveBeenCalled();
+    const st = useStore.getState();
+    expect(st.sessions).toHaveLength(1); // no optimistic local session inserted
+    expect(st.creatingSession).toBe(false); // lock released
+    expect(st.showSidebar).toBe(false); // drawer closed on navigation
+  });
+
+  it("surfaces a local create rejection instead of an unhandled rejection", async () => {
+    // The local path now wraps createSession in try/catch so a reject (locked DB /
+    // core not ready) lands in the visible error surface rather than escaping as an
+    // unhandled promise rejection (callers use bare onClick / void).
+    m.createSession.mockRejectedValueOnce(new Error("db locked"));
+    useStore.setState({ sessions: [session({ id: "old" })] });
+
+    await expect(useStore.getState().newSession()).resolves.toBeUndefined();
+
+    const st = useStore.getState();
+    expect(st.initError).toBe("db locked");
+    expect(st.sessions).toHaveLength(1); // no phantom session on failure
+    expect(st.creatingSession).toBe(false); // lock released
+  });
 });
 
 describe("selectSession", () => {
@@ -622,6 +654,116 @@ describe("send", () => {
       m.runAgent.mockClear();
       await useStore.getState().send("retry");
       expect(m.runAgent).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers a hung REMOTE turn via the idle watchdog so the phone composer isn't stranded", async () => {
+    // Symmetric with the local watchdog: in remote mode only a desktop live frame can
+    // clear `streaming`. If the channel stays up but the desktop's agent dies without
+    // emitting turn_end/error (no drop), nothing would recover the composer. The
+    // remote watchdog force-ends the silent turn after the idle window.
+    vi.useFakeTimers();
+    try {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "New chat" })],
+        activeId: "a",
+        messages: { a: [] },
+        remoteConnected: true,
+      });
+
+      await useStore.getState().send("do it");
+      expect(useStore.getState().streaming).toBe(true);
+      expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({
+        cmd: "run",
+        session_id: "a",
+        text: "do it",
+      });
+
+      // No live frame arrives. Idle past the watchdog window → the turn force-ends.
+      await vi.advanceTimersByTimeAsync(152_000);
+
+      const st = useStore.getState();
+      expect(st.streaming).toBe(false);
+      expect(st.pendingPermission).toBeNull();
+      const text = st.messages.a[st.messages.a.length - 1].blocks
+        .map((b) => (b.kind === "text" ? b.text : ""))
+        .join("");
+      expect(text).toContain("timed out");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a remote live frame for the active session resets the idle watchdog", async () => {
+    // Activity keeps the watchdog from firing: a live frame mid-window must reset
+    // last-activity so a still-streaming turn isn't falsely timed out.
+    vi.useFakeTimers();
+    try {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "New chat" })],
+        activeId: "a",
+        messages: { a: [] },
+        remoteConnected: true,
+      });
+
+      await useStore.getState().send("do it");
+      expect(useStore.getState().streaming).toBe(true);
+
+      // Just before the window elapses, a live frame arrives (the desktop is alive).
+      await vi.advanceTimersByTimeAsync(149_000);
+      useStore
+        .getState()
+        .applyFrame({ t: "live", session_id: "a", event: { type: "turn_start", messageId: "m1" } });
+
+      // Another almost-full window passes; without the reset the watchdog would have
+      // fired by now, but the live frame kept the turn alive.
+      await vi.advanceTimersByTimeAsync(140_000);
+      expect(useStore.getState().streaming).toBe(true);
+
+      // Now go fully idle past the window from the last activity → it finally recovers.
+      await vi.advanceTimersByTimeAsync(152_000);
+      expect(useStore.getState().streaming).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a remote turn_end clears the idle watchdog so it can't fire after a clean finish", async () => {
+    vi.useFakeTimers();
+    try {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "New chat" })],
+        activeId: "a",
+        messages: { a: [] },
+        remoteConnected: true,
+      });
+
+      await useStore.getState().send("do it");
+      // The desktop builds the assistant message, then finishes the turn cleanly.
+      useStore
+        .getState()
+        .applyFrame({ t: "live", session_id: "a", event: { type: "turn_start", messageId: "m1" } });
+      useStore.getState().applyFrame({
+        t: "live",
+        session_id: "a",
+        event: { type: "turn_end", stopReason: "end_turn" },
+      });
+      expect(useStore.getState().streaming).toBe(false);
+
+      // Append a fresh assistant block so a (wrongly) still-armed watchdog would be
+      // detectable by a spurious timed-out note. Advancing well past the window must
+      // NOT re-flip streaming or append a timeout note.
+      await vi.advanceTimersByTimeAsync(200_000);
+
+      const st = useStore.getState();
+      expect(st.streaming).toBe(false);
+      const text = st.messages.a
+        .flatMap((msg) => msg.blocks)
+        .map((b) => (b.kind === "text" ? b.text : ""))
+        .join("");
+      expect(text).not.toContain("timed out");
     } finally {
       vi.useRealTimers();
     }

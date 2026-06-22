@@ -262,7 +262,13 @@ describe("RemotePairing — verify panel", () => {
 
     expect(screen.getByText("VERIFY THIS CODE")).toBeInTheDocument();
     expect(screen.getByText("TANGO-42")).toBeInTheDocument();
-    expect(screen.getByLabelText("Pairing verification code")).toHaveTextContent("TANGO-42");
+    // The SAS box's accessible NAME must INCLUDE the digits — an aria-label that
+    // merely says "Pairing verification code" would suppress the code subtree, so
+    // a screen reader would never hear the actual SAS (defeating the out-of-band
+    // comparison). Assert the computed name carries the code, not just textContent.
+    const sasBox = screen.getByLabelText(/Pairing verification code/);
+    expect(sasBox).toHaveAccessibleName(/TANGO-42/);
+    expect(sasBox).toHaveTextContent("TANGO-42");
     // The connect panel is gone.
     expect(screen.queryByText("CONNECT TO DESKTOP")).not.toBeInTheDocument();
   });
@@ -272,14 +278,18 @@ describe("RemotePairing — verify panel", () => {
     render(<RemotePairing />);
     // Focus must NOT sit on the trust-granting button (a queued Enter would
     // bypass the SAS comparison); it lands on the code region instead.
-    expect(screen.getByLabelText("Pairing verification code")).toHaveFocus();
+    expect(screen.getByLabelText(/Pairing verification code/)).toHaveFocus();
     expect(screen.getByRole("button", { name: /Codes match/ })).not.toHaveFocus();
   });
 
   it("renders a placeholder when the SAS is somehow absent", () => {
     useStore.setState({ remoteConnected: true, remoteSas: null });
     render(<RemotePairing />);
-    expect(screen.getByLabelText("Pairing verification code")).toHaveTextContent("—");
+    // With no SAS, the box paints a dash and its accessible name says so plainly
+    // (never silently "Pairing verification code" with an empty/suppressed code).
+    const sasBox = screen.getByLabelText(/Pairing verification code/);
+    expect(sasBox).toHaveTextContent("—");
+    expect(sasBox).toHaveAccessibleName(/not available/);
   });
 
   it("Continue confirms the SAS (marks the connection verified)", () => {

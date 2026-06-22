@@ -296,7 +296,7 @@ function VerifyPanel() {
       <div
         ref={sasRef}
         tabIndex={-1}
-        aria-label="Pairing verification code"
+        aria-label={`Pairing verification code: ${sas ?? "not available"}`}
         className="rounded-xl border border-accent/40 bg-panel-2 px-4 py-5 text-center shadow-[0_0_24px_rgba(255,46,126,0.16)] outline-none"
       >
         <div className="select-text break-all font-mono text-[26px] font-bold leading-tight tracking-[3px] text-accent-2">

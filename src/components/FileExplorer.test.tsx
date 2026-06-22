@@ -148,9 +148,10 @@ describe("FileExplorer tree", () => {
 
     expect(await screen.findByText("src")).toBeInTheDocument();
     expect(screen.getByText("README.md")).toBeInTheDocument();
-    // A collapsed directory shows both the caret "▸" and the amber folder
-    // glyph "▸" (two distinct spans share the same right-pointing triangle).
-    expect(screen.getAllByText("▸")).toHaveLength(2);
+    // A collapsed directory shows the closed caret "▸" plus a neutral amber
+    // folder mark "▣" — so the caret is now the only right-pointing triangle.
+    expect(screen.getAllByText("▸")).toHaveLength(1);
+    expect(screen.getByText("▣")).toBeInTheDocument();
     // README.md is the extension-less-of-interest fallback "◇" (text-faint).
     expect(screen.getByText("◇")).toBeInTheDocument();
   });
@@ -170,8 +171,10 @@ describe("FileExplorer tree", () => {
     // Second listDir call carries the directory's path.
     await waitFor(() => expect(m.listDir).toHaveBeenNthCalledWith(2, "src"));
     expect(await screen.findByText("App.tsx")).toBeInTheDocument();
-    // Caret flips to the expanded glyph.
+    // Caret flips to the expanded glyph and the folder mark flips to its open
+    // neutral form "▢" (no second triangle to contradict the open caret).
     expect(screen.getByText("▾")).toBeInTheDocument();
+    expect(screen.getByText("▢")).toBeInTheDocument();
   });
 
   it("collapses an expanded directory without refetching, then re-expands from cache", async () => {
@@ -243,7 +246,9 @@ describe("FileExplorer tree", () => {
     // caret collapses back to "▸" and no stuck-open empty directory remains.
     await waitFor(() => expect(m.listDir).toHaveBeenNthCalledWith(2, "locked"));
     await waitFor(() => expect(screen.queryByText("▾")).not.toBeInTheDocument());
-    expect(screen.getAllByText("▸")).toHaveLength(2);
+    // Collapsed again: the caret is the only "▸"; the folder mark reverts to "▣".
+    expect(screen.getAllByText("▸")).toHaveLength(1);
+    expect(screen.getByText("▣")).toBeInTheDocument();
 
     // children settled to [] (not null), so re-expanding serves the cache
     // without re-hitting the failing backend.
@@ -341,8 +346,10 @@ describe("FileExplorer accessibility", () => {
     // The decorative caret/glyph spans are aria-hidden, so the row's accessible
     // name comes solely from the explicit aria-label, not the leaked symbols.
     expect(await screen.findByRole("treeitem", { name: "src folder" })).toBeInTheDocument();
-    // Decorative glyphs stay in the DOM (aria-hidden) so text assertions hold.
-    expect(screen.getAllByText("▸")).toHaveLength(2);
+    // Decorative glyphs stay in the DOM (aria-hidden) so text assertions hold:
+    // a single closed caret "▸" plus the neutral closed folder mark "▣".
+    expect(screen.getAllByText("▸")).toHaveLength(1);
+    expect(screen.getByText("▣")).toBeInTheDocument();
   });
 
   it("surfaces a workspace open failure in an alert region", () => {

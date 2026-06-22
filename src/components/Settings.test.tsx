@@ -151,10 +151,14 @@ describe("SettingsPanel — Claude subscription sign-in", () => {
     expect(screen.getByText("Pro").className).toContain("violet");
   });
 
-  it("surfaces a sign-in error from the store", () => {
+  it("surfaces a sign-in error from the store as an assertive live region", () => {
     useStore.setState({ oauthError: "oauth denied" });
     renderPanel();
-    expect(screen.getByText(/Sign-in failed: oauth denied/)).toBeInTheDocument();
+    const alert = screen.getByText(/Sign-in failed: oauth denied/);
+    expect(alert).toBeInTheDocument();
+    // The error appears asynchronously after the sign-in click while focus stays
+    // on the trigger, so it must be announced (role="alert") like pairingError.
+    expect(alert).toHaveAttribute("role", "alert");
   });
 });
 
@@ -328,7 +332,11 @@ describe("SettingsPanel — model picker", () => {
     // surfaces it adjacent to the Model select (in the CONNECTION section, not the
     // far-away PERMISSIONS banner) and the persisted model is unchanged.
     const conn = screen.getByText("CONNECTION").closest("section")!;
-    expect(within(conn).getByText(/Couldn't save settings: disk full/)).toBeInTheDocument();
+    const settingsAlert = within(conn).getByText(/Couldn't save settings: disk full/);
+    expect(settingsAlert).toBeInTheDocument();
+    // Announced to screen readers (matches the pairingError pattern): the error
+    // appears asynchronously after the change while focus stays on the select.
+    expect(settingsAlert).toHaveAttribute("role", "alert");
     expect(useStore.getState().settings.model).toBe(MODELS[0].id);
     expect(useStore.getState().settingsError).toBe("disk full");
   });
@@ -470,10 +478,51 @@ describe("SettingsPanel — API key", () => {
     });
 
     // The error is shown and the typed value is kept so the user can retry.
-    expect(screen.getByText(/Couldn't save key: keyring locked/)).toBeInTheDocument();
+    const keyAlert = screen.getByText(/Couldn't save key: keyring locked/);
+    expect(keyAlert).toBeInTheDocument();
+    // Announced like its success counterpart (the role="status" "API key saved").
+    expect(keyAlert).toHaveAttribute("role", "alert");
     expect(input.value).toBe("sk-ant-secret");
     // apiKeySet was never flipped, so the resting label is still "Save".
     expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
+    expect(useStore.getState().settings.apiKeySet).toBe(false);
+  });
+
+  it("does not show 'Saved' when the apiKeySet persist fails; surfaces keyError, not a stray Model-section settingsError", async () => {
+    // The credential write succeeds but persisting the apiKeySet flag rejects.
+    // saveKey persists directly via ipc.saveSettings (not the swallow-everything
+    // updateSettings), so the reject hits its own catch: no "Saved", keep the value,
+    // and the failure surfaces next to the key — not as a far-away settingsError.
+    m.setApiKey.mockResolvedValueOnce(undefined);
+    m.saveSettings.mockRejectedValueOnce(new Error("disk full"));
+    renderPanel({ apiKeySet: false });
+
+    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The failure is announced next to the key input, and the typed value is kept.
+    const keyAlert = screen.getByText(/Couldn't save key: disk full/);
+    expect(keyAlert).toBeInTheDocument();
+    expect(keyAlert).toHaveAttribute("role", "alert");
+    expect(input.value).toBe("sk-ant-secret");
+
+    // "Saved" is NEVER shown (label stays resting "Save") and the polite "API key
+    // saved" status is never announced — success must not be claimed on a failure.
+    expect(screen.queryByRole("button", { name: "Saved" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("");
+
+    // The failure must NOT misroute to the Model/CONNECTION section as a
+    // settingsError, and the store's apiKeySet stays false (never flipped).
+    expect(screen.queryByText(/Couldn't save settings/)).not.toBeInTheDocument();
+    expect(useStore.getState().settingsError).toBeNull();
     expect(useStore.getState().settings.apiKeySet).toBe(false);
   });
 

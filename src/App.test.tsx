@@ -218,6 +218,37 @@ describe("remote mode shell", () => {
     expect(useStore.getState().showSidebar).toBe(false);
   });
 
+  it("Escape closes only the topmost layer when Settings stacks over the drawer", () => {
+    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+
+    render(<App />);
+    const opener = screen.getByRole("button", { name: "Toggle sessions" });
+    opener.focus();
+    fireEvent.click(opener);
+    // Both overlays are open: the drawer renders <Sidebar/>, whose footer Settings
+    // button opens Settings without closing the drawer (it stacks on top, z-58 > z-50).
+    // SettingsPanel is stubbed here, so its own unconditional Escape handler isn't
+    // present — this case targets the drawer's new bail branch, leaving the topmost
+    // layer (Settings) to dismiss itself (covered in Settings.test).
+    act(() => useStore.setState({ showSettings: true }));
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+    expect(screen.getByTestId("settings-panel")).toBeInTheDocument();
+
+    // First Escape: the drawer's handler bails while Settings is open, so the drawer
+    // stays mounted instead of collapsing both layers at once.
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(useStore.getState().showSidebar).toBe(true);
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+
+    // Once the top layer (Settings) is gone, focus returns to the drawer and a
+    // second Escape closes it, restoring focus to the hamburger.
+    act(() => useStore.setState({ showSettings: false }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(useStore.getState().showSidebar).toBe(false);
+    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(opener);
+  });
+
   it("moves focus into the drawer on open and restores it to the opener on close", () => {
     useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
 
