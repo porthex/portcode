@@ -29,7 +29,7 @@ export function MessageView({
   return (
     <div className={`mb-5 flex gap-[11px] ${isUser ? "justify-end" : ""}`}>
       {!isUser && <Avatar />}
-      <div className={`min-w-0 ${isUser ? "" : "flex-1"}`}>
+      <div className={`min-w-0 ${isUser ? "max-w-[82%]" : "flex-1"}`}>
         {isUser ? (
           <div className="pc-bubble-user whitespace-pre-wrap select-text">{textOf(message)}</div>
         ) : (
