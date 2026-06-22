@@ -200,10 +200,10 @@ fn scrub_event(mut event: Event<'static>) -> Option<Event<'static>> {
 }
 
 /// Scrub a slice of stack frames down to non-PII fields: drop the absolute path,
-/// source context, and locals; redact every remaining identifying string (filename
-/// + symbol/package/module, which can embed home-dir paths or user identifiers).
-/// Keeps `function`/`lineno`/`colno`/`in_app`. Shared by exceptions, threads, and
-/// the top-level stacktrace.
+/// source context, and locals; redact every remaining identifying string
+/// (filename, symbol, package, module — any can embed home-dir paths or user
+/// identifiers). Keeps `function`/`lineno`/`colno`/`in_app`. Shared by exceptions,
+/// threads, and the top-level stacktrace.
 fn scrub_frames(frames: &mut [Frame]) {
     for f in frames {
         f.abs_path = None;
@@ -309,7 +309,7 @@ pub fn capture_message(msg: &str) {
 /// behavior is otherwise identical to a bare `spawn`. Not adopted at any call site
 /// in 1b (the global hook already covers spawned-task panics under abort); provided
 /// for future opt-in at obviously-safe `Output = ()` sites.
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 pub fn spawn_reporting<F>(future: F) -> tauri::async_runtime::JoinHandle<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
