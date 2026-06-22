@@ -78,7 +78,10 @@ pub async fn gate(
 
     // The channel is `agent://{session_id}`; recover the session so a later cancel
     // denies only this session's pending prompts (not every session's).
-    let session_id = channel.strip_prefix("agent://").unwrap_or(channel).to_string();
+    let session_id = channel
+        .strip_prefix("agent://")
+        .unwrap_or(channel)
+        .to_string();
     let id = Uuid::new_v4().to_string();
     let (tx, mut rx) = oneshot::channel();
     pending.lock().unwrap().insert(id.clone(), (session_id, tx));
@@ -123,14 +126,23 @@ mod tests {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (tx_a, mut rx_a) = oneshot::channel::<Decision>();
         let (tx_b, mut rx_b) = oneshot::channel::<Decision>();
-        pending.lock().unwrap().insert("req-a".into(), ("sess-a".into(), tx_a));
-        pending.lock().unwrap().insert("req-b".into(), ("sess-b".into(), tx_b));
+        pending
+            .lock()
+            .unwrap()
+            .insert("req-a".into(), ("sess-a".into(), tx_a));
+        pending
+            .lock()
+            .unwrap()
+            .insert("req-b".into(), ("sess-b".into(), tx_b));
 
         deny_all(&pending, "sess-a");
 
         // sess-a's prompt was denied; sess-b's is left pending and intact.
         assert!(matches!(rx_a.try_recv(), Ok(Decision::Deny)));
-        assert!(matches!(rx_b.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        assert!(matches!(
+            rx_b.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
         assert!(pending.lock().unwrap().contains_key("req-b"));
     }
 }
