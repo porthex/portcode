@@ -74,7 +74,7 @@ impl CommandHandler for DesktopCommandHandler {
                 if let Some(flag) = self.cancels.lock().unwrap().get(&session_id) {
                     flag.store(true, Ordering::Relaxed);
                 }
-                permissions::deny_all(&self.pending);
+                permissions::deny_all(&self.pending, &session_id);
                 Ok(())
             }
             // Mirror `resolve_permission`.
