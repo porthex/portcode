@@ -46,32 +46,39 @@ export function ToolCall({
           <span className="text-faint">{open ? "▾" : "▸"}</span>
         </span>
       </button>
-      {open && (
-        <div className="pc-toolcall__body">
-          <div className="mb-1 text-[10px] uppercase tracking-wide text-faint">Input</div>
-          <pre className="mb-2 overflow-x-auto font-mono text-[11.5px] text-fg select-text">
-            {JSON.stringify(input, null, 2)}
-          </pre>
-          {result && (
-            <>
-              <div className="mb-1 text-[10px] uppercase tracking-wide text-faint">
-                {error ? "Error" : "Result"}
-              </div>
-              {isDiff ? (
-                <DiffView text={result.output} />
-              ) : (
-                <pre
-                  className={`max-h-72 overflow-auto font-mono text-[11.5px] select-text ${
-                    error ? "text-danger" : "text-muted"
-                  }`}
-                >
-                  {result.output}
-                </pre>
-              )}
-            </>
-          )}
+      {/* Smooth expand/collapse via a grid 0fr->1fr accordion (the overflow-hidden
+          child can shrink to 0). Body stays mounted so it animates both ways. */}
+      <div
+        className="grid transition-[grid-template-rows] duration-200 ease-out motion-reduce:transition-none"
+        style={{ gridTemplateRows: open ? "1fr" : "0fr" }}
+      >
+        <div className="overflow-hidden">
+          <div className="pc-toolcall__body" aria-hidden={!open}>
+            <div className="mb-1 text-[10px] uppercase tracking-wide text-faint">Input</div>
+            <pre className="mb-2 overflow-x-auto font-mono text-[11.5px] text-fg select-text">
+              {JSON.stringify(input, null, 2)}
+            </pre>
+            {result && (
+              <>
+                <div className="mb-1 text-[10px] uppercase tracking-wide text-faint">
+                  {error ? "Error" : "Result"}
+                </div>
+                {isDiff ? (
+                  <DiffView text={result.output} />
+                ) : (
+                  <pre
+                    className={`max-h-72 overflow-auto font-mono text-[11.5px] select-text ${
+                      error ? "text-danger" : "text-muted"
+                    }`}
+                  >
+                    {result.output}
+                  </pre>
+                )}
+              </>
+            )}
+          </div>
         </div>
-      )}
+      </div>
     </div>
   );
 }

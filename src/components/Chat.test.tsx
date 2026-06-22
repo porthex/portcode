@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { render, screen, fireEvent } from "@testing-library/react";
 
 import { Chat } from "./Chat";
 import { useStore } from "../store/store";
@@ -156,5 +156,52 @@ describe("Chat children", () => {
     ).toBeInTheDocument();
     // PermissionPrompt returns null when nothing is pending.
     expect(screen.queryByText(/wants to run/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("Chat auto-scroll (only follows when pinned to bottom)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("attaches a passive scroll listener that recomputes pinned-to-bottom without throwing", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "hi")] },
+      streaming: false,
+    });
+    const { container } = render(<Chat />);
+    const scroller = container.querySelector(".overflow-y-auto");
+    expect(scroller).not.toBeNull();
+    // Firing the listener (the user scrolling) just recomputes the flag — no throw.
+    expect(() => fireEvent.scroll(scroller as HTMLElement)).not.toThrow();
+  });
+
+  it("follows the streaming transcript to the bottom via a ResizeObserver while pinned", () => {
+    const captured: { cb?: () => void } = {};
+    const observe = vi.fn();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(cb: () => void) {
+          captured.cb = cb;
+        }
+        observe = observe;
+        disconnect = vi.fn();
+      },
+    );
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "streaming")] },
+      streaming: true,
+    });
+    render(<Chat />);
+    // The streaming effect observes the content for height growth.
+    expect(observe).toHaveBeenCalledTimes(1);
+    // Firing the observer (a content resize, pinned to bottom) must not throw.
+    expect(captured.cb).toBeDefined();
+    captured.cb?.();
   });
 });

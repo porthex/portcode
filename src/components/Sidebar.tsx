@@ -11,6 +11,7 @@ export function Sidebar() {
   const setShowSettings = useStore((s) => s.setShowSettings);
   const settings = useStore((s) => s.settings);
   const oauthStatus = useStore((s) => s.oauthStatus);
+  const streaming = useStore((s) => s.streaming);
 
   const signedInClaude = !!oauthStatus?.signedIn;
   const authed = signedInClaude || settings.apiKeySet;
@@ -35,7 +36,12 @@ export function Sidebar() {
 
       {/* New session */}
       <div className="px-3 pb-2">
-        <button onClick={newSession} className="pc-newsession">
+        <button
+          onClick={newSession}
+          disabled={streaming}
+          title={streaming ? "Finish or stop the current turn first" : undefined}
+          className={`pc-newsession ${streaming ? "cursor-not-allowed opacity-50" : ""}`}
+        >
           <span className="text-[15px] leading-none">+</span>
           NEW SESSION
         </button>
@@ -63,8 +69,11 @@ export function Sidebar() {
               <div className="flex items-center">
                 <button
                   onClick={() => selectSession(s.id)}
-                  className="flex min-w-0 flex-1 flex-col text-left"
-                  title={s.title}
+                  disabled={streaming}
+                  className={`flex min-w-0 flex-1 flex-col text-left ${
+                    streaming ? "cursor-not-allowed" : ""
+                  }`}
+                  title={streaming ? "Finish or stop the current turn first" : s.title}
                 >
                   <span className="flex items-center gap-2">
                     {active && <span className="pc-dot pc-dot--accent" />}
@@ -84,9 +93,12 @@ export function Sidebar() {
                 </button>
                 <button
                   onClick={() => deleteSession(s.id)}
-                  className="ml-1 hidden h-6 w-6 shrink-0 items-center justify-center rounded text-faint hover:text-danger group-hover:flex"
+                  disabled={streaming}
+                  className={`ml-1 hidden h-6 w-6 shrink-0 items-center justify-center rounded text-faint hover:text-danger group-hover:flex ${
+                    streaming ? "cursor-not-allowed opacity-50" : ""
+                  }`}
                   aria-label={`Delete session: ${s.title}`}
-                  title="Delete session"
+                  title={streaming ? "Finish or stop the current turn first" : "Delete session"}
                 >
                   ✕
                 </button>
