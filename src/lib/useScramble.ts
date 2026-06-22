@@ -1,25 +1,54 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
 
-const prefersReducedMotion = (): boolean =>
-  typeof window !== "undefined" &&
-  typeof window.matchMedia === "function" &&
-  window.matchMedia(REDUCED_MOTION_QUERY).matches;
+// One shared matchMedia subscription for the whole app: every
+// usePrefersReducedMotion consumer registers a lightweight callback here instead
+// of attaching its own matchMedia "change" listener, so a long transcript of
+// memoized MessageViews costs a Set of callbacks rather than N media-query
+// listeners. The single module-level "change" listener lives for the app's life.
+let reducedMotionMql: MediaQueryList | null = null;
+const reducedMotionListeners = new Set<() => void>();
+
+function onReducedMotionChange(): void {
+  for (const listener of reducedMotionListeners) listener();
+}
+
+function ensureReducedMotionMql(): MediaQueryList | null {
+  if (reducedMotionMql) return reducedMotionMql;
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return null;
+  reducedMotionMql = window.matchMedia(REDUCED_MOTION_QUERY);
+  reducedMotionMql.addEventListener("change", onReducedMotionChange);
+  return reducedMotionMql;
+}
+
+function subscribeReducedMotion(onStoreChange: () => void): () => void {
+  ensureReducedMotionMql();
+  reducedMotionListeners.add(onStoreChange);
+  return () => {
+    reducedMotionListeners.delete(onStoreChange);
+  };
+}
+
+function getReducedMotionSnapshot(): boolean {
+  const mq = ensureReducedMotionMql();
+  return mq ? mq.matches : false;
+}
 
 /** Tracks the OS "reduce motion" accessibility setting, reactively. */
 export function usePrefersReducedMotion(): boolean {
-  const [reduced, setReduced] = useState(prefersReducedMotion);
+  return useSyncExternalStore(subscribeReducedMotion, getReducedMotionSnapshot, () => false);
+}
 
-  useEffect(() => {
-    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
-    const mq = window.matchMedia(REDUCED_MOTION_QUERY);
-    const onChange = () => setReduced(mq.matches);
-    mq.addEventListener("change", onChange);
-    return () => mq.removeEventListener("change", onChange);
-  }, []);
-
-  return reduced;
+/**
+ * Test-only: tear down the shared reduced-motion subscription so each test starts
+ * from a fresh singleton. The module-level matchMedia listener is otherwise created
+ * once and lives for the app's lifetime, which would leak state across tests.
+ */
+export function __resetReducedMotionForTests(): void {
+  reducedMotionMql?.removeEventListener("change", onReducedMotionChange);
+  reducedMotionMql = null;
+  reducedMotionListeners.clear();
 }
 
 // A per-word "decode" reveal for the in-flight assistant turn. The reply streams
@@ -40,6 +69,11 @@ const DIGITS = "0123456789";
 export const STEP_MS = 22;
 const FRAMES_PER_CHAR = 1.5;
 const MIN_FRAMES = 3;
+// A backgrounded tab pauses requestAnimationFrame, then resumes with the timestamp
+// jumped forward by seconds or minutes. Past this gap we snap straight to the final
+// text instead of grinding through thousands of catch-up frames (which would freeze
+// the UI) — the turn is almost certainly finished by the time the tab returns anyway.
+const MAX_CATCHUP_MS = 1000;
 
 const isSpace = (c: string): boolean => c === " " || c === "\n" || c === "\t" || c === "\r";
 
@@ -167,9 +201,18 @@ export function useScramble(full: string, enabled: boolean): ScrambleView {
     let lastTs = 0;
     const tick = (ts: number) => {
       if (lastTs === 0) lastTs = ts;
+      // Long pause (backgrounded tab): snap to the final text instead of animating
+      // thousands of missed frames in one tick, which would freeze the UI on return.
+      if (ts - lastTs > MAX_CATCHUP_MS) {
+        progressRef.current = { settled: fullRef.current.length, active: null };
+        setV(view(fullRef.current, progressRef.current));
+        lastTs = ts;
+        raf = requestAnimationFrame(tick);
+        return;
+      }
       let changed = false;
       // Advance whole frames for the elapsed time so the cadence stays steady
-      // regardless of the display's refresh rate (and so a paused tab catches up).
+      // regardless of the display's refresh rate.
       while (ts - lastTs >= STEP_MS) {
         lastTs += STEP_MS;
         if (stepFrame(fullRef.current, progressRef.current)) changed = true;

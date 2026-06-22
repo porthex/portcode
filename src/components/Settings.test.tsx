@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, act, cleanup } from "@testing-library/react";
+import { render, screen, fireEvent, act, cleanup, within } from "@testing-library/react";
 
 import { SettingsPanel } from "./Settings";
 import { useStore } from "../store/store";
@@ -80,18 +80,27 @@ describe("SettingsPanel — structure", () => {
   it("renders the modal chrome, provider, model select and footer", () => {
     renderPanel();
 
+    // The panel is an accessible modal: role="dialog"/aria-modal labelled by the
+    // SETTINGS title span (id="pc-settings-title").
+    expect(screen.getByRole("dialog", { name: /settings/i })).toBeInTheDocument();
+
     // The Neon-Noir header renders the title as a styled (font-display) span,
     // not a semantic heading; assert on its literal uppercase text instead.
     expect(screen.getByText("SETTINGS")).toBeInTheDocument();
     expect(screen.getByText("Anthropic (Claude)")).toBeInTheDocument();
 
-    // Model select reflects the store's current model.
-    const select = screen.getByRole("combobox") as HTMLSelectElement;
+    // Model select reflects the store's current model. Query by its accessible
+    // name (the visible "Model" label is associated via htmlFor/id), which both
+    // locks in the accessible-name wiring and finds the same <select>.
+    const select = screen.getByLabelText("Model") as HTMLSelectElement;
     expect(select.value).toBe(DEFAULT_SETTINGS.model);
     // Every model from the catalogue is offered as an option.
     for (const model of MODELS) {
       expect(screen.getByRole("option", { name: model.label })).toBeInTheDocument();
     }
+
+    // The API-key field also has an accessible name from its associated label.
+    expect(screen.getByLabelText("API key")).toBeInTheDocument();
   });
 });
 
@@ -142,10 +151,14 @@ describe("SettingsPanel — Claude subscription sign-in", () => {
     expect(screen.getByText("Pro").className).toContain("violet");
   });
 
-  it("surfaces a sign-in error from the store", () => {
+  it("surfaces a sign-in error from the store as an assertive live region", () => {
     useStore.setState({ oauthError: "oauth denied" });
     renderPanel();
-    expect(screen.getByText(/Sign-in failed: oauth denied/)).toBeInTheDocument();
+    const alert = screen.getByText(/Sign-in failed: oauth denied/);
+    expect(alert).toBeInTheDocument();
+    // The error appears asynchronously after the sign-in click while focus stays
+    // on the trigger, so it must be announced (role="alert") like pairingError.
+    expect(alert).toHaveAttribute("role", "alert");
   });
 });
 
@@ -189,11 +202,112 @@ describe("SettingsPanel — close affordances", () => {
   });
 });
 
+describe("SettingsPanel — focus management", () => {
+  // jsdom does no layout, so `offsetParent` is always null — which would make the
+  // component's visibility filter (offsetParent !== null) treat every control as
+  // hidden. Stub it to mirror a real browser: null only for elements inside a
+  // `.hidden` ancestor (the remoteMode sections), the body otherwise.
+  function installOffsetParentStub() {
+    const orig = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetParent");
+    Object.defineProperty(HTMLElement.prototype, "offsetParent", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this.closest(".hidden") ? null : document.body;
+      },
+    });
+    return () => {
+      if (orig) Object.defineProperty(HTMLElement.prototype, "offsetParent", orig);
+    };
+  }
+
+  /** Live-query the visible focusable controls inside the dialog (matches the component). */
+  function visibleFocusable(dialog: HTMLElement) {
+    return Array.from(
+      dialog.querySelectorAll<HTMLElement>(
+        'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter((el) => el.offsetParent !== null);
+  }
+
+  it("exposes dialog semantics and moves focus into the modal on open", () => {
+    renderPanel();
+
+    const dialog = screen.getByRole("dialog", { name: /settings/i });
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    // The first focusable descendant (the close ✕) receives focus on mount, so a
+    // keyboard user isn't left on a background control behind the scrim.
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Close settings" }));
+  });
+
+  it("traps Tab: from the last focusable wraps to the first", () => {
+    const restore = installOffsetParentStub();
+    try {
+      renderPanel();
+
+      const dialog = screen.getByRole("dialog", { name: /settings/i });
+      const focusable = visibleFocusable(dialog);
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+
+      last.focus();
+      fireEvent.keyDown(dialog, { key: "Tab" });
+      expect(document.activeElement).toBe(first);
+    } finally {
+      restore();
+    }
+  });
+
+  it("traps Shift+Tab: from the first focusable wraps to the last", () => {
+    const restore = installOffsetParentStub();
+    try {
+      renderPanel();
+
+      const dialog = screen.getByRole("dialog", { name: /settings/i });
+      const focusable = visibleFocusable(dialog);
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+
+      first.focus();
+      fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
+      expect(document.activeElement).toBe(last);
+    } finally {
+      restore();
+    }
+  });
+
+  it("ignores non-Tab keys in the trap handler", () => {
+    renderPanel();
+    const dialog = screen.getByRole("dialog", { name: /settings/i });
+    const before = document.activeElement;
+    // A bare key press must not move focus (only Tab is trapped).
+    fireEvent.keyDown(dialog, { key: "a" });
+    expect(document.activeElement).toBe(before);
+  });
+
+  it("restores focus to the opener when the modal unmounts", () => {
+    // Stub an opener that has focus before the modal mounts; closing the modal
+    // must return focus to it.
+    const trigger = document.createElement("button");
+    trigger.textContent = "open settings";
+    document.body.appendChild(trigger);
+    trigger.focus();
+    expect(document.activeElement).toBe(trigger);
+
+    const { unmount } = renderPanel();
+    // Focus moved into the dialog on open.
+    expect(document.activeElement).not.toBe(trigger);
+
+    unmount();
+    expect(document.activeElement).toBe(trigger);
+    trigger.remove();
+  });
+});
+
 describe("SettingsPanel — model picker", () => {
   it("persists a model change through ipc.saveSettings and updates the store", async () => {
     renderPanel();
 
-    const select = screen.getByRole("combobox");
+    const select = screen.getByLabelText("Model");
     fireEvent.change(select, { target: { value: "claude-haiku-4-5-20251001" } });
 
     // updateSettings -> ipc.saveSettings; flush the microtask the action awaits.
@@ -201,6 +315,30 @@ describe("SettingsPanel — model picker", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(useStore.getState().settings.model).toBe("claude-haiku-4-5-20251001");
+  });
+
+  it("surfaces store.settingsError when a model save fails and preserves the prior value", async () => {
+    m.saveSettings.mockRejectedValueOnce(new Error("disk full"));
+    renderPanel({ model: MODELS[0].id });
+
+    const select = screen.getByLabelText("Model") as HTMLSelectElement;
+    await act(async () => {
+      fireEvent.change(select, { target: { value: "claude-haiku-4-5-20251001" } });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The store's updateSettings catches the reject into settingsError; the panel
+    // surfaces it adjacent to the Model select (in the CONNECTION section, not the
+    // far-away PERMISSIONS banner) and the persisted model is unchanged.
+    const conn = screen.getByText("CONNECTION").closest("section")!;
+    const settingsAlert = within(conn).getByText(/Couldn't save settings: disk full/);
+    expect(settingsAlert).toBeInTheDocument();
+    // Announced to screen readers (matches the pairingError pattern): the error
+    // appears asynchronously after the change while focus stays on the select.
+    expect(settingsAlert).toHaveAttribute("role", "alert");
+    expect(useStore.getState().settings.model).toBe(MODELS[0].id);
+    expect(useStore.getState().settingsError).toBe("disk full");
   });
 });
 
@@ -211,6 +349,17 @@ describe("SettingsPanel — API key", () => {
     expect(screen.getByText(/Stored securely in Windows Credential Manager/)).toBeInTheDocument();
     const input = screen.getByPlaceholderText("sk-ant-…");
     expect(input).toBeInTheDocument();
+  });
+
+  it("gives the API-key input a keyboard-focus border affordance that survives the global box-shadow reset", () => {
+    renderPanel({ apiKeySet: false });
+
+    // The dialog is a focus trap whose only Tab-reachable text control is this
+    // input; the global `input:focus { box-shadow: none }` rule zeroes any ring,
+    // so the focus indicator must be a border change (focus:border-accent/50),
+    // mirroring the RemotePairing textarea. WCAG 2.4.7 (Focus Visible).
+    const input = screen.getByLabelText("API key");
+    expect(input.className).toContain("focus:border-accent/50");
   });
 
   it("shows the 'key stored' hint and replace placeholder when a key exists", () => {
@@ -274,6 +423,138 @@ describe("SettingsPanel — API key", () => {
       vi.advanceTimersByTime(1800);
     });
     expect(screen.getByRole("button", { name: "Replace" })).toBeInTheDocument();
+  });
+
+  it("keeps focus inside the dialog after a successful save (no flash remount)", async () => {
+    renderPanel({ apiKeySet: false });
+
+    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
+
+    // A keyboard user activates Save from the button itself; capture the node so we
+    // can prove the flash replay reuses it rather than remounting via a React key
+    // (which would drop focus to <body>, outside the focus trap).
+    const save = screen.getByRole("button", { name: "Save" }) as HTMLButtonElement;
+    save.focus();
+    expect(document.activeElement).toBe(save);
+
+    await act(async () => {
+      fireEvent.click(save);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Same DOM node survived the save (re-querying by its new "Saved" label returns
+    // the very element we held), so focus never left the focus-trapped dialog.
+    expect(screen.getByRole("button", { name: "Saved" })).toBe(save);
+    const dialog = screen.getByRole("dialog", { name: /settings/i });
+    expect(document.activeElement).not.toBe(document.body);
+    expect(dialog.contains(document.activeElement)).toBe(true);
+  });
+
+  it("clears a stale 'Couldn't save key' error as the user edits the field", async () => {
+    m.setApiKey.mockRejectedValueOnce(new Error("keyring locked"));
+    renderPanel({ apiKeySet: false });
+
+    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByText(/Couldn't save key: keyring locked/)).toBeInTheDocument();
+
+    // Editing the key toward a correction clears the stale error immediately,
+    // rather than lingering until the next Save click.
+    fireEvent.change(input, { target: { value: "sk-ant-secret2" } });
+    expect(screen.queryByText(/Couldn't save key/)).not.toBeInTheDocument();
+  });
+
+  it("surfaces a setApiKey failure and retains the typed value", async () => {
+    m.setApiKey.mockRejectedValueOnce(new Error("keyring locked"));
+    renderPanel({ apiKeySet: false });
+
+    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The error is shown and the typed value is kept so the user can retry.
+    const keyAlert = screen.getByText(/Couldn't save key: keyring locked/);
+    expect(keyAlert).toBeInTheDocument();
+    // Announced like its success counterpart (the role="status" "API key saved").
+    expect(keyAlert).toHaveAttribute("role", "alert");
+    expect(input.value).toBe("sk-ant-secret");
+    // apiKeySet was never flipped, so the resting label is still "Save".
+    expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
+    expect(useStore.getState().settings.apiKeySet).toBe(false);
+  });
+
+  it("does not show 'Saved' when the apiKeySet persist fails; surfaces keyError, not a stray Model-section settingsError", async () => {
+    // The credential write succeeds but persisting the apiKeySet flag rejects.
+    // saveKey persists directly via ipc.saveSettings (not the swallow-everything
+    // updateSettings), so the reject hits its own catch: no "Saved", keep the value,
+    // and the failure surfaces next to the key — not as a far-away settingsError.
+    m.setApiKey.mockResolvedValueOnce(undefined);
+    m.saveSettings.mockRejectedValueOnce(new Error("disk full"));
+    renderPanel({ apiKeySet: false });
+
+    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The failure is announced next to the key input, and the typed value is kept.
+    const keyAlert = screen.getByText(/Couldn't save key: disk full/);
+    expect(keyAlert).toBeInTheDocument();
+    expect(keyAlert).toHaveAttribute("role", "alert");
+    expect(input.value).toBe("sk-ant-secret");
+
+    // "Saved" is NEVER shown (label stays resting "Save") and the polite "API key
+    // saved" status is never announced — success must not be claimed on a failure.
+    expect(screen.queryByRole("button", { name: "Saved" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("");
+
+    // The failure must NOT misroute to the Model/CONNECTION section as a
+    // settingsError, and the store's apiKeySet stays false (never flipped).
+    expect(screen.queryByText(/Couldn't save settings/)).not.toBeInTheDocument();
+    expect(useStore.getState().settingsError).toBeNull();
+    expect(useStore.getState().settings.apiKeySet).toBe(false);
+  });
+
+  it("announces the saved key via a polite live region after a successful save", async () => {
+    vi.useFakeTimers();
+    renderPanel({ apiKeySet: false });
+
+    // Before saving, the status region is empty (rendered unconditionally).
+    const region = screen.getByRole("status");
+    expect(region).toHaveTextContent("");
+
+    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("status")).toHaveTextContent("API key saved");
   });
 
   it("clears the Saved-flash timer on unmount so it can't update state after close", async () => {
@@ -462,6 +743,14 @@ describe("SettingsPanel — Phone Sync section", () => {
     expect(screen.getByRole("button", { name: "Pair a phone" })).toBeInTheDocument();
   });
 
+  it("surfaces store.pairingError when begin-pairing or unpair fails", () => {
+    useStore.setState({ pairingPayload: null, pairingError: "keyring locked" });
+    renderPanel();
+    const alert = screen.getByText(/Pairing failed: keyring locked/);
+    expect(alert).toBeInTheDocument();
+    expect(alert).toHaveAttribute("role", "alert");
+  });
+
   it("calls beginPairing and shows the pairing code when Pair a phone is clicked", async () => {
     useStore.setState({ pairingPayload: null });
     m.phoneSyncBeginPairing.mockResolvedValue({ version: 1, publicKey: "PUB==", nonce: "NON==" });
@@ -511,6 +800,10 @@ describe("SettingsPanel — Phone Sync section", () => {
 
     expect(writeText).toHaveBeenCalledWith('{"version":1,"publicKey":"PUB==","nonce":"NON=="}');
     expect(screen.getByRole("button", { name: /Copied/ })).toBeInTheDocument();
+    // A polite status region announces the copy for screen-reader users.
+    expect(
+      screen.getByText("Pairing code copied", { selector: '[role="status"]' }),
+    ).toBeInTheDocument();
   });
 
   it("Done button clears the pairing payload", () => {

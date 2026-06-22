@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { useStore } from "../store/store";
 import * as ipc from "../lib/ipc";
 import type { DirEntry } from "../types";
@@ -6,10 +6,19 @@ import type { DirEntry } from "../types";
 export function FileExplorer() {
   const workspace = useStore((s) => s.settings.workspace);
   const openWorkspace = useStore((s) => s.openWorkspace);
+  const workspaceError = useStore((s) => s.workspaceError);
   const [roots, setRoots] = useState<DirEntry[]>([]);
+  // Roving-tabindex active row: the path of the single treeitem that holds
+  // tabIndex 0. Null until the user focuses a row, so the first root keeps the
+  // default tab stop. One tab stop into the tree; arrow keys move within it.
+  const [activePath, setActivePath] = useState<string | null>(null);
+  const treeRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let alive = true;
+    // The prior workspace's active row no longer exists; drop it so the new
+    // tree's first root reclaims the default tab stop.
+    setActivePath(null);
     ipc
       .listDir(undefined)
       .then((r) => {
@@ -25,8 +34,70 @@ export function FileExplorer() {
     };
   }, [workspace]);
 
+  // Keyboard model for the ARIA tree pattern, driven off the live DOM: the rows
+  // are queried in document order each keypress, so navigation always reflects
+  // the current expanded shape without a parallel registry to keep in sync.
+  const onKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
+    const tree = treeRef.current;
+    if (!tree) return;
+    // Collapsed folders keep their children mounted (so the accordion can animate
+    // shut) but mark them aria-hidden; exclude those rows so arrow nav never lands
+    // focus on an invisible row inside an aria-hidden subtree.
+    const rows = [...tree.querySelectorAll<HTMLButtonElement>('[role="treeitem"]')].filter(
+      (r) => !r.closest('[aria-hidden="true"]'),
+    );
+    if (rows.length === 0) return;
+    const current = rows.indexOf(document.activeElement as HTMLButtonElement);
+    // Focus on the container itself (tabbed in, not yet on a row) starts at the
+    // first row for the next move.
+    const idx = current === -1 ? 0 : current;
+    const focusRow = (row: HTMLButtonElement | undefined) => {
+      if (!row) return;
+      setActivePath(row.dataset.path ?? null);
+      row.focus();
+    };
+    const row = rows[idx];
+    const isDir = row?.getAttribute("aria-expanded") !== null;
+    const isOpen = row?.getAttribute("aria-expanded") === "true";
+    switch (e.key) {
+      case "ArrowDown":
+        e.preventDefault();
+        focusRow(rows[Math.min(idx + 1, rows.length - 1)]);
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        focusRow(rows[Math.max(idx - 1, 0)]);
+        break;
+      case "ArrowRight":
+        e.preventDefault();
+        // Closed dir → expand; already-open dir → step into its first child.
+        if (isDir && !isOpen) row.click();
+        else if (isDir && isOpen) focusRow(rows[Math.min(idx + 1, rows.length - 1)]);
+        break;
+      case "ArrowLeft":
+        e.preventDefault();
+        if (isDir && isOpen) row.click();
+        break;
+      case "Home":
+        e.preventDefault();
+        focusRow(rows[0]);
+        break;
+      case "End":
+        e.preventDefault();
+        focusRow(rows[rows.length - 1]);
+        break;
+    }
+  }, []);
+
+  // Exactly one treeitem must carry tabIndex 0. Honour an explicit focus choice;
+  // otherwise default to the first root so the tree stays keyboard-reachable.
+  const activeRow = activePath ?? roots[0]?.path ?? null;
+
   return (
-    <aside className="flex h-full w-[236px] shrink-0 flex-col border-r border-border bg-panel/80">
+    <aside
+      aria-label="File explorer"
+      className="flex h-full w-[236px] shrink-0 flex-col border-r border-border bg-panel/80"
+    >
       <div className="flex items-center gap-2 border-b border-border px-3.5 py-[11px]">
         <span
           className="pc-eyebrow-mono text-[9.5px] tracking-[2px] text-accent-2"
@@ -43,7 +114,22 @@ export function FileExplorer() {
           OPEN…
         </button>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto py-1.5 font-mono text-[12px]">
+      {workspaceError && (
+        <p
+          role="alert"
+          className="flex items-start gap-1.5 border-b border-border px-3.5 py-2 text-[11px] text-danger"
+        >
+          <span aria-hidden="true">⚠</span>
+          <span>Couldn’t open folder: {workspaceError}</span>
+        </p>
+      )}
+      <div
+        ref={treeRef}
+        role="tree"
+        aria-label="File tree"
+        onKeyDown={onKeyDown}
+        className="min-h-0 flex-1 overflow-y-auto py-1.5 font-mono text-[12px]"
+      >
         {roots.length === 0 ? (
           <div className="px-3 py-6 text-center text-[11px] text-muted">
             No workspace set
@@ -58,14 +144,39 @@ export function FileExplorer() {
             </button>
           </div>
         ) : (
-          roots.map((e) => <TreeNode key={e.path} entry={e} depth={0} />)
+          // Key the rendered roots by workspace so a workspace switch remounts
+          // every TreeNode, clearing stale open/children state from a prior
+          // workspace whose paths could collide with the new one. A Fragment
+          // (not a wrapper <div>) keeps role="tree" the direct parent of the
+          // root treeitems, as the ARIA tree pattern requires.
+          <Fragment key={workspace ?? "__none__"}>
+            {roots.map((e) => (
+              <TreeNode
+                key={e.path}
+                entry={e}
+                depth={0}
+                activeRow={activeRow}
+                onActivate={setActivePath}
+              />
+            ))}
+          </Fragment>
         )}
       </div>
     </aside>
   );
 }
 
-function TreeNode({ entry, depth }: { entry: DirEntry; depth: number }) {
+function TreeNode({
+  entry,
+  depth,
+  activeRow,
+  onActivate,
+}: {
+  entry: DirEntry;
+  depth: number;
+  activeRow: string | null;
+  onActivate: (path: string) => void;
+}) {
   const [open, setOpen] = useState(false);
   const [children, setChildren] = useState<DirEntry[] | null>(null);
   // Synchronous in-flight guard: a ref (not state) so a second toggle in the
@@ -104,23 +215,68 @@ function TreeNode({ entry, depth }: { entry: DirEntry; depth: number }) {
     <div>
       <button
         onClick={() => void toggle()}
+        onFocus={() => onActivate(entry.path)}
+        role="treeitem"
+        data-path={entry.path}
+        aria-expanded={entry.isDir ? open : undefined}
+        aria-level={depth + 1}
+        aria-label={entry.isDir ? `${entry.name} folder` : entry.name}
+        // Roving tabindex: only the active row is a tab stop; arrow keys move
+        // the active row within that single stop.
+        tabIndex={activeRow === entry.path ? 0 : -1}
         className={`pc-row--file flex w-full items-center gap-1.5 py-1 pr-2 text-left ${rowColor}`}
         style={{ paddingLeft: 10 + depth * 14 }}
         title={entry.isDir ? entry.name : `Insert ${entry.path} into composer`}
       >
         {entry.isDir ? (
-          <span className="w-3 shrink-0 text-[10px] text-faint">{open ? "▾" : "▸"}</span>
+          <span aria-hidden="true" className="w-3 shrink-0 text-[10px] text-faint">
+            {open ? "▾" : "▸"}
+          </span>
         ) : (
-          <span className="w-3 shrink-0" />
+          <span aria-hidden="true" className="w-3 shrink-0" />
         )}
         {entry.isDir ? (
-          <span className="shrink-0 text-warn">▸</span>
+          <span aria-hidden="true" className="inline-flex w-4 shrink-0 justify-center text-warn">
+            {open ? "▢" : "▣"}
+          </span>
         ) : (
-          <span className={`shrink-0 ${glyph!.colorClass}`}>{glyph!.glyph}</span>
+          <span
+            aria-hidden="true"
+            className={`inline-flex w-4 shrink-0 justify-center ${glyph!.colorClass}`}
+          >
+            {glyph!.glyph}
+          </span>
         )}
         <span className="truncate">{entry.name}</span>
       </button>
-      {open && children?.map((c) => <TreeNode key={c.path} entry={c} depth={depth + 1} />)}
+      {/* Smooth expand/collapse via the same grid 0fr->1fr accordion the app uses
+          for ToolCall bodies and the file rail (the overflow-hidden child shrinks
+          to 0). children stays null until first expand, so the group mounts only
+          once data exists, then animates on every subsequent toggle. */}
+      <div
+        className="grid transition-[grid-template-rows] duration-200 ease-out motion-reduce:transition-none"
+        style={{ gridTemplateRows: open ? "1fr" : "0fr" }}
+      >
+        <div className="overflow-hidden">
+          {children && (
+            // The expandable treeitem owns its contents via a child role="group",
+            // so AT reports the parent/child level the aria-expanded above implies.
+            // Once opened the group persists while collapsed (to animate), so
+            // aria-hidden drops it from AT when the directory is closed.
+            <div role="group" aria-hidden={!open || undefined}>
+              {children.map((c) => (
+                <TreeNode
+                  key={c.path}
+                  entry={c}
+                  depth={depth + 1}
+                  activeRow={activeRow}
+                  onActivate={onActivate}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

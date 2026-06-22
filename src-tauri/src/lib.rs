@@ -334,7 +334,7 @@ fn cancel_agent(state: State<AppState>, session_id: String) {
     if let Some(flag) = state.cancels.lock().unwrap().get(&session_id) {
         flag.store(true, Ordering::Relaxed);
     }
-    permissions::deny_all(&state.pending);
+    permissions::deny_all(&state.pending, &session_id);
 }
 
 #[cfg(desktop)]

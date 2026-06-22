@@ -61,6 +61,12 @@ describe("RemotePairing — connect panel", () => {
     expect(screen.queryByRole("button", { name: /Scan QR/ })).not.toBeInTheDocument();
   });
 
+  it("autofocuses the pairing textarea on mount (paste path, no camera)", () => {
+    render(<RemotePairing />);
+    // Off-phone there is no Scan button, so the primary control is the textarea.
+    expect(qrBox()).toHaveFocus();
+  });
+
   it("disables Connect until the pairing code has content", () => {
     render(<RemotePairing />);
     expect(connectBtn()).toBeDisabled();
@@ -148,6 +154,12 @@ describe("RemotePairing — camera scan (phone)", () => {
   it("offers an enabled Scan QR button on the phone", () => {
     render(<RemotePairing />);
     expect(scanBtn()).toBeEnabled();
+  });
+
+  it("autofocuses the Scan button on mount (phone path)", () => {
+    render(<RemotePairing />);
+    // On the phone the camera scan is the primary action, so it takes focus.
+    expect(scanBtn()).toHaveFocus();
   });
 
   it("dials the scanned payload on a successful scan", async () => {
@@ -241,6 +253,29 @@ describe("RemotePairing — camera scan (phone)", () => {
       screen.queryByRole("dialog", { name: /Scanning for a pairing QR/ }),
     ).not.toBeInTheDocument();
   });
+
+  it("moves focus to Cancel and cancels on Escape (modal keyboard affordances)", async () => {
+    // Hold the scan open so the overlay stays mounted. While scanning, the app
+    // shell goes visibility:hidden, so the dialog must take focus itself and offer
+    // a keyboard path to Cancel — assert focus lands on Cancel and Escape cancels.
+    s.scanQrPayload.mockReturnValue(new Promise<scanner.ScanOutcome>(() => {}));
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(scanBtn());
+      await Promise.resolve();
+    });
+
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    expect(cancel).toHaveFocus();
+
+    // Escape (handled at the window level) cancels the scan, mirroring the click path.
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Escape" });
+      await Promise.resolve();
+    });
+    expect(s.cancelScan).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("RemotePairing — verify panel", () => {
@@ -250,15 +285,34 @@ describe("RemotePairing — verify panel", () => {
 
     expect(screen.getByText("VERIFY THIS CODE")).toBeInTheDocument();
     expect(screen.getByText("TANGO-42")).toBeInTheDocument();
-    expect(screen.getByLabelText("Pairing verification code")).toHaveTextContent("TANGO-42");
+    // The SAS box's accessible NAME must INCLUDE the digits — an aria-label that
+    // merely says "Pairing verification code" would suppress the code subtree, so
+    // a screen reader would never hear the actual SAS (defeating the out-of-band
+    // comparison). Assert the computed name carries the code, not just textContent.
+    const sasBox = screen.getByLabelText(/Pairing verification code/);
+    expect(sasBox).toHaveAccessibleName(/TANGO-42/);
+    expect(sasBox).toHaveTextContent("TANGO-42");
     // The connect panel is gone.
     expect(screen.queryByText("CONNECT TO DESKTOP")).not.toBeInTheDocument();
+  });
+
+  it("lands initial focus on the SAS code, not the affirmative confirm", () => {
+    useStore.setState({ remoteConnected: true, remoteSas: "TANGO-42" });
+    render(<RemotePairing />);
+    // Focus must NOT sit on the trust-granting button (a queued Enter would
+    // bypass the SAS comparison); it lands on the code region instead.
+    expect(screen.getByLabelText(/Pairing verification code/)).toHaveFocus();
+    expect(screen.getByRole("button", { name: /Codes match/ })).not.toHaveFocus();
   });
 
   it("renders a placeholder when the SAS is somehow absent", () => {
     useStore.setState({ remoteConnected: true, remoteSas: null });
     render(<RemotePairing />);
-    expect(screen.getByLabelText("Pairing verification code")).toHaveTextContent("—");
+    // With no SAS, the box paints a dash and its accessible name says so plainly
+    // (never silently "Pairing verification code" with an empty/suppressed code).
+    const sasBox = screen.getByLabelText(/Pairing verification code/);
+    expect(sasBox).toHaveTextContent("—");
+    expect(sasBox).toHaveAccessibleName(/not available/);
   });
 
   it("Continue confirms the SAS (marks the connection verified)", () => {
@@ -305,6 +359,16 @@ describe("RemotePairing — reconnect after a drop", () => {
     const st = useStore.getState();
     expect(st.remoteConnected).toBe(true);
     expect(st.remoteVerified).toBe(true);
+  });
+
+  // The drop announcement now lives in a persistent live region at the App shell
+  // (it must survive the connected↔pairing remount to fire as an empty→filled
+  // change), so it is covered in App's tests — not here. RemotePairing no longer
+  // renders its own role="status" region.
+  it("renders no in-panel live region for the drop (announced at the App shell)", () => {
+    useStore.setState({ remoteDropped: true, lastPairingQr: "QR-REMEMBERED" });
+    render(<RemotePairing />);
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
 
   it("shows no reconnect affordance without a remembered pairing", () => {

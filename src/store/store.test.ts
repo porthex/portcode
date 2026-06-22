@@ -136,6 +136,55 @@ describe("init", () => {
 
     expect(useStore.getState().sessions[0].model).toBe("claude-sonnet-4-6");
   });
+
+  it("records initError when a load-bearing startup call rejects", async () => {
+    // A failed core / locked DB rejects a guarded call; init must surface an error
+    // instead of leaving a permanently blank welcome shell with no feedback.
+    m.listSessions.mockRejectedValue(new Error("core not ready"));
+
+    await useStore.getState().init();
+
+    const st = useStore.getState();
+    expect(st.initError).toBe("core not ready");
+    expect(st.sessions).toEqual([]);
+    expect(st.activeId).toBeNull();
+  });
+
+  it("retryInit clears initError and re-runs init successfully", async () => {
+    m.listSessions.mockRejectedValueOnce(new Error("core not ready"));
+    await useStore.getState().init();
+    expect(useStore.getState().initError).toBe("core not ready");
+
+    // The core recovers; the retry succeeds and clears the error.
+    await useStore.getState().retryInit();
+
+    const st = useStore.getState();
+    expect(st.initError).toBeNull();
+    expect(st.sessions).toHaveLength(1);
+    expect(m.createSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears a prior initError on a later successful init", async () => {
+    useStore.setState({ initError: "stale failure" });
+
+    await useStore.getState().init();
+
+    expect(useStore.getState().initError).toBeNull();
+  });
+
+  it("is a no-op for the remote client (no desktop IPCs, no stale initError)", async () => {
+    // On the phone the desktop-only session/settings commands would reject and
+    // strand a spurious crash panel over the connected remote session, so init()
+    // bails early — remote state arrives from the desktop's frames instead.
+    useStore.setState({ remoteMode: true, initError: "stale" });
+
+    await useStore.getState().init();
+
+    const st = useStore.getState();
+    expect(st.initError).toBeNull();
+    expect(m.listSessions).not.toHaveBeenCalled();
+    expect(m.getSettings).not.toHaveBeenCalled();
+  });
 });
 
 describe("newSession", () => {
@@ -188,6 +237,62 @@ describe("newSession", () => {
     expect(m.createSession).not.toHaveBeenCalled();
     expect(useStore.getState().activeId).toBe("a");
     expect(useStore.getState().sessions).toHaveLength(1);
+  });
+
+  it("re-entry guard: a rapid double-call creates exactly one session", async () => {
+    // createSession is async; the synchronous creatingSession lock must make the
+    // second same-tick call bail so two fast clicks (or Ctrl+N + click) can't create
+    // two orphan empty sessions.
+    let release!: () => void;
+    m.createSession.mockReturnValueOnce(
+      new Promise<void>((res) => {
+        release = res;
+      }),
+    );
+    useStore.setState({ sessions: [session({ id: "old" })] });
+
+    const first = useStore.getState().newSession();
+    // Second call lands while the first create is still in flight.
+    const second = useStore.getState().newSession();
+
+    release();
+    await Promise.all([first, second]);
+
+    expect(m.createSession).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().sessions).toHaveLength(2); // old + one new, not two new
+    expect(useStore.getState().creatingSession).toBe(false); // lock released
+  });
+
+  it("routes through the remote command (not the desktop-only local create) when connected", async () => {
+    // On the phone the agent-side create_session is desktop-only; calling the local
+    // Tauri invoke would reject. newSession must forward a `create_session` command
+    // and let the desktop's session_list frame reconcile — not optimistically insert
+    // a phantom local session.
+    useStore.setState({ remoteConnected: true, sessions: [session({ id: "old" })] });
+
+    await useStore.getState().newSession();
+
+    expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({ cmd: "create_session" });
+    expect(m.createSession).not.toHaveBeenCalled();
+    const st = useStore.getState();
+    expect(st.sessions).toHaveLength(1); // no optimistic local session inserted
+    expect(st.creatingSession).toBe(false); // lock released
+    expect(st.showSidebar).toBe(false); // drawer closed on navigation
+  });
+
+  it("surfaces a local create rejection instead of an unhandled rejection", async () => {
+    // The local path now wraps createSession in try/catch so a reject (locked DB /
+    // core not ready) lands in the visible error surface rather than escaping as an
+    // unhandled promise rejection (callers use bare onClick / void).
+    m.createSession.mockRejectedValueOnce(new Error("db locked"));
+    useStore.setState({ sessions: [session({ id: "old" })] });
+
+    await expect(useStore.getState().newSession()).resolves.toBeUndefined();
+
+    const st = useStore.getState();
+    expect(st.initError).toBe("db locked");
+    expect(st.sessions).toHaveLength(1); // no phantom session on failure
+    expect(st.creatingSession).toBe(false); // lock released
   });
 });
 
@@ -245,6 +350,39 @@ describe("selectSession", () => {
     useStore.setState({ showSidebar: true });
     await useStore.getState().selectSession("c");
     expect(useStore.getState().showSidebar).toBe(false);
+  });
+
+  it("flags loadErrors[id] when getMessages rejects (no silent welcome screen)", async () => {
+    m.getMessages.mockRejectedValue(new Error("disk error"));
+
+    await useStore.getState().selectSession("b");
+
+    const st = useStore.getState();
+    expect(st.activeId).toBe("b");
+    expect(st.loadErrors.b).toBe(true);
+    expect(st.messages.b).toBeUndefined();
+  });
+
+  it("retryLoad re-fetches and clears loadErrors[id]", async () => {
+    const msg: Message = { id: "m", role: "assistant", blocks: [], createdAt: 1 };
+    m.getMessages.mockRejectedValueOnce(new Error("disk error"));
+    await useStore.getState().selectSession("b");
+    expect(useStore.getState().loadErrors.b).toBe(true);
+
+    m.getMessages.mockResolvedValue([msg]);
+    await useStore.getState().retryLoad("b");
+
+    const st = useStore.getState();
+    expect(st.loadErrors.b).toBe(false);
+    expect(st.messages.b).toEqual([msg]);
+  });
+
+  it("retryLoad keeps loadErrors[id] set when the refetch also rejects", async () => {
+    m.getMessages.mockRejectedValue(new Error("still down"));
+
+    await useStore.getState().retryLoad("b");
+
+    expect(useStore.getState().loadErrors.b).toBe(true);
   });
 });
 
@@ -305,6 +443,42 @@ describe("deleteSession", () => {
 
     expect(m.deleteSession).not.toHaveBeenCalled();
     expect(useStore.getState().sessions).toHaveLength(1);
+  });
+
+  it("flags loadErrors when the surviving session's reload rejects", async () => {
+    m.getMessages.mockRejectedValue(new Error("reload failed"));
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      messages: {},
+    });
+
+    await useStore.getState().deleteSession("b");
+
+    const st = useStore.getState();
+    expect(st.activeId).toBe("a");
+    expect(st.loadErrors.a).toBe(true);
+    expect(st.messages.a).toBeUndefined();
+  });
+
+  it("surfaces a deleteSession IPC rejection and leaves the list untouched", async () => {
+    // A failed delete (locked DB / core not ready) must surface via initError instead
+    // of escaping as an unhandled rejection (caller is a bare onClick). The guard runs
+    // BEFORE the optimistic mutation, so the row correctly stays — it wasn't deleted.
+    m.deleteSession.mockRejectedValue(new Error("locked"));
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      messages: { a: [], b: [] },
+    });
+
+    await expect(useStore.getState().deleteSession("a")).resolves.toBeUndefined();
+
+    const st = useStore.getState();
+    expect(st.initError).toBe("locked");
+    expect(st.sessions).toHaveLength(2); // the row stays — it wasn't deleted
+    expect(st.activeId).toBe("a"); // unchanged
+    expect(st.messages.a).toEqual([]); // not removed
   });
 });
 
@@ -376,6 +550,47 @@ describe("send", () => {
     expect(st.pendingPermission).toBeNull();
   });
 
+  it("trims surrounding whitespace from the stored user bubble and derived title", async () => {
+    let emit!: (e: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
+    useStore.setState({
+      sessions: [session({ id: "a", title: "New chat" })],
+      activeId: "a",
+      messages: { a: [] },
+    });
+
+    await useStore.getState().send("  hi  ");
+    emit({ type: "turn_end", stopReason: "end_turn" }); // end the turn so the watchdog can't leak
+
+    const st = useStore.getState();
+    expect(st.messages.a[0].blocks).toEqual([{ kind: "text", text: "hi" }]);
+    expect(st.sessions[0].title).toBe("hi");
+    // The local agent is also prompted with the trimmed body (not the raw padded
+    // draft), so what the user sees and what the model receives stay consistent.
+    expect(m.runAgent).toHaveBeenCalledWith("a", "hi", expect.any(Function));
+  });
+
+  it("trims the forwarded run text in remote mode", async () => {
+    useStore.setState({
+      sessions: [session({ id: "a", title: "New chat" })],
+      activeId: "a",
+      messages: { a: [] },
+      remoteConnected: true,
+    });
+
+    await useStore.getState().send("  do it  ");
+
+    expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({
+      cmd: "run",
+      session_id: "a",
+      text: "do it",
+    });
+    expect(useStore.getState().messages.a[0].blocks).toEqual([{ kind: "text", text: "do it" }]);
+  });
+
   it("keeps the existing title once a session already has messages", async () => {
     let emit!: (e: StreamEvent) => void;
     m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
@@ -419,7 +634,9 @@ describe("send", () => {
     await useStore.getState().send("do it remotely");
 
     // The desktop is authoritative: we forward a `run` command and DON'T run the
-    // local agent or pre-create an assistant message / flip streaming.
+    // local agent or pre-create an assistant message. We DO flip streaming
+    // optimistically (closing the double-submit window) rather than waiting for the
+    // desktop's turn_start frame.
     expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({
       cmd: "run",
       session_id: "a",
@@ -428,11 +645,39 @@ describe("send", () => {
     expect(m.runAgent).not.toHaveBeenCalled();
 
     const st = useStore.getState();
-    expect(st.streaming).toBe(false);
+    expect(st.streaming).toBe(true);
     // Only the optimistic user echo from sendRemoteCommand — no assistant stub.
     expect(st.messages.a).toHaveLength(1);
     expect(st.messages.a[0].role).toBe("user");
     expect(st.messages.a[0].blocks).toEqual([{ kind: "text", text: "do it remotely" }]);
+  });
+
+  it("remote send flips streaming optimistically so a second send can't double-dispatch", async () => {
+    // streaming used to stay false until the desktop's turn_start frame returned,
+    // leaving the composer enabled across the round-trip — a second Enter would fire
+    // a duplicate `run`. Flipping streaming up front closes that window: the second
+    // send() is a no-op (the streaming guard at the top of send catches it).
+    useStore.setState({
+      sessions: [session({ id: "a", title: "New chat" })],
+      activeId: "a",
+      messages: { a: [] },
+      remoteConnected: true,
+    });
+
+    await useStore.getState().send("first");
+    expect(useStore.getState().streaming).toBe(true);
+
+    // A follow-up before turn_start arrives must NOT fire a second command.
+    await useStore.getState().send("second");
+
+    expect(m.phoneSyncSendCommand).toHaveBeenCalledTimes(1);
+    expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({
+      cmd: "run",
+      session_id: "a",
+      text: "first",
+    });
+    // Only the first optimistic user echo — no duplicate user bubble.
+    expect(useStore.getState().messages.a).toHaveLength(1);
   });
 
   it("tears down the turn's listener on turn_end so a later turn can't edit this message", async () => {
@@ -511,6 +756,151 @@ describe("send", () => {
       vi.useRealTimers();
     }
   });
+
+  it("recovers a hung REMOTE turn via the idle watchdog so the phone composer isn't stranded", async () => {
+    // Symmetric with the local watchdog: in remote mode only a desktop live frame can
+    // clear `streaming`. If the channel stays up but the desktop's agent dies without
+    // emitting turn_end/error (no drop), nothing would recover the composer. The
+    // remote watchdog force-ends the silent turn after the idle window.
+    vi.useFakeTimers();
+    try {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "New chat" })],
+        activeId: "a",
+        messages: { a: [] },
+        remoteConnected: true,
+      });
+
+      await useStore.getState().send("do it");
+      expect(useStore.getState().streaming).toBe(true);
+      expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({
+        cmd: "run",
+        session_id: "a",
+        text: "do it",
+      });
+
+      // No live frame arrives. Idle past the watchdog window → the turn force-ends.
+      await vi.advanceTimersByTimeAsync(152_000);
+
+      const st = useStore.getState();
+      expect(st.streaming).toBe(false);
+      expect(st.pendingPermission).toBeNull();
+      const text = st.messages.a[st.messages.a.length - 1].blocks
+        .map((b) => (b.kind === "text" ? b.text : ""))
+        .join("");
+      expect(text).toContain("timed out");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a remote live frame for the active session resets the idle watchdog", async () => {
+    // Activity keeps the watchdog from firing: a live frame mid-window must reset
+    // last-activity so a still-streaming turn isn't falsely timed out.
+    vi.useFakeTimers();
+    try {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "New chat" })],
+        activeId: "a",
+        messages: { a: [] },
+        remoteConnected: true,
+      });
+
+      await useStore.getState().send("do it");
+      expect(useStore.getState().streaming).toBe(true);
+
+      // Just before the window elapses, a live frame arrives (the desktop is alive).
+      await vi.advanceTimersByTimeAsync(149_000);
+      useStore
+        .getState()
+        .applyFrame({ t: "live", session_id: "a", event: { type: "turn_start", messageId: "m1" } });
+
+      // Another almost-full window passes; without the reset the watchdog would have
+      // fired by now, but the live frame kept the turn alive.
+      await vi.advanceTimersByTimeAsync(140_000);
+      expect(useStore.getState().streaming).toBe(true);
+
+      // Now go fully idle past the window from the last activity → it finally recovers.
+      await vi.advanceTimersByTimeAsync(152_000);
+      expect(useStore.getState().streaming).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a remote turn_end clears the idle watchdog so it can't fire after a clean finish", async () => {
+    vi.useFakeTimers();
+    try {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "New chat" })],
+        activeId: "a",
+        messages: { a: [] },
+        remoteConnected: true,
+      });
+
+      await useStore.getState().send("do it");
+      // The desktop builds the assistant message, then finishes the turn cleanly.
+      useStore
+        .getState()
+        .applyFrame({ t: "live", session_id: "a", event: { type: "turn_start", messageId: "m1" } });
+      useStore.getState().applyFrame({
+        t: "live",
+        session_id: "a",
+        event: { type: "turn_end", stopReason: "end_turn" },
+      });
+      expect(useStore.getState().streaming).toBe(false);
+
+      // Append a fresh assistant block so a (wrongly) still-armed watchdog would be
+      // detectable by a spurious timed-out note. Advancing well past the window must
+      // NOT re-flip streaming or append a timeout note.
+      await vi.advanceTimersByTimeAsync(200_000);
+
+      const st = useStore.getState();
+      expect(st.streaming).toBe(false);
+      const text = st.messages.a
+        .flatMap((msg) => msg.blocks)
+        .map((b) => (b.kind === "text" ? b.text : ""))
+        .join("");
+      expect(text).not.toContain("timed out");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("Stop pressed during the runAgent await window aborts the backend and disposes the listener", async () => {
+    // The cancel handle is only armed AFTER runAgent resolves. If the user presses
+    // Stop in that window, stop() can't invoke a (null) cancel — so the post-await
+    // block must honor the already-flipped streaming:false by cancelling the
+    // still-pending backend turn and disposing the listener (no stale Stop re-armed,
+    // no further deltas folded in).
+    const cancel = vi.fn(async () => {});
+    const dispose = vi.fn();
+    let resolveRun!: (h: { cancel: typeof cancel; dispose: typeof dispose }) => void;
+    m.runAgent.mockImplementation(
+      async () =>
+        new Promise((res) => {
+          resolveRun = res;
+        }),
+    );
+    useStore.setState({ sessions: [session({ id: "a" })], activeId: "a", messages: { a: [] } });
+
+    // Kick off the turn; runAgent stays pending (cancel handle not yet armed).
+    const sending = useStore.getState().send("hello");
+    expect(useStore.getState().streaming).toBe(true);
+    expect(useStore.getState().cancel).toBeNull(); // handle not armed during the await
+
+    // User presses Stop mid-await — there's no cancel handle to invoke yet.
+    await useStore.getState().stop();
+    expect(useStore.getState().streaming).toBe(false);
+
+    // Now the backend handle resolves. The post-await block must cancel it
+    // (cancel_agent + unlisten), since Stop couldn't reach it earlier.
+    resolveRun({ cancel, dispose });
+    await sending;
+
+    expect(cancel).toHaveBeenCalledTimes(1); // backend turn actually aborted
+    expect(useStore.getState().cancel).toBeNull(); // no stale Stop re-armed
+  });
 });
 
 describe("stop", () => {
@@ -523,6 +913,28 @@ describe("stop", () => {
     });
 
     await useStore.getState().stop();
+
+    expect(cancel).toHaveBeenCalledTimes(1);
+    const st = useStore.getState();
+    expect(st.streaming).toBe(false);
+    expect(st.cancel).toBeNull();
+    expect(st.pendingPermission).toBeNull();
+  });
+
+  it("clears the composer even when the cancel_agent IPC rejects (never bricks the UI)", async () => {
+    // A rejecting cancel (core busy/locked/dead) must not strand the composer: stop()
+    // wraps the cancel call so streaming/cancel/pendingPermission are always cleared
+    // and the rejection never escapes as an unhandled promise rejection.
+    const cancel = vi.fn(async () => {
+      throw new Error("cancel failed");
+    });
+    useStore.setState({
+      streaming: true,
+      cancel,
+      pendingPermission: { id: "p", tool: "t", summary: "s", input: {} },
+    });
+
+    await expect(useStore.getState().stop()).resolves.toBeUndefined();
 
     expect(cancel).toHaveBeenCalledTimes(1);
     const st = useStore.getState();
@@ -574,22 +986,62 @@ describe("resolvePermission", () => {
     expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
   });
 
-  it("does not resolve a superseding request when a stale click lands mid-await", async () => {
-    // allow-always awaits updateSettings; a newer permission request can arrive
-    // during that await. A stale click must not clear or answer the new prompt.
-    const newer = { id: "p2", tool: "fs_edit", summary: "newer", input: {} };
+  it("answers the gate FIRST and persists allow-always after (ordered)", async () => {
+    // The backend gate must be answered before the best-effort policy save, so a
+    // failing save can never strand the prompt or leave the gate unanswered.
+    const calls: string[] = [];
+    m.resolvePermission.mockImplementationOnce(async () => {
+      calls.push("resolve");
+    });
     m.saveSettings.mockImplementationOnce(async (s) => {
-      useStore.setState({ pendingPermission: newer });
+      calls.push("save");
       return { ...DEFAULT_SETTINGS, ...s };
+    });
+    useStore.setState({
+      pendingPermission: { id: "p1", tool: "fs_edit", summary: "x", input: {} },
+    });
+
+    await useStore.getState().resolvePermission("allow", true);
+
+    expect(calls).toEqual(["resolve", "save"]);
+  });
+
+  it("still answers the gate and clears the prompt when the policy save rejects", async () => {
+    // saveSettings now runs AFTER the gate is answered, so its rejection can't
+    // strand the banner or leave the backend gate unanswered.
+    m.saveSettings.mockRejectedValueOnce(new Error("disk full"));
+    useStore.setState({
+      pendingPermission: { id: "p1", tool: "fs_edit", summary: "x", input: {} },
+    });
+
+    await useStore.getState().resolvePermission("allow", true);
+
+    expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
+    const st = useStore.getState();
+    expect(st.pendingPermission).toBeNull();
+    // The failed best-effort policy save surfaces via settingsError (updateSettings).
+    expect(st.settingsError).toBe("disk full");
+  });
+
+  it("does not resolve a superseding request when a stale click lands mid-await", async () => {
+    // A newer permission request can arrive while we await the backend resolve.
+    // A stale click must not then clear or answer the new prompt.
+    const newer = { id: "p2", tool: "fs_edit", summary: "newer", input: {} };
+    m.resolvePermission.mockImplementationOnce(async () => {
+      useStore.setState({ pendingPermission: newer });
     });
     useStore.setState({
       pendingPermission: { id: "p1", tool: "fs_edit", summary: "stale", input: {} },
     });
 
+    // The captured request (p1) is answered and the allow-always policy save still
+    // runs; it just never touches pendingPermission, so the newer prompt that
+    // arrived mid-await stays pending (the pre-await guard only blocks answering a
+    // request whose id changed before the await began).
     await useStore.getState().resolvePermission("allow", true);
 
-    // The stale p1 click is dropped; the newer prompt stays pending and unanswered.
-    expect(m.resolvePermission).not.toHaveBeenCalled();
+    // p1 was answered, but the newer prompt that arrived mid-await stays pending.
+    expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
     expect(useStore.getState().pendingPermission).toEqual(newer);
   });
 
@@ -741,6 +1193,43 @@ describe("settings + workspace", () => {
     await useStore.getState().openWorkspace();
     expect(m.saveSettings).not.toHaveBeenCalled();
   });
+
+  it("updateSettings records settingsError and preserves prior settings when the save rejects", async () => {
+    const prior = useStore.getState().settings;
+    m.saveSettings.mockRejectedValueOnce(new Error("keyring locked"));
+
+    await useStore.getState().updateSettings({ model: "claude-sonnet-4-6" });
+
+    const st = useStore.getState();
+    expect(st.settingsError).toBe("keyring locked");
+    expect(st.settings).toEqual(prior); // controlled UI doesn't silently corrupt
+  });
+
+  it("updateSettings clears a prior settingsError on a successful save", async () => {
+    useStore.setState({ settingsError: "old failure" });
+
+    await useStore.getState().updateSettings({ model: "claude-sonnet-4-6" });
+
+    expect(useStore.getState().settingsError).toBeNull();
+  });
+
+  it("openWorkspace records workspaceError when the picker rejects", async () => {
+    m.openFolder.mockRejectedValueOnce(new Error("dialog failed"));
+
+    await useStore.getState().openWorkspace();
+
+    expect(useStore.getState().workspaceError).toBe("dialog failed");
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("openWorkspace records workspaceError when persisting the folder rejects", async () => {
+    m.openFolder.mockResolvedValueOnce("C:/work/repo");
+    m.saveSettings.mockRejectedValueOnce(new Error("save failed"));
+
+    await useStore.getState().openWorkspace();
+
+    expect(useStore.getState().workspaceError).toBe("save failed");
+  });
 });
 
 describe("phone sync", () => {
@@ -793,6 +1282,35 @@ describe("phone sync", () => {
     expect(useStore.getState().pairingPayload).toEqual(payload);
   });
 
+  it("beginPairing surfaces a rejection via pairingError and shows no QR", async () => {
+    // phoneSyncBeginPairing is fallible; the Settings UI calls it via `void`, so a
+    // swallowed rejection would leave the user with no QR and no feedback.
+    m.phoneSyncBeginPairing.mockRejectedValueOnce(new Error("lock poisoned"));
+    useStore.setState({ pairingError: "stale" });
+
+    await useStore.getState().beginPairing();
+
+    const st = useStore.getState();
+    expect(st.pairingError).toBe("lock poisoned");
+    expect(st.pairingPayload).toBeNull(); // no QR shown on failure
+  });
+
+  it("beginPairing clears a prior pairingError on a successful pairing", async () => {
+    useStore.setState({ pairingError: "old failure" });
+
+    await useStore.getState().beginPairing();
+
+    expect(useStore.getState().pairingError).toBeNull();
+  });
+
+  it("unpair surfaces a rejection via pairingError", async () => {
+    m.phoneSyncUnpair.mockRejectedValueOnce(new Error("db remove failed"));
+
+    await useStore.getState().unpair("PHONE==");
+
+    expect(useStore.getState().pairingError).toBe("db remove failed");
+  });
+
   it("clearPairing removes the pairing payload from state", () => {
     useStore.setState({ pairingPayload: { version: 1, publicKey: "DEVICE==", nonce: "NONCE==" } });
 
@@ -826,8 +1344,11 @@ describe("remote client", () => {
   });
 
   // Seed a live assistant message so the per-event reducer has a "last" message
-  // to fold into (the dual of send pre-creating the assistant message).
+  // to fold into (the dual of send pre-creating the assistant message). The seeded
+  // session is made active so the global turn flags (streaming/pendingPermission)
+  // apply — those are now gated on the frame's session being the active one.
   const seedTurn = (sid = "s1", id = "a1") => {
+    useStore.setState({ activeId: sid });
     useStore.getState().applyFrame({
       t: "live",
       session_id: sid,
@@ -956,7 +1477,9 @@ describe("remote client", () => {
       expect(useStore.getState().messages.s1).toBeUndefined();
     });
 
-    it("permission_request surfaces a pending prompt", () => {
+    it("permission_request surfaces a pending prompt for the active session", () => {
+      useStore.setState({ activeId: "s1" });
+
       useStore.getState().applyFrame({
         t: "live",
         session_id: "s1",
@@ -981,8 +1504,9 @@ describe("remote client", () => {
       expect(useStore.getState().usage.s1).toEqual({ input: 110, output: 45 });
     });
 
-    it("turn_end clears streaming and any pending prompt", () => {
+    it("turn_end clears streaming and any pending prompt for the active session", () => {
       useStore.setState({
+        activeId: "s1",
         streaming: true,
         pendingPermission: { id: "p", tool: "t", summary: "s", input: {} },
       });
@@ -1013,6 +1537,68 @@ describe("remote client", () => {
       const text = st.messages.s1[0].blocks.map((b) => (b.kind === "text" ? b.text : "")).join("");
       expect(text).toContain("Error");
       expect(text).toContain("boom");
+    });
+
+    describe("background-session frames don't hijack the visible UI", () => {
+      // The user is looking at "active"; frames for a different (background)
+      // session must still build that session's history, but must NOT flip the
+      // visible composer/HUD or pop a permission prompt with no context.
+      const bgLive = (event: StreamEvent) =>
+        useStore.getState().applyFrame({ t: "live", session_id: "bg", event });
+
+      it("turn_start for a background session appends its message but doesn't flip streaming", () => {
+        useStore.setState({ activeId: "active", streaming: false });
+
+        bgLive({ type: "turn_start", messageId: "b1" });
+
+        const st = useStore.getState();
+        expect(st.streaming).toBe(false); // visible composer untouched
+        expect(st.messages.bg).toEqual([
+          { id: "b1", role: "assistant", blocks: [], createdAt: expect.any(Number) },
+        ]);
+      });
+
+      it("permission_request for a background session does NOT pop a prompt", () => {
+        useStore.setState({ activeId: "active", pendingPermission: null });
+
+        bgLive({ type: "permission_request", id: "p9", tool: "fs_edit", summary: "x", input: {} });
+
+        expect(useStore.getState().pendingPermission).toBeNull();
+      });
+
+      it("text_delta still folds into the background session's message", () => {
+        useStore.setState({ activeId: "active" });
+        bgLive({ type: "turn_start", messageId: "b1" });
+
+        bgLive({ type: "text_delta", text: "hi" });
+
+        expect(useStore.getState().messages.bg[0].blocks).toEqual([{ kind: "text", text: "hi" }]);
+      });
+
+      it("turn_end / error for a background session leave the visible turn flags alone", () => {
+        useStore.setState({
+          activeId: "active",
+          streaming: true,
+          pendingPermission: { id: "p", tool: "t", summary: "s", input: {} },
+        });
+        bgLive({ type: "turn_start", messageId: "b1" });
+
+        bgLive({ type: "error", message: "boom" });
+        let st = useStore.getState();
+        // The visible turn flags belong to the active session, not the background one.
+        expect(st.streaming).toBe(true);
+        expect(st.pendingPermission).not.toBeNull();
+        // ...but the background message still got the inline error.
+        const text = st.messages.bg[0].blocks
+          .map((b) => (b.kind === "text" ? b.text : ""))
+          .join("");
+        expect(text).toContain("boom");
+
+        bgLive({ type: "turn_end", stopReason: "end_turn" });
+        st = useStore.getState();
+        expect(st.streaming).toBe(true);
+        expect(st.pendingPermission).not.toBeNull();
+      });
     });
   });
 
@@ -1086,6 +1672,83 @@ describe("remote client", () => {
       expect(st.remoteUnlisten).toBeNull();
       expect(st.remoteError).toBe("dial failed");
       expect(m.onPhoneSyncFrame).not.toHaveBeenCalled();
+    });
+
+    it("serializes concurrent dials so only one frame listener is registered", async () => {
+      // Two interleaved dials (Reconnect + Scan/Connect) must not each register a
+      // frame listener and orphan one that keeps double-feeding applyFrame.
+      let release!: () => void;
+      m.phoneSyncConnect.mockReturnValueOnce(
+        new Promise((res) => {
+          release = () => res({ sas: "SAS-1", peerPublicKey: "PEER==" });
+        }),
+      );
+
+      const first = useStore.getState().connectRemote("QR-A");
+      // Second call lands while the first dial is still in flight — the re-entry
+      // guard makes it a no-op.
+      const second = useStore.getState().connectRemote("QR-B");
+
+      release();
+      await Promise.all([first, second]);
+
+      expect(m.phoneSyncConnect).toHaveBeenCalledTimes(1);
+      expect(m.onPhoneSyncFrame).toHaveBeenCalledTimes(1);
+      expect(useStore.getState().remoteConnecting).toBe(false);
+    });
+
+    it("clears the re-entry lock so a later dial can proceed", async () => {
+      await useStore.getState().connectRemote("QR-1");
+      expect(useStore.getState().remoteConnecting).toBe(false);
+
+      m.phoneSyncConnect.mockClear();
+      await useStore.getState().connectRemote("QR-2");
+
+      expect(m.phoneSyncConnect).toHaveBeenCalledWith("QR-2");
+    });
+
+    it("releases the re-entry lock even when the dial fails", async () => {
+      m.phoneSyncConnect.mockRejectedValueOnce(new Error("dial failed"));
+
+      await useStore.getState().connectRemote("QR");
+
+      expect(useStore.getState().remoteConnecting).toBe(false);
+    });
+
+    it("honors a disconnect that lands mid-dial: stays disconnected, leaks no listener", async () => {
+      // disconnectRemote during an in-flight dial clears remoteConnecting as an abort
+      // sentinel. When the (slow) dial finally resolves, connectRemote must bail
+      // BEFORE registering its frame/drop listeners and tear down the native session,
+      // instead of overriding the user's disconnect and resurrecting the connection.
+      const unlistenFrame = vi.fn();
+      let release!: () => void;
+      m.phoneSyncConnect.mockReturnValueOnce(
+        new Promise((res) => {
+          release = () => res({ sas: "SAS-1", peerPublicKey: "PEER==" });
+        }),
+      );
+      m.onPhoneSyncFrame.mockResolvedValue(unlistenFrame);
+
+      const connecting = useStore.getState().connectRemote("QR");
+      // The user disconnects while the dial is still pending.
+      await useStore.getState().disconnectRemote();
+      expect(useStore.getState().remoteConnecting).toBe(false); // abort sentinel set
+
+      // The dial resolves late — connectRemote must NOT register listeners or connect.
+      release();
+      await connecting;
+
+      const st = useStore.getState();
+      expect(st.remoteConnected).toBe(false); // disconnect honored, not overridden
+      expect(st.remoteUnlisten).toBeNull(); // no live subscription stored
+      // No frame listener was registered (we bailed before subscribing), so the only
+      // leak risk — an orphaned subscription — is avoided, and the native session the
+      // dial opened was torn down.
+      expect(m.onPhoneSyncFrame).not.toHaveBeenCalled();
+      expect(unlistenFrame).not.toHaveBeenCalled();
+      // phoneSyncDisconnect ran once for the user's disconnect and once for the
+      // abort-path teardown of the just-opened native session.
+      expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -1268,6 +1931,37 @@ describe("remote client", () => {
 
       expect(useStore.getState().messages.s1).toBeUndefined();
       expect(m.phoneSyncSendCommand).toHaveBeenCalledWith(command);
+    });
+
+    it("annotates the optimistic message and flags remoteDropped when a run send rejects", async () => {
+      m.phoneSyncSendCommand.mockRejectedValueOnce(new Error("link down"));
+      useStore.setState({ streaming: true });
+
+      // Must not throw (callers swallow the rejection).
+      await expect(
+        useStore.getState().sendRemoteCommand({ cmd: "run", session_id: "s1", text: "do it" }),
+      ).resolves.toBeUndefined();
+
+      const st = useStore.getState();
+      const text = st.messages.s1[0].blocks.map((b) => (b.kind === "text" ? b.text : "")).join("");
+      expect(text).toContain("do it");
+      expect(text).toContain("Couldn't reach your desktop");
+      expect(st.remoteDropped).toBe(true);
+      expect(st.streaming).toBe(false);
+    });
+
+    it("clears streaming on a rejecting cancel (stop) without annotating any message", async () => {
+      m.phoneSyncSendCommand.mockRejectedValueOnce(new Error("link down"));
+      useStore.setState({ streaming: true });
+
+      await expect(
+        useStore.getState().sendRemoteCommand({ cmd: "cancel", session_id: "s1" }),
+      ).resolves.toBeUndefined();
+
+      const st = useStore.getState();
+      expect(st.streaming).toBe(false);
+      expect(st.remoteDropped).toBe(true);
+      expect(st.messages.s1).toBeUndefined(); // nothing optimistic to annotate
     });
   });
 

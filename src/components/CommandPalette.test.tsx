@@ -34,7 +34,13 @@ const TOTAL_COMMANDS = FIXED_COMMANDS + MODELS.length;
 
 const open = () => useStore.setState({ showPalette: true });
 const input = () => screen.getByPlaceholderText("Type a command…") as HTMLInputElement;
-const commandButtons = () => screen.queryAllByRole("button").filter((b) => b.querySelector("span"));
+// Rows are role="option" under the role="listbox" results container (their
+// implicit <button> role is overridden), so query them by the option role.
+const commandButtons = () => screen.queryAllByRole("option");
+// The empty-state text exists twice when nothing matches: the visible message in
+// the listbox and a persistent sr-only live region. Scope queries to the visible
+// listbox copy to avoid an ambiguous getByText match.
+const emptyState = () => screen.getByRole("listbox", { name: "Commands" }).querySelector("div");
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -76,8 +82,9 @@ describe("visibility", () => {
     open();
     render(<CommandPalette />);
 
-    // the input is reachable by its accessible name, which placeholders do not provide
-    const search = screen.getByRole("textbox", { name: "Command palette search" });
+    // the input is reachable by its accessible name, which placeholders do not provide.
+    // It carries role="combobox" (overriding the implicit textbox role) for the listbox.
+    const search = screen.getByRole("combobox", { name: "Command palette search" });
     expect(search).toBe(input());
   });
 
@@ -86,9 +93,71 @@ describe("visibility", () => {
     render(<CommandPalette />);
 
     // a hinted row announces label + shortcut to screen readers, not a bare glyph
-    expect(screen.getByRole("button", { name: "New chat, Ctrl+N" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "New chat, Ctrl+N" })).toBeInTheDocument();
     // a hintless row falls back to just its label
-    expect(screen.getByRole("button", { name: "Open folder…" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Open folder…" })).toBeInTheDocument();
+  });
+});
+
+describe("accessibility roles", () => {
+  it("exposes the palette as a modal dialog and the input as a combobox", () => {
+    open();
+    render(<CommandPalette />);
+
+    const dialog = screen.getByRole("dialog", { name: "Command palette" });
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+
+    const combobox = screen.getByRole("combobox", { name: "Command palette search" });
+    expect(combobox).toBe(input());
+    expect(combobox).toHaveAttribute("aria-controls", "pc-palette-list");
+    expect(combobox).toHaveAttribute("aria-haspopup", "listbox");
+
+    // the results container is the listbox the combobox controls
+    const listbox = screen.getByRole("listbox", { name: "Commands" });
+    expect(listbox).toHaveAttribute("id", "pc-palette-list");
+  });
+
+  it("tracks the active option via aria-activedescendant as the highlight moves", () => {
+    open();
+    render(<CommandPalette />);
+    const el = input();
+
+    // first command ("New chat") is active initially
+    expect(el).toHaveAttribute("aria-activedescendant", "pc-cmd-new");
+
+    // arrowing down moves the active descendant to the next row
+    fireEvent.keyDown(el, { key: "ArrowDown" });
+    expect(el).toHaveAttribute("aria-activedescendant", "pc-cmd-files");
+  });
+
+  it("clears aria-activedescendant when nothing matches", () => {
+    open();
+    render(<CommandPalette />);
+    const el = input();
+
+    fireEvent.change(el, { target: { value: "zzzzz-nope" } });
+    expect(emptyState()).toHaveTextContent("No matching commands");
+    expect(el).not.toHaveAttribute("aria-activedescendant");
+  });
+
+  it("announces the empty result set through a persistent polite live region", () => {
+    open();
+    render(<CommandPalette />);
+    const el = input();
+
+    // the status region is always mounted, but empty while results exist — so no
+    // spurious announcement fires on open
+    const status = screen.getByRole("status");
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(status).toHaveTextContent("");
+
+    // typing a non-matching query populates it, which AT speaks as "no results"
+    fireEvent.change(el, { target: { value: "zzz" } });
+    expect(screen.getByRole("status")).toHaveTextContent("No matching commands");
+
+    // returning to a matching state empties the region again
+    fireEvent.change(el, { target: { value: "" } });
+    expect(screen.getByRole("status")).toHaveTextContent("");
   });
 });
 
@@ -120,7 +189,7 @@ describe("filtering", () => {
 
     fireEvent.change(input(), { target: { value: "zzzzz-nope" } });
 
-    expect(screen.getByText("No matching commands")).toBeInTheDocument();
+    expect(emptyState()).toHaveTextContent("No matching commands");
     expect(commandButtons()).toHaveLength(0);
   });
 });
@@ -239,7 +308,7 @@ describe("running commands", () => {
 
     // no matches: sel would otherwise be set to filtered.length - 1 === -1
     fireEvent.change(el, { target: { value: "zzzzz-nope" } });
-    expect(screen.getByText("No matching commands")).toBeInTheDocument();
+    expect(emptyState()).toHaveTextContent("No matching commands");
 
     // pressing ArrowDown must not crash nor make a later Enter fire choose(-1)
     expect(() => fireEvent.keyDown(el, { key: "ArrowDown" })).not.toThrow();
@@ -257,7 +326,7 @@ describe("running commands", () => {
     const el = input();
 
     fireEvent.change(el, { target: { value: "zzzzz-nope" } });
-    expect(screen.getByText("No matching commands")).toBeInTheDocument();
+    expect(emptyState()).toHaveTextContent("No matching commands");
 
     // wrapping over length 0 must not divide-by-zero into NaN; selection stays 0
     fireEvent.keyDown(el, { key: "ArrowDown" });
@@ -312,6 +381,17 @@ describe("closing", () => {
     expect(useStore.getState().showPalette).toBe(false);
   });
 
+  it("Escape closes the palette even when focus has left the input", () => {
+    open();
+    render(<CommandPalette />);
+
+    // Focus may sit on a row (after hovering/clicking) rather than the input; the
+    // input's own keydown wouldn't fire, so a window-level handler must catch Escape.
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    expect(useStore.getState().showPalette).toBe(false);
+  });
+
   it("ignores unrelated keys", () => {
     open();
     render(<CommandPalette />);
@@ -323,6 +403,47 @@ describe("closing", () => {
     expect(commandButtons()[0]).toHaveAttribute("aria-selected", "true");
   });
 
+  it("traps Tab so focus stays in the palette (default prevented, list unchanged)", () => {
+    open();
+    render(<CommandPalette />);
+
+    // Tab/Shift+Tab on the input must not move focus to app chrome behind the scrim
+    const tab = fireEvent.keyDown(input(), { key: "Tab" });
+    expect(tab).toBe(false); // returns false when preventDefault() was called
+
+    // the palette stays open with the first row still selected
+    expect(useStore.getState().showPalette).toBe(true);
+    expect(commandButtons()[0]).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("keeps option rows out of the tab order so the combobox is the only tab stop", () => {
+    open();
+    render(<CommandPalette />);
+
+    // every row carries tabindex="-1": the input owns DOM focus, aria-activedescendant
+    // marks the active option (combobox-with-listbox pattern), so rows aren't tab stops.
+    for (const row of commandButtons()) {
+      expect(row).toHaveAttribute("tabindex", "-1");
+    }
+  });
+
+  it("traps focus inside the dialog even when a row holds focus (Tab + Shift+Tab)", () => {
+    open();
+    render(<CommandPalette />);
+    const dialog = screen.getByRole("dialog", { name: "Command palette" });
+
+    // Even if focus somehow reaches a row (SR/spatial nav), Tab must not escape the modal.
+    const row = commandButtons()[0];
+    row.focus();
+    expect(dialog.contains(document.activeElement)).toBe(true);
+
+    fireEvent.keyDown(row, { key: "Tab" });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+
+    fireEvent.keyDown(row, { key: "Tab", shiftKey: true });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+  });
+
   it("clicking the backdrop closes the palette", () => {
     open();
     const { container } = render(<CommandPalette />);
@@ -331,6 +452,43 @@ describe("closing", () => {
     fireEvent.click(overlay);
 
     expect(useStore.getState().showPalette).toBe(false);
+  });
+
+  it("restores focus to the opener when closed via Escape", () => {
+    // The palette is always mounted; render it closed with an opener focused, then
+    // open (captures the opener) and close (cleanup refocuses it) — so a keyboard
+    // user isn't dropped onto document.body.
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    opener.focus();
+    expect(document.activeElement).toBe(opener);
+
+    const view = render(<CommandPalette />);
+    open();
+    view.rerender(<CommandPalette />);
+
+    fireEvent.keyDown(input(), { key: "Escape" });
+    view.rerender(<CommandPalette />);
+
+    expect(document.activeElement).toBe(opener);
+    document.body.removeChild(opener);
+  });
+
+  it("restores focus to the opener when closed via the backdrop", () => {
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    opener.focus();
+
+    const view = render(<CommandPalette />);
+    open();
+    view.rerender(<CommandPalette />);
+
+    const overlay = view.container.firstChild as HTMLElement;
+    fireEvent.click(overlay);
+    view.rerender(<CommandPalette />);
+
+    expect(document.activeElement).toBe(opener);
+    document.body.removeChild(opener);
   });
 
   it("clicking inside the dialog does not close the palette (stopPropagation)", () => {

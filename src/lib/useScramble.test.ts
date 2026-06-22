@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook } from "@testing-library/react";
 
-import { STEP_MS, usePrefersReducedMotion, useScramble } from "./useScramble";
+import {
+  STEP_MS,
+  __resetReducedMotionForTests,
+  usePrefersReducedMotion,
+  useScramble,
+} from "./useScramble";
 
 // useScramble drives a per-word decode off requestAnimationFrame. We replace rAF
 // with a manual queue so the animation advances by an exact number of frames and
@@ -145,40 +150,68 @@ describe("useScramble", () => {
     expect(result.current.display).toBe("Hi");
     expect(result.current.scrambleStart).toBe(2);
   });
+
+  it("snaps to the final text after a long pause instead of grinding catch-up frames", () => {
+    // A backgrounded tab pauses rAF, then resumes with a huge timestamp jump. Without
+    // the snap, the one tick would grind tens of thousands of catch-up frames and
+    // freeze the UI. Instead it jumps straight to the finished text.
+    const text = "aa bb cc dd ee ff gg hh ii jj ";
+    const { result } = renderHook(() => useScramble(text, true));
+    prime();
+    tick(T0 + 10 * 60 * 1000); // ~10 minutes later
+    expect(result.current.display).toBe(text);
+    expect(result.current.scrambleStart).toBe(text.length);
+  });
 });
 
 describe("usePrefersReducedMotion", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    // Reset the shared module singleton so these tests are order-independent.
+    __resetReducedMotionForTests();
+  });
+
   it("returns false when matchMedia is unavailable", () => {
     vi.stubGlobal("matchMedia", undefined);
     const { result } = renderHook(() => usePrefersReducedMotion());
     expect(result.current).toBe(false);
   });
 
-  it("reflects the setting, reacts to changes, and unsubscribes on unmount", () => {
+  it("shares one matchMedia subscription across consumers and reacts to changes", () => {
     let handler: (() => void) | null = null;
-    const removeEventListener = vi.fn();
     const mq = {
       matches: true,
       addEventListener: (_type: string, h: () => void) => {
         handler = h;
       },
-      removeEventListener,
+      removeEventListener: vi.fn(),
     };
-    vi.stubGlobal(
-      "matchMedia",
-      vi.fn(() => mq),
-    );
+    const matchMedia = vi.fn(() => mq);
+    vi.stubGlobal("matchMedia", matchMedia);
 
-    const { result, unmount } = renderHook(() => usePrefersReducedMotion());
-    expect(result.current).toBe(true);
+    // Two consumers (e.g. two MessageViews) share a SINGLE media-query listener.
+    const a = renderHook(() => usePrefersReducedMotion());
+    const b = renderHook(() => usePrefersReducedMotion());
+    expect(a.result.current).toBe(true);
+    expect(b.result.current).toBe(true);
+    expect(matchMedia).toHaveBeenCalledTimes(1);
 
+    // A change fans out to every consumer.
     act(() => {
       mq.matches = false;
       handler?.();
     });
-    expect(result.current).toBe(false);
+    expect(a.result.current).toBe(false);
+    expect(b.result.current).toBe(false);
 
-    unmount();
-    expect(removeEventListener).toHaveBeenCalledTimes(1);
+    // Unsubscribing one consumer leaves the others subscribed and updating, while
+    // the unmounted consumer no longer receives changes (its listener was removed).
+    a.unmount();
+    act(() => {
+      mq.matches = true;
+      handler?.();
+    });
+    expect(b.result.current).toBe(true);
+    expect(a.result.current).toBe(false);
   });
 });

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useStore } from "../store/store";
 import { isScannerAvailable, scanQrPayload, cancelScan } from "../lib/scanner";
@@ -135,6 +135,19 @@ function ConnectPanel({
   const reconnectRemote = useStore((s) => s.reconnectRemote);
   const [reconnecting, setReconnecting] = useState(false);
 
+  // Place initial focus on the primary action: the Scan button on the phone,
+  // otherwise the pairing textarea — so the panel is operable from the keyboard
+  // without a hunt.
+  const scanRef = useRef<HTMLButtonElement>(null);
+  const pasteRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    if (canScan && !(scanning || connecting)) scanRef.current?.focus();
+    else if (!connecting) pasteRef.current?.focus();
+    // Run once on mount; the connecting/scanning guards just avoid focusing a
+    // disabled control if the panel happens to mount mid-flight.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const onReconnect = async () => {
     if (reconnecting) return;
     setReconnecting(true);
@@ -147,6 +160,9 @@ function ConnectPanel({
 
   return (
     <div>
+      {/* The drop is announced by a persistent live region at the App shell (it
+          survives the connected↔pairing remount); a region inside this panel can't,
+          since the panel only mounts on the drop and so is born with content set. */}
       {canReconnect && (
         <div
           className={`mb-4 rounded-xl border px-4 py-3.5 ${
@@ -188,6 +204,7 @@ function ConnectPanel({
       {canScan && (
         <>
           <button
+            ref={scanRef}
             type="button"
             onClick={() => void onScan()}
             disabled={scanning || connecting}
@@ -215,6 +232,7 @@ function ConnectPanel({
         Pairing code
       </label>
       <textarea
+        ref={pasteRef}
         id="pc-remote-qr"
         value={qr}
         onChange={(e) => setQr(e.target.value)}
@@ -250,6 +268,14 @@ function VerifyPanel() {
   const confirmRemoteSas = useStore((s) => s.confirmRemoteSas);
   const disconnectRemote = useStore((s) => s.disconnectRemote);
 
+  // Land initial focus on the SAS code, NOT the affirmative confirm: focusing
+  // "Codes match — Continue" would let a queued/habitual Enter verify the
+  // connection without the user comparing codes, defeating the SAS check.
+  const sasRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    sasRef.current?.focus();
+  }, []);
+
   return (
     <div>
       <div className="mb-3 flex items-center gap-2">
@@ -265,10 +291,13 @@ function VerifyPanel() {
         connection.
       </p>
 
-      {/* The SAS, large and unmissable — the one security-critical artifact. */}
+      {/* The SAS, large and unmissable — the one security-critical artifact.
+          Takes initial focus (tabIndex=-1) so the user reads the code first. */}
       <div
-        aria-label="Pairing verification code"
-        className="rounded-xl border border-accent/40 bg-panel-2 px-4 py-5 text-center shadow-[0_0_24px_rgba(255,46,126,0.16)]"
+        ref={sasRef}
+        tabIndex={-1}
+        aria-label={`Pairing verification code: ${sas ?? "not available"}`}
+        className="rounded-xl border border-accent/40 bg-panel-2 px-4 py-5 text-center shadow-[0_0_24px_rgba(255,46,126,0.16)] outline-none"
       >
         <div className="select-text break-all font-mono text-[26px] font-bold leading-tight tracking-[3px] text-accent-2">
           {sas ?? "—"}
@@ -296,16 +325,49 @@ function VerifyPanel() {
  *  camera preview shows through; this paints only a viewfinder + a Cancel control.
  *  Portaled to <body> so it sits outside the hidden app shell and stays visible. */
 function ScanOverlay({ onCancel }: { onCancel: () => void }) {
+  const cancelRef = useRef<HTMLButtonElement>(null);
+
+  // Give this aria-modal dialog the keyboard affordances every other overlay has.
+  // While scanning, `pc-scanning` sets `#root { visibility: hidden }`, dropping the
+  // opener (the Scan button) out of the focus order — so without this, activeElement
+  // is stranded on <body> with no keyboard path to Cancel.
+  useEffect(() => {
+    // Remember the opener so focus can return to it once the overlay unmounts.
+    const opener = document.activeElement as HTMLElement | null;
+    // (1) Move focus into the dialog so it isn't stranded on the hidden shell.
+    cancelRef.current?.focus();
+    // (2) Escape cancels the scan no matter where focus sits.
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onCancel();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      if (opener && opener.isConnected) opener.focus();
+    };
+  }, [onCancel]);
+
   return (
     <div
       className="pc-scan-overlay"
       role="dialog"
       aria-modal="true"
       aria-label="Scanning for a pairing QR code"
+      // (3) Trap Tab: the dialog has a single focusable control, so keep focus on
+      // Cancel rather than letting it walk into the visibility:hidden #root.
+      onKeyDown={(e) => {
+        if (e.key === "Tab") {
+          e.preventDefault();
+          cancelRef.current?.focus();
+        }
+      }}
     >
       <div className="pc-scan-frame" aria-hidden="true" />
       <p className="pc-scan-hint">Point your camera at the QR code on your desktop</p>
-      <button type="button" onClick={onCancel} className="pc-scan-cancel">
+      <button ref={cancelRef} type="button" onClick={onCancel} className="pc-scan-cancel">
         Cancel
       </button>
     </div>

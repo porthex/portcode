@@ -92,11 +92,42 @@ describe("Composer textarea", () => {
 
     // Streaming: the textarea goes inert so keystrokes are visibly ignored,
     // mirroring submit()'s `streaming` early-return guard.
+    // Idle: not flagged busy to assistive tech.
+    expect(ta()).not.toHaveAttribute("aria-busy", "true");
+
     act(() => {
       useStore.setState({ streaming: true });
     });
     rerender(<Composer />);
     expect(ta()).toBeDisabled();
+    // Streaming: AT sees the input as busy for the duration of the turn.
+    expect(ta()).toHaveAttribute("aria-busy", "true");
+  });
+
+  it("carries the streaming dim on the input itself, not the frame", () => {
+    render(<Composer />);
+    // The disabled-state dim lives on the textarea so it greys only the inert
+    // input while leaving the Stop button (rendered in the same frame) bright.
+    const ta = screen.getByPlaceholderText(
+      "Describe a task, ask a question, or give an instruction…",
+    );
+    expect(ta.className).toContain("disabled:opacity-60");
+    expect(ta.className).toContain("disabled:saturate-[0.6]");
+    // The dim/undim eases instead of snapping at turn boundaries: opacity and
+    // filter are in the transition list (not just height), and the
+    // reduced-motion guard still neutralizes it.
+    expect(ta.className).toContain("transition-[height,opacity,filter]");
+    expect(ta.className).toContain("motion-reduce:transition-none");
+  });
+
+  it("exposes an explicit accessible name (not just the placeholder)", () => {
+    render(<Composer />);
+    // The placeholder is an unreliable accessible name (dropped once a draft is
+    // present; not exposed by some AT). The aria-label is the stable name, so
+    // the field is reachable by accessible name regardless of draft state.
+    expect(screen.getByRole("textbox", { name: "Message Portcode" })).toBe(
+      screen.getByPlaceholderText("Describe a task, ask a question, or give an instruction…"),
+    );
   });
 });
 
@@ -154,6 +185,49 @@ describe("Composer send button", () => {
       expect.any(Function),
     );
   });
+
+  it("collapses the textarea to an explicit px height on submit (not 'auto')", async () => {
+    useStore.setState({
+      sessions: [
+        {
+          id: "a",
+          title: "New chat",
+          workspace: null,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+      activeId: "a",
+      messages: { a: [] },
+    });
+    // Mount with an empty draft so the [text] effect captures the single-row
+    // height first; only then does submit() have a px target to collapse to.
+    render(<Composer />);
+    const ta = screen.getByPlaceholderText(
+      "Describe a task, ask a question, or give an instruction…",
+    ) as HTMLTextAreaElement;
+
+    // Seed a tall multi-line draft (drives the [text] effect to grow the field).
+    act(() => {
+      useStore.setState({ draft: "line one\nline two\nline three" });
+    });
+
+    fireEvent.click(sendButton());
+
+    // The collapse sets an interpolatable px value (CSS can't ease to/from
+    // "auto"). jsdom reports scrollHeight 0, so the concrete value is "0px" —
+    // what matters is it's a px string, not "auto".
+    expect(ta.style.height).toMatch(/px$/);
+    expect(ta.style.height).not.toBe("auto");
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(m.runAgent).toHaveBeenCalledWith(
+      "a",
+      "line one\nline two\nline three",
+      expect.any(Function),
+    );
+  });
 });
 
 describe("Composer key handling", () => {
@@ -189,6 +263,37 @@ describe("Composer key handling", () => {
       "claude-opus-4-8",
       expect.any(Function),
     );
+  });
+
+  it("does not submit on the Enter that commits an IME composition", async () => {
+    useStore.setState({
+      sessions: [
+        {
+          id: "a",
+          title: "New chat",
+          workspace: null,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+      activeId: "a",
+      messages: { a: [] },
+      draft: "日本語",
+    });
+    render(<Composer />);
+
+    const ta = screen.getByPlaceholderText(
+      "Describe a task, ask a question, or give an instruction…",
+    );
+    // The composition-commit Enter carries isComposing on the native event; the
+    // guard must let it pass through (commit the candidate) without sending.
+    fireEvent.keyDown(ta, { key: "Enter", isComposing: true });
+
+    // Draft is preserved (not cleared by submit) and no turn was started.
+    expect(useStore.getState().draft).toBe("日本語");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(m.runAgent).not.toHaveBeenCalled();
   });
 
   it("inserts a newline (does not submit) on Shift+Enter", () => {
@@ -275,6 +380,25 @@ describe("Composer stop button", () => {
     // The stop control is a bare red square with no text; the aria-label is the
     // only thing announcing its purpose to assistive tech.
     expect(screen.getByRole("button", { name: "Stop generating" })).toBe(stopButton());
+  });
+
+  it("guards its glow transition under prefers-reduced-motion", () => {
+    useStore.setState({ streaming: true });
+    render(<Composer />);
+    // The Stop button animates box-shadow/filter on hover/active; without the
+    // guard that would still play under reduced-motion (the global CSS doesn't
+    // cover Tailwind transition utilities).
+    expect(stopButton().className).toContain("motion-reduce:transition-none");
+  });
+
+  it("stays at full strength while streaming (the dim is scoped to the input)", () => {
+    useStore.setState({ streaming: true });
+    render(<Composer />);
+    // The streaming dim must NOT live on the pc-neon-frame wrapper, or it would
+    // de-emphasize the Stop button — the only available action during a run.
+    const frame = stopButton().closest(".pc-neon-frame")!;
+    expect(frame.className).not.toContain("opacity-70");
+    expect(frame.className).not.toContain("saturate-[0.6]");
   });
 });
 

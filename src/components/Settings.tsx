@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { useStore } from "../store/store";
 import { MODELS, type PairingPayload, type ToolPolicy } from "../types";
@@ -8,6 +8,8 @@ export function SettingsPanel() {
   const settings = useStore((s) => s.settings);
   const updateSettings = useStore((s) => s.updateSettings);
   const setShowSettings = useStore((s) => s.setShowSettings);
+  const settingsError = useStore((s) => s.settingsError);
+  const pairingError = useStore((s) => s.pairingError);
   const oauthStatus = useStore((s) => s.oauthStatus);
   const oauthError = useStore((s) => s.oauthError);
   const loginWithClaude = useStore((s) => s.loginWithClaude);
@@ -31,8 +33,11 @@ export function SettingsPanel() {
   const [apiKey, setApiKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [savedKey, setSavedKey] = useState(false);
+  const [keyError, setKeyError] = useState<string | null>(null);
   const [signingIn, setSigningIn] = useState(false);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const modalRef = useRef<HTMLDivElement | null>(null);
+  const saveBtnRef = useRef<HTMLButtonElement | null>(null);
 
   const signedIn = !!oauthStatus?.signedIn;
 
@@ -45,6 +50,20 @@ export function SettingsPanel() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [setShowSettings]);
 
+  // Move focus into the dialog on open and restore it to the opener on close, so a
+  // keyboard user isn't left on a background control behind the scrim.
+  useEffect(() => {
+    const opener = document.activeElement as HTMLElement | null;
+    const modal = modalRef.current;
+    const first = modal?.querySelector<HTMLElement>(
+      'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])',
+    );
+    (first ?? modal)?.focus();
+    return () => {
+      if (opener && opener.isConnected) opener.focus();
+    };
+  }, []);
+
   // Clear the "Saved" toast timer on unmount so it can't update state after close.
   useEffect(() => {
     return () => {
@@ -52,16 +71,58 @@ export function SettingsPanel() {
     };
   }, []);
 
+  // Replay the one-shot pc-flash on the SAME Save node when a save succeeds —
+  // restart the CSS animation by toggling the class across a forced reflow rather
+  // than remounting via a React key, which would drop focus out of the focus trap.
+  useEffect(() => {
+    if (!savedKey) return;
+    replayFlash(saveBtnRef.current);
+  }, [savedKey]);
+
+  // Trap Tab within the dialog: query focusable descendants live (sections toggle
+  // `hidden` in remoteMode), skip hidden ones, and wrap at the first/last element.
+  const onModalKeyDown = (e: ReactKeyboardEvent) => {
+    if (e.key !== "Tab") return;
+    const modal = modalRef.current;
+    if (!modal) return;
+    const focusable = Array.from(
+      modal.querySelectorAll<HTMLElement>(
+        'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter((el) => el.offsetParent !== null);
+    if (focusable.length === 0) return;
+    const firstEl = focusable[0];
+    const lastEl = focusable[focusable.length - 1];
+    const active = document.activeElement as HTMLElement | null;
+    if (e.shiftKey) {
+      if (active === firstEl || !active || !focusable.includes(active)) {
+        e.preventDefault();
+        lastEl.focus();
+      }
+    } else if (active === lastEl) {
+      e.preventDefault();
+      firstEl.focus();
+    }
+  };
+
   const saveKey = async () => {
     if (!apiKey.trim()) return;
     setSaving(true);
     try {
+      setKeyError(null);
       await ipc.setApiKey(apiKey.trim());
-      await updateSettings({ apiKeySet: true });
+      // Persist the apiKeySet flag directly (not via updateSettings, which swallows
+      // a reject into settingsError and resolves anyway) so a save failure hits this
+      // catch — "Saved" is never shown and the typed value is kept for retry.
+      const next = await ipc.saveSettings({ apiKeySet: true });
+      useStore.setState({ settings: next });
       setApiKey("");
       setSavedKey(true);
       if (savedTimer.current !== null) clearTimeout(savedTimer.current);
       savedTimer.current = setTimeout(() => setSavedKey(false), 1800);
+    } catch (err) {
+      // Surface the failure and keep the typed value so the user can retry.
+      setKeyError(err instanceof Error ? err.message : String(err));
     } finally {
       setSaving(false);
     }
@@ -80,10 +141,19 @@ export function SettingsPanel() {
 
   return (
     <div
-      className="pc-overlay items-center justify-center z-[58] p-6"
+      className="pc-overlay items-start justify-center z-[58] p-6"
       onClick={() => setShowSettings(false)}
     >
-      <div className="pc-modal" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="pc-modal my-auto"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="pc-settings-title"
+        tabIndex={-1}
+        ref={modalRef}
+        onKeyDown={onModalKeyDown}
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="pc-sweep pc-sweep--accent" />
 
         {/* HEADER */}
@@ -104,7 +174,12 @@ export function SettingsPanel() {
               <circle cx="12" cy="12" r="3" />
               <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
             </svg>
-            <span className="font-display font-semibold text-[16px] tracking-[1px]">SETTINGS</span>
+            <span
+              id="pc-settings-title"
+              className="font-display font-semibold text-[16px] tracking-[1px]"
+            >
+              SETTINGS
+            </span>
           </div>
           <button
             onClick={() => setShowSettings(false)}
@@ -130,13 +205,17 @@ export function SettingsPanel() {
               </div>
 
               <div>
-                <label className="mb-1.5 block text-[12.5px] font-medium text-fg">
+                <label
+                  htmlFor="pc-settings-model"
+                  className="mb-1.5 block text-[12.5px] font-medium text-fg"
+                >
                   Default model (new sessions)
                 </label>
                 <select
+                  id="pc-settings-model"
                   value={settings.model}
                   onChange={(e) => void updateSettings({ model: e.target.value })}
-                  className="w-full rounded-lg border border-border bg-panel-2 px-3 py-2.5 text-[12.5px] text-fg outline-none"
+                  className="pc-select w-full rounded-lg border border-border bg-panel-2 px-3 py-2.5 text-[12.5px] text-fg outline-none"
                 >
                   {MODELS.map((m) => (
                     <option key={m.id} value={m.id}>
@@ -148,6 +227,13 @@ export function SettingsPanel() {
                   Used as the starting model for new chats. Change a chat&apos;s model from its
                   composer.
                 </p>
+                {/* settingsError is shared by the model select and the permission
+                    policy buttons; surface it next to its higher control here. */}
+                {settingsError && (
+                  <p className="mt-1.5 text-[11px] text-danger" role="alert">
+                    Couldn't save settings: {settingsError}
+                  </p>
+                )}
               </div>
 
               <div>
@@ -198,21 +284,34 @@ export function SettingsPanel() {
                   </button>
                 )}
                 {oauthError && (
-                  <p className="mt-1.5 text-[11px] text-danger">Sign-in failed: {oauthError}</p>
+                  <p className="mt-1.5 text-[11px] text-danger" role="alert">
+                    Sign-in failed: {oauthError}
+                  </p>
                 )}
               </div>
 
               <div>
-                <label className="mb-1.5 block text-[12.5px] font-medium text-fg">API key</label>
+                <label
+                  htmlFor="pc-settings-apikey"
+                  className="mb-1.5 block text-[12.5px] font-medium text-fg"
+                >
+                  API key
+                </label>
                 <div className="flex gap-2">
                   <input
+                    id="pc-settings-apikey"
                     type="password"
                     value={apiKey}
-                    onChange={(e) => setApiKey(e.target.value)}
+                    onChange={(e) => {
+                      setApiKey(e.target.value);
+                      // Clear a stale "Couldn't save key" as the user corrects it.
+                      if (keyError) setKeyError(null);
+                    }}
                     placeholder={settings.apiKeySet ? "••••••••  (replace)" : "sk-ant-…"}
-                    className="flex-1 rounded-lg border border-border bg-panel-2 px-3 py-2.5 font-mono text-[12.5px] text-muted outline-none select-text"
+                    className="flex-1 rounded-lg border border-border bg-panel-2 px-3 py-2.5 font-mono text-[12.5px] text-muted outline-none transition-colors focus:border-accent/50 select-text"
                   />
                   <button
+                    ref={saveBtnRef}
                     onClick={() => void saveKey()}
                     disabled={saving || !apiKey.trim()}
                     className="pc-btn-accent px-4 py-2.5 text-[12.5px] disabled:opacity-30"
@@ -220,6 +319,14 @@ export function SettingsPanel() {
                     {saveLabel}
                   </button>
                 </div>
+                {keyError && (
+                  <p className="mt-1.5 text-[11px] text-danger" role="alert">
+                    Couldn't save key: {keyError}
+                  </p>
+                )}
+                <span role="status" aria-live="polite" className="sr-only">
+                  {savedKey ? "API key saved" : ""}
+                </span>
                 <p className="mt-1.5 text-[11px] text-faint">
                   {signedIn
                     ? "Signed in with Claude — Portcode uses your subscription; an API key is optional."
@@ -337,6 +444,11 @@ export function SettingsPanel() {
                   Pair a phone
                 </button>
               )}
+              {pairingError && (
+                <p className="mt-1.5 text-[11px] text-danger" role="alert">
+                  Pairing failed: {pairingError}
+                </p>
+              )}
             </div>
           </section>
         </div>
@@ -349,6 +461,16 @@ export function SettingsPanel() {
       </div>
     </div>
   );
+}
+
+/** Restart the one-shot pc-flash on a persistent node: drop the class, force a
+ *  reflow so the browser registers the removal, then re-add it. Replays the CSS
+ *  animation without remounting (which would yank focus out of the focus trap). */
+function replayFlash(node: HTMLElement | null) {
+  if (!node) return;
+  node.classList.remove("pc-flash");
+  void node.offsetWidth; // force reflow so the re-added class restarts the animation
+  node.classList.add("pc-flash");
 }
 
 /** Show only the first 8 and last 4 chars of a base64 key to keep the UI compact. */
@@ -372,12 +494,31 @@ function PairingCode({ payload, onDone }: { payload: PairingPayload; onDone: () 
   const json = JSON.stringify(payload);
   const [copied, setCopied] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyBtnRef = useRef<HTMLButtonElement | null>(null);
+
+  // Clear the "Copied ✓" reset timer on unmount. PairingCode is dismissed (Done)
+  // well within the 1.5s window, so an uncleared timer would setState after unmount.
+  useEffect(
+    () => () => {
+      if (copiedTimer.current !== null) clearTimeout(copiedTimer.current);
+    },
+    [],
+  );
+
+  // Replay the one-shot pc-flash on the SAME Copy node when a copy succeeds,
+  // restarting the CSS animation without remounting (which would drop focus).
+  useEffect(() => {
+    if (!copied) return;
+    replayFlash(copyBtnRef.current);
+  }, [copied]);
 
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(json);
       setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      if (copiedTimer.current !== null) clearTimeout(copiedTimer.current);
+      copiedTimer.current = setTimeout(() => setCopied(false), 1500);
     } catch {
       // Clipboard may be unavailable (no permission / older webview); the raw text
       // below is always selectable as a fallback.
@@ -412,6 +553,7 @@ function PairingCode({ payload, onDone }: { payload: PairingPayload; onDone: () 
 
         <div className="flex w-full items-center gap-2">
           <button
+            ref={copyBtnRef}
             onClick={() => void copy()}
             className="flex-1 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12.5px] text-fg transition-colors hover:border-accent/50"
           >
@@ -424,6 +566,9 @@ function PairingCode({ payload, onDone }: { payload: PairingPayload; onDone: () 
             Done
           </button>
         </div>
+        <span role="status" aria-live="polite" className="sr-only">
+          {copied ? "Pairing code copied" : ""}
+        </span>
 
         <button
           onClick={() => setShowRaw((v) => !v)}

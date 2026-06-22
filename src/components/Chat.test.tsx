@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { render, screen, fireEvent } from "@testing-library/react";
 
 import { Chat } from "./Chat";
 import { useStore } from "../store/store";
@@ -43,7 +43,14 @@ beforeEach(() => {
 
 describe("Chat empty state", () => {
   it("shows the welcome empty state when there is no active session", () => {
-    useStore.setState({ activeId: null, messages: {}, streaming: false });
+    // An API key is set so the unauthenticated sign-in nudge is suppressed and the
+    // keyboard-hint assertions below aren't ambiguous.
+    useStore.setState({
+      activeId: null,
+      messages: {},
+      streaming: false,
+      settings: { ...initial.settings, apiKeySet: true },
+    });
 
     render(<Chat />);
 
@@ -157,5 +164,335 @@ describe("Chat children", () => {
     ).toBeInTheDocument();
     // PermissionPrompt returns null when nothing is pending.
     expect(screen.queryByText(/wants to run/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("Chat auto-scroll (only follows when pinned to bottom)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("attaches a passive scroll listener that recomputes pinned-to-bottom without throwing", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "hi")] },
+      streaming: false,
+    });
+    const { container } = render(<Chat />);
+    const scroller = container.querySelector(".overflow-y-auto");
+    expect(scroller).not.toBeNull();
+    // Firing the listener (the user scrolling) just recomputes the flag — no throw.
+    expect(() => fireEvent.scroll(scroller as HTMLElement)).not.toThrow();
+  });
+
+  it("follows the streaming transcript to the bottom via a ResizeObserver while pinned", () => {
+    const captured: { cb?: () => void } = {};
+    const observe = vi.fn();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(cb: () => void) {
+          captured.cb = cb;
+        }
+        observe = observe;
+        disconnect = vi.fn();
+      },
+    );
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "streaming")] },
+      streaming: true,
+    });
+    render(<Chat />);
+    // The streaming effect observes the content for height growth.
+    expect(observe).toHaveBeenCalledTimes(1);
+    // Firing the observer (a content resize, pinned to bottom) must not throw.
+    expect(captured.cb).toBeDefined();
+    captured.cb?.();
+  });
+});
+
+describe("Chat live region (screen-reader announcements)", () => {
+  it("marks the transcript wrapper as a polite live region and reflects streaming via aria-busy", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "hi")] },
+      streaming: true,
+    });
+
+    const { container } = render(<Chat />);
+    const log = container.querySelector('[role="log"]');
+    expect(log).not.toBeNull();
+    expect(log).toHaveAttribute("aria-live", "polite");
+    // aria-busy mirrors `streaming` so AT knows the turn is still updating.
+    expect(log).toHaveAttribute("aria-busy", "true");
+  });
+
+  it("clears aria-busy when no turn is streaming", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "hi")] },
+      streaming: false,
+    });
+
+    const { container } = render(<Chat />);
+    expect(container.querySelector('[role="log"]')).toHaveAttribute("aria-busy", "false");
+  });
+
+  it("makes the transcript programmatically focusable (tabIndex -1) so focus can be routed there", () => {
+    // The scroll region is focusable out of the Tab order so the PermissionPrompt
+    // can move focus back to it when a gated turn clears mid-stream and the Deny
+    // button unmounts (otherwise focus would fall back to <body>).
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "hi")] },
+      streaming: false,
+    });
+
+    const { container } = render(<Chat />);
+    const log = container.querySelector('[role="log"]') as HTMLElement;
+    expect(log).toHaveAttribute("tabindex", "-1");
+    // It actually accepts focus.
+    log.focus();
+    expect(log).toHaveFocus();
+  });
+});
+
+describe("Chat init-error panel", () => {
+  it("renders the init-failure alert (not the welcome copy) when initError is set", () => {
+    useStore.setState({
+      activeId: null,
+      messages: {},
+      streaming: false,
+      initError: "core unreachable",
+    });
+
+    render(<Chat />);
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toBeInTheDocument();
+    expect(screen.getByText("core unreachable")).toBeInTheDocument();
+    // The welcome empty state must not also render.
+    expect(screen.queryByText(EMPTY_HINT)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+  });
+
+  it("calls retryInit when the init-error Retry button is clicked", () => {
+    const retryInit = vi.fn(async () => {});
+    useStore.setState({
+      activeId: null,
+      messages: {},
+      streaming: false,
+      initError: "boom",
+      retryInit,
+    });
+
+    render(<Chat />);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(retryInit).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Chat load-error retry block", () => {
+  it("renders the load-failure retry alert for a load-failed session", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: {}, // no entry -> EMPTY fallback, so messages.length === 0
+      loadErrors: { s1: true },
+      streaming: false,
+    });
+
+    render(<Chat />);
+
+    expect(screen.getByText("Couldn't load this conversation.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    // The welcome empty state must not win for a load-failed session.
+    expect(screen.queryByText(EMPTY_HINT)).not.toBeInTheDocument();
+  });
+
+  it("calls retryLoad(activeId) when the load-error Retry button is clicked", () => {
+    const retryLoad = vi.fn(async () => {});
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: {},
+      loadErrors: { s1: true },
+      streaming: false,
+      retryLoad,
+    });
+
+    render(<Chat />);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(retryLoad).toHaveBeenCalledWith("s1");
+  });
+
+  it("still shows the welcome empty state for a genuinely empty (non-failed) session", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [] },
+      loadErrors: {},
+      streaming: false,
+      settings: { ...initial.settings, apiKeySet: true },
+    });
+
+    render(<Chat />);
+    expect(screen.getByText(EMPTY_HINT)).toBeInTheDocument();
+    expect(screen.queryByText("Couldn't load this conversation.")).not.toBeInTheDocument();
+  });
+});
+
+describe("Chat scroll-to-latest affordance", () => {
+  // Pretend the scroller is taller than the viewport and scrolled up, so the
+  // scroll listener computes "not pinned".
+  const stubScrolledUp = (el: HTMLElement) => {
+    Object.defineProperty(el, "scrollHeight", { value: 1000, configurable: true });
+    Object.defineProperty(el, "clientHeight", { value: 300, configurable: true });
+    el.scrollTop = 0;
+  };
+
+  it("hides the button while pinned to the bottom", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "hi")] },
+      streaming: false,
+    });
+
+    render(<Chat />);
+    expect(screen.queryByRole("button", { name: "Scroll to latest" })).not.toBeInTheDocument();
+  });
+
+  it("shows the button after the user scrolls up, then hides it and pins on click", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "hi")] },
+      streaming: false,
+    });
+
+    const { container } = render(<Chat />);
+    const scroller = container.querySelector(".overflow-y-auto") as HTMLElement;
+    stubScrolledUp(scroller);
+    fireEvent.scroll(scroller);
+
+    const btn = screen.getByRole("button", { name: "Scroll to latest" });
+    expect(btn).toBeInTheDocument();
+    // Carries the pcRise entrance class (gated for reduced motion in index.css)
+    // so it eases in instead of snapping, since it mounts only when scrolled up.
+    expect(btn).toHaveClass("pc-fab-enter");
+
+    fireEvent.click(btn);
+    expect(screen.queryByRole("button", { name: "Scroll to latest" })).not.toBeInTheDocument();
+
+    // After re-pinning, a real scroll with bottom geometry must keep it hidden via
+    // the `scrollHeight - scrollTop - clientHeight < 80` recompute, not just the
+    // direct setPinned in the click handler.
+    scroller.scrollTop = scroller.scrollHeight - 300; // 1000 - clientHeight(300) => delta 0 < 80
+    fireEvent.scroll(scroller);
+    expect(screen.queryByRole("button", { name: "Scroll to latest" })).not.toBeInTheDocument();
+  });
+
+  it("never shows the button when there are no messages", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [] },
+      streaming: false,
+      settings: { ...initial.settings, apiKeySet: true },
+    });
+
+    const { container } = render(<Chat />);
+    const scroller = container.querySelector(".overflow-y-auto") as HTMLElement;
+    stubScrolledUp(scroller);
+    fireEvent.scroll(scroller);
+    expect(screen.queryByRole("button", { name: "Scroll to latest" })).not.toBeInTheDocument();
+  });
+});
+
+describe("Chat EmptyState auth affordance", () => {
+  it("nudges to sign in when unauthenticated on desktop", () => {
+    useStore.setState({
+      activeId: null,
+      messages: {},
+      streaming: false,
+      remoteMode: false,
+      oauthStatus: null,
+      settings: { ...initial.settings, apiKeySet: false },
+    });
+
+    render(<Chat />);
+    expect(screen.getByText("Sign in with Claude or add an API key to start")).toBeInTheDocument();
+  });
+
+  it("opens settings when the sign-in nudge button is clicked", () => {
+    const setShowSettings = vi.fn();
+    useStore.setState({
+      activeId: null,
+      messages: {},
+      streaming: false,
+      remoteMode: false,
+      oauthStatus: null,
+      settings: { ...initial.settings, apiKeySet: false },
+      setShowSettings,
+    });
+
+    render(<Chat />);
+    fireEvent.click(screen.getByRole("button", { name: "Open settings" }));
+    expect(setShowSettings).toHaveBeenCalledWith(true);
+  });
+
+  it("hides the nudge when signed in via OAuth", () => {
+    useStore.setState({
+      activeId: null,
+      messages: {},
+      streaming: false,
+      remoteMode: false,
+      oauthStatus: { signedIn: true, expiresAt: null, account: null, tier: null },
+      settings: { ...initial.settings, apiKeySet: false },
+    });
+
+    render(<Chat />);
+    expect(
+      screen.queryByText("Sign in with Claude or add an API key to start"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("hides the nudge when an API key is set", () => {
+    useStore.setState({
+      activeId: null,
+      messages: {},
+      streaming: false,
+      remoteMode: false,
+      oauthStatus: null,
+      settings: { ...initial.settings, apiKeySet: true },
+    });
+
+    render(<Chat />);
+    expect(
+      screen.queryByText("Sign in with Claude or add an API key to start"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("suppresses the nudge in remote mode even when unauthenticated", () => {
+    useStore.setState({
+      activeId: null,
+      messages: {},
+      streaming: false,
+      remoteMode: true,
+      oauthStatus: null,
+      settings: { ...initial.settings, apiKeySet: false },
+    });
+
+    render(<Chat />);
+    expect(
+      screen.queryByText("Sign in with Claude or add an API key to start"),
+    ).not.toBeInTheDocument();
   });
 });

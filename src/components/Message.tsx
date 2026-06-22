@@ -1,12 +1,28 @@
+import { memo, useMemo, type ComponentProps } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
-import type { Message } from "../types";
+import type { ContentBlock, Message } from "../types";
 import { useStore } from "../store/store";
 import { usePrefersReducedMotion, useScramble } from "../lib/useScramble";
 import { ToolCall } from "./ToolCall";
 
-export function MessageView({
+// Hoisted to module scope so they're referentially stable across renders —
+// otherwise a fresh array each render defeats React.memo on TextBlock and makes
+// ReactMarkdown re-run remark/rehype (incl. syntax highlighting) on every delta.
+// Typed off ReactMarkdown's own props so we don't deep-import unified's PluggableList.
+type MarkdownPlugins = NonNullable<ComponentProps<typeof ReactMarkdown>["remarkPlugins"]>;
+const REMARK_PLUGINS: MarkdownPlugins = [remarkGfm];
+const REHYPE_PLUGINS: MarkdownPlugins = [[rehypeHighlight, { detect: true }]];
+
+// A tool_result paired with its tool_use by toolUseId. Reused (not re-derived)
+// so the ToolCall props stay the existing narrowed shape.
+type ResultBlock = Extract<ContentBlock, { kind: "tool_result" }>;
+
+// Memoised: while a turn streams, only the active assistant message's props change,
+// so history rows (incl. their markdown + syntax highlighting) don't re-render on
+// every delta — which kept the whole transcript re-highlighting ~45x/sec.
+export const MessageView = memo(function MessageView({
   message,
   isActive = false,
 }: {
@@ -26,12 +42,22 @@ export function MessageView({
     if (b.kind === "text") lastTextIndex = i;
   });
 
+  // Index results by toolUseId once per render instead of a linear find per
+  // tool_use — the active assistant row re-renders on every delta.
+  const resultByUseId = useMemo(() => {
+    const m = new Map<string, ResultBlock>();
+    for (const b of message.blocks) if (b.kind === "tool_result") m.set(b.toolUseId, b);
+    return m;
+  }, [message.blocks]);
+
   return (
-    <div className={`mb-5 flex gap-[11px] ${isUser ? "justify-end" : ""}`}>
+    <div className={`mb-5 flex gap-[11px] ${isUser ? "justify-end" : "pc-msg-enter"}`}>
       {!isUser && <Avatar />}
-      <div className={`min-w-0 ${isUser ? "" : "flex-1"}`}>
+      <div className={`min-w-0 ${isUser ? "max-w-[82%]" : "flex-1"}`}>
         {isUser ? (
-          <div className="pc-bubble-user whitespace-pre-wrap select-text">{textOf(message)}</div>
+          <div className="pc-bubble-user whitespace-pre-wrap break-words select-text">
+            {textOf(message)}
+          </div>
         ) : (
           <div className="space-y-2">
             {message.blocks.map((b, i) => {
@@ -41,22 +67,14 @@ export function MessageView({
                     key={i}
                     text={b.text}
                     animate={animate}
+                    active={isActive}
                     caret={animate && i === lastTextIndex}
                   />
                 );
               }
               if (b.kind === "tool_use") {
-                const result = message.blocks.find(
-                  (x) => x.kind === "tool_result" && x.toolUseId === b.id,
-                );
-                return (
-                  <ToolCall
-                    key={i}
-                    name={b.name}
-                    input={b.input}
-                    result={result && result.kind === "tool_result" ? result : undefined}
-                  />
-                );
+                const result = resultByUseId.get(b.id);
+                return <ToolCall key={i} name={b.name} input={b.input} result={result} />;
               }
               return null; // tool_result is rendered alongside its tool_use
             })}
@@ -66,28 +84,47 @@ export function MessageView({
       </div>
     </div>
   );
-}
+});
 
 /**
  * A single assistant text block. While its turn is streaming it reveals one WORD
  * at a time as a "decode" — each word flickers through random glyphs and resolves
  * left-to-right; once the turn completes it re-renders as full Markdown.
  */
-function TextBlock({ text, animate, caret }: { text: string; animate: boolean; caret: boolean }) {
+const TextBlock = memo(function TextBlock({
+  text,
+  animate,
+  active,
+  caret,
+}: {
+  text: string;
+  animate: boolean;
+  active: boolean;
+  caret: boolean;
+}) {
   if (animate) {
     return <ScrambleText text={text} caret={caret} />;
   }
+  // Active but NOT animating (reduced-motion ON, or typingAnimation off): render
+  // cheap static plain text in the SAME .prose-pc body typography as the settled
+  // markdown, so the body resolves in place when ReactMarkdown takes over. This
+  // avoids re-running remark/rehype + syntax highlighting on every streaming
+  // delta — the whole accumulated reply was otherwise re-highlighted per chunk.
+  if (active) {
+    return (
+      <div className="prose-pc">
+        <p className="whitespace-pre-wrap break-words">{text}</p>
+      </div>
+    );
+  }
   return (
     <div className="prose-pc">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[[rehypeHighlight, { detect: true }]]}
-      >
+      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS}>
         {text}
       </ReactMarkdown>
     </div>
   );
-}
+});
 
 /**
  * The streaming assistant turn rendered as a per-word decode (see useScramble):
@@ -99,11 +136,19 @@ function ScrambleText({ text, caret }: { text: string; caret: boolean }) {
   const { display, scrambleStart } = useScramble(text, true);
   const settled = display.slice(0, scrambleStart);
   const decoding = display.slice(scrambleStart);
+  // Render the decode in the SAME typography as the settled markdown body (.prose-pc,
+  // a <p>) so that when the turn finishes and ReactMarkdown takes over, the text
+  // resolves in place — no font/size/line-height swap reflowing the whole reply.
+  // Hidden from assistive tech: the ~45/sec glyph churn would flood the chat live
+  // region. When the turn ends the same text re-renders via the non-hidden
+  // ReactMarkdown TextBlock, which the conversation log announces in place.
   return (
-    <div className="prose-pc whitespace-pre-wrap break-words font-mono text-[13px]">
-      {settled}
-      {decoding && <span className="pc-scramble">{decoding}</span>}
-      {caret && <span className="pc-caret" aria-hidden="true" />}
+    <div className="prose-pc" aria-hidden="true">
+      <p className="whitespace-pre-wrap break-words">
+        {settled}
+        {decoding && <span className="pc-scramble">{decoding}</span>}
+        {caret && <span className="pc-caret" aria-hidden="true" />}
+      </p>
     </div>
   );
 }
@@ -133,17 +178,20 @@ function Avatar() {
 
 function Thinking() {
   return (
-    <div role="status" aria-live="polite" className="flex items-center gap-1 py-1 text-muted">
+    <div className="flex items-center gap-1 py-1 text-muted">
       <span className="sr-only">Agent is thinking</span>
       <span
         aria-hidden="true"
-        className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.2s]"
+        className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.2s] motion-reduce:animate-none"
       />
       <span
         aria-hidden="true"
-        className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.1s]"
+        className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.1s] motion-reduce:animate-none"
       />
-      <span aria-hidden="true" className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted" />
+      <span
+        aria-hidden="true"
+        className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted motion-reduce:animate-none"
+      />
     </div>
   );
 }

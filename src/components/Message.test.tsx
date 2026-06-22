@@ -3,6 +3,7 @@ import { render, screen, fireEvent, act } from "@testing-library/react";
 
 import { MessageView } from "./Message";
 import { STEP_MS } from "../lib/useScramble";
+import { useStore } from "../store/store";
 import type { ContentBlock, Message, Role } from "../types";
 
 // MessageView is a pure, props-driven presentational component: it folds a
@@ -63,6 +64,21 @@ describe("MessageView — user role", () => {
     expect(bubble).not.toBeNull();
     expect(bubble.textContent).toBe("");
   });
+
+  it("wraps a long unbroken string in the user bubble (break-words)", () => {
+    // A pasted long URL/path/spaceless key must wrap inside the 82% wrapper
+    // instead of overflowing it — the bubble carries break-words like the
+    // assistant streaming path.
+    const url = "https://example.com/" + "a".repeat(200);
+    const { container } = render(
+      <MessageView message={message("user", [{ kind: "text", text: url }])} />,
+    );
+
+    const bubble = container.querySelector(".pc-bubble-user") as HTMLElement;
+    expect(bubble).not.toBeNull();
+    expect(bubble.className).toContain("break-words");
+    expect(bubble.textContent).toBe(url);
+  });
 });
 
 describe("MessageView — assistant role", () => {
@@ -88,6 +104,39 @@ describe("MessageView — assistant role", () => {
     expect(screen.getByText("bold")).toBeInTheDocument();
     expect(container.querySelector("strong")).not.toBeNull();
     expect(container.querySelector(".prose-pc")).not.toBeNull();
+  });
+
+  it("renders a settled long unbroken token inside a .prose-pc <p> so it wraps at full width", () => {
+    // The wrapping itself is delivered by the `.prose-pc p` stylesheet rule
+    // (overflow-wrap/word-break), which jsdom does not lay out — so assert the
+    // structural contract the rule targets: the long token lands in a <p> within
+    // .prose-pc (not in a <pre>, which keeps horizontal scroll).
+    const longPath = "C:\\dev\\porthex\\" + "segment".repeat(40) + "\\file.ts";
+    const { container } = render(
+      <MessageView message={message("assistant", [{ kind: "text", text: longPath }])} />,
+    );
+
+    const prose = container.querySelector(".prose-pc");
+    expect(prose).not.toBeNull();
+    const p = prose!.querySelector("p");
+    expect(p).not.toBeNull();
+    expect(p!.textContent).toBe(longPath);
+    // The token must not be wrapped in a <pre> (those keep overflow-x: auto).
+    expect(prose!.querySelector("pre")).toBeNull();
+  });
+
+  it("eases assistant rows in with pc-msg-enter while user rows do not animate", () => {
+    const { container: asst } = render(
+      <MessageView message={message("assistant", [{ kind: "text", text: "hi" }])} />,
+    );
+    const asstRow = asst.firstElementChild as HTMLElement;
+    expect(asstRow.className).toContain("pc-msg-enter");
+
+    const { container: usr } = render(
+      <MessageView message={message("user", [{ kind: "text", text: "hi" }])} />,
+    );
+    const usrRow = usr.firstElementChild as HTMLElement;
+    expect(usrRow.className).not.toContain("pc-msg-enter");
   });
 
   it("renders a tool_use block as a ToolCall and pairs it with a non-error tool_result", () => {
@@ -174,13 +223,15 @@ describe("MessageView — assistant role", () => {
     const dots = container.querySelectorAll(".animate-bounce");
     expect(dots).toHaveLength(3);
 
-    // The indicator is announced to assistive tech: a polite live status region
-    // carrying a visually-hidden "Agent is thinking" label, while the decorative
-    // dots are hidden from the accessibility tree.
-    const status = screen.getByRole("status");
-    expect(status).toHaveAttribute("aria-live", "polite");
-    expect(status).toHaveTextContent("Agent is thinking");
+    // The indicator carries a visually-hidden "Agent is thinking" label that the
+    // outer transcript log region announces when this row is inserted; it is NOT
+    // its own live region (no nested role="status"/aria-live inside role="log"),
+    // while the decorative dots are hidden from the accessibility tree.
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByText("Agent is thinking")).toBeInTheDocument();
     dots.forEach((dot) => expect(dot).toHaveAttribute("aria-hidden", "true"));
+    // The geometric bounce stops under prefers-reduced-motion (ON on the dev OS).
+    dots.forEach((dot) => expect(dot.className).toContain("motion-reduce:animate-none"));
   });
 
   it("renders multiple text blocks and a tool pair together", () => {
@@ -214,7 +265,7 @@ describe("MessageView — typing animation", () => {
     vi.unstubAllGlobals();
   });
 
-  it("types the in-flight assistant turn in monospace with a blinking caret", () => {
+  it("renders the in-flight assistant turn in the body typography with a blinking caret", () => {
     const { container } = render(
       <MessageView
         message={message("assistant", [{ kind: "text", text: "**bold** text" }])}
@@ -222,9 +273,10 @@ describe("MessageView — typing animation", () => {
       />,
     );
 
-    // The active turn shows the mono typing view + caret, not formatted markdown.
+    // The active turn shows the decode view in the SAME .prose-pc body typography as
+    // the settled markdown (so it resolves in place) + a caret, not formatted markdown.
     expect(container.querySelector(".pc-caret")).not.toBeNull();
-    expect(container.querySelector(".font-mono")).not.toBeNull();
+    expect(container.querySelector(".prose-pc")).not.toBeNull();
     expect(container.querySelector("strong")).toBeNull();
   });
 
@@ -235,6 +287,58 @@ describe("MessageView — typing animation", () => {
 
     expect(container.querySelector(".pc-caret")).toBeNull();
     expect(container.querySelector("strong")).not.toBeNull();
+  });
+
+  it("renders the active turn as cheap plain text (no markdown) when the decode is off", () => {
+    // typingAnimation off (also the reduced-motion default) means the active row
+    // does not animate — instead of re-running ReactMarkdown + rehype-highlight on
+    // every streaming delta, it renders static plain text in the .prose-pc body
+    // typography so it resolves in place when the turn settles.
+    const prev = useStore.getState().settings;
+    useStore.setState({ settings: { ...prev, typingAnimation: false } });
+    try {
+      const { container } = render(
+        <MessageView
+          message={message("assistant", [{ kind: "text", text: "**bold** and plain" }])}
+          isActive
+        />,
+      );
+
+      // The growing reply is plain text in a .prose-pc <p> — NOT highlighted markdown.
+      const prose = container.querySelector(".prose-pc");
+      expect(prose).not.toBeNull();
+      const p = prose!.querySelector("p");
+      expect(p).not.toBeNull();
+      expect(p!.className).toContain("whitespace-pre-wrap");
+      expect(p!.textContent).toBe("**bold** and plain");
+      // No markdown parse and no syntax highlighting ran on the streaming row.
+      expect(container.querySelector("strong")).toBeNull();
+      expect(container.querySelector("code.hljs")).toBeNull();
+      // It is the static path, not the animated decode — no caret/scramble.
+      expect(container.querySelector(".pc-caret")).toBeNull();
+      expect(container.querySelector(".pc-scramble")).toBeNull();
+    } finally {
+      useStore.setState({ settings: prev });
+    }
+  });
+
+  it("renders the SAME content as markdown once the turn is inactive (decode off)", () => {
+    // The plain streaming branch only applies while active; once the row settles
+    // (isActive false), the same text re-renders through ReactMarkdown.
+    const prev = useStore.getState().settings;
+    useStore.setState({ settings: { ...prev, typingAnimation: false } });
+    try {
+      const { container } = render(
+        <MessageView
+          message={message("assistant", [{ kind: "text", text: "**bold** and plain" }])}
+        />,
+      );
+
+      expect(container.querySelector("strong")).not.toBeNull();
+      expect(container.querySelector(".prose-pc")).not.toBeNull();
+    } finally {
+      useStore.setState({ settings: prev });
+    }
   });
 });
 
@@ -284,12 +388,17 @@ describe("MessageView — scramble decode (active turn)", () => {
     prime();
     step(1);
 
-    // The decoding tail is wrapped in .pc-scramble (the accent glow); the turn is
-    // monospace with a caret and is NOT yet rendered as Markdown.
+    // The decoding tail is wrapped in .pc-scramble (the accent glow), in the same
+    // .prose-pc body typography as settled markdown, with a caret, and is NOT yet
+    // rendered as Markdown.
     expect(container.querySelector(".pc-scramble")).not.toBeNull();
-    expect(container.querySelector(".font-mono")).not.toBeNull();
+    expect(container.querySelector(".prose-pc")).not.toBeNull();
     expect(container.querySelector(".pc-caret")).not.toBeNull();
     expect(container.querySelector("strong")).toBeNull();
+
+    // The decoding wrapper is hidden from assistive tech: its ~45/sec glyph churn
+    // would flood the chat live region. The settled markdown re-announces in place.
+    expect(container.querySelector(".prose-pc")).toHaveAttribute("aria-hidden", "true");
   });
 
   it("resolves words into their real characters as frames advance", () => {
