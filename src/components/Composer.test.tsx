@@ -34,7 +34,7 @@ beforeEach(() => {
   useStore.setState(initial, true);
   // Default: runAgent resolves to a cancellable handle so `send` starts a turn
   // without ever touching a real backend.
-  m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}) });
+  m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}), dispose: vi.fn() });
   m.openFolder.mockResolvedValue(null);
   m.saveSettings.mockImplementation(async (s) => ({ ...DEFAULT_SETTINGS, ...s }));
 });
@@ -304,11 +304,11 @@ describe("Composer UsageMeter", () => {
     useStore.setState({ activeId: "a", usage: { a: usage } });
     render(<Composer />);
 
-    // fmtTokens(1500) -> "1.5k"; Opus cost = (1200*15 + 300*75)/1e6 = 0.0405
-    // which is >= 0.01, so 2 decimals: $0.04. Tokens and cost render in their
+    // fmtTokens(1500) -> "1.5k"; Opus cost = (1200*5 + 300*25)/1e6 = 0.0135
+    // which is >= 0.01, so 2 decimals: $0.01. Tokens and cost render in their
     // own spans (text-accent-2 / text-success), so assert each separately.
     expect(screen.getByText("1.5k tok")).toBeInTheDocument();
-    expect(screen.getByText("$0.04")).toBeInTheDocument();
+    expect(screen.getByText("$0.01")).toBeInTheDocument();
     // Hover title carries the localized raw in/out split.
     expect(screen.getByTitle("1,200 in · 300 out")).toBeInTheDocument();
   });
@@ -318,10 +318,10 @@ describe("Composer UsageMeter", () => {
     useStore.setState({ activeId: "a", usage: { a: usage } });
     render(<Composer />);
 
-    // total 100 -> fmtTokens(100) -> "100"; Opus cost = (100*15)/1e6 = 0.0015
-    // which is < 0.01, so 4 decimals: $0.0015.
+    // total 100 -> fmtTokens(100) -> "100"; Opus cost = (100*5)/1e6 = 0.0005
+    // which is < 0.01, so 4 decimals: $0.0005.
     expect(screen.getByText("100 tok")).toBeInTheDocument();
-    expect(screen.getByText("$0.0015")).toBeInTheDocument();
+    expect(screen.getByText("$0.0005")).toBeInTheDocument();
     expect(screen.getByTitle("100 in · 0 out")).toBeInTheDocument();
   });
 

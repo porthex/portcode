@@ -4,7 +4,14 @@ import { render, screen, fireEvent, act, cleanup } from "@testing-library/react"
 import { SettingsPanel } from "./Settings";
 import { useStore } from "../store/store";
 import * as ipc from "../lib/ipc";
-import { DEFAULT_SETTINGS, MODELS, type Settings, type ToolPolicy } from "../types";
+import {
+  DEFAULT_SETTINGS,
+  MODELS,
+  type PairedDevice,
+  type PhoneSyncStatus,
+  type Settings,
+  type ToolPolicy,
+} from "../types";
 
 // SettingsPanel is the settings modal. It reads `settings` from the real store
 // and mutates it through the store's `updateSettings` action (which lands on
@@ -24,6 +31,10 @@ vi.mock("../lib/ipc", () => ({
   startOauthLogin: vi.fn(),
   oauthLogout: vi.fn(),
   oauthStatus: vi.fn(),
+  // Phone sync: reached via the store's refreshPhoneSync/beginPairing/unpair.
+  phoneSyncStatus: vi.fn(),
+  phoneSyncBeginPairing: vi.fn(),
+  phoneSyncUnpair: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -56,6 +67,13 @@ beforeEach(() => {
   });
   m.oauthLogout.mockResolvedValue(undefined);
   m.oauthStatus.mockResolvedValue({ signedIn: false, expiresAt: null, account: null, tier: null });
+  m.phoneSyncStatus.mockResolvedValue({ devicePublicKey: "DEVICE==", paired: [] });
+  m.phoneSyncBeginPairing.mockResolvedValue({
+    version: 1,
+    publicKey: "DEVICE==",
+    nonce: "NONCE==",
+  });
+  m.phoneSyncUnpair.mockResolvedValue(undefined);
 });
 
 describe("SettingsPanel — structure", () => {
@@ -385,5 +403,138 @@ describe("SettingsPanel — footer environment label", () => {
     m.isTauri.mockReturnValue(true);
     renderPanel();
     expect(screen.getByText("NATIVE CORE")).toBeInTheDocument();
+  });
+});
+
+describe("SettingsPanel — Phone Sync section", () => {
+  const withPhoneSync = (over: Partial<PhoneSyncStatus> = {}): PhoneSyncStatus => ({
+    devicePublicKey: "DEVICE_KEY_BASE64==",
+    paired: [],
+    ...over,
+  });
+
+  const paired = (): PairedDevice => ({
+    publicKey: "PHONE_KEY==",
+    name: "My Android",
+    pairedAt: 1000,
+    lastSeen: 2000,
+  });
+
+  it("renders the PHONE SYNC eyebrow label", () => {
+    renderPanel();
+    expect(screen.getByText("PHONE SYNC")).toBeInTheDocument();
+  });
+
+  it("shows the device public key (truncated) when phoneSync is set", () => {
+    useStore.setState({ phoneSync: withPhoneSync() });
+    renderPanel();
+    // "DEVICE_KEY_BASE64==" is 18 chars, so it gets truncated to first 8 + "…" + last 4
+    expect(screen.getByText("DEVICE_K…64==")).toBeInTheDocument();
+    expect(screen.getByText("This device")).toBeInTheDocument();
+  });
+
+  it("lists paired phones with name, truncated key, and unpair button", () => {
+    useStore.setState({ phoneSync: withPhoneSync({ paired: [paired()] }) });
+    renderPanel();
+
+    expect(screen.getByText("My Android")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Unpair My Android" })).toBeInTheDocument();
+  });
+
+  it("calls ipc.phoneSyncUnpair and refreshes when Unpair is clicked", async () => {
+    useStore.setState({ phoneSync: withPhoneSync({ paired: [paired()] }) });
+    m.phoneSyncStatus.mockResolvedValue(withPhoneSync({ paired: [] }));
+    renderPanel();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Unpair My Android" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(m.phoneSyncUnpair).toHaveBeenCalledWith("PHONE_KEY==");
+    expect(m.phoneSyncStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the Pair a phone button when no pairing is in progress", () => {
+    useStore.setState({ pairingPayload: null });
+    renderPanel();
+    expect(screen.getByRole("button", { name: "Pair a phone" })).toBeInTheDocument();
+  });
+
+  it("calls beginPairing and shows the pairing code when Pair a phone is clicked", async () => {
+    useStore.setState({ pairingPayload: null });
+    m.phoneSyncBeginPairing.mockResolvedValue({ version: 1, publicKey: "PUB==", nonce: "NON==" });
+    renderPanel();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Pair a phone" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(m.phoneSyncBeginPairing).toHaveBeenCalledTimes(1);
+    // After beginPairing the store sets pairingPayload; the component shows the QR.
+    useStore.setState({ pairingPayload: { version: 1, publicKey: "PUB==", nonce: "NON==" } });
+    // Re-render to see the updated state.
+    cleanup();
+    renderPanel();
+    expect(screen.getByTestId("pairing-qr")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Done" })).toBeInTheDocument();
+  });
+
+  it("renders the pairing payload as a scannable QR with a copyable text fallback", () => {
+    useStore.setState({ pairingPayload: { version: 1, publicKey: "PUB==", nonce: "NON==" } });
+    renderPanel();
+
+    // The QR (which the phone scans) and Done are shown up front; the raw code is
+    // tucked behind a "show" toggle for the can't-scan fallback.
+    expect(screen.getByTestId("pairing-qr")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Done" })).toBeInTheDocument();
+    expect(screen.queryByText(/"publicKey":"PUB=="/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Show pairing code/ }));
+    // The revealed text is the exact JSON the phone parses.
+    expect(screen.getByText(/"publicKey":"PUB=="/)).toBeInTheDocument();
+  });
+
+  it("copies the full pairing payload to the clipboard", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    useStore.setState({ pairingPayload: { version: 1, publicKey: "PUB==", nonce: "NON==" } });
+    renderPanel();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Copy code/ }));
+      await Promise.resolve();
+    });
+
+    expect(writeText).toHaveBeenCalledWith('{"version":1,"publicKey":"PUB==","nonce":"NON=="}');
+    expect(screen.getByRole("button", { name: /Copied/ })).toBeInTheDocument();
+  });
+
+  it("Done button clears the pairing payload", () => {
+    useStore.setState({ pairingPayload: { version: 1, publicKey: "PUB==", nonce: "NON==" } });
+    renderPanel();
+
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+
+    expect(useStore.getState().pairingPayload).toBeNull();
+  });
+
+  it("hides the desktop-only sections on a phone (remote mode)", () => {
+    // The agent's config (model/key/sign-in), the tool policy, and the desktop's
+    // show-a-QR pairing flow all live on the desktop — several of their commands
+    // are desktop-only and would error — so the phone hides those sections.
+    useStore.setState({ remoteMode: true });
+    renderPanel();
+
+    expect(screen.getByText("CONNECTION").closest("section")).toHaveClass("hidden");
+    expect(screen.getByText("PERMISSIONS").closest("section")).toHaveClass("hidden");
+    expect(screen.getByText("PHONE SYNC").closest("section")).toHaveClass("hidden");
+    // Appearance (purely client-side UI prefs) stays available.
+    expect(screen.getByText("APPEARANCE").closest("section")).not.toHaveClass("hidden");
+
+    useStore.setState({ remoteMode: false }); // don't leak into other tests
   });
 });

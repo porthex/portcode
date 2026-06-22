@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use std::time::Duration;
+use tauri::AppHandle;
 
 use futures_util::StreamExt;
 
@@ -70,8 +71,9 @@ pub struct ChatMessage {
 }
 
 /// Events streamed to the frontend. Tagged + camelCased to match `StreamEvent`
-/// in `src/types.ts`.
-#[derive(Serialize, Clone, Debug)]
+/// in `src/types.ts`. `Deserialize` lets Phone Sync decode it on the phone side
+/// (it is forwarded verbatim inside `sync::protocol::SyncFrame::Live`).
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
     TurnStart {
@@ -143,7 +145,8 @@ enum Building {
 }
 
 fn emit(app: &AppHandle, channel: &str, ev: StreamEvent) {
-    let _ = app.emit(channel, ev);
+    // Canonical chokepoint: delivers to the desktop UI and mirrors to the phone.
+    crate::sync::emit_event(app, channel, ev);
 }
 
 /// Stream a single assistant turn. Emits text/tool events as they arrive and
@@ -213,11 +216,26 @@ pub async fn stream_turn(
     let mut input_tokens: u32 = 0;
     let mut output_tokens: u32 = 0;
 
-    while let Some(chunk) = stream.next().await {
+    loop {
         if cancel.load(Ordering::Relaxed) {
             stop_reason = "cancelled".into();
             break;
         }
+        // Bound each read so a stalled connection can't park the turn forever with no
+        // terminal event — that would leave the UI's `streaming` flag stuck true and
+        // silently no-op every later message. 120s of total silence = a dead stream.
+        // This also makes the cancel check above reachable within <=120s, so Stop
+        // takes effect even when the connection is hung mid-read.
+        let next = match tokio::time::timeout(Duration::from_secs(120), stream.next()).await {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                return Err(
+                    "Stream stalled: no data from Anthropic for 120s. Please try again."
+                        .to_string(),
+                )
+            }
+        };
+        let Some(chunk) = next else { break };
         let bytes = chunk.map_err(|e| format!("Stream error: {e}"))?;
         buf.extend_from_slice(&bytes);
 

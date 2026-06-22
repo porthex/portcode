@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
+import { QRCodeSVG } from "qrcode.react";
 import { useStore } from "../store/store";
-import { MODELS, type ToolPolicy } from "../types";
+import { MODELS, type PairingPayload, type ToolPolicy } from "../types";
 import * as ipc from "../lib/ipc";
 
 export function SettingsPanel() {
@@ -16,6 +17,16 @@ export function SettingsPanel() {
   const scanlines = useStore((s) => s.scanlines);
   const setAmbientRain = useStore((s) => s.setAmbientRain);
   const setScanlines = useStore((s) => s.setScanlines);
+
+  const phoneSync = useStore((s) => s.phoneSync);
+  const pairingPayload = useStore((s) => s.pairingPayload);
+  const beginPairing = useStore((s) => s.beginPairing);
+  const unpair = useStore((s) => s.unpair);
+  const clearPairing = useStore((s) => s.clearPairing);
+  // On the phone (remote client) the agent — its model, key, sign-in, tool policy —
+  // and the desktop's "show a QR to pair" flow all live on the DESKTOP, so those
+  // sections are hidden here (several of their commands are desktop-only).
+  const remoteMode = useStore((s) => s.remoteMode);
 
   const [apiKey, setApiKey] = useState("");
   const [saving, setSaving] = useState(false);
@@ -107,7 +118,7 @@ export function SettingsPanel() {
         {/* BODY */}
         <div className="flex flex-col gap-6 p-5 max-h-[72vh] overflow-y-auto">
           {/* CONNECTION */}
-          <section>
+          <section className={remoteMode ? "hidden" : undefined}>
             <div className="pc-eyebrow">CONNECTION</div>
             <div className="flex flex-col gap-3.5">
               <div>
@@ -221,7 +232,7 @@ export function SettingsPanel() {
           </section>
 
           {/* PERMISSIONS */}
-          <section>
+          <section className={remoteMode ? "hidden" : undefined}>
             <div className="pc-eyebrow pc-eyebrow--amber">PERMISSIONS</div>
             <div className="flex gap-2">
               {(["allow", "ask", "deny"] as ToolPolicy[]).map((p) => (
@@ -267,6 +278,67 @@ export function SettingsPanel() {
               />
             </div>
           </section>
+
+          {/* PHONE SYNC */}
+          <section className={remoteMode ? "hidden" : undefined}>
+            <div className="pc-eyebrow">PHONE SYNC</div>
+            <div className="flex flex-col gap-3.5">
+              {phoneSync && (
+                <div>
+                  <label className="mb-1.5 block text-[12.5px] font-medium text-fg">
+                    This device
+                  </label>
+                  <div className="rounded-lg border border-border bg-panel-2 px-3 py-2.5 font-mono text-[11.5px] text-muted select-text">
+                    {truncateKey(phoneSync.devicePublicKey)}
+                  </div>
+                </div>
+              )}
+
+              {phoneSync && phoneSync.paired.length > 0 && (
+                <div>
+                  <label className="mb-1.5 block text-[12.5px] font-medium text-fg">
+                    Paired phones
+                  </label>
+                  <div className="flex flex-col gap-1.5">
+                    {phoneSync.paired.map((device) => (
+                      <div
+                        key={device.publicKey}
+                        className="flex items-center justify-between gap-3 rounded-lg border border-border bg-panel-2 px-3 py-2"
+                      >
+                        <div className="min-w-0 text-[12.5px]">
+                          <div className="flex items-center gap-1.5">
+                            <span className="pc-dot pc-dot--success" />
+                            <span className="min-w-0 truncate text-fg">{device.name}</span>
+                          </div>
+                          <div className="mt-0.5 font-mono text-[11px] text-muted">
+                            {truncateKey(device.publicKey)}
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => void unpair(device.publicKey)}
+                          className="shrink-0 rounded-lg border border-border bg-panel px-3 py-2 text-[12.5px] text-muted hover:text-danger"
+                          aria-label={`Unpair ${device.name}`}
+                        >
+                          Unpair
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {pairingPayload ? (
+                <PairingCode payload={pairingPayload} onDone={clearPairing} />
+              ) : (
+                <button
+                  onClick={() => void beginPairing()}
+                  className="pc-btn-accent w-full px-3 py-2.5 text-[12.5px]"
+                >
+                  Pair a phone
+                </button>
+              )}
+            </div>
+          </section>
         </div>
 
         {/* FOOTER */}
@@ -279,12 +351,95 @@ export function SettingsPanel() {
   );
 }
 
+/** Show only the first 8 and last 4 chars of a base64 key to keep the UI compact. */
+function truncateKey(key: string): string {
+  if (key.length <= 16) return key;
+  return `${key.slice(0, 8)}…${key.slice(-4)}`;
+}
+
 function formatExpiry(expiresAt: number): string {
   // expiresAt is a unix timestamp in seconds.
   return new Date(expiresAt * 1000).toLocaleString(undefined, {
     dateStyle: "medium",
     timeStyle: "short",
   });
+}
+
+/** The desktop pairing affordance: the live PairingPayload rendered as a scannable
+ *  QR (the phone scans it) with a copyable text fallback for manual entry. The QR
+ *  encodes the exact JSON `phone_sync_connect` parses, so a scan dials directly. */
+function PairingCode({ payload, onDone }: { payload: PairingPayload; onDone: () => void }) {
+  const json = JSON.stringify(payload);
+  const [copied, setCopied] = useState(false);
+  const [showRaw, setShowRaw] = useState(false);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(json);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard may be unavailable (no permission / older webview); the raw text
+      // below is always selectable as a fallback.
+    }
+  };
+
+  return (
+    <div>
+      <label className="mb-1.5 block text-[12.5px] font-medium text-fg">Pairing code</label>
+      <p className="mb-3 text-[11px] leading-[1.5] text-faint">
+        On your phone, open Portcode and tap <span className="text-muted">Scan QR</span>, then point
+        the camera at this code.
+      </p>
+
+      <div className="flex flex-col items-center gap-3">
+        {/* Dark-on-white: cameras read high-contrast QRs most reliably, regardless
+            of the app's dark theme. */}
+        <div
+          className="rounded-xl border border-accent/40 bg-white p-3 shadow-[0_0_24px_rgba(255,46,126,0.18)]"
+          data-testid="pairing-qr"
+        >
+          <QRCodeSVG
+            value={json}
+            size={256}
+            level="M"
+            marginSize={4}
+            bgColor="#ffffff"
+            fgColor="#0a0a12"
+            title="Portcode pairing QR code"
+          />
+        </div>
+
+        <div className="flex w-full items-center gap-2">
+          <button
+            onClick={() => void copy()}
+            className="flex-1 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12.5px] text-fg transition-colors hover:border-accent/50"
+          >
+            {copied ? "Copied ✓" : "Copy code"}
+          </button>
+          <button
+            onClick={onDone}
+            className="flex-1 rounded-lg border border-border bg-panel px-3 py-2 text-[12.5px] text-muted hover:text-fg"
+          >
+            Done
+          </button>
+        </div>
+
+        <button
+          onClick={() => setShowRaw((v) => !v)}
+          className="self-start text-[11px] text-faint underline-offset-2 hover:text-muted hover:underline"
+          aria-expanded={showRaw}
+        >
+          {showRaw ? "Hide pairing code" : "Can’t scan? Show pairing code"}
+        </button>
+        {showRaw && (
+          <div className="w-full rounded-lg border border-border bg-panel-2 px-3 py-2.5 font-mono text-[10.5px] leading-[1.5] text-accent-2 select-text break-all">
+            {json}
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 function ToggleRow({

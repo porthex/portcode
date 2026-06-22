@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -64,7 +64,11 @@ pub async fn gate(
     let (tx, mut rx) = oneshot::channel();
     pending.lock().unwrap().insert(id.clone(), tx);
 
-    let _ = app.emit(
+    // Route through the canonical emit chokepoint so a paired phone receives the
+    // prompt too. Emitting directly here (the old bug) reached only the desktop, so
+    // a remote turn that hit an "ask" tool hung forever with no prompt on either end.
+    crate::sync::emit_event(
+        app,
         channel,
         StreamEvent::PermissionRequest {
             id: id.clone(),

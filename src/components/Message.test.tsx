@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, act } from "@testing-library/react";
 
 import { MessageView } from "./Message";
+import { STEP_MS } from "../lib/useScramble";
 import type { ContentBlock, Message, Role } from "../types";
 
 // MessageView is a pure, props-driven presentational component: it folds a
@@ -234,5 +235,75 @@ describe("MessageView — typing animation", () => {
 
     expect(container.querySelector(".pc-caret")).toBeNull();
     expect(container.querySelector("strong")).not.toBeNull();
+  });
+});
+
+describe("MessageView — scramble decode (active turn)", () => {
+  // useScramble runs off requestAnimationFrame; drive it with a manual queue so
+  // the decode advances by exact frames. One callback is scheduled per tick.
+  let rafQueue: FrameRequestCallback[] = [];
+  let elapsed = 0;
+  const T0 = 1000;
+
+  beforeEach(() => {
+    rafQueue = [];
+    elapsed = 0;
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      rafQueue.push(cb);
+      return rafQueue.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function tick(ts: number) {
+    const cbs = rafQueue;
+    rafQueue = [];
+    act(() => {
+      cbs.forEach((cb) => cb(ts));
+    });
+  }
+  function prime() {
+    tick(T0);
+  }
+  function step(n = 1) {
+    elapsed += n;
+    tick(T0 + elapsed * STEP_MS);
+  }
+
+  it("decodes the in-flight word as a glowing accent tail, not markdown", () => {
+    const { container } = render(
+      <MessageView
+        message={message("assistant", [{ kind: "text", text: "**Hello** world " }])}
+        isActive
+      />,
+    );
+
+    prime();
+    step(1);
+
+    // The decoding tail is wrapped in .pc-scramble (the accent glow); the turn is
+    // monospace with a caret and is NOT yet rendered as Markdown.
+    expect(container.querySelector(".pc-scramble")).not.toBeNull();
+    expect(container.querySelector(".font-mono")).not.toBeNull();
+    expect(container.querySelector(".pc-caret")).not.toBeNull();
+    expect(container.querySelector("strong")).toBeNull();
+  });
+
+  it("resolves words into their real characters as frames advance", () => {
+    const { container } = render(
+      <MessageView
+        message={message("assistant", [{ kind: "text", text: "Hello world " }])}
+        isActive
+      />,
+    );
+
+    prime();
+    step(40);
+
+    // Both words have decoded into the real text (settled, no longer glyphs).
+    expect(container.textContent).toContain("Hello world");
   });
 });

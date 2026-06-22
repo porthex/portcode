@@ -49,7 +49,7 @@ beforeEach(() => {
   m.saveSettings.mockImplementation(async (s) => ({ ...DEFAULT_SETTINGS, ...s }));
   m.resolvePermission.mockResolvedValue(undefined);
   m.openFolder.mockResolvedValue(null);
-  m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}) });
+  m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}), dispose: vi.fn() });
 });
 
 describe("visibility", () => {

@@ -45,6 +45,7 @@ export function StatusHud() {
   const streaming = useStore((s) => s.streaming);
   const usage = useStore((s) => (s.activeId ? s.usage[s.activeId] : undefined));
   const messages = useStore((s) => (s.activeId ? s.messages[s.activeId] : undefined));
+  const remoteMode = useStore((s) => s.remoteMode);
   const tokens = usage ? usage.input + usage.output : 0;
 
   const workspaceConnected = Boolean(session?.workspace);
@@ -57,16 +58,23 @@ export function StatusHud() {
         {"⎇"} {workspaceLabel(session?.workspace)}
       </div>
       <div className="pc-hud-seg text-accent-2">{modelLabel(model)}</div>
-      <div className="pc-hud-seg text-warn">POLICY: {policy.toUpperCase()}</div>
-      <div className="pc-hud-seg text-violet">
-        {"◆"} WORKSPACE {workspaceConnected ? "LINKED" : "LOCAL"}
-      </div>
+      {/* The phone trims the HUD to essentials so the 7 desktop segments don't
+          overflow a narrow screen — policy and the redundant workspace segment
+          (the ⎇ branch above already names the workspace) are desktop-only. */}
+      {!remoteMode && <div className="pc-hud-seg text-warn">POLICY: {policy.toUpperCase()}</div>}
+      {!remoteMode && (
+        <div className="pc-hud-seg text-violet">
+          {"◆"} WORKSPACE {workspaceConnected ? "LINKED" : "LOCAL"}
+        </div>
+      )}
 
       <div className="pc-hud-spacer" />
 
-      <div className="pc-hud-seg pc-hud-seg--right text-faint">
-        {toolUses === 1 ? "1 TOOL CALL" : `${toolUses} TOOL CALLS`}
-      </div>
+      {!remoteMode && (
+        <div className="pc-hud-seg pc-hud-seg--right text-faint">
+          {toolUses === 1 ? "1 TOOL CALL" : `${toolUses} TOOL CALLS`}
+        </div>
+      )}
       <div className="pc-hud-seg pc-hud-seg--right text-faint">{tokens.toLocaleString()} tok</div>
       <div className="pc-hud-seg pc-hud-seg--right text-success">
         <span className="pc-dot pc-dot--success" />

@@ -164,6 +164,23 @@ describe("StatusHud", () => {
     expect(screen.getByText("POLICY: DENY")).toBeInTheDocument();
   });
 
+  it("trims the desktop-dense segments on the phone (remote mode)", () => {
+    useStore.setState({
+      sessions: [session({ workspace: "C:/dev/porthex/portcode" })],
+      activeId: "s1",
+      remoteMode: true,
+    });
+
+    render(<StatusHud />);
+
+    // Essentials stay; the desktop-only / overflow-prone segments are dropped so
+    // the 7-segment bar fits a narrow screen.
+    expect(screen.getByText(/NEURAL LINK/)).toBeInTheDocument();
+    expect(screen.queryByText(/POLICY:/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/WORKSPACE LINKED/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/TOOL CALL/)).not.toBeInTheDocument();
+  });
+
   it("renders cumulative token usage for the active session", () => {
     const usage: Usage = { input: 1200, output: 340 };
     useStore.setState({

@@ -4,7 +4,9 @@ version = "5.0.0"
 description = "Portcode — a fast, native Windows AI coding agent (Porthex)."
 authors = ["Porthex"]
 edition = "2021"
-rust-version = "1.77"
+# Bumped for `iroh` (Phone Sync transport), which requires Rust >= 1.91. CI pins
+# the `stable` channel, which is well past this.
+rust-version = "1.91"
 license = "Apache-2.0"
 publish = false
 
@@ -30,13 +32,12 @@ serde_json = "1"
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "process", "sync", "time"] }
 futures-util = "0.3"
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 
 async-trait = "0.1"
 anyhow = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
-keyring = { version = "3", features = ["windows-native"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Subscription OAuth (PKCE S256). All safe Rust. The OAuth constants and flow in
@@ -45,11 +46,42 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 
+# Phone Sync E2E crypto (Phase 1): application-layer Noise so the relay stays
+# blind. Default features give Noise_*_25519_ChaChaPoly_BLAKE2s (Curve25519 +
+# ChaCha20-Poly1305 + BLAKE2s) with getrandom — no extra flags needed. The
+# `unsafe_code = "deny"` lint below applies only to this crate, not to snow.
+snow = "0.10"
+# Zero the long-term Noise static private key on drop so it doesn't linger in
+# freed heap memory (snow uses zeroize internally for its own key material too).
+zeroize = "1"
+
+# Phone Sync transport (Phase 2): iroh QUIC — dial-by-public-key P2P with
+# hole-punching and a self-hostable relay fallback. Carries the app-layer Noise
+# session so the relay only ever sees ciphertext. Requires Rust >= 1.91 (see the
+# rust-version bump above).
+iroh = "1"
+
 # search / matching for tools
 regex = "1"
 globset = "0.4"
 ignore = "0.4"
 similar = "3"
+
+# `keyring` (Windows Credential Manager) only has a working backend on Windows.
+# On Android/Linux there is no working keyring backend, so `src/secrets.rs` uses
+# an app-private file store instead and keyring is not a dependency there at all —
+# gating it to `cfg(windows)` means it is never compiled for the Android
+# cross-compile probe or the Linux CI leg. Relocating an already-resolved dep to
+# a target table does not change its version/features, so Cargo.lock stays valid.
+[target."cfg(windows)".dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+# Native QR scanner for the phone's pairing screen — built ONLY for the mobile
+# targets. The desktop advertises the pairing QR (it never scans one), so gating
+# the crate to android/iOS keeps it out of the Windows/Linux desktop binaries and
+# off the desktop/Linux CI legs entirely (it is registered under `#[cfg(mobile)]`).
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-barcode-scanner = "2"
 
 [profile.release]
 opt-level = "s"

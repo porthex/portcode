@@ -1,7 +1,19 @@
 // IPC bridge. Talks to the Rust core when running under Tauri; otherwise falls
 // back to an in-browser mock so the UI is fully runnable via `vite` alone.
 
-import type { DirEntry, Message, OAuthStatus, Session, Settings, StreamEvent } from "../types";
+import type {
+  ConnectInfo,
+  DirEntry,
+  Message,
+  OAuthStatus,
+  PairingPayload,
+  PhoneSyncStatus,
+  RemoteCommand,
+  Session,
+  Settings,
+  StreamEvent,
+  SyncFrame,
+} from "../types";
 
 export const isTauri = (): boolean =>
   typeof window !== "undefined" &&
@@ -69,6 +81,86 @@ export async function oauthLogout(): Promise<void> {
     return;
   }
   return mock.oauthLogout();
+}
+
+// ── Phone Sync ────────────────────────────────────────────────────────────────
+
+export async function phoneSyncStatus(): Promise<PhoneSyncStatus> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<PhoneSyncStatus>("phone_sync_status");
+  }
+  return mock.phoneSyncStatus();
+}
+
+export async function phoneSyncBeginPairing(): Promise<PairingPayload> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<PairingPayload>("phone_sync_begin_pairing");
+  }
+  return mock.phoneSyncBeginPairing();
+}
+
+export async function phoneSyncUnpair(publicKey: string): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("phone_sync_unpair", { publicKey });
+    return;
+  }
+  return mock.phoneSyncUnpair(publicKey);
+}
+
+// ── Phone Sync — mobile CLIENT (the phone drives a paired desktop) ─────────────
+
+/** Dial + pair with a desktop from its scanned QR payload (JSON). Returns the SAS
+ *  to compare out-of-band plus the pinned desktop key. */
+export async function phoneSyncConnect(qr: string): Promise<ConnectInfo> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<ConnectInfo>("phone_sync_connect", { qr });
+  }
+  return mock.phoneSyncConnect(qr);
+}
+
+/** Send one command to the live desktop session. */
+export async function phoneSyncSendCommand(command: RemoteCommand): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("phone_sync_send_command", { command });
+    return;
+  }
+  return mock.phoneSyncSendCommand(command);
+}
+
+/** Tear down the live desktop session. Idempotent. */
+export async function phoneSyncDisconnect(): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("phone_sync_disconnect");
+    return;
+  }
+  return mock.phoneSyncDisconnect();
+}
+
+/** Subscribe to frames forwarded from the paired desktop (live events + catch-up).
+ *  Returns an unlisten handle. */
+export async function onPhoneSyncFrame(cb: (frame: SyncFrame) => void): Promise<Unlisten> {
+  if (isTauri()) {
+    const { event } = await tauri();
+    return event.listen<SyncFrame>("phone-sync://frame", (ev) => cb(ev.payload));
+  }
+  return mock.onPhoneSyncFrame(cb);
+}
+
+/** Subscribe to the "session dropped unexpectedly" signal from the native client
+ *  (the desktop closed the channel, or the network dropped). Returns an unlisten
+ *  handle. */
+export async function onPhoneSyncDisconnected(cb: () => void): Promise<Unlisten> {
+  if (isTauri()) {
+    const { event } = await tauri();
+    return event.listen("phone-sync://disconnected", () => cb());
+  }
+  return mock.onPhoneSyncDisconnected(cb);
 }
 
 export async function resolvePermission(id: string, decision: "allow" | "deny"): Promise<void> {
@@ -145,15 +237,32 @@ export async function openFolder(): Promise<string | null> {
 }
 
 /**
- * Send a user message and stream the agent run. Returns an unlisten/cancel
- * handle. Events arrive via `onEvent`.
+ * A handle to a single running agent turn.
+ *
+ * `dispose()` stops listening for this turn's events WITHOUT cancelling the run —
+ * call it the instant a turn reaches a terminal state (turn_end/error) so the
+ * per-turn listener can't leak. A leaked listener keeps folding the NEXT turn's
+ * deltas into this turn's message (the "second reply edits the first" bug).
+ *
+ * `cancel()` additionally tells the Rust core to abort an in-flight turn, then
+ * stops listening — used by Stop and the client-side idle watchdog.
+ */
+export interface AgentRunHandle {
+  cancel: () => Promise<void>;
+  dispose: () => void;
+}
+
+/**
+ * Send a user message and stream the agent run. Returns a handle to stop the run
+ * (`cancel`) or just stop listening on a normal end (`dispose`). Events arrive
+ * via `onEvent`.
  */
 export async function runAgent(
   sessionId: string,
   text: string,
   model: string,
   onEvent: (e: StreamEvent) => void,
-): Promise<{ cancel: () => Promise<void> }> {
+): Promise<AgentRunHandle> {
   if (isTauri()) {
     const { core, event } = await tauri();
     const channel = `agent://${sessionId}`;
@@ -166,6 +275,7 @@ export async function runAgent(
         await core.invoke("cancel_agent", { sessionId });
         unlisten();
       },
+      dispose: unlisten,
     };
   }
   return mock.runAgent(sessionId, text, model, onEvent);
@@ -186,6 +296,12 @@ const mock = (() => {
 
   // Fake subscription-auth state so the sign-in UX is testable without Tauri.
   let oauth: OAuthStatus = { signedIn: false, expiresAt: null, account: null, tier: null };
+
+  // Fake phone sync state: a stable mock identity + no paired phones by default.
+  let phoneSyncState: PhoneSyncStatus = {
+    devicePublicKey: "MOCK_DEVICE_PUBLIC_KEY_BASE64==",
+    paired: [],
+  };
 
   const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const resolvers = new Map<string, (d: "allow" | "deny") => void>();
@@ -216,6 +332,42 @@ const mock = (() => {
     },
     async oauthLogout() {
       oauth = { signedIn: false, expiresAt: null, account: null, tier: null };
+    },
+    async phoneSyncStatus() {
+      return { ...phoneSyncState, paired: [...phoneSyncState.paired] };
+    },
+    async phoneSyncBeginPairing(): Promise<PairingPayload> {
+      return {
+        version: 1,
+        publicKey: phoneSyncState.devicePublicKey,
+        nonce: "MOCK_NONCE_BASE64==",
+        // Mirrors the real desktop payload: an opaque iroh node address the phone
+        // would dial. Shaped like iroh's EndpointAddr serialization.
+        nodeAddr: { id: "mock-endpoint-id", addrs: [] },
+      };
+    },
+    async phoneSyncUnpair(publicKey: string) {
+      phoneSyncState = {
+        ...phoneSyncState,
+        paired: phoneSyncState.paired.filter((d) => d.publicKey !== publicKey),
+      };
+    },
+    // Mobile remote client — no real desktop in the browser preview, so connect
+    // returns a deterministic SAS and the frame stream is inert.
+    async phoneSyncConnect(_qr: string): Promise<ConnectInfo> {
+      return { sas: "MOCK-SAS-1234", peerPublicKey: "MOCK_DESKTOP_KEY_BASE64==" };
+    },
+    async phoneSyncSendCommand(_command: RemoteCommand) {
+      // no-op: the preview has no paired desktop to receive commands.
+    },
+    async phoneSyncDisconnect() {
+      // no-op: nothing to tear down in the preview.
+    },
+    async onPhoneSyncFrame(_cb: (frame: SyncFrame) => void): Promise<Unlisten> {
+      return () => {}; // inert subscription; the preview never emits frames.
+    },
+    async onPhoneSyncDisconnected(_cb: () => void): Promise<Unlisten> {
+      return () => {}; // inert: the preview never drops a (nonexistent) session.
     },
     async resolvePermission(id: string, decision: "allow" | "deny") {
       resolvers.get(id)?.(decision);
@@ -326,6 +478,10 @@ const mock = (() => {
           cancelled = true;
           resolvers.forEach((r) => r("deny"));
           resolvers.clear();
+        },
+        // Stop delivering this turn's events without the cancel/deny side effects.
+        dispose: () => {
+          cancelled = true;
         },
       };
     },

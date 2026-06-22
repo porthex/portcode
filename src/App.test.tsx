@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
 
 import App from "./App";
 import { useStore } from "./store/store";
@@ -28,6 +28,9 @@ vi.mock("./components/Settings", () => ({
 vi.mock("./components/CommandPalette", () => ({
   CommandPalette: () => <div data-testid="command-palette" />,
 }));
+vi.mock("./components/RemotePairing", () => ({
+  RemotePairing: () => <div data-testid="remote-pairing" />,
+}));
 
 // `isTauri` is consumed by App's TitleBar; the rest of the surface is what the
 // store's `init()` path invokes. A single mock of this module covers both the
@@ -44,6 +47,12 @@ vi.mock("./lib/ipc", () => ({
   oauthStatus: vi.fn(),
   startOauthLogin: vi.fn(),
   oauthLogout: vi.fn(),
+  // store.init() also fetches phone sync status.
+  phoneSyncStatus: vi.fn(),
+  phoneSyncBeginPairing: vi.fn(),
+  phoneSyncUnpair: vi.fn(),
+  // Reached when the remote-session banner's Disconnect is clicked.
+  phoneSyncDisconnect: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -60,6 +69,8 @@ beforeEach(() => {
   m.createSession.mockResolvedValue(undefined);
   m.getMessages.mockResolvedValue([]);
   m.oauthStatus.mockResolvedValue({ signedIn: false, expiresAt: null, account: null, tier: null });
+  m.phoneSyncStatus.mockResolvedValue({ devicePublicKey: "DEVICE==", paired: [] });
+  m.phoneSyncDisconnect.mockResolvedValue(undefined);
 });
 
 describe("App layout", () => {
@@ -76,6 +87,20 @@ describe("App layout", () => {
     expect(screen.getByTestId("chat")).toBeInTheDocument();
     // CommandPalette is always mounted (it self-gates on showPalette internally).
     expect(screen.getByTestId("command-palette")).toBeInTheDocument();
+  });
+
+  it("releases the remote frame subscription when the app unmounts", async () => {
+    const unlisten = vi.fn();
+    const { unmount } = render(<App />);
+    // Let init() settle so its async setState can't race the teardown assertion.
+    await waitFor(() => expect(useStore.getState().sessions).toHaveLength(1));
+    useStore.setState({ remoteUnlisten: unlisten });
+
+    unmount();
+
+    // App's unmount effect tears the live native frame listener down so it can't
+    // survive into a fresh store instance (HMR / root remount) and double-feed.
+    expect(unlisten).toHaveBeenCalledTimes(1);
   });
 
   it("hides FileExplorer and SettingsPanel when their flags are false", () => {
@@ -103,6 +128,96 @@ describe("App layout", () => {
 
     expect(screen.getByTestId("settings-panel")).toBeInTheDocument();
     expect(screen.queryByTestId("file-explorer")).not.toBeInTheDocument();
+  });
+});
+
+describe("remote mode shell", () => {
+  it("renders the desktop layout (no pairing screen) when remoteMode is off", () => {
+    useStore.setState({ remoteMode: false });
+
+    render(<App />);
+
+    expect(screen.queryByTestId("remote-pairing")).not.toBeInTheDocument();
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+    expect(screen.queryByText("Remote · connected")).not.toBeInTheDocument();
+  });
+
+  it("shows the pairing screen (and hides the session) when in remote mode but not connected", () => {
+    useStore.setState({ remoteMode: true, remoteConnected: false, remoteVerified: false });
+
+    render(<App />);
+
+    expect(screen.getByTestId("remote-pairing")).toBeInTheDocument();
+    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat")).not.toBeInTheDocument();
+  });
+
+  it("keeps showing the pairing screen while connected but not yet SAS-verified", () => {
+    // The SAS gate: a live connection alone isn't enough to reveal the session.
+    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: false });
+
+    render(<App />);
+
+    expect(screen.getByTestId("remote-pairing")).toBeInTheDocument();
+    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
+  });
+
+  it("renders the remote session with a connected banner once verified", () => {
+    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+
+    render(<App />);
+
+    expect(screen.queryByTestId("remote-pairing")).not.toBeInTheDocument();
+    // On the phone the session list is a drawer, not an inline rail — reached via
+    // the TitleBar "Sessions" menu button.
+    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Toggle sessions" })).toBeInTheDocument();
+    expect(screen.getByTestId("chat")).toBeInTheDocument();
+    expect(screen.getByText("Remote · connected")).toBeInTheDocument();
+  });
+
+  it("opens the session drawer from the menu button and closes it on the backdrop", () => {
+    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+
+    render(<App />);
+    // Drawer closed initially: the sidebar isn't mounted.
+    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Toggle sessions" }));
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+    expect(useStore.getState().showSidebar).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Close sessions" }));
+    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
+    expect(useStore.getState().showSidebar).toBe(false);
+  });
+
+  it("hides the desktop command-palette button on the phone", () => {
+    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+
+    render(<App />);
+
+    // ⌘K is a desktop keyboard affordance — gone on the phone.
+    expect(
+      screen.queryByRole("button", { name: "Open command palette (Ctrl+K)" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("disconnects from the desktop via the banner button", async () => {
+    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+
+    render(<App />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Disconnect from desktop" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(1);
+    const st = useStore.getState();
+    expect(st.remoteConnected).toBe(false);
+    expect(st.remoteVerified).toBe(false);
   });
 });
 
