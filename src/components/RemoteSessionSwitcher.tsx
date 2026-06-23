@@ -61,6 +61,10 @@ export function RemoteSessionSwitcher({ onClose }: { onClose: () => void }) {
   };
 
   const pick = (id: string) => {
+    // selectSession is a no-op mid-stream (switching activeId would strand the
+    // streaming turn). Closing the sheet then would falsely imply the session
+    // changed, so when a switch can't take effect, keep the sheet open instead.
+    if (streaming && id !== activeId) return;
     void selectSession(id);
     onClose();
   };

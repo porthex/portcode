@@ -414,7 +414,8 @@ function SafetyPanel() {
       <div className="flex flex-col gap-2.5">
         <button
           onClick={() => confirmRemoteSas()}
-          className="h-[54px] w-full rounded-[13px] border border-accent bg-accent font-display text-[15px] font-bold tracking-[0.8px] text-bg shadow-glow-accent transition hover:shadow-[0_0_34px_rgba(255,46,126,.75)] hover:brightness-110"
+          disabled={!sas}
+          className="h-[54px] w-full rounded-[13px] border border-accent bg-accent font-display text-[15px] font-bold tracking-[0.8px] text-bg shadow-glow-accent transition hover:shadow-[0_0_34px_rgba(255,46,126,.75)] hover:brightness-110 disabled:opacity-40 disabled:shadow-none disabled:hover:brightness-100"
         >
           ✓ It matches — Confirm
         </button>
