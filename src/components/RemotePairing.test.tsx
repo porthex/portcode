@@ -352,6 +352,9 @@ describe("RemotePairing — safety panel", () => {
     const sasBox = screen.getByLabelText(/Safety code/);
     expect(sasBox).toHaveTextContent("—");
     expect(sasBox).toHaveAccessibleName(/not available/);
+    // Anti-MITM: with no code to compare, Confirm must be non-actionable so a
+    // state regression can't let the user verify an unverifiable connection.
+    expect(screen.getByRole("button", { name: /It matches/ })).toBeDisabled();
   });
 
   it("Confirm marks the connection verified", () => {

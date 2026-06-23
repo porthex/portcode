@@ -49,6 +49,23 @@ describe("RemoteSessionSwitcher", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it("blocks a mid-stream switch: keeps the sheet open and attempts no switch", () => {
+    // selectSession no-ops while a turn streams (switching would strand it), so
+    // tapping a different session can't take effect — the sheet must stay open
+    // rather than close as if it had switched.
+    useStore.setState({ streaming: true, activeId: "a" });
+    render(<RemoteSessionSwitcher onClose={onClose} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Beta/ }));
+    expect(selectSession).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+
+    // Re-selecting the already-active session is a no-op switch, so it still closes.
+    fireEvent.click(screen.getByRole("button", { name: /Alpha/ }));
+    expect(selectSession).toHaveBeenCalledWith("a");
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it("closes on the scrim and on Escape", () => {
     render(<RemoteSessionSwitcher onClose={onClose} />);
 
