@@ -48,6 +48,9 @@ pub struct MessageRow {
 
 /// A phone paired for Phone Sync, keyed by its Curve25519 static public key
 /// (base64). `name` is a user-facing label; timestamps are unix millis.
+/// `confirmed` is the desktop-side trust gate: a device only graduates from
+/// "handshake completed" to "may issue commands" once the desktop user has
+/// explicitly compared the SAS and confirmed it (see `confirm_paired_device`).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct PairedDevice {
@@ -55,6 +58,10 @@ pub struct PairedDevice {
     pub name: String,
     pub paired_at: i64,
     pub last_seen: i64,
+    /// Whether the desktop user has explicitly confirmed this device's SAS. Only
+    /// a confirmed device is served the command surface; an unconfirmed row (the
+    /// default, and what every pre-migration row becomes) must re-confirm.
+    pub confirmed: bool,
 }
 
 #[derive(Serialize)]
@@ -139,12 +146,40 @@ impl Db {
                 public_key TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 paired_at INTEGER NOT NULL,
-                last_seen INTEGER NOT NULL
+                last_seen INTEGER NOT NULL,
+                confirmed INTEGER NOT NULL DEFAULT 0
             );",
         )?;
+        // ADDITIVE migration: a `paired_devices` table created before the
+        // device-trust gate landed has no `confirmed` column. Add it without
+        // dropping the table, defaulting every pre-existing row to 0 (untrusted).
+        // That means devices paired under the old, vulnerable "handshake ==
+        // authorized" code must re-confirm on their next connection — the
+        // intended, secure-by-default behavior for this alpha. `ALTER TABLE ... ADD
+        // COLUMN` errors with "duplicate column name" once the column exists, so we
+        // probe `PRAGMA table_info` first and only add when missing (keeping
+        // startup idempotent across launches).
+        Self::migrate_add_confirmed(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Idempotently add the `confirmed` column to a legacy `paired_devices`
+    /// table. No-op when the column already exists (fresh DBs create it inline).
+    fn migrate_add_confirmed(conn: &Connection) -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(paired_devices)")?;
+        let has_confirmed = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(|c| c.ok())
+            .any(|name| name == "confirmed");
+        if !has_confirmed {
+            conn.execute(
+                "ALTER TABLE paired_devices ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn list_sessions(&self) -> rusqlite::Result<Vec<SessionRow>> {
@@ -321,23 +356,59 @@ impl Db {
 
     /// Record a paired device (or refresh an existing one's name/last_seen). The
     /// `public_key` (base64) is the device identity; re-pairing keeps the original
-    /// `paired_at`.
+    /// `paired_at`. A brand-new row defaults to `confirmed = 0` (untrusted); the
+    /// `ON CONFLICT` path deliberately leaves `confirmed` UNTOUCHED so a device the
+    /// user already confirmed stays trusted across reconnects (and a known-but-
+    /// unconfirmed device is never silently upgraded by a mere reconnect).
     pub fn add_paired_device(&self, public_key: &str, name: &str, ts: i64) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO paired_devices (public_key, name, paired_at, last_seen)
-             VALUES (?1, ?2, ?3, ?3)
+            "INSERT INTO paired_devices (public_key, name, paired_at, last_seen, confirmed)
+             VALUES (?1, ?2, ?3, ?3, 0)
              ON CONFLICT(public_key) DO UPDATE SET name = ?2, last_seen = ?3",
             params![public_key, name, ts],
         )?;
         Ok(())
     }
 
+    /// Mark a device CONFIRMED-trusted (the desktop user compared its SAS and
+    /// accepted it). Upserts so a confirm can land even if the row was not
+    /// pre-inserted, keeping the original `paired_at` on conflict.
+    pub fn confirm_paired_device(
+        &self,
+        public_key: &str,
+        name: &str,
+        ts: i64,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO paired_devices (public_key, name, paired_at, last_seen, confirmed)
+             VALUES (?1, ?2, ?3, ?3, 1)
+             ON CONFLICT(public_key) DO UPDATE SET name = ?2, last_seen = ?3, confirmed = 1",
+            params![public_key, name, ts],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a device's static key is confirmed-trusted. The serve-time
+    /// authorization check: only a `true` here lets a peer reach the command
+    /// surface without a fresh desktop confirmation. A missing row or a DB read
+    /// error both read as `false` (fail-closed).
+    pub fn is_device_confirmed(&self, public_key: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT confirmed FROM paired_devices WHERE public_key = ?1",
+            params![public_key],
+            |r| r.get::<_, i64>(0),
+        )
+        .is_ok_and(|c| c != 0)
+    }
+
     /// All paired devices, most recently paired first.
     pub fn list_paired_devices(&self) -> Vec<PairedDevice> {
         let conn = self.conn.lock().unwrap();
         let Ok(mut stmt) = conn.prepare(
-            "SELECT public_key, name, paired_at, last_seen
+            "SELECT public_key, name, paired_at, last_seen, confirmed
              FROM paired_devices ORDER BY paired_at DESC",
         ) else {
             return Vec::new();
@@ -348,6 +419,7 @@ impl Db {
                 name: r.get(1)?,
                 paired_at: r.get(2)?,
                 last_seen: r.get(3)?,
+                confirmed: r.get::<_, i64>(4)? != 0,
             })
         });
         let Ok(rows) = rows else { return Vec::new() };
@@ -698,11 +770,107 @@ mod tests {
         assert_eq!(list[0].name, "iPhone");
         assert_eq!(list[0].paired_at, 200);
         assert_eq!(list[0].last_seen, 200);
+        assert!(!list[0].confirmed); // a freshly-added device is untrusted
 
         db.remove_paired_device("pubA").unwrap();
         let list = db.list_paired_devices();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].public_key, "pubB");
+    }
+
+    // ── device-trust gate (confirmed column) ─────────────────────────────────
+
+    #[test]
+    fn a_newly_added_device_is_unconfirmed_by_default() {
+        let db = mem_db();
+        db.add_paired_device("pub", "Pixel", 100).unwrap();
+        assert!(!db.is_device_confirmed("pub"));
+        assert!(!db.list_paired_devices()[0].confirmed);
+    }
+
+    #[test]
+    fn confirm_paired_device_marks_it_trusted() {
+        let db = mem_db();
+        db.add_paired_device("pub", "Pixel", 100).unwrap();
+        assert!(!db.is_device_confirmed("pub"));
+
+        db.confirm_paired_device("pub", "Pixel", 200).unwrap();
+        assert!(db.is_device_confirmed("pub"));
+        let d = &db.list_paired_devices()[0];
+        assert!(d.confirmed);
+        assert_eq!(d.paired_at, 100); // original paired_at preserved
+        assert_eq!(d.last_seen, 200); // last_seen refreshed
+    }
+
+    #[test]
+    fn confirm_can_upsert_a_brand_new_device() {
+        // A confirm landing before any add still creates the (trusted) row.
+        let db = mem_db();
+        db.confirm_paired_device("pub", "Pixel", 300).unwrap();
+        assert!(db.is_device_confirmed("pub"));
+        assert_eq!(db.list_paired_devices()[0].paired_at, 300);
+    }
+
+    #[test]
+    fn a_reconnect_does_not_silently_upgrade_or_downgrade_trust() {
+        let db = mem_db();
+        // Confirm a device, then re-add it (the serve-path upsert on reconnect).
+        db.confirm_paired_device("pub", "Pixel", 100).unwrap();
+        db.add_paired_device("pub", "Pixel", 500).unwrap();
+        // Still trusted: add_paired_device leaves `confirmed` untouched on conflict.
+        assert!(db.is_device_confirmed("pub"));
+        // And an unconfirmed device stays unconfirmed across a reconnect.
+        db.add_paired_device("other", "iPhone", 100).unwrap();
+        db.add_paired_device("other", "iPhone", 500).unwrap();
+        assert!(!db.is_device_confirmed("other"));
+    }
+
+    #[test]
+    fn is_device_confirmed_is_false_for_an_unknown_key() {
+        let db = mem_db();
+        assert!(!db.is_device_confirmed("never-seen"));
+    }
+
+    #[test]
+    fn migrate_add_confirmed_is_additive_and_defaults_legacy_rows_to_untrusted() {
+        // Simulate a PRE-MIGRATION database: the old paired_devices schema with no
+        // `confirmed` column, holding a row paired under the vulnerable code.
+        let conn = Connection::open(Path::new(":memory:")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE paired_devices (
+                public_key TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                paired_at INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL
+            );
+            INSERT INTO paired_devices (public_key, name, paired_at, last_seen)
+            VALUES ('legacy', 'Old Phone', 100, 100);",
+        )
+        .unwrap();
+
+        // Migrating must ADD the column (not drop the table) and default the legacy
+        // row to untrusted — so a device paired under the old code must re-confirm.
+        Db::migrate_add_confirmed(&conn).unwrap();
+        let confirmed: i64 = conn
+            .query_row(
+                "SELECT confirmed FROM paired_devices WHERE public_key = 'legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(confirmed, 0, "legacy rows must default to untrusted");
+        // The row itself survived (additive, not a drop+recreate).
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM paired_devices WHERE public_key = 'legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "Old Phone");
+
+        // Idempotent: a second migration is a no-op, not a "duplicate column" error.
+        Db::migrate_add_confirmed(&conn).unwrap();
     }
 
     #[test]

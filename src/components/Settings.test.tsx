@@ -35,6 +35,9 @@ vi.mock("../lib/ipc", () => ({
   phoneSyncStatus: vi.fn(),
   phoneSyncBeginPairing: vi.fn(),
   phoneSyncUnpair: vi.fn(),
+  // Device-trust gate: reached via the store's confirm/rejectPairingRequest.
+  confirmPairing: vi.fn(async (_id: string) => {}),
+  rejectPairing: vi.fn(async (_id: string) => {}),
 }));
 
 const m = vi.mocked(ipc);
@@ -699,6 +702,7 @@ describe("SettingsPanel — Phone Sync section", () => {
     name: "My Android",
     pairedAt: 1000,
     lastSeen: 2000,
+    confirmed: true,
   });
 
   it("renders the PHONE SYNC eyebrow label", () => {
@@ -813,6 +817,61 @@ describe("SettingsPanel — Phone Sync section", () => {
     fireEvent.click(screen.getByRole("button", { name: "Done" }));
 
     expect(useStore.getState().pairingPayload).toBeNull();
+  });
+
+  // ── device-trust gate: the desktop-side confirm prompt ───────────────────────
+
+  it("surfaces a pending pairing request with its SAS for comparison", () => {
+    useStore.setState({
+      pairingRequest: { requestId: "req-1", sas: "GOLF-77", peerKeyHex: "PHONE_KEY==" },
+    });
+    renderPanel();
+
+    expect(screen.getByText("New phone pairing")).toBeInTheDocument();
+    // The SAS box's accessible name must carry the digits (mirrors the phone-side
+    // VerifyPanel) so a screen reader hears the actual code to compare.
+    const sasBox = screen.getByLabelText(/Pairing verification code/);
+    expect(sasBox).toHaveAccessibleName(/GOLF-77/);
+    expect(screen.getByText("GOLF-77")).toBeInTheDocument();
+  });
+
+  it("Allow confirms the pending pairing via ipc and clears the prompt", async () => {
+    useStore.setState({
+      pairingRequest: { requestId: "req-1", sas: "GOLF-77", peerKeyHex: "PHONE_KEY==" },
+    });
+    m.phoneSyncStatus.mockResolvedValue({ devicePublicKey: "DEVICE==", paired: [] });
+    renderPanel();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Codes match/ }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(m.confirmPairing).toHaveBeenCalledWith("req-1");
+    expect(useStore.getState().pairingRequest).toBeNull();
+  });
+
+  it("Reject declines the pending pairing via ipc and clears the prompt", async () => {
+    useStore.setState({
+      pairingRequest: { requestId: "req-1", sas: "GOLF-77", peerKeyHex: "PHONE_KEY==" },
+    });
+    renderPanel();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(m.rejectPairing).toHaveBeenCalledWith("req-1");
+    expect(useStore.getState().pairingRequest).toBeNull();
+  });
+
+  it("shows no pairing-confirm prompt when there is no pending request", () => {
+    useStore.setState({ pairingRequest: null });
+    renderPanel();
+    expect(screen.queryByText("New phone pairing")).not.toBeInTheDocument();
   });
 
   it("hides the desktop-only sections on a phone (remote mode)", () => {

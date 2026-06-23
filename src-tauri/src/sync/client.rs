@@ -177,10 +177,13 @@ mod tests {
         let client_noise = StaticKeypair::generate().unwrap();
         let server_addr = server_ep.addr();
 
+        // Both peers bind the same pairing nonce into the handshake prologue.
+        const NONCE: &[u8] = &[0xab, 0xcd, 0xef, 0x01];
         let server_priv = server_noise.private.clone();
-        let server_task =
-            tokio::spawn(async move { accept_and_pair(&server_ep, &server_priv).await });
-        let client = connect_and_pair(&client_ep, server_addr, &client_noise.private)
+        let server_task = tokio::spawn(async move {
+            accept_and_pair(&server_ep, &server_priv, || NONCE.to_vec()).await
+        });
+        let client = connect_and_pair(&client_ep, server_addr, &client_noise.private, NONCE)
             .await
             .expect("client pairing");
         let server = server_task.await.unwrap().expect("server pairing");

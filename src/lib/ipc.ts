@@ -7,6 +7,7 @@ import type {
   Message,
   OAuthStatus,
   PairingPayload,
+  PairingRequest,
   PhoneSyncStatus,
   RemoteCommand,
   Session,
@@ -110,16 +111,55 @@ export async function phoneSyncUnpair(publicKey: string): Promise<void> {
   return mock.phoneSyncUnpair(publicKey);
 }
 
+/** Subscribe to the desktop-side "a new phone wants to pair" event. The handler
+ *  receives the request id + the SAS to compare; the desktop user confirms or
+ *  rejects via {@link confirmPairing} / {@link rejectPairing}. Returns an unlisten
+ *  handle. Desktop-only event; in the browser mock it never fires. */
+export async function onPhoneSyncPairingRequest(
+  cb: (req: PairingRequest) => void,
+): Promise<Unlisten> {
+  if (isTauri()) {
+    const { event } = await tauri();
+    return event.listen<PairingRequest>("phone-sync://pairing-request", (ev) => cb(ev.payload));
+  }
+  return mock.onPhoneSyncPairingRequest(cb);
+}
+
+/** Confirm a pending new-device pairing (the desktop user compared the SAS and
+ *  accepted). Persists the device as trusted and lets the connection proceed. */
+export async function confirmPairing(requestId: string): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("confirm_pairing", { requestId });
+    return;
+  }
+  return mock.confirmPairing(requestId);
+}
+
+/** Reject a pending new-device pairing (SAS mismatch or declined). Drops the
+ *  connection without serving it. */
+export async function rejectPairing(requestId: string): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("reject_pairing", { requestId });
+    return;
+  }
+  return mock.rejectPairing(requestId);
+}
+
 // ── Phone Sync — mobile CLIENT (the phone drives a paired desktop) ─────────────
 
 /** Dial + pair with a desktop from its scanned QR payload (JSON). Returns the SAS
- *  to compare out-of-band plus the pinned desktop key. */
-export async function phoneSyncConnect(qr: string): Promise<ConnectInfo> {
+ *  to compare out-of-band plus the pinned desktop key. `reconnect` selects the
+ *  handshake prologue: `false` (a first pairing) binds the QR nonce; `true` (a
+ *  remembered-desktop reconnect) binds an empty prologue to match the desktop's
+ *  closed pairing window. */
+export async function phoneSyncConnect(qr: string, reconnect = false): Promise<ConnectInfo> {
   if (isTauri()) {
     const { core } = await tauri();
-    return core.invoke<ConnectInfo>("phone_sync_connect", { qr });
+    return core.invoke<ConnectInfo>("phone_sync_connect", { qr, reconnect });
   }
-  return mock.phoneSyncConnect(qr);
+  return mock.phoneSyncConnect(qr, reconnect);
 }
 
 /** Send one command to the live desktop session. */
@@ -350,9 +390,21 @@ const mock = (() => {
         paired: phoneSyncState.paired.filter((d) => d.publicKey !== publicKey),
       };
     },
+    // Desktop pairing-confirm surface — inert in the preview (no real phone dials
+    // in, so the pairing-request event never fires and confirm/reject are no-ops).
+    async onPhoneSyncPairingRequest(_cb: (req: PairingRequest) => void): Promise<Unlisten> {
+      return () => {};
+    },
+    async confirmPairing(_requestId: string) {
+      // no-op: the preview has no pending pairing to confirm.
+    },
+    async rejectPairing(_requestId: string) {
+      // no-op: the preview has no pending pairing to reject.
+    },
     // Mobile remote client — no real desktop in the browser preview, so connect
-    // returns a deterministic SAS and the frame stream is inert.
-    async phoneSyncConnect(_qr: string): Promise<ConnectInfo> {
+    // returns a deterministic SAS and the frame stream is inert. `reconnect` is
+    // accepted for signature parity but unused in the preview.
+    async phoneSyncConnect(_qr: string, _reconnect = false): Promise<ConnectInfo> {
       return { sas: "MOCK-SAS-1234", peerPublicKey: "MOCK_DESKTOP_KEY_BASE64==" };
     },
     async phoneSyncSendCommand(_command: RemoteCommand) {

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { useStore } from "../store/store";
-import { MODELS, type PairingPayload, type ToolPolicy } from "../types";
+import { MODELS, type PairingPayload, type PairingRequest, type ToolPolicy } from "../types";
 import * as ipc from "../lib/ipc";
 
 export function SettingsPanel() {
@@ -25,6 +25,9 @@ export function SettingsPanel() {
   const beginPairing = useStore((s) => s.beginPairing);
   const unpair = useStore((s) => s.unpair);
   const clearPairing = useStore((s) => s.clearPairing);
+  const pairingRequest = useStore((s) => s.pairingRequest);
+  const confirmPairingRequest = useStore((s) => s.confirmPairingRequest);
+  const rejectPairingRequest = useStore((s) => s.rejectPairingRequest);
   // On the phone (remote client) the agent — its model, key, sign-in, tool policy —
   // and the desktop's "show a QR to pair" flow all live on the DESKTOP, so those
   // sections are hidden here (several of their commands are desktop-only).
@@ -430,6 +433,17 @@ export function SettingsPanel() {
                 </div>
               )}
 
+              {/* Device-trust gate: a phone completed the handshake and is waiting
+                  for this desktop user to compare its SAS and confirm. Until the
+                  user confirms, the phone is served NOTHING. */}
+              {pairingRequest && (
+                <PairingConfirm
+                  request={pairingRequest}
+                  onConfirm={() => void confirmPairingRequest()}
+                  onReject={() => void rejectPairingRequest()}
+                />
+              )}
+
               {pairingPayload ? (
                 <PairingCode payload={pairingPayload} onDone={clearPairing} />
               ) : (
@@ -481,6 +495,69 @@ function formatExpiry(expiresAt: number): string {
     dateStyle: "medium",
     timeStyle: "short",
   });
+}
+
+/** The device-trust confirmation prompt: a phone completed the Noise handshake
+ *  inside an open pairing window and is awaiting this desktop user's approval. The
+ *  user compares this SAS with the one shown on the phone; only on Confirm is the
+ *  phone persisted as trusted and served the command surface. This is the gate that
+ *  closes the "handshake == authorized" hole — without it, the phone gets nothing. */
+function PairingConfirm({
+  request,
+  onConfirm,
+  onReject,
+}: {
+  request: PairingRequest;
+  onConfirm: () => void;
+  onReject: () => void;
+}) {
+  // Land focus on the SAS, NOT the affirmative Confirm — a queued/habitual Enter
+  // must not approve a device before the user actually compares codes (mirrors the
+  // phone-side VerifyPanel in RemotePairing).
+  const sasRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    sasRef.current?.focus();
+  }, []);
+
+  return (
+    <div
+      className="rounded-xl border border-accent/40 bg-panel-2 p-4 shadow-[0_0_24px_rgba(255,46,126,0.16)]"
+      role="group"
+      aria-label="Confirm new phone pairing"
+    >
+      <div className="mb-2 flex items-center gap-2">
+        <span className="pc-dot pc-dot--cyan" />
+        <span className="font-mono text-[11px] uppercase tracking-[1.5px] text-accent-2">
+          New phone pairing
+        </span>
+      </div>
+      <p className="mb-3 text-[12px] leading-[1.5] text-muted">
+        A phone is trying to pair. Compare this code with the one on the phone — they must match
+        before you allow it to control this desktop.
+      </p>
+      <div
+        ref={sasRef}
+        tabIndex={-1}
+        aria-label={`Pairing verification code: ${request.sas}`}
+        className="rounded-lg border border-accent/40 bg-panel px-4 py-4 text-center outline-none"
+      >
+        <div className="select-text break-all font-mono text-[22px] font-bold leading-tight tracking-[3px] text-accent-2">
+          {request.sas}
+        </div>
+      </div>
+      <div className="mt-3 flex gap-2">
+        <button onClick={onConfirm} className="pc-btn-accent flex-1 px-3 py-2.5 text-[12.5px]">
+          Codes match — Allow
+        </button>
+        <button
+          onClick={onReject}
+          className="flex-1 rounded-lg border border-border bg-panel px-3 py-2.5 text-[12.5px] text-muted transition-colors hover:border-danger/50 hover:text-danger"
+        >
+          Reject
+        </button>
+      </div>
+    </div>
+  );
 }
 
 /** The desktop pairing affordance: the live PairingPayload rendered as a scannable

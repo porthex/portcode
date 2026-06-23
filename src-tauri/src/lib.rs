@@ -59,6 +59,12 @@ pub struct AppState {
     /// across an await — same discipline as `phone_client` (see transport.rs:63-68).
     #[cfg_attr(mobile, allow(dead_code))]
     pub listen_endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
+    /// Desktop-side device-trust gate: the bounded pairing window + the pending
+    /// new-device confirmations. Shared between the pairing commands, the accept
+    /// loop, and `serve_connection`. DESKTOP-ONLY — the phone is a pure client and
+    /// never gates an inbound peer.
+    #[cfg(desktop)]
+    pub pairing_gate: Arc<sync::pairing_gate::PairingGate>,
 }
 
 // ── settings & secrets ───────────────────────────────────────────────────────
@@ -394,23 +400,34 @@ fn phone_sync_begin_pairing(
         slot.as_ref().map(|ep| ep.addr())
     };
 
-    match live_addr {
-        Some(addr) => {
-            // Mirror sync::pairing::begin_pairing: same identity + a fresh nonce,
-            // but the node_addr is the live full address instead of identity-only.
-            let identity = sync::pairing::device_identity()?;
-            let mut nonce = [0u8; 16];
-            rand::thread_rng().fill_bytes(&mut nonce);
-            Ok(sync::pairing::PairingPayload::new(
-                &identity.public,
-                &nonce,
-                addr,
-            ))
-        }
+    // Build the payload AND open the device-trust pairing window with the SAME
+    // nonce: only while this bounded window is open does the accept loop entertain
+    // a NEW (untrusted) peer, and the nonce is bound into the handshake prologue so
+    // a phone that scanned a different/stale QR fails the handshake. Generating the
+    // nonce here lets us register it on the gate.
+    let identity = sync::pairing::device_identity()?;
+    let mut nonce = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut nonce);
+
+    let payload = match live_addr {
+        // Same identity + this nonce, but the node_addr is the live full address
+        // instead of identity-only.
+        Some(addr) => sync::pairing::PairingPayload::new(&identity.public, &nonce, addr),
         // Listener not bound yet (e.g. bind still in flight) → identity-only QR
         // (still dialable via n0 discovery).
-        None => sync::pairing::begin_pairing(),
-    }
+        None => sync::pairing::PairingPayload::new(
+            &identity.public,
+            &nonce,
+            sync::pairing::iroh_node_addr()?,
+        ),
+    };
+
+    // Arm the bounded pairing window with this nonce. A phone must scan + complete
+    // the handshake within the window TTL (and the desktop user must confirm its
+    // SAS) before any command surface is served.
+    state.pairing_gate.open_window(nonce.to_vec());
+
+    Ok(payload)
 }
 
 /// Forget a paired device by its base64 public key. Idempotent. (The device list
@@ -421,6 +438,43 @@ fn phone_sync_unpair(state: State<AppState>, public_key: String) -> Result<(), S
         .db
         .remove_paired_device(&public_key)
         .map_err(|e| e.to_string())
+}
+
+/// Confirm a pending new-device pairing the desktop UI surfaced (the user
+/// compared the SAS shown in the `phone-sync://pairing-request` event and
+/// accepted). Persists the peer's static key as CONFIRMED-trusted, then releases
+/// the awaiting `serve_connection` so it serves the device. Idempotent: an
+/// unknown/expired request id is a no-op (the connection already timed out).
+// DESKTOP-ONLY: the device-trust gate lives on the SYNC SERVER. The phone never
+// confirms an inbound peer.
+#[cfg(desktop)]
+#[tauri::command]
+fn confirm_pairing(state: State<AppState>, request_id: String) -> Result<(), String> {
+    // `resolve_pending(true)` removes the pending entry, returns the peer key, and
+    // signals the awaiting `serve_connection` (which then serves THIS connection
+    // because the user accepted — it does not re-read the DB). We persist the key as
+    // confirmed here so the NEXT reconnect is auto-served without re-confirmation;
+    // persisting in this command (rather than in serve_connection) also keeps the
+    // confirm durable even if the connection raced away after we signalled it.
+    if let Some(peer_key_b64) = state.pairing_gate.resolve_pending(&request_id, true) {
+        state
+            .db
+            .confirm_paired_device(&peer_key_b64, "Phone", db::now_ms())
+            .map_err(|e| e.to_string())?;
+        // Single-use: a successful confirm consumes the pairing window so a stale QR
+        // can't admit a second unsolicited device.
+        state.pairing_gate.close_window();
+    }
+    Ok(())
+}
+
+/// Reject a pending new-device pairing (the SAS did not match, or the user
+/// declined). Drops the connection without serving it. Idempotent.
+// DESKTOP-ONLY: see `confirm_pairing`.
+#[cfg(desktop)]
+#[tauri::command]
+fn reject_pairing(state: State<AppState>, request_id: String) {
+    state.pairing_gate.resolve_pending(&request_id, false);
 }
 
 /// Start the Phone Sync listener: bind an iroh endpoint under this device's
@@ -459,6 +513,7 @@ fn phone_sync_listen(app: AppHandle, state: State<AppState>) -> Result<(), Strin
         state.pending.clone(),
         state.oauth_refresh.clone(),
         state.listen_endpoint.clone(),
+        state.pairing_gate.clone(),
     )
 }
 
@@ -472,14 +527,77 @@ async fn serve_connection(
     app: AppHandle,
     db: Arc<Db>,
     handler: sync::server::DesktopCommandHandler,
+    pairing_gate: Arc<sync::pairing_gate::PairingGate>,
     mut paired: sync::transport::Paired,
 ) {
     use base64::Engine as _;
+    use sync::pairing_gate::ServeDecision;
+    use tauri::Emitter as _;
 
-    // Record / refresh the paired device by its pinned Noise static key.
-    if let Some(peer) = &paired.peer_static {
-        let pk = base64::engine::general_purpose::STANDARD.encode(peer);
-        let _ = db.add_paired_device(&pk, "Phone", db::now_ms());
+    // ── DEVICE-TRUST GATE ────────────────────────────────────────────────────
+    // Completing the keyless XX handshake does NOT authorize a peer. Identify the
+    // peer by its pinned Noise static key; an absent key (malformed handshake) is
+    // never served.
+    let Some(peer) = paired.peer_static.clone() else {
+        eprintln!("phone-sync: connection had no pinned static key — refusing");
+        return;
+    };
+    let pk = base64::engine::general_purpose::STANDARD.encode(&peer);
+
+    match sync::pairing_gate::serve_decision(
+        db.is_device_confirmed(&pk),
+        pairing_gate.window_is_open(),
+    ) {
+        // Already-trusted device: refresh its row (confirmed stays set) and serve.
+        ServeDecision::Serve => {
+            let _ = db.add_paired_device(&pk, "Phone", db::now_ms());
+        }
+        // Untrusted peer, no pairing window open → drop before any dispatch. Emit
+        // nothing (no spurious prompt for a random off-LAN dialer).
+        ServeDecision::Drop => {
+            eprintln!("phone-sync: untrusted device connected outside a pairing window — dropping");
+            return;
+        }
+        // Untrusted peer inside an open window → register a pending request, surface
+        // the SAS to the desktop UI, and await the user's decision (bounded). On
+        // confirm the command persists the key as confirmed; on reject/timeout we
+        // drop without serving (no catch-up, no command loop).
+        ServeDecision::Prompt => {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let rx = match pairing_gate.register_pending(request_id.clone(), pk.clone()) {
+                Ok(rx) => rx,
+                Err(e) => {
+                    eprintln!("phone-sync: could not register pending pairing: {e}");
+                    return;
+                }
+            };
+            let _ = app.emit(
+                "phone-sync://pairing-request",
+                serde_json::json!({
+                    "requestId": request_id,
+                    "sas": paired.sas.clone(),
+                    "peerKeyHex": pk,
+                }),
+            );
+
+            let confirmed =
+                match tokio::time::timeout(sync::pairing_gate::PAIRING_CONFIRM_TIMEOUT, rx).await {
+                    // The user confirmed: `confirm_pairing` already persisted the key
+                    // as confirmed before resolving this oneshot.
+                    Ok(Ok(true)) => true,
+                    // Rejected, or the sender was dropped (forgotten) — do not serve.
+                    Ok(Ok(false)) | Ok(Err(_)) => false,
+                    // Timed out — clean up the pending entry and do not serve.
+                    Err(_) => {
+                        pairing_gate.forget_pending(&request_id);
+                        false
+                    }
+                };
+            if !confirmed {
+                eprintln!("phone-sync: pairing not confirmed — dropping connection");
+                return;
+            }
+        }
     }
 
     // Subscribe BEFORE catch-up so no live event emitted during the catch-up
@@ -533,10 +651,10 @@ async fn serve_connection(
 // cross into the spawn. Called once from `setup` (startup) and from the idempotent
 // `phone_sync_listen` backstop.
 #[cfg(desktop)]
-// 8 params (the AppState pieces the accept loop needs as owned clones, plus the
-// shared `listen_endpoint`) > clippy's 7-arg threshold; same pattern + allow as
-// `agent::run`. Bundling them into a struct buys nothing here — they are already
-// the `AppState` fields, threaded through once.
+// 9 params (the AppState pieces the accept loop needs as owned clones, plus the
+// shared `listen_endpoint` and `pairing_gate`) > clippy's 7-arg threshold; same
+// pattern + allow as `agent::run`. Bundling them into a struct buys nothing here —
+// they are already the `AppState` fields, threaded through once.
 #[allow(clippy::too_many_arguments)]
 fn start_listener(
     app: AppHandle,
@@ -547,6 +665,7 @@ fn start_listener(
     pending: permissions::Pending,
     oauth_refresh: Arc<tokio::sync::Mutex<()>>,
     listen_endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
+    pairing_gate: Arc<sync::pairing_gate::PairingGate>,
 ) -> Result<(), String> {
     // App-layer (Noise) pairing identity — the key phones pin.
     let device = sync::pairing::device_identity()?;
@@ -594,7 +713,20 @@ fn start_listener(
         }
 
         loop {
-            let paired = match sync::transport::accept_and_pair(&endpoint, &device_private).await {
+            // Prologue policy (must mirror the phone's in `phone_sync_connect`):
+            // bind the OPEN pairing window's nonce when one is open (a first pairing),
+            // else an empty prologue (a confirmed device reconnecting outside any
+            // window). A peer whose prologue doesn't match fails the handshake — so a
+            // stale/forged QR can't even complete it during an open window. The nonce
+            // is read by the closure only AFTER a phone has actually connected (inside
+            // `accept_and_pair`, post-`accept`), so it captures the window open at
+            // connect time — not a stale snapshot from while the loop was parked idle.
+            let gate_for_nonce = pairing_gate.clone();
+            let paired = match sync::transport::accept_and_pair(&endpoint, &device_private, || {
+                gate_for_nonce.active_nonce().unwrap_or_default()
+            })
+            .await
+            {
                 Ok(p) => p,
                 Err(e) => {
                     if e == "endpoint closed" {
@@ -610,8 +742,9 @@ fn start_listener(
             let handler = handler.clone();
             let db = db.clone();
             let app = app_for_loop.clone();
+            let gate = pairing_gate.clone();
             tauri::async_runtime::spawn(async move {
-                serve_connection(app, db, handler, paired).await;
+                serve_connection(app, db, handler, gate, paired).await;
             });
         }
     });
@@ -640,11 +773,22 @@ struct ConnectInfo {
 /// desktop's static key, and spawn the live session (relay inbound frames to the
 /// UI via `phone-sync://frame`, forward UI commands to the desktop). Returns the
 /// SAS + pinned key so the UI can show the out-of-band comparison string.
+///
+/// `reconnect` selects the handshake prologue, which must match the desktop
+/// responder's:
+///   * FIRST pairing (`reconnect = false`): bind the QR's nonce as the prologue.
+///     The desktop has an OPEN pairing window carrying the same nonce, so the
+///     handshake completes; a phone that scanned a different/stale QR fails.
+///   * RECONNECT (`reconnect = true`): bind an EMPTY prologue. A confirmed device
+///     reconnects when no pairing window is open, and the desktop responder uses an
+///     empty prologue then — so the two match and the (already-trusted) device is
+///     served without a fresh confirmation.
 #[tauri::command]
 async fn phone_sync_connect(
     app: AppHandle,
     state: State<'_, AppState>,
     qr: String,
+    reconnect: Option<bool>,
 ) -> Result<ConnectInfo, String> {
     use base64::Engine as _;
     // Clone the Arc slot BEFORE any await: `State<'_>` must not be held across an
@@ -659,10 +803,23 @@ async fn phone_sync_connect(
     let identity = sync::pairing::device_identity()?;
     // 3. Bind a client endpoint (RelayMode::Default for hole-punch + relay).
     let endpoint = sync::transport::build_endpoint(iroh_key, iroh::RelayMode::Default).await?;
-    // 4. Dial + run the XX initiator handshake.
-    let paired =
-        sync::transport::connect_and_pair(&endpoint, payload.node_addr.clone(), &identity.private)
-            .await?;
+    // 4. Dial + run the XX initiator handshake. Prologue = the QR nonce for a first
+    //    pairing (matches the desktop's open window), or empty on reconnect (matches
+    //    the desktop's closed-window empty prologue). See the doc comment above.
+    let prologue: Vec<u8> = if reconnect.unwrap_or(false) {
+        Vec::new()
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(&payload.nonce)
+            .map_err(|e| e.to_string())?
+    };
+    let paired = sync::transport::connect_and_pair(
+        &endpoint,
+        payload.node_addr.clone(),
+        &identity.private,
+        &prologue,
+    )
+    .await?;
     // 5. PIN CHECK: the paired peer's Noise static must equal the QR's key.
     let expected = base64::engine::general_purpose::STANDARD
         .decode(&payload.public_key)
@@ -802,6 +959,8 @@ pub fn run() {
                 oauth_refresh: Arc::new(tokio::sync::Mutex::new(())),
                 phone_client: Arc::new(Mutex::new(None)),
                 listen_endpoint: Arc::new(Mutex::new(None)),
+                #[cfg(desktop)]
+                pairing_gate: Arc::new(sync::pairing_gate::PairingGate::new()),
             });
             // Phone Sync fan-out hub (Phase 0). The agent/llm `emit` helpers look
             // this up via `app.try_state` to mirror events; absent until managed,
@@ -825,6 +984,7 @@ pub fn run() {
                     state.pending.clone(),
                     state.oauth_refresh.clone(),
                     state.listen_endpoint.clone(),
+                    state.pairing_gate.clone(),
                 ) {
                     eprintln!("phone-sync: listener failed to start: {e}");
                 }
@@ -867,7 +1027,9 @@ pub fn run() {
         phone_sync_listen,
         phone_sync_connect,
         phone_sync_send_command,
-        phone_sync_disconnect
+        phone_sync_disconnect,
+        confirm_pairing,
+        reject_pairing
     ]);
 
     // MOBILE — the remote-CLIENT subset. Shared settings/secrets/sessions +

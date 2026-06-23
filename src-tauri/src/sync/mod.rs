@@ -16,6 +16,11 @@
 pub mod client;
 pub mod noise;
 pub mod pairing;
+// DESKTOP-ONLY: the device-trust gate (pairing window + pending-confirm map) is
+// part of the accept-loop SERVER. The phone is a pure CLIENT and never gates an
+// inbound peer, so this is excluded from the mobile binary alongside `server`.
+#[cfg(desktop)]
+pub mod pairing_gate;
 pub mod protocol;
 // DESKTOP-ONLY: the accept-loop sync SERVER. `server.rs` does `use crate::agent`
 // (the agent loop), which is `#[cfg(desktop)]`-excluded on mobile; gating the

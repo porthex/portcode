@@ -53,10 +53,13 @@ pub async fn build_endpoint(secret_key: SecretKey, relay: RelayMode) -> Result<E
 /// needs (the SAS to compare out-of-band, the peer's pinned static key).
 pub struct Paired {
     pub channel: SecureChannel,
-    /// Short Authentication String — surfaced to the pairing UI in a later
-    /// increment; asserted in tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Short Authentication String. The desktop surfaces it to the pairing UI for
+    /// out-of-band comparison before confirming an untrusted device; the phone
+    /// returns it from `phone_sync_connect` for the same comparison on its end.
     pub sas: String,
+    /// The peer's pinned Noise static public key, the identity the device-trust
+    /// gate keys off (confirmed vs. not). `None` only if the handshake never
+    /// received it (a malformed/aborted handshake), which the serve path rejects.
     pub peer_static: Option<Vec<u8>>,
 }
 
@@ -162,21 +165,22 @@ fn decrypt_frame(noise: &SharedNoise, ciphertext: &[u8]) -> Result<SyncFrame, St
 }
 
 /// Dial a peer, run the XX pairing handshake as the initiator, and return the
-/// resulting encrypted channel. The desktop is always the responder
-/// (`accept_and_pair`); this initiator path is exercised only by the iroh
-/// integration tests (and the future phone-side client).
-#[cfg_attr(not(test), allow(dead_code))]
+/// resulting encrypted channel. `nonce` is the pairing nonce the phone scanned
+/// from the desktop's QR — it is bound into the handshake prologue so the
+/// responder, which uses its OPEN pairing window's nonce, only completes the
+/// handshake when the two match (a stale/forged nonce fails cryptographically).
 pub async fn connect_and_pair(
     endpoint: &Endpoint,
     peer: EndpointAddr,
     local_noise_private: &[u8],
+    nonce: &[u8],
 ) -> Result<Paired, String> {
     let conn = endpoint
         .connect(peer, ALPN)
         .await
         .map_err(|e| e.to_string())?;
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
-    let hs = Handshake::xx_initiator(local_noise_private)?;
+    let hs = Handshake::xx_initiator(local_noise_private, nonce)?;
     let (noise, sas, peer_static) = drive_xx(hs, &mut send, &mut recv, true).await?;
     Ok(Paired {
         channel: SecureChannel {
@@ -193,14 +197,26 @@ pub async fn connect_and_pair(
 
 /// Accept one inbound connection, run the XX pairing handshake as the responder,
 /// and return the resulting encrypted channel.
+///
+/// `nonce_for` yields the handshake-prologue nonce and is invoked AFTER a
+/// connection has actually arrived (post-`accept`), NOT before. This timing is
+/// load-bearing: the accept loop is usually parked in `accept()` with no pairing
+/// window open, and a window opens (with a fresh nonce) only when the desktop user
+/// clicks "Pair a phone". Reading the nonce lazily — once a phone has connected —
+/// captures the window that is open AT THAT MOMENT, so a legitimate first pairing
+/// binds the same nonce on both ends. Reading it eagerly (before `accept`) would
+/// snapshot the stale empty nonce and break every first pairing.
 pub async fn accept_and_pair(
     endpoint: &Endpoint,
     local_noise_private: &[u8],
+    nonce_for: impl FnOnce() -> Vec<u8>,
 ) -> Result<Paired, String> {
     let incoming = endpoint.accept().await.ok_or("endpoint closed")?;
     let conn = incoming.await.map_err(|e| e.to_string())?;
     let (mut send, mut recv) = conn.accept_bi().await.map_err(|e| e.to_string())?;
-    let hs = Handshake::xx_responder(local_noise_private)?;
+    // Resolve the prologue nonce now that a peer has connected (see above).
+    let nonce = nonce_for();
+    let hs = Handshake::xx_responder(local_noise_private, &nonce)?;
     let (noise, sas, peer_static) = drive_xx(hs, &mut send, &mut recv, false).await?;
     Ok(Paired {
         channel: SecureChannel {
@@ -279,6 +295,11 @@ mod tests {
     use crate::llm::StreamEvent;
     use crate::sync::noise::StaticKeypair;
 
+    /// The pairing nonce both peers bind into the handshake prologue. Real code
+    /// derives it from the QR / the open pairing window; the tests just need both
+    /// sides to agree on the same bytes for the handshake to complete.
+    const TEST_NONCE: &[u8] = &[0x01, 0x02, 0x03, 0x04];
+
     // Headless desktop↔desktop proof: two in-process iroh endpoints (no relay)
     // pair over QUIC via the XX Noise handshake, agree on a SAS, pin each other's
     // static keys, and exchange encrypted SyncFrames both directions.
@@ -307,12 +328,14 @@ mod tests {
         // Endpoint clone inside the returned Paired (Arc-backed) keeps the socket
         // alive for the frame exchange below.
         let server_priv = server_noise.private.clone();
-        let server_task =
-            tokio::spawn(async move { accept_and_pair(&server_ep, &server_priv).await });
+        let server_task = tokio::spawn(async move {
+            accept_and_pair(&server_ep, &server_priv, || TEST_NONCE.to_vec()).await
+        });
 
-        let mut client = connect_and_pair(&client_ep, server_addr, &client_noise.private)
-            .await
-            .expect("client pairing");
+        let mut client =
+            connect_and_pair(&client_ep, server_addr, &client_noise.private, TEST_NONCE)
+                .await
+                .expect("client pairing");
         let mut server = server_task.await.unwrap().expect("server pairing");
 
         // Out-of-band SAS matches, and each side pinned the other's static key.
@@ -359,6 +382,48 @@ mod tests {
         }
     }
 
+    // Security proof over the real iroh transport: a phone presenting a DIFFERENT
+    // pairing nonce than the responder's open-window nonce fails the XX handshake
+    // (the nonce is bound into the Noise prologue). This is the transport-level
+    // analogue of `noise::tests::xx_with_a_mismatched_prologue_nonce_fails`, and it
+    // proves a stale/forged QR can't complete pairing even after dialing in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mismatched_pairing_nonce_fails_the_handshake_over_iroh() {
+        let server_ep = build_endpoint(SecretKey::generate(), RelayMode::Disabled)
+            .await
+            .unwrap();
+        let client_ep = build_endpoint(SecretKey::generate(), RelayMode::Disabled)
+            .await
+            .unwrap();
+        let server_noise = StaticKeypair::generate().unwrap();
+        let client_noise = StaticKeypair::generate().unwrap();
+        let server_addr = server_ep.addr();
+
+        // Responder binds nonce A; the dialing phone binds a DIFFERENT nonce B.
+        let server_priv = server_noise.private.clone();
+        let server_task = tokio::spawn(async move {
+            accept_and_pair(&server_ep, &server_priv, || vec![0xAA, 0xAA]).await
+        });
+
+        let client_res = connect_and_pair(
+            &client_ep,
+            server_addr,
+            &client_noise.private,
+            &[0xBB, 0xBB],
+        )
+        .await;
+
+        // At least one side must reject the prologue-mismatched handshake; in
+        // practice both error. Asserting the initiator fails is the load-bearing
+        // claim (the phone never gets a usable channel).
+        assert!(
+            client_res.is_err(),
+            "a phone with the wrong pairing nonce must fail the handshake"
+        );
+        // Drain the server task so it doesn't dangle (it also errors).
+        let _ = server_task.await;
+    }
+
     // End-to-end Phase 2c proof: pair two iroh endpoints, split BOTH channels,
     // and run the real concurrent server loops (forward_live + handle_commands)
     // against a client that issues one Command and reads forwarded Live frames.
@@ -392,9 +457,10 @@ mod tests {
         let server_addr = server_ep.addr();
 
         let server_priv = server_noise.private.clone();
-        let server_task =
-            tokio::spawn(async move { accept_and_pair(&server_ep, &server_priv).await });
-        let client = connect_and_pair(&client_ep, server_addr, &client_noise.private)
+        let server_task = tokio::spawn(async move {
+            accept_and_pair(&server_ep, &server_priv, || TEST_NONCE.to_vec()).await
+        });
+        let client = connect_and_pair(&client_ep, server_addr, &client_noise.private, TEST_NONCE)
             .await
             .expect("client pairing");
         let server = server_task.await.unwrap().expect("server pairing");
