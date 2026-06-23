@@ -63,6 +63,8 @@ vi.mock("./lib/ipc", () => ({
   phoneSyncUnpair: vi.fn(),
   // Reached when the remote-session banner's Disconnect is clicked.
   phoneSyncDisconnect: vi.fn(),
+  // store.init() (desktop) subscribes to inbound pairing-confirm requests.
+  onPhoneSyncPairingRequest: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -81,6 +83,7 @@ beforeEach(() => {
   m.oauthStatus.mockResolvedValue({ signedIn: false, expiresAt: null, account: null, tier: null });
   m.phoneSyncStatus.mockResolvedValue({ devicePublicKey: "DEVICE==", paired: [] });
   m.phoneSyncDisconnect.mockResolvedValue(undefined);
+  m.onPhoneSyncPairingRequest.mockResolvedValue(() => {});
 });
 
 describe("App layout", () => {

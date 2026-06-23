@@ -87,7 +87,8 @@ describe("RemotePairing — pair panel", () => {
       await Promise.resolve();
     });
 
-    expect(m.phoneSyncConnect).toHaveBeenCalledWith("{payload}");
+    // A first dial is not a reconnect (reconnect=false → binds the QR nonce).
+    expect(m.phoneSyncConnect).toHaveBeenCalledWith("{payload}", false);
     expect(useStore.getState().remoteConnected).toBe(true);
     expect(useStore.getState().remoteSas).toBe("TANGO-42");
   });
@@ -210,7 +211,7 @@ describe("RemotePairing — camera scan (phone)", () => {
       await Promise.resolve();
     });
 
-    expect(m.phoneSyncConnect).toHaveBeenCalledWith("{scanned}");
+    expect(m.phoneSyncConnect).toHaveBeenCalledWith("{scanned}", false);
     expect(useStore.getState().remoteConnected).toBe(true);
     expect(useStore.getState().remoteSas).toBe("TANGO-42");
   });
@@ -395,8 +396,9 @@ describe("RemotePairing — cross-launch reconnect", () => {
       await Promise.resolve();
     });
 
-    // Re-dials the remembered desktop, pre-verified (no SAS re-comparison needed).
-    expect(m.phoneSyncConnect).toHaveBeenCalledWith("QR-REMEMBERED");
+    // Re-dials the remembered desktop, pre-verified (no SAS re-comparison needed)
+    // and as a reconnect (reconnect=true → binds an empty handshake prologue).
+    expect(m.phoneSyncConnect).toHaveBeenCalledWith("QR-REMEMBERED", true);
     const st = useStore.getState();
     expect(st.remoteConnected).toBe(true);
     expect(st.remoteVerified).toBe(true);

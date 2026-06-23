@@ -82,8 +82,15 @@ export default function App() {
 
   // Release the live remote frame subscription if the app tree unmounts (HMR, a
   // root remount) so a stale native listener can't survive into a new store
-  // instance and double-feed applyFrame.
-  useEffect(() => () => useStore.getState().remoteUnlisten?.(), []);
+  // instance and double-feed applyFrame. The desktop's pairing-request listener
+  // (device-trust gate) is torn down the same way so it can't leak across remounts.
+  useEffect(
+    () => () => {
+      useStore.getState().remoteUnlisten?.();
+      useStore.getState().pairingRequestUnlisten?.();
+    },
+    [],
+  );
 
   // Global keyboard shortcuts.
   useEffect(() => {

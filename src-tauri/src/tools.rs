@@ -24,8 +24,10 @@ pub trait Tool: Send + Sync {
         false
     }
 
-    /// Short human-readable summary of a call, for the permission prompt.
-    fn summarize(&self, input: &Value) -> String {
+    /// Short human-readable summary of a call, for the permission prompt. Takes
+    /// `ctx` so a tool can resolve a path to its real destination (so an "ask"
+    /// prompt can't be deceived by a benign-looking relative or symlinked path).
+    fn summarize(&self, input: &Value, _ctx: &ToolCtx) -> String {
         for key in ["path", "command", "pattern"] {
             if let Some(s) = input.get(key).and_then(|v| v.as_str()) {
                 return s.to_string();
@@ -102,8 +104,25 @@ fn resolve_existing(base: &Path, p: &str) -> Result<PathBuf, String> {
     Ok(canon)
 }
 
-/// Lexically resolve `.`/`..` against the (canonical) base without touching the
-/// filesystem, so we can validate paths that don't exist yet (for writes).
+/// Resolve a path for writing, sandboxed to the workspace, allowing the final
+/// component(s) not to exist yet.
+///
+/// A purely lexical check (`..`-popping + `starts_with`) is not enough: a symlink
+/// or NTFS junction *inside* the workspace can redirect an otherwise-contained
+/// path to an arbitrary location outside it (persistence / RCE). So we resolve the
+/// real destination through the filesystem and re-assert containment:
+///
+///  1. Lexically normalize `.`/`..` to get the intended absolute target `out`,
+///     and reject an obvious lexical escape early.
+///  2. Walk up `out` to the deepest ancestor that actually exists and
+///     `canonicalize()` it — this follows every reparse point on the existing
+///     prefix to its real location.
+///  3. Re-join the remaining (not-yet-existing) tail onto that real ancestor.
+///  4. Require the result to stay under the canonical base.
+///
+/// Because the canonical base contains no reparse points, any junction/symlink in
+/// the existing prefix that pointed outside the workspace makes the canonicalized
+/// ancestor fall outside `base`, so the final `starts_with` rejects it.
 fn resolve_for_write(base: &Path, p: &str) -> Result<PathBuf, String> {
     let path = Path::new(p);
     let joined = if path.is_absolute() {
@@ -124,7 +143,40 @@ fn resolve_for_write(base: &Path, p: &str) -> Result<PathBuf, String> {
     if !out.starts_with(base) {
         return Err(format!("path '{p}' is outside the workspace"));
     }
-    Ok(out)
+
+    // Find the deepest existing ancestor of `out`, canonicalize it (resolving any
+    // reparse points), and re-attach the not-yet-existing tail.
+    let mut existing = out.as_path();
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let real_ancestor = loop {
+        match existing.canonicalize() {
+            Ok(real) => break real,
+            Err(_) => {
+                // This component doesn't exist yet (or can't be resolved); strip it
+                // and try its parent. The lexical `out` is already base-contained, so
+                // we always reach `base` (which canonicalizes) before running out.
+                let Some(name) = existing.file_name() else {
+                    // No more components to strip and nothing canonicalized — treat as
+                    // outside, rather than silently allowing an unresolved path.
+                    return Err(format!("path '{p}' is outside the workspace"));
+                };
+                tail.push(name);
+                let Some(parent) = existing.parent() else {
+                    return Err(format!("path '{p}' is outside the workspace"));
+                };
+                existing = parent;
+            }
+        }
+    };
+
+    let mut real = real_ancestor;
+    for name in tail.iter().rev() {
+        real.push(name);
+    }
+    if !real.starts_with(base) {
+        return Err(format!("path '{p}' is outside the workspace"));
+    }
+    Ok(real)
 }
 
 fn str_arg<'a>(input: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -376,6 +428,21 @@ impl Tool for FsWrite {
     fn mutating(&self) -> bool {
         true
     }
+    /// Show the RESOLVED absolute destination in the permission prompt, not the raw
+    /// argument, so a benign-looking relative path (or one that traverses a symlink/
+    /// junction) can't trick the user into approving a write outside the workspace.
+    /// Falls back to the raw path if resolution fails (so the prompt is never empty).
+    fn summarize(&self, input: &Value, ctx: &ToolCtx) -> String {
+        let raw = input.get("path").and_then(|v| v.as_str());
+        match (base_dir(ctx), raw) {
+            (Ok(base), Some(p)) => match resolve_for_write(&base, p) {
+                Ok(resolved) => resolved.display().to_string(),
+                Err(_) => p.to_string(),
+            },
+            (_, Some(p)) => p.to_string(),
+            _ => self.name().to_string(),
+        }
+    }
     async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String, String> {
         let base = base_dir(ctx)?;
         let p = str_arg(&input, "path")?;
@@ -582,10 +649,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A real, canonicalized workspace dir. `resolve_for_write` now resolves through
+    /// the filesystem (to defeat reparse-point escapes), so the base must exist and
+    /// be canonical — mirroring production, where the base is `base_dir(ctx)`.
     fn base() -> PathBuf {
-        // Absolute on Windows + Linux; `resolve_for_write` is lexical, so the dir
-        // does not need to exist.
-        std::env::temp_dir().join("portcode_sandbox_test_base")
+        unique_temp_dir("base")
     }
 
     #[test]
@@ -594,15 +662,19 @@ mod tests {
         let p = resolve_for_write(&b, "sub/file.txt").unwrap();
         assert!(p.starts_with(&b));
         assert!(p.ends_with("file.txt"));
+        std::fs::remove_dir_all(&b).ok();
     }
 
     #[test]
     fn resolve_for_write_normalizes_dot_and_dotdot_within_base() {
         let b = base();
+        // `b` is canonical and the existing ancestor, so the not-yet-existing tail is
+        // appended verbatim onto it.
         assert_eq!(
             resolve_for_write(&b, "a/../b/./c.txt").unwrap(),
             b.join("b").join("c.txt")
         );
+        std::fs::remove_dir_all(&b).ok();
     }
 
     #[test]
@@ -611,6 +683,7 @@ mod tests {
         assert!(resolve_for_write(&b, "../escape.txt")
             .unwrap_err()
             .contains("outside the workspace"));
+        std::fs::remove_dir_all(&b).ok();
     }
 
     #[test]
@@ -620,6 +693,177 @@ mod tests {
         assert!(resolve_for_write(&b, outside.to_str().unwrap())
             .unwrap_err()
             .contains("outside the workspace"));
+        std::fs::remove_dir_all(&b).ok();
+    }
+
+    // ── sandbox-escape via reparse points (junction / symlink) ────────────────
+    //
+    // These build a REAL temp tree so the canonicalizing containment check is
+    // actually exercised, not just the lexical pop. Each uses a unique workspace
+    // dir so the tests are independent and parallel-safe.
+
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "portcode_resolve_test_{tag}_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Canonicalize so the base matches what `base_dir(ctx)` produces in
+        // production (and so containment comparisons are apples-to-apples).
+        dir.canonicalize().unwrap()
+    }
+
+    /// Create a directory junction/symlink at `link` pointing to `target`. Returns
+    /// false if the OS refused (e.g. symlink privilege missing on CI) so the caller
+    /// can skip gracefully.
+    #[cfg(windows)]
+    fn make_dir_reparse(link: &Path, target: &Path) -> bool {
+        // Prefer a junction (no privilege required, unlike a symlink on most CI).
+        std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &target.to_string_lossy(),
+            ])
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    #[cfg(unix)]
+    fn make_dir_reparse(link: &Path, target: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    fn make_dir_reparse(_link: &Path, _target: &Path) -> bool {
+        false
+    }
+
+    #[tokio::test]
+    async fn fs_write_through_an_inside_junction_to_outside_is_rejected() {
+        let root = unique_temp_dir("escape");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // A reparse point that lives INSIDE the workspace but points OUTSIDE it.
+        let link = workspace.join("escape");
+        if !make_dir_reparse(&link, &outside) {
+            // Couldn't create a reparse point (privilege). Don't fail CI; the
+            // resolver is still covered by the lexical-escape tests.
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+
+        let ctx = ToolCtx {
+            workspace: workspace.clone(),
+        };
+        let err = FsWrite
+            .run(json!({ "path": "escape/pwned.txt", "content": "x" }), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("outside the workspace"),
+            "expected sandbox rejection, got: {err}"
+        );
+        // The write must NOT have landed in the real outside dir.
+        assert!(!outside.join("pwned.txt").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_edit_through_an_inside_junction_to_outside_is_rejected() {
+        let root = unique_temp_dir("escape_edit");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // A real file outside, reachable only through the junction.
+        std::fs::write(outside.join("secret.txt"), "original").unwrap();
+
+        let link = workspace.join("escape");
+        if !make_dir_reparse(&link, &outside) {
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+
+        let ctx = ToolCtx {
+            workspace: workspace.clone(),
+        };
+        let err = FsEdit
+            .run(
+                json!({
+                    "path": "escape/secret.txt",
+                    "old_string": "original",
+                    "new_string": "tampered"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("outside the workspace"),
+            "expected sandbox rejection, got: {err}"
+        );
+        // The outside file must be untouched.
+        assert_eq!(
+            std::fs::read_to_string(outside.join("secret.txt")).unwrap(),
+            "original"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_write_creates_a_missing_parent_inside_the_workspace() {
+        let workspace = unique_temp_dir("normal_write");
+        let ctx = ToolCtx {
+            workspace: workspace.clone(),
+        };
+        let out = FsWrite
+            .run(
+                json!({ "path": "nested/dir/file.txt", "content": "hello" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("Created"));
+        let written = workspace.join("nested").join("dir").join("file.txt");
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), "hello");
+
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_write_summarize_shows_the_resolved_destination() {
+        let workspace = unique_temp_dir("summarize");
+        let ctx = ToolCtx {
+            workspace: workspace.clone(),
+        };
+        let summary = FsWrite.summarize(&json!({ "path": "sub/f.txt" }), &ctx);
+        // Resolved to an absolute path under the (canonicalized) workspace, not the
+        // raw "sub/f.txt".
+        assert!(summary.ends_with("f.txt"));
+        assert!(
+            Path::new(&summary).is_absolute(),
+            "summary should be absolute, got: {summary}"
+        );
+        let canon_ws = workspace.canonicalize().unwrap();
+        assert!(
+            Path::new(&summary).starts_with(&canon_ws),
+            "summary {summary} should be under {}",
+            canon_ws.display()
+        );
+
+        std::fs::remove_dir_all(&workspace).ok();
     }
 
     #[test]
@@ -664,9 +908,16 @@ mod tests {
 
     #[test]
     fn summarize_prefers_path_command_pattern_then_falls_back_to_name() {
-        assert_eq!(FsRead.summarize(&json!({ "path": "src/x.rs" })), "src/x.rs");
-        assert_eq!(Shell.summarize(&json!({ "command": "ls" })), "ls");
-        assert_eq!(GrepTool.summarize(&json!({ "pattern": "foo" })), "foo");
-        assert_eq!(FsRead.summarize(&json!({})), "fs_read"); // no recognized key → tool name
+        let ctx = ToolCtx { workspace: base() };
+        assert_eq!(
+            FsRead.summarize(&json!({ "path": "src/x.rs" }), &ctx),
+            "src/x.rs"
+        );
+        assert_eq!(Shell.summarize(&json!({ "command": "ls" }), &ctx), "ls");
+        assert_eq!(
+            GrepTool.summarize(&json!({ "pattern": "foo" }), &ctx),
+            "foo"
+        );
+        assert_eq!(FsRead.summarize(&json!({}), &ctx), "fs_read"); // no recognized key → tool name
     }
 }
