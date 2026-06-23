@@ -1,19 +1,39 @@
-// Opt-in crash reporting for the Rust host (Phase 1b). The whole pipeline is INERT
-// unless two conditions hold: the user has explicitly consented (the frontend
-// calls `telemetry_set_consent(true)`) AND a DSN was injected at build time
-// (`option_env!("SENTRY_DSN")`). Dev builds, contributor builds, and forks ship no
-// DSN, so the SDK is never initialized and reporting is physically impossible
-// there — preserving Portcode's "zero telemetry by default" promise. See
-// docs/SENTRY_PLAN.md and the Phase-1a frontend `src/lib/telemetry.ts`.
+// Opt-in crash reporting for the Rust host (Phase 1b) + desktop minidump capture
+// (Phase 2). The whole pipeline is INERT unless two conditions hold: the user has
+// explicitly consented (the frontend calls `telemetry_set_consent(true)`) AND a DSN
+// was injected at build time (`option_env!("SENTRY_DSN")`). Dev builds, contributor
+// builds, and forks ship no DSN, so the SDK is never initialized and reporting is
+// physically impossible there — preserving Portcode's "zero telemetry by default"
+// promise. See docs/SENTRY_PLAN.md and the Phase-1a frontend `src/lib/telemetry.ts`.
 //
-// Consent is enforced AT THE EDGE, mirroring the frontend: a `CONSENT_LIVE` atomic
-// is checked inside `before_send`, which returns `None` (drop the event) when it is
+// Consent is enforced AT THE EDGE, mirroring the frontend: it is checked inside
+// `before_send` (→ `scrub_event`), which returns `None` (drop the event) when it is
 // false. We deliberately do NOT call `Client::close()` to opt out — closing is
 // permanent and leaves the panic handler installed, so a later opt-in couldn't
-// cleanly re-init. The SDK is initialized at most once (its guard kept alive in a
-// `OnceLock`); flipping the atomic gates sending. Every event that DOES pass the
-// gate is rebuilt + redacted by the allowlist scrubber (`scrub_event`) before it
-// can leave.
+// cleanly re-init. Every event that DOES pass the gate is rebuilt + redacted by the
+// allowlist scrubber (`scrub_event`) before it can leave.
+//
+// ── PHASE 2 — CROSS-PROCESS CONSENT (the central correctness fix) ───────────────
+// The minidump monitor (`sentry_rust_minidump::init`) re-execs THIS binary as a
+// separate "crash-reporter" process that waits for a native crash. That process has
+// its OWN address space, so an in-memory `CONSENT_LIVE` atomic set by the IPC in the
+// MAIN process is invisible to it. Consent therefore lives ON DISK: `consent_is_live`
+// reads `<app_config_dir>/.telemetry_consent` (content "1" = on; absent/anything else
+// = off, fail-safe). BOTH processes run `before_send` → `scrub_event` →
+// `consent_is_live`, so a crash event the monitor captures is dropped exactly when the
+// user hasn't opted in — and flows when they have, with no IPC to the child. The
+// atomic is kept as a fast write-through hint, but the FILE is authoritative.
+//
+// This also fixes 1b's startup-capture gap: the client is now bound at startup (see
+// `init_desktop_with_minidump`) and gated by the on-disk file, so a user who opted in
+// during a prior session has reporting live from the next launch.
+//
+// PRIVACY NOTE (owner-accepted): the raw minidump is sent as a Sentry ATTACHMENT,
+// which bypasses `before_send`/the allowlist scrubber entirely — a memory snapshot can
+// contain secrets and is NOT redactable. It IS still consent-gated, because the whole
+// Fatal event (attachment included) is dropped by `scrub_event` when consent is off.
+// The owner explicitly chose to ship full native minidumps accepting this residual
+// risk (the DECISION that authorized Phase 2).
 //
 // PERFORMANCE TRACING: sentry-rust (verified through 0.41) has NO
 // `before_send_transaction` hook — it is a JS/Python-SDK feature that does not
@@ -25,28 +45,34 @@
 // transaction hook (or we adopt manual `Transaction` capture) the scrubber is ready
 // to wire in — but it is intentionally not referenced by `init` today.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use sentry::protocol::{Context, Event, Frame};
 
 use crate::scrub::redact_secrets;
 
-/// The user's CURRENT consent, checked at send time inside `before_send`. Starts
-/// `false` (off by default). Toggled by `set_consent`; the gate is what makes
-/// opt-out instant + total and opt-in-again a no-op flag flip.
-static CONSENT_LIVE: AtomicBool = AtomicBool::new(false);
+/// This app's bundle identifier — kept in lockstep with `tauri.conf.json`'s
+/// `identifier`. Hardcoded so the consent-file path resolves WITHOUT a Tauri
+/// `AppHandle`: `init_desktop_with_minidump` runs before the builder AND in the
+/// re-exec'd crash-reporter process, neither of which has access to managed state.
+const BUNDLE_IDENTIFIER: &str = "dev.porthex.portcode";
 
-/// Holds the live client guard for the lifetime of the process. Its presence is
-/// also our "already initialized" flag — `set_consent` only calls `init()` when
-/// this is empty, and `init()` itself sets it exactly once.
-static GUARD: OnceLock<sentry::ClientInitGuard> = OnceLock::new();
+/// Name of the on-disk consent flag inside `<app_config_dir>`. Dotfile so it reads
+/// as internal state, not a user document.
+const CONSENT_FILE: &str = ".telemetry_consent";
+
+/// A fast write-through hint mirroring the on-disk consent for the MAIN process. The
+/// FILE (`consent_is_live`) is authoritative — it is what the separate crash-reporter
+/// process reads — but checking the atomic first avoids a filesystem stat on every
+/// captured event in the common (main-process) path.
+static CONSENT_LIVE: AtomicBool = AtomicBool::new(false);
 
 /// Build-time DSN, or `None` when absent/blank (dev/contributor/fork builds).
 /// `option_env!` evaluates at COMPILE time: with no `SENTRY_DSN` in the build
-/// environment this is a `None` constant, so `set_consent` can never initialize
-/// the SDK and the whole module is effectively dead at runtime.
+/// environment this is a `None` constant, so `init_desktop_with_minidump` returns
+/// `None` and the whole module is effectively dead at runtime.
 pub fn dsn() -> Option<&'static str> {
     match option_env!("SENTRY_DSN") {
         Some(d) if !d.trim().is_empty() => Some(d),
@@ -54,28 +80,84 @@ pub fn dsn() -> Option<&'static str> {
     }
 }
 
-/// The single entry point the IPC command (`telemetry_set_consent`) calls when the
-/// frontend's consent toggle changes.
-///
-///  * `true`  → arm the gate; lazily `init()` the SDK iff a DSN exists and we have
-///    not initialized yet. The first opt-in after launch wires Sentry; later
-///    opt-ins just re-arm the flag.
-///  * `false` → disarm the gate. We do NOT close the client — the atomic makes
-///    `before_send` drop every event (including ones Sentry's own panic hook
-///    captures), which is instant, total, and reversible.
-pub fn set_consent(enabled: bool) {
-    CONSENT_LIVE.store(enabled, Ordering::SeqCst);
-    if enabled && GUARD.get().is_none() && dsn().is_some() {
-        init();
+// Test-only per-thread override for the consent-file path. `cargo test` runs tests in
+// parallel threads that all share this module's statics, so a THREAD-LOCAL (not a
+// global) lets each test drive its OWN on-disk consent at a unique temp path —
+// isolated, race-free, and without ever touching the user's real config dir. In
+// production this hook does not exist; `consent_path` resolves the real path.
+#[cfg(test)]
+thread_local! {
+    static CONSENT_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Absolute path of the consent file: `<app_config_dir>/.telemetry_consent`, where
+/// `<app_config_dir>` reproduces Tauri's own `app_config_dir()` =
+/// `dirs::config_dir().join(<identifier>)`. Returns `None` only if the platform has
+/// no config dir (then consent reads as off — fail safe).
+fn consent_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        if let Some(p) = CONSENT_PATH_OVERRIDE.with(|c| c.borrow().clone()) {
+            return Some(p);
+        }
+    }
+    Some(
+        dirs::config_dir()?
+            .join(BUNDLE_IDENTIFIER)
+            .join(CONSENT_FILE),
+    )
+}
+
+/// The AUTHORITATIVE consent check, readable from BOTH the main and crash-reporter
+/// processes. Reads the on-disk flag: `"1"` (trimmed) ⇒ live; absent, unreadable, or
+/// any other content ⇒ off. Fails safe to OFF on every error path, so a missing dir,
+/// an IO error, or a partially-written file can never cause an event to be sent.
+fn consent_is_live() -> bool {
+    match consent_path() {
+        Some(p) => matches!(std::fs::read_to_string(&p), Ok(s) if s.trim() == "1"),
+        None => false,
     }
 }
 
-/// Initialize the Sentry SDK once and install the panic-flush hook. Idempotent via
-/// the `GUARD` OnceLock: a racing second call whose `set` loses simply drops its
-/// (now-redundant) guard, and only the winner installs the panic hook.
-fn init() {
-    let Some(dsn) = dsn() else { return };
+/// The single entry point the IPC command (`telemetry_set_consent`) calls when the
+/// frontend's consent toggle changes. Writes the AUTHORITATIVE on-disk flag (so the
+/// separate crash-reporter process sees the change) and updates the fast in-memory
+/// hint. It does NOT init/close the SDK: the client is bound once at startup
+/// (`init_desktop_with_minidump`, DSN-gated), and `before_send` → `consent_is_live`
+/// gates sending — so opt-out is instant + total and opt-in is just a flag flip.
+///
+///  * `true`  → write `"1"` to the consent file.
+///  * `false` → remove the file (best-effort; a leftover-then-removed file would
+///    still read as off, but removing keeps no stale "1" around).
+///
+/// Best-effort IO: errors are swallowed. The fail-safe is OFF, so a failed write on
+/// opt-IN simply means nothing is sent (never the reverse) — the privacy-safe
+/// direction.
+pub fn set_consent(enabled: bool) {
+    CONSENT_LIVE.store(enabled, Ordering::SeqCst);
+    let Some(path) = consent_path() else { return };
+    if enabled {
+        // Ensure the parent dir exists (it normally does — settings/db live there).
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, "1");
+    } else {
+        // Removing is enough; if removal fails the leftover content is "1", so as a
+        // belt-and-suspenders also try to overwrite with "0" (read as off).
+        if std::fs::remove_file(&path).is_err() {
+            let _ = std::fs::write(&path, "0");
+        }
+    }
+}
 
+/// Build the Sentry client + `ClientOptions`. Shared by BOTH processes (the main app
+/// and the re-exec'd crash reporter), so both carry the SAME `before_send` scrubber +
+/// consent gate. The options are byte-for-byte the 1b options — only the call site
+/// (a `Client` built up front, rather than a lazy `sentry::init`) changed, because
+/// the minidump monitor must be armed before any crash can happen.
+fn build_client(dsn: &str) -> sentry::Client {
     let options = sentry::ClientOptions {
         release: Some(env!("CARGO_PKG_VERSION").into()),
         environment: Some(
@@ -94,22 +176,54 @@ fn init() {
         // The privacy gate + allowlist scrubber, enforced at the edge. A bare `fn`
         // coerces to the `dyn Fn(Event) -> Option<Event> + Send + Sync` the field
         // expects.
-        before_send: Some(Arc::new(scrub_event)),
+        before_send: Some(std::sync::Arc::new(scrub_event)),
         ..Default::default()
     };
+    sentry::Client::from((dsn, options))
+}
 
-    let guard = sentry::init((dsn, options));
+/// Initialize crash reporting for the DESKTOP host (Phase 2). Called as the FIRST
+/// thing in `run()`, before the Tauri builder, so it executes in BOTH the app process
+/// and the re-exec'd crash-reporter process (everything before `minidump::init`
+/// runs in both).
+///
+/// Returns `None` when no DSN was baked in — the unchanged inert-by-default contract:
+/// dev/contributor/fork builds never init the SDK or spawn a monitor. When a DSN IS
+/// present:
+///   1. build the client (with our scrubber + gate) and bind it to the current hub,
+///   2. start the OUT-OF-PROCESS minidump monitor (`tauri_plugin_sentry::minidump`),
+///      which re-execs this binary; the parent gets the handle, the child becomes the
+///      monitor and never returns past `minidump::init`,
+///   3. (main process only, after the monitor split) install the chained panic-flush
+///      hook so `panic = "abort"` panics still flush before the process dies.
+///
+/// The returned guard MUST be held for the whole process lifetime — dropping it stops
+/// the crash-reporter child. The caller (`run()`) keeps it alive until `.run()`
+/// returns.
+pub fn init_desktop_with_minidump() -> Option<tauri_plugin_sentry::minidump::Handle> {
+    let dsn = dsn()?;
 
-    // Store the guard; if another thread won the race, keep theirs (ours drops here)
-    // and do NOT double-install the panic hook.
-    if GUARD.set(guard).is_err() {
-        return;
-    }
+    let client = build_client(dsn);
+    // Bind the client to the current hub so `sentry::capture_*` (incl. the plugin's
+    // webview→Rust `envelope` command and the minidump monitor's Fatal event) route
+    // through OUR client → OUR `before_send` scrubber + consent gate.
+    sentry::Hub::current().bind_client(Some(std::sync::Arc::new(client.clone())));
 
-    // The `panic` integration installs its OWN capturing hook during `sentry::init`
-    // above. We chain AFTER init so that capturing hook is our `prev`: on a panic we
-    // first let it run (capture → routed through `before_send` → scrubbed), then
-    // flush before the process aborts (`panic = "abort"` in `[profile.release]`).
+    // Caution: everything before this line runs in BOTH processes; everything after
+    // runs ONLY in the app process. Starting the monitor re-execs this binary; in the
+    // crash-reporter child this call never returns normally. We log + continue if the
+    // monitor fails to start (in-process panic capture via the hook below still works).
+    let handle = match tauri_plugin_sentry::minidump::init(&client) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("telemetry: minidump monitor failed to start: {e}");
+            None
+        }
+    };
+
+    // Chain the panic-flush hook AFTER the panic integration's own capturing hook
+    // (installed when the client was built). On a panic: capture (→ before_send →
+    // scrubbed) runs first, then we flush before the process aborts.
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         prev(info);
@@ -117,14 +231,21 @@ fn init() {
             let _ = client.flush(Some(Duration::from_secs(2)));
         }
     }));
+
+    handle
 }
 
 /// Allowlist scrubber for error events (the `before_send` hook). Returns `None`
 /// when consent isn't live (drop the event); otherwise redacts every surviving
 /// string and nulls out the PII carriers. Mirrors the frontend `scrubEvent`,
 /// adapted to sentry-rust's `protocol::Event`.
+///
+/// CONSENT GATE: reads the AUTHORITATIVE on-disk flag (`consent_is_live`), NOT the
+/// in-memory atomic — this is what lets the separate crash-reporter process honor the
+/// user's choice (it never receives the IPC). The whole event (incl. any minidump
+/// ATTACHMENT) is dropped here when consent is off.
 fn scrub_event(mut event: Event<'static>) -> Option<Event<'static>> {
-    if !CONSENT_LIVE.load(Ordering::SeqCst) {
+    if !consent_is_live() {
         return None;
     }
 
@@ -250,7 +371,7 @@ fn deep_redact_event(event: Event<'static>) -> Option<Event<'static>> {
 /// carriers `scrub_event` does.
 #[cfg_attr(not(test), allow(dead_code))]
 fn scrub_transaction(mut event: Event<'static>) -> Option<Event<'static>> {
-    if !CONSENT_LIVE.load(Ordering::SeqCst) {
+    if !consent_is_live() {
         return None;
     }
 
@@ -291,7 +412,7 @@ fn strip_pii_carriers(event: &mut Event<'static>) {
 /// resulting event still passes through `before_send` for a second scrub.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn capture_message(msg: &str) {
-    if !CONSENT_LIVE.load(Ordering::SeqCst) {
+    if !consent_is_live() {
         return;
     }
     sentry::capture_message(&redact_secrets(msg), sentry::Level::Error);
@@ -353,19 +474,90 @@ mod tests {
 
     // The scrubber is the privacy gate for Rust-host crash reporting — these tests
     // are the SHARED CONTRACT that secrets NEVER survive into an outgoing event,
-    // mirroring `src/lib/scrub.test.ts`. They all share the `CONSENT_LIVE` static,
-    // so each one sets + resets it via `with_consent`.
+    // mirroring `src/lib/scrub.test.ts`. The gate now reads an on-disk file
+    // (`consent_is_live`) so the separate crash-reporter process can honor it, so the
+    // helper points this thread's `consent_path` at a UNIQUE temp file and writes the
+    // requested state there. Thread-local override = no races with parallel tests and
+    // no touching the user's real config dir. The temp file is removed on exit.
     fn with_consent<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "portcode-test-consent-{}-{:?}.flag",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, if enabled { "1" } else { "0" }).expect("write consent flag");
+        CONSENT_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(path.clone()));
+        // Keep the atomic in sync too, so a test that asserts via either path agrees.
         CONSENT_LIVE.store(enabled, Ordering::SeqCst);
+
         let out = f();
+
+        CONSENT_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
         CONSENT_LIVE.store(false, Ordering::SeqCst);
+        let _ = std::fs::remove_file(&path);
         out
+    }
+
+    // Point this thread's consent_path at a temp file WITHOUT pre-writing it, so
+    // `set_consent`/`consent_is_live` can be exercised against a clean slate. Returns
+    // the path; the caller removes it. Resets the override on the next `reset_*`.
+    fn temp_consent_path() -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "portcode-test-setconsent-{}-{:?}.flag",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path); // clean slate
+        CONSENT_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(path.clone()));
+        path
+    }
+
+    fn clear_consent_override(path: &std::path::Path) {
+        CONSENT_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn dsn_is_none_in_dev_builds() {
         // No SENTRY_DSN is set in the test build, so the whole pipeline is inert.
         assert!(dsn().is_none());
+    }
+
+    #[test]
+    fn consent_is_off_when_file_absent() {
+        // The fail-safe: no file ⇒ off. (Clean-slate temp path, never written.)
+        let path = temp_consent_path();
+        assert!(!consent_is_live());
+        clear_consent_override(&path);
+    }
+
+    #[test]
+    fn consent_is_off_for_non_one_content() {
+        // Only the exact trimmed content "1" arms the gate; "0"/garbage ⇒ off.
+        let path = temp_consent_path();
+        std::fs::write(&path, "0").unwrap();
+        assert!(!consent_is_live());
+        std::fs::write(&path, "yes").unwrap();
+        assert!(!consent_is_live());
+        clear_consent_override(&path);
+    }
+
+    #[test]
+    fn set_consent_writes_then_removes_the_flag() {
+        // set_consent is the cross-process gate writer: "1" on opt-in (→ live),
+        // file gone on opt-out (→ off). This is what the crash-reporter child reads.
+        let path = temp_consent_path();
+        set_consent(true);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "1");
+        assert!(consent_is_live());
+
+        set_consent(false);
+        assert!(!consent_is_live());
+        // Either removed, or overwritten to "0" — both read as off.
+        assert!(!path.exists() || std::fs::read_to_string(&path).unwrap().trim() != "1");
+        clear_consent_override(&path);
     }
 
     #[test]

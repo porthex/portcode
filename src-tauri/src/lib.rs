@@ -778,6 +778,16 @@ fn phone_sync_disconnect(state: State<AppState>) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Phase 2 — arm desktop crash reporting FIRST: the out-of-process minidump monitor
+    // + the Rust Sentry client whose `before_send` scrubs and consent-gates every event.
+    // This MUST be the first statement in run(): it executes in BOTH this process and
+    // the re-exec'd crash-reporter child (everything before `minidump::init` runs in
+    // both), and the monitor must be live before any crash. Inert (returns None) when no
+    // `SENTRY_DSN` was baked in — dev/contributor/fork builds never report. The returned
+    // guard is held for the whole process lifetime; dropping it stops the reporter child.
+    #[cfg(desktop)]
+    let _sentry_guard = telemetry::init_desktop_with_minidump();
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
