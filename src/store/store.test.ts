@@ -1247,4 +1247,78 @@ describe("remote client", () => {
       expect(useStore.getState().remoteConnected).toBe(false);
     });
   });
+
+  describe("remote navigation + presence", () => {
+    it("openRemoteSession switches to the session and opens the chat view", async () => {
+      const msg: Message = { id: "m", role: "assistant", blocks: [], createdAt: 1 };
+      m.getMessages.mockResolvedValue([msg]);
+
+      await useStore.getState().openRemoteSession("z");
+
+      const st = useStore.getState();
+      expect(st.activeId).toBe("z");
+      expect(st.remoteChatOpen).toBe(true);
+      expect(st.messages.z).toEqual([msg]);
+    });
+
+    it("closeRemoteSession returns to the sessions list without disconnecting", () => {
+      useStore.setState({ remoteChatOpen: true, remoteConnected: true });
+
+      useStore.getState().closeRemoteSession();
+
+      const st = useStore.getState();
+      expect(st.remoteChatOpen).toBe(false);
+      expect(st.remoteConnected).toBe(true); // the link stays live
+    });
+
+    it("forgetRemotePairing clears the remembered desktop and the dropped flag", () => {
+      useStore.setState({ lastPairingQr: "QR", remoteDropped: true });
+      localStorage.setItem("pc.lastPairingQr", "QR");
+
+      useStore.getState().forgetRemotePairing();
+
+      const st = useStore.getState();
+      expect(st.lastPairingQr).toBeNull();
+      expect(st.remoteDropped).toBe(false);
+      expect(localStorage.getItem("pc.lastPairingQr")).toBeNull();
+    });
+
+    it("setOnline reflects network presence", () => {
+      useStore.getState().setOnline(false);
+      expect(useStore.getState().online).toBe(false);
+
+      useStore.getState().setOnline(true);
+      expect(useStore.getState().online).toBe(true);
+    });
+
+    it("a fresh dial resets the chat view to the sessions list", async () => {
+      useStore.setState({ remoteChatOpen: true });
+
+      await useStore.getState().connectRemote("QR");
+
+      expect(useStore.getState().remoteChatOpen).toBe(false);
+    });
+
+    it("disconnect closes the chat view", async () => {
+      useStore.setState({ remoteConnected: true, remoteChatOpen: true });
+
+      await useStore.getState().disconnectRemote();
+
+      expect(useStore.getState().remoteChatOpen).toBe(false);
+    });
+
+    it("an unexpected drop closes the chat view", async () => {
+      let dropCb!: () => void;
+      m.onPhoneSyncDisconnected.mockImplementation(async (cb) => {
+        dropCb = cb;
+        return () => {};
+      });
+      await useStore.getState().connectRemote("QR");
+      useStore.setState({ remoteChatOpen: true });
+
+      dropCb();
+
+      expect(useStore.getState().remoteChatOpen).toBe(false);
+    });
+  });
 });

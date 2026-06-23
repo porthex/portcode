@@ -8,6 +8,10 @@ export function Composer() {
   const streaming = useStore((s) => s.streaming);
   const send = useStore((s) => s.send);
   const stop = useStore((s) => s.stop);
+  // On the phone, a pending permission pauses the agent on the desktop; reflect
+  // that in the (already disabled-mid-turn) composer placeholder so the wait reads
+  // as intentional rather than a frozen input.
+  const awaitingPermission = useStore((s) => s.remoteMode && s.pendingPermission !== null);
   const ref = useRef<HTMLTextAreaElement>(null);
 
   // Keep the textarea height in sync when the draft changes externally
@@ -55,7 +59,11 @@ export function Composer() {
             onKeyDown={onKeyDown}
             disabled={streaming}
             rows={1}
-            placeholder="Describe a task, ask a question, or give an instruction…"
+            placeholder={
+              awaitingPermission
+                ? "Agent paused — awaiting permission"
+                : "Describe a task, ask a question, or give an instruction…"
+            }
             className="max-h-[120px] flex-1 resize-none bg-transparent text-[13.5px] leading-[1.5] text-fg outline-none placeholder:text-faint select-text disabled:cursor-not-allowed disabled:opacity-60"
           />
           {streaming ? (

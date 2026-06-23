@@ -313,3 +313,31 @@ describe("Composer UsageMeter", () => {
     expect(screen.getByText("no-such-model")).toBeInTheDocument();
   });
 });
+
+describe("Composer remote permission pause", () => {
+  it("shows the paused placeholder while a remote permission is pending", () => {
+    // On the phone a pending permission pauses the desktop agent; the (already
+    // disabled mid-turn) composer reads as an intentional wait, not a frozen field.
+    useStore.setState({
+      remoteMode: true,
+      streaming: true,
+      pendingPermission: { id: "p", tool: "write", summary: "x", input: {} },
+    });
+    render(<Composer />);
+
+    expect(screen.getByPlaceholderText("Agent paused — awaiting permission")).toBeInTheDocument();
+  });
+
+  it("keeps the normal placeholder off the phone even with a permission pending", () => {
+    useStore.setState({
+      remoteMode: false,
+      streaming: true,
+      pendingPermission: { id: "p", tool: "write", summary: "x", input: {} },
+    });
+    render(<Composer />);
+
+    expect(
+      screen.getByPlaceholderText("Describe a task, ask a question, or give an instruction…"),
+    ).toBeInTheDocument();
+  });
+});

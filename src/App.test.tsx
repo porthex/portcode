@@ -31,6 +31,16 @@ vi.mock("./components/CommandPalette", () => ({
 vi.mock("./components/RemotePairing", () => ({
   RemotePairing: () => <div data-testid="remote-pairing" />,
 }));
+vi.mock("./components/RemoteSessions", () => ({
+  RemoteSessions: () => <div data-testid="remote-sessions" />,
+}));
+vi.mock("./components/RemoteChatHeader", () => ({
+  RemoteChatHeader: () => <div data-testid="remote-chat-header" />,
+}));
+vi.mock("./components/RemoteEdgeStates", () => ({
+  DisconnectedState: () => <div data-testid="disconnected-state" />,
+  OfflineState: () => <div data-testid="offline-state" />,
+}));
 
 // `isTauri` is consumed by App's TitleBar; the rest of the surface is what the
 // store's `init()` path invokes. A single mock of this module covers both the
@@ -103,46 +113,57 @@ describe("App layout", () => {
     expect(unlisten).toHaveBeenCalledTimes(1);
   });
 
-  it("hides FileExplorer and SettingsPanel when their flags are false", () => {
+  it("collapses the file rail and hides SettingsPanel when their flags are false", () => {
     useStore.setState({ showFiles: false, showSettings: false });
 
     render(<App />);
 
-    expect(screen.queryByTestId("file-explorer")).not.toBeInTheDocument();
+    // The rail stays mounted (so its width can animate) but collapses to a 0fr
+    // grid column and goes inert/aria-hidden so it's out of the tab order and AT.
+    const rail = screen.getByTestId("file-rail");
+    expect(rail).toHaveStyle({ gridTemplateColumns: "0fr" });
+    expect(rail).toHaveAttribute("aria-hidden", "true");
+    expect(rail).toHaveAttribute("inert");
     expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
   });
 
-  it("shows FileExplorer only when showFiles is true", () => {
+  it("expands the file rail (1fr, not inert) when showFiles is true", () => {
     useStore.setState({ showFiles: true });
 
     render(<App />);
 
+    const rail = screen.getByTestId("file-rail");
     expect(screen.getByTestId("file-explorer")).toBeInTheDocument();
+    expect(rail).toHaveStyle({ gridTemplateColumns: "1fr" });
+    // Open: it's reachable — no inert, no aria-hidden masking the tree.
+    expect(rail).not.toHaveAttribute("inert");
+    expect(rail).not.toHaveAttribute("aria-hidden");
     expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
   });
 
   it("shows SettingsPanel only when showSettings is true", () => {
-    useStore.setState({ showSettings: true });
+    useStore.setState({ showSettings: true, showFiles: false });
 
     render(<App />);
 
     expect(screen.getByTestId("settings-panel")).toBeInTheDocument();
-    expect(screen.queryByTestId("file-explorer")).not.toBeInTheDocument();
+    // The file rail is mounted but collapsed when showFiles is false.
+    expect(screen.getByTestId("file-rail")).toHaveStyle({ gridTemplateColumns: "0fr" });
   });
 });
 
 describe("remote mode shell", () => {
-  it("renders the desktop layout (no pairing screen) when remoteMode is off", () => {
+  it("renders the desktop layout (no remote screens) when remoteMode is off", () => {
     useStore.setState({ remoteMode: false });
 
     render(<App />);
 
-    expect(screen.queryByTestId("remote-pairing")).not.toBeInTheDocument();
     expect(screen.getByTestId("sidebar")).toBeInTheDocument();
-    expect(screen.queryByText("Remote · connected")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("remote-pairing")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("remote-sessions")).not.toBeInTheDocument();
   });
 
-  it("shows the pairing screen (and hides the session) when in remote mode but not connected", () => {
+  it("shows the pairing screen (and hides the desktop layout) when not connected", () => {
     useStore.setState({ remoteMode: true, remoteConnected: false, remoteVerified: false });
 
     render(<App />);
@@ -153,71 +174,90 @@ describe("remote mode shell", () => {
   });
 
   it("keeps showing the pairing screen while connected but not yet SAS-verified", () => {
-    // The SAS gate: a live connection alone isn't enough to reveal the session.
+    // The SAS gate: a live connection alone isn't enough to reveal the sessions.
     useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: false });
 
     render(<App />);
 
     expect(screen.getByTestId("remote-pairing")).toBeInTheDocument();
-    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("remote-sessions")).not.toBeInTheDocument();
   });
 
-  it("renders the remote session with a connected banner once verified", () => {
-    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+  it("shows the sessions list once verified, before a session is opened", () => {
+    useStore.setState({
+      remoteMode: true,
+      remoteConnected: true,
+      remoteVerified: true,
+      remoteChatOpen: false,
+    });
 
     render(<App />);
 
+    expect(screen.getByTestId("remote-sessions")).toBeInTheDocument();
     expect(screen.queryByTestId("remote-pairing")).not.toBeInTheDocument();
-    // On the phone the session list is a drawer, not an inline rail — reached via
-    // the TitleBar "Sessions" menu button.
+    expect(screen.queryByTestId("remote-chat-header")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat")).not.toBeInTheDocument();
+    // No desktop chrome on the phone (the inline session rail is desktop-only).
     expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Toggle sessions" })).toBeInTheDocument();
+  });
+
+  it("opens the chat view (header + chat) when a session is open", () => {
+    useStore.setState({
+      remoteMode: true,
+      remoteConnected: true,
+      remoteVerified: true,
+      remoteChatOpen: true,
+    });
+
+    render(<App />);
+
+    expect(screen.getByTestId("remote-chat-header")).toBeInTheDocument();
     expect(screen.getByTestId("chat")).toBeInTheDocument();
-    expect(screen.getByText("Remote · connected")).toBeInTheDocument();
-  });
-
-  it("opens the session drawer from the menu button and closes it on the backdrop", () => {
-    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
-
-    render(<App />);
-    // Drawer closed initially: the sidebar isn't mounted.
-    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Toggle sessions" }));
-    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
-    expect(useStore.getState().showSidebar).toBe(true);
-
-    fireEvent.click(screen.getByRole("button", { name: "Close sessions" }));
-    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
-    expect(useStore.getState().showSidebar).toBe(false);
-  });
-
-  it("hides the desktop command-palette button on the phone", () => {
-    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
-
-    render(<App />);
-
-    // ⌘K is a desktop keyboard affordance — gone on the phone.
+    expect(screen.queryByTestId("remote-sessions")).not.toBeInTheDocument();
+    // The desktop command-palette button is a keyboard affordance — gone on the phone.
     expect(
       screen.queryByRole("button", { name: "Open command palette (Ctrl+K)" }),
     ).not.toBeInTheDocument();
   });
 
-  it("disconnects from the desktop via the banner button", async () => {
-    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+  it("shows the disconnected screen when the link dropped", () => {
+    useStore.setState({ remoteMode: true, remoteDropped: true });
 
     render(<App />);
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Disconnect from desktop" }));
-      await Promise.resolve();
-      await Promise.resolve();
+    expect(screen.getByTestId("disconnected-state")).toBeInTheDocument();
+    expect(screen.queryByTestId("remote-pairing")).not.toBeInTheDocument();
+  });
+
+  it("shows the offline screen, taking precedence over a drop, when the device is offline", () => {
+    useStore.setState({ remoteMode: true, remoteDropped: true, online: false });
+
+    render(<App />);
+
+    expect(screen.getByTestId("offline-state")).toBeInTheDocument();
+    expect(screen.queryByTestId("disconnected-state")).not.toBeInTheDocument();
+  });
+
+  it("recovers from the offline screen when the network returns", () => {
+    useStore.setState({
+      remoteMode: true,
+      remoteConnected: true,
+      remoteVerified: true,
+      remoteChatOpen: true,
+      online: false,
     });
 
-    expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(1);
-    const st = useStore.getState();
-    expect(st.remoteConnected).toBe(false);
-    expect(st.remoteVerified).toBe(false);
+    render(<App />);
+    expect(screen.getByTestId("offline-state")).toBeInTheDocument();
+
+    // App's online/offline listener re-reads navigator.onLine (true in jsdom) on the
+    // browser 'online' event, flipping the store flag and revealing the chat again.
+    act(() => {
+      window.dispatchEvent(new Event("online"));
+    });
+
+    expect(screen.queryByTestId("offline-state")).not.toBeInTheDocument();
+    expect(screen.getByTestId("remote-chat-header")).toBeInTheDocument();
   });
 });
 
@@ -251,6 +291,28 @@ describe("TitleBar", () => {
     expect(screen.getByText("Refactor the parser")).toBeInTheDocument();
   });
 
+  it("shows the active session title in the title-bar breadcrumb (not as a competing heading)", () => {
+    useStore.setState({
+      sessions: [
+        {
+          id: "a",
+          title: "Refactor the parser",
+          workspace: null,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+      activeId: "a",
+    });
+
+    render(<App />);
+
+    // The breadcrumb shows the title as plain text. It is deliberately NOT a
+    // heading, so it never competes with Chat's single empty-state/error <h1>.
+    expect(screen.getByText("Refactor the parser")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Refactor the parser" })).not.toBeInTheDocument();
+  });
+
   it("renders the preview-mode badge outside Tauri", () => {
     m.isTauri.mockReturnValue(false);
 
@@ -270,11 +332,20 @@ describe("TitleBar", () => {
   it("toggles the file explorer via the TitleBar button", () => {
     render(<App />);
 
-    expect(screen.queryByTestId("file-explorer")).not.toBeInTheDocument();
+    // The rail is mounted but collapsed (0fr / inert) before the toggle, and the
+    // toggle button reports its off state to assistive tech via aria-pressed.
+    const rail = screen.getByTestId("file-rail");
+    expect(rail).toHaveStyle({ gridTemplateColumns: "0fr" });
+    expect(rail).toHaveAttribute("inert");
+    const toggle = screen.getByRole("button", { name: "Toggle file explorer (Ctrl+B)" });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
 
-    fireEvent.click(screen.getByTitle("Toggle file explorer (Ctrl+B)"));
+    fireEvent.click(toggle);
 
-    expect(screen.getByTestId("file-explorer")).toBeInTheDocument();
+    // After the toggle it expands to 1fr, drops inert, and flips aria-pressed on.
+    expect(screen.getByTestId("file-rail")).toHaveStyle({ gridTemplateColumns: "1fr" });
+    expect(screen.getByTestId("file-rail")).not.toHaveAttribute("inert");
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
     expect(useStore.getState().showFiles).toBe(true);
   });
 
@@ -335,6 +406,29 @@ describe("global keyboard shortcuts", () => {
 
     expect(useStore.getState().showFiles).toBe(true);
     expect(screen.getByTestId("file-explorer")).toBeInTheDocument();
+    // Toggling on expands the rail's grid column from 0fr to 1fr.
+    expect(screen.getByTestId("file-rail")).toHaveStyle({ gridTemplateColumns: "1fr" });
+  });
+
+  it("rescues focus to the file-toggle button when Ctrl+B collapses the rail", () => {
+    // Open the rail first so the toggle is a true->false (collapse) transition.
+    useStore.setState({ showFiles: true });
+    render(<App />);
+
+    // Simulate the inert-collapse blur: when the rail goes inert the browser
+    // blurs the focused tree row and focus falls to <body>. We can't focus a
+    // real treeitem (FileExplorer is stubbed), so we reproduce the end state.
+    act(() => (document.body as HTMLElement).focus());
+    expect(document.activeElement).toBe(document.body);
+
+    fireEvent.keyDown(window, { key: "b", ctrlKey: true });
+
+    // The collapse-edge effect rescues focus to the still-visible, still-tabbable
+    // toggle button instead of leaving the keyboard user stranded on <body>.
+    expect(useStore.getState().showFiles).toBe(false);
+    const toggle = screen.getByRole("button", { name: "Toggle file explorer (Ctrl+B)" });
+    expect(document.activeElement).toBe(toggle);
+    expect(document.activeElement).not.toBe(document.body);
   });
 
   it("Ctrl+, opens settings", () => {
@@ -354,6 +448,143 @@ describe("global keyboard shortcuts", () => {
 
     const st = useStore.getState();
     expect(st.showPalette).toBe(false);
+    expect(st.showFiles).toBe(false);
+    expect(st.showSettings).toBe(false);
+  });
+
+  it("ignores shell shortcuts (except Ctrl+K) while typing in an input", () => {
+    render(<App />);
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.focus();
+
+    // A real event so e.target is the focused input (fireEvent.keyDown(window)
+    // would target window, defeating the guard). Ctrl+, must NOT open Settings
+    // while the user is typing.
+    act(() => {
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: ",", ctrlKey: true, bubbles: true }));
+    });
+
+    const st = useStore.getState();
+    expect(st.showPalette).toBe(false);
+    expect(st.showSettings).toBe(false);
+    document.body.removeChild(input);
+  });
+
+  it("ignores shell shortcuts while typing in a textarea", () => {
+    render(<App />);
+    const ta = document.createElement("textarea");
+    document.body.appendChild(ta);
+    ta.focus();
+
+    act(() => {
+      ta.dispatchEvent(new KeyboardEvent("keydown", { key: ",", ctrlKey: true, bubbles: true }));
+    });
+
+    expect(useStore.getState().showSettings).toBe(false);
+    document.body.removeChild(ta);
+  });
+
+  it("keeps Ctrl+K live from a focused field (it's the advertised palette toggle)", () => {
+    render(<App />);
+    const ta = document.createElement("textarea");
+    document.body.appendChild(ta);
+    ta.focus();
+
+    act(() => {
+      ta.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
+    });
+
+    // Unlike the other shortcuts, Ctrl+K is not suppressed while typing — it must
+    // open the command palette straight from the composer textarea.
+    expect(useStore.getState().showPalette).toBe(true);
+    document.body.removeChild(ta);
+  });
+
+  it("announces a dropped remote link via a persistent App-level live region", () => {
+    useStore.setState({
+      remoteMode: true,
+      remoteConnected: true,
+      remoteVerified: true,
+      remoteDropped: false,
+    });
+    render(<App />);
+
+    // No drop message while the link is healthy — the region is mounted but empty.
+    expect(screen.queryByText(/Connection to desktop lost/)).not.toBeInTheDocument();
+
+    act(() => useStore.setState({ remoteDropped: true }));
+
+    // The persistent region (mounted before the drop) now carries the message, so
+    // the empty->message change is announced (role=status / aria-live=polite).
+    const status = screen.getByText(/Connection to desktop lost/);
+    expect(status).toHaveAttribute("role", "status");
+    expect(status).toHaveAttribute("aria-live", "polite");
+  });
+
+  it("announces a successful remote pairing on the connected+verified edge", () => {
+    vi.useFakeTimers();
+    try {
+      // Start in remote mode on the pairing screen (not yet connected/verified),
+      // so the live region is mounted empty and the success message is announced
+      // as an empty->message change once the SAS is confirmed.
+      useStore.setState({ remoteMode: true, remoteConnected: false, remoteVerified: false });
+      render(<App />);
+
+      expect(screen.queryByText(/Connected to your desktop/)).not.toBeInTheDocument();
+
+      // Confirm-SAS path: connected + verified flip true together, clearing the
+      // gate. The false->true edge sets the transient success announcement.
+      act(() => useStore.setState({ remoteConnected: true, remoteVerified: true }));
+
+      const status = screen.getByText(/Connected to your desktop/);
+      expect(status).toHaveAttribute("role", "status");
+      expect(status).toHaveAttribute("aria-live", "polite");
+
+      // The message is transient: it clears so a later re-announcement can fire.
+      act(() => vi.advanceTimersByTime(4000));
+      expect(screen.queryByText(/Connected to your desktop/)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not stack the palette over open Settings (Ctrl+K is a no-op)", () => {
+    useStore.setState({ showSettings: true });
+    render(<App />);
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+
+    // Settings is open: Ctrl+K must not open the palette on top of it.
+    expect(useStore.getState().showPalette).toBe(false);
+    expect(useStore.getState().showSettings).toBe(true);
+  });
+
+  it("ignores Ctrl+N/B/, while Settings is open", () => {
+    useStore.setState({ showSettings: true });
+    render(<App />);
+    const before = useStore.getState().sessions.length;
+
+    fireEvent.keyDown(window, { key: "n", ctrlKey: true });
+    fireEvent.keyDown(window, { key: "b", ctrlKey: true });
+    fireEvent.keyDown(window, { key: ",", ctrlKey: true });
+
+    const st = useStore.getState();
+    expect(st.sessions).toHaveLength(before);
+    expect(st.showFiles).toBe(false);
+  });
+
+  it("ignores Ctrl+N/B/, while the palette is open", () => {
+    useStore.setState({ showPalette: true });
+    render(<App />);
+    const before = useStore.getState().sessions.length;
+
+    fireEvent.keyDown(window, { key: "n", ctrlKey: true });
+    fireEvent.keyDown(window, { key: "b", ctrlKey: true });
+    fireEvent.keyDown(window, { key: ",", ctrlKey: true });
+
+    const st = useStore.getState();
+    expect(st.sessions).toHaveLength(before);
     expect(st.showFiles).toBe(false);
     expect(st.showSettings).toBe(false);
   });
