@@ -95,6 +95,16 @@ keyring = { version = "3", features = ["windows-native"] }
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "2"
 
+# iroh's transitive `netdev` / `hickory-resolver` read the process-global
+# `ndk_context` AndroidContext (JavaVM + Activity) during `Endpoint::bind()`. tao
+# captures those into its OWN ndk_glue store but never populates `ndk_context`, so
+# without an explicit bridge the first bind panics "android context was not
+# initialized" (fatal under panic="abort"). `run()` calls `init_ndk_context()` to
+# forward tao's context here. Android-only (the init fn is `cfg(target_os=android)`);
+# already at 0.1.1 in Cargo.lock transitively, so the lockfile stays valid.
+[target.'cfg(target_os = "android")'.dependencies]
+ndk-context = "0.1"
+
 [profile.release]
 opt-level = "s"
 lto = true
