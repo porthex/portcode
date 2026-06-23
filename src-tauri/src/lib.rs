@@ -658,6 +658,11 @@ async fn phone_sync_connect(
     let iroh_key = secrets::get_or_create_iroh_key()?;
     let identity = sync::pairing::device_identity()?;
     // 3. Bind a client endpoint (RelayMode::Default for hole-punch + relay).
+    // Belt-and-suspenders: ensure the `ndk_context` global is populated before bind
+    // even if `setup` somehow ran before the activity existed. No-op after the first
+    // call (guarded by the `Once` inside).
+    #[cfg(target_os = "android")]
+    init_ndk_context();
     let endpoint = sync::transport::build_endpoint(iroh_key, iroh::RelayMode::Default).await?;
     // 4. Dial + run the XX initiator handshake.
     let paired =
@@ -759,6 +764,34 @@ fn phone_sync_disconnect(state: State<AppState>) -> Result<(), String> {
     Ok(()) // no-op when nothing was connected
 }
 
+/// Forward tao's captured Android JavaVM + Activity into the process-wide
+/// `ndk_context` global that iroh's transitive `netdev` / `hickory-resolver` read
+/// on `Endpoint::bind()`. tao stores the VM+Activity in its OWN ndk_glue and never
+/// populates `ndk_context`, so without this the first iroh bind on the phone
+/// (`phone_sync_connect`; the desktop `start_listener` is `#[cfg(desktop)]`) panics
+/// "android context was not initialized" on a tokio worker → SIGABRT under
+/// `panic="abort"`. Idempotent via `Once` (`initialize_android_context` asserts the
+/// global was previously unset). Counterpart to the rustls `install_default()` below.
+#[cfg(target_os = "android")]
+#[allow(unsafe_code)] // the crate denies unsafe; the ndk_context bridge requires it (android-only)
+fn init_ndk_context() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // tao is re-exported by tauri; its prelude re-exports ndk_glue. tao populates
+        // its context in onActivityCreate — before the webview/JS (and any bind) runs.
+        match tauri::tao::platform::android::prelude::main_android_context() {
+            // `java_vm` / `context_jobject` are already `*mut c_void` — pass straight through.
+            Some(ctx) => unsafe {
+                ndk_context::initialize_android_context(ctx.java_vm, ctx.context_jobject);
+            },
+            None => {
+                eprintln!("portcode: tao android context unavailable; ndk_context NOT initialized");
+            }
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Surface Rust panics in the platform log instead of dying silently. On Android
@@ -794,6 +827,12 @@ pub fn run() {
         // so a placeholder pubkey is inert until the owner provisions a real key.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            // Bridge tao's Android JavaVM+Activity into `ndk_context` BEFORE any iroh
+            // bind can read it (see `init_ndk_context`). The activity exists by the
+            // time `setup` runs, so the context is available here.
+            #[cfg(target_os = "android")]
+            init_ndk_context();
+
             let dir = app
                 .path()
                 .app_config_dir()

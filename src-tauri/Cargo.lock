@@ -4194,6 +4194,7 @@ dependencies = [
  "ignore",
  "iroh",
  "keyring",
+ "ndk-context",
  "rand 0.8.6",
  "regex",
  "reqwest",
