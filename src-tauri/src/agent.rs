@@ -23,6 +23,32 @@ type Cancels = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 /// Refresh an OAuth access token once it is within this many seconds of expiry.
 const REFRESH_SKEW_SECS: i64 = 60;
 
+/// Hard ceiling on model turns (and therefore tool batches) in a single run. A
+/// confused model or an indirect prompt injection can otherwise loop forever,
+/// burning tokens and mutating the workspace unbounded. When exceeded, the run
+/// stops with a clear error instead of looping.
+const MAX_AGENT_STEPS: usize = 50;
+
+/// True once the per-run step counter has passed the ceiling. `step` is 1-based
+/// (the count of the turn about to run), so step `MAX_AGENT_STEPS` is allowed and
+/// `MAX_AGENT_STEPS + 1` is the first one rejected.
+fn step_limit_exceeded(step: usize) -> bool {
+    step > MAX_AGENT_STEPS
+}
+
+/// Whether the remaining tools in a batch should be skipped: either a prior tool
+/// in this batch was already cancelled, or the cancel flag is now set. Used both
+/// at the top of each block and right before running an allowed tool, so a Stop
+/// that lands mid-batch interrupts the rest.
+fn batch_cancelled(prev_cancelled: bool, cancel_flag: bool) -> bool {
+    prev_cancelled || cancel_flag
+}
+
+/// The synthetic tool_result text posted for a ToolUse block that was skipped
+/// because the user pressed Stop. Anthropic requires a result for every tool_use,
+/// so we post this (as an error) rather than dropping the block.
+const CANCELLED_TOOL_RESULT: &str = "Cancelled: the user stopped the turn before this tool ran.";
+
 fn emit(app: &AppHandle, channel: &str, ev: StreamEvent) {
     // Canonical chokepoint: delivers to the desktop UI and mirrors to the phone.
     crate::sync::emit_event(app, channel, ev);
@@ -260,11 +286,23 @@ async fn run_inner(
     db.touch_session(session_id, db::now_ms());
 
     let final_stop;
+    let mut steps: usize = 0;
 
     loop {
         if cancel.load(Ordering::Relaxed) {
             final_stop = "cancelled".to_string();
             break;
+        }
+
+        // Kill-switch: cap the number of model turns / tool batches per run so a
+        // runaway (model confusion or prompt injection) can't loop unboundedly.
+        steps += 1;
+        if step_limit_exceeded(steps) {
+            return Err(format!(
+                "Run stopped: exceeded the maximum of {MAX_AGENT_STEPS} steps. \
+                 This usually means the model got stuck in a loop. Start a new \
+                 message to continue."
+            ));
         }
 
         // Refresh an expiring OAuth token before each turn (no-op for API keys).
@@ -302,8 +340,32 @@ async fn run_inner(
 
         if turn.stop_reason == "tool_use" {
             let mut results: Vec<Block> = Vec::new();
+            let mut cancelled = false;
             for block in &turn.content {
                 if let Block::ToolUse { id, name, input } = block {
+                    // Stop must interrupt an in-flight batch: once cancelled, run no
+                    // more tools, but still post a synthetic tool_result for every
+                    // remaining ToolUse so the persisted history stays well-formed
+                    // (Anthropic requires a result for each tool_use, else it 400s).
+                    if batch_cancelled(cancelled, cancel.load(Ordering::Relaxed)) {
+                        cancelled = true;
+                        let output = CANCELLED_TOOL_RESULT.to_string();
+                        emit(
+                            app,
+                            channel,
+                            StreamEvent::ToolResult {
+                                id: id.clone(),
+                                output: output.clone(),
+                                is_error: true,
+                            },
+                        );
+                        results.push(Block::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: output,
+                            is_error: true,
+                        });
+                        continue;
+                    }
                     let (output, is_error) = match registry.find(name) {
                         Some(tool) => {
                             let decision = if tool.mutating() {
@@ -314,7 +376,7 @@ async fn run_inner(
                                     pending,
                                     cancel,
                                     name,
-                                    &tool.summarize(input),
+                                    &tool.summarize(input, &ctx),
                                     input,
                                 )
                                 .await
@@ -322,6 +384,13 @@ async fn run_inner(
                                 Decision::Allow
                             };
                             match decision {
+                                // Re-check cancel right before running: a Stop that
+                                // arrived during the gate (or during a prior tool in
+                                // this batch) must not let this tool execute.
+                                Decision::Allow if cancel.load(Ordering::Relaxed) => {
+                                    cancelled = true;
+                                    (CANCELLED_TOOL_RESULT.to_string(), true)
+                                }
                                 Decision::Allow => match tool.run(input.clone(), &ctx).await {
                                     Ok(out) => (out, false),
                                     Err(err) => (err, true),
@@ -365,6 +434,13 @@ async fn run_inner(
             db.try_append_message(session_id, &tool_msg, db::now_ms())
                 .map_err(|e| format!("Failed to save tool results: {e}"))?;
             messages.push(tool_msg);
+            // If the batch was cancelled mid-flight, stop here rather than starting
+            // another model turn. The tool results above are already persisted, so the
+            // history stays well-formed for a later resume.
+            if cancelled {
+                final_stop = "cancelled".to_string();
+                break;
+            }
             continue;
         } else {
             final_stop = turn.stop_reason;
@@ -378,7 +454,31 @@ async fn run_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_title, is_terminal_auth_error};
+    use super::{
+        batch_cancelled, derive_title, is_terminal_auth_error, step_limit_exceeded, MAX_AGENT_STEPS,
+    };
+
+    #[test]
+    fn step_limit_allows_up_to_the_ceiling_then_rejects() {
+        assert!(!step_limit_exceeded(1));
+        assert!(!step_limit_exceeded(MAX_AGENT_STEPS));
+        // The first step past the ceiling is rejected, breaking the agent loop with
+        // an error instead of looping forever.
+        assert!(step_limit_exceeded(MAX_AGENT_STEPS + 1));
+        assert!(step_limit_exceeded(MAX_AGENT_STEPS + 100));
+    }
+
+    #[test]
+    fn batch_cancel_short_circuits_once_cancelled_or_flagged() {
+        // Not cancelled and flag clear → keep running the batch.
+        assert!(!batch_cancelled(false, false));
+        // A live cancel flag stops the rest of the batch (a Stop landing mid-batch).
+        assert!(batch_cancelled(false, true));
+        // Once a prior tool in the batch was cancelled, stay cancelled even if the
+        // flag is somehow re-read as clear.
+        assert!(batch_cancelled(true, false));
+        assert!(batch_cancelled(true, true));
+    }
 
     #[test]
     fn classifies_terminal_vs_transient_auth_errors() {
