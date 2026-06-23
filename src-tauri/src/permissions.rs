@@ -59,6 +59,23 @@ pub fn deny_all(pending: &Pending, session_id: &str) {
     }
 }
 
+/// The synchronous fast-path of [`gate`]: decide without prompting when we can.
+///
+/// A cancel (Stop) must win even on the "allow" policy — otherwise an allow-policy
+/// tool batch keeps mutating the workspace after the user pressed Stop, because
+/// "allow" never reaches the cancel-aware select loop. Returns `None` only for the
+/// "ask" policy when not cancelled, i.e. when the caller must actually prompt.
+fn fast_path_decision(policy: &str, cancelled: bool) -> Option<Decision> {
+    if cancelled {
+        return Some(Decision::Deny);
+    }
+    match policy {
+        "allow" => Some(Decision::Allow),
+        "deny" => Some(Decision::Deny),
+        _ => None,
+    }
+}
+
 /// Decide whether a mutating tool call may proceed.
 pub async fn gate(
     app: &AppHandle,
@@ -70,10 +87,8 @@ pub async fn gate(
     summary: &str,
     input: &Value,
 ) -> Decision {
-    match policy {
-        "allow" => return Decision::Allow,
-        "deny" => return Decision::Deny,
-        _ => {}
+    if let Some(decision) = fast_path_decision(policy, cancel.load(Ordering::Relaxed)) {
+        return decision;
     }
 
     // The channel is `agent://{session_id}`; recover the session so a later cancel
@@ -120,6 +135,31 @@ pub async fn gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_path_allows_under_allow_policy_when_not_cancelled() {
+        assert_eq!(fast_path_decision("allow", false), Some(Decision::Allow));
+    }
+
+    #[test]
+    fn fast_path_denies_under_deny_policy() {
+        assert_eq!(fast_path_decision("deny", false), Some(Decision::Deny));
+    }
+
+    #[test]
+    fn fast_path_denies_when_cancelled_even_under_allow_policy() {
+        // Stop must win over an "allow" policy: a cancelled allow-batch must not keep
+        // mutating the workspace.
+        assert_eq!(fast_path_decision("allow", true), Some(Decision::Deny));
+        assert_eq!(fast_path_decision("deny", true), Some(Decision::Deny));
+        assert_eq!(fast_path_decision("ask", true), Some(Decision::Deny));
+    }
+
+    #[test]
+    fn fast_path_returns_none_for_ask_when_not_cancelled() {
+        // "ask" without a cancel means the caller must actually prompt the user.
+        assert_eq!(fast_path_decision("ask", false), None);
+    }
 
     #[test]
     fn deny_all_only_denies_the_named_session() {
