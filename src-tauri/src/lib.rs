@@ -404,14 +404,14 @@ fn phone_sync_begin_pairing(
     // nonce: only while this bounded window is open does the accept loop entertain
     // a NEW (untrusted) peer, and the nonce is bound into the handshake prologue so
     // a phone that scanned a different/stale QR fails the handshake. Generating the
-    // nonce here (rather than inside `begin_pairing`) lets us register it on the gate.
+    // nonce here lets us register it on the gate.
     let identity = sync::pairing::device_identity()?;
     let mut nonce = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut nonce);
 
     let payload = match live_addr {
-        // Mirror sync::pairing::begin_pairing: same identity + this nonce, but the
-        // node_addr is the live full address instead of identity-only.
+        // Same identity + this nonce, but the node_addr is the live full address
+        // instead of identity-only.
         Some(addr) => sync::pairing::PairingPayload::new(&identity.public, &nonce, addr),
         // Listener not bound yet (e.g. bind still in flight) → identity-only QR
         // (still dialable via n0 discovery).
