@@ -168,11 +168,11 @@ impl Db {
     /// Idempotently add the `confirmed` column to a legacy `paired_devices`
     /// table. No-op when the column already exists (fresh DBs create it inline).
     fn migrate_add_confirmed(conn: &Connection) -> rusqlite::Result<()> {
-        let has_confirmed = {
-            let mut stmt = conn.prepare("PRAGMA table_info(paired_devices)")?;
-            let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
-            cols.filter_map(|c| c.ok()).any(|name| name == "confirmed")
-        };
+        let mut stmt = conn.prepare("PRAGMA table_info(paired_devices)")?;
+        let has_confirmed = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(|c| c.ok())
+            .any(|name| name == "confirmed");
         if !has_confirmed {
             conn.execute(
                 "ALTER TABLE paired_devices ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0",
