@@ -5,6 +5,7 @@ import type {
   MessageRow,
   OAuthStatus,
   PairingPayload,
+  PairingRequest,
   PendingPermission,
   PhoneSyncStatus,
   RemoteCommand,
@@ -29,6 +30,11 @@ interface AppState {
   phoneSync: PhoneSyncStatus | null; // phone sync device identity + paired devices
   pairingPayload: PairingPayload | null; // in-progress pairing code to display
   pairingError: string | null; // last begin-pairing/unpair failure, surfaced in Settings
+  // Desktop-side device-trust gate: a phone completed the handshake inside an open
+  // pairing window and is awaiting the desktop user's SAS confirmation. Null when
+  // no request is outstanding; surfaced in the Settings pairing UI.
+  pairingRequest: PairingRequest | null;
+  pairingRequestUnlisten: (() => void) | null; // tears down the pairing-request subscription
   creatingSession: boolean; // a newSession() create is in flight (re-entry guard)
   streaming: boolean;
   showSettings: boolean;
@@ -84,6 +90,9 @@ interface AppState {
   beginPairing: () => Promise<void>;
   unpair: (publicKey: string) => Promise<void>;
   clearPairing: () => void;
+  listenForPairingRequests: () => Promise<void>;
+  confirmPairingRequest: () => Promise<void>;
+  rejectPairingRequest: () => Promise<void>;
   resolvePermission: (decision: "allow" | "deny", always?: boolean) => Promise<void>;
   setRemoteMode: (v: boolean) => void;
   confirmRemoteSas: () => void;
@@ -183,6 +192,8 @@ export const useStore = create<AppState>((set, get) => ({
   phoneSync: null,
   pairingPayload: null,
   pairingError: null,
+  pairingRequest: null,
+  pairingRequestUnlisten: null,
   creatingSession: false,
   streaming: false,
   showSettings: false,
@@ -222,6 +233,11 @@ export const useStore = create<AppState>((set, get) => ({
       set({ initError: null });
       return;
     }
+    // Desktop is the SYNC SERVER: subscribe to inbound pairing-confirm requests so
+    // the device-trust gate's prompt can surface in Settings. Fire-and-forget (the
+    // listener install is resilient and the mock is inert), kept off the load-
+    // bearing startup path below.
+    void get().listenForPairingRequests();
     // Fetch settings, subscription status, and phone sync status together.
     // The oauth and phoneSync calls are kept resilient so an unwired/older
     // core can't block startup. The load-bearing calls (getSettings/listSessions/
@@ -797,6 +813,50 @@ export const useStore = create<AppState>((set, get) => ({
     set({ pairingPayload: null });
   },
 
+  // Subscribe to the desktop-side "a new phone wants to pair" event so the
+  // Settings pairing UI can surface the SAS + Confirm/Reject. Idempotent: tears
+  // down any prior subscription first so a re-open never double-registers. The
+  // browser mock's listener is inert (it never fires), so this is a safe no-op
+  // there too.
+  async listenForPairingRequests() {
+    const prev = get().pairingRequestUnlisten;
+    if (prev) prev();
+    set({ pairingRequestUnlisten: null });
+    try {
+      const unlisten = await ipc.onPhoneSyncPairingRequest((req) => {
+        set({ pairingRequest: req });
+      });
+      set({ pairingRequestUnlisten: unlisten });
+    } catch {
+      // Core not ready / event unsupported — leave the gate UI dormant.
+    }
+  },
+
+  async confirmPairingRequest() {
+    const req = get().pairingRequest;
+    if (!req) return;
+    // Clear the prompt up front so a double-click can't fire two confirms; surface
+    // a failure via pairingError and refresh the (now-trusted) device list.
+    set({ pairingRequest: null, pairingError: null });
+    try {
+      await ipc.confirmPairing(req.requestId);
+      await get().refreshPhoneSync();
+    } catch (err) {
+      set({ pairingError: errMessage(err) });
+    }
+  },
+
+  async rejectPairingRequest() {
+    const req = get().pairingRequest;
+    if (!req) return;
+    set({ pairingRequest: null, pairingError: null });
+    try {
+      await ipc.rejectPairing(req.requestId);
+    } catch (err) {
+      set({ pairingError: errMessage(err) });
+    }
+  },
+
   // ── Mobile remote client ──────────────────────────────────────────────────
   setRemoteMode(v) {
     set({ remoteMode: v });
@@ -871,7 +931,11 @@ export const useStore = create<AppState>((set, get) => ({
     let unlistenFrame: (() => void) | null = null;
     let unlistenDrop: (() => void) | null = null;
     try {
-      const info = await ipc.phoneSyncConnect(qr);
+      // `verified` doubles as the reconnect flag: a pre-verified dial is a
+      // remembered-desktop reconnect, which binds an empty handshake prologue to
+      // match the desktop's closed pairing window. A fresh (unverified) dial is a
+      // first pairing and binds the QR nonce.
+      const info = await ipc.phoneSyncConnect(qr, verified);
       // A disconnectRemote that landed mid-dial cleared remoteConnecting as an abort
       // sentinel. Honor it: bail BEFORE registering the frame/drop listeners (so no
       // orphaned subscription is ever created) and tear down the native session the
