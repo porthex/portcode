@@ -37,6 +37,21 @@ pub struct DesktopCommandHandler {
     pub oauth_refresh: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// Map a phone-supplied permission decision string to a [`Decision`], validated
+/// against an explicit allowlist. Only "allow"/"deny" are meaningful; ANY other
+/// value (typo, future variant, hostile input from a confirmed-but-misbehaving
+/// device) is treated as Deny (fail-closed) and logged — never coerced into Allow.
+fn parse_decision(decision: &str) -> Decision {
+    match decision {
+        "allow" => Decision::Allow,
+        "deny" => Decision::Deny,
+        other => {
+            eprintln!("phone-sync: unknown permission decision {other:?} — denying");
+            Decision::Deny
+        }
+    }
+}
+
 #[async_trait]
 impl CommandHandler for DesktopCommandHandler {
     async fn handle(&self, command: RemoteCommand) -> Result<(), String> {
@@ -81,14 +96,15 @@ impl CommandHandler for DesktopCommandHandler {
                 permissions::deny_all(&self.pending, &session_id);
                 Ok(())
             }
-            // Mirror `resolve_permission`.
+            // Mirror `resolve_permission`, but validate the decision string against
+            // an explicit allowlist: only "allow"/"deny" are meaningful, and
+            // anything else is treated as Deny (fail-closed) and logged. The
+            // device-trust gate (see `serve_connection`) now prevents an untrusted
+            // peer from reaching this command at all, so a malformed decision here
+            // can only come from a confirmed device, but we still refuse to coerce
+            // an unknown value into Allow.
             RemoteCommand::Permission { id, decision } => {
-                let d = if decision == "allow" {
-                    Decision::Allow
-                } else {
-                    Decision::Deny
-                };
-                permissions::resolve(&self.pending, &id, d);
+                permissions::resolve(&self.pending, &id, parse_decision(&decision));
                 Ok(())
             }
             // Mirror `create_session`. The phone supplies only a title; the desktop
@@ -105,6 +121,27 @@ impl CommandHandler for DesktopCommandHandler {
                     )
                     .map_err(|e| e.to_string())
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_decision_only_allows_the_literal_allow() {
+        assert_eq!(parse_decision("allow"), Decision::Allow);
+        assert_eq!(parse_decision("deny"), Decision::Deny);
+        // Everything else is fail-closed to Deny — never coerced into Allow.
+        for bad in [
+            "", "ALLOW", "Allow", "yes", "true", "1", "allow ", " allow", "grant",
+        ] {
+            assert_eq!(
+                parse_decision(bad),
+                Decision::Deny,
+                "unknown decision {bad:?} must map to Deny"
+            );
         }
     }
 }

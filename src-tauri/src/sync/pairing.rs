@@ -22,9 +22,6 @@ use crate::sync::noise::StaticKeypair;
 /// QR/wire format version so a phone can refuse an incompatible pairing format.
 const PAIRING_VERSION: u32 = 1;
 
-/// Bytes of fresh randomness bound into each pairing attempt.
-const NONCE_LEN: usize = 16;
-
 /// Load the device's long-term Noise identity, creating + persisting it on first
 /// run. The private key lives only in the OS credential store.
 pub fn device_identity() -> Result<StaticKeypair, String> {
@@ -74,20 +71,6 @@ impl PairingPayload {
 pub fn iroh_node_addr() -> Result<EndpointAddr, String> {
     Ok(EndpointAddr::new(
         secrets::get_or_create_iroh_key()?.public(),
-    ))
-}
-
-/// Start a pairing attempt: load/create the device identity and advertise it with
-/// a fresh nonce plus this desktop's dialable node address.
-pub fn begin_pairing() -> Result<PairingPayload, String> {
-    use rand::RngCore as _;
-    let identity = device_identity()?;
-    let mut nonce = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce);
-    Ok(PairingPayload::new(
-        &identity.public,
-        &nonce,
-        iroh_node_addr()?,
     ))
 }
 

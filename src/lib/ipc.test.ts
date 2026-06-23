@@ -156,12 +156,56 @@ describe("Tauri command serialization", () => {
     expect(invoke).toHaveBeenCalledWith("phone_sync_unpair", { publicKey: "abc==" });
   });
 
-  it("phone_sync_connect forwards the qr string and returns the ConnectInfo", async () => {
+  it("phone_sync_connect forwards the qr string + reconnect flag and returns the ConnectInfo", async () => {
     const { ipc, invoke } = await load();
     const info = { sas: "AB-12-CD", peerPublicKey: "KEY==" };
     invoke.mockResolvedValue(info);
+    // Default (first pairing): reconnect defaults to false.
     await expect(ipc.phoneSyncConnect('{"version":1}')).resolves.toBe(info);
-    expect(invoke).toHaveBeenCalledWith("phone_sync_connect", { qr: '{"version":1}' });
+    expect(invoke).toHaveBeenCalledWith("phone_sync_connect", {
+      qr: '{"version":1}',
+      reconnect: false,
+    });
+    // Reconnect path forwards reconnect: true (binds an empty handshake prologue).
+    invoke.mockResolvedValue(info);
+    await ipc.phoneSyncConnect('{"version":1}', true);
+    expect(invoke).toHaveBeenCalledWith("phone_sync_connect", {
+      qr: '{"version":1}',
+      reconnect: true,
+    });
+  });
+
+  it("confirm_pairing and reject_pairing forward the requestId", async () => {
+    const { ipc, invoke } = await load();
+    invoke.mockResolvedValue(undefined);
+    await expect(ipc.confirmPairing("req-1")).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("confirm_pairing", { requestId: "req-1" });
+    await expect(ipc.rejectPairing("req-2")).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("reject_pairing", { requestId: "req-2" });
+  });
+
+  it("onPhoneSyncPairingRequest listens on the pairing-request channel and unwraps payloads", async () => {
+    const { ipc, listen } = await load();
+    const unlisten = vi.fn();
+    let registered!: (ev: { payload: unknown }) => void;
+    listen.mockImplementation(async (_channel, cb) => {
+      registered = cb as typeof registered;
+      return unlisten;
+    });
+
+    const onReq = vi.fn();
+    const off = await ipc.onPhoneSyncPairingRequest(onReq);
+    expect(listen).toHaveBeenCalledWith("phone-sync://pairing-request", expect.any(Function));
+
+    registered({ payload: { requestId: "req-1", sas: "GOLF-77", peerKeyHex: "KEY==" } });
+    expect(onReq).toHaveBeenCalledWith({
+      requestId: "req-1",
+      sas: "GOLF-77",
+      peerKeyHex: "KEY==",
+    });
+
+    off();
+    expect(unlisten).toHaveBeenCalledTimes(1);
   });
 
   it("phone_sync_send_command wraps the command under a `command` key", async () => {
@@ -381,6 +425,20 @@ describe("browser fallback (no Tauri core)", () => {
     expect(typeof off).toBe("function");
     off(); // must not throw
     expect(onFrame).not.toHaveBeenCalled();
+  });
+
+  it("the device-trust gate surface is inert in the browser mock", async () => {
+    const { ipc, invoke } = await load();
+    // The pairing-request subscription never fires in the preview (no real phone).
+    const onReq = vi.fn();
+    const off = await ipc.onPhoneSyncPairingRequest(onReq);
+    expect(typeof off).toBe("function");
+    off(); // must not throw
+    expect(onReq).not.toHaveBeenCalled();
+    // confirm/reject are harmless no-ops that never reach the (absent) core.
+    await expect(ipc.confirmPairing("req-1")).resolves.toBeUndefined();
+    await expect(ipc.rejectPairing("req-1")).resolves.toBeUndefined();
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it("oauth mock signs into a Claude Max subscription and logout clears it", async () => {

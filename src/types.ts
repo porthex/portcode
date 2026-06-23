@@ -142,12 +142,28 @@ export interface PairedDevice {
   name: string;
   pairedAt: number;
   lastSeen: number;
+  /** Whether the desktop user has confirmed this device's SAS (the trust gate).
+   *  An unconfirmed device is never served the command surface. */
+  confirmed: boolean;
 }
 
 /** Returned by `phone_sync_status`: this device's identity + all paired phones. */
 export interface PhoneSyncStatus {
   devicePublicKey: string;
   paired: PairedDevice[];
+}
+
+/**
+ * Payload of the desktop-side `phone-sync://pairing-request` event: an untrusted
+ * phone completed the handshake inside an open pairing window and is awaiting the
+ * desktop user's SAS confirmation. The user compares `sas` with the code shown on
+ * the phone, then calls `confirm_pairing(requestId)` or `reject_pairing(requestId)`.
+ */
+export interface PairingRequest {
+  requestId: string;
+  sas: string;
+  /** The phone's pinned Noise static key (base64) — shown for reference. */
+  peerKeyHex: string;
 }
 
 /**

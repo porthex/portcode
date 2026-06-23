@@ -78,36 +78,49 @@ pub struct Handshake {
 }
 
 impl Handshake {
-    /// First-pairing initiator (writes the first message).
-    pub fn xx_initiator(local_private: &[u8]) -> Result<Self, String> {
-        Self::build(XX_PARAMS, local_private, None, true)
+    /// First-pairing initiator (writes the first message). `prologue` is the
+    /// pairing nonce both sides bind into the handshake — a peer presenting a
+    /// different/stale nonce fails the handshake cryptographically (see `build`).
+    pub fn xx_initiator(local_private: &[u8], prologue: &[u8]) -> Result<Self, String> {
+        Self::build(XX_PARAMS, local_private, None, prologue, true)
     }
-    /// First-pairing responder.
-    pub fn xx_responder(local_private: &[u8]) -> Result<Self, String> {
-        Self::build(XX_PARAMS, local_private, None, false)
+    /// First-pairing responder. See [`Handshake::xx_initiator`] re: `prologue`.
+    pub fn xx_responder(local_private: &[u8], prologue: &[u8]) -> Result<Self, String> {
+        Self::build(XX_PARAMS, local_private, None, prologue, false)
     }
     /// Reconnect initiator — the peer's static key must already be pinned.
     /// KK fast-reconnect lands in a later phase; exercised only by tests today.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn kk_initiator(local_private: &[u8], remote_public: &[u8]) -> Result<Self, String> {
-        Self::build(KK_PARAMS, local_private, Some(remote_public), true)
+        Self::build(KK_PARAMS, local_private, Some(remote_public), &[], true)
     }
     /// Reconnect responder — the peer's static key must already be pinned.
     /// KK fast-reconnect lands in a later phase; exercised only by tests today.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn kk_responder(local_private: &[u8], remote_public: &[u8]) -> Result<Self, String> {
-        Self::build(KK_PARAMS, local_private, Some(remote_public), false)
+        Self::build(KK_PARAMS, local_private, Some(remote_public), &[], false)
     }
 
     fn build(
         spec: &str,
         local_private: &[u8],
         remote_public: Option<&[u8]>,
+        prologue: &[u8],
         initiator: bool,
     ) -> Result<Self, String> {
         // snow 0.10: the key setters return `Result<Builder, _>`, so `?` each one
         // (older snow returned a bare `Self`).
+        //
+        // The prologue is mixed into the handshake hash before the first message:
+        // both peers must supply byte-identical prologue data or the AEAD checks on
+        // the handshake messages fail. We bind the pairing NONCE here so a peer that
+        // scanned a different/stale QR (different nonce) cannot complete the XX
+        // handshake at all — pushing the nonce check below the crypto rather than
+        // leaving it as the unused QR field it used to be. An empty prologue (KK
+        // reconnect, or a legacy caller) is a valid no-op that mixes nothing.
         let mut builder = Builder::new(parse_params(spec)?)
+            .prologue(prologue)
+            .map_err(err)?
             .local_private_key(local_private)
             .map_err(err)?;
         if let Some(rp) = remote_public {
@@ -207,6 +220,11 @@ fn sas_from_hash(hash: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// A shared, non-empty prologue (the pairing nonce) for tests that don't
+    /// specifically exercise the prologue-mismatch path. Both peers pass the same
+    /// bytes, so the handshake completes exactly as before the nonce was bound.
+    const TEST_NONCE: &[u8] = &[0xaa, 0xbb, 0xcc, 0xdd];
+
     /// Drive a 3-message XX handshake to completion.
     fn run_xx(ini: &mut Handshake, res: &mut Handshake) {
         let m1 = ini.write(&[]).unwrap(); // -> e
@@ -240,8 +258,8 @@ mod tests {
     fn xx_pairing_completes_pins_peer_keys_and_agrees_on_sas() {
         let a = StaticKeypair::generate().unwrap();
         let b = StaticKeypair::generate().unwrap();
-        let mut ini = Handshake::xx_initiator(&a.private).unwrap();
-        let mut res = Handshake::xx_responder(&b.private).unwrap();
+        let mut ini = Handshake::xx_initiator(&a.private, TEST_NONCE).unwrap();
+        let mut res = Handshake::xx_responder(&b.private, TEST_NONCE).unwrap();
 
         run_xx(&mut ini, &mut res);
 
@@ -258,8 +276,8 @@ mod tests {
     fn transport_round_trips_in_both_directions_after_xx() {
         let a = StaticKeypair::generate().unwrap();
         let b = StaticKeypair::generate().unwrap();
-        let mut ini = Handshake::xx_initiator(&a.private).unwrap();
-        let mut res = Handshake::xx_responder(&b.private).unwrap();
+        let mut ini = Handshake::xx_initiator(&a.private, TEST_NONCE).unwrap();
+        let mut res = Handshake::xx_responder(&b.private, TEST_NONCE).unwrap();
         run_xx(&mut ini, &mut res);
 
         let mut it = ini.into_transport().unwrap();
@@ -297,8 +315,8 @@ mod tests {
     fn a_tampered_handshake_message_is_rejected() {
         let a = StaticKeypair::generate().unwrap();
         let b = StaticKeypair::generate().unwrap();
-        let mut ini = Handshake::xx_initiator(&a.private).unwrap();
-        let mut res = Handshake::xx_responder(&b.private).unwrap();
+        let mut ini = Handshake::xx_initiator(&a.private, TEST_NONCE).unwrap();
+        let mut res = Handshake::xx_responder(&b.private, TEST_NONCE).unwrap();
 
         let m1 = ini.write(&[]).unwrap();
         res.read(&m1).unwrap();
@@ -329,11 +347,35 @@ mod tests {
     }
 
     #[test]
+    fn xx_with_a_mismatched_prologue_nonce_fails() {
+        // The pairing nonce is bound into the handshake as the Noise prologue.
+        // A peer that scanned a different/stale QR (different nonce) must fail the
+        // handshake cryptographically — this is what makes the nonce a real
+        // single-use challenge, not the inert QR field it used to be.
+        let a = StaticKeypair::generate().unwrap();
+        let b = StaticKeypair::generate().unwrap();
+        let mut ini = Handshake::xx_initiator(&a.private, &[1, 2, 3, 4]).unwrap();
+        let mut res = Handshake::xx_responder(&b.private, &[9, 9, 9, 9]).unwrap();
+
+        // The XX hash divergence surfaces when the responder authenticates the
+        // initiator's static key (message 3 carries `s, se`), so drive to there.
+        let m1 = ini.write(&[]).unwrap();
+        res.read(&m1).unwrap();
+        let m2 = res.write(&[]).unwrap();
+        // The initiator decrypts the responder's reply (e, ee, s, es); the prologue
+        // mismatch corrupts the symmetric state, so this AEAD check already fails.
+        assert!(
+            ini.read(&m2).is_err(),
+            "a mismatched prologue nonce must fail the XX handshake"
+        );
+    }
+
+    #[test]
     fn sas_is_deterministic_and_grouped() {
         let a = StaticKeypair::generate().unwrap();
         let b = StaticKeypair::generate().unwrap();
-        let mut ini = Handshake::xx_initiator(&a.private).unwrap();
-        let mut res = Handshake::xx_responder(&b.private).unwrap();
+        let mut ini = Handshake::xx_initiator(&a.private, TEST_NONCE).unwrap();
+        let mut res = Handshake::xx_responder(&b.private, TEST_NONCE).unwrap();
         run_xx(&mut ini, &mut res);
 
         let sas = ini.sas();
@@ -351,15 +393,15 @@ mod tests {
         // Honest A <-> B.
         let a = StaticKeypair::generate().unwrap();
         let b = StaticKeypair::generate().unwrap();
-        let mut ini = Handshake::xx_initiator(&a.private).unwrap();
-        let mut res = Handshake::xx_responder(&b.private).unwrap();
+        let mut ini = Handshake::xx_initiator(&a.private, TEST_NONCE).unwrap();
+        let mut res = Handshake::xx_responder(&b.private, TEST_NONCE).unwrap();
         run_xx(&mut ini, &mut res);
         let honest_sas = ini.sas();
 
         // A unknowingly handshakes with an interceptor M instead of B.
         let m = StaticKeypair::generate().unwrap();
-        let mut ini2 = Handshake::xx_initiator(&a.private).unwrap();
-        let mut mitm = Handshake::xx_responder(&m.private).unwrap();
+        let mut ini2 = Handshake::xx_initiator(&a.private, TEST_NONCE).unwrap();
+        let mut mitm = Handshake::xx_responder(&m.private, TEST_NONCE).unwrap();
         run_xx(&mut ini2, &mut mitm);
 
         // The out-of-band SAS comparison is what catches the MITM.
@@ -374,8 +416,8 @@ mod tests {
     fn transport_rejects_a_tampered_ciphertext() {
         let a = StaticKeypair::generate().unwrap();
         let b = StaticKeypair::generate().unwrap();
-        let mut ini = Handshake::xx_initiator(&a.private).unwrap();
-        let mut res = Handshake::xx_responder(&b.private).unwrap();
+        let mut ini = Handshake::xx_initiator(&a.private, TEST_NONCE).unwrap();
+        let mut res = Handshake::xx_responder(&b.private, TEST_NONCE).unwrap();
         run_xx(&mut ini, &mut res);
         let mut it = ini.into_transport().unwrap();
         let mut rt = res.into_transport().unwrap();
@@ -392,8 +434,8 @@ mod tests {
     fn transport_rejects_a_replayed_message() {
         let a = StaticKeypair::generate().unwrap();
         let b = StaticKeypair::generate().unwrap();
-        let mut ini = Handshake::xx_initiator(&a.private).unwrap();
-        let mut res = Handshake::xx_responder(&b.private).unwrap();
+        let mut ini = Handshake::xx_initiator(&a.private, TEST_NONCE).unwrap();
+        let mut res = Handshake::xx_responder(&b.private, TEST_NONCE).unwrap();
         run_xx(&mut ini, &mut res);
         let mut it = ini.into_transport().unwrap();
         let mut rt = res.into_transport().unwrap();
@@ -412,13 +454,13 @@ mod tests {
         let a = StaticKeypair::generate().unwrap();
         let b = StaticKeypair::generate().unwrap();
 
-        let mut i1 = Handshake::xx_initiator(&a.private).unwrap();
-        let mut r1 = Handshake::xx_responder(&b.private).unwrap();
+        let mut i1 = Handshake::xx_initiator(&a.private, TEST_NONCE).unwrap();
+        let mut r1 = Handshake::xx_responder(&b.private, TEST_NONCE).unwrap();
         run_xx(&mut i1, &mut r1);
         let mut t1 = i1.into_transport().unwrap();
 
-        let mut i2 = Handshake::xx_initiator(&a.private).unwrap();
-        let mut r2 = Handshake::xx_responder(&b.private).unwrap();
+        let mut i2 = Handshake::xx_initiator(&a.private, TEST_NONCE).unwrap();
+        let mut r2 = Handshake::xx_responder(&b.private, TEST_NONCE).unwrap();
         run_xx(&mut i2, &mut r2);
         let mut t2 = i2.into_transport().unwrap();
 
@@ -434,8 +476,8 @@ mod tests {
     fn remote_static_is_none_until_the_peer_key_is_received_during_xx() {
         let a = StaticKeypair::generate().unwrap();
         let b = StaticKeypair::generate().unwrap();
-        let mut ini = Handshake::xx_initiator(&a.private).unwrap();
-        let mut res = Handshake::xx_responder(&b.private).unwrap();
+        let mut ini = Handshake::xx_initiator(&a.private, TEST_NONCE).unwrap();
+        let mut res = Handshake::xx_responder(&b.private, TEST_NONCE).unwrap();
 
         let m1 = ini.write(&[]).unwrap(); // -> e
         assert!(ini.remote_static().is_none()); // hasn't seen b's s yet
@@ -453,7 +495,7 @@ mod tests {
     #[test]
     fn into_transport_before_the_handshake_finishes_errs() {
         let a = StaticKeypair::generate().unwrap();
-        let ini = Handshake::xx_initiator(&a.private).unwrap();
+        let ini = Handshake::xx_initiator(&a.private, TEST_NONCE).unwrap();
         assert!(!ini.is_finished());
         assert!(ini.into_transport().is_err());
     }
@@ -461,12 +503,12 @@ mod tests {
     #[test]
     fn handshake_read_rejects_garbage_without_panicking() {
         let a = StaticKeypair::generate().unwrap();
-        let mut ini = Handshake::xx_initiator(&a.private).unwrap();
+        let mut ini = Handshake::xx_initiator(&a.private, TEST_NONCE).unwrap();
         ini.write(&[]).unwrap(); // XX: write before reading
         assert!(ini.read(&[]).is_err());
 
         let b = StaticKeypair::generate().unwrap();
-        let mut res = Handshake::xx_responder(&b.private).unwrap();
+        let mut res = Handshake::xx_responder(&b.private, TEST_NONCE).unwrap();
         assert!(res.read(&[0xde, 0xad, 0xbe, 0xef]).is_err());
     }
 
@@ -474,8 +516,8 @@ mod tests {
     fn transport_read_rejects_garbage_without_panicking() {
         let a = StaticKeypair::generate().unwrap();
         let b = StaticKeypair::generate().unwrap();
-        let mut ini = Handshake::xx_initiator(&a.private).unwrap();
-        let mut res = Handshake::xx_responder(&b.private).unwrap();
+        let mut ini = Handshake::xx_initiator(&a.private, TEST_NONCE).unwrap();
+        let mut res = Handshake::xx_responder(&b.private, TEST_NONCE).unwrap();
         run_xx(&mut ini, &mut res);
         let mut rt = res.into_transport().unwrap();
 

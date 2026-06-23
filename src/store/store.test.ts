@@ -40,6 +40,9 @@ vi.mock("../lib/ipc", () => ({
   phoneSyncDisconnect: vi.fn(),
   onPhoneSyncFrame: vi.fn(),
   onPhoneSyncDisconnected: vi.fn(),
+  onPhoneSyncPairingRequest: vi.fn(),
+  confirmPairing: vi.fn(),
+  rejectPairing: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -90,6 +93,9 @@ beforeEach(() => {
   m.phoneSyncDisconnect.mockResolvedValue(undefined);
   m.onPhoneSyncFrame.mockResolvedValue(() => {});
   m.onPhoneSyncDisconnected.mockResolvedValue(() => {});
+  m.onPhoneSyncPairingRequest.mockResolvedValue(() => {});
+  m.confirmPairing.mockResolvedValue(undefined);
+  m.rejectPairing.mockResolvedValue(undefined);
 });
 
 describe("init", () => {
@@ -1238,6 +1244,7 @@ describe("phone sync", () => {
     name: "My Phone",
     pairedAt: 1000,
     lastSeen: 2000,
+    confirmed: true,
   });
 
   it("init fetches phone sync status alongside settings", async () => {
@@ -1329,6 +1336,79 @@ describe("phone sync", () => {
     expect(m.phoneSyncUnpair).toHaveBeenCalledWith("PHONE==");
     expect(m.phoneSyncStatus).toHaveBeenCalledTimes(1);
     expect(useStore.getState().phoneSync).toEqual(refreshed);
+  });
+
+  // ── device-trust gate (desktop-side confirm flow) ──────────────────────────
+
+  it("listenForPairingRequests surfaces an inbound request into state", async () => {
+    let fire!: (req: { requestId: string; sas: string; peerKeyHex: string }) => void;
+    m.onPhoneSyncPairingRequest.mockImplementation(async (cb) => {
+      fire = cb;
+      return () => {};
+    });
+
+    await useStore.getState().listenForPairingRequests();
+    expect(useStore.getState().pairingRequest).toBeNull();
+
+    // The desktop server emitted a "new phone wants to pair" event.
+    fire({ requestId: "req-9", sas: "GOLF-77", peerKeyHex: "PHONE==" });
+    expect(useStore.getState().pairingRequest).toEqual({
+      requestId: "req-9",
+      sas: "GOLF-77",
+      peerKeyHex: "PHONE==",
+    });
+  });
+
+  it("listenForPairingRequests tears down a prior subscription before re-subscribing", async () => {
+    const prev = vi.fn();
+    m.onPhoneSyncPairingRequest.mockResolvedValueOnce(prev);
+    await useStore.getState().listenForPairingRequests();
+
+    m.onPhoneSyncPairingRequest.mockResolvedValueOnce(() => {});
+    await useStore.getState().listenForPairingRequests();
+
+    expect(prev).toHaveBeenCalledTimes(1);
+  });
+
+  it("confirmPairingRequest confirms via ipc, clears the prompt, and refreshes", async () => {
+    useStore.setState({
+      pairingRequest: { requestId: "req-1", sas: "GOLF-77", peerKeyHex: "PHONE==" },
+    });
+    m.phoneSyncStatus.mockResolvedValue({ devicePublicKey: "DEVICE==", paired: [] });
+
+    await useStore.getState().confirmPairingRequest();
+
+    expect(m.confirmPairing).toHaveBeenCalledWith("req-1");
+    expect(m.phoneSyncStatus).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().pairingRequest).toBeNull();
+  });
+
+  it("rejectPairingRequest rejects via ipc and clears the prompt", async () => {
+    useStore.setState({
+      pairingRequest: { requestId: "req-1", sas: "GOLF-77", peerKeyHex: "PHONE==" },
+    });
+
+    await useStore.getState().rejectPairingRequest();
+
+    expect(m.rejectPairing).toHaveBeenCalledWith("req-1");
+    expect(useStore.getState().pairingRequest).toBeNull();
+  });
+
+  it("confirmPairingRequest is a no-op with no pending request", async () => {
+    useStore.setState({ pairingRequest: null });
+    await useStore.getState().confirmPairingRequest();
+    expect(m.confirmPairing).not.toHaveBeenCalled();
+  });
+
+  it("confirmPairingRequest surfaces an ipc failure via pairingError", async () => {
+    useStore.setState({
+      pairingRequest: { requestId: "req-1", sas: "GOLF-77", peerKeyHex: "PHONE==" },
+    });
+    m.confirmPairing.mockRejectedValueOnce(new Error("gate poisoned"));
+
+    await useStore.getState().confirmPairingRequest();
+
+    expect(useStore.getState().pairingError).toBe("gate poisoned");
   });
 });
 
@@ -1631,7 +1711,8 @@ describe("remote client", () => {
       await useStore.getState().connectRemote("QR-PAYLOAD");
 
       const st = useStore.getState();
-      expect(m.phoneSyncConnect).toHaveBeenCalledWith("QR-PAYLOAD");
+      // A first dial is NOT a reconnect, so it binds the QR nonce (reconnect=false).
+      expect(m.phoneSyncConnect).toHaveBeenCalledWith("QR-PAYLOAD", false);
       expect(st.remoteConnected).toBe(true);
       expect(st.remoteSas).toBe("SAS-1");
       expect(st.remoteError).toBeNull();
@@ -1704,7 +1785,7 @@ describe("remote client", () => {
       m.phoneSyncConnect.mockClear();
       await useStore.getState().connectRemote("QR-2");
 
-      expect(m.phoneSyncConnect).toHaveBeenCalledWith("QR-2");
+      expect(m.phoneSyncConnect).toHaveBeenCalledWith("QR-2", false);
     });
 
     it("releases the re-entry lock even when the dial fails", async () => {
@@ -1786,7 +1867,9 @@ describe("remote client", () => {
 
       await useStore.getState().reconnectRemote();
 
-      expect(m.phoneSyncConnect).toHaveBeenCalledWith("QR-1");
+      // A reconnect binds an empty prologue (reconnect=true) to match the desktop's
+      // closed pairing window.
+      expect(m.phoneSyncConnect).toHaveBeenCalledWith("QR-1", true);
       const st = useStore.getState();
       expect(st.remoteConnected).toBe(true);
       // A pin-matched reconnect skips the SAS re-comparison.
