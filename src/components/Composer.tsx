@@ -13,6 +13,10 @@ export function Composer() {
   const send = useStore((s) => s.send);
   const stop = useStore((s) => s.stop);
   const remoteMode = useStore((s) => s.remoteMode);
+  // On the phone, a pending permission pauses the agent on the desktop; reflect
+  // that in the (already disabled-mid-turn) composer placeholder so the wait reads
+  // as intentional rather than a frozen input.
+  const awaitingPermission = useStore((s) => s.remoteMode && s.pendingPermission !== null);
   const ref = useRef<HTMLTextAreaElement>(null);
   // The pixel height of a single, empty row. Captured lazily from a collapsed
   // textarea so the post-submit collapse has a concrete target to ease toward —
@@ -89,7 +93,11 @@ export function Composer() {
             aria-busy={streaming}
             aria-label="Message Portcode"
             rows={1}
-            placeholder="Describe a task, ask a question, or give an instruction…"
+            placeholder={
+              awaitingPermission
+                ? "Agent paused — awaiting permission"
+                : "Describe a task, ask a question, or give an instruction…"
+            }
             style={{ maxHeight: MAX_TEXTAREA_H }}
             className="flex-1 resize-none bg-transparent text-[13.5px] leading-[1.5] text-fg outline-none transition-[height,opacity,filter] duration-150 ease-out motion-reduce:transition-none placeholder:text-faint select-text disabled:cursor-not-allowed disabled:opacity-60 disabled:saturate-[0.6]"
           />

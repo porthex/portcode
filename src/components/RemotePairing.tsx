@@ -3,19 +3,19 @@ import { createPortal } from "react-dom";
 import { useStore } from "../store/store";
 import { isScannerAvailable, scanQrPayload, cancelScan } from "../lib/scanner";
 
-// The remote-mode pairing screen. Shown on the phone (or any client in remote
-// mode) until a live desktop session is both established AND its SAS verified.
-// Two visual states:
+// The remote-mode pairing flow, in the Neon-Noir mobile design language
+// (design_handoff_mobile_remote). Two full-screen states:
 //
-//   1. CONNECT  — scan the desktop's QR with the camera (native phone client) or
-//                 paste the QR payload (JSON) as a fallback, then dial.
-//   2. VERIFY   — once connected, show the SAS prominently for out-of-band
-//                 comparison; "Continue" confirms it and hands off to the session.
+//   1. PAIR    — a camera viewport (corner brackets + sweeping scan line) is the
+//                primary affordance on the phone; tapping it opens the native
+//                scanner. A pasted QR payload is the fallback on every host.
+//   2. SAFETY  — once connected, the SAS is shown large for an out-of-band
+//                comparison (anti-MITM). Confirm hands off to the sessions list;
+//                Cancel tears the connection down.
 //
-// The camera path uses the native barcode scanner (see lib/scanner); it is only
-// offered where it exists (the phone), and paste always works as a fallback.
-// Styled with the Neon-Noir utility classes, mirroring the desktop pairing UI in
-// Settings.
+// The phone holds no keys and never touches files — it pairs, confirms the safety
+// code, then drives a desktop session. Wired entirely to the real store/socket
+// layer (connectRemote / confirmRemoteSas / disconnectRemote / reconnectRemote).
 export function RemotePairing() {
   const connectRemote = useStore((s) => s.connectRemote);
   const remoteConnected = useStore((s) => s.remoteConnected);
@@ -26,8 +26,8 @@ export function RemotePairing() {
   const [scanError, setScanError] = useState<string | null>(null);
 
   // Dial a payload. connectRemote never throws — it folds failures into
-  // store.remoteError, which the connect panel surfaces inline. On success it
-  // flips remoteConnected and this screen swaps to the VERIFY state.
+  // store.remoteError, which the pair panel surfaces inline. On success it flips
+  // remoteConnected and this screen swaps to the SAFETY state.
   const connectWith = async (payload: string) => {
     const v = payload.trim();
     if (!v || connecting) return;
@@ -42,7 +42,7 @@ export function RemotePairing() {
   const connect = () => connectWith(qr);
 
   // Scan the desktop's QR with the camera, then dial the decoded payload. The
-  // payload also lands in the textarea so a failed dial can be retried/edited.
+  // payload also lands in the field so a failed dial can be retried/edited.
   const onScan = async () => {
     if (scanning || connecting) return;
     setScanError(null);
@@ -68,39 +68,20 @@ export function RemotePairing() {
   };
 
   return (
-    <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-y-auto bg-bg px-6 py-10 text-fg">
-      <div className="pc-neon-frame w-full max-w-[440px]">
-        <div className="rounded-[13px] bg-panel p-6">
-          {/* Brand + mode header */}
-          <div className="mb-5 flex items-center gap-3">
-            <div className="flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-lg border border-accent/60 bg-gradient-to-br from-accent/30 to-accent-2/25 shadow-[0_0_14px_rgba(255,46,126,0.4)]">
-              <Logo />
-            </div>
-            <div className="flex min-w-0 flex-col">
-              <span className="pc-wordmark">PORTCODE</span>
-              <span className="pc-eyebrow-mono text-[8.5px]">REMOTE CLIENT</span>
-            </div>
-          </div>
-
-          {remoteConnected ? (
-            <VerifyPanel />
-          ) : (
-            <ConnectPanel
-              qr={qr}
-              setQr={setQr}
-              connect={connect}
-              connecting={connecting}
-              onScan={onScan}
-              scanning={scanning}
-              scanError={scanError}
-            />
-          )}
-        </div>
-      </div>
-
-      <p className="mt-5 text-center font-mono text-[10.5px] tracking-wide text-faint">
-        End-to-end encrypted · paired over your local network
-      </p>
+    <div className="relative flex min-h-0 flex-1 flex-col bg-bg text-fg">
+      {remoteConnected ? (
+        <SafetyPanel />
+      ) : (
+        <PairPanel
+          qr={qr}
+          setQr={setQr}
+          connect={connect}
+          connecting={connecting}
+          onScan={onScan}
+          scanning={scanning}
+          scanError={scanError}
+        />
+      )}
 
       {/* The camera preview renders behind a transparented webview; this overlay
           (outside the hidden app shell, via a body portal) is the only painted UI. */}
@@ -110,8 +91,8 @@ export function RemotePairing() {
   );
 }
 
-/** State 1 — scan the desktop's QR (phone) or paste its payload, then dial. */
-function ConnectPanel({
+/** State 1 — PAIR. Camera viewport (scan) + paste-code fallback, then dial. */
+function PairPanel({
   qr,
   setQr,
   connect,
@@ -130,21 +111,20 @@ function ConnectPanel({
 }) {
   const error = useStore((s) => s.remoteError);
   const canScan = isScannerAvailable();
-  const dropped = useStore((s) => s.remoteDropped);
   const canReconnect = useStore((s) => s.lastPairingQr !== null);
   const reconnectRemote = useStore((s) => s.reconnectRemote);
   const [reconnecting, setReconnecting] = useState(false);
+  const [pasteError, setPasteError] = useState(false);
 
-  // Place initial focus on the primary action: the Scan button on the phone,
-  // otherwise the pairing textarea — so the panel is operable from the keyboard
-  // without a hunt.
+  // Place initial focus on the primary action: the camera viewport on the phone,
+  // otherwise the paste field — so the panel is operable from the keyboard without
+  // a hunt. Runs once on mount; the guards just avoid focusing a disabled control
+  // if the panel happens to mount mid-flight.
   const scanRef = useRef<HTMLButtonElement>(null);
   const pasteRef = useRef<HTMLTextAreaElement>(null);
   useEffect(() => {
     if (canScan && !(scanning || connecting)) scanRef.current?.focus();
     else if (!connecting) pasteRef.current?.focus();
-    // Run once on mount; the connecting/scanning guards just avoid focusing a
-    // disabled control if the panel happens to mount mid-flight.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -158,164 +138,293 @@ function ConnectPanel({
     }
   };
 
-  return (
-    <div>
-      {/* The drop is announced by a persistent live region at the App shell (it
-          survives the connected↔pairing remount); a region inside this panel can't,
-          since the panel only mounts on the drop and so is born with content set. */}
-      {canReconnect && (
-        <div
-          className={`mb-4 rounded-xl border px-4 py-3.5 ${
-            dropped ? "border-warn/40 bg-warn/5" : "border-accent-2/30 bg-accent-2/5"
-          }`}
-        >
-          <div className="flex items-center gap-2">
-            <span className={`pc-dot ${dropped ? "pc-dot--warn" : "pc-dot--cyan"}`} />
-            <span
-              className={`font-mono text-[11px] uppercase tracking-[1.5px] ${
-                dropped ? "text-warn" : "text-accent-2"
-              }`}
-            >
-              {dropped ? "Connection lost" : "Paired desktop"}
-            </span>
-          </div>
-          <p className="mt-1.5 text-[12px] leading-[1.5] text-muted">
-            {dropped
-              ? "The link to your desktop dropped. Reconnect without re-scanning."
-              : "Reconnect to the desktop you paired with — no need to re-scan."}
-          </p>
-          <button
-            onClick={() => void onReconnect()}
-            disabled={reconnecting}
-            aria-busy={reconnecting}
-            className="pc-btn-accent mt-2.5 w-full px-3 py-2.5 text-[13px] disabled:opacity-40"
-          >
-            {reconnecting ? "Reconnecting…" : "Reconnect"}
-          </button>
-        </div>
-      )}
-      <div className="pc-eyebrow pc-eyebrow--accent">CONNECT TO DESKTOP</div>
-      <p className="mb-3 text-[12px] leading-[1.5] text-muted">
-        On your desktop, open <span className="text-fg">Settings → Phone Sync</span> and choose{" "}
-        <span className="text-fg">Pair a phone</span>
-        {canScan ? ", then scan the QR it shows." : ". Paste the pairing code below."}
-      </p>
+  // PASTE chip — pull the payload straight from the clipboard. Best-effort: where
+  // the Clipboard API is unavailable or denied we flag it so the user pastes by hand.
+  const onPaste = async () => {
+    setPasteError(false);
+    try {
+      const text = await navigator.clipboard?.readText();
+      if (text) {
+        setQr(text);
+        pasteRef.current?.focus();
+      } else {
+        setPasteError(true);
+      }
+    } catch {
+      setPasteError(true);
+    }
+  };
 
-      {canScan && (
-        <>
+  return (
+    <div className="flex min-h-0 flex-1 flex-col px-[22px] pb-6 pt-[18px]">
+      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+        <p className="font-mono text-[10px] tracking-[3px] text-accent-2 [text-shadow:0_0_8px_rgba(33,230,255,.4)]">
+          ◧ REMOTE MODE
+        </p>
+        <h1 className="mb-1.5 mt-[9px] font-display text-[27px] font-bold leading-[1.12] tracking-[0.4px] text-fg">
+          Pair a phone
+        </h1>
+        <p className="text-[13px] leading-[1.5] text-muted">
+          On your desktop, open{" "}
+          <span className="font-mono text-fg/90">
+            Settings <span className="text-faint">→</span> Phone Sync{" "}
+            <span className="text-faint">→</span> Pair a phone
+          </span>
+          {canScan ? ", then scan the QR it shows." : "."}
+        </p>
+
+        {/* camera viewport — the scan trigger on the phone, decorative otherwise */}
+        {canScan ? (
           <button
             ref={scanRef}
             type="button"
             onClick={() => void onScan()}
             disabled={scanning || connecting}
+            aria-label="Scan QR code"
             aria-busy={scanning}
-            className="pc-btn-accent mb-2 flex w-full items-center justify-center gap-2 px-3 py-2.5 text-[13px] disabled:opacity-40"
+            className="group relative mb-1 mt-5 aspect-square overflow-hidden rounded-[18px] border border-border bg-[linear-gradient(150deg,#080a11,#04050a)] shadow-[inset_0_0_60px_rgba(0,0,0,.6)] transition hover:border-accent-2/40 disabled:opacity-80"
           >
-            <CameraIcon />
-            {scanning ? "Scanning…" : "Scan QR code"}
+            <Viewfinder showScanLine={!scanning && !connecting} />
           </button>
-          {scanError && (
-            <p role="alert" className="mb-2 flex items-start gap-1.5 text-[11.5px] text-danger">
-              <span aria-hidden="true">⚠</span>
-              <span>{scanError}</span>
-            </p>
-          )}
-          <div className="my-3 flex items-center gap-3 font-mono text-[10px] uppercase tracking-[1.5px] text-faint">
-            <span className="h-px flex-1 bg-border" />
-            or enter manually
-            <span className="h-px flex-1 bg-border" />
+        ) : (
+          <div
+            aria-hidden="true"
+            className="relative mb-1 mt-5 aspect-square overflow-hidden rounded-[18px] border border-border bg-[linear-gradient(150deg,#080a11,#04050a)] shadow-[inset_0_0_60px_rgba(0,0,0,.6)]"
+          >
+            <Viewfinder showScanLine={!connecting} />
           </div>
-        </>
-      )}
+        )}
 
-      <label htmlFor="pc-remote-qr" className="mb-1.5 block text-[12.5px] font-medium text-fg">
-        Pairing code
-      </label>
-      <textarea
-        ref={pasteRef}
-        id="pc-remote-qr"
-        value={qr}
-        onChange={(e) => setQr(e.target.value)}
-        disabled={connecting}
-        rows={4}
-        spellCheck={false}
-        placeholder={'{ "version": 1, "publicKey": "…", "nonce": "…", "nodeAddr": { … } }'}
-        className="w-full resize-none rounded-lg border border-border bg-panel-2 px-3 py-2.5 font-mono text-[11.5px] leading-[1.5] text-fg outline-none transition-colors placeholder:text-faint focus:border-accent/50 select-text disabled:cursor-not-allowed disabled:opacity-60"
-      />
+        {/* viewport caption — below the frame so it never collides with the brackets */}
+        <div className="mt-[13px] flex items-center justify-center gap-2 font-mono text-[11px] tracking-[0.5px] text-[#7a8499]">
+          <span className="pc-dot pc-dot--cyan" aria-hidden="true" />
+          {scanning
+            ? "Scanning…"
+            : connecting
+              ? "Reading…"
+              : canScan
+                ? "Point at the QR on your desktop"
+                : "Show the QR from your desktop"}
+        </div>
 
-      {error && (
-        <p role="alert" className="mt-2 flex items-start gap-1.5 text-[11.5px] text-danger">
-          <span aria-hidden="true">⚠</span>
-          <span>Couldn’t connect: {error}</span>
-        </p>
-      )}
+        {/* divider */}
+        <div className="my-4 flex items-center gap-3 font-mono text-[10px] tracking-[2px] text-faint/70">
+          <span className="h-px flex-1 bg-border" /> OR PASTE CODE{" "}
+          <span className="h-px flex-1 bg-border" />
+        </div>
 
-      <button
-        onClick={() => void connect()}
-        disabled={connecting || !qr.trim()}
-        aria-busy={connecting}
-        className="pc-btn-accent mt-3.5 w-full px-3 py-2.5 text-[13px] disabled:opacity-30"
-      >
-        {connecting ? "Connecting…" : "Connect"}
-      </button>
+        {/* paste-code field — a multi-line area for the QR payload JSON */}
+        <label className="flex items-start gap-[9px] rounded-[11px] border border-border-2 bg-panel px-3.5 py-3 transition focus-within:border-accent-2/45 focus-within:shadow-glow-cyan">
+          <textarea
+            ref={pasteRef}
+            value={qr}
+            onChange={(e) => setQr(e.target.value)}
+            disabled={connecting}
+            rows={2}
+            spellCheck={false}
+            aria-label="Pairing code"
+            placeholder='{ "version": 1, "publicKey": "…", "nodeAddr": { … } }'
+            className="min-w-0 flex-1 resize-none break-all bg-transparent font-mono text-[12px] leading-[1.5] text-fg/90 outline-none placeholder:text-faint select-text disabled:opacity-60"
+          />
+          <button
+            type="button"
+            onClick={() => void onPaste()}
+            disabled={connecting}
+            className="mt-px shrink-0 rounded-md border border-accent-2/30 bg-accent-2/10 px-2 py-1 font-mono text-[10px] tracking-[1px] text-accent-2 transition hover:bg-accent-2/20 disabled:opacity-40"
+          >
+            PASTE
+          </button>
+        </label>
+        {pasteError && (
+          <p className="mt-1.5 text-[11px] text-faint">
+            Couldn’t read the clipboard — paste the code by hand.
+          </p>
+        )}
+
+        {/* calm cross-launch reconnect: a remembered desktop, dial it without re-scanning */}
+        {canReconnect && (
+          <div className="mt-4 rounded-[11px] border border-accent-2/30 bg-accent-2/5 px-4 py-3">
+            <div className="flex items-center gap-2">
+              <span className="pc-dot pc-dot--cyan" aria-hidden="true" />
+              <span className="font-mono text-[10px] uppercase tracking-[1.5px] text-accent-2">
+                Paired desktop
+              </span>
+            </div>
+            <p className="mt-1.5 text-[12px] leading-[1.5] text-muted">
+              Reconnect to the desktop you paired with — no need to re-scan.
+            </p>
+            <button
+              onClick={() => void onReconnect()}
+              disabled={reconnecting}
+              aria-busy={reconnecting}
+              className="mt-2.5 h-11 w-full rounded-[11px] border border-accent-2/40 bg-accent-2/10 font-display text-[13px] font-semibold tracking-[0.4px] text-accent-2 transition hover:bg-accent-2/20 hover:shadow-glow-cyan disabled:opacity-40"
+            >
+              {reconnecting ? "Reconnecting…" : "Reconnect"}
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* footer — status/errors then the pinned primary action */}
+      <div className="pt-3">
+        {scanError && (
+          <p role="alert" className="mb-[13px] flex items-start gap-1.5 text-[11.5px] text-danger">
+            <span aria-hidden="true">⚠</span>
+            <span>{scanError}</span>
+          </p>
+        )}
+        {error && (
+          <div
+            role="alert"
+            className="mb-[13px] flex items-start gap-2.5 rounded-[11px] border border-danger/40 bg-danger/[0.07] px-3 py-3"
+          >
+            <span className="mt-px flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full border border-danger/50 bg-danger/[0.16] text-[13px] font-bold text-danger">
+              !
+            </span>
+            <div className="min-w-0">
+              <p className="text-[13px] font-semibold text-[#ffd2d5]">Couldn’t connect</p>
+              <p className="mt-0.5 break-words text-[12px] leading-[1.45] text-[#a9889a]">
+                {error}
+              </p>
+            </div>
+          </div>
+        )}
+
+        {connecting ? (
+          <>
+            <button
+              disabled
+              aria-busy="true"
+              className="flex h-[54px] w-full items-center justify-center gap-2.5 rounded-[13px] border border-accent/50 bg-accent/[0.14] font-display text-[15px] font-semibold tracking-[0.6px] text-[#ff7eb0] shadow-[0_0_22px_rgba(255,46,126,.18)]"
+            >
+              <span className="h-4 w-4 animate-spin rounded-full border-2 border-[#ff7eb0]/30 border-t-[#ff7eb0] motion-reduce:animate-none" />
+              CONNECTING…
+            </button>
+            <p className="mt-[11px] flex items-center justify-center gap-[7px] font-mono text-[11px] text-faint">
+              <span className="pc-dot pc-dot--cyan" aria-hidden="true" /> reaching your desktop…
+            </p>
+          </>
+        ) : (
+          <button
+            onClick={() => void connect()}
+            disabled={!qr.trim()}
+            className="h-[54px] w-full rounded-[13px] border border-accent bg-accent font-display text-[15px] font-bold tracking-[0.8px] text-bg shadow-glow-accent transition hover:shadow-[0_0_34px_rgba(255,46,126,.75)] hover:brightness-110 active:brightness-90 disabled:opacity-30 disabled:shadow-none disabled:hover:brightness-100"
+          >
+            {error ? "↻ Try again" : "Connect"}
+          </button>
+        )}
+      </div>
     </div>
   );
 }
 
-/** State 2 — connected; show the SAS for out-of-band verification. */
-function VerifyPanel() {
+/** The camera viewfinder: scan-texture, four corner brackets, a faint QR ghost,
+ *  and (idle) a sweeping cyan scan line. Pure decoration — `aria-hidden`. */
+function Viewfinder({ showScanLine }: { showScanLine: boolean }) {
+  return (
+    <span aria-hidden="true">
+      <span className="absolute inset-0 [background:repeating-linear-gradient(115deg,rgba(33,230,255,.03)_0_2px,transparent_2px_9px)]" />
+      <Bracket className="left-[26px] top-[26px] rounded-tl-[7px] border-l-[3px] border-t-[3px]" />
+      <Bracket className="right-[26px] top-[26px] rounded-tr-[7px] border-r-[3px] border-t-[3px]" />
+      <Bracket className="bottom-[26px] left-[26px] rounded-bl-[7px] border-b-[3px] border-l-[3px]" />
+      <Bracket className="bottom-[26px] right-[26px] rounded-br-[7px] border-b-[3px] border-r-[3px]" />
+      <QrGhost />
+      {showScanLine && (
+        <span
+          className="absolute left-[8%] right-[8%] h-0.5 bg-[linear-gradient(90deg,transparent,#21e6ff,transparent)] shadow-[0_0_14px_2px_rgba(33,230,255,.6)] motion-safe:animate-[pcScanV_2.4s_ease-in-out_infinite_alternate]"
+          style={{ top: "6%" }}
+        />
+      )}
+    </span>
+  );
+}
+
+function Bracket({ className }: { className: string }) {
+  return (
+    <span
+      className={`absolute h-10 w-10 border-accent-2 shadow-[0_0_10px_rgba(33,230,255,.4)] ${className}`}
+    />
+  );
+}
+
+function QrGhost() {
+  return (
+    <svg
+      className="absolute left-1/2 top-1/2 h-[46%] w-[46%] -translate-x-1/2 -translate-y-1/2 opacity-[0.16]"
+      viewBox="0 0 100 100"
+      fill="none"
+      aria-hidden="true"
+    >
+      <path d="M10 10h26v26H10zM64 10h26v26H64zM10 64h26v26H10z" stroke="#21e6ff" strokeWidth="5" />
+      <path d="M18 18h10v10H18zM72 18h10v10H72zM18 72h10v10H18z" fill="#21e6ff" />
+      <path d="M64 64h10v10H64zM80 64h10v10H80zM64 80h10v10H64zM80 80h10v10H80z" fill="#21e6ff" />
+    </svg>
+  );
+}
+
+/** State 2 — SAFETY. Anti-MITM gate: show the SAS large for out-of-band comparison. */
+function SafetyPanel() {
   const sas = useStore((s) => s.remoteSas);
   const confirmRemoteSas = useStore((s) => s.confirmRemoteSas);
   const disconnectRemote = useStore((s) => s.disconnectRemote);
 
   // Land initial focus on the SAS code, NOT the affirmative confirm: focusing
-  // "Codes match — Continue" would let a queued/habitual Enter verify the
-  // connection without the user comparing codes, defeating the SAS check.
+  // "It matches — Confirm" would let a queued/habitual Enter verify the connection
+  // without the user comparing codes, defeating the SAS check.
   const sasRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     sasRef.current?.focus();
   }, []);
 
   return (
-    <div>
-      <div className="mb-3 flex items-center gap-2">
-        <span className="pc-dot pc-dot--success" />
-        <span className="font-mono text-[11px] uppercase tracking-[1.5px] text-success">
-          Connected
-        </span>
-      </div>
-
-      <div className="pc-eyebrow pc-eyebrow--accent">VERIFY THIS CODE</div>
-      <p className="mb-3 text-[12px] leading-[1.5] text-muted">
-        Compare this code with the one shown on your desktop. They must match before you trust this
-        connection.
+    <div className="flex min-h-0 flex-1 flex-col px-[22px] pb-6 pt-5">
+      <p className="font-mono text-[10px] tracking-[3px] text-warn [text-shadow:0_0_8px_rgba(255,176,46,.4)]">
+        ⛨ SECURITY CHECK
+      </p>
+      <h1 className="mb-1.5 mt-[9px] font-display text-[25px] font-bold leading-[1.14] tracking-[0.3px] text-fg">
+        Confirm it’s really your desktop
+      </h1>
+      <p className="text-[13px] leading-[1.5] text-muted">
+        Check this code matches the one shown on{" "}
+        <span className="font-mono text-fg/90">your desktop</span>.
       </p>
 
-      {/* The SAS, large and unmissable — the one security-critical artifact.
-          Takes initial focus (tabIndex=-1) so the user reads the code first. */}
-      <div
-        ref={sasRef}
-        tabIndex={-1}
-        aria-label={`Pairing verification code: ${sas ?? "not available"}`}
-        className="rounded-xl border border-accent/40 bg-panel-2 px-4 py-5 text-center shadow-[0_0_24px_rgba(255,46,126,0.16)] outline-none"
-      >
-        <div className="select-text break-all font-mono text-[26px] font-bold leading-tight tracking-[3px] text-accent-2">
-          {sas ?? "—"}
+      <div className="flex min-h-0 flex-1 items-center justify-center py-4">
+        {/* The SAS, large and unmissable — the one security-critical artifact. Takes
+            initial focus (tabIndex=-1) so the user reads the code first. The aria-label
+            carries the code so a screen reader hears the actual SAS (the out-of-band
+            comparison), never a bare "Safety code" with the digits suppressed. */}
+        <div
+          ref={sasRef}
+          role="status"
+          tabIndex={-1}
+          aria-label={`Safety code: ${sas ?? "not available"}`}
+          className="w-full rounded-[18px] border border-accent/[0.32] bg-[linear-gradient(160deg,rgba(255,46,126,.07),rgba(33,230,255,.05))] px-[18px] py-[30px] text-center shadow-[0_0_40px_rgba(255,46,126,.14),inset_0_0_30px_rgba(33,230,255,.05)] outline-none"
+        >
+          <p className="mb-4 font-mono text-[10px] tracking-[3px] text-faint">SAFETY CODE</p>
+          <p className="select-text break-all font-mono text-[clamp(26px,8.5vw,44px)] font-semibold leading-tight tracking-[4px] text-white [text-shadow:0_0_18px_rgba(255,46,126,.55),0_0_4px_rgba(33,230,255,.4)]">
+            {sas ?? "—"}
+          </p>
+          <p className="mt-[18px] text-[11.5px] leading-[1.45] text-muted">
+            This proves no one is intercepting the connection.
+          </p>
         </div>
       </div>
 
-      <button
-        onClick={() => confirmRemoteSas()}
-        className="pc-btn-accent mt-4 w-full px-3 py-2.5 text-[13px]"
-      >
-        Codes match — Continue
-      </button>
-      <button
-        onClick={() => void disconnectRemote()}
-        className="mt-2 w-full rounded-lg border border-border bg-panel px-3 py-2.5 text-[12.5px] text-muted transition-colors hover:border-danger/50 hover:text-danger"
-      >
-        Codes don’t match — Disconnect
-      </button>
+      <div className="flex flex-col gap-2.5">
+        <button
+          onClick={() => confirmRemoteSas()}
+          className="h-[54px] w-full rounded-[13px] border border-accent bg-accent font-display text-[15px] font-bold tracking-[0.8px] text-bg shadow-glow-accent transition hover:shadow-[0_0_34px_rgba(255,46,126,.75)] hover:brightness-110"
+        >
+          ✓ It matches — Confirm
+        </button>
+        <button
+          onClick={() => void disconnectRemote()}
+          className="h-12 w-full rounded-[13px] border border-border-2 bg-panel-2/60 font-display text-[14px] font-semibold tracking-[0.5px] text-[#a9b2c4] transition hover:border-danger/50 hover:text-danger"
+        >
+          It doesn’t match — Cancel
+        </button>
+      </div>
     </div>
   );
 }
@@ -329,14 +438,11 @@ function ScanOverlay({ onCancel }: { onCancel: () => void }) {
 
   // Give this aria-modal dialog the keyboard affordances every other overlay has.
   // While scanning, `pc-scanning` sets `#root { visibility: hidden }`, dropping the
-  // opener (the Scan button) out of the focus order — so without this, activeElement
-  // is stranded on <body> with no keyboard path to Cancel.
+  // opener (the viewport button) out of the focus order — so without this,
+  // activeElement is stranded on <body> with no keyboard path to Cancel.
   useEffect(() => {
-    // Remember the opener so focus can return to it once the overlay unmounts.
     const opener = document.activeElement as HTMLElement | null;
-    // (1) Move focus into the dialog so it isn't stranded on the hidden shell.
     cancelRef.current?.focus();
-    // (2) Escape cancels the scan no matter where focus sits.
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
@@ -356,8 +462,6 @@ function ScanOverlay({ onCancel }: { onCancel: () => void }) {
       role="dialog"
       aria-modal="true"
       aria-label="Scanning for a pairing QR code"
-      // (3) Trap Tab: the dialog has a single focusable control, so keep focus on
-      // Cancel rather than letting it walk into the visibility:hidden #root.
       onKeyDown={(e) => {
         if (e.key === "Tab") {
           e.preventDefault();
@@ -371,33 +475,5 @@ function ScanOverlay({ onCancel }: { onCancel: () => void }) {
         Cancel
       </button>
     </div>
-  );
-}
-
-function Logo() {
-  return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path
-        d="M7 9l3 3-3 3M13 15h4"
-        stroke="var(--color-accent-hi)"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
-}
-
-function CameraIcon() {
-  return (
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path
-        d="M3 8a2 2 0 0 1 2-2h2l1.2-1.6a1 1 0 0 1 .8-.4h6a1 1 0 0 1 .8.4L19 6h0a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8Z"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinejoin="round"
-      />
-      <circle cx="12" cy="13" r="3.2" stroke="currentColor" strokeWidth="1.5" />
-    </svg>
   );
 }

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 
 import { RemotePairing } from "./RemotePairing";
@@ -7,12 +7,12 @@ import * as ipc from "../lib/ipc";
 import * as scanner from "../lib/scanner";
 import type { ConnectInfo, SyncFrame } from "../types";
 
-// RemotePairing is the remote-mode entry screen. It reads remote state from the
-// real store and drives it through connectRemote / confirmRemoteSas /
-// disconnectRemote. We mock the IPC layer and the camera scanner (TDD London
-// style) so connect can resolve a deterministic SAS without a real desktop, and a
-// scan can resolve a payload without a real camera; then we assert on observable
-// DOM + store state. House style mirrors Settings.test.tsx / store.test.ts.
+// RemotePairing is the remote-mode pair/safety flow (design_handoff_mobile_remote).
+// It reads remote state from the real store and drives it through connectRemote /
+// confirmRemoteSas / disconnectRemote / reconnectRemote. We mock the IPC layer and
+// the camera scanner (TDD London style) so connect resolves a deterministic SAS
+// without a real desktop, and a scan resolves a payload without a real camera; then
+// we assert on observable DOM + store state.
 vi.mock("../lib/ipc", () => ({
   phoneSyncConnect: vi.fn(),
   phoneSyncSendCommand: vi.fn(),
@@ -30,7 +30,7 @@ const m = vi.mocked(ipc);
 const s = vi.mocked(scanner);
 const initial = useStore.getState();
 
-const qrBox = () => screen.getByLabelText("Pairing code") as HTMLTextAreaElement;
+const codeBox = () => screen.getByLabelText("Pairing code") as HTMLTextAreaElement;
 const connectBtn = () => screen.getByRole("button", { name: "Connect" });
 const scanBtn = () => screen.getByRole("button", { name: "Scan QR code" });
 
@@ -50,38 +50,37 @@ beforeEach(() => {
   s.cancelScan.mockResolvedValue(undefined);
 });
 
-describe("RemotePairing — connect panel", () => {
-  it("renders the paste affordance and hides the camera button off-phone", () => {
+describe("RemotePairing — pair panel", () => {
+  it("renders the design eyebrow/title and the paste field, hiding the camera off-phone", () => {
     render(<RemotePairing />);
 
-    expect(screen.getByText("CONNECT TO DESKTOP")).toBeInTheDocument();
-    expect(qrBox()).toBeInTheDocument();
-
+    expect(screen.getByText("◧ REMOTE MODE")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Pair a phone" })).toBeInTheDocument();
+    expect(codeBox()).toBeInTheDocument();
     // No camera scanner in the preview/desktop host — paste is the only path.
-    expect(screen.queryByRole("button", { name: /Scan QR/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Scan QR code" })).not.toBeInTheDocument();
   });
 
-  it("autofocuses the pairing textarea on mount (paste path, no camera)", () => {
+  it("autofocuses the paste field on mount (no camera)", () => {
     render(<RemotePairing />);
-    // Off-phone there is no Scan button, so the primary control is the textarea.
-    expect(qrBox()).toHaveFocus();
+    expect(codeBox()).toHaveFocus();
   });
 
   it("disables Connect until the pairing code has content", () => {
     render(<RemotePairing />);
     expect(connectBtn()).toBeDisabled();
 
-    fireEvent.change(qrBox(), { target: { value: "  " } });
+    fireEvent.change(codeBox(), { target: { value: "  " } });
     expect(connectBtn()).toBeDisabled();
 
-    fireEvent.change(qrBox(), { target: { value: "{json}" } });
+    fireEvent.change(codeBox(), { target: { value: "{json}" } });
     expect(connectBtn()).toBeEnabled();
   });
 
   it("dials connectRemote with the trimmed payload on Connect", async () => {
     render(<RemotePairing />);
 
-    fireEvent.change(qrBox(), { target: { value: "  {payload}  " } });
+    fireEvent.change(codeBox(), { target: { value: "  {payload}  " } });
     await act(async () => {
       fireEvent.click(connectBtn());
       await Promise.resolve();
@@ -89,14 +88,11 @@ describe("RemotePairing — connect panel", () => {
     });
 
     expect(m.phoneSyncConnect).toHaveBeenCalledWith("{payload}");
-    // A successful dial stores the SAS and flips to the verify state.
     expect(useStore.getState().remoteConnected).toBe(true);
     expect(useStore.getState().remoteSas).toBe("TANGO-42");
   });
 
   it("shows a pending state while the dial is in flight", async () => {
-    // Hold the dial open so the pending UI is observable: the button reads
-    // "Connecting…" and the textarea goes inert.
     let release!: (info: ConnectInfo) => void;
     m.phoneSyncConnect.mockReturnValue(
       new Promise<ConnectInfo>((res) => {
@@ -105,44 +101,85 @@ describe("RemotePairing — connect panel", () => {
     );
     render(<RemotePairing />);
 
-    fireEvent.change(qrBox(), { target: { value: "{payload}" } });
+    fireEvent.change(codeBox(), { target: { value: "{payload}" } });
     await act(async () => {
       fireEvent.click(connectBtn());
       await Promise.resolve();
     });
 
-    const pending = screen.getByRole("button", { name: "Connecting…" });
+    const pending = screen.getByRole("button", { name: "CONNECTING…" });
     expect(pending).toBeDisabled();
     expect(pending).toHaveAttribute("aria-busy", "true");
-    expect(qrBox()).toBeDisabled();
+    expect(codeBox()).toBeDisabled();
+    expect(screen.getByText(/reaching your desktop/)).toBeInTheDocument();
 
-    // Let it finish so the component settles into the verify state.
     await act(async () => {
       release({ sas: "TANGO-42", peerPublicKey: "PEER==" });
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(screen.getByText("VERIFY THIS CODE")).toBeInTheDocument();
+    expect(screen.getByText("⛨ SECURITY CHECK")).toBeInTheDocument();
   });
 
   it("surfaces a dial failure inline without losing the typed payload", async () => {
     m.phoneSyncConnect.mockRejectedValue(new Error("no route to host"));
     render(<RemotePairing />);
 
-    fireEvent.change(qrBox(), { target: { value: "{payload}" } });
+    fireEvent.change(codeBox(), { target: { value: "{payload}" } });
     await act(async () => {
       fireEvent.click(connectBtn());
       await Promise.resolve();
       await Promise.resolve();
     });
 
-    // connectRemote folds the failure into store.remoteError; the panel shows it
-    // as an alert and stays on the connect screen (not connected).
     const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Couldn’t connect");
     expect(alert).toHaveTextContent("no route to host");
     expect(useStore.getState().remoteConnected).toBe(false);
-    // The textarea keeps the payload so the user can retry without re-pasting.
-    expect(qrBox().value).toBe("{payload}");
+    // The field keeps the payload, and the CTA relabels to a retry.
+    expect(codeBox().value).toBe("{payload}");
+    expect(screen.getByRole("button", { name: /Try again/ })).toBeInTheDocument();
+  });
+
+  it("fills the field from the clipboard via the PASTE chip", async () => {
+    const readText = vi.fn().mockResolvedValue("{from-clipboard}");
+    Object.defineProperty(navigator, "clipboard", { value: { readText }, configurable: true });
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "PASTE" }));
+      await Promise.resolve();
+    });
+
+    expect(readText).toHaveBeenCalledTimes(1);
+    expect(codeBox().value).toBe("{from-clipboard}");
+  });
+
+  it("surfaces a clipboard read failure as a hint", async () => {
+    const readText = vi.fn().mockRejectedValue(new Error("denied"));
+    Object.defineProperty(navigator, "clipboard", { value: { readText }, configurable: true });
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "PASTE" }));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText(/Couldn’t read the clipboard/)).toBeInTheDocument();
+  });
+
+  it("surfaces an empty clipboard as the same hint", async () => {
+    const readText = vi.fn().mockResolvedValue("");
+    Object.defineProperty(navigator, "clipboard", { value: { readText }, configurable: true });
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "PASTE" }));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText(/Couldn’t read the clipboard/)).toBeInTheDocument();
+    expect(codeBox().value).toBe("");
   });
 });
 
@@ -151,14 +188,13 @@ describe("RemotePairing — camera scan (phone)", () => {
     s.isScannerAvailable.mockReturnValue(true);
   });
 
-  it("offers an enabled Scan QR button on the phone", () => {
+  it("offers an enabled camera viewport on the phone", () => {
     render(<RemotePairing />);
     expect(scanBtn()).toBeEnabled();
   });
 
-  it("autofocuses the Scan button on mount (phone path)", () => {
+  it("autofocuses the camera viewport on mount (phone path)", () => {
     render(<RemotePairing />);
-    // On the phone the camera scan is the primary action, so it takes focus.
     expect(scanBtn()).toHaveFocus();
   });
 
@@ -179,7 +215,7 @@ describe("RemotePairing — camera scan (phone)", () => {
     expect(useStore.getState().remoteSas).toBe("TANGO-42");
   });
 
-  it("surfaces a denied-camera scan as an inline hint, staying on connect", async () => {
+  it("surfaces a denied-camera scan as an inline hint, staying on pair", async () => {
     s.scanQrPayload.mockResolvedValue({ ok: false, reason: "denied" });
     render(<RemotePairing />);
 
@@ -233,9 +269,8 @@ describe("RemotePairing — camera scan (phone)", () => {
       await Promise.resolve();
     });
 
-    // The button reads "Scanning…" and the viewfinder overlay (portaled to body)
-    // is visible with a Cancel control.
-    expect(screen.getByRole("button", { name: "Scanning…" })).toBeDisabled();
+    // The viewport reports busy and the viewfinder overlay (portaled to body) is up.
+    expect(scanBtn()).toHaveAttribute("aria-busy", "true");
     expect(screen.getByRole("dialog", { name: /Scanning for a pairing QR/ })).toBeInTheDocument();
 
     await act(async () => {
@@ -244,7 +279,6 @@ describe("RemotePairing — camera scan (phone)", () => {
     });
     expect(s.cancelScan).toHaveBeenCalledTimes(1);
 
-    // Settle the underlying scan promise so nothing dangles.
     await act(async () => {
       release({ ok: false, reason: "cancelled" });
       await Promise.resolve();
@@ -255,9 +289,6 @@ describe("RemotePairing — camera scan (phone)", () => {
   });
 
   it("moves focus to Cancel and cancels on Escape (modal keyboard affordances)", async () => {
-    // Hold the scan open so the overlay stays mounted. While scanning, the app
-    // shell goes visibility:hidden, so the dialog must take focus itself and offer
-    // a keyboard path to Cancel — assert focus lands on Cancel and Escape cancels.
     s.scanQrPayload.mockReturnValue(new Promise<scanner.ScanOutcome>(() => {}));
     render(<RemotePairing />);
 
@@ -269,67 +300,74 @@ describe("RemotePairing — camera scan (phone)", () => {
     const cancel = screen.getByRole("button", { name: "Cancel" });
     expect(cancel).toHaveFocus();
 
-    // Escape (handled at the window level) cancels the scan, mirroring the click path.
     await act(async () => {
       fireEvent.keyDown(window, { key: "Escape" });
       await Promise.resolve();
     });
     expect(s.cancelScan).toHaveBeenCalledTimes(1);
   });
+
+  it("traps Tab on the scanning overlay (focus stays on Cancel)", async () => {
+    s.scanQrPayload.mockReturnValue(new Promise<scanner.ScanOutcome>(() => {}));
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(scanBtn());
+      await Promise.resolve();
+    });
+
+    const dialog = screen.getByRole("dialog", { name: /Scanning for a pairing QR/ });
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    fireEvent.keyDown(dialog, { key: "Tab" });
+    expect(cancel).toHaveFocus();
+  });
 });
 
-describe("RemotePairing — verify panel", () => {
+describe("RemotePairing — safety panel", () => {
   it("shows the SAS prominently once connected", () => {
     useStore.setState({ remoteConnected: true, remoteSas: "TANGO-42" });
     render(<RemotePairing />);
 
-    expect(screen.getByText("VERIFY THIS CODE")).toBeInTheDocument();
+    expect(screen.getByText("⛨ SECURITY CHECK")).toBeInTheDocument();
     expect(screen.getByText("TANGO-42")).toBeInTheDocument();
-    // The SAS box's accessible NAME must INCLUDE the digits — an aria-label that
-    // merely says "Pairing verification code" would suppress the code subtree, so
-    // a screen reader would never hear the actual SAS (defeating the out-of-band
-    // comparison). Assert the computed name carries the code, not just textContent.
-    const sasBox = screen.getByLabelText(/Pairing verification code/);
+    // The SAS box's accessible NAME must INCLUDE the digits so a screen reader hears
+    // the actual code (the out-of-band comparison), not a bare "Safety code".
+    const sasBox = screen.getByLabelText(/Safety code/);
     expect(sasBox).toHaveAccessibleName(/TANGO-42/);
     expect(sasBox).toHaveTextContent("TANGO-42");
-    // The connect panel is gone.
-    expect(screen.queryByText("CONNECT TO DESKTOP")).not.toBeInTheDocument();
+    // The pair panel is gone.
+    expect(screen.queryByText("◧ REMOTE MODE")).not.toBeInTheDocument();
   });
 
   it("lands initial focus on the SAS code, not the affirmative confirm", () => {
     useStore.setState({ remoteConnected: true, remoteSas: "TANGO-42" });
     render(<RemotePairing />);
-    // Focus must NOT sit on the trust-granting button (a queued Enter would
-    // bypass the SAS comparison); it lands on the code region instead.
-    expect(screen.getByLabelText(/Pairing verification code/)).toHaveFocus();
-    expect(screen.getByRole("button", { name: /Codes match/ })).not.toHaveFocus();
+    expect(screen.getByLabelText(/Safety code/)).toHaveFocus();
+    expect(screen.getByRole("button", { name: /It matches/ })).not.toHaveFocus();
   });
 
   it("renders a placeholder when the SAS is somehow absent", () => {
     useStore.setState({ remoteConnected: true, remoteSas: null });
     render(<RemotePairing />);
-    // With no SAS, the box paints a dash and its accessible name says so plainly
-    // (never silently "Pairing verification code" with an empty/suppressed code).
-    const sasBox = screen.getByLabelText(/Pairing verification code/);
+    const sasBox = screen.getByLabelText(/Safety code/);
     expect(sasBox).toHaveTextContent("—");
     expect(sasBox).toHaveAccessibleName(/not available/);
   });
 
-  it("Continue confirms the SAS (marks the connection verified)", () => {
+  it("Confirm marks the connection verified", () => {
     useStore.setState({ remoteConnected: true, remoteSas: "TANGO-42" });
     render(<RemotePairing />);
 
-    fireEvent.click(screen.getByRole("button", { name: /Codes match/ }));
-
+    fireEvent.click(screen.getByRole("button", { name: /It matches/ }));
     expect(useStore.getState().remoteVerified).toBe(true);
   });
 
-  it("Disconnect drops the channel via the store", async () => {
+  it("Cancel drops the channel via the store", async () => {
     useStore.setState({ remoteConnected: true, remoteVerified: false, remoteSas: "TANGO-42" });
     render(<RemotePairing />);
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /Codes don.t match/ }));
+      fireEvent.click(screen.getByRole("button", { name: /doesn.t match/ }));
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -339,12 +377,12 @@ describe("RemotePairing — verify panel", () => {
   });
 });
 
-describe("RemotePairing — reconnect after a drop", () => {
-  it("offers a one-tap reconnect that re-dials the remembered pairing", async () => {
-    useStore.setState({ remoteDropped: true, lastPairingQr: "QR-REMEMBERED" });
+describe("RemotePairing — cross-launch reconnect", () => {
+  it("offers a one-tap reconnect for a remembered desktop", async () => {
+    useStore.setState({ lastPairingQr: "QR-REMEMBERED" });
     render(<RemotePairing />);
 
-    expect(screen.getByText("Connection lost")).toBeInTheDocument();
+    expect(screen.getByText("Paired desktop")).toBeInTheDocument();
     const reconnect = screen.getByRole("button", { name: "Reconnect" });
 
     await act(async () => {
@@ -361,28 +399,10 @@ describe("RemotePairing — reconnect after a drop", () => {
     expect(st.remoteVerified).toBe(true);
   });
 
-  // The drop announcement now lives in a persistent live region at the App shell
-  // (it must survive the connected↔pairing remount to fire as an empty→filled
-  // change), so it is covered in App's tests — not here. RemotePairing no longer
-  // renders its own role="status" region.
-  it("renders no in-panel live region for the drop (announced at the App shell)", () => {
-    useStore.setState({ remoteDropped: true, lastPairingQr: "QR-REMEMBERED" });
-    render(<RemotePairing />);
-    expect(screen.queryByRole("status")).not.toBeInTheDocument();
-  });
-
   it("shows no reconnect affordance without a remembered pairing", () => {
-    useStore.setState({ remoteDropped: true, lastPairingQr: null });
+    useStore.setState({ lastPairingQr: null });
     render(<RemotePairing />);
     expect(screen.queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
-  });
-
-  it("offers reconnect for a remembered desktop even without a drop (cross-launch)", () => {
-    useStore.setState({ remoteDropped: false, lastPairingQr: "QR-REMEMBERED" });
-    render(<RemotePairing />);
-    // No drop, but a remembered desktop → a calm "Paired desktop" reconnect card.
-    expect(screen.getByText("Paired desktop")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Reconnect" })).toBeInTheDocument();
   });
 });
 
@@ -395,17 +415,24 @@ describe("RemotePairing — connect drives the live frame subscription", () => {
     });
     render(<RemotePairing />);
 
-    fireEvent.change(qrBox(), { target: { value: "{payload}" } });
+    fireEvent.change(codeBox(), { target: { value: "{payload}" } });
     await act(async () => {
       fireEvent.click(connectBtn());
       await Promise.resolve();
       await Promise.resolve();
     });
 
-    // The subscription the store registered must fold frames into state.
     act(() => {
       cb({ t: "session_list", sessions: [] });
     });
     expect(m.onPhoneSyncFrame).toHaveBeenCalledTimes(1);
   });
+});
+
+afterEach(() => {
+  // The clipboard stub is defined per-test; drop it so it can't leak across files.
+  if ("clipboard" in navigator) {
+    // @ts-expect-error — test-only teardown of the stubbed property.
+    delete navigator.clipboard;
+  }
 });
