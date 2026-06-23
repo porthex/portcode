@@ -2,6 +2,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Network state: iroh's transport (netwatch/netdev) enumerates and watches
+         the device's network interfaces via Android's ConnectivityManager (JNI) when
+         it binds an endpoint. Without these the queries throw a Java SecurityException
+         — which surfaced as a native crash the moment the phone bound its endpoint
+         right after scanning the pairing QR. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
     <!-- Camera: scan the desktop's pairing QR (Phone Sync). Declared not-required
          as a hardware feature so the app still installs on camera-less devices —
          the pairing screen falls back to pasting the code. -->

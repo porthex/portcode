@@ -761,6 +761,30 @@ fn phone_sync_disconnect(state: State<AppState>) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Surface Rust panics in the platform log instead of dying silently. On Android
+    // a panic on a worker thread (e.g. inside iroh's relay/discovery startup) shows
+    // up otherwise only as a bare, symbol-stripped SIGABRT in logcat with no Rust
+    // frame; logging the location + payload (Tauri routes stderr to logcat under the
+    // `RustStdoutStderr` tag) makes the faulting frame visible for diagnosis. Keeps
+    // the default hook too, so behavior is otherwise unchanged.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("portcode: PANIC: {info}");
+        prev_hook(info);
+    }));
+
+    // Pin rustls's process-wide crypto provider BEFORE any TLS is used. Our
+    // dependency graph compiles a single rustls with BOTH the aws-lc-rs (via
+    // reqwest) and ring (via iroh's QUIC) providers, so rustls cannot auto-select a
+    // default; the first no-arg `ClientConfig::builder()` — reached on the phone's
+    // first iroh relay/DNS-over-TLS handshake immediately after a pairing scan —
+    // would otherwise panic ("Could not automatically determine the process-level
+    // CryptoProvider"), which crashed the Android app right after scanning the QR.
+    // Installing ring up front makes the choice deterministic on every target.
+    // Idempotent: a duplicate install returns Err (a provider is already set), which
+    // we deliberately ignore.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())

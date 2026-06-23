@@ -61,6 +61,18 @@ zeroize = "1"
 # rust-version bump above).
 iroh = "1"
 
+# Used ONLY to pin rustls's process-wide CryptoProvider at startup (see `run()` in
+# lib.rs). The dependency graph compiles a SINGLE rustls with BOTH providers —
+# aws-lc-rs (pulled by reqwest) and ring (pulled by iroh's QUIC) — so rustls cannot
+# auto-select a default, and the first no-arg `ClientConfig::builder()` panics
+# ("Could not automatically determine the process-level CryptoProvider"). That panic
+# crashed the Android phone on its first relay/DNS-over-TLS handshake right after a
+# pairing scan. We install `ring` (the provider iroh already uses) up front to make
+# the choice deterministic on every target. `default-features = false` keeps this
+# edge from pulling aws-lc-rs again; the full feature set still arrives via the
+# reqwest/iroh edges through Cargo's feature unification.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
 # search / matching for tools
 regex = "1"
 globset = "0.4"
