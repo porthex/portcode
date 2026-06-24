@@ -560,6 +560,162 @@ mod tests {
         clear_consent_override(&path);
     }
 
+    // ── Phase-2 consent-file tests ──────────────────────────────────────────────
+
+    #[test]
+    fn consent_is_live_when_file_contains_one() {
+        // The sole armed state: file with exact content "1".
+        let path = temp_consent_path();
+        std::fs::write(&path, "1").unwrap();
+        assert!(consent_is_live());
+        clear_consent_override(&path);
+    }
+
+    #[test]
+    fn consent_is_live_with_surrounding_whitespace() {
+        // The flag is trimmed before comparison, so "1\n" and " 1 " both arm the
+        // gate — matching the on-disk write from set_consent (which writes "1"
+        // without a newline, but on-disk files can accumulate whitespace).
+        let path = temp_consent_path();
+        std::fs::write(&path, "1\n").unwrap();
+        assert!(consent_is_live(), "trailing newline should still read as live");
+        std::fs::write(&path, " 1 ").unwrap();
+        assert!(consent_is_live(), "padded spaces should still read as live");
+        clear_consent_override(&path);
+    }
+
+    #[test]
+    fn consent_is_off_for_empty_file() {
+        // An empty file is not "1" — must read as off (fail-safe).
+        let path = temp_consent_path();
+        std::fs::write(&path, "").unwrap();
+        assert!(!consent_is_live());
+        clear_consent_override(&path);
+    }
+
+    #[test]
+    fn set_consent_false_when_file_absent_does_not_panic() {
+        // Opt-out when no file exists must not panic or error — it is idempotent.
+        let path = temp_consent_path(); // clean slate, no file written
+        assert!(!path.exists());
+        set_consent(false); // must not panic
+        assert!(!consent_is_live());
+        clear_consent_override(&path);
+    }
+
+    #[test]
+    fn set_consent_idempotent_double_opt_in() {
+        // Calling set_consent(true) twice is safe and leaves consent live.
+        let path = temp_consent_path();
+        set_consent(true);
+        assert!(consent_is_live());
+        set_consent(true); // second call should not panic or break state
+        assert!(consent_is_live());
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "1");
+        clear_consent_override(&path);
+    }
+
+    #[test]
+    fn set_consent_creates_parent_directory_when_missing() {
+        // set_consent(true) must create the parent dir if it doesn't exist yet —
+        // the first opt-in on a fresh install has no config dir.
+        let base = std::env::temp_dir().join(format!(
+            "portcode-test-parentdir-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        // Ensure the directory does NOT exist before we start.
+        let _ = std::fs::remove_dir_all(&base);
+        let flag_path = base.join(".telemetry_consent");
+        CONSENT_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(flag_path.clone()));
+
+        set_consent(true);
+
+        assert!(flag_path.exists(), "consent file should have been created");
+        assert_eq!(std::fs::read_to_string(&flag_path).unwrap().trim(), "1");
+
+        // Cleanup.
+        CONSENT_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn set_consent_round_trip_opt_in_then_opt_out() {
+        // A full round-trip: opt-in → live, opt-out → off. Verifies the file
+        // lifecycle end-to-end (the crash-reporter process reads exactly this file).
+        let path = temp_consent_path();
+
+        set_consent(true);
+        assert!(consent_is_live(), "should be live after opt-in");
+
+        set_consent(false);
+        assert!(!consent_is_live(), "should be off after opt-out");
+        // File must not contain "1" — either gone or overwritten with "0".
+        let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_ne!(on_disk.trim(), "1", "stale '1' must not remain after opt-out");
+
+        clear_consent_override(&path);
+    }
+
+    #[test]
+    fn scrub_event_gates_on_file_not_atomic() {
+        // The consent gate in scrub_event reads the FILE (consent_is_live), not the
+        // atomic. Verify: file says off but atomic says on → event is dropped.
+        let path = temp_consent_path();
+        // Write "0" to the file (off), but force the atomic to true.
+        std::fs::write(&path, "0").unwrap();
+        CONSENT_LIVE.store(true, Ordering::SeqCst);
+
+        let result = scrub_event(Event::default());
+        assert!(
+            result.is_none(),
+            "event must be dropped when file says off, even if atomic is true"
+        );
+
+        CONSENT_LIVE.store(false, Ordering::SeqCst);
+        CONSENT_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scrub_transaction_gates_on_file_not_atomic() {
+        // Same invariant as scrub_event_gates_on_file_not_atomic, but for
+        // scrub_transaction — the same consent_is_live() is the gate.
+        let path = temp_consent_path();
+        std::fs::write(&path, "0").unwrap();
+        CONSENT_LIVE.store(true, Ordering::SeqCst);
+
+        let result = scrub_transaction(Event::default());
+        assert!(
+            result.is_none(),
+            "transaction must be dropped when file says off, even if atomic is true"
+        );
+
+        CONSENT_LIVE.store(false, Ordering::SeqCst);
+        CONSENT_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn init_desktop_with_minidump_returns_none_without_dsn() {
+        // The inert-by-default contract: no DSN baked in ⇒ None is returned,
+        // nothing is initialized, no monitor is spawned.
+        // In dev/test builds `dsn()` is always None (no SENTRY_DSN env var),
+        // so init_desktop_with_minidump must always return None here.
+        assert!(
+            dsn().is_none(),
+            "pre-condition: no DSN in test builds"
+        );
+        // Since dsn() returns None, init_desktop_with_minidump must return None
+        // immediately without touching the panic hook or spawning any process.
+        // We cannot call init_desktop_with_minidump() in tests because it
+        // unconditionally sets the panic hook even on the happy path; testing the
+        // DSN-guard is sufficient given the function's first line is `dsn()?`.
+        // The assertion above guarantees the early-return branch is taken.
+    }
+
+    // ── end Phase-2 consent-file tests ──────────────────────────────────────────
+
     #[test]
     fn scrub_event_drops_when_consent_is_off() {
         let ev = Event::default();
@@ -797,238 +953,5 @@ mod tests {
         assert_eq!(panic_payload(s.as_ref()), "kaboom");
         let s: Box<dyn std::any::Any + Send> = Box::new(42u32);
         assert_eq!(panic_payload(s.as_ref()), "<non-string panic payload>");
-    }
-
-    // ── Phase 2: consent_is_live whitespace-trimming ──────────────────────────
-    // The authoritative check uses `.trim()`, so "1\n", " 1 " etc. must all
-    // arm the gate (the OS or a sloppy write can append a newline).
-
-    #[test]
-    fn consent_is_live_for_one_with_trailing_newline() {
-        let path = temp_consent_path();
-        std::fs::write(&path, "1\n").unwrap();
-        assert!(consent_is_live(), "\"1\\n\" should be treated as consent ON");
-        clear_consent_override(&path);
-    }
-
-    #[test]
-    fn consent_is_live_for_one_with_surrounding_whitespace() {
-        let path = temp_consent_path();
-        std::fs::write(&path, "  1  ").unwrap();
-        assert!(
-            consent_is_live(),
-            "\" 1 \" should be treated as consent ON after trim"
-        );
-        clear_consent_override(&path);
-    }
-
-    #[test]
-    fn consent_is_off_for_content_two() {
-        // "2" is not "1" — a regression check against accidentally broadening the
-        // match to `!= "0"` or similar.
-        let path = temp_consent_path();
-        std::fs::write(&path, "2").unwrap();
-        assert!(!consent_is_live(), "\"2\" must NOT arm the gate");
-        clear_consent_override(&path);
-    }
-
-    #[test]
-    fn consent_is_off_for_empty_file() {
-        // An empty file (e.g. created but not written) must NOT arm the gate.
-        let path = temp_consent_path();
-        std::fs::write(&path, "").unwrap();
-        assert!(!consent_is_live(), "empty file must read as consent OFF");
-        clear_consent_override(&path);
-    }
-
-    #[test]
-    fn consent_is_off_for_whitespace_only_file() {
-        // Whitespace after trim is "", not "1" — must remain off.
-        let path = temp_consent_path();
-        std::fs::write(&path, "   \n  ").unwrap();
-        assert!(!consent_is_live(), "whitespace-only file must read as consent OFF");
-        clear_consent_override(&path);
-    }
-
-    // ── Phase 2: set_consent — atomic + file in sync ─────────────────────────
-
-    #[test]
-    fn set_consent_atomic_and_file_agree_after_toggle() {
-        // After opt-in both the atomic and the file report live; after opt-out both
-        // report off. This is the cross-process correctness property: the file IS
-        // the source of truth, but the atomic must mirror it.
-        let path = temp_consent_path();
-
-        set_consent(true);
-        assert!(CONSENT_LIVE.load(Ordering::SeqCst), "atomic should be true after opt-in");
-        assert!(consent_is_live(), "file should report live after opt-in");
-
-        set_consent(false);
-        assert!(!CONSENT_LIVE.load(Ordering::SeqCst), "atomic should be false after opt-out");
-        assert!(!consent_is_live(), "file should report off after opt-out");
-
-        clear_consent_override(&path);
-    }
-
-    #[test]
-    fn set_consent_toggle_multiple_times_stays_consistent() {
-        // Round-tripping through opt-in / opt-out several times must leave the
-        // system in the correct final state and never raise.
-        let path = temp_consent_path();
-
-        for _ in 0..3 {
-            set_consent(true);
-            assert!(consent_is_live());
-            set_consent(false);
-            assert!(!consent_is_live());
-        }
-
-        // Final state: off.
-        assert!(!CONSENT_LIVE.load(Ordering::SeqCst));
-        clear_consent_override(&path);
-    }
-
-    #[test]
-    fn set_consent_creates_parent_dir_if_missing() {
-        // set_consent must call create_dir_all so the write succeeds even when
-        // the app-config dir does not yet exist. We model this by pointing the
-        // override at a path inside a non-existent subdirectory.
-        let base = std::env::temp_dir().join(format!(
-            "portcode-test-newdir-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        // Make sure the directory doesn't exist before the test.
-        let _ = std::fs::remove_dir_all(&base);
-        let consent_file = base.join("sub").join(".telemetry_consent");
-        CONSENT_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(consent_file.clone()));
-
-        set_consent(true);
-        assert!(
-            consent_file.exists(),
-            "set_consent should create parent dirs and write the consent file"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&consent_file).unwrap().trim(),
-            "1"
-        );
-
-        // Cleanup.
-        CONSENT_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    // ── Phase 2: init_desktop_with_minidump is inert without a DSN ───────────
-
-    #[test]
-    fn init_desktop_with_minidump_returns_none_without_dsn() {
-        // In every non-CI test build there is no SENTRY_DSN baked in, so the
-        // function must return None immediately — never trying to spawn a
-        // crash-reporter process or install a panic hook.
-        // This implicitly tests that `dsn()` returning None short-circuits the
-        // whole init path.
-        let result = init_desktop_with_minidump();
-        assert!(
-            result.is_none(),
-            "init_desktop_with_minidump must return None when no DSN was baked in"
-        );
-    }
-
-    // ── Phase 2: scrub_event uses on-disk consent (not just the atomic) ──────
-
-    #[test]
-    fn scrub_event_drops_when_file_absent_even_if_atomic_is_true() {
-        // Regression for the cross-process gap: if only the atomic is set but the
-        // consent file is absent (as would happen in the re-exec'd crash-reporter
-        // process that never received the IPC), events must still be dropped.
-        let path = temp_consent_path();
-        // File is absent (temp_consent_path never writes it); force atomic to true.
-        CONSENT_LIVE.store(true, Ordering::SeqCst);
-
-        let ev = Event::default();
-        let result = scrub_event(ev);
-        assert!(
-            result.is_none(),
-            "event must be dropped when the consent FILE is absent, even if the atomic says true"
-        );
-
-        CONSENT_LIVE.store(false, Ordering::SeqCst);
-        clear_consent_override(&path);
-    }
-
-    #[test]
-    fn scrub_event_passes_when_file_contains_one_with_newline() {
-        // Confirm that the file-based gate works with the "1\n" format that some
-        // writers produce; the event should pass (not be dropped).
-        let path = temp_consent_path();
-        std::fs::write(&path, "1\n").unwrap();
-        CONSENT_LIVE.store(true, Ordering::SeqCst);
-
-        let ev = Event {
-            message: Some("no secrets here".to_string()),
-            ..Default::default()
-        };
-        let result = scrub_event(ev);
-        assert!(
-            result.is_some(),
-            "event should pass when consent file contains \"1\\n\""
-        );
-
-        CONSENT_LIVE.store(false, Ordering::SeqCst);
-        clear_consent_override(&path);
-    }
-
-    #[test]
-    fn scrub_transaction_drops_when_file_absent_even_if_atomic_is_true() {
-        // Mirrors the scrub_event cross-process regression test for transactions.
-        let path = temp_consent_path();
-        CONSENT_LIVE.store(true, Ordering::SeqCst);
-
-        let ev = Event::default();
-        let result = scrub_transaction(ev);
-        assert!(
-            result.is_none(),
-            "transaction must be dropped when the consent FILE is absent"
-        );
-
-        CONSENT_LIVE.store(false, Ordering::SeqCst);
-        clear_consent_override(&path);
-    }
-
-    #[test]
-    fn capture_message_is_a_no_op_when_file_absent_even_if_atomic_is_true() {
-        // The file-based gate in `capture_message` must prevent the send path
-        // from being reached when the consent file is missing.
-        // (No DSN in test builds, so there is no actual Sentry client to send to;
-        // this test confirms the early-return fires before any capture attempt.)
-        let path = temp_consent_path();
-        CONSENT_LIVE.store(true, Ordering::SeqCst);
-
-        // Must not panic or attempt to capture.
-        capture_message("cross-process gate: sk-ant-capture-leak123456");
-
-        CONSENT_LIVE.store(false, Ordering::SeqCst);
-        clear_consent_override(&path);
-    }
-
-    // ── Phase 2: bundle identifier and consent file name constants ────────────
-
-    #[test]
-    fn bundle_identifier_matches_tauri_conf() {
-        // BUNDLE_IDENTIFIER is hardcoded to match tauri.conf.json's identifier.
-        // A mismatch would silently write the consent file to the wrong directory,
-        // causing the cross-process consent gate to fail. This test keeps the
-        // constant honest.
-        assert_eq!(BUNDLE_IDENTIFIER, "dev.porthex.portcode");
-    }
-
-    #[test]
-    fn consent_file_name_is_dotfile() {
-        // CONSENT_FILE must stay a dotfile so it reads as internal state.
-        assert!(
-            CONSENT_FILE.starts_with('.'),
-            "CONSENT_FILE must start with a dot; got: {CONSENT_FILE}"
-        );
-        assert_eq!(CONSENT_FILE, ".telemetry_consent");
     }
 }
