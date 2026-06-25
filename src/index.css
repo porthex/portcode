@@ -1,5 +1,13 @@
 @import "tailwindcss";
 
+/* Tailwind v4 auto-detects class usage starting from the Vite ROOT. The Tauri
+   build roots at the repo root (scans src/ fine), but the web build
+   (vite.web.config.ts) roots at web/ — so without this it never scans the
+   components under src/ where every utility class lives, producing a CSS bundle
+   with ZERO utilities (totally unstyled UI). `@source` is resolved relative to
+   THIS file (src/index.css), so this points both builds at the src/ tree. */
+@source "./**/*.{ts,tsx}";
+
 /* =========================================================================
    PORTCODE · NEON-NOIR
    Token-driven design system. Components style with semantic tokens + the
