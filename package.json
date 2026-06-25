@@ -24,6 +24,7 @@
     "prepare": "husky"
   },
   "dependencies": {
+    "@sentry/react": "^10.59.0",
     "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/plugin-barcode-scanner": "^2.4.5",
     "@tauri-apps/plugin-dialog": "^2.2.0",

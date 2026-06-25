@@ -1,4 +1,5 @@
 import React from "react";
+import { reportError } from "../lib/telemetry";
 
 interface Props {
   children: React.ReactNode;
@@ -19,6 +20,11 @@ interface State {
 // unmount the whole tree and leave a blank window with no way out but restarting.
 // Catch it here and render a recoverable fallback instead. Dependency-free
 // (class component) so it never touches the lockfile.
+//
+// On catch it also forwards the error to crash reporting — `reportError` is a
+// no-op unless the user has opted in AND a DSN was baked into this build, and the
+// event is scrubbed by `beforeSend` before it can leave the machine. The fallback
+// itself is shown regardless of consent: it's a UX safety net, not telemetry.
 export class ErrorBoundary extends React.Component<Props, State> {
   state: State = { error: null };
 
@@ -30,7 +36,11 @@ export class ErrorBoundary extends React.Component<Props, State> {
   }
 
   componentDidCatch(error: unknown, info: React.ErrorInfo): void {
-    // No telemetry yet — log so the throw is at least visible in dev/devtools.
+    // Forward to crash reporting. `reportError` is a no-op unless reporting is
+    // active and never throws; the event is scrubbed by `beforeSend` on its way out.
+    reportError(error);
+    // Surface in the dev console too so the throw is visible in dev/devtools
+    // (no PII concern locally).
     console.error("ErrorBoundary caught a render error:", error, info.componentStack);
   }
 
@@ -44,7 +54,10 @@ export class ErrorBoundary extends React.Component<Props, State> {
     if (error) {
       if (this.props.fallback) return this.props.fallback(error, this.reset);
       return (
-        <div className="flex h-full w-full flex-col items-center justify-center gap-3 bg-bg p-6 text-fg">
+        <div
+          role="alert"
+          className="flex h-full w-full flex-col items-center justify-center gap-3 bg-bg p-6 text-fg"
+        >
           <h1 className="font-display text-lg font-semibold tracking-wide text-accent">
             Something went wrong
           </h1>

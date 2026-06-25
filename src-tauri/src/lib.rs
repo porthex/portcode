@@ -10,9 +10,13 @@ mod llm;
 #[cfg(desktop)]
 mod oauth;
 mod permissions;
+#[cfg(desktop)]
+mod scrub;
 mod secrets;
 mod settings;
 mod sync;
+#[cfg(desktop)]
+mod telemetry;
 #[cfg(desktop)]
 mod tools;
 
@@ -348,6 +352,19 @@ fn resolve_permission(state: State<AppState>, id: String, decision: String) {
         permissions::Decision::Deny
     };
     permissions::resolve(&state.pending, &id, d);
+}
+
+// ── Opt-in crash reporting (Phase 1b) ────────────────────────────────────────
+
+/// Mirror the frontend's crash-reporting consent into the Rust host. Desktop-only:
+/// the phone is a pure remote client and ships no host crash reporter. The whole
+/// pipeline is inert without a build-time `SENTRY_DSN`, so this is a no-op on
+/// dev/contributor/fork builds (and the frontend swallows the error on builds where
+/// the command isn't registered). See `telemetry::set_consent`.
+#[cfg(desktop)]
+#[tauri::command]
+fn telemetry_set_consent(enabled: bool) {
+    telemetry::set_consent(enabled);
 }
 
 // ── Phone Sync (Phase 1b: identity + pairing surface) ────────────────────────
@@ -918,6 +935,16 @@ fn phone_sync_disconnect(state: State<AppState>) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Phase 2 — arm desktop crash reporting FIRST: the out-of-process minidump monitor
+    // + the Rust Sentry client whose `before_send` scrubs and consent-gates every event.
+    // This MUST be the first statement in run(): it executes in BOTH this process and
+    // the re-exec'd crash-reporter child (everything before `minidump::init` runs in
+    // both), and the monitor must be live before any crash. Inert (returns None) when no
+    // `SENTRY_DSN` was baked in — dev/contributor/fork builds never report. The returned
+    // guard is held for the whole process lifetime; dropping it stops the reporter child.
+    #[cfg(desktop)]
+    let _sentry_guard = telemetry::init_desktop_with_minidump();
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -1021,6 +1048,7 @@ pub fn run() {
         run_agent,
         cancel_agent,
         resolve_permission,
+        telemetry_set_consent,
         phone_sync_status,
         phone_sync_begin_pairing,
         phone_sync_unpair,
