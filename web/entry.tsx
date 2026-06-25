@@ -16,6 +16,7 @@ import App from "../src/App";
 import { ErrorBoundary } from "../src/components/ErrorBoundary";
 import { setWebClientMode } from "../src/lib/ipc";
 import { useStore } from "../src/store/store";
+import { registerServiceWorker, startWebClientLifecycle } from "../src/lib/webClientLifecycle";
 import "../src/index.css";
 
 // Route Phone Sync client calls through the WASM transport. The real WASM
@@ -28,6 +29,15 @@ setWebClientMode(true);
 // without this the app would boot into the desktop layout instead of the remote
 // pairing flow.
 useStore.getState().setRemoteMode(true);
+
+// Session persistence (§5.8): reconnect-on-resume + durable pinned-peer storage.
+// Wires pwaLifecycle + webStorage to the store. Started once; lives for the whole
+// document, so we never tear it down (the document dies on a real iOS suspend).
+startWebClientLifecycle();
+
+// Register the offline-shell service worker + push scaffolding (§5.7), guarded so
+// it's a no-op where unsupported. Fire-and-forget — the app runs without it online.
+void registerServiceWorker();
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

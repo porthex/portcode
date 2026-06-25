@@ -11,7 +11,9 @@ import { RemotePairing } from "./components/RemotePairing";
 import { RemoteSessions } from "./components/RemoteSessions";
 import { RemoteChatHeader } from "./components/RemoteChatHeader";
 import { DisconnectedState, OfflineState } from "./components/RemoteEdgeStates";
-import { isTauri } from "./lib/ipc";
+import { InstallGate } from "./components/InstallGate";
+import { isTauri, isWebClientMode } from "./lib/ipc";
+import { getInstallState } from "./lib/installGate";
 
 export default function App() {
   const init = useStore((s) => s.init);
@@ -137,7 +139,7 @@ export default function App() {
   }, []);
 
   return (
-    <div className="relative flex h-full w-full flex-col overflow-hidden bg-bg text-fg">
+    <div className="pc-safe-area relative flex h-full w-full flex-col overflow-hidden bg-bg text-fg">
       {/* Ambient layers — vignette always on; rain/scanlines are user-opt-in. */}
       {ambientRain && <NeonRain />}
       {scanlines && <div className="pc-scanlines" aria-hidden="true" />}
@@ -216,6 +218,13 @@ function RemoteShell({
 }) {
   if (!online) return <OfflineState />;
   if (remoteDropped) return <DisconnectedState />;
+  // Web-client (iOS PWA) install gate (§5.7): block pairing until the app is
+  // installed to the Home Screen on iOS, since install is what grants push, durable
+  // storage, and the correct storage partition. Only gates in web-client mode and
+  // only when the reason is "needs-install" (iOS in a Safari tab); desktop/Android
+  // browsers ("not-ios-ok") and an already-installed iOS PWA ("ok") fall through to
+  // pairing. The Tauri/native path never enters this branch (isWebClientMode is off).
+  if (isWebClientMode() && getInstallState().reason === "needs-install") return <InstallGate />;
   if (!(remoteConnected && remoteVerified)) return <RemotePairing />;
   if (!remoteChatOpen) return <RemoteSessions />;
   // Open session — the chat view. `relative` so the session switcher's scrim/sheet

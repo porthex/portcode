@@ -1,0 +1,101 @@
+// Service worker for the Vercel-hosted iOS web client (docs/IOS_WEB_CLIENT_PLAN.md
+// §5.7). Two jobs at this phase:
+//
+//   1. OFFLINE SHELL. Cache the app shell at install so a cold launch paints even
+//      with no network (then the live iroh-in-browser connection is made at runtime,
+//      which the SW never touches — it only serves the static UI).
+//   2. PUSH SCAFFOLDING. A `push` handler stub (no real VAPID payloads until Phase 5)
+//      and a `notificationclick` handler that focuses/opens the PWA, so tapping a
+//      future "permission needed" / "turn finished" push cold-starts the app →
+//      reconnect-on-resume (§5.8).
+//
+// This file is shipped verbatim to the browser (it is NOT bundled or type-checked);
+// the testable registration helper lives in src/lib/webClientLifecycle.ts.
+
+const CACHE = "portcode-shell-v1";
+
+// The minimal shell. Hashed JS/CSS assets are cached on demand by the fetch handler
+// (their names change per build, so we can't list them here); these are the stable
+// entry points + PWA metadata.
+const SHELL = ["/", "/index.html", "/manifest.webmanifest"];
+
+self.addEventListener("install", (event) => {
+  // Pre-cache the shell, then take over immediately so the first load is controlled.
+  event.waitUntil(
+    caches
+      .open(CACHE)
+      .then((cache) => cache.addAll(SHELL))
+      .then(() => self.skipWaiting()),
+  );
+});
+
+self.addEventListener("activate", (event) => {
+  // Drop stale shell caches from older deploys, then claim open clients.
+  event.waitUntil(
+    caches
+      .keys()
+      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+      .then(() => self.clients.claim()),
+  );
+});
+
+self.addEventListener("fetch", (event) => {
+  const { request } = event;
+  // Only the GET navigations / static assets are cacheable. Anything else (the
+  // relay WebSocket upgrade, POSTs) falls through to the network untouched.
+  if (request.method !== "GET") return;
+
+  event.respondWith(
+    caches.match(request).then((cached) => {
+      if (cached) return cached;
+      return fetch(request)
+        .then((response) => {
+          // Cache same-origin successful responses for the next offline launch.
+          if (response.ok && new URL(request.url).origin === self.location.origin) {
+            const copy = response.clone();
+            caches.open(CACHE).then((cache) => cache.put(request, copy));
+          }
+          return response;
+        })
+        .catch(() => {
+          // Offline and uncached: for a navigation, fall back to the cached shell so
+          // the app still boots; otherwise let the failure surface.
+          if (request.mode === "navigate") return caches.match("/index.html");
+          return Response.error();
+        });
+    }),
+  );
+});
+
+// Push stub (Phase 5 wires real VAPID payloads). For now, show a generic
+// notification so the end-to-end plumbing (register → push → tap → focus) is in
+// place and testable on-device.
+self.addEventListener("push", (event) => {
+  let title = "Portcode";
+  let body = "Your desktop has an update.";
+  try {
+    if (event.data) {
+      const payload = event.data.json();
+      title = payload.title || title;
+      body = payload.body || body;
+    }
+  } catch {
+    // Non-JSON / empty payload — keep the generic copy.
+  }
+  event.waitUntil(self.registration.showNotification(title, { body, icon: "/icon-192.png" }));
+});
+
+// Tapping a notification focuses an existing PWA window or opens a new one. A
+// cold-start lands on "/", where the web client's reconnect-on-resume re-dials the
+// pinned desktop (§5.8).
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  event.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clients) => {
+      for (const client of clients) {
+        if ("focus" in client) return client.focus();
+      }
+      return self.clients.openWindow("/");
+    }),
+  );
+});
