@@ -1,6 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import wasm from "vite-plugin-wasm";
 import { resolve } from "node:path";
 
 // Build config for the Vercel-hosted static PWA (the iOS web client).
@@ -15,7 +16,14 @@ import { resolve } from "node:path";
 // browser↔desktop connection (iroh-in-browser over a relay WebSocket) is made
 // client-side at runtime; Vercel never sees it.
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  // `wasm()` lets the browser bundle import the WebAssembly packages loaded at
+  // runtime — `zxing-wasm` (QR decode, §5.9) and the CI-built `portcode-wasm`
+  // (iroh-in-browser transport, §5.4). Both are dynamically `import()`ed (lazy),
+  // so they only affect the async chunks that pull them in, and each lazy chunk
+  // can carry its own top-level await — no separate top-level-await plugin needed
+  // (and `vite-plugin-top-level-await` hard-requires `rollup`, absent under Vite 8's
+  // rolldown bundler).
+  plugins: [wasm(), react(), tailwindcss()],
   root: resolve(__dirname, "web"),
   // Static assets (manifest, icons) live at the repo-level public/ dir.
   publicDir: resolve(__dirname, "public"),

@@ -131,6 +131,141 @@ export function createMockConnector(): WebSessionConnector {
   };
 }
 
+// ── Real WASM-backed connector ───────────────────────────────────────────────
+//
+// The shipped web client dials through the iroh-in-browser stack compiled to
+// WebAssembly (`portcode-wasm`, built by CI per §6 — NOT present in this repo at
+// test/build time). The package exposes a `Session` class shaped like §5.4:
+// `Session.connect(qr, reconnect) -> Promise<Session>`, `sendCommand`, `onEvent`,
+// `disconnect`, and a `peerPublicKey` getter. We adapt that to {@link WebSession}.
+//
+// Two things keep this safe to ship before the wasm exists:
+//   1. The wasm package is imported LAZILY via a dynamic `import()` on the FIRST
+//      `connect` (so the PWA shell paints before the hundreds-of-KB wasm chunk
+//      loads, per §5.6), and the import specifier is INJECTABLE so tests never
+//      resolve the real (absent) module.
+//   2. If the import FAILS (module missing — the normal state here until CI wires
+//      it) the connector logs once and FALLS BACK to the deterministic mock, so
+//      `webPhoneSyncConnect` keeps resolving and the deployed PWA stays usable.
+
+/**
+ * The subset of the `portcode-wasm` `Session` class (§5.4) we depend on. Declared
+ * structurally so this module never imports the wasm glue at type-check time.
+ */
+export interface WasmSession {
+  readonly sas: string;
+  readonly peerPublicKey: string;
+  sendCommand(cmd: RemoteCommand): void | Promise<void>;
+  /** Register the inbound-frame callback; Rust invokes it per `SyncFrame`. */
+  onEvent(cb: (f: SyncFrame) => void): void;
+  /** Tear down the session (drops the channel; ends the loops). */
+  disconnect(): void | Promise<void>;
+}
+
+/** The shape of the `portcode-wasm` module: a `Session` class with a static
+ *  `connect`. Only what we call is declared. */
+export interface WasmModule {
+  Session: {
+    connect(qr: string, reconnect: boolean): Promise<WasmSession>;
+  };
+}
+
+/** Loads the `portcode-wasm` module. Injectable so tests supply a fake instead of
+ *  resolving the real (CI-built, here-absent) package. */
+export type WasmLoader = () => Promise<WasmModule>;
+
+/**
+ * The default {@link WasmLoader}: a dynamic `import()` of the `portcode-wasm`
+ * package. The specifier is held in a variable and the import is marked
+ * `@vite-ignore` so neither Vite nor the TS resolver tries to statically resolve a
+ * package that does not exist in this repo (it is produced by CI). When the
+ * package is absent the returned promise rejects, which the connector catches to
+ * fall back to the mock.
+ */
+/* c8 ignore start -- exercised only in a real browser; tests inject a fake loader. */
+export const defaultWasmLoader: WasmLoader = () => {
+  const spec = "portcode-wasm";
+  return import(/* @vite-ignore */ spec) as Promise<WasmModule>;
+};
+/* c8 ignore stop */
+
+/** Adapt a wasm {@link WasmSession} to the {@link WebSession} interface. The wasm
+ *  side exposes a single `onEvent` callback; we fan it out to multiple `onFrame`
+ *  subscribers and synthesize `onDisconnected` locally (fired by `disconnect`). */
+function adaptWasmSession(ws: WasmSession): WebSession {
+  const frameCbs = new Set<(f: SyncFrame) => void>();
+  const disconnectedCbs = new Set<() => void>();
+  // Bridge the single wasm `onEvent` to our multi-subscriber `onFrame` registry.
+  ws.onEvent((f: SyncFrame) => {
+    for (const cb of frameCbs) cb(f);
+  });
+  let disconnected = false;
+  return {
+    sas: ws.sas,
+    peerPublicKey: ws.peerPublicKey,
+    async sendCommand(cmd: RemoteCommand): Promise<void> {
+      await ws.sendCommand(cmd);
+    },
+    onFrame(cb: (f: SyncFrame) => void): Unlisten {
+      frameCbs.add(cb);
+      return () => {
+        frameCbs.delete(cb);
+      };
+    },
+    onDisconnected(cb: () => void): Unlisten {
+      disconnectedCbs.add(cb);
+      return () => {
+        disconnectedCbs.delete(cb);
+      };
+    },
+    async disconnect(): Promise<void> {
+      // Idempotent: only tear down the wasm session + notify once.
+      if (disconnected) return;
+      disconnected = true;
+      await ws.disconnect();
+      for (const cb of disconnectedCbs) cb();
+      frameCbs.clear();
+      disconnectedCbs.clear();
+    },
+  };
+}
+
+/**
+ * Build the real WASM-backed {@link WebSessionConnector}. It lazily loads the
+ * `portcode-wasm` module on the first {@link WebSessionConnector.connect}; on load
+ * failure (module absent) it logs ONCE and permanently delegates to the mock
+ * connector so the PWA keeps working until CI wires the wasm in.
+ *
+ * @param load injectable module loader (defaults to {@link defaultWasmLoader});
+ *   tests pass a fake to avoid resolving the real package.
+ */
+export function createWasmConnector(load: WasmLoader = defaultWasmLoader): WebSessionConnector {
+  // Memoize the load so we import once and reuse the resolved module / fallback.
+  let mod: Promise<WasmModule | null> | null = null;
+  const fallback = createMockConnector();
+
+  function loadModule(): Promise<WasmModule | null> {
+    if (mod === null) {
+      mod = load().catch((e: unknown) => {
+        // Expected here until CI builds portcode-wasm: degrade to the mock so the
+        // shipped PWA still pairs (against the inert preview) instead of throwing.
+        console.warn("[webSession] portcode-wasm unavailable; falling back to mock connector:", e);
+        return null;
+      });
+    }
+    return mod;
+  }
+
+  return {
+    async connect(qr: string, reconnect: boolean): Promise<WebSession> {
+      const m = await loadModule();
+      if (m === null) return fallback.connect(qr, reconnect);
+      const ws = await m.Session.connect(qr, reconnect);
+      return adaptWasmSession(ws);
+    },
+  };
+}
+
 // ── Connector registry ──────────────────────────────────────────────────────
 //
 // `connector` is the active transport factory; it defaults to the mock so the app
