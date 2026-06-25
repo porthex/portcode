@@ -14,6 +14,10 @@ node_modules/
 # Generated / vendored
 pnpm-lock.yaml
 
+# Opt-in MCP example config — intentionally JSONC (has `//` comments documenting
+# the Serena opt-in), so it is not part of the Prettier (JSON) baseline.
+.mcp.json.example
+
 # Transient planning / handoff artifacts (not part of the formatted baseline)
 HANDOFF-oss-setup.md
 PHASE0-REPORT.md
