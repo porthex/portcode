@@ -59,6 +59,7 @@ interface AppState {
   remoteVerified: boolean; // the user confirmed the SAS matches; gates entry to the remote session
   remoteSas: string | null; // short-auth-string to compare out-of-band; null when not connected
   remotePeerKey: string | null; // the desktop's pinned static public key (from ConnectInfo); the STABLE identity, distinct from the SAS
+  remoteVapidKey: string | null; // the desktop's Web Push VAPID public key (from ConnectInfo); null when the desktop sent none. Drives the installed-PWA push subscription (§5.7).
   remoteError: string | null; // last connect failure, surfaced in the connect UI
   remoteUnlisten: (() => void) | null; // tears down the frame subscription (private; mirrors `cancel`)
   remoteDropped: boolean; // the live session ended unexpectedly — the UI offers a reconnect
@@ -224,6 +225,7 @@ export const useStore = create<AppState>((set, get) => ({
   remoteVerified: false,
   remoteSas: null,
   remotePeerKey: null,
+  remoteVapidKey: null,
   remoteError: null,
   remoteUnlisten: null,
   remoteDropped: false,
@@ -994,6 +996,9 @@ export const useStore = create<AppState>((set, get) => ({
         // The STABLE pinned desktop key (distinct from the SAS verification code).
         // Durable storage pins this, never the SAS.
         remotePeerKey: info.peerPublicKey,
+        // The desktop's Web Push VAPID key (or null when it sent none). The web
+        // lifecycle reads this to drive the installed-PWA push subscription (§5.7).
+        remoteVapidKey: info.vapidPublicKey ?? null,
         remoteError: null,
         remoteDropped: false,
         lastPairingQr: qr,
@@ -1014,6 +1019,7 @@ export const useStore = create<AppState>((set, get) => ({
         remoteConnected: false,
         remoteSas: null,
         remotePeerKey: null,
+        remoteVapidKey: null,
         remoteUnlisten: null,
         remoteError: errMessage(err),
       });
@@ -1078,6 +1084,7 @@ export const useStore = create<AppState>((set, get) => ({
       remoteVerified: false,
       remoteSas: null,
       remotePeerKey: null,
+      remoteVapidKey: null,
       remoteDropped: false,
       lastPairingQr: null,
       remoteUnlisten: null,

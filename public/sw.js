@@ -84,22 +84,48 @@ self.addEventListener("fetch", (event) => {
   );
 });
 
-// Push stub (Phase 5 wires real VAPID payloads). For now, show a generic
-// notification so the end-to-end plumbing (register → push → tap → focus) is in
-// place and testable on-device.
+// Web Push handler (Phase 5). The desktop (the push SENDER) posts a VAPID-signed
+// JSON payload shaped `{ title, body, tag?, badge? }`:
+//   - title / body: the visible notification copy (iOS requires a VISIBLE
+//     notification per push — `userVisibleOnly: true`).
+//   - tag: collapses repeats so a re-sent "permission needed" replaces the prior
+//     one instead of stacking (keyed e.g. by the pending decision id).
+//   - badge: the pending-decision count to mirror on the app icon (App Badging),
+//     so the badge stays correct even when the app is closed and only the SW runs.
+// Missing/non-JSON payloads fall back to generic copy so a malformed push still
+// pulls the user back (the in-app decision queue is the source of truth — §5.7).
 self.addEventListener("push", (event) => {
   let title = "Portcode";
   let body = "Your desktop has an update.";
+  let tag;
+  let badge;
   try {
     if (event.data) {
       const payload = event.data.json();
       title = payload.title || title;
       body = payload.body || body;
+      if (typeof payload.tag === "string") tag = payload.tag;
+      if (typeof payload.badge === "number") badge = payload.badge;
     }
   } catch {
     // Non-JSON / empty payload — keep the generic copy.
   }
-  event.waitUntil(self.registration.showNotification(title, { body, icon: "/icon-192.png" }));
+
+  const options = { body, icon: "/icon-192.png", badge: "/icon-192.png" };
+  // `tag` (when present) collapses duplicate notifications for the same event.
+  if (tag !== undefined) options.tag = tag;
+
+  // Show the notification, and best-effort sync the app icon badge from the payload
+  // count (guarded — `setAppBadge`/`clearAppBadge` aren't in every SW global).
+  const work = [self.registration.showNotification(title, options)];
+  if (typeof badge === "number" && typeof self.navigator !== "undefined") {
+    if (badge > 0 && self.navigator.setAppBadge) {
+      work.push(self.navigator.setAppBadge(badge).catch(() => {}));
+    } else if (badge <= 0 && self.navigator.clearAppBadge) {
+      work.push(self.navigator.clearAppBadge().catch(() => {}));
+    }
+  }
+  event.waitUntil(Promise.all(work));
 });
 
 // Tapping a notification focuses an existing PWA window or opens a new one. A

@@ -51,12 +51,19 @@ export type Unlisten = () => void;
  * A live browser↔desktop session. The WASM-bindgen `Session` class implements
  * this interface; {@link createMockConnector} returns an in-memory fake of it.
  *
- * `sas` / `peerPublicKey` are captured at connect time (the short authentication
- * string to compare out-of-band and the pinned desktop key), so they are readonly.
+ * `sas` / `peerPublicKey` / `vapidPublicKey` are captured at connect time (the
+ * short authentication string to compare out-of-band, the pinned desktop key, and
+ * the desktop's Web Push VAPID key), so they are readonly.
  */
 export interface WebSession {
   readonly sas: string;
   readonly peerPublicKey: string;
+  /**
+   * The desktop's Web Push VAPID PUBLIC key (base64url), or `undefined` when the
+   * desktop sent none (predates push, or the inert mock). The installed PWA passes
+   * it as the `applicationServerKey` when subscribing to Web Push (§5.7).
+   */
+  readonly vapidPublicKey?: string;
   /** Send one command to the live desktop. */
   sendCommand(cmd: RemoteCommand): Promise<void>;
   /** Subscribe to frames forwarded from the desktop. Returns an unlisten handle. */
@@ -106,6 +113,10 @@ export function createMockConnector(): WebSessionConnector {
       return {
         sas: "MOCK-SAS-1234",
         peerPublicKey: "MOCK_DESKTOP_KEY_BASE64==",
+        // A deterministic, well-formed base64url VAPID key so preview/tests can
+        // exercise the push-subscribe path (the desktop's real key is supplied by
+        // the wasm `Session` in the shipped client). The bytes are arbitrary.
+        vapidPublicKey: "MOCK_VAPID_PUBLIC_KEY_BASE64URL",
         async sendCommand(_cmd: RemoteCommand): Promise<void> {
           // no-op: the preview has no paired desktop to receive commands.
         },
@@ -155,6 +166,9 @@ export function createMockConnector(): WebSessionConnector {
 export interface WasmSession {
   readonly sas: string;
   readonly peerPublicKey: string;
+  /** The desktop's Web Push VAPID PUBLIC key getter (added on the Rust `Session`
+   *  alongside `peerPublicKey`); `undefined` when the desktop sent none. */
+  readonly vapidPublicKey?: string;
   sendCommand(cmd: RemoteCommand): void | Promise<void>;
   /** Register the inbound-frame callback; Rust invokes it per `SyncFrame`. */
   onEvent(cb: (f: SyncFrame) => void): void;
@@ -181,6 +195,16 @@ export type WasmLoader = () => Promise<WasmModule>;
  * package that does not exist in this repo (it is produced by CI). When the
  * package is absent the returned promise rejects, which the connector catches to
  * fall back to the mock.
+ *
+ * SUBRESOURCE INTEGRITY (§5.10/§6): the wasm is delivered as a dynamically
+ * `import()`ed ES module, and the SRI `integrity` attribute only applies to
+ * `<script>`/`<link>` tags — there is no broadly-supported way to pin a hash on a
+ * dynamic `import()` (the proposed import-map integrity is not yet shippable). The
+ * integrity guarantees we rely on instead are: same-origin delivery from the Vercel
+ * CDN, the strict CSP in `web/index.html` (`script-src 'self'`, no third-party
+ * origins, no `unsafe-eval` beyond `wasm-unsafe-eval`), and content-hashed immutable
+ * asset URLs. True wasm SRI is deferred to a build step that emits `<link
+ * rel="modulepreload" integrity=...>` once the CI wasm artifact is wired (Phase 6).
  */
 /* c8 ignore start -- exercised only in a real browser; tests inject a fake loader. */
 export const defaultWasmLoader: WasmLoader = () => {
@@ -203,6 +227,9 @@ function adaptWasmSession(ws: WasmSession): WebSession {
   return {
     sas: ws.sas,
     peerPublicKey: ws.peerPublicKey,
+    // Carry the desktop's VAPID key through to the WebSession so the push client
+    // can use it as the `applicationServerKey` (undefined when the desktop sent none).
+    vapidPublicKey: ws.vapidPublicKey,
     async sendCommand(cmd: RemoteCommand): Promise<void> {
       await ws.sendCommand(cmd);
     },
@@ -295,7 +322,7 @@ let current: WebSession | null = null;
 /**
  * Dial + pair with a desktop from its scanned QR payload via the active connector,
  * store the result as the current session, and return its {@link ConnectInfo}
- * (`{ sas, peerPublicKey }`). Mirrors ipc.ts `phoneSyncConnect`.
+ * (`{ sas, peerPublicKey, vapidPublicKey? }`). Mirrors ipc.ts `phoneSyncConnect`.
  */
 export async function webPhoneSyncConnect(qr: string, reconnect = false): Promise<ConnectInfo> {
   // Capture the session being replaced so we can tear it down: overwriting
@@ -310,7 +337,7 @@ export async function webPhoneSyncConnect(qr: string, reconnect = false): Promis
   if (previous && previous !== next) {
     await previous.disconnect().catch(() => {});
   }
-  return { sas: next.sas, peerPublicKey: next.peerPublicKey };
+  return { sas: next.sas, peerPublicKey: next.peerPublicKey, vapidPublicKey: next.vapidPublicKey };
 }
 
 /** Forward one command to the current session. No-op if not connected. */
