@@ -9,6 +9,40 @@
 > see `docs/ANDROID_APP_PLAN.md`) and reuses that Rust protocol code **compiled
 > to WebAssembly** rather than reimplementing it in JavaScript.
 
+## Implementation status
+
+The **browser-client frontend foundation** (the locally-verifiable parts of
+§5.6–§5.9) has landed; the WASM transport + Rust workspace split are next.
+
+**Done:**
+
+- `src/lib/webSession.ts` — the WASM transport boundary: the `WebSession` /
+  `WebSessionConnector` interfaces the future iroh-in-browser module implements,
+  a deterministic mock connector, an injectable connector registry, and
+  ipc-shaped wrappers.
+- `src/lib/webStorage.ts` — IndexedDB pinned-peer + device-identity persistence
+  with `navigator.storage.persist()` request/verify (§5.7/§5.8).
+- `src/lib/installGate.ts` — installed/standalone/iOS detection + pairing gate
+  with Share→Add-to-Home-Screen guidance (§5.7).
+- `src/lib/pwaLifecycle.ts` — visibility/online/pageshow watcher + reconnect
+  controller with full-jitter exponential backoff (§5.8, the session-persistence
+  core).
+- `src/lib/webScanner.ts` — browser QR capture (camera + file fallback) with an
+  injectable decoder (zxing-wasm wired later) (§5.9).
+- `src/lib/ipc.ts` — `setWebClientMode()` seam routing the Phone Sync client
+  surface through `webSession` (off by default; Tauri always wins).
+- PWA + Vercel build target: `web/index.html` (manifest + Apple meta + web CSP),
+  `web/entry.tsx`, `vite.web.config.ts` (→ `web-dist/`), `public/manifest.webmanifest`,
+  `vercel.json`, and `pnpm build:web`.
+
+All shipped with unit tests; the full suite + coverage gate stay green, and
+`pnpm build:web` produces a deployable static bundle.
+
+**Next:** Phase 0 on-device iOS spike (the go/no-go gate), then the Rust
+`portcode-sync` crate extraction + the real iroh-in-browser `WebSessionConnector`
+that replaces the mock, then wiring `installGate`/`pwaLifecycle`/`webStorage` into
+the React tree and the live store.
+
 ---
 
 ## 1. Goal & constraints (the decisions this plan is built on)

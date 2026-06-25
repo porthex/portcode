@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { StreamEvent } from "../types";
+import type { RemoteCommand, StreamEvent, SyncFrame } from "../types";
+import type { WebSession, WebSessionConnector } from "./webSession";
 
 // The IPC bridge has two paths per command: the Tauri path (serializes the call
 // across `invoke`) and the in-browser fallback (a deterministic mock so the UI
@@ -505,5 +506,127 @@ describe("browser fallback agent stream", () => {
     await vi.runAllTimersAsync();
 
     expect(onEvent).not.toHaveBeenCalled();
+  });
+});
+
+// Web-client mode: the Vercel PWA enables it (setWebClientMode) after injecting a
+// WASM-backed connector, and the Phone Sync CLIENT calls then route through the
+// `webSession` transport instead of the mock. `isTauri()` still wins.
+describe("web-client mode (WASM transport routing)", () => {
+  // A fresh module graph so ipc + webSession share one instance and the web-client
+  // flag / injected connector don't leak across cases.
+  async function loadWeb() {
+    vi.resetModules();
+    const ipc = await import("./ipc");
+    const webSession = await import("./webSession");
+    return { ipc, webSession };
+  }
+
+  /** Build a recording WebSession + connector so the test can assert routing and
+   *  drive the frame / disconnected callbacks. */
+  function recordingConnector() {
+    const sent: RemoteCommand[] = [];
+    const calls: { qr: string; reconnect: boolean }[] = [];
+    let frameCb: ((f: SyncFrame) => void) | null = null;
+    let disconnectedCb: (() => void) | null = null;
+    let disconnected = false;
+
+    const session: WebSession = {
+      sas: "WEB-SAS",
+      peerPublicKey: "WEB-KEY",
+      async sendCommand(cmd) {
+        sent.push(cmd);
+      },
+      onFrame(cb) {
+        frameCb = cb;
+        return () => {
+          frameCb = null;
+        };
+      },
+      onDisconnected(cb) {
+        disconnectedCb = cb;
+        return () => {
+          disconnectedCb = null;
+        };
+      },
+      async disconnect() {
+        disconnected = true;
+        disconnectedCb?.();
+      },
+    };
+
+    const connector: WebSessionConnector = {
+      async connect(qr, reconnect) {
+        calls.push({ qr, reconnect });
+        return session;
+      },
+    };
+
+    return {
+      connector,
+      sent,
+      calls,
+      fireFrame: (f: SyncFrame) => frameCb?.(f),
+      isDisconnected: () => disconnected,
+    };
+  }
+
+  it("routes the Phone Sync client surface through the injected web transport", async () => {
+    const { ipc, webSession } = await loadWeb();
+    const rec = recordingConnector();
+    webSession.setWebSessionConnector(rec.connector);
+    ipc.setWebClientMode(true);
+
+    const info = await ipc.phoneSyncConnect("qr-1", true);
+    expect(info).toEqual({ sas: "WEB-SAS", peerPublicKey: "WEB-KEY" });
+    expect(rec.calls).toEqual([{ qr: "qr-1", reconnect: true }]);
+
+    const frames: SyncFrame[] = [];
+    const unlisten = await ipc.onPhoneSyncFrame((f) => frames.push(f));
+    rec.fireFrame({ t: "ack", session_id: "s1", seq: 7 });
+    expect(frames).toHaveLength(1);
+    unlisten();
+    rec.fireFrame({ t: "ack", session_id: "s1", seq: 8 });
+    expect(frames).toHaveLength(1); // unlistened: no further delivery
+
+    let dropped = false;
+    await ipc.onPhoneSyncDisconnected(() => {
+      dropped = true;
+    });
+    await ipc.phoneSyncSendCommand({ cmd: "cancel", session_id: "s1" });
+    expect(rec.sent).toEqual([{ cmd: "cancel", session_id: "s1" }]);
+
+    await ipc.phoneSyncDisconnect();
+    expect(rec.isDisconnected()).toBe(true);
+    expect(dropped).toBe(true);
+  });
+
+  it("connect defaults reconnect to false in web-client mode", async () => {
+    const { ipc, webSession } = await loadWeb();
+    const rec = recordingConnector();
+    webSession.setWebSessionConnector(rec.connector);
+    ipc.setWebClientMode(true);
+
+    await ipc.phoneSyncConnect("qr-2");
+    expect(rec.calls).toEqual([{ qr: "qr-2", reconnect: false }]);
+  });
+
+  it("Tauri always wins over web-client mode", async () => {
+    const { ipc } = await loadWeb();
+    ipc.setWebClientMode(true);
+    enterTauri();
+    const { invoke } = await import("@tauri-apps/api/core");
+    vi.mocked(invoke).mockResolvedValue({ sas: "T", peerPublicKey: "K" });
+
+    const info = await ipc.phoneSyncConnect("qr", false);
+    expect(info).toEqual({ sas: "T", peerPublicKey: "K" });
+    expect(invoke).toHaveBeenCalledWith("phone_sync_connect", { qr: "qr", reconnect: false });
+  });
+
+  it("falls back to the mock when web-client mode is off", async () => {
+    const { ipc } = await loadWeb();
+    // not enabled
+    const info = await ipc.phoneSyncConnect("qr");
+    expect(info).toEqual({ sas: "MOCK-SAS-1234", peerPublicKey: "MOCK_DESKTOP_KEY_BASE64==" });
   });
 });
