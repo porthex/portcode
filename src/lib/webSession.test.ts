@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { WebSession, WebSessionConnector } from "./webSession";
+import type { WasmModule, WasmSession, WebSession, WebSessionConnector } from "./webSession";
 import {
   createMockConnector,
+  createWasmConnector,
   resetWebSessionConnector,
   setWebSessionConnector,
   webOnPhoneSyncDisconnected,
@@ -233,5 +234,164 @@ describe("connector registry", () => {
     // current session cleared: a later send is a no-op (doesn't reach the fake)
     await webPhoneSyncSendCommand({ cmd: "cancel", session_id: "s1" });
     expect(fake.sent).toEqual([]);
+  });
+});
+
+// ── Real WASM-backed connector ───────────────────────────────────────────────
+//
+// The real connector lazily `import()`s `portcode-wasm` and adapts its `Session`
+// class to {@link WebSession}. The actual package is not present here (CI builds
+// it), so every test injects a fake loader — we NEVER resolve the real specifier.
+
+/** A fake `portcode-wasm` `Session` that records calls and lets the test drive the
+ *  inbound-frame callback the way the network would. */
+function createFakeWasmSession() {
+  const sent: RemoteCommand[] = [];
+  let eventCb: ((f: SyncFrame) => void) | null = null;
+  const calls = { disconnect: 0 };
+  const session: WasmSession = {
+    sas: "WASM-SAS",
+    peerPublicKey: "WASM_KEY==",
+    sendCommand(cmd) {
+      sent.push(cmd);
+    },
+    onEvent(cb) {
+      eventCb = cb;
+    },
+    disconnect() {
+      calls.disconnect += 1;
+    },
+  };
+  return {
+    session,
+    sent,
+    calls,
+    emit(f: SyncFrame) {
+      eventCb?.(f);
+    },
+  };
+}
+
+describe("createWasmConnector (real connector, faked wasm module)", () => {
+  it("adapts the wasm Session: connect returns its sas/peerPublicKey", async () => {
+    const fake = createFakeWasmSession();
+    const load = vi.fn(
+      async (): Promise<WasmModule> => ({
+        Session: { connect: vi.fn(async () => fake.session) },
+      }),
+    );
+    const connector = createWasmConnector(load);
+    const session = await connector.connect("the-qr", true);
+    expect(session.sas).toBe("WASM-SAS");
+    expect(session.peerPublicKey).toBe("WASM_KEY==");
+  });
+
+  it("forwards qr/reconnect to Session.connect and only loads the module once", async () => {
+    const fake = createFakeWasmSession();
+    const connect = vi.fn(async () => fake.session);
+    const load = vi.fn(async (): Promise<WasmModule> => ({ Session: { connect } }));
+    const connector = createWasmConnector(load);
+
+    await connector.connect("qr-1", false);
+    await connector.connect("qr-2", true);
+
+    expect(load).toHaveBeenCalledTimes(1); // memoized
+    expect(connect).toHaveBeenNthCalledWith(1, "qr-1", false);
+    expect(connect).toHaveBeenNthCalledWith(2, "qr-2", true);
+  });
+
+  it("sendCommand reaches the wasm session; onEvent frames fan out to onFrame", async () => {
+    const fake = createFakeWasmSession();
+    const connector = createWasmConnector(async () => ({
+      Session: { connect: async () => fake.session },
+    }));
+    const session = await connector.connect("qr", false);
+
+    await session.sendCommand({ cmd: "run", session_id: "s1", text: "hi" });
+    expect(fake.sent).toEqual([{ cmd: "run", session_id: "s1", text: "hi" }]);
+
+    const a = vi.fn();
+    const b = vi.fn();
+    session.onFrame(a);
+    const offB = session.onFrame(b);
+    fake.emit(SAMPLE_FRAME);
+    expect(a).toHaveBeenCalledWith(SAMPLE_FRAME);
+    expect(b).toHaveBeenCalledWith(SAMPLE_FRAME);
+
+    // unlisten stops just that subscriber
+    offB();
+    fake.emit(SAMPLE_FRAME);
+    expect(a).toHaveBeenCalledTimes(2);
+    expect(b).toHaveBeenCalledTimes(1);
+  });
+
+  it("disconnect tears down the wasm session, fires onDisconnected, and is idempotent", async () => {
+    const fake = createFakeWasmSession();
+    const connector = createWasmConnector(async () => ({
+      Session: { connect: async () => fake.session },
+    }));
+    const session = await connector.connect("qr", false);
+
+    const onDisc = vi.fn();
+    session.onDisconnected(onDisc);
+    await session.disconnect();
+    await session.disconnect(); // second call is a no-op
+
+    expect(fake.calls.disconnect).toBe(1);
+    expect(onDisc).toHaveBeenCalledTimes(1);
+  });
+
+  it("onDisconnected unlisten removes the callback before disconnect", async () => {
+    const fake = createFakeWasmSession();
+    const connector = createWasmConnector(async () => ({
+      Session: { connect: async () => fake.session },
+    }));
+    const session = await connector.connect("qr", false);
+    const onDisc = vi.fn();
+    const off = session.onDisconnected(onDisc);
+    off();
+    await session.disconnect();
+    expect(onDisc).not.toHaveBeenCalled();
+  });
+
+  it("FALLS BACK to the mock connector when the wasm import fails (module absent)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Loader rejects exactly as a missing `portcode-wasm` package would.
+    const load = vi.fn(() => Promise.reject(new Error("Cannot find module 'portcode-wasm'")));
+    const connector = createWasmConnector(load);
+
+    const session = await connector.connect("qr", false);
+    // The mock's fixed identity proves we fell back rather than threw.
+    expect(session.sas).toBe("MOCK-SAS-1234");
+    expect(session.peerPublicKey).toBe("MOCK_DESKTOP_KEY_BASE64==");
+    expect(warn).toHaveBeenCalled();
+
+    // The fallback session is a working mock session.
+    await expect(session.sendCommand({ cmd: "cancel", session_id: "s1" })).resolves.toBeUndefined();
+
+    // A second connect reuses the cached fallback without re-importing.
+    const again = await connector.connect("qr2", true);
+    expect(again.sas).toBe("MOCK-SAS-1234");
+    expect(load).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+
+  it("works through setWebSessionConnector + webPhoneSyncConnect end to end", async () => {
+    const fake = createFakeWasmSession();
+    setWebSessionConnector(
+      createWasmConnector(async () => ({
+        Session: { connect: async () => fake.session },
+      })),
+    );
+    const info = await webPhoneSyncConnect("qr", false);
+    expect(info).toEqual({ sas: "WASM-SAS", peerPublicKey: "WASM_KEY==" });
+
+    const cb = vi.fn();
+    webOnPhoneSyncFrame(cb);
+    fake.emit(SAMPLE_FRAME);
+    expect(cb).toHaveBeenCalledWith(SAMPLE_FRAME);
+
+    await webPhoneSyncDisconnect();
+    expect(fake.calls.disconnect).toBe(1);
   });
 });

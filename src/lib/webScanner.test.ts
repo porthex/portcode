@@ -1,10 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  createZxingDecoder,
   isWebCameraAvailable,
   scanFromFile,
   scanWithCamera,
   type ScannerDeps,
   type QrDecoder,
+  type ZxingReaderModule,
 } from "./webScanner";
 
 // A throwaway ImageData stand-in: jsdom has no real canvas, so we never construct
@@ -345,5 +347,65 @@ describe("scanWithCamera", () => {
     });
     expect(out).toEqual({ ok: false, reason: "error", message: "draw failed" });
     expect(track.stop).toHaveBeenCalled();
+  });
+});
+
+// ── createZxingDecoder ───────────────────────────────────────────────────────
+//
+// The real default decoder is backed by `zxing-wasm`. We NEVER load real wasm in
+// vitest: every test injects a fake loader that returns a stub `readBarcodes`.
+
+describe("createZxingDecoder", () => {
+  it("returns the first VALID barcode's text", async () => {
+    const readBarcodes = vi.fn().mockResolvedValue([
+      { isValid: false, text: "garbage" },
+      { isValid: true, text: "payload-json" },
+    ]);
+    const load = vi.fn(async (): Promise<ZxingReaderModule> => ({ readBarcodes }));
+    const decode = createZxingDecoder(load);
+
+    const out = await decode(fakeImage);
+    expect(out).toBe("payload-json");
+    expect(readBarcodes).toHaveBeenCalledWith(fakeImage);
+  });
+
+  it("returns null when no barcode is found (empty results)", async () => {
+    const load = async (): Promise<ZxingReaderModule> => ({
+      readBarcodes: vi.fn().mockResolvedValue([]),
+    });
+    const decode = createZxingDecoder(load);
+    expect(await decode(fakeImage)).toBeNull();
+  });
+
+  it("returns null when results are present but none are valid (or are empty text)", async () => {
+    const load = async (): Promise<ZxingReaderModule> => ({
+      readBarcodes: vi.fn().mockResolvedValue([
+        { isValid: false, text: "nope" },
+        { isValid: true, text: "" }, // valid but empty → not a usable QR
+      ]),
+    });
+    const decode = createZxingDecoder(load);
+    expect(await decode(fakeImage)).toBeNull();
+  });
+
+  it("loads the wasm module only once across repeated decodes (memoized)", async () => {
+    const readBarcodes = vi.fn().mockResolvedValue([{ isValid: true, text: "x" }]);
+    const load = vi.fn(async (): Promise<ZxingReaderModule> => ({ readBarcodes }));
+    const decode = createZxingDecoder(load);
+
+    await decode(fakeImage);
+    await decode(fakeImage);
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(readBarcodes).toHaveBeenCalledTimes(2);
+  });
+
+  it("plugs into scanFromFile as a real QrDecoder", async () => {
+    const load = async (): Promise<ZxingReaderModule> => ({
+      readBarcodes: vi.fn().mockResolvedValue([{ isValid: true, text: "from-file" }]),
+    });
+    const decode: QrDecoder = createZxingDecoder(load);
+    const deps: ScannerDeps = { decodeFile: vi.fn().mockResolvedValue(fakeImage) };
+    const out = await scanFromFile(fakeFile, decode, deps);
+    expect(out).toEqual({ ok: true, value: "from-file" });
   });
 });

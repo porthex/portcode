@@ -35,6 +35,62 @@
  */
 export type QrDecoder = (image: ImageData) => string | null | Promise<string | null>;
 
+// ── Default zxing-wasm decoder ───────────────────────────────────────────────
+//
+// The production {@link QrDecoder} is backed by `zxing-wasm` (ZXing-C++ compiled
+// to WebAssembly — iOS Safari ships no `BarcodeDetector`, see the file header).
+// Its `readBarcodes(ImageData)` returns the decoded barcodes; we keep the first
+// VALID result's text. The wasm chunk is hundreds of KB, so it is LAZILY loaded
+// via a dynamic `import()` on the first decode (the PWA shell paints first).
+//
+// The loader is injectable so vitest never resolves/instantiates the real wasm
+// (it would try to fetch the `.wasm` binary, which jsdom can't do). The default
+// loader imports `zxing-wasm/reader` — the reader-only entry, the smallest build.
+
+/** The subset of the `zxing-wasm` reader module {@link defaultQrDecoder} uses. */
+export interface ZxingReaderModule {
+  readBarcodes(input: ImageData): Promise<ReadonlyArray<{ isValid: boolean; text: string }>>;
+}
+
+/** Loads the `zxing-wasm` reader module. Injectable so tests mock it instead of
+ *  loading real wasm. */
+export type ZxingLoader = () => Promise<ZxingReaderModule>;
+
+/** Default loader: lazy dynamic `import()` of the reader-only `zxing-wasm` entry.
+ *  Untestable under jsdom (it would fetch the real `.wasm` binary), so tests inject
+ *  a fake loader via {@link createZxingDecoder} and this body is c8-ignored. */
+/* c8 ignore start */
+export const defaultZxingLoader: ZxingLoader = () =>
+  import("zxing-wasm/reader") as Promise<ZxingReaderModule>;
+/* c8 ignore stop */
+
+/**
+ * Build a {@link QrDecoder} backed by `zxing-wasm`. The wasm module is loaded once
+ * (memoized) on the first call and reused. Returns the first VALID decoded text,
+ * or `null` when no barcode is found — matching the {@link QrDecoder} contract
+ * (`scanFromFile`/`scanWithCamera` treat `null` as "no QR yet", never an error).
+ *
+ * @param load injectable module loader (defaults to {@link defaultZxingLoader}).
+ */
+export function createZxingDecoder(load: ZxingLoader = defaultZxingLoader): QrDecoder {
+  let modPromise: Promise<ZxingReaderModule> | null = null;
+  return async (image: ImageData): Promise<string | null> => {
+    if (modPromise === null) modPromise = load();
+    const mod = await modPromise;
+    const results = await mod.readBarcodes(image);
+    const hit = results.find((r) => r.isValid && r.text.length > 0);
+    return hit ? hit.text : null;
+  };
+}
+
+/**
+ * The DEFAULT QR decoder used when a caller does not inject one: a lazily-loaded
+ * `zxing-wasm` decoder. A single shared instance so the wasm module is loaded at
+ * most once across the app. Tests inject their own decoder (or a fake loader via
+ * {@link createZxingDecoder}) so real wasm never loads under vitest.
+ */
+export const defaultQrDecoder: QrDecoder = createZxingDecoder();
+
 /**
  * The result of a web scan attempt. Like the native `ScanOutcome`, the scan
  * functions never throw — they fold every failure into one of these reasons:
