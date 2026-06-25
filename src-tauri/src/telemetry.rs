@@ -578,7 +578,10 @@ mod tests {
         // without a newline, but on-disk files can accumulate whitespace).
         let path = temp_consent_path();
         std::fs::write(&path, "1\n").unwrap();
-        assert!(consent_is_live(), "trailing newline should still read as live");
+        assert!(
+            consent_is_live(),
+            "trailing newline should still read as live"
+        );
         std::fs::write(&path, " 1 ").unwrap();
         assert!(consent_is_live(), "padded spaces should still read as live");
         clear_consent_override(&path);
@@ -652,7 +655,11 @@ mod tests {
         assert!(!consent_is_live(), "should be off after opt-out");
         // File must not contain "1" — either gone or overwritten with "0".
         let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
-        assert_ne!(on_disk.trim(), "1", "stale '1' must not remain after opt-out");
+        assert_ne!(
+            on_disk.trim(),
+            "1",
+            "stale '1' must not remain after opt-out"
+        );
 
         clear_consent_override(&path);
     }
@@ -702,10 +709,7 @@ mod tests {
         // nothing is initialized, no monitor is spawned.
         // In dev/test builds `dsn()` is always None (no SENTRY_DSN env var),
         // so init_desktop_with_minidump must always return None here.
-        assert!(
-            dsn().is_none(),
-            "pre-condition: no DSN in test builds"
-        );
+        assert!(dsn().is_none(), "pre-condition: no DSN in test builds");
         // Since dsn() returns None, init_desktop_with_minidump must return None
         // immediately without touching the panic hook or spawning any process.
         // We cannot call init_desktop_with_minidump() in tests because it
