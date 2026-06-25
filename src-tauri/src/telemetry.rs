@@ -954,4 +954,91 @@ mod tests {
         let s: Box<dyn std::any::Any + Send> = Box::new(42u32);
         assert_eq!(panic_payload(s.as_ref()), "<non-string panic payload>");
     }
+
+    // ── additional coverage merged from PR #65 (CodeRabbit) ─────────────────────
+
+    #[test]
+    fn consent_is_live_with_trailing_newline() {
+        // The on-disk file written by many tools appends a newline; trim() must handle it.
+        let path = temp_consent_path();
+        std::fs::write(&path, "1\n").unwrap();
+        assert!(consent_is_live());
+        clear_consent_override(&path);
+    }
+
+    #[test]
+    fn set_consent_updates_atomic_on_opt_in() {
+        // The CONSENT_LIVE atomic must mirror the requested state after set_consent.
+        let path = temp_consent_path();
+        set_consent(true);
+        assert!(CONSENT_LIVE.load(Ordering::SeqCst));
+        clear_consent_override(&path);
+        CONSENT_LIVE.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn set_consent_updates_atomic_on_opt_out() {
+        let path = temp_consent_path();
+        // Start with consent on so the opt-out is meaningful.
+        set_consent(true);
+        assert!(CONSENT_LIVE.load(Ordering::SeqCst));
+        set_consent(false);
+        assert!(!CONSENT_LIVE.load(Ordering::SeqCst));
+        clear_consent_override(&path);
+    }
+
+    #[test]
+    fn set_consent_toggle_multiple_times() {
+        // Repeated on/off/on/off should always reflect the last write.
+        let path = temp_consent_path();
+        for round in 0..3 {
+            set_consent(true);
+            assert!(
+                consent_is_live(),
+                "expected live after opt-in (round {round})"
+            );
+            set_consent(false);
+            assert!(
+                !consent_is_live(),
+                "expected off after opt-out (round {round})"
+            );
+        }
+        clear_consent_override(&path);
+    }
+
+    #[test]
+    fn bundle_identifier_constant_matches_tauri_conf() {
+        // The path that both processes derive MUST use the identifier declared in
+        // tauri.conf.json. Catch any accidental drift here.
+        assert_eq!(BUNDLE_IDENTIFIER, "dev.porthex.portcode");
+    }
+
+    #[test]
+    fn consent_file_constant_is_dotfile() {
+        // The consent flag must be a dotfile so it isn't surfaced as a user doc.
+        assert_eq!(CONSENT_FILE, ".telemetry_consent");
+        assert!(CONSENT_FILE.starts_with('.'));
+    }
+
+    #[test]
+    fn consent_path_includes_bundle_identifier_and_consent_file() {
+        // In tests the thread-local override is active; in the real path
+        // (no override) the consent path must embed both the identifier and the
+        // filename so the crash-reporter process and the app agree on the location.
+        // We exercise only the production-code path (override cleared) and just
+        // check that the path components appear in the expected order.
+        CONSENT_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
+        if let Some(path) = consent_path() {
+            let s = path.to_string_lossy();
+            assert!(
+                s.contains(BUNDLE_IDENTIFIER),
+                "consent path should contain BUNDLE_IDENTIFIER: {s}"
+            );
+            assert!(
+                s.ends_with(CONSENT_FILE),
+                "consent path should end with CONSENT_FILE: {s}"
+            );
+        }
+        // If dirs::config_dir() is None (headless CI) that's fine: fail-safe is off.
+    }
 }
