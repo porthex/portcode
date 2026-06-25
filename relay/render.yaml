@@ -1,0 +1,35 @@
+# Render.com Blueprint for the Portcode Phone Sync iroh-relay.
+#
+# Deploy: push this repo to GitHub, then in Render: New > Blueprint, point it at
+# the repo. Render reads this file, builds relay/Dockerfile, and runs the relay.
+# (Or use `render blueprint launch` with the Render CLI.)
+#
+# Shape B (Render terminates TLS at its edge — see relay/relay.config.toml).
+# Render gives every web service a managed HTTPS hostname
+# (https://portcode-relay.onrender.com) and forwards plaintext HTTP to the
+# container, so the relay serves plain HTTP internally and clients use wss://.
+#
+# PLACE IT NEAR YOUR USERS (§5.5): set `region` to the Render region closest to
+# most phones. Relay-only means latency is the relay hop — co-locate with users.
+
+services:
+  - type: web
+    name: portcode-relay
+    runtime: docker
+    plan: starter # always-on; do NOT use a plan that spins down on idle (§3)
+    region: oregon # CHANGE ME: nearest region to your users (oregon|ohio|virginia|frankfurt|singapore)
+    rootDir: relay
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # Render maps its public 443 (wss) to this internal port. Matches
+    # relay.config.toml http_bind_addr and the Dockerfile EXPOSE.
+    envVars:
+      - key: IROH_VERSION
+        value: "1.0.0" # lock-step with the workspace `iroh` version (see Dockerfile)
+    # Network health check: Render polls this path to decide the service is live.
+    # iroh-relay answers a plaintext 200 on its HTTP probe path; adjust to the
+    # probe your pinned iroh-relay exposes (`iroh-relay --help`).
+    healthCheckPath: /
+    # Keep the relay always-on. Render's free tier spins down on idle and would
+    # drop every live WebSocket — use a paid plan for the product (§3, §9 risk #2).
+    autoDeploy: true

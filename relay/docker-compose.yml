@@ -1,0 +1,38 @@
+# docker-compose for running the Portcode Phone Sync iroh-relay on a plain VPS.
+#
+# Use this when you self-terminate TLS on the box (Shape A in relay.config.toml)
+# rather than letting a platform edge do it. Put a real cert at the paths below
+# (Let's Encrypt / your CA), enable the `[tls]` block in relay.config.toml, and
+# clients connect to wss://relay.example.com.
+#
+#   docker compose up -d --build
+#   docker compose logs -f relay
+#
+# PLACE IT NEAR YOUR USERS (§5.5): pick a VPS region close to most phones — the
+# relay hop dominates latency in relay-only mode.
+
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Lock-step with the workspace `iroh` version (see Dockerfile header).
+        IROH_VERSION: "1.0.0"
+    image: portcode-relay:1.0.0
+    restart: always # always-on infra (§3)
+    ports:
+      - "443:443/tcp" # WSS (relay-terminated TLS, Shape A)
+      - "3478:3478/udp" # QUIC address discovery (native desktop leg)
+    volumes:
+      # Shape A only: mount your TLS cert + key and enable the [tls] block in
+      # relay.config.toml. Omit for Shape B (edge-terminated TLS).
+      - ./certs:/etc/iroh-relay/certs:ro
+    healthcheck:
+      # Network probe against the relay's HTTP path (adjust to your pinned
+      # iroh-relay's probe path; see `iroh-relay --help`).
+      test: ["CMD", "/usr/local/bin/iroh-relay", "--help"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

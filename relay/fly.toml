@@ -1,0 +1,54 @@
+# Fly.io deploy config for the Portcode Phone Sync iroh-relay.
+#
+# Deploy:  fly launch --no-deploy --copy-config   (first time, to create the app)
+#          fly deploy                              (build the Dockerfile + ship)
+#
+# Shape B (Fly terminates TLS at its edge, forwards plaintext HTTP to the
+# container — see relay/relay.config.toml). Fly's anycast edge handles the public
+# cert for your <app>.fly.dev hostname (or a custom domain via `fly certs add`),
+# so the relay itself serves plain HTTP internally. Clients connect over wss://.
+#
+# PLACE IT NEAR YOUR USERS (§5.5): set `primary_region` to the region closest to
+# where most phones live. Relay-only means every byte is relayed, so latency is
+# dominated by the relay hop — co-locate it with users, not with a far datacenter.
+
+app = "portcode-relay"
+primary_region = "iad"            # CHANGE ME: nearest region to your users (e.g. lhr, fra, syd)
+
+[build]
+dockerfile = "Dockerfile"
+# Pin in lock-step with the workspace `iroh` version (see Dockerfile header).
+[build.args]
+IROH_VERSION = "1.0.0"
+
+[http_service]
+# The relay's internal plaintext HTTP/WebSocket port (matches relay.config.toml
+# http_bind_addr). Fly maps public 443 (wss) -> this with edge TLS.
+internal_port = 443
+force_https = true                # redirect plaintext :80 -> :443 at the edge
+auto_stop_machines = "off"        # the relay is ALWAYS-ON infra (§3) — never idle-stop it
+auto_start_machines = true
+min_machines_running = 1          # keep at least one machine up 24/7
+
+[http_service.concurrency]
+type = "connections"
+# Relay connections are long-lived WebSockets; size for concurrent paired phones.
+soft_limit = 200
+hard_limit = 250
+
+# Network health check: hit the relay's HTTP probe path. iroh-relay answers a
+# plaintext 200 on its generated/landing path; adjust `path` to the probe your
+# pinned iroh-relay exposes (see `iroh-relay --help`). This is the check that
+# tells Fly the relay is actually serving, not just that the process is up.
+[[http_service.checks]]
+interval = "15s"
+timeout = "5s"
+grace_period = "20s"
+method = "GET"
+path = "/"
+
+# Tiny VM is plenty for a control/mirror-plane relay (small frames). Bump only if
+# you see CPU/RAM pressure under real load.
+[[vm]]
+size = "shared-cpu-1x"
+memory = "256mb"
