@@ -78,11 +78,12 @@ function createFakeConnector() {
 }
 
 describe("mock connector", () => {
-  it("connect returns the fixed ConnectInfo", async () => {
+  it("connect returns the fixed ConnectInfo (incl. a mock VAPID key)", async () => {
     const conn = createMockConnector();
     const session = await conn.connect("ignored-qr", false);
     expect(session.sas).toBe("MOCK-SAS-1234");
     expect(session.peerPublicKey).toBe("MOCK_DESKTOP_KEY_BASE64==");
+    expect(session.vapidPublicKey).toBe("MOCK_VAPID_PUBLIC_KEY_BASE64URL");
   });
 
   it("sendCommand resolves to undefined", async () => {
@@ -128,11 +129,12 @@ describe("mock connector", () => {
 });
 
 describe("ipc-shaped wrappers (default mock connector)", () => {
-  it("webPhoneSyncConnect returns the mock ConnectInfo", async () => {
+  it("webPhoneSyncConnect returns the mock ConnectInfo (with the VAPID key)", async () => {
     const info: ConnectInfo = await webPhoneSyncConnect("qr");
     expect(info).toEqual({
       sas: "MOCK-SAS-1234",
       peerPublicKey: "MOCK_DESKTOP_KEY_BASE64==",
+      vapidPublicKey: "MOCK_VAPID_PUBLIC_KEY_BASE64URL",
     });
   });
 
@@ -252,6 +254,7 @@ function createFakeWasmSession() {
   const session: WasmSession = {
     sas: "WASM-SAS",
     peerPublicKey: "WASM_KEY==",
+    vapidPublicKey: "WASM_VAPID==",
     sendCommand(cmd) {
       sent.push(cmd);
     },
@@ -284,6 +287,8 @@ describe("createWasmConnector (real connector, faked wasm module)", () => {
     const session = await connector.connect("the-qr", true);
     expect(session.sas).toBe("WASM-SAS");
     expect(session.peerPublicKey).toBe("WASM_KEY==");
+    // The VAPID key threads through the adapter (used for the push subscription).
+    expect(session.vapidPublicKey).toBe("WASM_VAPID==");
   });
 
   it("forwards qr/reconnect to Session.connect and only loads the module once", async () => {
@@ -384,7 +389,11 @@ describe("createWasmConnector (real connector, faked wasm module)", () => {
       })),
     );
     const info = await webPhoneSyncConnect("qr", false);
-    expect(info).toEqual({ sas: "WASM-SAS", peerPublicKey: "WASM_KEY==" });
+    expect(info).toEqual({
+      sas: "WASM-SAS",
+      peerPublicKey: "WASM_KEY==",
+      vapidPublicKey: "WASM_VAPID==",
+    });
 
     const cb = vi.fn();
     webOnPhoneSyncFrame(cb);

@@ -166,6 +166,17 @@ export interface PairingPayload {
 export interface ConnectInfo {
   sas: string;
   peerPublicKey: string;
+  /**
+   * The desktop's Web Push VAPID PUBLIC key (base64url), learned at connect time
+   * from the pairing payload. The Rust side adds `vapid_public_key` to
+   * `PairingPayload` + a `vapidPublicKey` getter on the wasm `Session`. The
+   * installed iOS PWA uses it as the `applicationServerKey` when subscribing to
+   * Web Push, then registers the subscription with the desktop via a
+   * `register_push` {@link RemoteCommand} (§5.7). Optional: absent on a desktop
+   * that predates push support and on the inert preview/mock — push is
+   * best-effort re-engagement, never core, so its absence degrades to a no-op.
+   */
+  vapidPublicKey?: string;
 }
 
 /**
@@ -177,7 +188,16 @@ export type RemoteCommand =
   | { cmd: "run"; session_id: string; text: string }
   | { cmd: "cancel"; session_id: string }
   | { cmd: "permission"; id: string; decision: string }
-  | { cmd: "create_session"; title?: string | null };
+  | { cmd: "create_session"; title?: string | null }
+  /**
+   * Register an installed-PWA Web Push subscription with the desktop (the push
+   * SENDER) so it can deliver "permission needed" / "turn finished" notifications
+   * (§5.7). `endpoint` is the push service URL; `p256dh`/`auth` are the
+   * base64url-encoded subscription keys from `PushSubscription.getKey(...)`. The
+   * desktop sends VAPID-signed pushes to `endpoint` using these. Sent best-effort
+   * after a successful `PushManager.subscribe` — never on the native/Tauri path.
+   */
+  | { cmd: "register_push"; endpoint: string; p256dh: string; auth: string };
 
 /** A catch-up message row from the desktop (camelCase; mirrors Rust `MessageRow`).
  *  Distinct from {@link Message}: it carries the session id + monotonic `seq`. */

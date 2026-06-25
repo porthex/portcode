@@ -42,7 +42,11 @@ import {
   savePinnedPeer as realSavePinnedPeer,
 } from "./webStorage";
 import { createReconnectController, watchLifecycle } from "./pwaLifecycle";
+import { isStandalonePwa } from "./installGate";
+import { requestAndSubscribe as realRequestAndSubscribe } from "./pushClient";
+import { setPendingBadge as realSetPendingBadge } from "./appBadge";
 import { useStore } from "../store/store";
+import type { PendingPermission, RemoteCommand } from "../types";
 
 /** The slice of the store this module reads + drives. Kept minimal so a test can
  *  supply a plain fake instead of standing up the whole zustand store. */
@@ -54,13 +58,22 @@ export interface LifecycleStoreState {
   /** The desktop's pinned static public key (the STABLE identity to persist as
    *  `PinnedPeer.peerPublicKey`), distinct from the `remoteSas` verification code. */
   remotePeerKey: string | null;
+  /** The desktop's Web Push VAPID public key (from `ConnectInfo`), or null when it
+   *  sent none. Drives the installed-PWA push subscription (§5.7). */
+  remoteVapidKey: string | null;
   lastPairingQr: string | null;
   online: boolean;
+  /** The current pending permission decision (or null). Its presence drives the
+   *  App Badge count (§5.7): the in-app decision queue is the source of truth. */
+  pendingPermission: PendingPermission | null;
   reconnectRemote: () => Promise<void>;
   setOnline: (v: boolean) => void;
   /** Hydrate a remembered QR (from durable storage) into `lastPairingQr` when the
    *  slot is empty, so `reconnectRemote()` can dial on a cold launch. */
   hydrateRememberedQr: (qr: string) => void;
+  /** Send a command to the desktop (used to register the push subscription via a
+   *  `register_push` {@link RemoteCommand}). */
+  sendRemoteCommand: (command: RemoteCommand) => Promise<void>;
 }
 
 /** A zustand-shaped store handle: read with `getState`, observe with `subscribe`.
@@ -90,6 +103,15 @@ export interface WebClientLifecycleOptions {
   /** Injected timer for the reconnect backoff. */
   setTimeoutFn?: typeof setTimeout;
   clearTimeoutFn?: typeof clearTimeout;
+  /** The Web Push subscribe call (defaults to {@link realRequestAndSubscribe}).
+   *  Injected so tests drive the push flow with a fake. */
+  requestAndSubscribe?: typeof realRequestAndSubscribe;
+  /** Whether we are an installed PWA (defaults to {@link isStandalonePwa}); push is
+   *  only attempted when installed. Injected so tests can force either state. */
+  isInstalled?: () => boolean;
+  /** Reflect the pending-decision count onto the App Badge (defaults to
+   *  {@link realSetPendingBadge}). Injected so tests assert the badge calls. */
+  setBadge?: typeof realSetPendingBadge;
 }
 
 const realStore: LifecycleStore = {
@@ -125,6 +147,9 @@ export function startWebClientLifecycle(opts: WebClientLifecycleOptions = {}): (
   const store = opts.store ?? realStore;
   const storage = opts.storage ?? realStorage;
   const watch = opts.watch ?? watchLifecycle;
+  const requestAndSubscribe = opts.requestAndSubscribe ?? realRequestAndSubscribe;
+  const isInstalled = opts.isInstalled ?? isStandalonePwa;
+  const setBadge = opts.setBadge ?? realSetPendingBadge;
 
   // The QR hydrated from IndexedDB on cold start, used by the resume path when the
   // store's own lastPairingQr is still empty (localStorage evicted). The store's
@@ -148,6 +173,15 @@ export function startWebClientLifecycle(opts: WebClientLifecycleOptions = {}): (
     }
   })();
 
+  // ── App Badge: reflect the pending-decision count on the Home-Screen icon ─────
+  // The pending-permission queue is the source of truth (§5.7); the badge mirrors
+  // its count (1 when a decision is pending, else 0). We dedupe so an unrelated
+  // store change doesn't re-issue the same badge call. Seed from the current state
+  // so the very first edge is detected.
+  const badgeCount = (s: LifecycleStoreState): number => (s.pendingPermission ? 1 : 0);
+  let lastBadge = badgeCount(store.getState());
+  setBadge(lastBadge); // sync the initial state (clears a stale badge on launch)
+
   // ── Durable pinned-peer persistence (subscribe to the store) ──────────────────
   let lastVerifiedLive = isVerifiedLive(store.getState());
   let lastQr = store.getState().lastPairingQr;
@@ -162,6 +196,10 @@ export function startWebClientLifecycle(opts: WebClientLifecycleOptions = {}): (
     // surfaced yet, skip pinning rather than storing the wrong value in the key slot.
     if (live && !lastVerifiedLive && s.remotePeerKey !== null && s.lastPairingQr) {
       void persistPinnedPeer(storage, s.lastPairingQr, s.remotePeerKey);
+      // On the SAME verified-live edge, attempt the installed-PWA Web Push
+      // subscription. Best-effort re-engagement (§5.7): guarded + never throws, so
+      // a failure (not installed / no key / permission denied) just no-ops.
+      void subscribePush(s);
     }
 
     // The store forgot the remembered desktop (explicit disconnect / forget pairing):
@@ -172,9 +210,37 @@ export function startWebClientLifecycle(opts: WebClientLifecycleOptions = {}): (
       void storage.clearPinnedPeer();
     }
 
+    // Mirror the pending-decision count onto the App Badge whenever it changes.
+    const count = badgeCount(s);
+    if (count !== lastBadge) {
+      setBadge(count);
+      lastBadge = count;
+    }
+
     lastVerifiedLive = live;
     lastQr = s.lastPairingQr;
   });
+
+  /** Subscribe the installed PWA to Web Push and register the subscription with the
+   *  desktop via a `register_push` command. Best-effort: every failure path is a
+   *  typed skip from {@link requestAndSubscribe}, and a send failure is swallowed. */
+  async function subscribePush(s: LifecycleStoreState): Promise<void> {
+    // Skip the whole flow cheaply when the desktop sent no VAPID key or we're not an
+    // installed PWA — requestAndSubscribe would skip anyway, but this avoids the call.
+    if (!s.remoteVapidKey || !isInstalled()) return;
+    const result = await requestAndSubscribe({
+      vapidPublicKey: s.remoteVapidKey,
+      isInstalled,
+    });
+    if (!result.ok) return;
+    const { endpoint, p256dh, auth } = result.registration;
+    // SHARED wire contract: snake_case register_push command through the existing
+    // command path. Swallow a send failure — push is non-essential.
+    await store
+      .getState()
+      .sendRemoteCommand({ cmd: "register_push", endpoint, p256dh, auth })
+      .catch(() => {});
+  }
 
   // ── Reconnect-on-resume ───────────────────────────────────────────────────────
   // The connect attempt the controller drives: re-dial the remembered desktop, but

@@ -9,6 +9,8 @@ import {
 } from "./webClientLifecycle";
 import type { LifecycleHandlers } from "./pwaLifecycle";
 import type { PinnedPeer } from "./webStorage";
+import type { PushResult } from "./pushClient";
+import type { RemoteCommand } from "../types";
 
 // webClientLifecycle ties pwaLifecycle + webStorage to the store. Everything is
 // dependency-injected, so we drive it with a fake store (getState + subscribe), a
@@ -25,17 +27,21 @@ function makeFakeStore(initial: Partial<LifecycleStoreState> = {}) {
   const hydrateRememberedQr = vi.fn((qr: string) => {
     if (!state.lastPairingQr) state.lastPairingQr = qr;
   });
+  const sendRemoteCommand = vi.fn(async (_command: RemoteCommand) => {});
   const state: LifecycleStoreState = {
     remoteConnected: false,
     remoteVerified: false,
     remoteConnecting: false,
     remoteSas: null,
     remotePeerKey: null,
+    remoteVapidKey: null,
     lastPairingQr: null,
     online: true,
+    pendingPermission: null,
     reconnectRemote,
     setOnline,
     hydrateRememberedQr,
+    sendRemoteCommand,
     ...initial,
   };
   const store: LifecycleStore = {
@@ -50,7 +56,16 @@ function makeFakeStore(initial: Partial<LifecycleStoreState> = {}) {
     Object.assign(state, patch);
     for (const l of [...listeners]) l();
   };
-  return { store, state, set, reconnectRemote, setOnline, hydrateRememberedQr, listeners };
+  return {
+    store,
+    state,
+    set,
+    reconnectRemote,
+    setOnline,
+    hydrateRememberedQr,
+    sendRemoteCommand,
+    listeners,
+  };
 }
 
 /** A fake storage whose calls are spies; the pinned peer is in-memory. */
@@ -360,6 +375,210 @@ describe("startWebClientLifecycle — durable pinned-peer persistence", () => {
     set({ online: false });
     await flush();
     expect(storage.savePinnedPeer).not.toHaveBeenCalled();
+    stop();
+  });
+});
+
+describe("startWebClientLifecycle — Web Push subscription (§5.7)", () => {
+  /** A push stub returning a fixed result, recording the options it was called with. */
+  function makePushStub(result: PushResult) {
+    const calls: Array<{ vapidPublicKey?: string }> = [];
+    const requestAndSubscribe = vi.fn(async (o: { vapidPublicKey?: string }) => {
+      calls.push(o);
+      return result;
+    }) as unknown as typeof import("./pushClient").requestAndSubscribe;
+    return { requestAndSubscribe, calls };
+  }
+
+  const okResult: PushResult = {
+    ok: true,
+    registration: { endpoint: "https://push/x", p256dh: "P", auth: "A" },
+  };
+
+  it("subscribes + sends register_push on a fresh verified connection with a VAPID key (installed)", async () => {
+    const { store, set, sendRemoteCommand } = makeFakeStore();
+    const push = makePushStub(okResult);
+    const stop = startWebClientLifecycle({
+      store,
+      storage: makeFakeStorage(),
+      watch: makeWatchStub().watch,
+      requestAndSubscribe: push.requestAndSubscribe,
+      isInstalled: () => true,
+    });
+
+    set({
+      remoteConnected: true,
+      remoteVerified: true,
+      remotePeerKey: "KEY",
+      remoteVapidKey: "VAPID-KEY",
+      lastPairingQr: "QR",
+    });
+    await flush();
+    await flush();
+
+    expect(push.calls).toHaveLength(1);
+    expect(push.calls[0].vapidPublicKey).toBe("VAPID-KEY");
+    // SHARED wire contract: snake_case register_push through the command path.
+    expect(sendRemoteCommand).toHaveBeenCalledWith({
+      cmd: "register_push",
+      endpoint: "https://push/x",
+      p256dh: "P",
+      auth: "A",
+    });
+    stop();
+  });
+
+  it("does NOT attempt push when the desktop sent no VAPID key", async () => {
+    const { store, set, sendRemoteCommand } = makeFakeStore();
+    const push = makePushStub(okResult);
+    const stop = startWebClientLifecycle({
+      store,
+      storage: makeFakeStorage(),
+      watch: makeWatchStub().watch,
+      requestAndSubscribe: push.requestAndSubscribe,
+      isInstalled: () => true,
+    });
+
+    set({
+      remoteConnected: true,
+      remoteVerified: true,
+      remotePeerKey: "KEY",
+      remoteVapidKey: null,
+      lastPairingQr: "QR",
+    });
+    await flush();
+    expect(push.calls).toHaveLength(0);
+    expect(sendRemoteCommand).not.toHaveBeenCalled();
+    stop();
+  });
+
+  it("does NOT attempt push when not installed", async () => {
+    const { store, set } = makeFakeStore();
+    const push = makePushStub(okResult);
+    const stop = startWebClientLifecycle({
+      store,
+      storage: makeFakeStorage(),
+      watch: makeWatchStub().watch,
+      requestAndSubscribe: push.requestAndSubscribe,
+      isInstalled: () => false,
+    });
+
+    set({
+      remoteConnected: true,
+      remoteVerified: true,
+      remotePeerKey: "KEY",
+      remoteVapidKey: "VAPID-KEY",
+      lastPairingQr: "QR",
+    });
+    await flush();
+    expect(push.calls).toHaveLength(0);
+    stop();
+  });
+
+  it("does NOT send register_push when the subscribe was skipped (best-effort)", async () => {
+    const { store, set, sendRemoteCommand } = makeFakeStore();
+    const push = makePushStub({ ok: false, reason: "permission-denied" });
+    const stop = startWebClientLifecycle({
+      store,
+      storage: makeFakeStorage(),
+      watch: makeWatchStub().watch,
+      requestAndSubscribe: push.requestAndSubscribe,
+      isInstalled: () => true,
+    });
+
+    set({
+      remoteConnected: true,
+      remoteVerified: true,
+      remotePeerKey: "KEY",
+      remoteVapidKey: "VAPID-KEY",
+      lastPairingQr: "QR",
+    });
+    await flush();
+    await flush();
+    expect(push.calls).toHaveLength(1);
+    expect(sendRemoteCommand).not.toHaveBeenCalled();
+    stop();
+  });
+
+  it("swallows a sendRemoteCommand failure (push is non-essential)", async () => {
+    const { store, set, sendRemoteCommand } = makeFakeStore();
+    sendRemoteCommand.mockRejectedValue(new Error("link dropped"));
+    const push = makePushStub(okResult);
+    const stop = startWebClientLifecycle({
+      store,
+      storage: makeFakeStorage(),
+      watch: makeWatchStub().watch,
+      requestAndSubscribe: push.requestAndSubscribe,
+      isInstalled: () => true,
+    });
+
+    set({
+      remoteConnected: true,
+      remoteVerified: true,
+      remotePeerKey: "KEY",
+      remoteVapidKey: "VAPID-KEY",
+      lastPairingQr: "QR",
+    });
+    await flush();
+    await flush();
+    // No unhandled rejection escapes; the command was attempted.
+    expect(sendRemoteCommand).toHaveBeenCalledTimes(1);
+    stop();
+  });
+});
+
+describe("startWebClientLifecycle — App Badge (§5.7)", () => {
+  it("syncs the initial badge to 0 on start (clears any stale badge)", () => {
+    const { store } = makeFakeStore({ pendingPermission: null });
+    const setBadge = vi.fn();
+    const stop = startWebClientLifecycle({
+      store,
+      storage: makeFakeStorage(),
+      watch: makeWatchStub().watch,
+      setBadge,
+    });
+    expect(setBadge).toHaveBeenCalledWith(0);
+    stop();
+  });
+
+  it("sets the badge to 1 when a permission becomes pending, and clears it when resolved", async () => {
+    const { store, set } = makeFakeStore({ pendingPermission: null });
+    const setBadge = vi.fn();
+    const stop = startWebClientLifecycle({
+      store,
+      storage: makeFakeStorage(),
+      watch: makeWatchStub().watch,
+      setBadge,
+    });
+    setBadge.mockClear(); // ignore the initial sync
+
+    set({ pendingPermission: { id: "p1", tool: "fs_edit", summary: "x", input: {} } });
+    await flush();
+    expect(setBadge).toHaveBeenLastCalledWith(1);
+
+    set({ pendingPermission: null });
+    await flush();
+    expect(setBadge).toHaveBeenLastCalledWith(0);
+    stop();
+  });
+
+  it("does not re-issue the same badge count on an unrelated state change", async () => {
+    const { store, set } = makeFakeStore({
+      pendingPermission: { id: "p1", tool: "t", summary: "s", input: {} },
+    });
+    const setBadge = vi.fn();
+    const stop = startWebClientLifecycle({
+      store,
+      storage: makeFakeStorage(),
+      watch: makeWatchStub().watch,
+      setBadge,
+    });
+    setBadge.mockClear(); // initial sync issued 1
+
+    // An unrelated change while the count stays 1 must not re-issue the badge.
+    set({ online: false });
+    await flush();
+    expect(setBadge).not.toHaveBeenCalled();
     stop();
   });
 });
