@@ -268,7 +268,7 @@ textarea:focus-visible {
     transform: translateY(100vh);
   }
 }
-@keyframes pcFlash {
+@keyframes pc-flash {
   0% {
     box-shadow: 0 0 0 0 rgba(52, 255, 158, 0);
   }
@@ -282,7 +282,7 @@ textarea:focus-visible {
 /* Mobile remote: the pairing camera-viewport scan line sweeps top→bottom, and the
    session-switcher bottom sheet slides up. Both are geometry, so the components
    gate them behind `motion-safe:` (silenced under prefers-reduced-motion). */
-@keyframes pcScanV {
+@keyframes pc-scan-v {
   0% {
     top: 6%;
   }
@@ -290,7 +290,7 @@ textarea:focus-visible {
     top: 92%;
   }
 }
-@keyframes pcSheet {
+@keyframes pc-sheet {
   from {
     transform: translateY(100%);
   }
@@ -532,9 +532,9 @@ textarea:focus-visible {
 }
 
 /* One-shot success-accent pulse for Settings Save / Copy confirmations
-   (pcFlash box-shadow; neutralized under prefers-reduced-motion). */
+   (pc-flash box-shadow; neutralized under prefers-reduced-motion). */
 .pc-flash {
-  animation: pcFlash 360ms ease-out;
+  animation: pc-flash 360ms ease-out;
 }
 
 /* =========================================================================

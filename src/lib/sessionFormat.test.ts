@@ -19,8 +19,18 @@ describe("workspaceLabel", () => {
     expect(workspaceLabel("/home/me/repo/")).toBe("repo");
   });
 
-  it("falls back to 'local' for a path that is only separators", () => {
-    expect(workspaceLabel("///")).toBe("local");
+  it("returns the POSIX root unchanged", () => {
+    expect(workspaceLabel("/")).toBe("/");
+  });
+
+  it("preserves an all-separators root path", () => {
+    expect(workspaceLabel("///")).toBe("///");
+  });
+
+  it("returns a Windows drive root without a trailing separator", () => {
+    expect(workspaceLabel("C:\\")).toBe("C:");
+    expect(workspaceLabel("C:/")).toBe("C:");
+    expect(workspaceLabel("C:")).toBe("C:");
   });
 });
 

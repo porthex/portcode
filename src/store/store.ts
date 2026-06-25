@@ -86,7 +86,7 @@ interface AppState {
   setShowPalette: (v: boolean) => void;
   setAmbientRain: (v: boolean) => void;
   setScanlines: (v: boolean) => void;
-  setCrashReporting: (v: boolean) => void;
+  setCrashReporting: (v: boolean) => Promise<void>;
   updateSettings: (s: Partial<Settings>) => Promise<void>;
   refreshOAuthStatus: () => Promise<void>;
   loginWithClaude: () => Promise<void>;
@@ -434,6 +434,17 @@ export const useStore = create<AppState>((set, get) => ({
       set((st) => ({
         sessions: st.sessions.map((s) => (s.id === activeId ? { ...s, model } : s)),
       }));
+      // Persist the active session's new model to its DB row so it survives a
+      // reload/catch-up (and so a remote phone-driven turn — which reads the
+      // session row, not settings.model — uses the chosen model). Best-effort:
+      // swallow so a desktop-only/unwired command can't strand the UI; the
+      // settings mirror below remains the global last-used default regardless.
+      try {
+        await ipc.setSessionModel(activeId, model);
+      } catch {
+        /* core not ready / command absent on mobile — the in-memory + settings
+           mirror still applied, so the picker stays consistent */
+      }
     }
     await get().updateSettings({ model });
   },
@@ -745,13 +756,14 @@ export const useStore = create<AppState>((set, get) => ({
 
   // Persist the consent choice; the frontend SDK init/shutdown is driven by an
   // effect in App watching `crashReporting`, so the store stays free of any
-  // telemetry-SDK import (keeps it pure + its tests lightweight). We ALSO mirror
-  // the choice to the Rust host (best-effort: swallow errors so the mobile build —
-  // where the command isn't registered — and DSN-less dev builds don't throw).
-  setCrashReporting(v) {
+  // telemetry-SDK import (keeps it pure + its tests lightweight). Tell the Rust
+  // host FIRST and only persist the local pref + flip state once it acknowledges,
+  // so the host gate (the source of truth) and the frontend never disagree: if the
+  // host rejects, leave consent unchanged rather than optimistically opting in.
+  async setCrashReporting(v) {
+    await ipc.setTelemetryConsent(v);
     writePref("pc.crashReporting", v);
     set({ crashReporting: v });
-    void ipc.setTelemetryConsent(v).catch(() => {});
   },
 
   toggleFiles() {

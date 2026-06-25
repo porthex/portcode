@@ -52,12 +52,12 @@ describe("RemoteChatHeader", () => {
 
   it("opens the switcher from the title and closes it on Escape", () => {
     render(<RemoteChatHeader />);
-    // The title button and the icon button both open the switcher; both are labelled.
-    const switchButtons = screen.getAllByRole("button", { name: "Switch session" });
-    expect(switchButtons.length).toBeGreaterThan(0);
+    // The title button has no aria-label: its accessible name comes from its visible
+    // text (the session title), so it reads distinctly from the icon switcher.
+    const titleButton = screen.getByRole("button", { name: /Rate-limit the client/ });
     expect(screen.queryByRole("dialog", { name: "Switch session" })).not.toBeInTheDocument();
 
-    fireEvent.click(switchButtons[0]);
+    fireEvent.click(titleButton);
     expect(screen.getByRole("dialog", { name: "Switch session" })).toBeInTheDocument();
 
     fireEvent.keyDown(window, { key: "Escape" });
@@ -66,9 +66,8 @@ describe("RemoteChatHeader", () => {
 
   it("opens the switcher from the swap icon button", () => {
     render(<RemoteChatHeader />);
-    const switchButtons = screen.getAllByRole("button", { name: "Switch session" });
-    // The last labelled control is the icon button.
-    fireEvent.click(switchButtons[switchButtons.length - 1]);
+    // Only the icon button carries the "Switch session" accessible name now.
+    fireEvent.click(screen.getByRole("button", { name: "Switch session" }));
     expect(screen.getByRole("dialog", { name: "Switch session" })).toBeInTheDocument();
   });
 });

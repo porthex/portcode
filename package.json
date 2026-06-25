@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "build:if-needed": "node -e \"process.exit(process.env.PORTCODE_SKIP_FRONTEND_BUILD ? 0 : 1)\" || pnpm build",
     "preview": "vite preview",
     "tauri": "tauri",
     "app:dev": "tauri dev",

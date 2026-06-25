@@ -78,9 +78,12 @@ impl CommandHandler for DesktopCommandHandler {
                         oauth_refresh,
                         session_id,
                         text,
-                        // The phone's Run command carries no per-session model override,
-                        // so use the desktop default — `agent::run` falls back to
-                        // settings.model on None, matching the pre-per-session behavior.
+                        // The phone's Run command carries no per-session model override
+                        // (the wire protocol has no model field), so pass None: `agent::run`
+                        // now resolves the model from the session ROW's persisted `model`
+                        // first (falling back to settings.model only for a legacy/null row),
+                        // so a remote turn honors the chat's stored model rather than always
+                        // using the desktop default.
                         None,
                     )
                     .await;
@@ -116,7 +119,12 @@ impl CommandHandler for DesktopCommandHandler {
                         &id,
                         title.as_deref().unwrap_or("New chat"),
                         None, // workspace
-                        None, // model — phone-created sessions use the desktop default
+                        // model: the CreateSession wire command carries no model field,
+                        // so a phone-created session starts with a null model row. Its
+                        // first turn falls back to the desktop default; once the phone
+                        // picks a model (a future protocol addition / desktop edit) it
+                        // is persisted on the row and `agent::run` honors it per turn.
+                        None,
                         db::now_ms(),
                     )
                     .map_err(|e| e.to_string())

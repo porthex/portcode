@@ -127,6 +127,18 @@ describe("Tauri command serialization", () => {
     expect(invoke).toHaveBeenCalledWith("get_messages", { sessionId: "s1" });
   });
 
+  it("set_session_model forwards the id + model (and null to clear it)", async () => {
+    const { ipc, invoke } = await load();
+    invoke.mockResolvedValue(undefined);
+    await ipc.setSessionModel("s1", "claude-sonnet-4-6");
+    expect(invoke).toHaveBeenCalledWith("set_session_model", {
+      id: "s1",
+      model: "claude-sonnet-4-6",
+    });
+    await ipc.setSessionModel("s1", null);
+    expect(invoke).toHaveBeenCalledWith("set_session_model", { id: "s1", model: null });
+  });
+
   it("list_dir passes the optional sub-path through", async () => {
     const { ipc, invoke } = await load();
     invoke.mockResolvedValue([]);

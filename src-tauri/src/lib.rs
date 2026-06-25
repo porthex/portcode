@@ -213,6 +213,22 @@ fn rename_session(state: State<AppState>, id: String, title: String) -> Result<(
         .map_err(|e| e.to_string())
 }
 
+/// Persist an existing session's model (per-session model selection). Mirrors
+/// `rename_session`: the frontend's `setSessionModel` calls this so the chosen
+/// model survives reload/catch-up, and a remote (phone-driven) turn reads it back
+/// from the session row when its `Run` command carries no model override.
+#[tauri::command]
+fn set_session_model(
+    state: State<AppState>,
+    id: String,
+    model: Option<String>,
+) -> Result<(), String> {
+    state
+        .db
+        .set_session_model(&id, model.as_deref())
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn delete_session(state: State<AppState>, id: String) -> Result<(), String> {
     state.db.delete_session(&id).map_err(|e| e.to_string())
@@ -953,21 +969,40 @@ fn phone_sync_disconnect(state: State<AppState>) -> Result<(), String> {
 #[cfg(target_os = "android")]
 #[allow(unsafe_code)] // the crate denies unsafe; the ndk_context bridge requires it (android-only)
 fn init_ndk_context() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        // tao is re-exported by tauri; its prelude re-exports ndk_glue. tao populates
-        // its context in onActivityCreate — before the webview/JS (and any bind) runs.
-        match tauri::tao::platform::android::prelude::main_android_context() {
-            // `java_vm` / `context_jobject` are already `*mut c_void` — pass straight through.
-            Some(ctx) => unsafe {
-                ndk_context::initialize_android_context(ctx.java_vm, ctx.context_jobject);
-            },
-            None => {
-                eprintln!("portcode: tao android context unavailable; ndk_context NOT initialized");
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // Records SUCCESS, not merely "we tried once". A plain `Once::call_once` was
+    // consumed even when `main_android_context()` returned `None`, permanently
+    // disabling the later retry from `phone_sync_connect()` (the context can become
+    // available after `setup` ran too early). Guard on actual initialization so the
+    // None path stays eligible for a retry; once the real bridge runs we never run
+    // it again (`initialize_android_context` asserts the global was previously unset).
+    static INITIALIZED: AtomicBool = AtomicBool::new(false);
+    if INITIALIZED.load(Ordering::Acquire) {
+        return;
+    }
+    // tao is re-exported by tauri; its prelude re-exports ndk_glue. tao populates
+    // its context in onActivityCreate — before the webview/JS (and any bind) runs.
+    match tauri::tao::platform::android::prelude::main_android_context() {
+        // `java_vm` / `context_jobject` are already `*mut c_void` — pass straight through.
+        Some(ctx) => {
+            // Claim the init slot only on success. `compare_exchange` makes the actual
+            // `initialize_android_context` call run at most once even if two threads
+            // race here (the loser returns without re-initializing).
+            if INITIALIZED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                unsafe {
+                    ndk_context::initialize_android_context(ctx.java_vm, ctx.context_jobject);
+                }
             }
         }
-    });
+        None => {
+            // Leave INITIALIZED false so a later call (e.g. from phone_sync_connect,
+            // once the activity context is available) can retry the bridge.
+            eprintln!("portcode: tao android context unavailable; ndk_context NOT initialized");
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1112,6 +1147,7 @@ pub fn run() {
         list_sessions,
         create_session,
         rename_session,
+        set_session_model,
         delete_session,
         get_messages,
         list_dir,
@@ -1145,6 +1181,7 @@ pub fn run() {
         list_sessions,
         create_session,
         rename_session,
+        set_session_model,
         delete_session,
         get_messages,
         phone_sync_status,

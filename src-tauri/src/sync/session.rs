@@ -289,7 +289,10 @@ mod tests {
     #[tokio::test]
     async fn catch_up_delivers_the_session_list_and_per_cursor_deltas() {
         let db = Db::open(Path::new(":memory:")).unwrap();
-        db.create_session("s1", "Alpha", None, None, 100).unwrap();
+        // Seed a concrete per-session model so the catch-up SessionList carries it
+        // through to the phone (covers the DB→sync model propagation).
+        db.create_session("s1", "Alpha", None, Some("claude-sonnet-4-6"), 100)
+            .unwrap();
         db.append_message("s1", &user("first"), 101);
         db.append_message("s1", &user("second"), 102);
 
@@ -313,6 +316,12 @@ mod tests {
 
         assert_eq!(catch_up.sessions.len(), 1);
         assert_eq!(catch_up.sessions[0].id, "s1");
+        // The session row's model propagates verbatim through the SessionList frame,
+        // so the phone can run remote turns against the chat's stored model.
+        assert_eq!(
+            catch_up.sessions[0].model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
         assert_eq!(catch_up.deltas.len(), 1);
         let (session_id, messages) = &catch_up.deltas[0];
         assert_eq!(session_id, "s1");

@@ -24,6 +24,7 @@ vi.mock("../lib/ipc", () => ({
   listSessions: vi.fn(),
   createSession: vi.fn(),
   getMessages: vi.fn(),
+  setSessionModel: vi.fn(),
   deleteSession: vi.fn(),
   saveSettings: vi.fn(),
   resolvePermission: vi.fn(),
@@ -74,6 +75,7 @@ beforeEach(() => {
   m.listSessions.mockResolvedValue([]);
   m.getMessages.mockResolvedValue([]);
   m.createSession.mockResolvedValue(undefined);
+  m.setSessionModel.mockResolvedValue(undefined);
   m.deleteSession.mockResolvedValue(undefined);
   m.saveSettings.mockImplementation(async (s) => ({ ...DEFAULT_SETTINGS, ...s }));
   m.resolvePermission.mockResolvedValue(undefined);
@@ -315,9 +317,29 @@ describe("setSessionModel", () => {
 
     const st = useStore.getState();
     expect(st.sessions[0].model).toBe("claude-sonnet-4-6");
+    // The active session's model is PERSISTED to its DB row so it survives a
+    // reload/catch-up (and a remote turn reads the row, not settings.model).
+    expect(m.setSessionModel).toHaveBeenCalledWith("a", "claude-sonnet-4-6");
     // Last-used sync: settings.model is updated through ipc.saveSettings.
     expect(m.saveSettings).toHaveBeenCalledWith({ model: "claude-sonnet-4-6" });
     expect(st.settings.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("still applies the in-memory model + persists the row even if the DB write rejects", async () => {
+    // Best-effort persistence: a rejected set_session_model (core not ready /
+    // command absent on mobile) must not strand the picker — the in-memory model
+    // and the settings mirror still apply.
+    m.setSessionModel.mockRejectedValueOnce(new Error("db locked"));
+    useStore.setState({
+      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      activeId: "a",
+    });
+
+    await expect(useStore.getState().setSessionModel("claude-sonnet-4-6")).resolves.toBeUndefined();
+
+    const st = useStore.getState();
+    expect(st.sessions[0].model).toBe("claude-sonnet-4-6");
+    expect(m.saveSettings).toHaveBeenCalledWith({ model: "claude-sonnet-4-6" });
   });
 
   it("still updates the last-used default when no session is active (palette safety)", async () => {
@@ -325,6 +347,8 @@ describe("setSessionModel", () => {
 
     await useStore.getState().setSessionModel("claude-haiku-4-5-20251001");
 
+    // No active session → nothing to persist to a row, only the global default.
+    expect(m.setSessionModel).not.toHaveBeenCalled();
     expect(m.saveSettings).toHaveBeenCalledWith({ model: "claude-haiku-4-5-20251001" });
     expect(useStore.getState().settings.model).toBe("claude-haiku-4-5-20251001");
   });
@@ -1110,31 +1134,60 @@ describe("draft + UI setters", () => {
     expect(useStore.getState().showSidebar).toBe(true);
   });
 
-  it("setCrashReporting persists the consent choice as a tri-state pref", () => {
-    useStore.getState().setCrashReporting(true);
+  it("setCrashReporting persists the consent choice as a tri-state pref", async () => {
+    await useStore.getState().setCrashReporting(true);
     expect(useStore.getState().crashReporting).toBe(true);
     expect(localStorage.getItem("pc.crashReporting")).toBe("1");
 
-    useStore.getState().setCrashReporting(false);
+    await useStore.getState().setCrashReporting(false);
     expect(useStore.getState().crashReporting).toBe(false);
     expect(localStorage.getItem("pc.crashReporting")).toBe("0");
   });
 
-  it("setCrashReporting mirrors the consent choice to the Rust host (both ways)", () => {
-    useStore.getState().setCrashReporting(true);
+  it("setCrashReporting mirrors the consent choice to the Rust host (both ways)", async () => {
+    await useStore.getState().setCrashReporting(true);
     expect(m.setTelemetryConsent).toHaveBeenCalledWith(true);
 
-    useStore.getState().setCrashReporting(false);
+    await useStore.getState().setCrashReporting(false);
     expect(m.setTelemetryConsent).toHaveBeenCalledWith(false);
   });
 
-  it("setCrashReporting still applies the choice when the host mirror rejects", () => {
-    // DSN-less dev builds / the mobile build (command unregistered) reject the
-    // invoke; the consent choice must still persist (the host gate is authoritative).
-    m.setTelemetryConsent.mockRejectedValueOnce(new Error("command not found"));
-    expect(() => useStore.getState().setCrashReporting(true)).not.toThrow();
-    expect(useStore.getState().crashReporting).toBe(true);
+  it("setCrashReporting tells the host BEFORE it persists the local pref/state", async () => {
+    // Ordering matters: the host gate is the source of truth, so consent must be
+    // acknowledged by the host before the local pref/state flips. While the host
+    // call is in flight, nothing is persisted or optimistically flipped.
+    localStorage.removeItem("pc.crashReporting"); // start from "not yet asked"
+    useStore.setState({ crashReporting: null });
+    let release!: () => void;
+    m.setTelemetryConsent.mockReturnValueOnce(
+      new Promise<void>((res) => {
+        release = res;
+      }),
+    );
+
+    const pending = useStore.getState().setCrashReporting(true);
+    expect(m.setTelemetryConsent).toHaveBeenCalledWith(true);
+    expect(localStorage.getItem("pc.crashReporting")).toBeNull(); // not yet persisted
+    expect(useStore.getState().crashReporting).toBeNull(); // not yet flipped
+
+    release();
+    await pending;
+
     expect(localStorage.getItem("pc.crashReporting")).toBe("1");
+    expect(useStore.getState().crashReporting).toBe(true);
+  });
+
+  it("setCrashReporting leaves consent UNCHANGED when the host rejects", async () => {
+    // The host gate is authoritative: a rejected consent change must NOT optimistically
+    // flip the local pref/state — the choice stays unchanged so the two never disagree.
+    localStorage.removeItem("pc.crashReporting"); // start from "not yet asked"
+    useStore.setState({ crashReporting: null });
+    m.setTelemetryConsent.mockRejectedValueOnce(new Error("host refused"));
+
+    await expect(useStore.getState().setCrashReporting(true)).rejects.toThrow("host refused");
+
+    expect(useStore.getState().crashReporting).toBeNull(); // unchanged (not yet asked)
+    expect(localStorage.getItem("pc.crashReporting")).toBeNull(); // not persisted
   });
 });
 

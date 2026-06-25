@@ -110,49 +110,105 @@ jobs:
           arguments: "--all-features"
           command-arguments: "--config deny.toml"
 
-      # ── Build the NSIS installer (UNSIGNED) ───────────────────────────────────
-      # createUpdaterArtifacts is NOT enabled, so this never needs a signing key
-      # and works in forks / dry runs. For NSIS the updater target IS the
-      # setup.exe, which we Authenticode-sign first and updater-sign afterwards.
-      - name: Build app (tauri build → NSIS)
-        run: pnpm app:build
+      # ── Build pipeline (UNSIGNED installer) ───────────────────────────────────
+      # The frontend build and the `tauri build` packaging are split ON PURPOSE so
+      # webview sourcemaps (.map) can be uploaded to Sentry and then STRIPPED from
+      # ../dist BEFORE Tauri packages it — otherwise the .map files ride inside the
+      # NSIS installer (frontendDist=../dist is bundled verbatim). Ordering:
+      #   1. pnpm build            → emits dist/**/*.map (only when SENTRY_AUTH_TOKEN set)
+      #   2. read version          → for the Sentry release name + later steps
+      #   3. upload sourcemaps     → to Sentry (secret-gated; consumes dist/**/*.map)
+      #   4. strip dist/**/*.map   → so the maps never reach the installer
+      #   5. tauri build           → packages the now-map-free ../dist (frontend NOT
+      #                              rebuilt: PORTCODE_SKIP_FRONTEND_BUILD makes
+      #                              beforeBuildCommand a no-op so step 4 isn't undone)
+      #   6. locate installer
+      # createUpdaterArtifacts is NOT enabled, so this never needs a signing key and
+      # works in forks / dry runs. For NSIS the updater target IS the setup.exe,
+      # which we Authenticode-sign first and updater-sign afterwards.
+      - name: Build frontend (vite) — emits sourcemaps when SENTRY_AUTH_TOKEN set
+        run: pnpm build
 
-      - name: Locate installer + read version
+      - name: Read app version
         id: artifact
         shell: pwsh
         run: |
-          $dir = "src-tauri/target/release/bundle/nsis"
-          $exe = Get-ChildItem -Path $dir -Filter *-setup.exe -ErrorAction Stop | Select-Object -First 1
-          if (-not $exe) { throw "No NSIS *-setup.exe found under $dir" }
           $ver = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          "path=$($exe.FullName)"   >> $env:GITHUB_OUTPUT
-          "name=$($exe.Name)"       >> $env:GITHUB_OUTPUT
-          "dir=$dir"                >> $env:GITHUB_OUTPUT
-          "version=$ver"            >> $env:GITHUB_OUTPUT
-          Write-Host "Installer: $($exe.FullName)  (v$ver)"
+          "dir=src-tauri/target/release/bundle/nsis" >> $env:GITHUB_OUTPUT
+          "version=$ver"                              >> $env:GITHUB_OUTPUT
+          Write-Host "App version: v$ver"
 
       # ── Sentry symbolication (Phase 2, SECRET-GATED) ──────────────────────────
-      # Makes crash reports readable: uploads the Rust/native debug symbols (.pdb,
-      # debug-id matched — this is what symbolicates desktop MINIDUMPS + Rust panics)
-      # and the webview JS sourcemaps (release matched). The release name is the BARE
-      # app version, matching what the SDKs report (Rust = CARGO_PKG_VERSION; webview
-      # = app version). Skipped cleanly without SENTRY_AUTH_TOKEN so dry runs / forks
-      # never hard-fail. (`[profile.release] debug = true` emits the .pdb; `strip`
-      # still strips the shipped .exe.)
-      - name: Upload debug symbols + sourcemaps to Sentry
-        if: env.SENTRY_AUTH_TOKEN != ''
+      # Makes crash reports readable. Split across two steps because the inputs
+      # become available at different points in the pipeline:
+      #   • webview JS sourcemaps (release matched) — uploaded HERE, BEFORE `tauri
+      #     build`, while dist/**/*.map still exists; stripped immediately after so
+      #     they never reach the installer.
+      #   • Rust/native debug symbols (.pdb, debug-id matched — symbolicates desktop
+      #     MINIDUMPS + Rust panics) — uploaded LATER, after `tauri build` produces
+      #     them. (`[profile.release] debug = true` emits the .pdb; `strip` still
+      #     strips the shipped .exe.)
+      # The release name is the BARE app version, matching what the SDKs report
+      # (Rust = CARGO_PKG_VERSION; webview = app version). Skipped cleanly without a
+      # complete Sentry config so dry runs / forks never hard-fail.
+      - name: Upload webview sourcemaps to Sentry
+        # Require ALL three: `sentry-cli releases` needs the org + project too, not
+        # just the auth token — a partial config would otherwise hard-fail here.
+        if: env.SENTRY_AUTH_TOKEN != '' && env.SENTRY_ORG != '' && env.SENTRY_PROJECT != ''
+        shell: pwsh
+        env:
+          # Pass the version through env (NOT inline `${{ }}` in the script body) so a
+          # crafted tag/version can't inject into the PowerShell command — template
+          # injection is only possible when the expansion lands inside `run:`.
+          SENTRY_RELEASE: ${{ steps.artifact.outputs.version }}
+        run: |
+          $rel = $env:SENTRY_RELEASE
+          npx -y @sentry/cli@3.5.1 releases new "$rel"
+          npx -y @sentry/cli@3.5.1 releases files "$rel" upload-sourcemaps ./dist
+          npx -y @sentry/cli@3.5.1 releases finalize "$rel"
+
+      # ── Strip sourcemaps BEFORE Tauri packages ../dist ────────────────────────
+      # Tauri bundles frontendDist (../dist) verbatim, so any dist/**/*.map left here
+      # would ship inside the NSIS installer. They've already been uploaded to Sentry
+      # above (when configured), so remove them now. Always runs — when no token was
+      # set, vite emitted no maps and this is a no-op. The subsequent `tauri build`
+      # does NOT regenerate them: PORTCODE_SKIP_FRONTEND_BUILD turns its
+      # beforeBuildCommand into a no-op.
+      - name: Strip webview sourcemaps from dist (keep them out of the installer)
         shell: pwsh
         run: |
-          $rel = "${{ steps.artifact.outputs.version }}"
-          npx -y @sentry/cli@3.5.1 debug-files upload --include-sources src-tauri/target/release
-          npx -y @sentry/cli@3.5.1 releases new $rel
-          npx -y @sentry/cli@3.5.1 releases files $rel upload-sourcemaps ./dist
-          npx -y @sentry/cli@3.5.1 releases finalize $rel
+          Get-ChildItem -Path ./dist -Filter *.map -Recurse -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "Removing $($_.FullName)"; Remove-Item -Force $_.FullName }
 
-      - name: Note — Sentry symbolication skipped (no SENTRY_AUTH_TOKEN)
-        if: env.SENTRY_AUTH_TOKEN == ''
+      # ── Build the NSIS installer (UNSIGNED) ───────────────────────────────────
+      # PORTCODE_SKIP_FRONTEND_BUILD makes beforeBuildCommand (pnpm build:if-needed)
+      # a no-op so the just-stripped ../dist is packaged as-is (no map regeneration).
+      - name: Build app (tauri build → NSIS)
+        env:
+          PORTCODE_SKIP_FRONTEND_BUILD: "1"
+        run: pnpm app:build
+
+      - name: Locate installer
+        id: installer
         shell: pwsh
-        run: Write-Host "::warning title=No symbolication::SENTRY_AUTH_TOKEN absent — skipping debug-file + sourcemap upload. Crashes will be unsymbolicated. Expected for dry runs/forks."
+        run: |
+          $dir = "${{ steps.artifact.outputs.dir }}"
+          $exe = Get-ChildItem -Path $dir -Filter *-setup.exe -ErrorAction Stop | Select-Object -First 1
+          if (-not $exe) { throw "No NSIS *-setup.exe found under $dir" }
+          "path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
+          "name=$($exe.Name)"     >> $env:GITHUB_OUTPUT
+          Write-Host "Installer: $($exe.FullName)"
+
+      - name: Upload Rust debug symbols to Sentry
+        if: env.SENTRY_AUTH_TOKEN != '' && env.SENTRY_ORG != '' && env.SENTRY_PROJECT != ''
+        shell: pwsh
+        run: |
+          npx -y @sentry/cli@3.5.1 debug-files upload --include-sources src-tauri/target/release
+
+      - name: Note — Sentry symbolication skipped (no Sentry config)
+        if: env.SENTRY_AUTH_TOKEN == '' || env.SENTRY_ORG == '' || env.SENTRY_PROJECT == ''
+        shell: pwsh
+        run: Write-Host "::warning title=No symbolication::Sentry config incomplete (need SENTRY_AUTH_TOKEN + SENTRY_ORG + SENTRY_PROJECT) — skipping debug-file + sourcemap upload. Crashes will be unsymbolicated. Expected for dry runs/forks."
 
       # ── Authenticode signing via Azure Trusted Signing (SECRET-GATED) ─────────
       # Signs the installer in place so SmartScreen / Defender trust it. Skipped
@@ -187,7 +243,7 @@ jobs:
       - name: Sign updater artifact (tauri signer sign)
         if: env.TAURI_SIGNING_PRIVATE_KEY != ''
         shell: pwsh
-        run: pnpm tauri signer sign "${{ steps.artifact.outputs.path }}"
+        run: pnpm tauri signer sign "${{ steps.installer.outputs.path }}"
 
       - name: Note — updater signature skipped (no updater key)
         if: env.TAURI_SIGNING_PRIVATE_KEY == ''
@@ -211,8 +267,8 @@ jobs:
         if: env.TAURI_SIGNING_PRIVATE_KEY != ''
         shell: pwsh
         run: |
-          $exe  = "${{ steps.artifact.outputs.path }}"
-          $name = "${{ steps.artifact.outputs.name }}"
+          $exe  = "${{ steps.installer.outputs.path }}"
+          $name = "${{ steps.installer.outputs.name }}"
           $ver  = "${{ steps.artifact.outputs.version }}"
           $dir  = "${{ steps.artifact.outputs.dir }}"
           if (-not (Test-Path "$exe.sig")) { throw "Expected updater signature $exe.sig not found" }

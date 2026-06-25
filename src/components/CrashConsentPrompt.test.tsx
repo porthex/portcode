@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { CrashConsentPrompt } from "./CrashConsentPrompt";
 import { useStore } from "../store/store";
 
@@ -18,17 +18,24 @@ describe("CrashConsentPrompt", () => {
     expect(screen.getByText("HELP FIX CRASHES?")).toBeInTheDocument();
   });
 
-  it("Enable crash reports sets consent true", () => {
+  it("discloses the desktop minidump caveat", () => {
+    render(<CrashConsentPrompt />);
+    expect(screen.getByText(/memory snapshot \(minidump\)/i)).toBeInTheDocument();
+  });
+
+  it("Enable crash reports sets consent true", async () => {
     render(<CrashConsentPrompt />);
     fireEvent.click(screen.getByText("Enable crash reports"));
-    expect(useStore.getState().crashReporting).toBe(true);
+    // setCrashReporting tells the Rust host FIRST and only flips state/pref once it
+    // acknowledges (a microtask later), so await the resulting state change.
+    await waitFor(() => expect(useStore.getState().crashReporting).toBe(true));
     expect(localStorage.getItem("pc.crashReporting")).toBe("1");
   });
 
-  it("No thanks sets consent false (declined, not unset)", () => {
+  it("No thanks sets consent false (declined, not unset)", async () => {
     render(<CrashConsentPrompt />);
     fireEvent.click(screen.getByText("No thanks"));
-    expect(useStore.getState().crashReporting).toBe(false);
+    await waitFor(() => expect(useStore.getState().crashReporting).toBe(false));
     expect(localStorage.getItem("pc.crashReporting")).toBe("0");
   });
 });

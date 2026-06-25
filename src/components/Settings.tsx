@@ -397,7 +397,7 @@ export function SettingsPanel() {
             <div>
               <ToggleRow
                 label="Crash & performance reports"
-                hint="Send anonymous, scrubbed crash + basic performance reports — never your prompts, code, files, or keys. Off by default."
+                hint="Send anonymous, scrubbed crash + basic performance reports — never your prompts, code, files, or keys. Desktop native crashes also attach a memory snapshot (minidump) that can't be scrubbed and may contain fragments of secrets. Off by default."
                 on={crashReporting === true}
                 onToggle={() => setCrashReporting(crashReporting !== true)}
               />

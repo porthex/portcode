@@ -36,11 +36,7 @@ export function RemoteChatHeader() {
             </svg>
           </button>
 
-          <button
-            onClick={() => setSwitcherOpen(true)}
-            aria-label="Switch session"
-            className="min-w-0 flex-1 text-left"
-          >
+          <button onClick={() => setSwitcherOpen(true)} className="min-w-0 flex-1 text-left">
             <div className="flex items-center gap-[7px]">
               <span className="min-w-0 truncate text-[14.5px] font-semibold text-fg">{title}</span>
               <span className="shrink-0 text-[11px] text-faint" aria-hidden="true">

@@ -291,8 +291,11 @@ invest time, here is what does and does not belong in this repository. See
 
 **Telemetry:** Portcode sends **no telemetry by default** and has no phone-home.
 There is one sanctioned, **opt-in, off-by-default** crash/error reporting path
-(scrubbed, EU-region Sentry, and armed only in official release builds — the DSN
-is never in source, so contributor and fork builds cannot report); see
+(scrubbed event payloads, EU-region Sentry, and armed only in official release
+builds — the DSN is never in source, so contributor and fork builds cannot
+report). One caveat: desktop **native-crash minidumps are NOT scrubbed** — they
+are a snapshot of process memory that can contain secrets, an owner-accepted
+trade-off that is still fully consent-gated (off by default). See
 [SECURITY.md](SECURITY.md) for exactly what it sends. PRs that add any _other_
 telemetry or phone-home behavior, that weaken the off-by-default / consent /
 scrubbing guarantees, or that bake a reporting DSN into source will be declined.

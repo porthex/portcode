@@ -248,10 +248,17 @@ async fn run_inner(
 ) -> Result<String, String> {
     let snapshot = { settings.lock().unwrap().clone() };
 
-    // Prefer the per-session model threaded from the frontend; fall back to the
-    // global settings default when it is absent or empty.
+    // Resolve the model for this turn, most-specific first:
+    //   1. the model threaded from the desktop frontend (`run_agent`), if any;
+    //   2. else the session ROW's persisted model — the source of truth for a
+    //      remote (phone-driven) turn, which calls `agent::run(..., None)` because
+    //      the phone's `Run` command carries no model override;
+    //   3. else the global settings default (legacy rows with a null model).
+    // Without step 2 a phone-sync turn would ignore the chat's chosen model and
+    // always use the desktop default.
     let active_model = model
         .filter(|m| !m.is_empty())
+        .or_else(|| db.session_model(session_id).filter(|m| !m.is_empty()))
         .unwrap_or_else(|| snapshot.model.clone());
 
     let mut cred = secrets::load_credential().ok_or(

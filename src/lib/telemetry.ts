@@ -81,6 +81,10 @@ export function initTelemetry(consent: boolean | null): boolean {
  *  couldn't cleanly re-init. Flipping the flag makes `beforeSend` drop everything —
  *  instant, total, and reversible. */
 export function shutdownTelemetry(): void {
+  // Wipe the current scope (breadcrumbs/tags/user) so nothing captured during the
+  // consented period lingers and leaks into a later opt-in session. We still avoid
+  // Sentry.close() so reporting stays cheaply reversible via the consent flag.
+  Sentry.getCurrentScope().clear();
   consentLive = false;
 }
 

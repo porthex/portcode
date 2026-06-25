@@ -7,6 +7,8 @@
  *  be called with an optional session's workspace (`session?.workspace`). */
 export function workspaceLabel(workspace: string | null | undefined): string {
   if (!workspace) return "local";
+  if (/^[\\/]+$/.test(workspace)) return workspace; // POSIX root "/"
+  if (/^[A-Za-z]:[\\/]?$/.test(workspace)) return workspace.replace(/[\\/]+$/, ""); // Windows drive root
   const parts = workspace.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] || "local";
 }

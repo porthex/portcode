@@ -153,9 +153,11 @@ impl Db {
             );",
         )?;
         // Migrate pre-existing databases: the CREATE-IF-NOT-EXISTS above won't add
-        // a column to a table that already exists, so add `model` in place. A
-        // duplicate-column error (column already present) is expected and ignored.
-        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT", []);
+        // a column to a table that already exists, so add `model` in place. Guarded
+        // by a `PRAGMA table_info` probe (same pattern as `migrate_add_confirmed`)
+        // so a real error (locked DB, disk failure) propagates instead of being
+        // swallowed alongside the expected "duplicate column name".
+        Self::migrate_add_model(&conn)?;
         // ADDITIVE migration: a `paired_devices` table created before the
         // device-trust gate landed has no `confirmed` column. Add it without
         // dropping the table, defaulting every pre-existing row to 0 (untrusted).
@@ -169,6 +171,23 @@ impl Db {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Idempotently add the `model` column to a legacy `sessions` table. No-op
+    /// when the column already exists (fresh DBs create it inline). Probes
+    /// `PRAGMA table_info` first so a genuine error (locked DB / disk failure) is
+    /// propagated rather than swallowed alongside the expected "duplicate column
+    /// name" once the column is present.
+    fn migrate_add_model(conn: &Connection) -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+        let has_model = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(|c| c.ok())
+            .any(|name| name == "model");
+        if !has_model {
+            conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT", [])?;
+        }
+        Ok(())
     }
 
     /// Idempotently add the `confirmed` column to a legacy `paired_devices`
@@ -231,6 +250,33 @@ impl Db {
             params![id, title],
         )?;
         Ok(())
+    }
+
+    /// Update an existing session's model (per-session model selection). Mirrors
+    /// `rename_session`: a plain `UPDATE ... WHERE id`, a no-op for an unknown id.
+    /// Pass `None` to clear it back to the global-default fallback.
+    pub fn set_session_model(&self, id: &str, model: Option<&str>) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET model = ?2 WHERE id = ?1",
+            params![id, model],
+        )?;
+        Ok(())
+    }
+
+    /// The session's persisted model, if any. `None` for an unknown id, a legacy
+    /// row that predates per-session model, or a DB read error (the caller then
+    /// falls back to the global default). The serve-time source of truth a remote
+    /// turn reads, since the phone's `Run` command carries no model override.
+    pub fn session_model(&self, id: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT model FROM sessions WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
     }
 
     pub fn touch_session(&self, id: &str, ts: i64) {
@@ -603,6 +649,71 @@ mod tests {
             .find(|s| s.id == "b")
             .unwrap();
         assert_eq!(b.title, "Derived");
+    }
+
+    #[test]
+    fn set_session_model_updates_an_existing_row_and_reads_back() {
+        let db = mem_db();
+        db.create_session("a", "A", None, None, 1).unwrap();
+        // Legacy / unset row has no model.
+        assert_eq!(db.session_model("a"), None);
+
+        db.set_session_model("a", Some("claude-sonnet-4-6"))
+            .unwrap();
+        assert_eq!(db.session_model("a").as_deref(), Some("claude-sonnet-4-6"));
+        // The model is observable in the listed row too (survives reload/catch-up).
+        assert_eq!(
+            db.list_sessions().unwrap()[0].model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+
+        // Passing None clears it back to the global-default fallback.
+        db.set_session_model("a", None).unwrap();
+        assert_eq!(db.session_model("a"), None);
+    }
+
+    #[test]
+    fn set_session_model_is_a_no_op_for_an_unknown_id() {
+        let db = mem_db();
+        assert!(db.set_session_model("ghost", Some("x")).is_ok());
+        assert_eq!(db.session_model("ghost"), None);
+    }
+
+    #[test]
+    fn migrate_add_model_is_additive_and_preserves_legacy_rows() {
+        // Simulate a PRE-MIGRATION sessions table with no `model` column.
+        let conn = Connection::open(Path::new(":memory:")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO sessions (id, title, workspace, created_at, updated_at)
+            VALUES ('legacy', 'Old chat', NULL, 100, 100);",
+        )
+        .unwrap();
+
+        // Migrating must ADD the column (not drop the table) and default the legacy
+        // row's model to NULL (falls back to the global default at read time).
+        Db::migrate_add_model(&conn).unwrap();
+        let model: Option<String> = conn
+            .query_row("SELECT model FROM sessions WHERE id = 'legacy'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(model, None);
+        let title: String = conn
+            .query_row("SELECT title FROM sessions WHERE id = 'legacy'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "Old chat");
+
+        // Idempotent: a second migration is a no-op, not a "duplicate column" error.
+        Db::migrate_add_model(&conn).unwrap();
     }
 
     #[test]

@@ -49,7 +49,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use sentry::protocol::{Context, Event, Frame};
+use sentry::protocol::{Context, DebugImage, Event, Frame};
 
 use crate::scrub::redact_secrets;
 
@@ -128,8 +128,9 @@ fn consent_is_live() -> bool {
 /// gates sending — so opt-out is instant + total and opt-in is just a flag flip.
 ///
 ///  * `true`  → write `"1"` to the consent file.
-///  * `false` → remove the file (best-effort; a leftover-then-removed file would
-///    still read as off, but removing keeps no stale "1" around).
+///  * `false` → write `"0"` (authoritative off) FIRST, then best-effort remove the
+///    file. Writing "0" before deleting guarantees that even if both IO ops fail the
+///    on-disk content can never be a stale "1" (= live); the worst case is "0" = off.
 ///
 /// Best-effort IO: errors are swallowed. The fail-safe is OFF, so a failed write on
 /// opt-IN simply means nothing is sent (never the reverse) — the privacy-safe
@@ -144,11 +145,13 @@ pub fn set_consent(enabled: bool) {
         }
         let _ = std::fs::write(&path, "1");
     } else {
-        // Removing is enough; if removal fails the leftover content is "1", so as a
-        // belt-and-suspenders also try to overwrite with "0" (read as off).
-        if std::fs::remove_file(&path).is_err() {
-            let _ = std::fs::write(&path, "0");
-        }
+        // The on-disk file is AUTHORITATIVE, so make it read as off FIRST: write "0"
+        // (which `consent_is_live` treats as off) before attempting deletion. A failed
+        // remove + failed write previously could have left a stale "1" = still live;
+        // writing "0" first means the worst case is a "0" file (off), never a stale
+        // "1". Then best-effort remove so no flag lingers when IO succeeds.
+        let _ = std::fs::write(&path, "0");
+        let _ = std::fs::remove_file(&path);
     }
 }
 
@@ -395,16 +398,57 @@ fn strip_pii_carriers(event: &mut Event<'static>) {
     event.extra.clear();
     event.modules.clear();
     event.tags.clear();
-    // Debug-image metadata embeds local binary paths (the image `name`). We don't
-    // symbolicate server-side, so drop the images entirely. `debug_meta` is a
-    // `Cow<DebugMeta>`; `.to_mut()` clones-on-write so we can clear in place.
-    event.debug_meta.to_mut().images.clear();
+    // Debug-image metadata embeds local binary paths (the image `name`/`code_file`/
+    // `debug_file`), but it ALSO carries the `debug_id`/`uuid` + load addresses that
+    // Phase-2 needs for server-side symbolication of the uploaded debug files +
+    // sourcemaps. So we DON'T drop the list (that would defeat Phase 2); we redact
+    // only the path-like string fields per variant and keep the identifying + address
+    // fields. `debug_meta` is a `Cow<DebugMeta>`; `.to_mut()` clones-on-write.
+    for image in event.debug_meta.to_mut().images.iter_mut() {
+        redact_debug_image(image);
+    }
     // Keep only the os / runtime / app(-version) contexts; drop everything else
     // (notably `device`, whose name is the hostname; `trace`, `gpu`, `browser`).
     event.contexts.retain(|key, ctx| {
         matches!(key.as_str(), "os" | "runtime" | "app")
             && matches!(ctx, Context::Os(_) | Context::Runtime(_) | Context::App(_))
     });
+}
+
+/// Redact the LOCAL-PATH string fields of a single `DebugImage` in place while
+/// PRESERVING the identifiers (`debug_id`/`uuid`/`id`) and address/arch fields that
+/// server-side symbolication needs (Phase 2 uploads matching debug files +
+/// sourcemaps keyed by those ids). Sentry 0.34's `DebugImage` is a closed (NOT
+/// `#[non_exhaustive]`) enum with exactly four variants (`Apple`/`Symbolic`/
+/// `Proguard`/`Wasm`, verified against sentry-types 0.34 `protocol/v7.rs`), so the
+/// match is exhaustive with NO wildcard arm (a wildcard would be an unreachable
+/// pattern and fail `-D warnings`). Belt-and-suspenders: any path string this misses
+/// is still caught by the `deep_redact_event` round-trip in `scrub_event`. We handle
+/// every variant:
+///   * Apple    — `name` (filename/path) cleared; keep arch/cpu_*/image_addr/
+///     image_size/image_vmaddr/uuid.
+///   * Symbolic — `name` (== `code_file`, the abs path) and `debug_file` (companion
+///     path) cleared; keep arch/image_addr/image_size/image_vmaddr/id (debug_id) and
+///     `code_id` (a content hash, not a path).
+///   * Proguard — only a `uuid`, no path; nothing to redact.
+///   * Wasm     — `name`/`code_file`/`debug_file` (paths/URLs) cleared; keep
+///     debug_id/code_id.
+fn redact_debug_image(image: &mut DebugImage) {
+    match image {
+        DebugImage::Apple(img) => {
+            img.name.clear();
+        }
+        DebugImage::Symbolic(img) => {
+            img.name.clear();
+            img.debug_file = None;
+        }
+        DebugImage::Proguard(_) => {}
+        DebugImage::Wasm(img) => {
+            img.name.clear();
+            img.code_file.clear();
+            img.debug_file = None;
+        }
+    }
 }
 
 /// Capture a redacted error-level message for explicit "should never happen"
@@ -818,20 +862,24 @@ mod tests {
         event.exception.values.push(exc);
         event.threads.values.push(thread);
         event.breadcrumbs.values.push(crumb);
-        // A debug image whose `name` is a local binary path.
+        // A debug image whose `name` is a local binary path. We assert below that the
+        // path is scrubbed but the identifying `uuid` (debug_id) + addresses SURVIVE,
+        // since Phase 2 needs them for server-side symbolication of uploaded debug
+        // files — clearing the whole image list would defeat that.
+        let dbg_uuid = uuid::Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
         event
             .debug_meta
             .to_mut()
             .images
             .push(DebugImage::Apple(AppleDebugImage {
                 name: r"C:\Users\Memphi$\app\portcode.exe".to_string(),
-                arch: None,
+                arch: Some("arm64".to_string()),
                 cpu_type: None,
                 cpu_subtype: None,
-                image_addr: Addr(0),
-                image_size: 0,
+                image_addr: Addr(0x1000),
+                image_size: 4096,
                 image_vmaddr: Addr(0),
-                uuid: uuid::Uuid::nil(),
+                uuid: dbg_uuid,
             }));
         event
             .extra
@@ -899,6 +947,26 @@ mod tests {
             Some("phone_sync_connect /home/~user/secret")
         );
         assert!(crumb.data.is_empty());
+
+        // Debug image: the local path in `name` is scrubbed, but the image is NOT
+        // dropped — its `uuid` (debug_id) + addresses survive so Phase-2 server-side
+        // symbolication still works against the uploaded debug files.
+        let images = &out.debug_meta.images;
+        assert_eq!(
+            images.len(),
+            1,
+            "debug image must be preserved, not cleared"
+        );
+        match &images[0] {
+            DebugImage::Apple(img) => {
+                assert!(img.name.is_empty(), "binary path in name must be cleared");
+                assert_eq!(img.uuid, dbg_uuid, "debug_id (uuid) must survive");
+                assert_eq!(img.image_addr.0, 0x1000, "image_addr must survive");
+                assert_eq!(img.image_size, 4096, "image_size must survive");
+                assert_eq!(img.arch.as_deref(), Some("arm64"), "arch must survive");
+            }
+            other => panic!("expected Apple debug image, got {other:?}"),
+        }
     }
 
     #[test]

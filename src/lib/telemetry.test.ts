@@ -4,11 +4,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 // @sentry/react and toggle the DSN env to drive every gate branch. Like ipc.test,
 // we reload the module per test because it keeps a module-level `active` flag.
 
+const scopeClear = vi.fn();
+
 vi.mock("@sentry/react", () => ({
   init: vi.fn(),
   close: vi.fn().mockResolvedValue(true),
   captureException: vi.fn(),
   browserTracingIntegration: vi.fn(() => ({ name: "BrowserTracing" })),
+  getCurrentScope: vi.fn(() => ({ clear: scopeClear })),
 }));
 
 const DSN = "https://abc@o1.ingest.sentry.io/1";
@@ -122,12 +125,17 @@ describe("reportError / consent lifecycle", () => {
     telemetry.shutdownTelemetry();
     expect(telemetry.isTelemetryActive()).toBe(false);
     expect(sentry.close).not.toHaveBeenCalled(); // we deliberately never close()
+    // Opt-out wipes the scope so stale breadcrumbs/tags/user from the consented
+    // period can't leak into a later opt-in session.
+    expect(scopeClear).toHaveBeenCalledTimes(1);
     // Off → the SAME beforeSend now drops everything (incl. auto-instrumented events).
     expect(beforeSend({ event_id: "2", message: "leak" } as never, {} as never)).toBeNull();
 
-    // Opt back in → live again, but NO second Sentry.init.
+    // Opt back in → live again, but NO second Sentry.init. The scope stays empty
+    // (clear ran on opt-out; re-opt-in does not re-populate it).
     expect(telemetry.initTelemetry(true)).toBe(true);
     expect(sentry.init).toHaveBeenCalledTimes(1);
+    expect(scopeClear).toHaveBeenCalledTimes(1);
     expect(telemetry.isTelemetryActive()).toBe(true);
     expect(beforeSend({ event_id: "3", message: "ok" } as never, {} as never)).not.toBeNull();
   });

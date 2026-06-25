@@ -255,6 +255,16 @@ export async function renameSession(id: string, title: string): Promise<void> {
   }
 }
 
+/** Persist an existing session's model (per-session model selection). Desktop-only
+ *  on the core side; a no-op in the browser preview. Pass null to clear it back to
+ *  the global-default fallback. */
+export async function setSessionModel(id: string, model: string | null): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("set_session_model", { id, model });
+  }
+}
+
 export async function deleteSession(id: string): Promise<void> {
   if (isTauri()) {
     const { core } = await tauri();

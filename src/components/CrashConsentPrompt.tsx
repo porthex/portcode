@@ -33,6 +33,10 @@ export function CrashConsentPrompt() {
               <span className="text-accent-2">✓</span> Off unless you turn it on — change it anytime
               in Settings
             </li>
+            <li>
+              <span className="text-muted">·</span> Desktop native crashes also attach a memory
+              snapshot (minidump) that can&apos;t be scrubbed and may contain secrets
+            </li>
           </ul>
           <button
             onClick={() => setCrashReporting(true)}

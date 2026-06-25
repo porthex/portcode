@@ -90,14 +90,33 @@ fn redactors() -> &'static [Redactor] {
     })
 }
 
-/// Run every redaction pass over a string. Caps length first (dump guard), then
-/// applies each pass in order. Safe on any string.
+/// Overlap window scanned PAST `MAX_REDACT_LEN` before the final cap. A secret that
+/// straddles the cap boundary (its prefix inside `MAX_REDACT_LEN`, its tail just
+/// past it) would otherwise have its in-bounds prefix survive unredacted. By running
+/// the redactors over `MAX_REDACT_LEN + OVERLAP` chars we let such a secret match
+/// fully (any single redacted token is far shorter than this window), THEN apply the
+/// hard output cap. 256 comfortably exceeds the longest secret we match.
+const REDACT_OVERLAP: usize = 256;
+
+/// Run every redaction pass over a string. Safe on any string.
+///
+/// Boundary-safe truncation: we don't cap to `MAX_REDACT_LEN` BEFORE redacting (that
+/// would leave the in-bounds prefix of a secret straddling the boundary unredacted).
+/// Instead we redact over an extended slice (`MAX_REDACT_LEN + REDACT_OVERLAP` chars)
+/// so any boundary-straddling secret matches in full, and only THEN apply the output
+/// cap + the "…[truncated]" marker. All slicing is by CHARS (never bytes) so we never
+/// split a UTF-8 codepoint; this mirrors the JS `slice(0, MAX_REDACT_LEN)`.
 pub fn redact_secrets(value: &str) -> String {
-    // Cap by CHARS (not bytes) so we never split a UTF-8 codepoint. This mirrors the
-    // JS `slice(0, MAX_REDACT_LEN)` which is also codepoint(-ish)-aware.
-    let capped = value.chars().count() > MAX_REDACT_LEN;
+    let total = value.chars().count();
+    let capped = total > MAX_REDACT_LEN;
+
+    // Slice we actually run the redactors over: the full string when short, otherwise
+    // the cap plus a small overlap so a secret crossing the cap is redacted whole.
     let mut out: String = if capped {
-        value.chars().take(MAX_REDACT_LEN).collect()
+        value
+            .chars()
+            .take(MAX_REDACT_LEN + REDACT_OVERLAP)
+            .collect()
     } else {
         value.to_string()
     };
@@ -106,6 +125,11 @@ pub fn redact_secrets(value: &str) -> String {
         out = r.re.replace_all(&out, r.repl).into_owned();
     }
     if capped {
+        // Apply the final hard cap (by chars) AFTER redaction, then mark truncation.
+        // Redaction can shrink OR grow the slice, so re-measure before capping.
+        if out.chars().count() > MAX_REDACT_LEN {
+            out = out.chars().take(MAX_REDACT_LEN).collect();
+        }
         out.push_str("…[truncated]");
     }
     out
@@ -214,6 +238,38 @@ mod tests {
         let out = redact_secrets(&huge);
         assert!(out.chars().count() < 3000);
         assert!(out.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn redacts_a_secret_straddling_the_truncation_boundary() {
+        // A secret whose prefix sits inside MAX_REDACT_LEN but whose tail spills past
+        // it must be FULLY redacted. We place an sk-ant key so that only `sk-ant-bo`
+        // (9 chars) is in-bounds — too short to match `sk-ant-[...]{6,}` on its own —
+        // and the rest spills past the cap. The OLD cap-BEFORE-redact path would slice
+        // off the tail and leave `sk-ant-bo` riding out unredacted; the fix scans the
+        // overlap window so the whole key matches and is redacted before the cap.
+        let key = "sk-ant-boundarysecret1234567890"; // 31 chars
+        let pad = MAX_REDACT_LEN - 9; // only "sk-ant-bo" lands in-bounds
+        let input = format!("{}{key} trailing", "x".repeat(pad));
+        let out = redact_secrets(&input);
+
+        // Neither the whole key nor any unredacted slice of it may survive — in
+        // particular the in-bounds prefix that the old path would have leaked.
+        assert!(!out.contains(key), "full boundary key survived: {out}");
+        assert!(
+            !out.contains("sk-ant-"),
+            "an unredacted sk-ant fragment survived the boundary: {out}"
+        );
+        // The redaction marker begins where the key was (it may itself be clipped by
+        // the hard cap since the key sat right at the boundary — that's fine; the
+        // contract is only that no secret survives).
+        assert!(
+            out.contains("[redacted"),
+            "boundary key was not redacted: {out}"
+        );
+        assert!(out.ends_with("…[truncated]"));
+        // Final output is still hard-capped (cap + marker), not the overlap window.
+        assert!(out.chars().count() <= MAX_REDACT_LEN + "…[truncated]".chars().count());
     }
 
     #[test]
