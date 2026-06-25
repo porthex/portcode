@@ -1,6 +1,14 @@
 import { useEffect, useRef } from "react";
 import { useStore } from "../store/store";
-import { estimateCost } from "../types";
+import { estimateCost, PROVIDERS } from "../types";
+
+/** Read the active session's model, falling back to the global default. */
+function useActiveModel(): string {
+  return useStore((s) => {
+    const sess = s.activeId ? s.sessions.find((x) => x.id === s.activeId) : undefined;
+    return sess?.model ?? s.settings.model;
+  });
+}
 
 // Auto-grow cap; kept in sync with the textarea's inline maxHeight so the JS
 // target and the CSS clip agree (otherwise the grow stops short at the smaller).
@@ -93,6 +101,7 @@ export function Composer() {
             style={{ maxHeight: MAX_TEXTAREA_H }}
             className="flex-1 resize-none bg-transparent text-[13.5px] leading-[1.5] text-fg outline-none transition-[height,opacity,filter] duration-150 ease-out motion-reduce:transition-none placeholder:text-faint select-text disabled:cursor-not-allowed disabled:opacity-60 disabled:saturate-[0.6]"
           />
+          <ModelPicker />
           {streaming ? (
             <button
               onClick={() => void stop()}
@@ -134,8 +143,35 @@ export function Composer() {
   );
 }
 
+/** Compact, provider-grouped picker for the ACTIVE session's model. */
+function ModelPicker() {
+  const model = useActiveModel();
+  const setSessionModel = useStore((s) => s.setSessionModel);
+  const activeId = useStore((s) => s.activeId);
+  const streaming = useStore((s) => s.streaming);
+  return (
+    <select
+      aria-label="Model"
+      value={model}
+      onChange={(e) => void setSessionModel(e.target.value)}
+      disabled={streaming || !activeId}
+      className="shrink-0 rounded-lg border border-border bg-panel-2 px-2.5 py-1.5 text-[12px] text-fg outline-none disabled:opacity-50"
+    >
+      {PROVIDERS.map((p) => (
+        <optgroup key={p.id} label={p.label}>
+          {p.models.map((mdl) => (
+            <option key={mdl.id} value={mdl.id}>
+              {mdl.label}
+            </option>
+          ))}
+        </optgroup>
+      ))}
+    </select>
+  );
+}
+
 function UsageMeter() {
-  const model = useStore((s) => s.settings.model);
+  const model = useActiveModel();
   const usage = useStore((s) => (s.activeId ? s.usage[s.activeId] : undefined));
   const total = usage ? usage.input + usage.output : 0;
   const cost = usage ? estimateCost(model, usage) : 0;

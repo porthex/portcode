@@ -191,6 +191,7 @@ fn create_session(
     id: String,
     title: Option<String>,
     workspace: Option<String>,
+    model: Option<String>,
 ) -> Result<(), String> {
     state
         .db
@@ -198,6 +199,7 @@ fn create_session(
             &id,
             title.as_deref().unwrap_or("New chat"),
             workspace.as_deref(),
+            model.as_deref(),
             db::now_ms(),
         )
         .map_err(|e| e.to_string())
@@ -307,6 +309,7 @@ async fn run_agent(
     state: State<'_, AppState>,
     session_id: String,
     text: String,
+    model: Option<String>,
 ) -> Result<(), String> {
     let http = state.http.clone();
     let settings = state.settings.clone();
@@ -328,6 +331,7 @@ async fn run_agent(
             oauth_refresh,
             session_id,
             text,
+            model,
         )
         .await;
     });

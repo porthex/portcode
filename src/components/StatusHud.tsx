@@ -39,7 +39,10 @@ function countToolUses(messages: Message[] | undefined): number {
  */
 export function StatusHud() {
   const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
-  const model = useStore((s) => s.settings.model);
+  const model = useStore((s) => {
+    const sess = s.sessions.find((x) => x.id === s.activeId);
+    return sess?.model ?? s.settings.model;
+  });
   const policy = useStore((s) => s.settings.defaultPolicy);
   const streaming = useStore((s) => s.streaming);
   const usage = useStore((s) => (s.activeId ? s.usage[s.activeId] : undefined));

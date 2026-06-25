@@ -93,9 +93,9 @@ describe("SettingsPanel — structure", () => {
     expect(screen.getByText("Anthropic (Claude)")).toBeInTheDocument();
 
     // Model select reflects the store's current model. Query by its accessible
-    // name (the visible "Model" label is associated via htmlFor/id), which both
+    // name (the visible "Default model" label is associated via htmlFor/id), which both
     // locks in the accessible-name wiring and finds the same <select>.
-    const select = screen.getByLabelText("Model") as HTMLSelectElement;
+    const select = screen.getByLabelText("Default model (new sessions)") as HTMLSelectElement;
     expect(select.value).toBe(DEFAULT_SETTINGS.model);
     // Every model from the catalogue is offered as an option.
     for (const model of MODELS) {
@@ -310,7 +310,7 @@ describe("SettingsPanel — model picker", () => {
   it("persists a model change through ipc.saveSettings and updates the store", async () => {
     renderPanel();
 
-    const select = screen.getByLabelText("Model");
+    const select = screen.getByLabelText("Default model (new sessions)");
     fireEvent.change(select, { target: { value: "claude-haiku-4-5-20251001" } });
 
     // updateSettings -> ipc.saveSettings; flush the microtask the action awaits.
@@ -324,7 +324,7 @@ describe("SettingsPanel — model picker", () => {
     m.saveSettings.mockRejectedValueOnce(new Error("disk full"));
     renderPanel({ model: MODELS[0].id });
 
-    const select = screen.getByLabelText("Model") as HTMLSelectElement;
+    const select = screen.getByLabelText("Default model (new sessions)") as HTMLSelectElement;
     await act(async () => {
       fireEvent.change(select, { target: { value: "claude-haiku-4-5-20251001" } });
       await Promise.resolve();

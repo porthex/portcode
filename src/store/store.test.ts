@@ -59,6 +59,7 @@ const session = (over: Partial<Session> = {}): Session => ({
   id: "s1",
   title: "Chat",
   workspace: null,
+  model: "claude-opus-4-8",
   createdAt: 1,
   updatedAt: 1,
   ...over,
@@ -131,6 +132,19 @@ describe("init", () => {
     expect(st.messages["a"]).toEqual([msg]);
   });
 
+  it("coerces a loaded session with no model to the last-used default", async () => {
+    // Old DB rows predate per-session model: listSessions yields a session whose
+    // model is absent. The store must coalesce it to settings.model so
+    // Session.model stays a non-null string.
+    m.getSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, model: "claude-sonnet-4-6" });
+    const legacy = { ...session({ id: "a" }), model: undefined } as unknown as Session;
+    m.listSessions.mockResolvedValue([legacy]);
+
+    await useStore.getState().init();
+
+    expect(useStore.getState().sessions[0].model).toBe("claude-sonnet-4-6");
+  });
+
   it("records initError when a load-bearing startup call rejects", async () => {
     // A failed core / locked DB rejects a guarded call; init must surface an error
     // instead of leaving a permanently blank welcome shell with no feedback.
@@ -192,6 +206,25 @@ describe("newSession", () => {
     expect(st.sessions).toHaveLength(2);
     expect(st.sessions[0].id).toBe(st.activeId);
     expect(st.messages[st.activeId!]).toEqual([]);
+  });
+
+  it("initializes the new session's model from the last-used settings.model", async () => {
+    useStore.setState({
+      sessions: [session({ id: "old" })],
+      settings: { ...DEFAULT_SETTINGS, model: "claude-haiku-4-5-20251001" },
+    });
+
+    await useStore.getState().newSession();
+
+    const st = useStore.getState();
+    expect(st.sessions[0].model).toBe("claude-haiku-4-5-20251001");
+    // The chosen model is persisted with the new session row.
+    expect(m.createSession).toHaveBeenCalledWith(
+      st.sessions[0].id,
+      "New chat",
+      null,
+      "claude-haiku-4-5-20251001",
+    );
   });
 
   it("closes the mobile session drawer", async () => {
@@ -268,6 +301,32 @@ describe("newSession", () => {
     expect(st.initError).toBe("db locked");
     expect(st.sessions).toHaveLength(1); // no phantom session on failure
     expect(st.creatingSession).toBe(false); // lock released
+  });
+});
+
+describe("setSessionModel", () => {
+  it("updates the active session's model and tracks it as the last-used default", async () => {
+    useStore.setState({
+      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      activeId: "a",
+    });
+
+    await useStore.getState().setSessionModel("claude-sonnet-4-6");
+
+    const st = useStore.getState();
+    expect(st.sessions[0].model).toBe("claude-sonnet-4-6");
+    // Last-used sync: settings.model is updated through ipc.saveSettings.
+    expect(m.saveSettings).toHaveBeenCalledWith({ model: "claude-sonnet-4-6" });
+    expect(st.settings.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("still updates the last-used default when no session is active (palette safety)", async () => {
+    useStore.setState({ sessions: [], activeId: null });
+
+    await useStore.getState().setSessionModel("claude-haiku-4-5-20251001");
+
+    expect(m.saveSettings).toHaveBeenCalledWith({ model: "claude-haiku-4-5-20251001" });
+    expect(useStore.getState().settings.model).toBe("claude-haiku-4-5-20251001");
   });
 });
 
@@ -447,7 +506,7 @@ describe("send", () => {
 
   it("appends user+assistant turns, titles the first turn, and folds streamed events", async () => {
     let emit!: (e: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
       emit = onEvent;
       return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
     });
@@ -464,7 +523,12 @@ describe("send", () => {
     expect(st.messages.a).toHaveLength(2);
     expect(st.messages.a[0].role).toBe("user");
     expect(st.sessions[0].title).toBe("Refactor the parser"); // derived from first message
-    expect(m.runAgent).toHaveBeenCalledWith("a", "Refactor the parser", expect.any(Function));
+    expect(m.runAgent).toHaveBeenCalledWith(
+      "a",
+      "Refactor the parser",
+      "claude-opus-4-8",
+      expect.any(Function),
+    );
 
     const assistant = () => useStore.getState().messages.a[1];
 
@@ -496,7 +560,7 @@ describe("send", () => {
 
   it("trims surrounding whitespace from the stored user bubble and derived title", async () => {
     let emit!: (e: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
       emit = onEvent;
       return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
     });
@@ -514,7 +578,7 @@ describe("send", () => {
     expect(st.sessions[0].title).toBe("hi");
     // The local agent is also prompted with the trimmed body (not the raw padded
     // draft), so what the user sees and what the model receives stay consistent.
-    expect(m.runAgent).toHaveBeenCalledWith("a", "hi", expect.any(Function));
+    expect(m.runAgent).toHaveBeenCalledWith("a", "hi", "claude-opus-4-8", expect.any(Function));
   });
 
   it("trims the forwarded run text in remote mode", async () => {
@@ -537,7 +601,7 @@ describe("send", () => {
 
   it("keeps the existing title once a session already has messages", async () => {
     let emit!: (e: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
       emit = onEvent;
       return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
     });
@@ -627,7 +691,7 @@ describe("send", () => {
   it("tears down the turn's listener on turn_end so a later turn can't edit this message", async () => {
     const handles: { cancel: ReturnType<typeof vi.fn>; dispose: ReturnType<typeof vi.fn> }[] = [];
     const emits: ((e: StreamEvent) => void)[] = [];
-    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
       emits.push(onEvent);
       const handle = { cancel: vi.fn(async () => {}), dispose: vi.fn() };
       handles.push(handle);
@@ -656,7 +720,7 @@ describe("send", () => {
   it("disposes the listener when a turn ends in an error event", async () => {
     const dispose = vi.fn();
     let emit!: (e: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
       emit = onEvent;
       return { cancel: vi.fn(async () => {}), dispose };
     });
@@ -673,7 +737,7 @@ describe("send", () => {
     vi.useFakeTimers();
     try {
       const cancel = vi.fn(async () => {});
-      m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
         // The turn starts streaming, then the backend goes silent — no turn_end/error.
         onEvent({ type: "text_delta", text: "thinking" });
         return { cancel, dispose: vi.fn() };
