@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- viewport-fit=cover so the app can paint into the notch / Dynamic Island
+         safe areas on iOS (used with env(safe-area-inset-*) in CSS). -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+
+    <!-- Web-client CSP. Distinct from the Tauri webview CSP (index.html at the
+         repo root): this build talks to an iroh relay over a secure WebSocket and
+         instantiates the sync-client WASM module, so it allows wss:/https: on
+         connect-src and 'wasm-unsafe-eval' on script-src. No relay/backend is
+         hosted on Vercel — only these static files. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' https: wss:; media-src 'self' blob:; manifest-src 'self'"
+    />
+
+    <title>Portcode</title>
+
+    <!-- PWA: manifest + theme. Honored on Android/desktop; iOS reads only some of
+         these, hence the Apple-specific tags below. -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#0b0f17" />
+
+    <!-- iOS standalone PWA tags. iOS does NOT derive these from the manifest:
+         - apple-mobile-web-app-capable: run full-screen when launched from Home Screen
+         - status-bar-style: dark status bar over the app's dark theme
+         - apple-mobile-web-app-title: Home Screen label
+         - apple-touch-icon: Home Screen icon (manifest icons are not used by iOS) -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Portcode" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/entry.tsx"></script>
+  </body>
+</html>
