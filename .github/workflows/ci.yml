@@ -122,16 +122,17 @@ jobs:
       - name: Test (cargo test)
         run: cargo test --workspace
 
-  # ── wasm compile gate for the shared sync crate (IOS_WEB_CLIENT_PLAN §5.3) ──
-  # Phase 1's exit criterion is that `portcode-sync` compiles to
-  # wasm32-unknown-unknown (the future iroh-in-browser PWA client target). It
-  # CANNOT be fully verified on low-RAM dev machines (per CLAUDE.md: "verify Rust
-  # via CI"), so this job is the source of truth. It builds ONLY the shared crate
-  # for wasm — `src-tauri` (Tauri desktop) is never a wasm target. Linux-only:
-  # the wasm build needs LLVM clang (Apple/MSVC clang can't target wasm32), and
-  # one OS leg is enough to prove the compile.
+  # ── wasm compile gate for the browser client (IOS_WEB_CLIENT_PLAN §5.3/§5.4) ──
+  # Phase 1's exit criterion was that `portcode-sync` compiles to
+  # wasm32-unknown-unknown; Phase 2 adds the real browser transport
+  # (`transport_wasm.rs`) and the `portcode-wasm` `Session` cdylib that the PWA
+  # loads. This job is the source of truth (the wasm leg CANNOT be fully verified
+  # on low-RAM dev machines — per CLAUDE.md "verify Rust via CI") and gates BOTH
+  # crates for the browser target. `src-tauri` (Tauri desktop) is never a wasm
+  # target. Linux-only: the wasm build needs LLVM clang (Apple/MSVC clang can't
+  # target wasm32), and one OS leg is enough to prove the compile.
   wasm:
-    name: WASM (portcode-sync compiles for wasm32)
+    name: WASM (portcode-sync + portcode-wasm compile for wasm32)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -160,28 +161,66 @@ jobs:
           # Separate cache key from the native legs (different target dir).
           key: wasm
 
-      # The exit criterion: the shared crate compiles for the browser target.
-      # The crate's `.cargo/config.toml` supplies the mandatory
-      # getrandom_backend="wasm_js" rustflag for this target. `transport_wasm.rs`
-      # is a compiling skeleton (the full browser iroh dial is Phase 2).
+      # Exit criterion 1: the shared crate compiles for the browser target.
+      # Each crate's `.cargo/config.toml` supplies the getrandom_backend="wasm_js"
+      # rustflag for this target.
       - name: Build portcode-sync for wasm32-unknown-unknown
         run: cargo build -p portcode-sync --target wasm32-unknown-unknown
 
+      # Exit criterion 2 (§5.4): the `Session` wasm-bindgen wrapper — the interop
+      # surface the PWA loads — compiles for the browser target. This gates the
+      # real browser iroh dial + Noise handshake + the Tsify-generated TS types.
+      - name: Build portcode-wasm for wasm32-unknown-unknown
+        run: cargo build -p portcode-wasm --target wasm32-unknown-unknown
+
+      # Clippy both wasm crates with warnings-as-errors, on the browser target —
+      # the native `rust` job's `--workspace` clippy compiles `portcode-wasm` to an
+      # EMPTY lib (it is `#![cfg(target_arch = "wasm32")]`), so its real code is
+      # only linted here.
+      - name: Clippy (wasm crates — warnings are errors)
+        run: cargo clippy -p portcode-sync -p portcode-wasm --target wasm32-unknown-unknown -- -D warnings
+
       # Belt-and-suspenders audit (§5.3): a native-only tokio `net`/`rt` path
-      # leaking into shared code would pull in `mio`, and enabling snow's
-      # `ring`/`std` would pull in `ring` — neither builds for wasm. Assert both
-      # are ABSENT from the wasm dependency tree.
-      - name: Audit for native bleed-through (no mio / no ring on wasm)
+      # leaking into shared code would pull in `mio`, which does NOT build for
+      # wasm — assert it is ABSENT from the wasm dependency tree.
+      #
+      # NOTE on `ring`: the plan's §4.3 assumed `ring` could not build for wasm and
+      # this audit once also forbade it. The Phase 0 iOS spike disproved that — iroh
+      # 1.0's browser leg uses the `tls-ring` feature, whose rustls `ring` provider
+      # DOES compile to wasm32 (and is what makes `presets::N0` available). So `ring`
+      # is now EXPECTED in the wasm tree via iroh, and is no longer a bleed-through
+      # signal. We instead assert snow stays on its pure-Rust resolver: snow must
+      # NOT be the thing pulling `ring` (its `std`/`ring` features would). Verified
+      # by confirming snow's only crypto deps remain the RustCrypto/dalek crates.
+      - name: Audit for native bleed-through (no mio; snow stays pure-Rust)
         run: |
-          if cargo tree -p portcode-sync --target wasm32-unknown-unknown -i mio 2>/dev/null | grep -q '^mio'; then
+          if cargo tree -p portcode-wasm --target wasm32-unknown-unknown -i mio 2>/dev/null | grep -q '^mio'; then
             echo "::error::mio leaked into the wasm build — a tokio net/rt path reached shared code"
             exit 1
           fi
-          if cargo tree -p portcode-sync --target wasm32-unknown-unknown -i ring 2>/dev/null | grep -q '^ring'; then
-            echo "::error::ring leaked into the wasm build — snow std/ring feature reached the wasm target"
+          # snow must resolve to the pure-Rust backend (chacha20poly1305 +
+          # curve25519-dalek + blake2), never `ring`. iroh legitimately pulls `ring`
+          # (via tls-ring), so a blanket "no ring" check no longer works; instead
+          # invert from `ring` and assert `snow` is NOT among its parents. If snow
+          # appears, its std/ring feature leaked into the wasm build.
+          if cargo tree -p portcode-wasm --target wasm32-unknown-unknown -i ring 2>/dev/null | grep -qi 'snow'; then
+            echo "::error::snow pulled ring on wasm — its std/ring feature leaked (keep snow on the pure-Rust default-resolver)"
             exit 1
           fi
-          echo "no mio / no ring on the wasm target — clean"
+          echo "no mio on the wasm target; snow on its pure-Rust resolver — clean"
+
+      # wasm-pack is what actually emits the browser package (`init()` + `_bg.wasm`
+      # + the Tsify `.d.ts`) the PWA consumes (§5.3/§5.4) — build it so the FULL
+      # interop surface (not just `cargo build`) is gated. `wasm-opt` is disabled in
+      # the crate's `[package.metadata.wasm-pack]` because binaryen downloads a
+      # binary at build time, which fails in this sandboxed runner (the Phase 0
+      # spike hit the same); the wasm is functional without it, only larger.
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - name: wasm-pack build the Session wrapper (interop surface)
+        run: wasm-pack build --target web crates/portcode-wasm
 
   coverage:
     name: Coverage (frontend · main/release only)

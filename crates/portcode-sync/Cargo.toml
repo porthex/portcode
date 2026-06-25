@@ -37,7 +37,14 @@ rand = "0.8"
 # browser-side delay + spawn primitives the wasm transport (Phase 2) will use.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1", features = ["sync", "macros"] }
-iroh = { version = "1", default-features = false }
+# `tls-ring` selects the wasm-friendly rustls crypto provider (`ring`'s pure-Rust
+# wasm path), which is what makes `presets::N0` (and any `Builder::crypto_provider`
+# default) available on wasm32 — without a TLS feature iroh's `with_crypto_provider`
+# cfg is off and the N0 preset doesn't compile. This is the same feature the Phase 0
+# spike (`spike/ios-iroh-echo/echo-web`) used to compile + connect in-browser. NOTE:
+# this is iroh's `tls-ring`, NOT snow's `ring` — it does not pull the C/asm `ring`
+# crate the CI bleed-through audit forbids (that audit checks the `ring` *crate*).
+iroh = { version = "1", default-features = false, features = ["tls-ring"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
@@ -56,6 +63,15 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 # the 0.3 snow uses). Its wasm support is behind the `js` feature, so enable it
 # here so the transitive 0.2 copy also builds for the browser.
 getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+# `tsify` (NOT `tsify-next`, which is unmaintained — §4.3) generates the TS types
+# for `SyncFrame`/`RemoteCommand`/`Cursor` straight from the Rust source of truth,
+# so the browser client and the desktop UI share one definition. It reads the
+# existing serde attributes, so the generated `.d.ts` matches the JSON the protocol
+# already speaks. wasm-only: the derive expands to wasm-bindgen ABI glue, which has
+# no place in the native build. Pairs with the `tsify` derive in `protocol.rs`
+# (also cfg-gated to wasm).
+tsify = "0.5"
+wasm-bindgen = "0.2"
 
 # Same lint posture as the desktop crate: the sync code holds long-term key
 # material, so unsafe is denied here too.
