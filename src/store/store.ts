@@ -1104,6 +1104,13 @@ export const useStore = create<AppState>((set, get) => ({
   // message load (and is a no-op mid-stream); opening the chat is unconditional so
   // tapping the already-active running session still enters it.
   async openRemoteSession(id) {
+    // Mid-stream, selectSession is a no-op (switching activeId would strand the
+    // streaming turn). Opening the chat unconditionally would then reveal the WRONG
+    // session (the still-active one). So when switching is blocked — streaming AND a
+    // *different* session is tapped — bail before selecting or opening. Tapping the
+    // already-active running session still falls through and enters it.
+    const { streaming, activeId } = get();
+    if (streaming && id !== activeId) return;
     await get().selectSession(id);
     set({ remoteChatOpen: true });
   },

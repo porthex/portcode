@@ -163,8 +163,19 @@ let current: WebSession | null = null;
  * (`{ sas, peerPublicKey }`). Mirrors ipc.ts `phoneSyncConnect`.
  */
 export async function webPhoneSyncConnect(qr: string, reconnect = false): Promise<ConnectInfo> {
-  current = await connector.connect(qr, reconnect);
-  return { sas: current.sas, peerPublicKey: current.peerPublicKey };
+  // Capture the session being replaced so we can tear it down: overwriting
+  // `current` without disconnecting the old session would leak it (its socket /
+  // WASM handle would stay open) across a reconnect.
+  const previous = current;
+  const next = await connector.connect(qr, reconnect);
+  current = next;
+  // Disconnect the prior session AFTER the new dial succeeds (so a failed dial
+  // leaves the existing session intact). Swallow errors — a best-effort teardown
+  // of the old session must not fail the new connect.
+  if (previous && previous !== next) {
+    await previous.disconnect().catch(() => {});
+  }
+  return { sas: next.sas, peerPublicKey: next.peerPublicKey };
 }
 
 /** Forward one command to the current session. No-op if not connected. */

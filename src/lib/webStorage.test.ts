@@ -7,6 +7,7 @@ import {
   getOrCreateDeviceId,
   requestPersistentStorage,
   isStoragePersisted,
+  resetDeviceIdCacheForTest,
   type PinnedPeer,
 } from "./webStorage";
 
@@ -29,6 +30,7 @@ function deleteDb(): Promise<void> {
 
 describe("webStorage (IndexedDB available)", () => {
   beforeEach(async () => {
+    resetDeviceIdCacheForTest();
     await deleteDb();
   });
 
@@ -152,6 +154,7 @@ describe("webStorage (IndexedDB unavailable)", () => {
   let realIndexedDB: typeof indexedDB;
 
   beforeEach(() => {
+    resetDeviceIdCacheForTest();
     realIndexedDB = globalThis.indexedDB;
     vi.stubGlobal("indexedDB", undefined);
   });
@@ -177,6 +180,16 @@ describe("webStorage (IndexedDB unavailable)", () => {
     const id = await getOrCreateDeviceId();
     expect(typeof id).toBe("string");
     expect(id.length).toBeGreaterThan(0);
+  });
+
+  it("returns the SAME id across concurrent and sequential calls even without IDB", async () => {
+    // Regression: with no IDB the write no-ops, so each call used to mint a fresh
+    // UUID (and concurrent first calls could race). Memoizing the promise means all
+    // callers — concurrent or later — share the first minted id for the session.
+    const [a, b] = await Promise.all([getOrCreateDeviceId(), getOrCreateDeviceId()]);
+    expect(a).toBe(b);
+    const c = await getOrCreateDeviceId();
+    expect(c).toBe(a);
   });
 });
 

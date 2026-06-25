@@ -163,6 +163,12 @@ export function createReconnectController(opts: {
   // Guards against a connect() promise that resolves/rejects after stop(): a late
   // settlement must not schedule a new retry on a controller the caller has torn down.
   let running = false;
+  // A monotonically-increasing token identifying the CURRENT run. Both start() and
+  // stop() bump it, so any connect() continuation captured by an older run can detect
+  // that it has been superseded and bail. Without this, a late settlement from a
+  // stopped run (or a previous start→stop→start cycle) could cancel the timer or
+  // schedule a retry belonging to a newer run.
+  let runId = 0;
 
   const cancelTimer = (): void => {
     if (timer !== undefined) {
@@ -171,11 +177,12 @@ export function createReconnectController(opts: {
     }
   };
 
-  const attempt = (): void => {
-    if (!running) return;
+  const attempt = (id: number): void => {
+    if (!running || id !== runId) return;
     void connect().then(
       () => {
-        if (!running) return;
+        // Bail unless this continuation belongs to the still-running current run.
+        if (!running || id !== runId) return;
         // Success: forget the failure history and idle. A future suspend/resume will
         // call start() again.
         attempts = 0;
@@ -183,7 +190,7 @@ export function createReconnectController(opts: {
         cancelTimer();
       },
       () => {
-        if (!running) return;
+        if (!running || id !== runId) return;
         if (maxAttempts !== undefined && attempts >= maxAttempts) {
           running = false;
           cancelTimer();
@@ -192,7 +199,7 @@ export function createReconnectController(opts: {
         }
         const delay = nextBackoffDelay(attempts, backoff);
         attempts += 1;
-        timer = setTimeoutFn(attempt, delay);
+        timer = setTimeoutFn(() => attempt(id), delay);
       },
     );
   };
@@ -200,11 +207,20 @@ export function createReconnectController(opts: {
   return {
     start(): void {
       if (running) return;
+      // A fresh run: bump the token and reset the failure history so attempts can't
+      // leak across a previous stop→start. Any older run's continuation now sees a
+      // stale id and no-ops.
+      runId += 1;
+      attempts = 0;
       running = true;
-      attempt();
+      attempt(runId);
     },
     stop(): void {
+      // Bump the token so a connect() still in flight from this run bails on
+      // settlement, and reset attempts so a later start() begins clean.
+      runId += 1;
       running = false;
+      attempts = 0;
       cancelTimer();
     },
     get attempts(): number {

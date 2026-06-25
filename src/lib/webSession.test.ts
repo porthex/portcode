@@ -184,6 +184,18 @@ describe("connector registry", () => {
     expect(fake.sent).toEqual([{ cmd: "cancel", session_id: "s1" }]);
   });
 
+  it("disconnects the previous session when reconnecting (no leak across dials)", async () => {
+    const fake = createFakeConnector();
+    setWebSessionConnector(fake.connector);
+
+    await webPhoneSyncConnect("qr-1");
+    await webPhoneSyncConnect("qr-2"); // replaces the first session
+
+    // The prior session must have been torn down exactly once by the second connect.
+    expect(fake.calls.connect).toBe(2);
+    expect(fake.calls.disconnect).toBe(1);
+  });
+
   it("resetWebSessionConnector restores the default mock connector", async () => {
     setWebSessionConnector(createFakeConnector().connector);
     resetWebSessionConnector();

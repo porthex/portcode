@@ -179,16 +179,34 @@ export async function clearPinnedPeer(): Promise<void> {
  * must be the *same* value on every call once minted — hence we read-through
  * IndexedDB and only mint when nothing is stored.
  *
- * When storage is unavailable the write silently no-ops, so we still return a
- * freshly generated id (correct for this session) even though it won't survive a
- * reload — that degrades to "looks like a new device each launch", not a crash.
+ * When storage is unavailable the write silently no-ops. To keep the id STABLE
+ * within a session regardless — and to make concurrent first calls race-free — we
+ * memoize the in-flight resolution in a module-level promise: the first call mints
+ * (or reads) once, and every later call awaits the same promise, so all callers
+ * see one id even when IndexedDB can't persist it across a reload.
  */
-export async function getOrCreateDeviceId(): Promise<string> {
-  const existing = await idbGet<string>(DEVICE_ID_KEY);
-  if (existing !== null) return existing;
-  const id = crypto.randomUUID();
-  await idbPut(DEVICE_ID_KEY, id);
-  return id;
+let deviceIdPromise: Promise<string> | null = null;
+
+export function getOrCreateDeviceId(): Promise<string> {
+  if (deviceIdPromise === null) {
+    deviceIdPromise = (async () => {
+      const existing = await idbGet<string>(DEVICE_ID_KEY);
+      if (existing !== null) return existing;
+      const id = crypto.randomUUID();
+      await idbPut(DEVICE_ID_KEY, id);
+      return id;
+    })();
+  }
+  return deviceIdPromise;
+}
+
+/**
+ * Reset the memoized device id (test-only seam). Production never needs this — the
+ * id is meant to live for the whole session — but tests that swap IndexedDB in/out
+ * must clear the cache so each scenario mints fresh.
+ */
+export function resetDeviceIdCacheForTest(): void {
+  deviceIdPromise = null;
 }
 
 /**

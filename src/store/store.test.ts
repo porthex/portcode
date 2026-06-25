@@ -2028,6 +2028,34 @@ describe("remote client", () => {
       expect(st.messages.z).toEqual([msg]);
     });
 
+    it("openRemoteSession is blocked for a different session while streaming", async () => {
+      // Mid-stream, tapping a DIFFERENT session must not open the chat (selectSession
+      // is a no-op, so opening would reveal the wrong session).
+      useStore.setState({ activeId: "a", streaming: true, remoteChatOpen: false });
+
+      await useStore.getState().openRemoteSession("b");
+
+      const st = useStore.getState();
+      expect(st.activeId).toBe("a"); // unchanged
+      expect(st.remoteChatOpen).toBe(false); // chat did NOT open
+    });
+
+    it("openRemoteSession still enters the already-active session while streaming", async () => {
+      const msg: Message = { id: "m", role: "assistant", blocks: [], createdAt: 1 };
+      useStore.setState({
+        activeId: "a",
+        streaming: true,
+        remoteChatOpen: false,
+        messages: { a: [msg] },
+      });
+
+      await useStore.getState().openRemoteSession("a");
+
+      const st = useStore.getState();
+      expect(st.activeId).toBe("a");
+      expect(st.remoteChatOpen).toBe(true); // tapping the active running session enters it
+    });
+
     it("closeRemoteSession returns to the sessions list without disconnecting", () => {
       useStore.setState({ remoteChatOpen: true, remoteConnected: true });
 

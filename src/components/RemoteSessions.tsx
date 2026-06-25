@@ -10,15 +10,25 @@ export function RemoteSessions() {
   const sessions = useStore((s) => s.sessions);
   const activeId = useStore((s) => s.activeId);
   const streaming = useStore((s) => s.streaming);
+  const creatingSession = useStore((s) => s.creatingSession);
   const openRemoteSession = useStore((s) => s.openRemoteSession);
   const newSession = useStore((s) => s.newSession);
+
+  // Mid-stream, switching to a DIFFERENT session is blocked (selectSession is a
+  // no-op then), so a tap on a non-active card must not open the chat — it would
+  // reveal the wrong session. Mirror RemoteSessionSwitcher.pick()'s guard: only
+  // open when not streaming or when tapping the already-active session.
+  const open = (id: string): void => {
+    if (streaming && id !== activeId) return;
+    void openRemoteSession(id);
+  };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-bg text-fg">
       <ConnectedBanner />
 
       {sessions.length === 0 ? (
-        <EmptyState onNew={() => void newSession()} creating={streaming} />
+        <EmptyState onNew={() => void newSession()} creating={creatingSession} />
       ) : (
         <>
           <div className="px-5 pb-2 pt-[18px]">
@@ -36,15 +46,15 @@ export function RemoteSessions() {
                 session={s}
                 active={s.id === activeId}
                 running={s.id === activeId && streaming}
-                onOpen={() => void openRemoteSession(s.id)}
+                onOpen={() => open(s.id)}
               />
             ))}
           </div>
           <div className="border-t border-[#141a29] px-4 py-3">
             <button
               onClick={() => void newSession()}
-              disabled={streaming}
-              title={streaming ? "Finish or stop the current turn first" : undefined}
+              disabled={creatingSession}
+              title={creatingSession ? "Creating a session…" : undefined}
               className="flex h-[50px] w-full items-center justify-center gap-2 rounded-[13px] border border-accent-2/30 bg-accent-2/[0.07] font-display text-[14px] font-semibold tracking-[0.4px] text-accent-2 transition hover:bg-accent-2/[0.14] hover:shadow-glow-cyan disabled:opacity-40"
             >
               <span className="-mt-0.5 text-[17px] leading-none">+</span> New session on desktop

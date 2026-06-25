@@ -276,6 +276,67 @@ describe("createReconnectController", () => {
     expect(timers.scheduled).toHaveLength(0);
   });
 
+  it("isolates runs: a late connect() from a stopped run can't cancel/reschedule the new run", async () => {
+    // Regression: stop() then start(), with the FIRST run's connect() settling late.
+    // The stale settlement must not touch the second run's timer/attempts.
+    const timers = makeTimerStub();
+    const resolvers: Array<{ res: () => void; rej: (e: unknown) => void }> = [];
+    const connect = vi.fn(
+      () =>
+        new Promise<void>((res, rej) => {
+          resolvers.push({ res, rej });
+        }),
+    );
+    const ctrl = createReconnectController({
+      connect,
+      backoff: { rng: () => 1 },
+      setTimeoutFn: timers.setTimeoutFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+    });
+
+    ctrl.start(); // run #1: connect() #1 is now pending
+    expect(connect).toHaveBeenCalledTimes(1);
+
+    ctrl.stop(); // tear run #1 down before it settles
+    ctrl.start(); // run #2: connect() #2 pending
+    expect(connect).toHaveBeenCalledTimes(2);
+
+    // Now the FIRST run's connect rejects LATE. It belongs to a superseded run, so it
+    // must NOT schedule a retry (no new timer) nor disturb run #2.
+    resolvers[0].rej(new Error("late from run #1"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(timers.scheduled).toHaveLength(0);
+    expect(ctrl.attempts).toBe(0);
+
+    // Run #2's own connect rejecting DOES schedule a retry — it's the live run.
+    resolvers[1].rej(new Error("run #2 fail"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(timers.scheduled).toHaveLength(1);
+    expect(ctrl.attempts).toBe(1);
+    ctrl.stop();
+  });
+
+  it("resets attempts across a stop→start cycle (no leak)", async () => {
+    const timers = makeTimerStub();
+    const connect = vi.fn(() => Promise.reject(new Error("always")));
+    const ctrl = createReconnectController({
+      connect,
+      backoff: { rng: () => 1 },
+      setTimeoutFn: timers.setTimeoutFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+    });
+    ctrl.start();
+    await Promise.resolve();
+    expect(ctrl.attempts).toBe(1); // one failure recorded
+    ctrl.stop();
+    expect(ctrl.attempts).toBe(0); // stop resets
+    ctrl.start();
+    expect(ctrl.attempts).toBe(0); // fresh run starts clean
+    ctrl.stop();
+  });
+
   it("start() is idempotent while already running", () => {
     const timers = makeTimerStub();
     const connect = vi.fn(() => new Promise<void>(() => {})); // never settles

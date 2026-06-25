@@ -91,6 +91,14 @@ function fakeStream(tracks: ReturnType<typeof fakeTrack>[]) {
   return { getTracks: () => tracks } as unknown as MediaStream;
 }
 
+// A pass-through `makeVideo` for the injected-deps tests: they supply their own
+// `captureFrame` and don't need a real `<video>`, so the "video" is just the
+// stream itself. Spread into deps so the default DOM-backed makeVideo (which
+// jsdom can't run) is never reached in these unit tests.
+const passThroughVideo = {
+  makeVideo: async (s: MediaStream) => s,
+} satisfies Partial<ScannerDeps>;
+
 // A `setTimeout` shim that fires immediately so the polling loop doesn't actually
 // wait. Returns a dummy handle (clearTimeout no-ops on it harmlessly).
 const immediateTimeout = ((fn: () => void) => {
@@ -117,7 +125,7 @@ describe("scanWithCamera", () => {
 
     const out = await scanWithCamera({
       decode,
-      deps: { getUserMedia, captureFrame, setTimeoutFn: immediateTimeout },
+      deps: { getUserMedia, captureFrame, setTimeoutFn: immediateTimeout, ...passThroughVideo },
     });
 
     expect(out).toEqual({ ok: true, value: "the-payload" });
@@ -140,6 +148,7 @@ describe("scanWithCamera", () => {
         getUserMedia: vi.fn().mockResolvedValue(stream),
         captureFrame: vi.fn().mockReturnValue(fakeImage),
         setTimeoutFn: immediateTimeout,
+        ...passThroughVideo,
       },
     });
     expect(out).toEqual({ ok: true, value: "v" });
@@ -159,11 +168,80 @@ describe("scanWithCamera", () => {
         getUserMedia: vi.fn().mockResolvedValue(fakeStream([track])),
         captureFrame,
         setTimeoutFn: immediateTimeout,
+        ...passThroughVideo,
       },
     });
     expect(out).toEqual({ ok: true, value: "ok-after-null-frame" });
     expect(decode).toHaveBeenCalledTimes(1);
     expect(track.stop).toHaveBeenCalled();
+  });
+
+  it("wraps the stream in a <video> and feeds THAT (not the raw stream) to captureFrame", async () => {
+    // Regression: the live-camera loop used to pass the raw MediaStream to
+    // captureFrame, but the default captureFrame needs an HTMLVideoElement, so it
+    // always returned null and the camera never decoded. Verify makeVideo is called
+    // with the stream and its output is what captureFrame receives.
+    const track = fakeTrack();
+    const stream = fakeStream([track]);
+    const fakeVideo = { tag: "video" } as unknown as HTMLVideoElement;
+    const makeVideo = vi.fn().mockResolvedValue(fakeVideo);
+    const captureFrame = vi.fn().mockReturnValue(fakeImage);
+    const decode = vi.fn().mockResolvedValue("decoded");
+
+    const out = await scanWithCamera({
+      decode,
+      deps: {
+        getUserMedia: vi.fn().mockResolvedValue(stream),
+        makeVideo,
+        captureFrame,
+        setTimeoutFn: immediateTimeout,
+      },
+    });
+
+    expect(out).toEqual({ ok: true, value: "decoded" });
+    expect(makeVideo).toHaveBeenCalledWith(stream);
+    // captureFrame must see the <video>, never the raw MediaStream.
+    expect(captureFrame).toHaveBeenCalledWith(fakeVideo);
+    expect(captureFrame).not.toHaveBeenCalledWith(stream);
+    expect(track.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the real default makeVideo (no <video>) under a DOM-less host without throwing", async () => {
+    // With no makeVideo injected, the default is used. Under jsdom we still go
+    // through resolveDeps's defaults; assert the call completes and releases the
+    // camera. (The default captureFrame yields null for the non-video source here,
+    // so we abort via signal to terminate the loop deterministically.)
+    const track = fakeTrack();
+    const controller = new AbortController();
+    const out = await scanWithCamera({
+      decode: vi.fn().mockResolvedValue(null),
+      signal: controller.signal,
+      deps: {
+        getUserMedia: vi.fn().mockResolvedValue(fakeStream([track])),
+        // No makeVideo / captureFrame injected → exercises resolveDeps defaults.
+        setTimeoutFn: ((fn: () => void) => {
+          controller.abort();
+          fn();
+          return 0 as unknown as ReturnType<typeof setTimeout>;
+        }) as unknown as typeof setTimeout,
+      },
+    });
+    expect(out).toEqual({ ok: false, reason: "cancelled" });
+    expect(track.stop).toHaveBeenCalled();
+  });
+
+  it("returns unavailable when no camera API exists and no getUserMedia is injected", async () => {
+    // Regression: a missing navigator.mediaDevices.getUserMedia used to surface as
+    // reason:"error" (the default getUserMedia throws a TypeError), but callers need
+    // "unavailable" to fall back to the file/manual path.
+    const orig = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { value: {}, configurable: true });
+    try {
+      const out = await scanWithCamera({ decode: vi.fn() });
+      expect(out).toEqual({ ok: false, reason: "unavailable" });
+    } finally {
+      Object.defineProperty(globalThis, "navigator", { value: orig, configurable: true });
+    }
   });
 
   it("maps NotAllowedError to denied", async () => {
@@ -221,7 +299,7 @@ describe("scanWithCamera", () => {
     const out = await scanWithCamera({
       decode,
       signal: controller.signal,
-      deps: { getUserMedia, captureFrame, setTimeoutFn: abortingTimeout },
+      deps: { getUserMedia, captureFrame, setTimeoutFn: abortingTimeout, ...passThroughVideo },
     });
 
     expect(out).toEqual({ ok: false, reason: "cancelled" });
@@ -245,6 +323,7 @@ describe("scanWithCamera", () => {
         getUserMedia: vi.fn().mockResolvedValue(fakeStream([track])),
         captureFrame,
         setTimeoutFn: immediateTimeout,
+        ...passThroughVideo,
       },
     });
     expect(out).toEqual({ ok: false, reason: "cancelled" });
@@ -261,6 +340,7 @@ describe("scanWithCamera", () => {
           throw new Error("draw failed");
         }),
         setTimeoutFn: immediateTimeout,
+        ...passThroughVideo,
       },
     });
     expect(out).toEqual({ ok: false, reason: "error", message: "draw failed" });

@@ -102,11 +102,46 @@ describe("RemoteSessions — list", () => {
     expect(newSession).toHaveBeenCalledTimes(1);
   });
 
-  it("disables the new-session footer while a turn is streaming", () => {
-    useStore.setState({ sessions: [session()], activeId: "s1", streaming: true });
+  it("disables the new-session footer while a create is in flight (creatingSession)", () => {
+    useStore.setState({ sessions: [session()], activeId: "s1", creatingSession: true });
     render(<RemoteSessions />);
 
     expect(screen.getByRole("button", { name: /New session on desktop/ })).toBeDisabled();
+  });
+
+  it("keeps the new-session footer enabled while merely streaming (create not in flight)", () => {
+    useStore.setState({ sessions: [session()], activeId: "s1", streaming: true });
+    render(<RemoteSessions />);
+
+    // The create CTA is gated on creatingSession, not streaming — a streaming turn
+    // alone doesn't block creating another desktop session.
+    expect(screen.getByRole("button", { name: /New session on desktop/ })).not.toBeDisabled();
+  });
+
+  it("does not open a different session when tapped mid-stream", () => {
+    useStore.setState({
+      sessions: [session({ id: "a", title: "Alpha" }), session({ id: "b", title: "Beta" })],
+      activeId: "a",
+      streaming: true,
+    });
+    render(<RemoteSessions />);
+
+    // Tapping the non-active Beta card while streaming is a no-op (would otherwise
+    // open the wrong session, since selectSession is blocked mid-stream).
+    fireEvent.click(screen.getByRole("button", { name: /Beta/ }));
+    expect(openRemoteSession).not.toHaveBeenCalled();
+  });
+
+  it("still opens the active session when tapped mid-stream", () => {
+    useStore.setState({
+      sessions: [session({ id: "a", title: "Alpha" }), session({ id: "b", title: "Beta" })],
+      activeId: "a",
+      streaming: true,
+    });
+    render(<RemoteSessions />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Alpha/ }));
+    expect(openRemoteSession).toHaveBeenCalledWith("a");
   });
 });
 
@@ -124,5 +159,11 @@ describe("RemoteSessions — empty", () => {
     useStore.setState({ sessions: [], activeId: null });
     render(<RemoteSessions />);
     expect(screen.getByRole("button", { name: "End connection" })).toBeInTheDocument();
+  });
+
+  it("disables the empty-state CTA while a create is in flight (creatingSession)", () => {
+    useStore.setState({ sessions: [], activeId: null, creatingSession: true });
+    render(<RemoteSessions />);
+    expect(screen.getByRole("button", { name: /New session/ })).toBeDisabled();
   });
 });

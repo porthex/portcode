@@ -84,7 +84,7 @@ export function RemoteSessionSwitcher({ onClose }: { onClose: () => void }) {
         aria-label="Switch session"
         tabIndex={-1}
         onKeyDown={onKeyDown}
-        className="absolute inset-x-0 bottom-0 z-[9] rounded-t-[20px] border-t border-border-2 bg-panel px-4 pb-[22px] pt-2.5 shadow-[0_-16px_50px_rgba(0,0,0,.6)] outline-none motion-safe:animate-[pcSheet_0.26s_cubic-bezier(0.2,0.8,0.2,1)_both]"
+        className="absolute inset-x-0 bottom-0 z-[9] rounded-t-[20px] border-t border-border-2 bg-panel px-4 pb-[22px] pt-2.5 shadow-[0_-16px_50px_rgba(0,0,0,.6)] outline-none motion-safe:animate-[pc-sheet_0.26s_cubic-bezier(0.2,0.8,0.2,1)_both]"
       >
         <div
           className="mx-auto mb-3.5 mt-0.5 h-1 w-[38px] rounded-[3px] bg-border-2"
