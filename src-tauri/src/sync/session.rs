@@ -16,6 +16,10 @@ use crate::sync::protocol::SyncFrame;
 
 // Re-export the shared session surface so every existing `crate::sync::session::…`
 // path (in `lib.rs`, `server.rs`, `client.rs`, and their tests) keeps resolving.
+// `#[allow(unused_imports)]`: the desktop crate uses only part of this surface
+// (the phone-side `request_catch_up`/`run_client_recv`/`CatchUp` are wasm-client
+// facing), but the shim re-exports the whole module under `-D warnings`.
+#[allow(unused_imports)]
 pub use portcode_sync::session::{
     forward_live, handle_commands, request_catch_up, run_client_recv, send_command, CatchUp,
     CommandHandler, FrameChannel, FrameSink, FrameSource,

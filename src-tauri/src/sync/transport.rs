@@ -7,6 +7,10 @@
 //! the same types through this module, so every existing `crate::sync::transport::…`
 //! path in `lib.rs`/`server.rs`/`client.rs` keeps resolving unchanged.
 
+// Full-surface compatibility re-export (see noise.rs); `#[allow(unused_imports)]`
+// because the channel half-types aren't named directly by src-tauri under
+// `-D warnings`.
+#[allow(unused_imports)]
 pub use portcode_sync::transport_native::{
     accept_and_pair, build_endpoint, connect_and_pair, ChannelReceiver, ChannelSender,
     SecureChannel,
