@@ -21,30 +21,15 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionRow {
-    pub id: String,
-    pub title: String,
-    pub workspace: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-/// One persisted message, with its raw append-only `seq`. Unlike [`UiMessage`]
-/// (the grouped frontend view), this is the flat row Phone Sync replicates: the
-/// `MessageDelta` catch-up frame ships these verbatim. `content` is the typed
-/// block list (same shape as [`ChatMessage::content`]).
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct MessageRow {
-    pub id: String,
-    pub session_id: String,
-    pub seq: i64,
-    pub role: String,
-    pub content: Vec<Block>,
-    pub created_at: i64,
-}
+// `SessionRow` and `MessageRow` are Phone Sync wire DTOs; Phase 1 of
+// docs/IOS_WEB_CLIENT_PLAN.md (§5.1) moved them into the shared `portcode-sync`
+// crate (`portcode_sync::wire`) so the wasm browser client can decode the
+// `SessionList` / `MessageDelta` catch-up frames without linking this desktop
+// crate. Re-exported here UNCHANGED (same camelCase serde shape), so every
+// `crate::db::SessionRow` / `MessageRow` path resolves to the SAME type. The flat
+// `MessageRow` is what Phone Sync replicates (the `MessageDelta` frame ships these
+// verbatim); `content` is the typed block list (same shape as `ChatMessage::content`).
+pub use portcode_sync::wire::{MessageRow, SessionRow};
 
 /// A phone paired for Phone Sync, keyed by its Curve25519 static public key
 /// (base64). `name` is a user-facing label; timestamps are unix millis.

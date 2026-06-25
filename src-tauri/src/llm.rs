@@ -3,7 +3,7 @@
 //! `Block`/`ChatMessage` are serialized directly into the Anthropic Messages
 //! API request body, so their serde shapes intentionally match that wire format.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -44,76 +44,14 @@ fn build_system(cred: &Credential, system: &str) -> Value {
     }
 }
 
-/// A single content block, matching the Anthropic content-block wire format.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Block {
-    Text {
-        text: String,
-    },
-    ToolUse {
-        id: String,
-        name: String,
-        input: Value,
-    },
-    ToolResult {
-        tool_use_id: String,
-        content: String,
-        #[serde(default)]
-        is_error: bool,
-    },
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: Vec<Block>,
-}
-
-/// Events streamed to the frontend. Tagged + camelCased to match `StreamEvent`
-/// in `src/types.ts`. `Deserialize` lets Phone Sync decode it on the phone side
-/// (it is forwarded verbatim inside `sync::protocol::SyncFrame::Live`).
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum StreamEvent {
-    TurnStart {
-        #[serde(rename = "messageId")]
-        message_id: String,
-    },
-    TextDelta {
-        text: String,
-    },
-    ToolUse {
-        id: String,
-        name: String,
-        input: Value,
-    },
-    ToolResult {
-        id: String,
-        output: String,
-        #[serde(rename = "isError")]
-        is_error: bool,
-    },
-    PermissionRequest {
-        id: String,
-        tool: String,
-        summary: String,
-        input: Value,
-    },
-    Usage {
-        #[serde(rename = "inputTokens")]
-        input_tokens: u32,
-        #[serde(rename = "outputTokens")]
-        output_tokens: u32,
-    },
-    TurnEnd {
-        #[serde(rename = "stopReason")]
-        stop_reason: String,
-    },
-    Error {
-        message: String,
-    },
-}
+// `Block`, `ChatMessage`, and `StreamEvent` are the Phone Sync wire DTOs; Phase 1
+// of docs/IOS_WEB_CLIENT_PLAN.md (§5.1) moved them into the shared `portcode-sync`
+// crate (`portcode_sync::wire`) so the future wasm browser client can decode them
+// without linking this desktop crate. They are re-exported here UNCHANGED, so
+// every `crate::llm::Block` / `ChatMessage` / `StreamEvent` path — and the serde
+// shapes that match `src/types.ts` and the Anthropic content-block format —
+// resolve to the SAME types as before.
+pub use portcode_sync::wire::{Block, ChatMessage, StreamEvent};
 
 pub struct TurnResult {
     pub content: Vec<Block>,

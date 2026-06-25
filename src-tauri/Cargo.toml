@@ -27,6 +27,15 @@ tauri-plugin-opener = "2"
 # the release workflow's secret-gated `tauri signer sign` step.
 tauri-plugin-updater = "2"
 
+# Phone Sync shared crate (Phase 1 of docs/IOS_WEB_CLIENT_PLAN.md): the protocol,
+# Noise crypto, session loops, and the native iroh transport now live here so the
+# same code compiles for the future wasm browser client. With default features
+# this resolves the crate's NATIVE target table (tokio + `iroh = "1"`); the wasm
+# path is selected only when something is built for wasm32. The desktop re-exports
+# these types through `src/sync/*.rs`, `src/llm.rs`, and `src/db.rs`, so the rest
+# of the crate stays source-compatible.
+portcode-sync = { path = "../crates/portcode-sync" }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -83,12 +92,9 @@ keyring = { version = "3", features = ["windows-native"] }
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "2"
 
-[profile.release]
-opt-level = "s"
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true
+# NOTE: `[profile.release]` moved to the workspace ROOT `Cargo.toml` — Cargo only
+# honors profiles at the workspace root and ignores (with a warning) a profile
+# defined in a member manifest. The exact same flags now live there.
 
 # Lint policy. CI runs `cargo clippy --all-targets -- -D warnings`; these make
 # the same baseline reproducible for local `cargo clippy`. `unsafe_code = "deny"`
