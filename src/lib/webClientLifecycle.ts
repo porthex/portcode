@@ -51,10 +51,16 @@ export interface LifecycleStoreState {
   remoteVerified: boolean;
   remoteConnecting: boolean;
   remoteSas: string | null;
+  /** The desktop's pinned static public key (the STABLE identity to persist as
+   *  `PinnedPeer.peerPublicKey`), distinct from the `remoteSas` verification code. */
+  remotePeerKey: string | null;
   lastPairingQr: string | null;
   online: boolean;
   reconnectRemote: () => Promise<void>;
   setOnline: (v: boolean) => void;
+  /** Hydrate a remembered QR (from durable storage) into `lastPairingQr` when the
+   *  slot is empty, so `reconnectRemote()` can dial on a cold launch. */
+  hydrateRememberedQr: (qr: string) => void;
 }
 
 /** A zustand-shaped store handle: read with `getState`, observe with `subscribe`.
@@ -134,6 +140,11 @@ export function startWebClientLifecycle(opts: WebClientLifecycleOptions = {}): (
     const pinned = await storage.loadPinnedPeer();
     if (pinned?.qr && !store.getState().lastPairingQr) {
       rememberedQr = pinned.qr;
+      // Push the hydrated QR into the store too, so `reconnectRemote()` (which only
+      // reads `store.lastPairingQr`) can actually dial on a cold launch — not just
+      // the resume guard, which reads `rememberedQr` directly. `hydrateRememberedQr`
+      // only fills an empty slot, so a localStorage value that arrives first wins.
+      store.getState().hydrateRememberedQr(pinned.qr);
     }
   })();
 
@@ -145,9 +156,12 @@ export function startWebClientLifecycle(opts: WebClientLifecycleOptions = {}): (
     const s = store.getState();
     const live = isVerifiedLive(s);
 
-    // Fresh verified connection (the false→true edge): pin the desktop key durably.
-    if (live && !lastVerifiedLive && s.remoteSas !== null && s.lastPairingQr) {
-      void persistPinnedPeer(storage, s.lastPairingQr, s.remoteSas);
+    // Fresh verified connection (the false→true edge): pin the desktop's STABLE
+    // public key durably. We require `remotePeerKey` (the actual pinned identity) —
+    // NOT the SAS, which is only a one-time verification code. If the key isn't
+    // surfaced yet, skip pinning rather than storing the wrong value in the key slot.
+    if (live && !lastVerifiedLive && s.remotePeerKey !== null && s.lastPairingQr) {
+      void persistPinnedPeer(storage, s.lastPairingQr, s.remotePeerKey);
     }
 
     // The store forgot the remembered desktop (explicit disconnect / forget pairing):
@@ -173,7 +187,11 @@ export function startWebClientLifecycle(opts: WebClientLifecycleOptions = {}): (
       // Nothing remembered, or a session is already live / a dial is in flight →
       // nothing to reconnect. Resolve so the controller stops retrying.
       if (!qr || isVerifiedLive(s) || s.remoteConnecting) return;
-      await s.reconnectRemote();
+      // Ensure the QR is in the store before dialing: `reconnectRemote()` reads only
+      // `store.lastPairingQr`, so on a cold launch where it's still empty (and the QR
+      // came from the durable `rememberedQr`), hydrate it first or the dial no-ops.
+      if (!s.lastPairingQr) s.hydrateRememberedQr(qr);
+      await store.getState().reconnectRemote();
     },
     setTimeoutFn: opts.setTimeoutFn,
     clearTimeoutFn: opts.clearTimeoutFn,
@@ -209,10 +227,10 @@ export function startWebClientLifecycle(opts: WebClientLifecycleOptions = {}): (
 }
 
 /** Write the pinned desktop identity to durable storage (and request persistence).
- *  `sas` is not itself secret, but its presence proves a verified handshake, so the
- *  peer key is `sas`-shaped only as a stand-in until the WASM transport surfaces the
- *  real peer key — for now we store the QR as the re-dial source and the SAS-derived
- *  key slot. Best-effort: never throws (webStorage swallows storage errors). */
+ *  `peerPublicKey` is the desktop's STABLE static public key (from `ConnectInfo`),
+ *  the identity reconnects authenticate against — NOT the SAS verification code.
+ *  `qr` is stored alongside as the re-dial source. Best-effort: never throws
+ *  (webStorage swallows storage errors). */
 async function persistPinnedPeer(
   storage: LifecycleStorage,
   qr: string,

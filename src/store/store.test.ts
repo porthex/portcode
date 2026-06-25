@@ -1651,6 +1651,8 @@ describe("remote client", () => {
       expect(m.phoneSyncConnect).toHaveBeenCalledWith("QR-PAYLOAD", false);
       expect(st.remoteConnected).toBe(true);
       expect(st.remoteSas).toBe("SAS-1");
+      // The STABLE pinned desktop key is captured separately from the SAS.
+      expect(st.remotePeerKey).toBe("PEER==");
       expect(st.remoteError).toBeNull();
 
       // The captured callback must drive applyFrame.
@@ -1828,6 +1830,20 @@ describe("remote client", () => {
       const st = useStore.getState();
       expect(st.remoteDropped).toBe(false);
       expect(st.lastPairingQr).toBeNull();
+      // The pinned peer key is cleared too — no stale identity left behind.
+      expect(st.remotePeerKey).toBeNull();
+    });
+
+    it("hydrateRememberedQr fills an empty lastPairingQr but never clobbers an existing one", async () => {
+      // Cold launch: nothing remembered yet → the durable QR hydrates the slot so
+      // reconnectRemote (which reads lastPairingQr) can dial.
+      expect(useStore.getState().lastPairingQr).toBeNull();
+      useStore.getState().hydrateRememberedQr("QR-FROM-IDB");
+      expect(useStore.getState().lastPairingQr).toBe("QR-FROM-IDB");
+
+      // A QR already in the store (the localStorage mirror) wins — hydration is a no-op.
+      useStore.getState().hydrateRememberedQr("QR-STALE");
+      expect(useStore.getState().lastPairingQr).toBe("QR-FROM-IDB");
     });
 
     it("tears down a partial subscription if the disconnect listener fails to register", async () => {

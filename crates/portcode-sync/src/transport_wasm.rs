@@ -37,6 +37,7 @@ use iroh::{Endpoint, EndpointAddr, RelayUrl};
 use crate::noise::{self, Handshake};
 use crate::pairing::PairingPayload;
 use crate::protocol::SyncFrame;
+use crate::session::RecvError;
 use crate::transport::{Paired, Transport, ALPN, MAX_FRAME};
 
 /// Shared Noise transport state. A `std::sync::Mutex` (not tokio) because the lock
@@ -63,10 +64,12 @@ impl SecureChannel {
         write_framed(&mut self.send, &ciphertext).await
     }
 
-    /// Receive + decrypt one `SyncFrame`.
-    pub async fn recv_frame(&mut self) -> Result<SyncFrame, String> {
+    /// Receive + decrypt one `SyncFrame`. A clean end-of-stream is reported as
+    /// [`RecvError::Closed`]; a torn relay connection / decrypt / parse failure is
+    /// [`RecvError::Protocol`] so the session loops can force a reconnect.
+    pub async fn recv_frame(&mut self) -> Result<SyncFrame, RecvError> {
         let ciphertext = read_framed(&mut self.recv).await?;
-        decrypt_frame(&self.noise, &ciphertext)
+        decrypt_frame(&self.noise, &ciphertext).map_err(RecvError::Protocol)
     }
 
     /// Split into independent send/recv halves so live-forward and command-intake
@@ -113,9 +116,9 @@ pub struct ChannelReceiver {
 }
 
 impl ChannelReceiver {
-    pub async fn recv_frame(&mut self) -> Result<SyncFrame, String> {
+    pub async fn recv_frame(&mut self) -> Result<SyncFrame, RecvError> {
         let ciphertext = read_framed(&mut self.recv).await?;
-        decrypt_frame(&self.noise, &ciphertext)
+        decrypt_frame(&self.noise, &ciphertext).map_err(RecvError::Protocol)
     }
 }
 
@@ -145,6 +148,12 @@ fn decrypt_frame(noise: &SharedNoise, ciphertext: &[u8]) -> Result<SyncFrame, St
 /// `SendStream` exposes the same inherent `write_all` as native (the Phase 0 spike
 /// uses it), so this is identical to the native helper.
 async fn write_framed(send: &mut SendStream, payload: &[u8]) -> Result<(), String> {
+    if payload.len() > MAX_FRAME {
+        return Err(format!(
+            "frame of {} bytes exceeds the {MAX_FRAME}-byte cap",
+            payload.len()
+        ));
+    }
     let len = u32::try_from(payload.len()).map_err(|_| "frame too large".to_string())?;
     send.write_all(&len.to_be_bytes())
         .await
@@ -152,22 +161,26 @@ async fn write_framed(send: &mut SendStream, payload: &[u8]) -> Result<(), Strin
     send.write_all(payload).await.map_err(|e| e.to_string())
 }
 
-/// Read a 4-byte big-endian length prefix then exactly that many bytes.
-async fn read_framed(recv: &mut RecvStream) -> Result<Vec<u8>, String> {
+/// Read a 4-byte big-endian length prefix then exactly that many bytes. A clean
+/// finish at a frame boundary reports [`RecvError::Closed`]; a truncated/oversized
+/// frame or a torn relay connection reports [`RecvError::Protocol`].
+async fn read_framed(recv: &mut RecvStream) -> Result<Vec<u8>, RecvError> {
     let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| e.to_string())?;
+    match recv.read_exact(&mut len_buf).await {
+        Ok(()) => {}
+        Err(iroh::endpoint::ReadExactError::FinishedEarly(0)) => return Err(RecvError::Closed),
+        Err(e) => return Err(RecvError::Protocol(e.to_string())),
+    }
     let n = u32::from_be_bytes(len_buf) as usize;
     if n > MAX_FRAME {
-        return Err(format!(
+        return Err(RecvError::Protocol(format!(
             "frame of {n} bytes exceeds the {MAX_FRAME}-byte cap"
-        ));
+        )));
     }
     let mut payload = vec![0u8; n];
     recv.read_exact(&mut payload)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| RecvError::Protocol(e.to_string()))?;
     Ok(payload)
 }
 

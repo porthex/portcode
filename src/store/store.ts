@@ -58,6 +58,7 @@ interface AppState {
   remoteConnected: boolean; // a live desktop session is established
   remoteVerified: boolean; // the user confirmed the SAS matches; gates entry to the remote session
   remoteSas: string | null; // short-auth-string to compare out-of-band; null when not connected
+  remotePeerKey: string | null; // the desktop's pinned static public key (from ConnectInfo); the STABLE identity, distinct from the SAS
   remoteError: string | null; // last connect failure, surfaced in the connect UI
   remoteUnlisten: (() => void) | null; // tears down the frame subscription (private; mirrors `cancel`)
   remoteDropped: boolean; // the live session ended unexpectedly — the UI offers a reconnect
@@ -107,6 +108,7 @@ interface AppState {
   closeRemoteSession: () => void;
   forgetRemotePairing: () => void;
   setOnline: (v: boolean) => void;
+  hydrateRememberedQr: (qr: string) => void;
 }
 
 const now = () => Date.now();
@@ -221,6 +223,7 @@ export const useStore = create<AppState>((set, get) => ({
   remoteConnected: false,
   remoteVerified: false,
   remoteSas: null,
+  remotePeerKey: null,
   remoteError: null,
   remoteUnlisten: null,
   remoteDropped: false,
@@ -988,6 +991,9 @@ export const useStore = create<AppState>((set, get) => ({
         // re-authenticated the same desktop key); a first dial never is.
         remoteVerified: verified,
         remoteSas: info.sas,
+        // The STABLE pinned desktop key (distinct from the SAS verification code).
+        // Durable storage pins this, never the SAS.
+        remotePeerKey: info.peerPublicKey,
         remoteError: null,
         remoteDropped: false,
         lastPairingQr: qr,
@@ -1007,6 +1013,7 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         remoteConnected: false,
         remoteSas: null,
+        remotePeerKey: null,
         remoteUnlisten: null,
         remoteError: errMessage(err),
       });
@@ -1070,6 +1077,7 @@ export const useStore = create<AppState>((set, get) => ({
       remoteConnected: false,
       remoteVerified: false,
       remoteSas: null,
+      remotePeerKey: null,
       remoteDropped: false,
       lastPairingQr: null,
       remoteUnlisten: null,
@@ -1133,6 +1141,14 @@ export const useStore = create<AppState>((set, get) => ({
   // Remote mode shows the offline screen while this is false.
   setOnline(v) {
     set({ online: v });
+  },
+
+  // Hydrate the remembered pairing QR from durable (IndexedDB) storage on a cold
+  // launch, so `reconnectRemote()` (which reads `lastPairingQr`) can one-tap dial
+  // even when the localStorage mirror was evicted. Only fills an EMPTY slot — never
+  // clobbers a QR the store already has (the live/localStorage value wins).
+  hydrateRememberedQr(qr) {
+    if (!get().lastPairingQr) set({ lastPairingQr: qr });
   },
 }));
 

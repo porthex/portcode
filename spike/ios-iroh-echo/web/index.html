@@ -16,7 +16,10 @@
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="iroh spike" />
-    <link rel="apple-touch-icon" href="./icon.svg" />
+    <!-- iOS ignores SVG for the Home-Screen icon, so point apple-touch-icon at a
+         PNG. 180x180 is the modern iPhone @3x size; iOS applies its own corner
+         mask, so a square icon is fine. -->
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
 
     <style>
       :root {

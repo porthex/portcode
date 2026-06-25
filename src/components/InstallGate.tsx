@@ -1,3 +1,5 @@
+import type { ReactNode } from "react";
+
 import { getInstallState } from "../lib/installGate";
 
 // iOS PWA install-gate onboarding screen (docs/IOS_WEB_CLIENT_PLAN.md §5.7).
@@ -17,7 +19,7 @@ import { getInstallState } from "../lib/installGate";
 // Home-Screen launch is a fresh document, so there is nothing to re-poll live).
 
 /** A single numbered step in the install walkthrough. */
-function Step({ n, children }: { n: number; children: React.ReactNode }) {
+function Step({ n, children }: { n: number; children: ReactNode }) {
   return (
     <li className="flex items-start gap-3 text-left">
       <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-accent/40 bg-accent/10 font-mono text-[12px] font-bold text-accent">

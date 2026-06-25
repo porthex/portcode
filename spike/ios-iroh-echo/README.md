@@ -59,7 +59,7 @@ cargo run --release
 
 It prints a banner like:
 
-```
+```text
   ENDPOINT ID (paste into the phone):
     <a long base32 endpoint id>
 
@@ -80,10 +80,19 @@ python3 -m http.server 8000      # localhost is a secure context; fine for wasm
 Find the laptop's LAN IP (e.g. `192.168.1.42`). On the **same Wi-Fi**, the phone
 opens `http://192.168.1.42:8000`.
 
-> A secure context (HTTPS or `localhost`) is required for wasm + PWA install.
-> A plain `http://<lan-ip>` page **will load the wasm** on iOS for a quick test,
-> but **"Add to Home Screen" / installed-PWA behaviour is only fully correct over
-> HTTPS** — so for the real installed-PWA test, prefer Vercel (next).
+There are TWO distinct things to verify, and they need different setups — don't
+conflate them:
+
+> **(a) Connectivity smoke test (plain `http://<lan-ip>`).** A plain
+> `http://192.168.1.42:8000` page **will load the wasm and dial the relay** on iOS
+> Safari, which is enough to sanity-check that iroh-in-browser connects and echoes.
+> This is a quick first check ONLY — it is NOT the installed-PWA test.
+>
+> **(b) Installed-PWA test (HTTPS / Vercel — see below).** A secure context (HTTPS,
+> or `localhost`) is required for **"Add to Home Screen" / installed-PWA behaviour**
+> to be fully correct (durable storage, the standalone launch, the resume model).
+> A plain `http://<lan-ip>` page is NOT a faithful installed-PWA environment, so do
+> the real Phase 0 go/no-go run over HTTPS via Vercel (next).
 
 #### (Recommended) deploy `web/` to Vercel as a static site
 

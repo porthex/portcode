@@ -10,3 +10,13 @@
 # resolved relative to this config's parent (the workspace root).
 [build]
 target-dir = "src-tauri/target"
+
+# MANDATORY for getrandom 0.3 on wasm: a root-level `cargo build -p portcode-sync
+# --target wasm32-unknown-unknown` (which CI runs from the workspace root) resolves
+# THIS config, not the crate-local `crates/portcode-*/.cargo/config.toml` — Cargo
+# only reads the config in/above the invocation directory. Without this flag the
+# wasm build fails with "the wasm_js backend requires the getrandom_backend cfg".
+# The crate-local configs are kept (harmless) so building from inside a crate dir
+# still works. Pairs with the `getrandom features=["wasm_js"]` in the wasm deps.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", 'getrandom_backend="wasm_js"']

@@ -25,10 +25,10 @@ pub use portcode_sync::pairing::PairingPayload;
 /// run. The private key lives only in the OS credential store.
 pub fn device_identity() -> Result<StaticKeypair, String> {
     if let Some((public, private)) = secrets::get_device_key() {
-        return Ok(StaticKeypair { public, private });
+        return Ok(StaticKeypair::from_parts(public, private));
     }
     let kp = StaticKeypair::generate()?;
-    secrets::set_device_key(&kp.public, &kp.private)?;
+    secrets::set_device_key(&kp.public, kp.private_key())?;
     Ok(kp)
 }
 

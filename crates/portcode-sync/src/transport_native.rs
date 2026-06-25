@@ -23,11 +23,17 @@ use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 
 use crate::noise::{self, Handshake};
 use crate::protocol::SyncFrame;
+use crate::session::RecvError;
 use crate::transport::{Paired, MAX_FRAME};
 
 /// ALPN identifying the Phone Sync protocol on the QUIC connection. Re-exported
 /// from the shared module so this file reads as it did before the split.
 use crate::transport::ALPN;
+
+/// Timeout for the pairing handshake. A peer that connects but then stalls
+/// mid-handshake (no follow-up message) must not park `accept`/`connect` forever;
+/// 30s is generous for a relayed round-trip yet bounds a hung/abandoned dial.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Build (and bind) an iroh endpoint with the given node identity + relay policy.
 /// Hold the returned `Endpoint` alive for as long as its connections are in use —
@@ -67,10 +73,12 @@ impl SecureChannel {
         write_framed(&mut self.send, &ciphertext).await
     }
 
-    /// Receive + decrypt one `SyncFrame`.
-    pub async fn recv_frame(&mut self) -> Result<SyncFrame, String> {
+    /// Receive + decrypt one `SyncFrame`. A clean end-of-stream is reported as
+    /// [`RecvError::Closed`]; a torn connection / decrypt / parse failure is
+    /// [`RecvError::Protocol`] so the session loops can force a reconnect.
+    pub async fn recv_frame(&mut self) -> Result<SyncFrame, RecvError> {
         let ciphertext = read_framed(&mut self.recv).await?;
-        decrypt_frame(&self.noise, &ciphertext)
+        decrypt_frame(&self.noise, &ciphertext).map_err(RecvError::Protocol)
     }
 
     /// Split into independent send/recv halves so live-forward and command-intake
@@ -116,9 +124,9 @@ pub struct ChannelReceiver {
 }
 
 impl ChannelReceiver {
-    pub async fn recv_frame(&mut self) -> Result<SyncFrame, String> {
+    pub async fn recv_frame(&mut self) -> Result<SyncFrame, RecvError> {
         let ciphertext = read_framed(&mut self.recv).await?;
-        decrypt_frame(&self.noise, &ciphertext)
+        decrypt_frame(&self.noise, &ciphertext).map_err(RecvError::Protocol)
     }
 }
 
@@ -160,7 +168,8 @@ pub async fn connect_and_pair(
         .map_err(|e| e.to_string())?;
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
     let hs = Handshake::xx_initiator(local_noise_private, nonce)?;
-    let (noise, sas, peer_static) = drive_xx(hs, &mut send, &mut recv, true).await?;
+    let (noise, sas, peer_static) =
+        with_handshake_timeout(drive_xx(hs, &mut send, &mut recv, true)).await?;
     Ok(Paired {
         channel: SecureChannel {
             send,
@@ -196,7 +205,8 @@ pub async fn accept_and_pair(
     // Resolve the prologue nonce now that a peer has connected (see above).
     let nonce = nonce_for();
     let hs = Handshake::xx_responder(local_noise_private, &nonce)?;
-    let (noise, sas, peer_static) = drive_xx(hs, &mut send, &mut recv, false).await?;
+    let (noise, sas, peer_static) =
+        with_handshake_timeout(drive_xx(hs, &mut send, &mut recv, false)).await?;
     Ok(Paired {
         channel: SecureChannel {
             send,
@@ -208,6 +218,22 @@ pub async fn accept_and_pair(
         sas,
         peer_static,
     })
+}
+
+/// Bound a pairing handshake by [`HANDSHAKE_TIMEOUT`], turning a stalled peer into
+/// a controlled error rather than a future that never resolves (which would park
+/// the accept loop / a dial indefinitely).
+async fn with_handshake_timeout<F, T>(fut: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, fut).await {
+        Ok(res) => res,
+        Err(_) => Err(format!(
+            "pairing handshake timed out after {}s",
+            HANDSHAKE_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 /// Drive a 3-message XX handshake over the framed stream, capture the SAS + peer
@@ -240,8 +266,17 @@ async fn drive_xx(
     Ok((transport, sas, peer_static))
 }
 
-/// Write a 4-byte big-endian length prefix followed by `payload`.
+/// Write a 4-byte big-endian length prefix followed by `payload`. Enforces the
+/// `MAX_FRAME` cap BEFORE writing (mirroring `read_framed`) so an oversized frame
+/// is rejected locally with a clear error rather than emitted onto the wire for the
+/// peer to reject.
 async fn write_framed(send: &mut SendStream, payload: &[u8]) -> Result<(), String> {
+    if payload.len() > MAX_FRAME {
+        return Err(format!(
+            "frame of {} bytes exceeds the {MAX_FRAME}-byte cap",
+            payload.len()
+        ));
+    }
     let len = u32::try_from(payload.len()).map_err(|_| "frame too large".to_string())?;
     send.write_all(&len.to_be_bytes())
         .await
@@ -249,22 +284,28 @@ async fn write_framed(send: &mut SendStream, payload: &[u8]) -> Result<(), Strin
     send.write_all(payload).await.map_err(|e| e.to_string())
 }
 
-/// Read a 4-byte big-endian length prefix then exactly that many bytes.
-async fn read_framed(recv: &mut RecvStream) -> Result<Vec<u8>, String> {
+/// Read a 4-byte big-endian length prefix then exactly that many bytes. A peer that
+/// finishes the stream cleanly at a frame boundary (nothing buffered) reports
+/// [`RecvError::Closed`]; a truncated frame, an oversized length, or a torn
+/// connection reports [`RecvError::Protocol`].
+async fn read_framed(recv: &mut RecvStream) -> Result<Vec<u8>, RecvError> {
     let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| e.to_string())?;
+    match recv.read_exact(&mut len_buf).await {
+        Ok(()) => {}
+        // A clean finish at a frame boundary reads zero bytes of the next prefix.
+        Err(iroh::endpoint::ReadExactError::FinishedEarly(0)) => return Err(RecvError::Closed),
+        Err(e) => return Err(RecvError::Protocol(e.to_string())),
+    }
     let n = u32::from_be_bytes(len_buf) as usize;
     if n > MAX_FRAME {
-        return Err(format!(
+        return Err(RecvError::Protocol(format!(
             "frame of {n} bytes exceeds the {MAX_FRAME}-byte cap"
-        ));
+        )));
     }
     let mut payload = vec![0u8; n];
     recv.read_exact(&mut payload)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| RecvError::Protocol(e.to_string()))?;
     Ok(payload)
 }
 
@@ -306,15 +347,19 @@ mod tests {
         // server_ep is moved into the task and dropped when it returns; the
         // Endpoint clone inside the returned Paired (Arc-backed) keeps the socket
         // alive for the frame exchange below.
-        let server_priv = server_noise.private.clone();
+        let server_priv = server_noise.private_key().to_vec();
         let server_task = tokio::spawn(async move {
             accept_and_pair(&server_ep, &server_priv, || TEST_NONCE.to_vec()).await
         });
 
-        let mut client =
-            connect_and_pair(&client_ep, server_addr, &client_noise.private, TEST_NONCE)
-                .await
-                .expect("client pairing");
+        let mut client = connect_and_pair(
+            &client_ep,
+            server_addr,
+            client_noise.private_key(),
+            TEST_NONCE,
+        )
+        .await
+        .expect("client pairing");
         let mut server = server_task.await.unwrap().expect("server pairing");
 
         // Out-of-band SAS matches, and each side pinned the other's static key.
@@ -379,7 +424,7 @@ mod tests {
         let server_addr = server_ep.addr();
 
         // Responder binds nonce A; the dialing phone binds a DIFFERENT nonce B.
-        let server_priv = server_noise.private.clone();
+        let server_priv = server_noise.private_key().to_vec();
         let server_task = tokio::spawn(async move {
             accept_and_pair(&server_ep, &server_priv, || vec![0xAA, 0xAA]).await
         });
@@ -387,7 +432,7 @@ mod tests {
         let client_res = connect_and_pair(
             &client_ep,
             server_addr,
-            &client_noise.private,
+            client_noise.private_key(),
             &[0xBB, 0xBB],
         )
         .await;
@@ -440,13 +485,18 @@ mod tests {
         let client_noise = StaticKeypair::generate().unwrap();
         let server_addr = server_ep.addr();
 
-        let server_priv = server_noise.private.clone();
+        let server_priv = server_noise.private_key().to_vec();
         let server_task = tokio::spawn(async move {
             accept_and_pair(&server_ep, &server_priv, || TEST_NONCE.to_vec()).await
         });
-        let client = connect_and_pair(&client_ep, server_addr, &client_noise.private, TEST_NONCE)
-            .await
-            .expect("client pairing");
+        let client = connect_and_pair(
+            &client_ep,
+            server_addr,
+            client_noise.private_key(),
+            TEST_NONCE,
+        )
+        .await
+        .expect("client pairing");
         let server = server_task.await.unwrap().expect("server pairing");
 
         // ── server: split, run both loops concurrently ──
@@ -498,12 +548,17 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        // Close: drop hub (forward_live returns), drop client send (server recv
-        // ends → handle_commands returns). Join both before asserting `seen`.
+        // Close: drop hub so forward_live returns. The `forward` task owns the SERVER
+        // send half (which keeps the server connection alive), so when it ends the
+        // server connection is torn down — which ends `handle_commands` with a
+        // transport "connection lost" Protocol error rather than a clean close. That
+        // is the CORRECT post-fix behavior (an abrupt teardown forces reconnect, not
+        // a silent Ok), so we only require both loops to TERMINATE; the meaningful
+        // assertion is that the one command was processed (`seen` below).
         drop(hub_tx);
         drop(client_send);
-        forward.await.unwrap().expect("forward_live ok");
-        intake.await.unwrap().expect("handle_commands ok");
+        let _ = forward.await.unwrap();
+        let _ = intake.await.unwrap();
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);

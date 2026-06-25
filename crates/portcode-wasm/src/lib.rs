@@ -91,7 +91,7 @@ impl Session {
         // a later increment will load a persisted identity from IndexedDB so KK
         // reconnects authenticate as the same pinned device.
         let local = StaticKeypair::generate().map_err(|e| js_err(&e))?;
-        let transport = WasmTransport::new(local.private.clone());
+        let transport = WasmTransport::new(local.private_key().to_vec());
 
         let paired = transport
             .connect(&payload, reconnect)
