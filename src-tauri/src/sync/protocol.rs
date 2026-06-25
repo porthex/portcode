@@ -4,4 +4,7 @@
 //! shared `portcode-sync` crate. Re-exported here so every existing
 //! `crate::sync::protocol::…` path keeps resolving to the SAME types.
 
+// Full-surface compatibility re-export (see noise.rs); `#[allow(unused_imports)]`
+// because src-tauri doesn't itself reference every wire type under `-D warnings`.
+#[allow(unused_imports)]
 pub use portcode_sync::protocol::{Cursor, RemoteCommand, SyncFrame};
