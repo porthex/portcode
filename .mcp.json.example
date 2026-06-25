@@ -1,0 +1,36 @@
+// .mcp.json.example — OPTIONAL local LSP navigation via Serena.
+//
+// This file is NOT loaded by Claude Code. Only a file literally named `.mcp.json`
+// is read for project-scoped MCP servers. This is an EXAMPLE / opt-in template.
+//
+// WHY DOCUMENT-ONLY (not a live .mcp.json):
+//   Project-scoped MCP servers require INTERACTIVE APPROVAL the first time they are
+//   used and sit as "Pending approval" until you approve them. Web/iOS cloud sessions
+//   start non-interactively, so a project MCP server would never auto-load there — it
+//   would provide zero autonomous value while adding a moving part. So we ship this as
+//   an opt-in example only.
+//
+// TO ENABLE (local terminal, or a web session where you can manually approve):
+//   1. Copy this file to `.mcp.json` (drop the comments — .mcp.json must be pure JSON).
+//   2. Ensure `uv`/`uvx` is installed (Serena launches via uvx).
+//   3. Run `claude` once and approve the server at the first-run prompt.
+//
+// DEGRADES SAFELY: if uvx / rust-analyzer is absent the server just shows "failed" in
+// /mcp; it never breaks the session.
+//
+// KEEP PII OUT of any committed .mcp.json: use `--project .` (relative), never an
+// absolute home path like /home/<user> or /Users/<user>. This repo is PUBLIC.
+{
+  "mcpServers": {
+    "serena": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "--from", "git+https://github.com/oraios/serena",
+        "serena", "start-mcp-server",
+        "--context", "ide-assistant",
+        "--project", "."
+      ]
+    }
+  }
+}
