@@ -6,6 +6,10 @@ dist-ssr
 web-dist
 # rust
 src-tauri/target
+# Workspace build output. Phase 1 of docs/IOS_WEB_CLIENT_PLAN.md turned the repo
+# into a Cargo workspace, so cargo now writes a shared `target/` at the repo root
+# (the per-crate `src-tauri/target` above is kept for any legacy/standalone build).
+/target
 # env / secrets
 .env
 .env.local

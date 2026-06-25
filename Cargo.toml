@@ -1,0 +1,28 @@
+# Cargo workspace root.
+#
+# Phase 1 of docs/IOS_WEB_CLIENT_PLAN.md (§5.1) extracts the Phone Sync
+# protocol/crypto/session/transport code into the shared `portcode-sync` crate
+# so it builds for BOTH native (desktop) and `wasm32` (the future
+# iroh-in-browser PWA client) from one source of truth. `src-tauri` (the Tauri
+# desktop binary) is a workspace member that depends on `portcode-sync` via a
+# path dependency and re-exports its shared types, so the desktop build is
+# unchanged in spirit — only `use` paths moved.
+[workspace]
+resolver = "2"
+members = [
+    "crates/portcode-sync",
+    "src-tauri",
+]
+
+# Release profile for the desktop binary. In a workspace, profiles are ONLY
+# honored at the root — a `[profile.release]` left in `src-tauri/Cargo.toml` is
+# silently ignored (Cargo warns). These are the exact flags that previously lived
+# in `src-tauri/Cargo.toml`, lifted here verbatim so the desktop release build is
+# unchanged. (Size flags for the eventual wasm consumer `portcode-wasm` land in
+# Phase 2 when that cdylib exists.)
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

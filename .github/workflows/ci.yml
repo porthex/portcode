@@ -106,18 +106,82 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          # Workspace root: covers both `src-tauri` and the extracted
+          # `crates/portcode-sync` member (Phase 1 of IOS_WEB_CLIENT_PLAN.md §5.1).
+          workspaces: .
 
-      # Single Rust crate today, so each command targets it via --manifest-path.
-      # Switch to `--workspace` once `portcode-core` is extracted (Phase 2).
+      # Now a Cargo workspace (`src-tauri` + `crates/portcode-sync`), so the
+      # commands run `--workspace` across every member instead of targeting a
+      # single manifest.
       - name: Format check (rustfmt)
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all --check
+        run: cargo fmt --all --check
 
       - name: Lint (clippy — warnings are errors)
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test (cargo test)
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --workspace
+
+  # ── wasm compile gate for the shared sync crate (IOS_WEB_CLIENT_PLAN §5.3) ──
+  # Phase 1's exit criterion is that `portcode-sync` compiles to
+  # wasm32-unknown-unknown (the future iroh-in-browser PWA client target). It
+  # CANNOT be fully verified on low-RAM dev machines (per CLAUDE.md: "verify Rust
+  # via CI"), so this job is the source of truth. It builds ONLY the shared crate
+  # for wasm — `src-tauri` (Tauri desktop) is never a wasm target. Linux-only:
+  # the wasm build needs LLVM clang (Apple/MSVC clang can't target wasm32), and
+  # one OS leg is enough to prove the compile.
+  wasm:
+    name: WASM (portcode-sync compiles for wasm32)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # LLVM clang is required to target wasm32 (Apple/MSVC clang cannot). Install
+      # it explicitly so the job is self-contained and doesn't silently regress if
+      # the runner image changes.
+      - name: Install LLVM clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm
+
+      # The pinned channel + components come from rust-toolchain.toml; add the
+      # wasm target on top (it is not in the pinned `targets` list, which only
+      # carries the desktop triples).
+      - name: Materialize pinned Rust toolchain + wasm target
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          # Separate cache key from the native legs (different target dir).
+          key: wasm
+
+      # The exit criterion: the shared crate compiles for the browser target.
+      # The crate's `.cargo/config.toml` supplies the mandatory
+      # getrandom_backend="wasm_js" rustflag for this target. `transport_wasm.rs`
+      # is a compiling skeleton (the full browser iroh dial is Phase 2).
+      - name: Build portcode-sync for wasm32-unknown-unknown
+        run: cargo build -p portcode-sync --target wasm32-unknown-unknown
+
+      # Belt-and-suspenders audit (§5.3): a native-only tokio `net`/`rt` path
+      # leaking into shared code would pull in `mio`, and enabling snow's
+      # `ring`/`std` would pull in `ring` — neither builds for wasm. Assert both
+      # are ABSENT from the wasm dependency tree.
+      - name: Audit for native bleed-through (no mio / no ring on wasm)
+        run: |
+          if cargo tree -p portcode-sync --target wasm32-unknown-unknown -i mio 2>/dev/null | grep -q '^mio'; then
+            echo "::error::mio leaked into the wasm build — a tokio net/rt path reached shared code"
+            exit 1
+          fi
+          if cargo tree -p portcode-sync --target wasm32-unknown-unknown -i ring 2>/dev/null | grep -q '^ring'; then
+            echo "::error::ring leaked into the wasm build — snow std/ring feature reached the wasm target"
+            exit 1
+          fi
+          echo "no mio / no ring on the wasm target — clean"
 
   coverage:
     name: Coverage (frontend · main/release only)
