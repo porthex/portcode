@@ -15,18 +15,18 @@
 
 ## What's here
 
-| Path                  | What it is                                                                                              |
-| --------------------- | ------------------------------------------------------------------------------------------------------- |
-| `echo-desktop/`       | Native Rust binary (`iroh = "1"`). Binds an endpoint, prints its **endpoint id** + relay, echoes bytes. |
-| `echo-web/`           | Rust → wasm crate (`iroh` relay-only, `getrandom` wasm_js). The browser echo client.                    |
-| `web/`                | `index.html` + `app.js` + PWA manifest/icon. Loads the wasm, connects, and does the resume-reconnect.   |
-| `build.sh`            | Builds `echo-web` into `web/pkg/` with `wasm-pack`.                                                      |
+| Path            | What it is                                                                                              |
+| --------------- | ------------------------------------------------------------------------------------------------------- |
+| `echo-desktop/` | Native Rust binary (`iroh = "1"`). Binds an endpoint, prints its **endpoint id** + relay, echoes bytes. |
+| `echo-web/`     | Rust → wasm crate (`iroh` relay-only, `getrandom` wasm_js). The browser echo client.                    |
+| `web/`          | `index.html` + `app.js` + PWA manifest/icon. Loads the wasm, connects, and does the resume-reconnect.   |
+| `build.sh`      | Builds `echo-web` into `web/pkg/` with `wasm-pack`.                                                     |
 
 **Relay:** the spike uses **n0 public relays** (`presets::N0`) — zero infra, no
 self-hosted relay (plan §5.5). The default relay URL shown in the UI is
 `https://relay.iroh.network./`. With `presets::N0`, the dialer resolves the
 desktop's relay from its endpoint id via n0 discovery, so the phone only needs
-*an* n0 public relay in that field.
+_an_ n0 public relay in that field.
 
 ---
 
@@ -140,12 +140,12 @@ Tie each to the plan's Phase 0 exit: _"a throwaway wasm page on real iOS Safari 
 installed PWA dials a native iroh desktop through a relay, exchanges bytes, and
 survives a background→resume reconnect."_
 
-| #   | Question                                                                   | GO if…                                          |
-| --- | -------------------------------------------------------------------------- | ----------------------------------------------- |
-| 1   | **Connects at all?** Does the installed PWA reach `CONNECTED` + echo once? | Yes, in Safari **and** the installed PWA.        |
+| #   | Question                                                                                  | GO if…                                                 |
+| --- | ----------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| 1   | **Connects at all?** Does the installed PWA reach `CONNECTED` + echo once?                | Yes, in Safari **and** the installed PWA.              |
 | 2   | **Survives background→resume?** After ≥30s locked, does it auto-reconnect and echo again? | Yes — automatically (or at worst with one manual tap). |
-| 3   | **Latency acceptable?** Round-trip echo feels interactive (rough: < ~1s).  | Echo returns promptly; no multi-second stalls.   |
-| 4   | **Stable?** Repeat the background/resume cycle 3–5×.                        | Reconnects every time; no permanent dead state.  |
+| 3   | **Latency acceptable?** Round-trip echo feels interactive (rough: < ~1s).                 | Echo returns promptly; no multi-second stalls.         |
+| 4   | **Stable?** Repeat the background/resume cycle 3–5×.                                      | Reconnects every time; no permanent dead state.        |
 
 - **All four GO → proceed** to Phase 1 (extract `portcode-sync`, build the real
   WASM transport).
