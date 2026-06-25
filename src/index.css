@@ -279,6 +279,25 @@ textarea:focus-visible {
     box-shadow: 0 0 0 0 rgba(52, 255, 158, 0);
   }
 }
+/* Mobile remote: the pairing camera-viewport scan line sweeps top→bottom, and the
+   session-switcher bottom sheet slides up. Both are geometry, so the components
+   gate them behind `motion-safe:` (silenced under prefers-reduced-motion). */
+@keyframes pcScanV {
+  0% {
+    top: 6%;
+  }
+  100% {
+    top: 92%;
+  }
+}
+@keyframes pcSheet {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
 
 @media (prefers-reduced-motion: reduce) {
   /* Reduced-motion: gate only large/ambient MOVEMENT. The digital rain

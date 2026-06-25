@@ -64,6 +64,8 @@ interface AppState {
   remoteDropped: boolean; // the live session ended unexpectedly — the UI offers a reconnect
   remoteConnecting: boolean; // a connectRemote dial is in flight (private re-entry guard)
   lastPairingQr: string | null; // last successful pairing payload, kept for one-tap reconnect
+  remoteChatOpen: boolean; // remote: a session is open (chat view) vs. the sessions list
+  online: boolean; // the device has network — remote needs it to reach the desktop
 
   init: () => Promise<void>;
   retryInit: () => Promise<void>;
@@ -104,6 +106,10 @@ interface AppState {
   sendRemoteCommand: (command: RemoteCommand) => Promise<void>;
   disconnectRemote: () => Promise<void>;
   reconnectRemote: () => Promise<void>;
+  openRemoteSession: (id: string) => Promise<void>;
+  closeRemoteSession: () => void;
+  forgetRemotePairing: () => void;
+  setOnline: (v: boolean) => void;
 }
 
 const now = () => Date.now();
@@ -239,6 +245,12 @@ export const useStore = create<AppState>((set, get) => ({
   // Remembered across launches so the phone can reconnect without re-scanning the
   // QR (Android frequently kills backgrounded apps). Public payload — no secret.
   lastPairingQr: readStr("pc.lastPairingQr"),
+  // After SAS verification the remote lands on the sessions LIST; opening a session
+  // flips this true (chat view). Reset on every disconnect/drop/fresh-dial.
+  remoteChatOpen: false,
+  // Network presence. Seeded from the browser; App keeps it live via online/offline
+  // events. Remote mode shows the offline screen when this is false.
+  online: typeof navigator !== "undefined" && "onLine" in navigator ? navigator.onLine : true,
 
   async init() {
     // The phone/remote client has no local sessions DB or settings — its session
@@ -971,6 +983,7 @@ export const useStore = create<AppState>((set, get) => ({
       remoteUnlisten: null,
       remoteError: null,
       remoteVerified: false,
+      remoteChatOpen: false,
       streaming: false,
       pendingPermission: null,
     });
@@ -1008,6 +1021,7 @@ export const useStore = create<AppState>((set, get) => ({
           remoteConnected: false,
           remoteVerified: false,
           remoteDropped: true,
+          remoteChatOpen: false,
           streaming: false,
           pendingPermission: null,
         });
@@ -1112,6 +1126,7 @@ export const useStore = create<AppState>((set, get) => ({
       // connectRemote's own finally clears this in steady state, so this is a no-op
       // when no dial is in flight.
       remoteConnecting: false,
+      remoteChatOpen: false,
       streaming: false, // the turn is over — don't strand a stuck composer
       pendingPermission: null,
     });
@@ -1128,6 +1143,35 @@ export const useStore = create<AppState>((set, get) => ({
     // re-authenticates the same static key the user already trusted at first
     // pairing, so no fresh SAS comparison is needed.
     await get().connectRemote(qr, true);
+  },
+
+  // Open a session from the remote sessions list — switch to it, then reveal the
+  // chat view. selectSession is the single source of truth for activeId + lazy
+  // message load (and is a no-op mid-stream); opening the chat is unconditional so
+  // tapping the already-active running session still enters it.
+  async openRemoteSession(id) {
+    await get().selectSession(id);
+    set({ remoteChatOpen: true });
+  },
+
+  // Back out of the chat view to the remote sessions list. The connection stays
+  // live — this is pure in-app navigation, not a disconnect.
+  closeRemoteSession() {
+    set({ remoteChatOpen: false });
+  },
+
+  // Forget the remembered desktop and clear the dropped flag so the UI falls back
+  // to the fresh pairing screen ("Pair a different desktop" from the drop screen).
+  // The channel is already down here, so there's nothing to tear down.
+  forgetRemotePairing() {
+    writeStr("pc.lastPairingQr", null);
+    set({ lastPairingQr: null, remoteDropped: false });
+  },
+
+  // Network presence, driven by the browser's online/offline events (see App).
+  // Remote mode shows the offline screen while this is false.
+  setOnline(v) {
+    set({ online: v });
   },
 }));
 
