@@ -823,6 +823,11 @@ async fn phone_sync_connect(
     let iroh_key = secrets::get_or_create_iroh_key()?;
     let identity = sync::pairing::device_identity()?;
     // 3. Bind a client endpoint (RelayMode::Default for hole-punch + relay).
+    // Belt-and-suspenders: ensure the `ndk_context` global is populated before bind
+    // even if `setup` somehow ran before the activity existed. No-op after the first
+    // call (guarded by the `Once` inside).
+    #[cfg(target_os = "android")]
+    init_ndk_context();
     let endpoint = sync::transport::build_endpoint(iroh_key, iroh::RelayMode::Default).await?;
     // 4. Dial + run the XX initiator handshake. Prologue = the QR nonce for a first
     //    pairing (matches the desktop's open window), or empty on reconnect (matches
@@ -937,6 +942,34 @@ fn phone_sync_disconnect(state: State<AppState>) -> Result<(), String> {
     Ok(()) // no-op when nothing was connected
 }
 
+/// Forward tao's captured Android JavaVM + Activity into the process-wide
+/// `ndk_context` global that iroh's transitive `netdev` / `hickory-resolver` read
+/// on `Endpoint::bind()`. tao stores the VM+Activity in its OWN ndk_glue and never
+/// populates `ndk_context`, so without this the first iroh bind on the phone
+/// (`phone_sync_connect`; the desktop `start_listener` is `#[cfg(desktop)]`) panics
+/// "android context was not initialized" on a tokio worker → SIGABRT under
+/// `panic="abort"`. Idempotent via `Once` (`initialize_android_context` asserts the
+/// global was previously unset). Counterpart to the rustls `install_default()` below.
+#[cfg(target_os = "android")]
+#[allow(unsafe_code)] // the crate denies unsafe; the ndk_context bridge requires it (android-only)
+fn init_ndk_context() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // tao is re-exported by tauri; its prelude re-exports ndk_glue. tao populates
+        // its context in onActivityCreate — before the webview/JS (and any bind) runs.
+        match tauri::tao::platform::android::prelude::main_android_context() {
+            // `java_vm` / `context_jobject` are already `*mut c_void` — pass straight through.
+            Some(ctx) => unsafe {
+                ndk_context::initialize_android_context(ctx.java_vm, ctx.context_jobject);
+            },
+            None => {
+                eprintln!("portcode: tao android context unavailable; ndk_context NOT initialized");
+            }
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Phase 2 — arm desktop crash reporting FIRST: the out-of-process minidump monitor
@@ -946,8 +979,35 @@ pub fn run() {
     // both), and the monitor must be live before any crash. Inert (returns None) when no
     // `SENTRY_DSN` was baked in — dev/contributor/fork builds never report. The returned
     // guard is held for the whole process lifetime; dropping it stops the reporter child.
+    // (Desktop-only; the desktop's Sentry/reqwest transport configures its own rustls
+    // provider explicitly, so it does not depend on the process-wide default installed
+    // just below.)
     #[cfg(desktop)]
     let _sentry_guard = telemetry::init_desktop_with_minidump();
+
+    // Surface Rust panics in the platform log instead of dying silently. On Android
+    // a panic on a worker thread (e.g. inside iroh's relay/discovery startup) shows
+    // up otherwise only as a bare, symbol-stripped SIGABRT in logcat with no Rust
+    // frame; logging the location + payload (Tauri routes stderr to logcat under the
+    // `RustStdoutStderr` tag) makes the faulting frame visible for diagnosis. Keeps
+    // the default hook too, so behavior is otherwise unchanged.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("portcode: PANIC: {info}");
+        prev_hook(info);
+    }));
+
+    // Pin rustls's process-wide crypto provider BEFORE any TLS is used. Our
+    // dependency graph compiles a single rustls with BOTH the aws-lc-rs (via
+    // reqwest) and ring (via iroh's QUIC) providers, so rustls cannot auto-select a
+    // default; the first no-arg `ClientConfig::builder()` — reached on the phone's
+    // first iroh relay/DNS-over-TLS handshake immediately after a pairing scan —
+    // would otherwise panic ("Could not automatically determine the process-level
+    // CryptoProvider"), which crashed the Android app right after scanning the QR.
+    // Installing ring up front makes the choice deterministic on every target.
+    // Idempotent: a duplicate install returns Err (a provider is already set), which
+    // we deliberately ignore.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -958,6 +1018,12 @@ pub fn run() {
         // so a placeholder pubkey is inert until the owner provisions a real key.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            // Bridge tao's Android JavaVM+Activity into `ndk_context` BEFORE any iroh
+            // bind can read it (see `init_ndk_context`). The activity exists by the
+            // time `setup` runs, so the context is available here.
+            #[cfg(target_os = "android")]
+            init_ndk_context();
+
             let dir = app
                 .path()
                 .app_config_dir()

@@ -61,6 +61,18 @@ zeroize = "1"
 # rust-version bump above).
 iroh = "1"
 
+# Used ONLY to pin rustls's process-wide CryptoProvider at startup (see `run()` in
+# lib.rs). The dependency graph compiles a SINGLE rustls with BOTH providers —
+# aws-lc-rs (pulled by reqwest) and ring (pulled by iroh's QUIC) — so rustls cannot
+# auto-select a default, and the first no-arg `ClientConfig::builder()` panics
+# ("Could not automatically determine the process-level CryptoProvider"). That panic
+# crashed the Android phone on its first relay/DNS-over-TLS handshake right after a
+# pairing scan. We install `ring` (the provider iroh already uses) up front to make
+# the choice deterministic on every target. `default-features = false` keeps this
+# edge from pulling aws-lc-rs again; the full feature set still arrives via the
+# reqwest/iroh edges through Cargo's feature unification.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
 # search / matching for tools
 regex = "1"
 globset = "0.4"
@@ -108,6 +120,16 @@ tauri-plugin-sentry = "=0.2.0"
 # `app_config_dir()` is `dirs::config_dir().join(<identifier>)`, so this reproduces the
 # exact path. `dirs = "6"` matches the version Tauri 2 already resolves (no dup in lock).
 dirs = "6"
+
+# iroh's transitive `netdev` / `hickory-resolver` read the process-global
+# `ndk_context` AndroidContext (JavaVM + Activity) during `Endpoint::bind()`. tao
+# captures those into its OWN ndk_glue store but never populates `ndk_context`, so
+# without an explicit bridge the first bind panics "android context was not
+# initialized" (fatal under panic="abort"). `run()` calls `init_ndk_context()` to
+# forward tao's context here. Android-only (the init fn is `cfg(target_os=android)`);
+# already at 0.1.1 in Cargo.lock transitively, so the lockfile stays valid.
+[target.'cfg(target_os = "android")'.dependencies]
+ndk-context = "0.1"
 
 [profile.release]
 opt-level = "s"
