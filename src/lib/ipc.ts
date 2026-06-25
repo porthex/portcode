@@ -44,6 +44,14 @@ export function setWebClientMode(on: boolean): void {
   webClientEnabled = on;
 }
 
+/** True when the PWA web-client mode flag is on (set by the PWA entry). Unlike
+ *  {@link webClientActive} this does NOT factor in Tauri — it is the raw flag, so
+ *  the React tree can ask "are we the web client?" to gate web-only UI (the iOS
+ *  install gate) without coupling to the transport-routing predicate. */
+export function isWebClientMode(): boolean {
+  return webClientEnabled;
+}
+
 /** True only when we should route Phone Sync client calls to the WASM transport:
  *  web-client mode is on AND we're not under Tauri. */
 const webClientActive = (): boolean => webClientEnabled && !isTauri();

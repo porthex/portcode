@@ -5,6 +5,7 @@ import App from "./App";
 import { useStore } from "./store/store";
 import { DEFAULT_SETTINGS } from "./types";
 import * as ipc from "./lib/ipc";
+import { getInstallState } from "./lib/installGate";
 
 // App's own logic is the mount-time `init()` effect, the global keyboard
 // shortcut effect, and the conditional rendering of panels by store flags
@@ -41,6 +42,23 @@ vi.mock("./components/RemoteEdgeStates", () => ({
   DisconnectedState: () => <div data-testid="disconnected-state" />,
   OfflineState: () => <div data-testid="offline-state" />,
 }));
+vi.mock("./components/InstallGate", () => ({
+  InstallGate: () => <div data-testid="install-gate" />,
+}));
+
+// The install gate is gated on the web-client flag (ipc.isWebClientMode) AND the
+// iOS install state (installGate.getInstallState). Stub the install state module so
+// these App tests can drive the gate branch; default to "not-ios-ok" (a desktop
+// browser) so the existing tests fall through to pairing exactly as before.
+vi.mock("./lib/installGate", () => ({
+  getInstallState: vi.fn(() => ({
+    installed: false,
+    ios: false,
+    canPair: true,
+    reason: "not-ios-ok",
+    guidance: "",
+  })),
+}));
 
 // `isTauri` is consumed by App's TitleBar; the rest of the surface is what the
 // store's `init()` path invokes. A single mock of this module covers both the
@@ -49,6 +67,8 @@ vi.mock("./components/RemoteEdgeStates", () => ({
 // them later through the imported (now-mocked) module.
 vi.mock("./lib/ipc", () => ({
   isTauri: vi.fn(),
+  // App uses this to gate the iOS install screen to the web-client path only.
+  isWebClientMode: vi.fn(),
   getSettings: vi.fn(),
   listSessions: vi.fn(),
   createSession: vi.fn(),
@@ -84,6 +104,16 @@ beforeEach(() => {
   m.phoneSyncStatus.mockResolvedValue({ devicePublicKey: "DEVICE==", paired: [] });
   m.phoneSyncDisconnect.mockResolvedValue(undefined);
   m.onPhoneSyncPairingRequest.mockResolvedValue(() => {});
+  // Default: NOT the web client (desktop preview / native), so the install gate
+  // never intercepts. The install-gate tests below flip these per-test.
+  m.isWebClientMode.mockReturnValue(false);
+  vi.mocked(getInstallState).mockReturnValue({
+    installed: false,
+    ios: false,
+    canPair: true,
+    reason: "not-ios-ok",
+    guidance: "",
+  });
 });
 
 describe("App layout", () => {
@@ -239,6 +269,69 @@ describe("remote mode shell", () => {
 
     expect(screen.getByTestId("offline-state")).toBeInTheDocument();
     expect(screen.queryByTestId("disconnected-state")).not.toBeInTheDocument();
+  });
+
+  it("gates pairing behind the install screen in web-client mode on uninstalled iOS", () => {
+    m.isWebClientMode.mockReturnValue(true);
+    vi.mocked(getInstallState).mockReturnValue({
+      installed: false,
+      ios: true,
+      canPair: false,
+      reason: "needs-install",
+      guidance: "install me",
+    });
+    useStore.setState({ remoteMode: true, remoteConnected: false, remoteVerified: false });
+
+    render(<App />);
+
+    expect(screen.getByTestId("install-gate")).toBeInTheDocument();
+    expect(screen.queryByTestId("remote-pairing")).not.toBeInTheDocument();
+  });
+
+  it("does NOT gate when not in web-client mode (native path), even on iOS", () => {
+    // Native/Tauri path: the install gate must never intercept the desktop/mobile
+    // app, no matter what the install sniff would say.
+    m.isWebClientMode.mockReturnValue(false);
+    vi.mocked(getInstallState).mockReturnValue({
+      installed: false,
+      ios: true,
+      canPair: false,
+      reason: "needs-install",
+      guidance: "install me",
+    });
+    useStore.setState({ remoteMode: true, remoteConnected: false, remoteVerified: false });
+
+    render(<App />);
+
+    expect(screen.queryByTestId("install-gate")).not.toBeInTheDocument();
+    expect(screen.getByTestId("remote-pairing")).toBeInTheDocument();
+  });
+
+  it("proceeds to pairing in web-client mode when install state is ok (installed iOS)", () => {
+    m.isWebClientMode.mockReturnValue(true);
+    vi.mocked(getInstallState).mockReturnValue({
+      installed: true,
+      ios: true,
+      canPair: true,
+      reason: "ok",
+      guidance: "",
+    });
+    useStore.setState({ remoteMode: true, remoteConnected: false, remoteVerified: false });
+
+    render(<App />);
+
+    expect(screen.queryByTestId("install-gate")).not.toBeInTheDocument();
+    expect(screen.getByTestId("remote-pairing")).toBeInTheDocument();
+  });
+
+  it("proceeds to pairing in web-client mode on a non-iOS browser (not-ios-ok)", () => {
+    m.isWebClientMode.mockReturnValue(true); // reason defaults to "not-ios-ok"
+    useStore.setState({ remoteMode: true, remoteConnected: false, remoteVerified: false });
+
+    render(<App />);
+
+    expect(screen.queryByTestId("install-gate")).not.toBeInTheDocument();
+    expect(screen.getByTestId("remote-pairing")).toBeInTheDocument();
   });
 
   it("recovers from the offline screen when the network returns", () => {

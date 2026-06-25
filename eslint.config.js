@@ -15,6 +15,10 @@ export default tseslint.config(
       "src-tauri/**",
       // graphify knowledge-graph output is machine-generated, not source.
       "graphify-out/**",
+      // Transient Claude Code agent git worktrees (gitignored): full repo copies
+      // with their own tsconfigs that otherwise break the TS parser's project-root
+      // detection. Not first-party source.
+      ".claude/worktrees/**",
     ],
   },
   {
