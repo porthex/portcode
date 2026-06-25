@@ -314,6 +314,43 @@ describe("Tauri command serialization", () => {
     expect(unlisten).toHaveBeenCalledTimes(1);
     expect(invoke).not.toHaveBeenCalledWith("cancel_agent", { sessionId: "sess-2" });
   });
+
+  it("run_agent tears the listener down if the invoke rejects (no leaked listener)", async () => {
+    const { ipc, invoke, listen } = await load();
+    const unlisten = vi.fn();
+    listen.mockImplementation(async () => unlisten);
+    // The run never starts (core busy / command missing / panic).
+    invoke.mockRejectedValue(new Error("run_agent failed"));
+
+    await expect(ipc.runAgent("sess-3", "hi", "claude-opus-4-8", vi.fn())).rejects.toThrow(
+      "run_agent failed",
+    );
+
+    // The per-turn listener registered before invoke must be released, or it would
+    // survive to fold the NEXT turn's deltas into a stale message.
+    expect(unlisten).toHaveBeenCalledTimes(1);
+  });
+
+  it("onPhoneSyncDisconnected listens on the disconnected channel and fires the bare callback", async () => {
+    const { ipc, listen } = await load();
+    const unlisten = vi.fn();
+    let registered!: (ev: { payload: unknown }) => void;
+    listen.mockImplementation(async (_channel, cb) => {
+      registered = cb as typeof registered;
+      return unlisten;
+    });
+
+    const onDrop = vi.fn();
+    const off = await ipc.onPhoneSyncDisconnected(onDrop);
+    expect(listen).toHaveBeenCalledWith("phone-sync://disconnected", expect.any(Function));
+
+    // It's a void signal — the payload is discarded, the callback takes no args.
+    registered({ payload: undefined });
+    expect(onDrop).toHaveBeenCalledTimes(1);
+
+    off();
+    expect(unlisten).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("browser fallback (no Tauri core)", () => {

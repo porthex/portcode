@@ -10,6 +10,7 @@ export function DisconnectedState() {
   const lastPairingQr = useStore((s) => s.lastPairingQr);
   const reconnectRemote = useStore((s) => s.reconnectRemote);
   const forgetRemotePairing = useStore((s) => s.forgetRemotePairing);
+  const remoteError = useStore((s) => s.remoteError);
   const [reconnecting, setReconnecting] = useState(false);
 
   const onReconnect = async () => {
@@ -51,6 +52,11 @@ export function DisconnectedState() {
         </p>
       </div>
       <div className="flex flex-col gap-2.5">
+        {remoteError && !reconnecting && (
+          <p role="alert" className="text-center text-[12px] leading-[1.5] text-danger">
+            Couldn’t reconnect: {remoteError}
+          </p>
+        )}
         <button
           onClick={() => void onReconnect()}
           disabled={reconnecting}

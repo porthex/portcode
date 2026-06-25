@@ -288,4 +288,118 @@ describe("scrubTransaction (performance events)", () => {
     expect(span.op).toBe("http.client");
     expect(span.data).toBeUndefined();
   });
+
+  // Defensive else-paths: Sentry's transaction payload is loosely typed, so every
+  // string field can also arrive as a non-string (number/undefined) or a wrong
+  // container shape. These must pass through without throwing — exercising the
+  // `typeof … === "string" ? … : x`, `trace ? … : undefined`, and
+  // `Array.isArray(spans) ? … : undefined` guards.
+  it("passes non-string transaction/description fields through untouched", () => {
+    const out = scrubTransaction({
+      type: "transaction",
+      event_id: "t2",
+      transaction: 1234, // not a string — must not be redacted or coerced
+      contexts: {
+        trace: { op: "fn", description: 42, trace_id: "z" }, // non-string description
+      },
+      spans: [{ op: "db", description: 99, status: "ok" }], // non-string span description
+    }) as Record<string, unknown>;
+    expect(out.transaction).toBe(1234);
+    const trace = (out.contexts as { trace?: { description?: unknown } }).trace;
+    expect(trace?.description).toBe(42);
+    expect((out.spans as Array<Record<string, unknown>>)[0].description).toBe(99);
+  });
+
+  it("handles a transaction with no trace and non-array spans", () => {
+    const out = scrubTransaction({
+      type: "transaction",
+      event_id: "t3",
+      transaction: "ok",
+      contexts: { app: { app_version: "5.0.0" } }, // no trace
+      spans: "not-an-array", // wrong shape → dropped to undefined
+    }) as Record<string, unknown>;
+    expect((out.contexts as { trace?: unknown }).trace).toBeUndefined();
+    expect(out.spans).toBeUndefined();
+  });
+
+  it("handles a transaction with no contexts at all", () => {
+    const out = scrubTransaction({
+      type: "transaction",
+      event_id: "t4",
+      transaction: "GET /ping",
+    }) as Record<string, unknown>;
+    expect(out.transaction).toBe("GET /ping");
+    expect((out.contexts as { trace?: unknown }).trace).toBeUndefined();
+  });
+});
+
+describe("scrubEvent (non-string defensive shapes)", () => {
+  // The exception/frame/breadcrumb scrubbers each guard a string field with a
+  // `typeof … === "string"` check; these exercise the else-branches with the
+  // odd-but-possible non-string payloads Sentry's types permit.
+  it("passes non-string exception value + frame filename through, drops non-string breadcrumb message", () => {
+    const out = scrubEvent({
+      event_id: "e1",
+      exception: {
+        values: [
+          {
+            type: "TypeError",
+            value: undefined, // non-string value
+            stacktrace: {
+              frames: [{ function: "f", filename: undefined, lineno: 1, in_app: true }],
+            },
+          },
+        ],
+      },
+      breadcrumbs: [{ category: "ui.click", message: undefined }],
+    } as unknown as ErrorEvent) as unknown as Record<string, unknown>;
+
+    const value = (out.exception as { values: Array<{ value?: unknown }> }).values[0];
+    expect(value.value).toBeUndefined();
+    const frame = (
+      out.exception as { values: Array<{ stacktrace?: { frames: Array<{ filename?: unknown }> } }> }
+    ).values[0].stacktrace?.frames[0];
+    expect(frame?.filename).toBeUndefined();
+    const crumb = (out.breadcrumbs as Array<{ message?: unknown }>)[0];
+    expect(crumb.message).toBeUndefined();
+  });
+
+  it("stringifies and redacts a non-string message-only event", () => {
+    const out = scrubEvent({
+      event_id: "e2",
+      message: { toString: () => "boom at /home/alice/x" },
+    } as unknown as ErrorEvent) as unknown as Record<string, unknown>;
+    expect(out.message).toBe("boom at /home/~user/x");
+  });
+
+  it("keeps an exception whose stacktrace has no frames array", () => {
+    const out = scrubEvent({
+      event_id: "e3",
+      exception: { values: [{ type: "Error", value: "x", stacktrace: {} }] },
+    } as unknown as ErrorEvent) as unknown as Record<string, unknown>;
+    const frames = (out.exception as { values: Array<{ stacktrace?: { frames: unknown[] } }> })
+      .values[0].stacktrace?.frames;
+    expect(frames).toEqual([]);
+  });
+
+  it("keeps an exception value that carries no stacktrace and no os context", () => {
+    const out = scrubEvent({
+      event_id: "e4",
+      // no contexts.os → the `os ? {name} : undefined` else-branch
+      exception: { values: [{ type: "Error", value: "boom" }] },
+    } as unknown as ErrorEvent) as unknown as Record<string, unknown>;
+    const value = (out.exception as { values: Array<{ stacktrace?: unknown }> }).values[0];
+    expect(value.stacktrace).toBeUndefined();
+    expect((out.contexts as { os?: unknown }).os).toBeUndefined();
+  });
+});
+
+describe("deepRedact (depth cap)", () => {
+  it("drops a value nested deeper than the depth limit", () => {
+    // Build a chain 10 levels deep; the leaf sits past the depth>8 cap and is dropped.
+    let node: Record<string, unknown> = { secret: "sk-ant-deep-leak123456" };
+    for (let i = 0; i < 10; i++) node = { child: node };
+    const blob = JSON.stringify(deepRedact(node));
+    expect(blob).not.toContain("sk-ant-deep-leak123456");
+  });
 });

@@ -5,6 +5,7 @@ import App from "./App";
 import { useStore } from "./store/store";
 import { DEFAULT_SETTINGS } from "./types";
 import * as ipc from "./lib/ipc";
+import * as telemetry from "./lib/telemetry";
 
 // App's own logic is the mount-time `init()` effect, the global keyboard
 // shortcut effect, and the conditional rendering of panels by store flags
@@ -67,7 +68,22 @@ vi.mock("./lib/ipc", () => ({
   onPhoneSyncPairingRequest: vi.fn(),
 }));
 
+// Telemetry is wired by App: an effect starts/stops the SDK with the consent
+// toggle, and the first-run consent prompt is gated on consent-unmade + a
+// reportable build. Mock it so we can assert that wiring deterministically
+// (telemetryConfigured defaults false → the prompt stays dormant, matching the
+// no-DSN test environment the other cases already rely on).
+vi.mock("./lib/telemetry", () => ({
+  initTelemetry: vi.fn(),
+  shutdownTelemetry: vi.fn(),
+  telemetryConfigured: vi.fn(),
+}));
+vi.mock("./components/CrashConsentPrompt", () => ({
+  CrashConsentPrompt: () => <div data-testid="crash-consent" />,
+}));
+
 const m = vi.mocked(ipc);
+const tel = vi.mocked(telemetry);
 const initialState = useStore.getState();
 
 beforeEach(() => {
@@ -84,6 +100,9 @@ beforeEach(() => {
   m.phoneSyncStatus.mockResolvedValue({ devicePublicKey: "DEVICE==", paired: [] });
   m.phoneSyncDisconnect.mockResolvedValue(undefined);
   m.onPhoneSyncPairingRequest.mockResolvedValue(() => {});
+  // Default to a build that CAN'T report (no DSN) so the consent prompt stays
+  // dormant for every existing case; the consent-gate block opts in explicitly.
+  tel.telemetryConfigured.mockReturnValue(false);
 });
 
 describe("App layout", () => {
@@ -602,5 +621,42 @@ describe("global keyboard shortcuts", () => {
 
     // With the listener cleaned up, the shortcut no longer mutates the store.
     expect(useStore.getState().showPalette).toBe(false);
+  });
+});
+
+// The crash-reporting consent gate is the exact "ships under-tested → reddens
+// main" shape CLAUDE.md warns about (a new consent surface landing without an
+// App-level test). These pin both the first-run prompt gating AND the
+// start/stop telemetry effect that the consent toggle drives.
+describe("App crash-reporting consent", () => {
+  it("shows the consent prompt only when consent is unmade AND the build can report", () => {
+    tel.telemetryConfigured.mockReturnValue(true);
+    useStore.setState({ crashReporting: null });
+    render(<App />);
+    expect(screen.getByTestId("crash-consent")).toBeInTheDocument();
+  });
+
+  it("hides the consent prompt once a choice is recorded", () => {
+    tel.telemetryConfigured.mockReturnValue(true);
+    useStore.setState({ crashReporting: false });
+    render(<App />);
+    expect(screen.queryByTestId("crash-consent")).not.toBeInTheDocument();
+  });
+
+  it("never offers the prompt on a build that can't report, even with consent unmade", () => {
+    tel.telemetryConfigured.mockReturnValue(false);
+    useStore.setState({ crashReporting: null });
+    render(<App />);
+    expect(screen.queryByTestId("crash-consent")).not.toBeInTheDocument();
+  });
+
+  it("starts reporting on opt-in and shuts it down when consent is off", () => {
+    tel.telemetryConfigured.mockReturnValue(true);
+    useStore.setState({ crashReporting: true });
+    render(<App />);
+    expect(tel.initTelemetry).toHaveBeenCalledWith(true);
+
+    act(() => useStore.setState({ crashReporting: false }));
+    expect(tel.shutdownTelemetry).toHaveBeenCalled();
   });
 });

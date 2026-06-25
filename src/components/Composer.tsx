@@ -57,7 +57,10 @@ export function Composer() {
 
   const submit = async () => {
     const t = text;
-    if (!t.trim() || streaming) return;
+    // Mirror send()'s own guards here so we never clear the draft for a turn that
+    // won't actually be sent — `send` early-returns when there's no active session,
+    // and clearing first would silently swallow the user's typed message.
+    if (!t.trim() || streaming || !useStore.getState().activeId) return;
     setText("");
     // Collapse to the measured single-row height (a px target) so the declared
     // transition-[height] can ease the shrink; fall back to "auto" only if we
@@ -100,6 +103,9 @@ export function Composer() {
             disabled={streaming}
             aria-busy={streaming}
             aria-label="Message Portcode"
+            // Defensive cap: a multi-MB paste (a log/file dump) would otherwise be
+            // stored and shipped whole — over the sync channel on the phone path.
+            maxLength={100_000}
             rows={1}
             placeholder={
               awaitingPermission

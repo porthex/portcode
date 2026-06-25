@@ -56,6 +56,52 @@ describe("DisconnectedState", () => {
     fireEvent.click(screen.getByRole("button", { name: "Pair a different desktop" }));
     expect(forgetRemotePairing).toHaveBeenCalledTimes(1);
   });
+
+  it("surfaces a reconnect failure instead of silently returning to the idle button", async () => {
+    // reconnectRemote folds failures into remoteError (it never throws); the screen
+    // must show that error so the user isn't left tapping Reconnect with no feedback.
+    const failing = vi.fn(async () => {
+      useStore.setState({ remoteError: "no route to host" });
+    });
+    useStore.setState({ lastPairingQr: "QR-REMEMBERED", reconnectRemote: failing });
+    render(<DisconnectedState />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Reconnect/ }));
+      await Promise.resolve();
+    });
+
+    expect(failing).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("alert")).toHaveTextContent("no route to host");
+  });
+
+  it("hides the reconnect error while a retry is in flight", async () => {
+    // A prior failure left an error, but once the user taps Reconnect again the
+    // stale error is replaced by the busy state rather than shown alongside it.
+    let release!: () => void;
+    const pending = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    useStore.setState({
+      lastPairingQr: "QR-REMEMBERED",
+      remoteError: "earlier failure",
+      reconnectRemote: pending,
+    });
+    render(<DisconnectedState />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Reconnect/ }));
+    // Mid-flight: the button is busy and the stale error is suppressed.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Reconnecting/ })).toBeInTheDocument();
+
+    await act(async () => {
+      release();
+      await Promise.resolve();
+    });
+  });
 });
 
 describe("OfflineState", () => {

@@ -581,6 +581,32 @@ describe("send", () => {
     expect(m.runAgent).toHaveBeenCalledWith("a", "hi", "claude-opus-4-8", expect.any(Function));
   });
 
+  it("falls back to settings.model when the active session has no model (legacy row)", async () => {
+    // PR #30 made Session.model required, but `send` keeps a `?? settings.model`
+    // fallback for legacy/desynced rows. A session whose model is absent must run
+    // the turn on the global default, not crash or send `undefined` to the core.
+    let emit!: (e: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
+    const legacy = {
+      ...session({ id: "a", title: "New chat" }),
+      model: undefined,
+    } as unknown as Session;
+    useStore.setState({
+      sessions: [legacy],
+      activeId: "a",
+      messages: { a: [] },
+      settings: { ...DEFAULT_SETTINGS, model: "claude-sonnet-4-6" },
+    });
+
+    await useStore.getState().send("hi");
+    emit({ type: "turn_end", stopReason: "end_turn" }); // end the turn so the watchdog can't leak
+
+    expect(m.runAgent).toHaveBeenCalledWith("a", "hi", "claude-sonnet-4-6", expect.any(Function));
+  });
+
   it("trims the forwarded run text in remote mode", async () => {
     useStore.setState({
       sessions: [session({ id: "a", title: "New chat" })],

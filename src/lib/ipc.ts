@@ -323,7 +323,15 @@ export async function runAgent(
     const unlisten: Unlisten = await event.listen<StreamEvent>(channel, (ev) =>
       onEvent(ev.payload),
     );
-    await core.invoke("run_agent", { sessionId, text, model });
+    try {
+      await core.invoke("run_agent", { sessionId, text, model });
+    } catch (e) {
+      // The run never started — tear the listener down so it can't survive to fold
+      // the NEXT turn's deltas into a stale message (the "second reply edits the
+      // first" leak this handle exists to prevent).
+      unlisten();
+      throw e;
+    }
     return {
       cancel: async () => {
         await core.invoke("cancel_agent", { sessionId });

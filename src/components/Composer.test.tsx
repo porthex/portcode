@@ -186,6 +186,51 @@ describe("Composer send button", () => {
     );
   });
 
+  it("trims surrounding whitespace from the sent text but preserves interior content", async () => {
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: { a: [] },
+      draft: "  hello\nworld  \n",
+    });
+    render(<Composer />);
+
+    fireEvent.click(sendButton());
+    await Promise.resolve();
+    await Promise.resolve();
+    // send() trims once so the stored bubble and forwarded command match the
+    // derived title — surrounding padding gone, interior newline kept.
+    expect(m.runAgent).toHaveBeenCalledWith(
+      "a",
+      "hello\nworld",
+      "claude-opus-4-8",
+      expect.any(Function),
+    );
+  });
+
+  it("does not clear the draft (or send) when there is no active session", async () => {
+    // The Send button only gates on a non-empty draft, so it's clickable with no
+    // active session. submit() must mirror send()'s `!activeId` guard and bail
+    // BEFORE wiping the draft — otherwise the user's typed message vanishes silently.
+    useStore.setState({ sessions: [], activeId: null, draft: "don't lose me" });
+    render(<Composer />);
+
+    fireEvent.click(sendButton());
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(useStore.getState().draft).toBe("don't lose me");
+    expect(m.runAgent).not.toHaveBeenCalled();
+  });
+
+  it("caps the textarea length so a giant paste can't be shipped whole", () => {
+    render(<Composer />);
+    const ta = screen.getByPlaceholderText(
+      "Describe a task, ask a question, or give an instruction…",
+    ) as HTMLTextAreaElement;
+    expect(ta.maxLength).toBe(100_000);
+  });
+
   it("collapses the textarea to an explicit px height on submit (not 'auto')", async () => {
     useStore.setState({
       sessions: [
