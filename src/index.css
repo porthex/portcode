@@ -269,7 +269,7 @@ textarea:focus-visible {
   }
 }
 /* Sweeping scan line inside the remote-pairing camera viewport (top↔bottom). */
-@keyframes pcScanV {
+@keyframes pc-scan-v {
   0% {
     top: 6%;
   }
@@ -278,7 +278,7 @@ textarea:focus-visible {
   }
 }
 /* Bottom-sheet slide-up for the remote session switcher. */
-@keyframes pcSheet {
+@keyframes pc-sheet {
   from {
     transform: translateY(100%);
   }

@@ -432,10 +432,20 @@ describe("RemotePairing — connect drives the live frame subscription", () => {
   });
 });
 
+// Snapshot the real clipboard descriptor before each test and restore it after, so
+// the per-test `Object.defineProperty(navigator, "clipboard", …)` stub can't leak
+// across tests/files. Fall back to delete only when there was no original descriptor.
+let origClipboardDescriptor: PropertyDescriptor | undefined;
+
+beforeEach(() => {
+  origClipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+});
+
 afterEach(() => {
-  // The clipboard stub is defined per-test; drop it so it can't leak across files.
-  if ("clipboard" in navigator) {
-    // @ts-expect-error — test-only teardown of the stubbed property.
+  if (origClipboardDescriptor) {
+    Object.defineProperty(navigator, "clipboard", origClipboardDescriptor);
+  } else if ("clipboard" in navigator) {
+    // @ts-expect-error — test-only teardown of the stubbed property (no original).
     delete navigator.clipboard;
   }
 });

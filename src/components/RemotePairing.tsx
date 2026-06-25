@@ -331,7 +331,7 @@ function Viewfinder({ showScanLine }: { showScanLine: boolean }) {
       <QrGhost />
       {showScanLine && (
         <span
-          className="absolute left-[8%] right-[8%] h-0.5 bg-[linear-gradient(90deg,transparent,#21e6ff,transparent)] shadow-[0_0_14px_2px_rgba(33,230,255,.6)] motion-safe:animate-[pcScanV_2.4s_ease-in-out_infinite_alternate]"
+          className="absolute left-[8%] right-[8%] h-0.5 bg-[linear-gradient(90deg,transparent,#21e6ff,transparent)] shadow-[0_0_14px_2px_rgba(33,230,255,.6)] motion-safe:animate-[pc-scan-v_2.4s_ease-in-out_infinite_alternate]"
           style={{ top: "6%" }}
         />
       )}

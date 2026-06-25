@@ -95,7 +95,7 @@ Crucially, the existing protocol code is already structured to make this cheap:
 
 ## 3. Architecture
 
-```
+```text
                                   ┌──────────────────────────────────────┐
                                   │  iOS device (Safari / installed PWA)  │
    Vercel (static CDN)            │                                       │
@@ -223,7 +223,7 @@ Four parallel research streams informed this plan. Highlights:
 Today all sync code lives inside the `src-tauri` crate. To target both native
 (desktop) and `wasm32` from one source of truth, extract a shared crate:
 
-```
+```text
 portcode/
 ├── Cargo.toml                      # [workspace] resolver = "2"
 ├── crates/
