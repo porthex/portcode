@@ -1,13 +1,10 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <!-- viewport-fit=cover so the page reaches under the notch / Dynamic Island
          when launched as an installed PWA (plan §5.7). -->
-    <meta
-      name="viewport"
-      content="width=device-width, initial-scale=1, viewport-fit=cover"
-    />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Portcode iOS iroh spike</title>
 
     <!-- PWA: make "Add to Home Screen" produce a standalone app on iOS. -->
@@ -17,10 +14,7 @@
     <!-- Apple-specific meta (iOS does NOT read these from the manifest). -->
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="mobile-web-app-capable" content="yes" />
-    <meta
-      name="apple-mobile-web-app-status-bar-style"
-      content="black-translucent"
-    />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="iroh spike" />
     <link rel="apple-touch-icon" href="./icon.svg" />
 
@@ -33,11 +27,13 @@
       }
       body {
         margin: 0;
-        font: 15px/1.45 -apple-system, system-ui, sans-serif;
+        font:
+          15px/1.45 -apple-system,
+          system-ui,
+          sans-serif;
         background: #111417;
         color: #e8edf2;
-        padding: max(12px, env(safe-area-inset-top)) 14px
-          max(12px, env(safe-area-inset-bottom));
+        padding: max(12px, env(safe-area-inset-top)) 14px max(12px, env(safe-area-inset-bottom));
       }
       h1 {
         font-size: 17px;
@@ -86,7 +82,11 @@
         padding: 10px;
         height: 38vh;
         overflow-y: auto;
-        font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+        font:
+          12px/1.4 ui-monospace,
+          SFMono-Regular,
+          Menlo,
+          monospace;
         white-space: pre-wrap;
         word-break: break-all;
       }
@@ -138,9 +138,7 @@
 
     <div class="row">
       <input id="msg" value="hello from iOS" placeholder="message to echo" />
-      <button id="sendBtn" class="secondary" disabled style="flex: 0 0 90px">
-        Send
-      </button>
+      <button id="sendBtn" class="secondary" disabled style="flex: 0 0 90px">Send</button>
     </div>
 
     <div id="log" aria-live="polite"></div>

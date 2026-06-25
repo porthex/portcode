@@ -148,6 +148,4 @@ $("msg").addEventListener("keydown", (e) => {
 
 setState("idle", "#444");
 log("ready. paste the desktop endpoint id, then tap Connect.");
-log(
-  "installed-PWA test: Share -> Add to Home Screen, then launch from the icon.",
-);
+log("installed-PWA test: Share -> Add to Home Screen, then launch from the icon.");
