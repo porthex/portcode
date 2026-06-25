@@ -13,15 +13,15 @@
 
 ## 1. Goal & constraints (the decisions this plan is built on)
 
-| Decision | Choice |
-| --- | --- |
-| **Transport** | Reuse **iroh in the browser (WASM)** — dial the desktop directly into the existing iroh network. No bespoke relay protocol, no WebSocket-tunnel-of-our-own. |
-| **What Vercel hosts** | **Only the static client UI** (the PWA: HTML/JS/CSS/wasm). No backend functions, no relay, no persistent server on Vercel. |
-| **Primary target** | **iOS** (Safari + installed Home-Screen PWA). Android/desktop browsers are a free side-benefit, not the design driver. |
-| **This deliverable** | A deeply-researched, buildable design — not code yet. |
+| Decision              | Choice                                                                                                                                                      |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Transport**         | Reuse **iroh in the browser (WASM)** — dial the desktop directly into the existing iroh network. No bespoke relay protocol, no WebSocket-tunnel-of-our-own. |
+| **What Vercel hosts** | **Only the static client UI** (the PWA: HTML/JS/CSS/wasm). No backend functions, no relay, no persistent server on Vercel.                                  |
+| **Primary target**    | **iOS** (Safari + installed Home-Screen PWA). Android/desktop browsers are a free side-benefit, not the design driver.                                      |
+| **This deliverable**  | A deeply-researched, buildable design — not code yet.                                                                                                       |
 
 Everything below honours those four constraints. Where a constraint forces a
-non-obvious decision (e.g. Vercel *cannot* be the relay), it is called out.
+non-obvious decision (e.g. Vercel _cannot_ be the relay), it is called out.
 
 ---
 
@@ -98,7 +98,7 @@ Crucially, the existing protocol code is already structured to make this cheap:
 - **The desktop is unchanged in spirit.** It already runs an iroh endpoint + the
   sync server. It only needs to (a) be configured with the **same relay** the
   browser uses, and (b) be **version-aligned** with the browser's iroh.
-- **The relay is the one new piece of always-on infra.** It is *not* on Vercel.
+- **The relay is the one new piece of always-on infra.** It is _not_ on Vercel.
   It can be n0's public relays for the spike, but should be **self-hosted** for
   the product (cost/latency/version control). The relay never sees plaintext.
 
@@ -109,16 +109,17 @@ Crucially, the existing protocol code is already structured to make this cheap:
 Four parallel research streams informed this plan. Highlights:
 
 ### 4.1 iroh-in-browser (the transport)
+
 - iroh **1.0 (2026-06-15)** officially supports `wasm32-unknown-unknown` via
   wasm-bindgen; tracked issue #2799 closed for 1.0-rc.
 - Browser nodes are **relay-only over WebSocket** — no direct/hole-punched
   connections. This is by design (browsers have no UDP), not a temporary gap. As
-  of iroh **0.91 (2025-08-01)** *all* relay traffic is WebSocket-based.
+  of iroh **0.91 (2025-08-01)** _all_ relay traffic is WebSocket-based.
 - A browser node **dials a native desktop by node id through a shared relay**;
   the desktop behind NAT is the documented happy path (it holds its own relay
   WebSocket). Connections stay mutually authenticated + E2E encrypted.
 - **iOS-safe by construction:** the browser leg rides WebSocket (supported on
-  iOS forever), *not* WebTransport — so iOS is the expected environment.
+  iOS forever), _not_ WebTransport — so iOS is the expected environment.
 - Build: `iroh = { version = "1", default-features = false }` (drops `metrics`,
   which breaks wasm). `getrandom` needs `wasm_js` + the cfg flag (see §6.3).
 - Risk: youngest surface; no iroh first-party iOS cert; relay-only latency;
@@ -130,6 +131,7 @@ Four parallel research streams informed this plan. Highlights:
   <https://github.com/n0-computer/iroh/discussions/3200>
 
 ### 4.2 iOS Safari / PWA constraints
+
 - **WebSocket** is baseline on iOS; **WebTransport** only shipped in **Safari
   26.4 (~Mar 2026)** with a tiny mid-2026 install base — WebSocket fallback is
   mandatory (matches iroh anyway).
@@ -137,7 +139,7 @@ Four parallel research streams informed this plan. Highlights:
   connections.** No keep-alive, no Background Sync/Fetch, no silent push. The
   fix is **reconnect-on-resume + server-side catch-up by cursor** — which the
   protocol already supports (`Cursor` + `Db::messages_since`).
-- **Web Push works on *installed* iOS PWAs since iOS 16.4** — good for
+- **Web Push works on _installed_ iOS PWAs since iOS 16.4** — good for
   "permission needed" / "turn finished" re-engagement (visible notifications
   only; ~70–85% reliable → keep an in-app decision queue).
 - **Camera/QR:** `getUserMedia` works in standalone PWAs since iOS 13.4; use
@@ -156,6 +158,7 @@ Four parallel research streams informed this plan. Highlights:
   <https://caniuse.com/webtransport>
 
 ### 4.3 Rust→WASM feasibility (the stack)
+
 - **snow 0.10** default = pure-Rust resolver → wasm-safe. **Do not enable
   `ring`** (doesn't build for wasm32-unknown-unknown).
 - **tokio:** runtime/timers **don't** work on browser wasm, but **`tokio::sync`
@@ -211,6 +214,7 @@ portcode/
 ```
 
 **Migration is mechanical, not a rewrite:**
+
 - `protocol.rs`, `noise.rs`, `session.rs`, `pairing.rs` move into
   `portcode-sync` **unchanged** (verified wasm-safe in §2).
 - `transport.rs` splits: the `SyncFrame` length-framing + a new `Transport`
@@ -222,7 +226,7 @@ portcode/
   rest of the desktop code is untouched.
 
 > The same `portcode-sync` crate is what the **native mobile (Android)** client
-> will also consume — so this restructure pays for both the web *and* the native
+> will also consume — so this restructure pays for both the web _and_ the native
 > mobile roadmaps.
 
 ### 5.2 The `Transport` trait (the one real abstraction)
@@ -452,7 +456,7 @@ on the desktop** and the phone is a resumable mirror.
 
 - **E2E encryption is preserved end-to-end.** The Noise XX handshake +
   ChaCha20-Poly1305 transport runs **inside** the iroh stream; the relay (ours or
-  n0's) only ever forwards ciphertext. Compiling the *same* `snow` code to wasm
+  n0's) only ever forwards ciphertext. Compiling the _same_ `snow` code to wasm
   means the browser client has the identical crypto as the native client — no
   second crypto implementation to audit.
 - **SAS out-of-band verification** is unchanged and mandatory before a session
@@ -479,9 +483,9 @@ on the desktop** and the phone is a resumable mirror.
   - **GitHub Actions builds the wasm** (`wasm-pack build --target web`, pinned
     `rust-toolchain.toml`, LLVM clang) and commits/uploads the artifact, or
   - the wasm artifact is published and the web build pulls it in.
-  Recommended: GH Actions job produces `portcode_wasm` package; Vercel's build
-  consumes the prebuilt files. (`{"github":{"enabled":false}}` if we want Vercel
-  to deploy only, not build Rust.)
+    Recommended: GH Actions job produces `portcode_wasm` package; Vercel's build
+    consumes the prebuilt files. (`{"github":{"enabled":false}}` if we want Vercel
+    to deploy only, not build Rust.)
 - **No COOP/COEP headers** (single-threaded wasm, no SharedArrayBuffer). Add a
   strict **CSP** + cache headers + SRI on the wasm instead.
 - **Brotli** is automatic on Vercel's CDN (~40–55% of raw wasm on the wire).
@@ -505,7 +509,7 @@ New frontend code **must** ship with tests in the same change (per `CLAUDE.md`).
   reconnect/visibility logic — needs matching vitest tests (mock the `Session`
   wasm class) to keep coverage ≥ threshold and avoid reddening `main` post-merge.
 - **E2E (wdio):** add a browser-mode smoke that pairs against a headless desktop
-  + local relay and exercises connect → command → frame → background → resume.
+  - local relay and exercises connect → command → frame → background → resume.
 - **iOS on-device:** the Phase 0 spike and a manual pre-launch checklist
   (install, pair, background/lock for >30s, resume, push tap) — there is no CI
   for real iOS Safari lifecycle behaviour.
@@ -514,21 +518,22 @@ New frontend code **must** ship with tests in the same change (per `CLAUDE.md`).
 
 ## 8. Phased roadmap
 
-| Phase | Goal | Exit criteria |
-| --- | --- | --- |
-| **0. iOS proof-of-connection (spike)** ⚠️ do first | De-risk the one unknown: does iroh-in-browser actually hold a connection on real iOS? | A throwaway wasm page on **real iOS Safari + installed PWA** dials a native iroh desktop through a relay, exchanges bytes, and survives a background→resume reconnect. **Go/no-go gate for everything below.** |
-| **1. Workspace restructure** | Extract `portcode-sync`; desktop builds unchanged against it. | `cargo build` (desktop) + `cargo test` green; `cargo build --target wasm32-unknown-unknown` of `portcode-sync` compiles. |
-| **2. WASM transport + interop** | `transport_wasm.rs` + `portcode-wasm` `Session` class; Noise handshake works browser↔desktop. | A Node/headless harness pairs, gets a SAS, sends a command, receives a `Live` frame through the relay. |
-| **3. Web frontend** | Vercel build target; WASM-backed `ipc`; web `scanner`; reuse store/UI. | A desktop-browser PWA pairs, drives a real session, mirrors live frames. |
-| **4. iOS PWA hardening** | Install gate, manifest/meta/splash, IndexedDB + `persist()`, visibility reconnect + cursor catch-up. | On real iOS: install → pair → run a turn → lock phone 1 min → resume with full catch-up, no data loss. |
-| **5. Web Push + polish** | Installed-PWA push for permission/turn events + App Badge; CSP/SRI; size budget. | Push pulls user back to a pending permission; Lighthouse PWA pass; wasm gzip budget met. |
-| **6. Self-host relay + launch** | Replace public relay with self-hosted, version-pinned `iroh-relay`; docs. | Stable relay; runbook; `SECURITY.md` updated; README "Phone Sync" status moved from roadmap → alpha. |
+| Phase                                              | Goal                                                                                                 | Exit criteria                                                                                                                                                                                                  |
+| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **0. iOS proof-of-connection (spike)** ⚠️ do first | De-risk the one unknown: does iroh-in-browser actually hold a connection on real iOS?                | A throwaway wasm page on **real iOS Safari + installed PWA** dials a native iroh desktop through a relay, exchanges bytes, and survives a background→resume reconnect. **Go/no-go gate for everything below.** |
+| **1. Workspace restructure**                       | Extract `portcode-sync`; desktop builds unchanged against it.                                        | `cargo build` (desktop) + `cargo test` green; `cargo build --target wasm32-unknown-unknown` of `portcode-sync` compiles.                                                                                       |
+| **2. WASM transport + interop**                    | `transport_wasm.rs` + `portcode-wasm` `Session` class; Noise handshake works browser↔desktop.        | A Node/headless harness pairs, gets a SAS, sends a command, receives a `Live` frame through the relay.                                                                                                         |
+| **3. Web frontend**                                | Vercel build target; WASM-backed `ipc`; web `scanner`; reuse store/UI.                               | A desktop-browser PWA pairs, drives a real session, mirrors live frames.                                                                                                                                       |
+| **4. iOS PWA hardening**                           | Install gate, manifest/meta/splash, IndexedDB + `persist()`, visibility reconnect + cursor catch-up. | On real iOS: install → pair → run a turn → lock phone 1 min → resume with full catch-up, no data loss.                                                                                                         |
+| **5. Web Push + polish**                           | Installed-PWA push for permission/turn events + App Badge; CSP/SRI; size budget.                     | Push pulls user back to a pending permission; Lighthouse PWA pass; wasm gzip budget met.                                                                                                                       |
+| **6. Self-host relay + launch**                    | Replace public relay with self-hosted, version-pinned `iroh-relay`; docs.                            | Stable relay; runbook; `SECURITY.md` updated; README "Phone Sync" status moved from roadmap → alpha.                                                                                                           |
 
 ---
 
 ## 9. Risks, open questions & decisions needed
 
 **Top risks (carry-forward):**
+
 1. **iOS Safari lifecycle is the real unknown** — long-lived WebSocket survival
    across backgrounding. Mitigated by the resume-by-cursor design, but **Phase 0
    must prove it on-device** before committing.
@@ -545,9 +550,10 @@ New frontend code **must** ship with tests in the same change (per `CLAUDE.md`).
    `Cargo.lock` resolves getrandom 0.3.
 
 **Decisions needed before/at Phase 1:**
+
 - **Relay hosting choice** (Fly.io vs Render vs VPS) and who operates it — this
   is the one recurring cost and uptime commitment, and it is **required** (Vercel
-  cannot fill this role). *(Spike can defer it by using n0 public relays.)*
+  cannot fill this role). _(Spike can defer it by using n0 public relays.)_
 - **Repo layout for the web app:** same repo (recommended — shares
   `portcode-sync` and types) vs a separate deploy. Plan assumes same repo.
 - **Web Push backend:** Web Push needs a tiny push-send step (VAPID). Since
@@ -558,6 +564,7 @@ New frontend code **must** ship with tests in the same change (per `CLAUDE.md`).
 ---
 
 ## 10. What this explicitly is NOT
+
 - Not a relay on Vercel (impossible — Vercel can't hold the long-lived socket).
 - Not a reimplementation of Noise/protocol in JS (we compile the Rust to wasm).
 - Not browser↔desktop direct P2P (iroh browser is relay-only today).
@@ -566,7 +573,7 @@ New frontend code **must** ship with tests in the same change (per `CLAUDE.md`).
 
 ---
 
-*This plan reuses the existing Phone Sync foundation (`src-tauri/src/sync/`) and
+_This plan reuses the existing Phone Sync foundation (`src-tauri/src/sync/`) and
 the roadmap framing in `docs/ANDROID_APP_PLAN.md`. Implementation should land
 phase-by-phase behind the existing `remoteMode` shell so nothing ships to desktop
-users until each phase is green.*
+users until each phase is green._
