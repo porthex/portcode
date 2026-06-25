@@ -15,11 +15,38 @@ import type {
   StreamEvent,
   SyncFrame,
 } from "../types";
+import {
+  webOnPhoneSyncDisconnected,
+  webOnPhoneSyncFrame,
+  webPhoneSyncConnect,
+  webPhoneSyncDisconnect,
+  webPhoneSyncSendCommand,
+} from "./webSession";
 
 export const isTauri = (): boolean =>
   typeof window !== "undefined" &&
   // Tauri v2 injects this on the window object.
   "__TAURI_INTERNALS__" in window;
+
+// Web-client mode. The Vercel-hosted PWA (the iOS web client) turns this on at
+// startup via {@link setWebClientMode} after injecting the WASM-backed transport
+// connector (see `webSession`/iroh-in-browser). When on, the Phone Sync CLIENT
+// calls — connect / send / disconnect / frame + disconnect subscriptions — route
+// through the real `webSession` transport instead of the inert browser mock.
+//
+// Off by default, so the desktop preview (`vite` alone) keeps using the mock and
+// every existing call site is unchanged. `isTauri()` always takes precedence: a
+// native build uses the Tauri bridge regardless of this flag.
+let webClientEnabled = false;
+
+/** Enable/disable web-client mode (called once by the PWA entry). */
+export function setWebClientMode(on: boolean): void {
+  webClientEnabled = on;
+}
+
+/** True only when we should route Phone Sync client calls to the WASM transport:
+ *  web-client mode is on AND we're not under Tauri. */
+const webClientActive = (): boolean => webClientEnabled && !isTauri();
 
 type Unlisten = () => void;
 
@@ -159,6 +186,7 @@ export async function phoneSyncConnect(qr: string, reconnect = false): Promise<C
     const { core } = await tauri();
     return core.invoke<ConnectInfo>("phone_sync_connect", { qr, reconnect });
   }
+  if (webClientActive()) return webPhoneSyncConnect(qr, reconnect);
   return mock.phoneSyncConnect(qr, reconnect);
 }
 
@@ -169,6 +197,7 @@ export async function phoneSyncSendCommand(command: RemoteCommand): Promise<void
     await core.invoke("phone_sync_send_command", { command });
     return;
   }
+  if (webClientActive()) return webPhoneSyncSendCommand(command);
   return mock.phoneSyncSendCommand(command);
 }
 
@@ -179,6 +208,7 @@ export async function phoneSyncDisconnect(): Promise<void> {
     await core.invoke("phone_sync_disconnect");
     return;
   }
+  if (webClientActive()) return webPhoneSyncDisconnect();
   return mock.phoneSyncDisconnect();
 }
 
@@ -189,6 +219,7 @@ export async function onPhoneSyncFrame(cb: (frame: SyncFrame) => void): Promise<
     const { event } = await tauri();
     return event.listen<SyncFrame>("phone-sync://frame", (ev) => cb(ev.payload));
   }
+  if (webClientActive()) return webOnPhoneSyncFrame(cb);
   return mock.onPhoneSyncFrame(cb);
 }
 
@@ -200,6 +231,7 @@ export async function onPhoneSyncDisconnected(cb: () => void): Promise<Unlisten>
     const { event } = await tauri();
     return event.listen("phone-sync://disconnected", () => cb());
   }
+  if (webClientActive()) return webOnPhoneSyncDisconnected(cb);
   return mock.onPhoneSyncDisconnected(cb);
 }
 

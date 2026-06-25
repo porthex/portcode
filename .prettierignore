@@ -1,6 +1,7 @@
 # Build output
 dist/
 dist-ssr/
+web-dist/
 coverage/
 
 # Rust build + generated bindings
