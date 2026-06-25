@@ -1,0 +1,59 @@
+[package]
+name = "portcode-wasm"
+version = "0.1.0"
+description = "Thin wasm-bindgen wrapper exposing the Phone Sync `Session` class to the browser PWA (IOS_WEB_CLIENT_PLAN.md §5.4)."
+authors = ["Porthex"]
+edition = "2021"
+# Matches the workspace root pin; `iroh` (via portcode-sync) requires Rust >= 1.91.
+rust-version = "1.91"
+license = "Apache-2.0"
+publish = false
+
+# cdylib → the `_bg.wasm` wasm-pack emits for the browser; rlib → so the crate can
+# also be unit-tested / depended on as a normal Rust lib (§5.1).
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# This crate is ONLY ever built for wasm32 (it is the browser client). It depends on
+# `portcode-sync`, whose wasm target table pulls relay-only iroh + the browser Noise
+# session. The deps below are all wasm-safe.
+[dependencies]
+portcode-sync = { path = "../portcode-sync" }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
+# Frames cross the JS boundary as native JS objects via serde (§5.4).
+serde-wasm-bindgen = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# base64-encode the pinned peer key for JS to persist (same engine as the rest of
+# the workspace).
+base64 = "0.22"
+# Single-threaded async mutex for the split channel halves the spawn_local loops
+# share — `futures-util`'s `Mutex` is `!Send`-friendly and exactly what the Phase 0
+# spike used for the same job.
+futures-util = "0.3"
+# Surface Rust panics in the Safari Web Inspector console (same as the spike).
+console_error_panic_hook = "0.1"
+
+# Same lint posture as the rest of the workspace: the client handles long-term key
+# material, so unsafe is denied. (wasm-bindgen's generated glue is in its own crate,
+# not gated by this.)
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Release size flags (§5.3) live at the workspace ROOT as a per-package profile
+# override (`[profile.release.package.portcode-wasm] opt-level = "z"`), because
+# Cargo honors profiles only at the workspace root and would ignore (with a warning)
+# a `[profile.release]` placed here. wasm-pack runs `wasm-opt` for an extra size
+# pass unless disabled below.
+[package.metadata.wasm-pack.profile.release]
+# wasm-opt (binaryen) downloads a binary from GitHub at build time, which fails in
+# network-restricted CI/dev sandboxes (the Phase 0 spike hit this too). Disabled so
+# the build is hermetic; the wasm is fully functional without it, only larger.
+# Re-enable once binaryen is vendored/available to reclaim the size win.
+wasm-opt = false

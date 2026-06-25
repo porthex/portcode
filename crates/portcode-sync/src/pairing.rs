@@ -22,6 +22,15 @@ use serde::{Deserialize, Serialize};
 /// QR/wire format version so a phone can refuse an incompatible pairing format.
 const PAIRING_VERSION: u32 = 1;
 
+/// The n0 public production relay (§5.5). When a [`PairingPayload`] carries no
+/// explicit `relay_url` (a desktop that emitted the QR before this field existed,
+/// or one that relies on n0 discovery resolving the relay from the node id), the
+/// browser dialer falls back to this so it still has a relay to ride. Documented
+/// here so the default is auditable and pinnable when the product moves to a
+/// self-hosted relay (§5.5). Matches the value the Phase 0 spike printed for the
+/// phone.
+pub const DEFAULT_RELAY_URL: &str = "https://relay.iroh.network./";
+
 /// What a desktop shows as a QR code (and a phone scans) to start pairing.
 /// `Deserialize` is for the phone-side decode (Phase 2) and the round-trip test —
 /// don't strip it as "unused".
@@ -38,18 +47,43 @@ pub struct PairingPayload {
     /// `EndpointId`; with n0 discovery the phone resolves the live relay/direct
     /// addresses from the id alone, so an identity-only address is enough to dial.
     pub node_addr: EndpointAddr,
+    /// The iroh relay URL the browser client should dial through (§5.5). The
+    /// browser is relay-only (no UDP/hole-punch), so it needs a relay to reach the
+    /// desktop. Optional + `#[serde(default)]` for backward compatibility: a
+    /// desktop that emitted a QR before this field existed simply omits it, and the
+    /// browser falls back to [`DEFAULT_RELAY_URL`] (see
+    /// [`PairingPayload::relay_url_or_default`]). The desktop emit side therefore
+    /// needs no change to keep compiling, and the existing native flow — which
+    /// ignores this field entirely — is untouched.
+    #[serde(default)]
+    pub relay_url: Option<String>,
 }
 
 impl PairingPayload {
     /// Build a payload from raw public-key + nonce bytes and the desktop's node
-    /// address.
+    /// address. The relay URL defaults to `None` (the browser will fall back to
+    /// [`DEFAULT_RELAY_URL`]); use [`PairingPayload::with_relay_url`] to pin one.
     pub fn new(public_key: &[u8], nonce: &[u8], node_addr: EndpointAddr) -> Self {
         Self {
             version: PAIRING_VERSION,
             public_key: B64.encode(public_key),
             nonce: B64.encode(nonce),
             node_addr,
+            relay_url: None,
         }
+    }
+
+    /// Attach the relay URL the browser client should dial through (§5.5).
+    pub fn with_relay_url(mut self, relay_url: impl Into<String>) -> Self {
+        self.relay_url = Some(relay_url.into());
+        self
+    }
+
+    /// The relay URL to dial, falling back to [`DEFAULT_RELAY_URL`] when the
+    /// payload carries none (a pre-`relay_url` desktop, or one leaning on n0
+    /// discovery). The browser transport calls this to decide which relay to ride.
+    pub fn relay_url_or_default(&self) -> &str {
+        self.relay_url.as_deref().unwrap_or(DEFAULT_RELAY_URL)
     }
 }
 
@@ -93,6 +127,50 @@ mod tests {
         let back: PairingPayload = serde_json::from_str(&json).unwrap();
         // The phone can reconstruct the exact iroh address it needs to dial.
         assert_eq!(back.node_addr, addr);
+        assert_eq!(back.node_addr.id, addr.id);
+    }
+
+    // The relay URL is what the browser client dials through (§5.5). When set it
+    // must survive the QR JSON round-trip; when absent the browser falls back to
+    // the documented n0 default rather than failing.
+    #[test]
+    fn relay_url_round_trips_and_defaults_when_absent() {
+        // Explicit relay survives the round-trip and is returned verbatim.
+        let p = PairingPayload::new(&[1, 2, 3], &[4, 5, 6], sample_addr())
+            .with_relay_url("https://relay.example.com./");
+        assert_eq!(p.relay_url.as_deref(), Some("https://relay.example.com./"));
+        let back: PairingPayload =
+            serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(
+            back.relay_url.as_deref(),
+            Some("https://relay.example.com./")
+        );
+        assert_eq!(back.relay_url_or_default(), "https://relay.example.com./");
+
+        // No relay set → falls back to the documented default.
+        let bare = PairingPayload::new(&[1], &[2], sample_addr());
+        assert_eq!(bare.relay_url, None);
+        assert_eq!(bare.relay_url_or_default(), DEFAULT_RELAY_URL);
+    }
+
+    // Backward compatibility (the load-bearing constraint of work item 3): a QR
+    // emitted by a desktop BEFORE the `relay_url` field existed has no `relayUrl`
+    // key at all. `#[serde(default)]` must let the phone still decode it, with the
+    // relay defaulting rather than the deserialize erroring — so the desktop emit
+    // side needs no change to keep working.
+    #[test]
+    fn legacy_payload_without_relay_url_key_still_decodes() {
+        let addr = sample_addr();
+        let legacy = serde_json::json!({
+            "version": PAIRING_VERSION,
+            "publicKey": B64.encode([7u8, 8, 9]),
+            "nonce": B64.encode([1u8, 2]),
+            "nodeAddr": addr,
+            // NOTE: no "relayUrl" key — this is the pre-field wire shape.
+        });
+        let back: PairingPayload = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.relay_url, None);
+        assert_eq!(back.relay_url_or_default(), DEFAULT_RELAY_URL);
         assert_eq!(back.node_addr.id, addr.id);
     }
 }

@@ -15,9 +15,20 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+// On wasm these DTOs also derive `Tsify` (cfg-gated, like the protocol types in
+// `protocol.rs`) because `SyncFrame` embeds them — tsify needs every reachable
+// type to derive `Tsify` so the generated `.d.ts` references resolve. Nested types
+// only need the type declaration (no `into/from_wasm_abi`); only the top-level
+// boundary-crossing types in `protocol.rs` carry those. The derive is wasm-only
+// ABI glue and never touches the native desktop build. `Value` (the `input` on
+// tool blocks) maps to TS `any`, the intended shape.
+#[cfg(target_arch = "wasm32")]
+use tsify::Tsify;
+
 /// A single content block, matching the Anthropic content-block wire format.
 /// (Was `crate::llm::Block`.)
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Block {
     Text {
@@ -48,6 +59,7 @@ pub struct ChatMessage {
 /// (it is forwarded verbatim inside `protocol::SyncFrame::Live`).
 /// (Was `crate::llm::StreamEvent`.)
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
     TurnStart {
@@ -91,6 +103,7 @@ pub enum StreamEvent {
 
 /// A session header row. (Was `crate::db::SessionRow`.)
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRow {
     pub id: String,
@@ -105,6 +118,7 @@ pub struct SessionRow {
 /// `content` is the typed block list (same shape as [`ChatMessage::content`]).
 /// (Was `crate::db::MessageRow`.)
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
 #[serde(rename_all = "camelCase")]
 pub struct MessageRow {
     pub id: String,

@@ -14,10 +14,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{MessageRow, SessionRow, StreamEvent};
 
+// On wasm the protocol types additionally derive `Tsify` so the browser client's
+// TypeScript types are generated from THIS Rust source of truth (§5.4). The derive
+// expands into wasm-bindgen ABI glue, so it is cfg-gated to wasm only — the native
+// desktop build never sees it. `into_wasm_abi`/`from_wasm_abi` let a value cross
+// the JS boundary by serde (via `serde-wasm-bindgen`) in both directions. tsify
+// reads the existing `#[serde(...)]` attributes, so the emitted `.d.ts` matches the
+// JSON the protocol already speaks.
+#[cfg(target_arch = "wasm32")]
+use tsify::Tsify;
+
 /// One end's high-water mark for a session: "I already hold every message up to
 /// and including `seq`." A reconnecting phone sends one per known session so the
 /// desktop can reply with only the newer rows (`Db::messages_since`).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[cfg_attr(target_arch = "wasm32", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(rename_all = "camelCase")]
 pub struct Cursor {
     pub session_id: String,
@@ -29,6 +41,8 @@ pub struct Cursor {
 /// / `create_session`) — the phone never runs tools or touches the workspace
 /// itself.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[cfg_attr(target_arch = "wasm32", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum RemoteCommand {
     /// Start/continue a turn — proxies to `run_agent`.
@@ -43,6 +57,8 @@ pub enum RemoteCommand {
 
 /// Everything that crosses the encrypted channel, in both directions.
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[cfg_attr(target_arch = "wasm32", tsify(into_wasm_abi, from_wasm_abi))]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum SyncFrame {
     /// phone → desktop, on connect: identity + what the phone already holds.

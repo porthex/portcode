@@ -11,6 +11,10 @@
 resolver = "2"
 members = [
     "crates/portcode-sync",
+    # Phase 2 (§5.4): the thin wasm-bindgen `Session` wrapper the browser PWA
+    # loads. cdylib (the `_bg.wasm`) + rlib. Only ever built for wasm32, but it is
+    # a workspace member so `cargo`/clippy and CI gate it alongside the rest.
+    "crates/portcode-wasm",
     "src-tauri",
 ]
 
@@ -18,11 +22,19 @@ members = [
 # honored at the root — a `[profile.release]` left in `src-tauri/Cargo.toml` is
 # silently ignored (Cargo warns). These are the exact flags that previously lived
 # in `src-tauri/Cargo.toml`, lifted here verbatim so the desktop release build is
-# unchanged. (Size flags for the eventual wasm consumer `portcode-wasm` land in
-# Phase 2 when that cdylib exists.)
+# unchanged.
 [profile.release]
 opt-level = "s"
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Size flags for the wasm `Session` bundle (§5.3). Profiles are honored only at the
+# workspace root, so the per-package override lives HERE rather than in
+# `crates/portcode-wasm/Cargo.toml` (where Cargo would ignore it with a warning).
+# `opt-level = "z"` (size over speed) is the one knob that differs from the desktop
+# binary's `"s"`; the rest match. wasm-pack additionally runs `wasm-opt` unless the
+# crate's `[package.metadata.wasm-pack]` disables it.
+[profile.release.package.portcode-wasm]
+opt-level = "z"
