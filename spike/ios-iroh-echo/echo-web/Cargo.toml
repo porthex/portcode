@@ -1,0 +1,51 @@
+# THROWAWAY Phase-0 iOS spike — browser echo client (Rust -> wasm).
+# Self-contained: the empty [workspace] table below makes this a workspace
+# root so cargo never walks up into a parent workspace, and this crate can't
+# break the main build. See spike/ios-iroh-echo/README.md.
+[workspace]
+
+[package]
+name = "echo-web"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Browser iroh is RELAY-ONLY over WebSocket. default-features=false drops
+# `metrics` (which breaks wasm). tls-ring is the wasm-friendly TLS backend
+# the n0 browser-echo example uses on wasm32-unknown-unknown.
+iroh = { version = "1", default-features = false, features = ["tls-ring"] }
+
+# getrandom 0.3 needs BOTH the wasm_js feature AND the cfg flag in
+# .cargo/config.toml (--cfg getrandom_backend="wasm_js"). Both are mandatory.
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+# tokio on browser wasm: channels/macros only. NO time/net/rt — those pull in
+# mio and won't build for wasm32-unknown-unknown.
+tokio = { version = "1", default-features = false, features = ["sync", "macros"] }
+
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+gloo-timers = { version = "0.3", features = ["futures"] }
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
+console_error_panic_hook = "0.1"
+futures-util = "0.3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[package.metadata.wasm-pack.profile.release]
+# wasm-opt (binaryen) is an OPTIONAL size pass. It is disabled here because it
+# downloads a binaryen binary from GitHub at build time, which fails in
+# network-restricted/CI sandboxes. The wasm is fully functional without it; the
+# only cost is a larger artifact. Re-enable (set to true / pass flags) for a
+# size-optimized build once binaryen is available locally.
+wasm-opt = false

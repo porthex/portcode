@@ -1,0 +1,21 @@
+# THROWAWAY Phase-0 iOS spike — native desktop echo peer.
+# Empty [workspace] table -> standalone workspace root; cannot be absorbed
+# into any parent workspace or break the main build.
+[workspace]
+
+[package]
+name = "echo-desktop"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "echo-desktop"
+path = "src/main.rs"
+
+[dependencies]
+# Native iroh: full defaults (direct + relay + discovery). The phone dials this
+# peer's endpoint id through an n0 public relay.
+iroh = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }
+anyhow = "1"
