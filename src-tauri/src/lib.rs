@@ -681,7 +681,7 @@ fn start_listener(
         pending,
         oauth_refresh,
     };
-    let device_private = device.private.clone();
+    let device_private = device.private_key().to_vec();
     let app_for_loop = app.clone();
 
     tauri::async_runtime::spawn(async move {
@@ -816,7 +816,7 @@ async fn phone_sync_connect(
     let paired = sync::transport::connect_and_pair(
         &endpoint,
         payload.node_addr.clone(),
-        &identity.private,
+        identity.private_key(),
         &prologue,
     )
     .await?;

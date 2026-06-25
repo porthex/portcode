@@ -30,8 +30,17 @@ const KK_PARAMS: &str = "Noise_KK_25519_ChaChaPoly_BLAKE2s";
 /// flow; raise it if a typed/voice comparison path is added. This tunes
 /// MITM-detection ergonomics only — it does not affect the channel's secrecy.
 const SAS_BYTES: usize = 5;
-/// Noise spec MAXMSGLEN — every message fits, so one fixed buffer always works.
+/// Noise spec MAXMSGLEN — the maximum size of a single on-wire Noise message
+/// (ciphertext incl. the AEAD tag). A handshake/transport message can never
+/// legitimately exceed this.
 const MAX_MSG: usize = 65535;
+/// ChaCha20-Poly1305 authentication tag length. A transport ciphertext is the
+/// plaintext plus this tag, so the largest plaintext that still fits one Noise
+/// message is `MAX_MSG - TAG_LEN`.
+const TAG_LEN: usize = 16;
+/// Largest plaintext that encrypts to a single Noise message (`MAX_MSG` incl. the
+/// 16-byte tag). Anything larger must be chunked by the caller (out of scope here).
+const MAX_PLAINTEXT: usize = MAX_MSG - TAG_LEN;
 
 fn parse_params(spec: &str) -> Result<NoiseParams, String> {
     spec.parse::<NoiseParams>().map_err(|e| e.to_string())
@@ -45,10 +54,14 @@ fn err(e: snow::Error) -> String {
 /// peer pins; `private` lives only in the OS credential store, never on disk.
 /// Intentionally NOT `Debug`/`Serialize` — the private half must never land in a
 /// log line or get serialized by accident.
-#[derive(Clone)]
+///
+/// The private key is NOT a public field and the type is NOT `Clone`: the secret
+/// is meant to be read through [`StaticKeypair::private_key`] at the point of use
+/// (e.g. handing it to a handshake builder) rather than copied around, so stray
+/// clones can't leave extra plaintext copies of the long-term secret on the heap.
 pub struct StaticKeypair {
     pub public: Vec<u8>,
-    pub private: Vec<u8>,
+    private: Vec<u8>,
 }
 
 impl StaticKeypair {
@@ -61,6 +74,20 @@ impl StaticKeypair {
             public: kp.public,
             private: kp.private,
         })
+    }
+
+    /// Reconstruct a keypair from raw bytes already held by the caller (e.g. loaded
+    /// from the OS credential store). The private half is move-stored, not copied
+    /// elsewhere; borrow it back via [`StaticKeypair::private_key`].
+    pub fn from_parts(public: Vec<u8>, private: Vec<u8>) -> Self {
+        Self { public, private }
+    }
+
+    /// Borrow the long-term private key bytes (e.g. to seed a Noise handshake).
+    /// Returns a reference rather than a copy so the secret isn't duplicated on
+    /// the heap; the bytes are zeroized on drop.
+    pub fn private_key(&self) -> &[u8] {
+        &self.private
     }
 }
 
@@ -189,8 +216,22 @@ pub struct Transport {
 }
 
 impl Transport {
-    /// Encrypt `plaintext`; returns the ciphertext to send.
+    /// Encrypt `plaintext`; returns the ciphertext (plaintext + 16-byte AEAD tag).
+    ///
+    /// Rejects a plaintext that wouldn't fit one Noise message (`> MAX_PLAINTEXT`)
+    /// with a clear error rather than letting snow fault on an undersized buffer —
+    /// the ciphertext is `plaintext.len() + TAG_LEN`, so the output buffer is sized
+    /// to hold the tag too (`MAX_MSG`, i.e. `MAX_PLAINTEXT + TAG_LEN`). Chunking
+    /// larger frames is a caller-side concern (see `transport::MAX_FRAME`).
     pub fn write(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        if plaintext.len() > MAX_PLAINTEXT {
+            return Err(format!(
+                "plaintext of {} bytes exceeds the {MAX_PLAINTEXT}-byte single-message limit \
+                 ({MAX_MSG} on the wire incl. the {TAG_LEN}-byte tag)",
+                plaintext.len()
+            ));
+        }
+        // Hold ciphertext = plaintext + tag. MAX_MSG already accounts for the tag.
         let mut buf = vec![0u8; MAX_MSG];
         let len = self.state.write_message(plaintext, &mut buf).map_err(err)?;
         buf.truncate(len);
@@ -510,6 +551,31 @@ mod tests {
         let b = StaticKeypair::generate().unwrap();
         let mut res = Handshake::xx_responder(&b.private, TEST_NONCE).unwrap();
         assert!(res.read(&[0xde, 0xad, 0xbe, 0xef]).is_err());
+    }
+
+    #[test]
+    fn transport_write_accepts_a_max_size_plaintext_and_rejects_an_oversized_one() {
+        let a = StaticKeypair::generate().unwrap();
+        let b = StaticKeypair::generate().unwrap();
+        let mut ini = Handshake::xx_initiator(&a.private, TEST_NONCE).unwrap();
+        let mut res = Handshake::xx_responder(&b.private, TEST_NONCE).unwrap();
+        run_xx(&mut ini, &mut res);
+        let mut it = ini.into_transport().unwrap();
+        let mut rt = res.into_transport().unwrap();
+
+        // The largest plaintext that fits one Noise message encrypts cleanly to
+        // exactly MAX_MSG bytes (plaintext + 16-byte tag) and round-trips.
+        let max_pt = vec![0x5au8; MAX_PLAINTEXT];
+        let ct = it.write(&max_pt).unwrap();
+        assert_eq!(ct.len(), MAX_MSG);
+        assert_eq!(rt.read(&ct).unwrap(), max_pt);
+
+        // One byte over the limit is rejected with a clear error, not a panic.
+        let too_big = vec![0u8; MAX_PLAINTEXT + 1];
+        assert!(
+            it.write(&too_big).is_err(),
+            "a plaintext larger than MAX_PLAINTEXT must be rejected"
+        );
     }
 
     #[test]

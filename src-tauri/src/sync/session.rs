@@ -22,7 +22,7 @@ use crate::sync::protocol::SyncFrame;
 #[allow(unused_imports)]
 pub use portcode_sync::session::{
     forward_live, handle_commands, request_catch_up, run_client_recv, send_command, CatchUp,
-    CommandHandler, FrameChannel, FrameSink, FrameSource,
+    CommandHandler, FrameChannel, FrameSink, FrameSource, RecvError,
 };
 
 /// Desktop side: answer a phone's catch-up request. Reads the phone's `Hello`,
@@ -89,8 +89,11 @@ mod tests {
     }
     #[async_trait]
     impl FrameSource for MemChannel {
-        async fn recv(&mut self) -> Result<SyncFrame, String> {
-            self.rx.recv().await.ok_or_else(|| "closed".to_string())
+        async fn recv(&mut self) -> Result<SyncFrame, portcode_sync::session::RecvError> {
+            self.rx
+                .recv()
+                .await
+                .ok_or(portcode_sync::session::RecvError::Closed)
         }
     }
 

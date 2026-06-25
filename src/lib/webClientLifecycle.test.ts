@@ -22,15 +22,20 @@ function makeFakeStore(initial: Partial<LifecycleStoreState> = {}) {
   const setOnline = vi.fn((v: boolean) => {
     state.online = v;
   });
+  const hydrateRememberedQr = vi.fn((qr: string) => {
+    if (!state.lastPairingQr) state.lastPairingQr = qr;
+  });
   const state: LifecycleStoreState = {
     remoteConnected: false,
     remoteVerified: false,
     remoteConnecting: false,
     remoteSas: null,
+    remotePeerKey: null,
     lastPairingQr: null,
     online: true,
     reconnectRemote,
     setOnline,
+    hydrateRememberedQr,
     ...initial,
   };
   const store: LifecycleStore = {
@@ -45,7 +50,7 @@ function makeFakeStore(initial: Partial<LifecycleStoreState> = {}) {
     Object.assign(state, patch);
     for (const l of [...listeners]) l();
   };
-  return { store, state, set, reconnectRemote, setOnline, listeners };
+  return { store, state, set, reconnectRemote, setOnline, hydrateRememberedQr, listeners };
 }
 
 /** A fake storage whose calls are spies; the pinned peer is in-memory. */
@@ -227,7 +232,9 @@ describe("startWebClientLifecycle — reconnect on resume", () => {
   });
 
   it("uses the IndexedDB-hydrated QR when the store has no remembered QR", async () => {
-    const { store, reconnectRemote, set } = makeFakeStore({ lastPairingQr: null });
+    const { store, reconnectRemote, hydrateRememberedQr, state, set } = makeFakeStore({
+      lastPairingQr: null,
+    });
     const storage = makeFakeStorage({
       peerPublicKey: "KEY",
       deviceId: "device-abc",
@@ -244,15 +251,19 @@ describe("startWebClientLifecycle — reconnect on resume", () => {
       clearTimeoutFn: t.clearTimeoutFn,
     });
 
-    // Let the async hydration IIFE settle so rememberedQr is populated.
+    // Let the async hydration IIFE settle so the durable QR is populated.
     await flush();
     await flush();
 
+    // The hydrated QR is pushed into the store so reconnectRemote (which reads only
+    // lastPairingQr) can actually dial on a cold launch — not just the resume guard.
+    expect(hydrateRememberedQr).toHaveBeenCalledWith("QR-FROM-IDB");
+    expect(state.lastPairingQr).toBe("QR-FROM-IDB");
+
     w.resume();
     await flush();
-    // reconnectRemote dials the store's lastPairingQr — which is still null here — so
-    // the store action itself wouldn't dial; but the controller's connect() saw a QR
-    // (the hydrated one) and called reconnectRemote.
+    // The controller's connect() saw the QR and called reconnectRemote, which now
+    // finds a non-null lastPairingQr (the hydrated one) to dial.
     expect(reconnectRemote).toHaveBeenCalledTimes(1);
     set({}); // touch to ensure no crash on a no-op notify
     stop();
@@ -266,11 +277,12 @@ describe("startWebClientLifecycle — durable pinned-peer persistence", () => {
     const w = makeWatchStub();
     const stop = startWebClientLifecycle({ store, storage, watch: w.watch });
 
-    // Simulate a successful connect+verify with a SAS and a remembered QR.
+    // Simulate a successful connect+verify carrying the STABLE peer key + a SAS.
     set({
       remoteConnected: true,
       remoteVerified: true,
       remoteSas: "SAS-99",
+      remotePeerKey: "DESKTOP-KEY-99",
       lastPairingQr: "QR-CONN",
     });
     await flush();
@@ -279,10 +291,32 @@ describe("startWebClientLifecycle — durable pinned-peer persistence", () => {
     expect(storage.getOrCreateDeviceId).toHaveBeenCalledTimes(1);
     expect(storage.savePinnedPeer).toHaveBeenCalledTimes(1);
     const saved = vi.mocked(storage.savePinnedPeer).mock.calls[0][0];
-    expect(saved.peerPublicKey).toBe("SAS-99");
+    // The PINNED value is the stable peer key, NOT the SAS verification code.
+    expect(saved.peerPublicKey).toBe("DESKTOP-KEY-99");
+    expect(saved.peerPublicKey).not.toBe("SAS-99");
     expect(saved.deviceId).toBe("device-abc");
     expect(saved.qr).toBe("QR-CONN");
     expect(typeof saved.pairedAt).toBe("number");
+    stop();
+  });
+
+  it("does NOT pin a verified connection that has no peer key yet (no SAS in the key slot)", async () => {
+    const { store, set } = makeFakeStore({ lastPairingQr: null });
+    const storage = makeFakeStorage();
+    const w = makeWatchStub();
+    const stop = startWebClientLifecycle({ store, storage, watch: w.watch });
+
+    // Verified + live, a SAS present, but the stable peer key not surfaced yet:
+    // we must skip pinning rather than store the SAS in the key slot.
+    set({
+      remoteConnected: true,
+      remoteVerified: true,
+      remoteSas: "SAS-ONLY",
+      remotePeerKey: null,
+      lastPairingQr: "QR",
+    });
+    await flush();
+    expect(storage.savePinnedPeer).not.toHaveBeenCalled();
     stop();
   });
 

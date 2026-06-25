@@ -31,16 +31,47 @@ use crate::transport_wasm::{ChannelReceiver, ChannelSender, SecureChannel};
 
 // ── frame-channel trait hierarchy ────────────────────────────────────────────
 
+/// Why a frame receive ended. Distinguishes a CLEAN end-of-stream (the peer
+/// finished/closed the channel with no bytes mid-frame — a normal shutdown) from a
+/// PROTOCOL/transport error (a torn connection, a truncated frame, a Noise/AEAD
+/// failure, a deserialization error). The live loops only treat `Closed` as a
+/// graceful stop; a `Protocol` error is propagated so the caller forces a
+/// reconnect/catch-up rather than silently treating corruption as "done".
+#[derive(Debug)]
+pub enum RecvError {
+    /// The peer closed the channel cleanly (graceful EOF, no partial frame).
+    Closed,
+    /// A transport/protocol failure: a torn connection, a truncated/oversized
+    /// frame, or a decrypt/deserialize error. Carries a human-readable detail.
+    Protocol(String),
+}
+
+impl std::fmt::Display for RecvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecvError::Closed => write!(f, "channel closed"),
+            RecvError::Protocol(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<RecvError> for String {
+    fn from(e: RecvError) -> String {
+        e.to_string()
+    }
+}
+
 /// The send half of a frame channel.
 #[async_trait]
 pub trait FrameSink {
     async fn send(&mut self, frame: &SyncFrame) -> Result<(), String>;
 }
 
-/// The receive half of a frame channel.
+/// The receive half of a frame channel. A clean end-of-stream is reported as
+/// [`RecvError::Closed`]; everything else is [`RecvError::Protocol`].
 #[async_trait]
 pub trait FrameSource {
-    async fn recv(&mut self) -> Result<SyncFrame, String>;
+    async fn recv(&mut self) -> Result<SyncFrame, RecvError>;
 }
 
 /// A bidirectional channel: both a [`FrameSink`] and a [`FrameSource`]. The
@@ -60,7 +91,7 @@ impl FrameSink for SecureChannel {
 }
 #[async_trait]
 impl FrameSource for SecureChannel {
-    async fn recv(&mut self) -> Result<SyncFrame, String> {
+    async fn recv(&mut self) -> Result<SyncFrame, RecvError> {
         self.recv_frame().await
     }
 }
@@ -75,7 +106,7 @@ impl FrameSink for ChannelSender {
 }
 #[async_trait]
 impl FrameSource for ChannelReceiver {
-    async fn recv(&mut self) -> Result<SyncFrame, String> {
+    async fn recv(&mut self) -> Result<SyncFrame, RecvError> {
         self.recv_frame().await
     }
 }
@@ -86,6 +117,7 @@ impl FrameSource for ChannelReceiver {
 /// phone asked about, the messages newer than its cursor.
 /// Phone side only (`request_catch_up`); the desktop never holds one.
 #[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
 pub struct CatchUp {
     pub sessions: Vec<SessionRow>,
     pub deltas: Vec<(String, Vec<MessageRow>)>,
@@ -114,12 +146,26 @@ pub async fn request_catch_up<C: FrameChannel + ?Sized>(
     };
 
     let mut deltas = Vec::with_capacity(cursors.len());
-    for _ in &cursors {
+    // The desktop answers one MessageDelta per cursor IN ORDER, so the delta for
+    // `cursor` must carry `cursor.session_id`. Validate it: a delta for a session
+    // we didn't request (or out of order) means the channel is desynced or a peer
+    // is feeding us rows for a session this catch-up never asked about — reject it
+    // rather than silently recording the wrong session's messages.
+    for cursor in &cursors {
         match channel.recv().await? {
             SyncFrame::MessageDelta {
                 session_id,
                 messages,
-            } => deltas.push((session_id, messages)),
+            } => {
+                if session_id != cursor.session_id {
+                    return Err(format!(
+                        "catch-up MessageDelta session_id {session_id:?} does not match the \
+                         requested cursor {:?}",
+                        cursor.session_id
+                    ));
+                }
+                deltas.push((session_id, messages));
+            }
             other => return Err(format!("expected MessageDelta, got {other:?}")),
         }
     }
@@ -137,9 +183,14 @@ pub async fn request_catch_up<C: FrameChannel + ?Sized>(
 // etc. through `AppState`) is the integration step in `src-tauri`.
 
 /// Forward live agent events from the desktop's broadcast hub to the phone until
-/// the hub is closed (all senders dropped) or a send fails. A `Lagged` (slow
-/// phone) is non-fatal: dropped frames are reconciled by the catch-up path, so we
-/// keep forwarding the live tail.
+/// the hub is closed (all senders dropped) or a send fails.
+///
+/// A `Lagged` (the phone fell behind the broadcast buffer) is NOT silently
+/// skipped: once the broadcast ring overwrites un-forwarded frames, continuing
+/// would permanently drop those live events with no signal to recover. We return
+/// an error so the caller tears the live forward down and forces a fresh
+/// catch-up (which reconciles the gap by cursor) instead of leaking a hole in the
+/// phone's view of the live stream.
 pub async fn forward_live(
     hub: &mut broadcast::Receiver<SyncFrame>,
     sink: &mut impl FrameSink,
@@ -149,7 +200,12 @@ pub async fn forward_live(
         match hub.recv().await {
             Ok(frame) => sink.send(&frame).await?,
             Err(RecvError::Closed) => return Ok(()),
-            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Lagged(n)) => {
+                return Err(format!(
+                    "live forward lagged {n} frames behind the broadcast buffer; \
+                     reconnect + catch-up required to avoid dropping live events"
+                ))
+            }
         }
     }
 }
@@ -179,7 +235,10 @@ pub async fn handle_commands(
             Ok(SyncFrame::Command { command }) => handler.handle(command).await?,
             Ok(SyncFrame::Ack { .. }) => {}
             Ok(other) => return Err(format!("unexpected frame in command loop: {other:?}")),
-            Err(_) => return Ok(()), // channel closed → done
+            Err(RecvError::Closed) => return Ok(()), // peer closed cleanly → done
+            // A transport/protocol error is NOT a clean shutdown: surface it so the
+            // session is torn down + reconnected rather than silently ending intake.
+            Err(RecvError::Protocol(e)) => return Err(e),
         }
     }
 }
@@ -202,7 +261,10 @@ pub async fn run_client_recv(
     loop {
         match source.recv().await {
             Ok(frame) => on_frame(frame),
-            Err(_) => return Ok(()), // channel closed → done
+            Err(RecvError::Closed) => return Ok(()), // peer closed cleanly → done
+            // A transport/protocol error means the live view is now incomplete:
+            // surface it so the client reconnects + re-runs catch-up.
+            Err(RecvError::Protocol(e)) => return Err(e),
         }
     }
 }
@@ -236,8 +298,9 @@ mod tests {
     }
     #[async_trait]
     impl FrameSource for MemChannel {
-        async fn recv(&mut self) -> Result<SyncFrame, String> {
-            self.rx.recv().await.ok_or_else(|| "closed".to_string())
+        async fn recv(&mut self) -> Result<SyncFrame, RecvError> {
+            // A dropped sender (all senders gone) is a clean end-of-stream.
+            self.rx.recv().await.ok_or(RecvError::Closed)
         }
     }
 
@@ -328,6 +391,148 @@ mod tests {
         assert_eq!(catch_up.deltas[0].1.len(), 1);
         assert_eq!(catch_up.deltas[1].0, "s2");
         assert!(catch_up.deltas[1].1.is_empty());
+    }
+
+    /// A FrameSource that yields a scripted sequence, then a terminal error. Used
+    /// to prove the loops distinguish a clean close from a protocol error.
+    struct ScriptedSource {
+        frames: std::collections::VecDeque<SyncFrame>,
+        terminal: Option<RecvError>,
+    }
+    #[async_trait]
+    impl FrameSource for ScriptedSource {
+        async fn recv(&mut self) -> Result<SyncFrame, RecvError> {
+            if let Some(f) = self.frames.pop_front() {
+                return Ok(f);
+            }
+            match self.terminal.take() {
+                Some(e) => Err(e),
+                None => Err(RecvError::Closed),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_catch_up_rejects_a_delta_for_an_unrequested_session() {
+        let (mut phone, mut desktop) = mem_pair();
+        let cursors = vec![Cursor {
+            session_id: "s1".into(),
+            seq: -1,
+        }];
+        // Desktop replies with a SessionList then a delta for the WRONG session.
+        let desktop_task = async {
+            desktop.recv().await.unwrap(); // Hello
+            desktop
+                .send(&SyncFrame::SessionList { sessions: vec![] })
+                .await
+                .unwrap();
+            desktop
+                .send(&SyncFrame::MessageDelta {
+                    session_id: "s2".into(), // not the requested s1
+                    messages: vec![],
+                })
+                .await
+                .unwrap();
+        };
+        let (res, ()) = tokio::join!(request_catch_up(&mut phone, "p1", cursors), desktop_task);
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("does not match"),
+            "mismatched session_id must be rejected, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_live_errors_when_the_phone_lags_behind_the_broadcast_buffer() {
+        // A tiny buffer (cap 1) so a burst overruns it before forward_live drains.
+        let (hub_tx, mut hub_rx) = broadcast::channel::<SyncFrame>(1);
+        for i in 0..8 {
+            hub_tx
+                .send(SyncFrame::Ack {
+                    session_id: format!("s{i}"),
+                    seq: i,
+                })
+                .unwrap();
+        }
+        // A sink that accepts everything; the lag comes from the hub, not the sink.
+        struct NullSink;
+        #[async_trait]
+        impl FrameSink for NullSink {
+            async fn send(&mut self, _: &SyncFrame) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let mut sink = NullSink;
+        let err = forward_live(&mut hub_rx, &mut sink).await.unwrap_err();
+        assert!(
+            err.contains("lagged"),
+            "a lagged phone must error (force catch-up), got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_commands_propagates_a_protocol_error_but_swallows_a_clean_close() {
+        struct NoopHandler;
+        #[async_trait]
+        impl CommandHandler for NoopHandler {
+            async fn handle(&self, _: RemoteCommand) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        // Clean close after one command → Ok.
+        let mut clean = ScriptedSource {
+            frames: [SyncFrame::Command {
+                command: RemoteCommand::Run {
+                    session_id: "s1".into(),
+                    text: "go".into(),
+                },
+            }]
+            .into(),
+            terminal: None,
+        };
+        handle_commands(&mut clean, &NoopHandler).await.unwrap();
+
+        // A protocol error → Err (forces reconnect), not a silent return.
+        let mut broken = ScriptedSource {
+            frames: Default::default(),
+            terminal: Some(RecvError::Protocol("stream reset by peer".into())),
+        };
+        let err = handle_commands(&mut broken, &NoopHandler)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("reset"),
+            "protocol error must propagate: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_client_recv_propagates_a_protocol_error_but_swallows_a_clean_close() {
+        // Clean close → Ok, all frames delivered.
+        let mut clean = ScriptedSource {
+            frames: [SyncFrame::Ack {
+                session_id: "s1".into(),
+                seq: 1,
+            }]
+            .into(),
+            terminal: None,
+        };
+        let mut count = 0usize;
+        {
+            let mut on_frame = |_: SyncFrame| count += 1;
+            run_client_recv(&mut clean, &mut on_frame).await.unwrap();
+        }
+        assert_eq!(count, 1);
+
+        // Protocol error → Err.
+        let mut broken = ScriptedSource {
+            frames: Default::default(),
+            terminal: Some(RecvError::Protocol("connection lost".into())),
+        };
+        let mut noop = |_: SyncFrame| {};
+        let err = run_client_recv(&mut broken, &mut noop).await.unwrap_err();
+        assert!(err.contains("lost"), "protocol error must propagate: {err}");
     }
 
     #[tokio::test]

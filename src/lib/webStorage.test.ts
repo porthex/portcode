@@ -79,6 +79,72 @@ describe("webStorage (IndexedDB available)", () => {
     expect(await loadPinnedPeer()).toBeNull();
   });
 
+  /** Write a raw value under the pinned-peer key (bypassing savePinnedPeer's typing). */
+  async function putRaw(value: unknown): Promise<void> {
+    await new Promise<void>((resolve) => {
+      const open = indexedDB.open("portcode-sync", 1);
+      open.onupgradeneeded = () => {
+        open.result.createObjectStore("kv");
+      };
+      open.onsuccess = () => {
+        const db = open.result;
+        const tx = db.transaction("kv", "readwrite");
+        tx.objectStore("kv").put(JSON.stringify(value), "pinned-peer");
+        tx.oncomplete = () => {
+          db.close();
+          resolve();
+        };
+      };
+    });
+  }
+
+  it("loadPinnedPeer rejects an old-schema record missing required fields", async () => {
+    // Old version: a pin without `deviceId` (and a numeric stand-in key). The
+    // type-guard must reject it so the reconnect path never sees a half-built peer.
+    await putRaw({ peerPublicKey: "k", pairedAt: 123 });
+    expect(await loadPinnedPeer()).toBeNull();
+  });
+
+  it("loadPinnedPeer rejects a record with wrong field types", async () => {
+    await putRaw({ peerPublicKey: 42, deviceId: "d", pairedAt: 1 }); // key not a string
+    expect(await loadPinnedPeer()).toBeNull();
+    await putRaw({ peerPublicKey: "k", deviceId: "d", pairedAt: "soon" }); // pairedAt not a number
+    expect(await loadPinnedPeer()).toBeNull();
+    await putRaw({ peerPublicKey: "k", deviceId: "d", pairedAt: 1, qr: 7 }); // qr not a string
+    expect(await loadPinnedPeer()).toBeNull();
+  });
+
+  it("loadPinnedPeer accepts a valid record with no optional qr", async () => {
+    const noQr: PinnedPeer = { peerPublicKey: "k", deviceId: "d", pairedAt: 5 };
+    await putRaw(noQr);
+    expect(await loadPinnedPeer()).toEqual(noQr);
+  });
+
+  it("loadPinnedPeer rejects a non-object JSON value", async () => {
+    await putRaw("just a string");
+    expect(await loadPinnedPeer()).toBeNull();
+    await putRaw(null);
+    expect(await loadPinnedPeer()).toBeNull();
+  });
+
+  it("getOrCreateDeviceId retries after a transient failure (cache not poisoned)", async () => {
+    // First call: crypto.randomUUID throws → the promise rejects AND the memoized
+    // cache must be cleared so a later call can succeed (not stay permanently broken).
+    const uuid = vi
+      .fn<() => string>()
+      .mockImplementationOnce(() => {
+        throw new Error("transient crypto failure");
+      })
+      .mockImplementation(() => "11111111-1111-1111-1111-111111111111");
+    vi.stubGlobal("crypto", { randomUUID: uuid });
+
+    await expect(getOrCreateDeviceId()).rejects.toThrow("transient crypto failure");
+    // The retry succeeds because the rejected promise was NOT memoized.
+    const id = await getOrCreateDeviceId();
+    expect(id).toBe("11111111-1111-1111-1111-111111111111");
+    expect(uuid).toHaveBeenCalledTimes(2);
+  });
+
   it("getOrCreateDeviceId returns a stable id across calls", async () => {
     const first = await getOrCreateDeviceId();
     const second = await getOrCreateDeviceId();

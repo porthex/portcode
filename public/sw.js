@@ -41,10 +41,32 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const { request } = event;
-  // Only the GET navigations / static assets are cacheable. Anything else (the
-  // relay WebSocket upgrade, POSTs) falls through to the network untouched.
+  // Only GET navigations / static assets are cacheable. Anything else (the relay
+  // WebSocket upgrade, POSTs) falls through to the network untouched.
   if (request.method !== "GET") return;
 
+  // NAVIGATIONS → network-first. The HTML shell is the one resource whose contents
+  // change every deploy (new hashed asset URLs); serving it cache-first would pin
+  // an old shell that references deleted asset hashes until the SW updates. So we
+  // try the network, refresh the cached shell on success, and fall back to the
+  // cached shell only when offline — preserving the offline launch.
+  if (request.mode === "navigate") {
+    event.respondWith(
+      fetch(request)
+        .then((response) => {
+          if (response.ok && new URL(request.url).origin === self.location.origin) {
+            const copy = response.clone();
+            caches.open(CACHE).then((cache) => cache.put(request, copy));
+          }
+          return response;
+        })
+        .catch(() => caches.match(request).then((cached) => cached || caches.match("/index.html"))),
+    );
+    return;
+  }
+
+  // NON-NAVIGATION GETs (hashed JS/CSS, manifest, icons) → cache-first. Their URLs
+  // are content-hashed and immutable, so a cache hit is always correct and fast.
   event.respondWith(
     caches.match(request).then((cached) => {
       if (cached) return cached;
@@ -57,12 +79,7 @@ self.addEventListener("fetch", (event) => {
           }
           return response;
         })
-        .catch(() => {
-          // Offline and uncached: for a navigation, fall back to the cached shell so
-          // the app still boots; otherwise let the failure surface.
-          if (request.mode === "navigate") return caches.match("/index.html");
-          return Response.error();
-        });
+        .catch(() => Response.error());
     }),
   );
 });

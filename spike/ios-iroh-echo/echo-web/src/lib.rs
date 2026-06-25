@@ -39,10 +39,15 @@ pub fn start() {
     console_error_panic_hook::set_once();
 }
 
-/// Open bi-stream halves for one live connection.
-struct Channel {
+/// The send and receive halves of the live connection are guarded by INDEPENDENT
+/// locks: the read loop parks inside `read_exact` holding only the recv lock, so a
+/// concurrent `send()` (which takes only the send lock) is never blocked by an
+/// in-flight read. (A single mutex over both halves deadlocks: the read loop holds
+/// it across the blocking `read_exact`, so `send`/`connect` can never acquire it
+/// and the echo never round-trips.) The `Connection` is held alive next to the
+/// send half so dropping the channel tears the stream down.
+struct SendHalf {
     send: SendStream,
-    recv: RecvStream,
     // Hold the Connection so it is not dropped (which would close the stream).
     _conn: Connection,
 }
@@ -50,7 +55,8 @@ struct Channel {
 #[wasm_bindgen]
 pub struct EchoClient {
     endpoint: Rc<RefCell<Option<Endpoint>>>,
-    channel: Rc<AsyncMutex<Option<Channel>>>,
+    send_half: Rc<AsyncMutex<Option<SendHalf>>>,
+    recv_half: Rc<AsyncMutex<Option<RecvStream>>>,
     on_message: Rc<RefCell<Option<js_sys::Function>>>,
     on_status: Rc<RefCell<Option<js_sys::Function>>>,
 }
@@ -61,7 +67,8 @@ impl EchoClient {
     pub fn new() -> EchoClient {
         EchoClient {
             endpoint: Rc::new(RefCell::new(None)),
-            channel: Rc::new(AsyncMutex::new(None)),
+            send_half: Rc::new(AsyncMutex::new(None)),
+            recv_half: Rc::new(AsyncMutex::new(None)),
             on_message: Rc::new(RefCell::new(None)),
             on_status: Rc::new(RefCell::new(None)),
         }
@@ -117,13 +124,9 @@ impl EchoClient {
         let (send, recv) = conn.open_bi().await.map_err(to_js)?;
         self.status("bi stream open. ready to echo.");
 
-        let mut guard = self.channel.lock().await;
-        *guard = Some(Channel {
-            send,
-            recv,
-            _conn: conn,
-        });
-        drop(guard);
+        // Install the two halves under their independent locks.
+        *self.send_half.lock().await = Some(SendHalf { send, _conn: conn });
+        *self.recv_half.lock().await = Some(recv);
 
         // Spawn the read loop that fires on_message per echoed chunk.
         self.spawn_read_loop();
@@ -133,21 +136,23 @@ impl EchoClient {
     /// Send one text line to the peer (length-prefixed: u32 BE len + bytes).
     #[wasm_bindgen]
     pub fn send(&self, text: String) {
-        let channel = self.channel.clone();
+        let send_half = self.send_half.clone();
         let status = self.on_status.clone();
         spawn_local(async move {
-            let mut guard = channel.lock().await;
-            let Some(ch) = guard.as_mut() else {
+            // Take ONLY the send lock — the read loop holds the recv lock, so this
+            // never contends with an in-flight read (that was the deadlock).
+            let mut guard = send_half.lock().await;
+            let Some(half) = guard.as_mut() else {
                 emit(&status, "send: not connected");
                 return;
             };
             let bytes = text.into_bytes();
             let len = (bytes.len() as u32).to_be_bytes();
-            if let Err(e) = ch.send.write_all(&len).await {
+            if let Err(e) = half.send.write_all(&len).await {
                 emit(&status, &format!("send error (len): {e}"));
                 return;
             }
-            if let Err(e) = ch.send.write_all(&bytes).await {
+            if let Err(e) = half.send.write_all(&bytes).await {
                 emit(&status, &format!("send error (body): {e}"));
                 return;
             }
@@ -159,30 +164,35 @@ impl EchoClient {
     /// re-dial is fast. Idempotent — safe to call on every visibility change.
     #[wasm_bindgen]
     pub fn disconnect(&self) {
-        let channel = self.channel.clone();
+        let send_half = self.send_half.clone();
+        let recv_half = self.recv_half.clone();
         let status = self.on_status.clone();
         spawn_local(async move {
-            let mut guard = channel.lock().await;
-            if guard.take().is_some() {
+            // Drop both halves. Dropping the send half drops the Connection, which
+            // also fails the read loop's next `read_exact` so it exits.
+            let dropped_send = send_half.lock().await.take().is_some();
+            recv_half.lock().await.take();
+            if dropped_send {
                 emit(&status, "disconnected (channel dropped)");
             }
         });
     }
 
     fn spawn_read_loop(&self) {
-        let channel = self.channel.clone();
+        let recv_half = self.recv_half.clone();
         let on_message = self.on_message.clone();
         let status = self.on_status.clone();
         spawn_local(async move {
             loop {
-                // Read one frame: u32 BE length, then that many bytes.
-                let mut guard = channel.lock().await;
-                let Some(ch) = guard.as_mut() else {
+                // Hold ONLY the recv lock across the blocking read, so a concurrent
+                // `send()` (send lock) is never blocked by an in-flight read.
+                let mut guard = recv_half.lock().await;
+                let Some(recv) = guard.as_mut() else {
                     // Channel was dropped (disconnect / resume). Stop the loop.
                     break;
                 };
                 let mut len_buf = [0u8; 4];
-                if let Err(e) = read_exact(&mut ch.recv, &mut len_buf).await {
+                if let Err(e) = read_exact(recv, &mut len_buf).await {
                     emit(&status, &format!("read loop ended: {e}"));
                     break;
                 }
@@ -192,11 +202,11 @@ impl EchoClient {
                     break;
                 }
                 let mut body = vec![0u8; len];
-                if let Err(e) = read_exact(&mut ch.recv, &mut body).await {
+                if let Err(e) = read_exact(recv, &mut body).await {
                     emit(&status, &format!("read loop ended: {e}"));
                     break;
                 }
-                drop(guard); // release lock before invoking JS
+                drop(guard); // release the recv lock before invoking JS
                 let text = String::from_utf8_lossy(&body).to_string();
                 if let Some(cb) = on_message.borrow().as_ref() {
                     let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(&text));

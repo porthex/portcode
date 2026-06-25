@@ -137,6 +137,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # This job runs no git operations; don't leave the token in the checkout
+          # (matches the coverage jobs). Hardens against a fork PR exfiltrating it.
+          persist-credentials: false
 
       # LLVM clang is required to target wasm32 (Apple/MSVC clang cannot). Install
       # it explicitly so the job is self-contained and doesn't silently regress if
@@ -160,6 +164,9 @@ jobs:
           workspaces: .
           # Separate cache key from the native legs (different target dir).
           key: wasm
+          # Only WRITE the cache from trusted (non-fork) runs on the canonical
+          # branches; fork PRs still READ the cache but can't poison it.
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release') }}
 
       # Exit criterion 1: the shared crate compiles for the browser target.
       # Each crate's `.cargo/config.toml` supplies the getrandom_backend="wasm_js"
