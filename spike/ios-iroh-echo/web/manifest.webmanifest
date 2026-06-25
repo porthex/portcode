@@ -1,0 +1,19 @@
+{
+  "id": "/portcode-ios-iroh-spike",
+  "name": "Portcode iOS iroh spike",
+  "short_name": "iroh spike",
+  "description": "Throwaway Phase-0 proof-of-connection: iroh-in-browser echo on iOS.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#111417",
+  "theme_color": "#111417",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

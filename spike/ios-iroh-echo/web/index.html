@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- viewport-fit=cover so the page reaches under the notch / Dynamic Island
+         when launched as an installed PWA (plan §5.7). -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>Portcode iOS iroh spike</title>
+
+    <!-- PWA: make "Add to Home Screen" produce a standalone app on iOS. -->
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <meta name="theme-color" content="#111417" />
+
+    <!-- Apple-specific meta (iOS does NOT read these from the manifest). -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta
+      name="apple-mobile-web-app-status-bar-style"
+      content="black-translucent"
+    />
+    <meta name="apple-mobile-web-app-title" content="iroh spike" />
+    <link rel="apple-touch-icon" href="./icon.svg" />
+
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font: 15px/1.45 -apple-system, system-ui, sans-serif;
+        background: #111417;
+        color: #e8edf2;
+        padding: max(12px, env(safe-area-inset-top)) 14px
+          max(12px, env(safe-area-inset-bottom));
+      }
+      h1 {
+        font-size: 17px;
+        margin: 4px 0 12px;
+      }
+      label {
+        display: block;
+        font-size: 12px;
+        opacity: 0.7;
+        margin: 10px 0 3px;
+      }
+      input,
+      button {
+        width: 100%;
+        font-size: 16px; /* >=16px stops iOS auto-zoom on focus */
+        padding: 11px 12px;
+        border-radius: 10px;
+        border: 1px solid #2a3138;
+        background: #1a1f24;
+        color: #e8edf2;
+      }
+      button {
+        background: #2563eb;
+        border: 0;
+        font-weight: 600;
+        margin-top: 12px;
+      }
+      button.secondary {
+        background: #2a3138;
+      }
+      button:disabled {
+        opacity: 0.45;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+      }
+      .row > * {
+        flex: 1;
+      }
+      #log {
+        margin-top: 14px;
+        background: #0c0f12;
+        border: 1px solid #20262c;
+        border-radius: 10px;
+        padding: 10px;
+        height: 38vh;
+        overflow-y: auto;
+        font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      .log-line {
+        margin: 0 0 2px;
+      }
+      .log-err {
+        color: #ff8a8a;
+      }
+      .log-rx {
+        color: #7ee787;
+      }
+      .log-sys {
+        color: #9aa7b3;
+      }
+      .pill {
+        display: inline-block;
+        font-size: 11px;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: #3a2; /* overwritten by JS */
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Portcode iOS iroh spike <span id="state" class="pill">idle</span></h1>
+
+    <label for="nodeId">Desktop endpoint id (from the desktop peer)</label>
+    <input
+      id="nodeId"
+      autocomplete="off"
+      autocapitalize="off"
+      autocorrect="off"
+      spellcheck="false"
+      placeholder="paste the endpoint id printed by echo-desktop"
+    />
+
+    <label for="relayUrl">Relay URL (n0 public relay)</label>
+    <input
+      id="relayUrl"
+      autocomplete="off"
+      autocapitalize="off"
+      autocorrect="off"
+      spellcheck="false"
+      value="https://relay.iroh.network./"
+    />
+
+    <button id="connectBtn">Connect</button>
+
+    <div class="row">
+      <input id="msg" value="hello from iOS" placeholder="message to echo" />
+      <button id="sendBtn" class="secondary" disabled style="flex: 0 0 90px">
+        Send
+      </button>
+    </div>
+
+    <div id="log" aria-live="polite"></div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
