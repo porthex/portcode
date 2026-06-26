@@ -34,7 +34,7 @@ use futures_util::future::{select, Either};
 use gloo_timers::future::TimeoutFuture;
 use iroh::endpoint::presets;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, RelayUrl};
+use iroh::{Endpoint, EndpointAddr};
 
 use crate::noise::{self, Handshake};
 use crate::pairing::PairingPayload;
@@ -222,13 +222,31 @@ async fn drive_xx_initiator(
     mut hs: Handshake,
     send: &mut SendStream,
     recv: &mut RecvStream,
+    dialing: &str,
 ) -> Result<(noise::Transport, String, Option<Vec<u8>>), String> {
-    let m1 = hs.write(&[])?; // -> e
-    write_framed(send, &m1).await?;
-    let m2 = read_framed(recv).await?; // <- e, ee, s, es
-    hs.read(&m2)?;
-    let m3 = hs.write(&[])?; // -> s, se
-    write_framed(send, &m3).await?;
+    let m1 = hs
+        .write(&[])
+        .map_err(|e| stage_err("handshake-write", dialing, &e))?; // -> e
+    write_framed(send, &m1)
+        .await
+        .map_err(|e| stage_err("handshake-write", dialing, &e))?;
+    // Reading m2 is two distinct failure modes the next on-device attempt must be
+    // able to tell apart: a TRANSPORT read (relay/stream torn — looks like the peer
+    // vanished) vs an AEAD DECRYPT of the responder's reply (the symptom of a
+    // prologue/nonce mismatch — H1 — or the desktop answering a different Noise
+    // pattern — H2). Label them separately so "decrypt error" vs "read error" is
+    // unambiguous in the surfaced message.
+    let m2 = read_framed(recv) // <- e, ee, s, es
+        .await
+        .map_err(|e| stage_err("handshake-read", dialing, &e.to_string()))?;
+    hs.read(&m2)
+        .map_err(|e| stage_err("handshake-decrypt", dialing, &e))?;
+    let m3 = hs
+        .write(&[])
+        .map_err(|e| stage_err("handshake-write", dialing, &e))?; // -> s, se
+    write_framed(send, &m3)
+        .await
+        .map_err(|e| stage_err("handshake-write", dialing, &e))?;
     let sas = hs.sas();
     let peer_static = hs.remote_static();
     let transport = hs.into_transport()?;
@@ -244,15 +262,48 @@ async fn drive_kk_initiator(
     mut hs: Handshake,
     send: &mut SendStream,
     recv: &mut RecvStream,
+    dialing: &str,
 ) -> Result<(noise::Transport, String, Option<Vec<u8>>), String> {
-    let m1 = hs.write(&[])?; // -> e, es, ss
-    write_framed(send, &m1).await?;
-    let m2 = read_framed(recv).await?; // <- e, ee, se
-    hs.read(&m2)?;
+    let m1 = hs
+        .write(&[])
+        .map_err(|e| stage_err("handshake-write", dialing, &e))?; // -> e, es, ss
+    write_framed(send, &m1)
+        .await
+        .map_err(|e| stage_err("handshake-write", dialing, &e))?;
+    // As in `drive_xx_initiator`: distinguish a transport read of m2 (relay/stream
+    // gone) from the AEAD decrypt of it (wrong pinned key, or the desktop ran a
+    // different Noise pattern — e.g. answered XX while we sent KK, the H2 gap).
+    let m2 = read_framed(recv) // <- e, ee, se
+        .await
+        .map_err(|e| stage_err("handshake-read", dialing, &e.to_string()))?;
+    hs.read(&m2)
+        .map_err(|e| stage_err("handshake-decrypt", dialing, &e))?;
     let sas = hs.sas();
     let peer_static = hs.remote_static();
     let transport = hs.into_transport()?;
     Ok((transport, sas, peer_static))
+}
+
+/// A compact, SECRET-FREE description of the dial target for diagnostics: the
+/// desktop's node id (a public identifier) and the relay URL(s) the address will
+/// ride. Never includes key/nonce material. Used to annotate every stage error so
+/// the next on-device attempt shows precisely which relay + node was in play.
+fn describe_dial(peer: &EndpointAddr) -> String {
+    let relays: Vec<String> = peer.relay_urls().map(|u| u.to_string()).collect();
+    let relay = if relays.is_empty() {
+        "no-relay".to_string()
+    } else {
+        relays.join(",")
+    };
+    // `EndpointId`'s Display is the public z-base-32 node id — safe to log.
+    format!("node={} relay={relay}", peer.id)
+}
+
+/// Tag an error with the failing STAGE and the (secret-free) dial description, so a
+/// surfaced PWA error reads e.g. `handshake-decrypt failed (node=… relay=…): …` —
+/// telling the next on-device attempt exactly where and against what it broke.
+fn stage_err(stage: &str, dialing: &str, e: &str) -> String {
+    format!("{stage} failed ({dialing}): {e}")
 }
 
 /// The browser transport. Holds the local Noise static private key the handshake
@@ -304,29 +355,36 @@ impl Transport for WasmTransport {
             .await
             .map_err(|e| e.to_string())?;
 
-        // Build the dialable address: the desktop's node identity from the QR,
-        // augmented with the relay URL the desktop advertised (or the documented
-        // n0 default). Adding the relay explicitly means we dial through the
-        // intended relay even if discovery is slow/unavailable.
-        let relay_url: RelayUrl = payload
-            .relay_url_or_default()
-            .parse()
-            .map_err(|e| format!("bad relay url: {e}"))?;
-        let peer: EndpointAddr = payload.node_addr.clone().with_relay_url(relay_url);
+        // Build the dialable address via the shared relay policy (H3 fix): only add
+        // the default/payload relay when the desktop's `node_addr` advertises none of
+        // its own, so we never duplicate/override the desktop's live home relay with
+        // a possibly-wrong hardcoded one. See `PairingPayload::dial_addr` for the full
+        // rationale and the unit tests that pin it.
+        let peer: EndpointAddr = payload.dial_addr()?;
+
+        // A compact, secret-free description of WHAT we are dialing, woven into every
+        // stage error below so the next on-device failure says exactly which relay +
+        // node id was in play. The node id is a public identifier (not a secret) and
+        // the relay url is public; no key/nonce material is ever included.
+        let dialing = describe_dial(&peer);
 
         // Every browser await below rides the relay WebSocket and can hang forever
         // (no UDP timeout to fall back on), so each is bounded by `CONNECT_TIMEOUT_MS`
         // — a stuck relay/offline peer becomes a clear `Err` the PWA retries on,
-        // never a frozen connect. Localized to this `connect` path only.
+        // never a frozen connect. Localized to this `connect` path only. Each stage
+        // is LABELLED ("dial" / "open-stream" / "handshake") so a surfaced error
+        // pinpoints where it broke for the next on-device attempt.
         let conn = with_connect_timeout("dial", async {
             endpoint
                 .connect(peer, ALPN)
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| format!("dial failed ({dialing}): {e}"))
         })
         .await?;
-        let (mut send, mut recv) = with_connect_timeout("open stream", async {
-            conn.open_bi().await.map_err(|e| e.to_string())
+        let (mut send, mut recv) = with_connect_timeout("open-stream", async {
+            conn.open_bi()
+                .await
+                .map_err(|e| format!("open-stream failed ({dialing}): {e}"))
         })
         .await?;
 
@@ -336,14 +394,22 @@ impl Transport for WasmTransport {
                 .decode(&payload.public_key)
                 .map_err(|e| format!("bad peer public key: {e}"))?;
             let hs = Handshake::kk_initiator(&self.local_noise_private, &remote_public)?;
-            with_connect_timeout("handshake", drive_kk_initiator(hs, &mut send, &mut recv)).await?
+            with_connect_timeout(
+                "handshake",
+                drive_kk_initiator(hs, &mut send, &mut recv, &dialing),
+            )
+            .await?
         } else {
             // XX first pairing: bind the QR nonce as the Noise prologue.
             let nonce = B64
                 .decode(&payload.nonce)
                 .map_err(|e| format!("bad pairing nonce: {e}"))?;
             let hs = Handshake::xx_initiator(&self.local_noise_private, &nonce)?;
-            with_connect_timeout("handshake", drive_xx_initiator(hs, &mut send, &mut recv)).await?
+            with_connect_timeout(
+                "handshake",
+                drive_xx_initiator(hs, &mut send, &mut recv, &dialing),
+            )
+            .await?
         };
 
         Ok(Paired {

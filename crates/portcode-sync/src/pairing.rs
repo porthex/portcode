@@ -85,6 +85,36 @@ impl PairingPayload {
     pub fn relay_url_or_default(&self) -> &str {
         self.relay_url.as_deref().unwrap_or(DEFAULT_RELAY_URL)
     }
+
+    /// Resolve the [`EndpointAddr`] the browser should actually dial, applying the
+    /// relay policy (H3): the desktop's `node_addr` (from its live `ep.addr()`)
+    /// already carries its REAL home relay as a `TransportAddr::Relay`. Because
+    /// [`EndpointAddr::with_relay_url`] *adds* to the address's relay set rather than
+    /// replacing it, blindly inserting [`DEFAULT_RELAY_URL`] (or the payload's
+    /// `relay_url`) would advertise a SECOND, possibly-wrong relay alongside the
+    /// desktop's actual one — which can route a relay-only browser dial to a relay
+    /// the desktop never registered with and time the attempt out.
+    ///
+    /// So we add a relay ONLY when `node_addr` advertises none of its own:
+    ///   * `node_addr` already has a relay → dial it AS-IS (trust the desktop's live
+    ///     home relay; never override or duplicate it).
+    ///   * `node_addr` has no relay → fall back to the payload's `relay_url`, else
+    ///     [`DEFAULT_RELAY_URL`], so a relay-only browser still has a path.
+    ///
+    /// Returns the dialable address, or an `Err` if the fallback relay URL can't be
+    /// parsed. Pure (no I/O) so it is unit-testable on every target.
+    pub fn dial_addr(&self) -> Result<EndpointAddr, String> {
+        let addr = self.node_addr.clone();
+        if addr.relay_urls().next().is_some() {
+            // The desktop advertised its own relay — dial exactly what it gave us.
+            return Ok(addr);
+        }
+        let relay_url: iroh::RelayUrl = self
+            .relay_url_or_default()
+            .parse()
+            .map_err(|e| format!("bad relay url: {e}"))?;
+        Ok(addr.with_relay_url(relay_url))
+    }
 }
 
 #[cfg(test)]
@@ -151,6 +181,49 @@ mod tests {
         let bare = PairingPayload::new(&[1], &[2], sample_addr());
         assert_eq!(bare.relay_url, None);
         assert_eq!(bare.relay_url_or_default(), DEFAULT_RELAY_URL);
+    }
+
+    // H3 — relay policy. The desktop's QR carries `node_addr = ep.addr()`, which
+    // already includes the desktop's REAL home relay. The browser must dial THAT
+    // relay, not duplicate/override it with the hardcoded default. `dial_addr` must
+    // therefore leave an address that already has a relay untouched.
+    #[test]
+    fn dial_addr_keeps_the_node_addrs_own_relay_and_does_not_add_the_default() {
+        let real_relay: iroh::RelayUrl = "https://relay.real-home.example./".parse().unwrap();
+        let addr = sample_addr().with_relay_url(real_relay.clone());
+        // Even with a DIFFERENT payload relay_url set, an address that already
+        // advertises its own relay is dialed as-is — we never override the live one.
+        let p = PairingPayload::new(&[1, 2, 3], &[4, 5, 6], addr.clone())
+            .with_relay_url("https://relay.iroh.network./");
+
+        let dial = p.dial_addr().unwrap();
+        let relays: Vec<_> = dial.relay_urls().cloned().collect();
+        assert_eq!(
+            relays,
+            vec![real_relay],
+            "an address with its own relay must be dialed unchanged — no default added, no override"
+        );
+        assert_eq!(dial.id, addr.id);
+    }
+
+    // When the desktop's `node_addr` carries NO relay (identity-only QR — e.g. the
+    // listener wasn't bound yet when the QR was built), the browser still needs a
+    // relay to ride, so `dial_addr` falls back: the payload's `relay_url` if set,
+    // else the documented n0 default.
+    #[test]
+    fn dial_addr_adds_a_fallback_relay_only_when_the_node_addr_has_none() {
+        // No relay anywhere → the n0 default is added so a relay-only browser can dial.
+        let bare = PairingPayload::new(&[1], &[2], sample_addr());
+        let dial = bare.dial_addr().unwrap();
+        let relays: Vec<String> = dial.relay_urls().map(|u| u.to_string()).collect();
+        assert_eq!(relays, vec![DEFAULT_RELAY_URL.to_string()]);
+
+        // No relay on the addr, but the payload pins one → that pinned relay is used.
+        let pinned = PairingPayload::new(&[1], &[2], sample_addr())
+            .with_relay_url("https://relay.example.com./");
+        let dial = pinned.dial_addr().unwrap();
+        let relays: Vec<String> = dial.relay_urls().map(|u| u.to_string()).collect();
+        assert_eq!(relays, vec!["https://relay.example.com./".to_string()]);
     }
 
     // Backward compatibility (the load-bearing constraint of work item 3): a QR

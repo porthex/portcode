@@ -411,6 +411,43 @@ mod tests {
         );
     }
 
+    // H2 — pattern mismatch. The desktop accept loop ONLY runs an XX responder
+    // (`transport_native::accept_and_pair` → `drive_xx(initiator=false)`); there is
+    // no KK responder in the accept path. So if the browser dials a KK initiator (a
+    // fast-reconnect, `reconnect=true`) the desktop answers with XX, and the two
+    // Noise patterns diverge from the very first message. This proves the gap at the
+    // crypto layer: a KK-initiator's m1 (`-> e, es, ss`) and an XX-responder cannot
+    // complete a handshake — the responder either rejects m1 outright or its m2
+    // fails to decrypt on the initiator. Either way the phone never gets a channel,
+    // which on-device surfaces as a handshake "decrypt" (responder answered) or
+    // "timeout" (responder rejected m1 and wrote nothing). Until a desktop KK
+    // responder exists, the browser must NOT send `reconnect=true` to it.
+    #[test]
+    fn kk_initiator_against_an_xx_responder_cannot_complete() {
+        let a = StaticKeypair::generate().unwrap();
+        let b = StaticKeypair::generate().unwrap();
+        // Browser dials KK (it has the desktop's pinned static); desktop answers XX.
+        let mut kk_ini = Handshake::kk_initiator(&a.private, &b.public).unwrap();
+        let mut xx_res = Handshake::xx_responder(&b.private, TEST_NONCE).unwrap();
+
+        // KK m1 carries `e, es, ss`; an XX responder reads it expecting only `e`.
+        let m1 = kk_ini.write(&[]).unwrap();
+        let res_read = xx_res.read(&m1);
+        // Drive the handshake as far as it will go and require it NOT to complete on
+        // both sides with an agreeing transport (the only "success" that would matter).
+        if res_read.is_ok() {
+            // The responder didn't reject m1 outright; then its XX m2 must fail to
+            // decrypt on the KK initiator (different pattern/state).
+            let m2 = xx_res.write(&[]).unwrap();
+            assert!(
+                kk_ini.read(&m2).is_err(),
+                "a KK initiator must not be able to complete against an XX responder"
+            );
+        }
+        // (If `res_read` was Err, the responder already rejected the mismatched m1 —
+        // the handshake is dead, which is the assertion.)
+    }
+
     #[test]
     fn sas_is_deterministic_and_grouped() {
         let a = StaticKeypair::generate().unwrap();
