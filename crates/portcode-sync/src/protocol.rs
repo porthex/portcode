@@ -53,21 +53,6 @@ pub enum RemoteCommand {
     Permission { id: String, decision: String },
     /// Open a new session — proxies to `create_session`.
     CreateSession { title: Option<String> },
-    /// Register (or replace) this device's Web Push subscription so the desktop can
-    /// send "permission needed" / "turn finished" pushes to the installed PWA
-    /// directly (IOS_WEB_CLIENT_PLAN §5.7/§9). Sent by the phone after the user
-    /// grants notification permission and `pushManager.subscribe(...)` resolves.
-    /// The three fields are exactly the `PushSubscription` keys the browser yields:
-    /// `endpoint` (the push-service URL the desktop POSTs the encrypted payload to)
-    /// and the `p256dh` + `auth` keys (base64url) used to encrypt it (RFC 8291).
-    /// The desktop only stores/uses this for a CONFIRMED-trusted device (the
-    /// existing device-trust gate), so an unconfirmed peer's subscription is ignored.
-    /// Wire form: `{ "cmd": "register_push", "endpoint": ..., "p256dh": ..., "auth": ... }`.
-    RegisterPush {
-        endpoint: String,
-        p256dh: String,
-        auth: String,
-    },
 }
 
 /// Everything that crosses the encrypted channel, in both directions.
@@ -209,24 +194,5 @@ mod tests {
         ] {
             round_trips(&SyncFrame::Command { command });
         }
-    }
-
-    // The RegisterPush wire contract (§5.7/§9) is shared with the browser/JS half:
-    // the phone sends `{ "cmd": "register_push", endpoint, p256dh, auth }`, which
-    // MUST deserialize into the new variant. Assert both the exact JSON the JS side
-    // emits decodes AND that the variant round-trips inside a Command frame.
-    #[test]
-    fn register_push_decodes_the_shared_js_wire_form_and_round_trips() {
-        let json = r#"{"cmd":"register_push","endpoint":"https://web.push.apple.com/abc","p256dh":"BPp256dhKey","auth":"AuthSecret"}"#;
-        let cmd: RemoteCommand = serde_json::from_str(json).expect("decode register_push");
-        assert!(matches!(
-            &cmd,
-            RemoteCommand::RegisterPush { endpoint, p256dh, auth }
-                if endpoint == "https://web.push.apple.com/abc"
-                    && p256dh == "BPp256dhKey"
-                    && auth == "AuthSecret"
-        ));
-        // And it survives the full SyncFrame::Command round-trip both ends rely on.
-        round_trips(&SyncFrame::Command { command: cmd });
     }
 }

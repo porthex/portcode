@@ -113,13 +113,6 @@ pub fn emit_event(app: &AppHandle, channel: &str, event: StreamEvent) {
     if let Some(hub) = app.try_state::<SyncHub>() {
         hub.publish(channel, event.clone());
     }
-    // Best-effort Web Push for the two re-engagement events (§5.7): a permission
-    // gate opening and a turn finishing. `notify_event` is a cheap no-op for every
-    // other event and for the no-subscription case, and it NEVER blocks (it spawns a
-    // detached task) — so this stays on the canonical emit chokepoint without
-    // slowing the agent loop. DESKTOP-ONLY: the phone never sends push.
-    #[cfg(desktop)]
-    crate::push::notify_event(app, &event);
     let _ = app.emit(channel, event);
 }
 
