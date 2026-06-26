@@ -41,16 +41,20 @@ ignore = [
 version = 2
 # Allow-list derived from the actual dependency tree, restricted to the Windows
 # (MSVC) graph that ships — every crate satisfies at least one of these via its
-# SPDX expression. The three non-obvious entries (Unicode-3.0, ISC, BSD-3-Clause)
-# are mandatory because they appear inside `AND` expressions, not just `OR`
-# alternatives. (CDLA-Permissive-2.0 exists only in non-Windows deps, so it is
-# intentionally omitted; add it back if a Windows-target dependency adopts it.)
+# SPDX expression. The non-obvious entries (Unicode-3.0, ISC, BSD-2-Clause,
+# BSD-3-Clause) are mandatory because they appear inside `AND` expressions, not
+# just `OR` alternatives. BSD-2-Clause (arrayref, spez, zerocopy) and
+# CDLA-Permissive-2.0 (webpki-roots — the rustls cert-root bundle) entered the
+# Windows graph with the iroh 1.0 TLS/QUIC transport (Phone Sync); both are
+# permissive and compatible with this Apache-2.0 project.
 allow = [
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
   "MIT",
   "ISC",
+  "BSD-2-Clause",
   "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
   "Unicode-3.0",
   "MPL-2.0",
   "Zlib",
@@ -61,8 +65,13 @@ confidence-threshold = 0.8
 # Duplicate transitive versions are unavoidable in a large Tauri tree (several
 # windows-sys majors, etc.); warn rather than fail so releases aren't blocked.
 multiple-versions = "warn"
-# The crate pins caret requirements ("2", "1") — never literal "*" wildcards.
+# Published deps pin caret requirements ("2", "1") — never literal "*" wildcards,
+# which stay denied. The one exception is WORKSPACE-INTERNAL path deps (e.g. the
+# desktop crate's `portcode-sync = { path = ... }`): a path-only dependency has no
+# version requirement, which cargo-deny reports as a wildcard. `allow-wildcard-paths`
+# permits that for private/path crates only — an unpinned crates.io dep still fails.
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 # Only crates.io is trusted. There are no git or alternate-registry dependencies

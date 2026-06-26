@@ -85,16 +85,18 @@ jobs:
 
       # ── Supply-chain gate (Phase 2 #2): licenses · advisories · bans · sources ─
       # Reads deny.toml at the repo root; fails fast before we spend build time.
-      - name: Supply-chain audit (cargo-deny)
-        uses: EmbarkStudios/cargo-deny-action@v2.0.20
+      #
+      # `EmbarkStudios/cargo-deny-action` is a Docker CONTAINER action and only runs
+      # on Linux runners — on this `windows-latest` job it fails immediately with
+      # "Container action is only supported on Linux", skipping the build. So we
+      # install the prebuilt, cross-platform cargo-deny CLI and invoke it directly.
+      # cargo-deny auto-discovers the root deny.toml from the working directory.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
         with:
-          manifest-path: src-tauri/Cargo.toml
-          command: check
-          # `arguments` are top-level flags (before the subcommand); `--config` is
-          # a `check` subcommand flag (after it) → command-arguments. Both verified
-          # against cargo-deny locally. The root deny.toml resolves from cwd.
-          arguments: "--all-features"
-          command-arguments: "--config deny.toml"
+          tool: cargo-deny
+      - name: Supply-chain audit (cargo-deny)
+        run: cargo deny --manifest-path src-tauri/Cargo.toml --all-features check
 
       # ── Build the NSIS installer (UNSIGNED) ───────────────────────────────────
       # createUpdaterArtifacts is NOT enabled, so this never needs a signing key
