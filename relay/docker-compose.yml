@@ -22,7 +22,10 @@ services:
     image: portcode-relay:1.0.0
     restart: always # always-on infra (§3)
     ports:
-      - "443:443/tcp" # WSS (relay-terminated TLS, Shape A)
+      # Public host :443 -> container :8443. The relay binds the UNPRIVILEGED 8443
+      # internally (non-root `relay` user can't bind <1024); the host publishes it
+      # as 443 so clients still connect to wss://relay.example.com (implicit :443).
+      - "443:8443/tcp" # WSS (relay-terminated TLS, Shape A)
       - "3478:3478/udp" # QUIC address discovery (native desktop leg)
     volumes:
       # Shape A only: mount your TLS cert + key and enable the [tls] block in

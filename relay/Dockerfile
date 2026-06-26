@@ -63,13 +63,14 @@ COPY relay.config.toml /etc/iroh-relay/relay.config.toml
 
 USER relay
 
-# The relay's WebSocket endpoint. In production iroh-relay terminates HTTPS/WSS
-# on 443 (see relay.config.toml). Hosts that terminate TLS at their own edge
-# (Fly/Render) map their public 443 -> this container's HTTP port; in that case
-# set `enable_quic_addr_discovery`/TLS off in the config and serve plain HTTP on
-# the internal port (see relay.config.toml comments). We also expose the UDP port
+# The relay's WebSocket endpoint. The container runs as the NON-ROOT `relay` user,
+# which cannot bind a privileged port (<1024) — so the relay listens on the
+# UNPRIVILEGED internal port 8443 (matches relay.config.toml `http_bind_addr`).
+# Hosts that terminate TLS at their own edge (Fly/Render) map their public 443
+# (wss) -> this container's 8443; a VPS doing Shape A (relay-terminated TLS) maps
+# host 443 -> 8443 too (see docker-compose.yml). We also expose the UDP port
 # iroh-relay uses for QUIC address discovery (the native-side relay leg).
-EXPOSE 443/tcp
+EXPOSE 8443/tcp
 EXPOSE 3478/udp
 
 # Liveness: confirm the pinned binary is present and runnable. iroh-relay also

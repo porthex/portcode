@@ -104,7 +104,10 @@ async function resumeReconnect(reason) {
   $("sendBtn").disabled = true;
   if (client) {
     try {
-      client.disconnect();
+      // AWAIT the teardown so the old Connection is fully dropped before we re-dial
+      // — otherwise the new connect could race the stale one (two live connections
+      // on resume). `disconnect()` now returns a Promise (see echo-web lib.rs).
+      await client.disconnect();
     } catch (_) {
       /* idempotent */
     }

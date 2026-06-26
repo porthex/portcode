@@ -113,10 +113,11 @@ export function createMockConnector(): WebSessionConnector {
       return {
         sas: "MOCK-SAS-1234",
         peerPublicKey: "MOCK_DESKTOP_KEY_BASE64==",
-        // A deterministic, well-formed base64url VAPID key so preview/tests can
-        // exercise the push-subscribe path (the desktop's real key is supplied by
-        // the wasm `Session` in the shipped client). The bytes are arbitrary.
-        vapidPublicKey: "MOCK_VAPID_PUBLIC_KEY_BASE64URL",
+        // No `vapidPublicKey`: a mock value decodes to the wrong byte length for a
+        // P-256 `applicationServerKey`, which would make `PushManager.subscribe`
+        // throw in any host that actually has push. Omitting it cleanly SKIPS the
+        // push-subscribe path (the desktop's real key is supplied by the wasm
+        // `Session` in the shipped client). See pushClient's `no-vapid-key` skip.
         async sendCommand(_cmd: RemoteCommand): Promise<void> {
           // no-op: the preview has no paired desktop to receive commands.
         },
@@ -172,6 +173,14 @@ export interface WasmSession {
   sendCommand(cmd: RemoteCommand): void | Promise<void>;
   /** Register the inbound-frame callback; Rust invokes it per `SyncFrame`. */
   onEvent(cb: (f: SyncFrame) => void): void;
+  /**
+   * OPTIONAL: register a callback fired when the wasm side observes the transport
+   * DROP on its own (relay/connection torn down), not just on a manual
+   * `disconnect()`. Older wasm builds may not provide it, so it is optional and
+   * guarded at the call site. When present, {@link adaptWasmSession} bridges it into
+   * the `onDisconnected` fanout so a spontaneous drop reaches the store.
+   */
+  onDisconnected?(cb: () => void): void;
   /** Tear down the session (drops the channel; ends the loops). */
   disconnect(): void | Promise<void>;
 }
@@ -224,6 +233,24 @@ function adaptWasmSession(ws: WasmSession): WebSession {
     for (const cb of frameCbs) cb(f);
   });
   let disconnected = false;
+  let toreDown = false;
+  // Notify every `onDisconnected` subscriber exactly once, then clear the
+  // registries. Shared by a spontaneous transport drop (the wasm `onDisconnected`
+  // bridge below) and a manual `disconnect()`, so whichever fires first wins and
+  // the other is a no-op.
+  function fanoutDisconnect(): void {
+    if (disconnected) return;
+    disconnected = true;
+    for (const cb of disconnectedCbs) cb();
+    frameCbs.clear();
+    disconnectedCbs.clear();
+  }
+  // Bridge a SPONTANEOUS transport drop (relay/connection torn down) into the
+  // fanout so the store learns the session died even without a manual disconnect.
+  // Guarded: older wasm builds don't expose `onDisconnected`.
+  ws.onDisconnected?.(() => {
+    fanoutDisconnect();
+  });
   return {
     sas: ws.sas,
     peerPublicKey: ws.peerPublicKey,
@@ -246,13 +273,14 @@ function adaptWasmSession(ws: WasmSession): WebSession {
       };
     },
     async disconnect(): Promise<void> {
-      // Idempotent: only tear down the wasm session + notify once.
-      if (disconnected) return;
-      disconnected = true;
+      // Tear down the wasm session at most once (a spontaneous drop fires the
+      // fanout but does NOT release the wasm handle, so a later manual disconnect
+      // still must). `fanoutDisconnect` is independently idempotent, so a drop that
+      // already notified makes this a notify no-op.
+      if (toreDown) return;
+      toreDown = true;
       await ws.disconnect();
-      for (const cb of disconnectedCbs) cb();
-      frameCbs.clear();
-      disconnectedCbs.clear();
+      fanoutDisconnect();
     },
   };
 }

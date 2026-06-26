@@ -681,9 +681,14 @@ fn start_listener(
         pending,
         oauth_refresh,
     };
-    let device_private = device.private_key().to_vec();
     let app_for_loop = app.clone();
 
+    // `device` (the long-term Noise identity) is MOVED into the task below (by the
+    // `async move`) and its private key is BORROWED at each `accept_and_pair` call —
+    // we never take a `.to_vec()` heap copy of the secret (which would linger
+    // un-zeroized in freed heap until reuse). `StaticKeypair` zeroizes its private
+    // half on drop, so the only copy lives for the task's lifetime and is wiped on
+    // exit.
     tauri::async_runtime::spawn(async move {
         // Build the endpoint INSIDE the task so it is owned here and outlives every
         // `accept_and_pair(&endpoint, …)` borrow below. RelayMode::Default = relay +
@@ -722,20 +727,21 @@ fn start_listener(
             // `accept_and_pair`, post-`accept`), so it captures the window open at
             // connect time — not a stale snapshot from while the loop was parked idle.
             let gate_for_nonce = pairing_gate.clone();
-            let paired = match sync::transport::accept_and_pair(&endpoint, &device_private, || {
-                gate_for_nonce.active_nonce().unwrap_or_default()
-            })
-            .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    if e == "endpoint closed" {
-                        return; // socket gone → stop listening
+            let paired =
+                match sync::transport::accept_and_pair(&endpoint, device.private_key(), || {
+                    gate_for_nonce.active_nonce().unwrap_or_default()
+                })
+                .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if e == "endpoint closed" {
+                            return; // socket gone → stop listening
+                        }
+                        eprintln!("phone-sync: pairing failed: {e}");
+                        continue; // a transient/rejected pairing must not kill the loop
                     }
-                    eprintln!("phone-sync: pairing failed: {e}");
-                    continue; // a transient/rejected pairing must not kill the loop
-                }
-            };
+                };
 
             // Hand off to a per-connection task so the accept loop is free to take
             // the next phone. `handler.clone()` is cheap (all Arc/AppHandle).

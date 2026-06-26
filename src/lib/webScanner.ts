@@ -75,7 +75,17 @@ export const defaultZxingLoader: ZxingLoader = () =>
 export function createZxingDecoder(load: ZxingLoader = defaultZxingLoader): QrDecoder {
   let modPromise: Promise<ZxingReaderModule> | null = null;
   return async (image: ImageData): Promise<string | null> => {
-    if (modPromise === null) modPromise = load();
+    if (modPromise === null) {
+      // Memoize the load — but if it REJECTS (transient network failure fetching
+      // the wasm chunk), clear the cache so the NEXT scan retries instead of being
+      // stuck on a permanently-rejected promise. Without this reset a single failed
+      // load would break scanning for the life of the decoder.
+      const pending = load();
+      pending.catch(() => {
+        if (modPromise === pending) modPromise = null;
+      });
+      modPromise = pending;
+    }
     const mod = await modPromise;
     const results = await mod.readBarcodes(image);
     const hit = results.find((r) => r.isValid && r.text.length > 0);

@@ -30,6 +30,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
+use futures_util::future::{select, Either};
+use gloo_timers::future::TimeoutFuture;
 use iroh::endpoint::presets;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, RelayUrl};
@@ -184,6 +186,34 @@ async fn read_framed(recv: &mut RecvStream) -> Result<Vec<u8>, RecvError> {
     Ok(payload)
 }
 
+/// How long (ms) the browser will wait for the dial + handshake to complete before
+/// giving up. In the browser everything rides a single relay WebSocket; if the relay
+/// is unreachable, the desktop is offline, or a packet is dropped mid-handshake, the
+/// underlying `connect`/`open_bi`/handshake-read futures can park FOREVER (there is
+/// no UDP timeout to fall back on). A bounded wait turns that hang into a clear `Err`
+/// the PWA can surface + retry. 20s is generous for a relay round-trip yet short
+/// enough that a stuck connect doesn't look like a frozen app.
+const CONNECT_TIMEOUT_MS: u32 = 20_000;
+
+/// Race `fut` against a `CONNECT_TIMEOUT_MS` timer (wasm-compatible — `gloo-timers`,
+/// not `tokio::time`, which has no `time` feature on the browser target). Returns the
+/// future's value on completion, or a clear timeout `Err` on expiry so the caller can
+/// retry instead of hanging forever. Used ONLY on the `connect` path's
+/// dial/handshake awaits.
+async fn with_connect_timeout<T, F>(what: &str, fut: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    let timeout = TimeoutFuture::new(CONNECT_TIMEOUT_MS);
+    futures_util::pin_mut!(fut);
+    match select(fut, timeout).await {
+        Either::Left((res, _)) => res,
+        Either::Right(((), _)) => Err(format!(
+            "{what} timed out after {CONNECT_TIMEOUT_MS}ms (relay unreachable or peer offline?)"
+        )),
+    }
+}
+
 /// Drive a 3-message XX handshake over the framed stream as the INITIATOR (the
 /// browser always dials, so it is always the initiator), capture the SAS + peer
 /// static key, and transition into transport mode. The exact initiator branch of
@@ -284,11 +314,21 @@ impl Transport for WasmTransport {
             .map_err(|e| format!("bad relay url: {e}"))?;
         let peer: EndpointAddr = payload.node_addr.clone().with_relay_url(relay_url);
 
-        let conn = endpoint
-            .connect(peer, ALPN)
-            .await
-            .map_err(|e| e.to_string())?;
-        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
+        // Every browser await below rides the relay WebSocket and can hang forever
+        // (no UDP timeout to fall back on), so each is bounded by `CONNECT_TIMEOUT_MS`
+        // — a stuck relay/offline peer becomes a clear `Err` the PWA retries on,
+        // never a frozen connect. Localized to this `connect` path only.
+        let conn = with_connect_timeout("dial", async {
+            endpoint
+                .connect(peer, ALPN)
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await?;
+        let (mut send, mut recv) = with_connect_timeout("open stream", async {
+            conn.open_bi().await.map_err(|e| e.to_string())
+        })
+        .await?;
 
         let (noise, sas, peer_static) = if reconnect {
             // KK reconnect: authenticate against the pinned desktop static key.
@@ -296,14 +336,14 @@ impl Transport for WasmTransport {
                 .decode(&payload.public_key)
                 .map_err(|e| format!("bad peer public key: {e}"))?;
             let hs = Handshake::kk_initiator(&self.local_noise_private, &remote_public)?;
-            drive_kk_initiator(hs, &mut send, &mut recv).await?
+            with_connect_timeout("handshake", drive_kk_initiator(hs, &mut send, &mut recv)).await?
         } else {
             // XX first pairing: bind the QR nonce as the Noise prologue.
             let nonce = B64
                 .decode(&payload.nonce)
                 .map_err(|e| format!("bad pairing nonce: {e}"))?;
             let hs = Handshake::xx_initiator(&self.local_noise_private, &nonce)?;
-            drive_xx_initiator(hs, &mut send, &mut recv).await?
+            with_connect_timeout("handshake", drive_xx_initiator(hs, &mut send, &mut recv)).await?
         };
 
         Ok(Paired {

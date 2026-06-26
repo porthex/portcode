@@ -57,16 +57,28 @@ pub struct Session {
     /// Send half of the secure channel. `None` after [`Session::disconnect`].
     sender: Rc<AsyncMutex<Option<ChannelSender>>>,
     /// The inbound-frame callback `(frame: SyncFrame) => void`, invoked per frame
-    /// by the `spawn_local` recv loop. Stored so [`Session::on_event`] can set it
-    /// after `connect` (the loop reads it each frame, so a late registration still
-    /// catches subsequent frames).
+    /// by the recv loop. Stored so [`Session::on_event`] can set it; the recv loop
+    /// is NOT spawned until this is set (so no early frame is dropped, see
+    /// [`Session::on_event`]).
     on_event: Rc<RefCell<Option<js_sys::Function>>>,
+    /// The split receive half, parked here until [`Session::on_event`] registers a
+    /// callback and starts the loop. `Some` until the loop is spawned (taken then),
+    /// so the recv loop never runs — and therefore never reads + drops a frame —
+    /// before a callback exists to deliver it to (§ early-frame fix).
+    receiver: Rc<RefCell<Option<ChannelReceiver>>>,
     /// Short Authentication String to compare out-of-band before trusting the
     /// session (§5.10). Surfaced via the `sas` getter.
     sas: String,
     /// The desktop's pinned Noise static public key (base64), to persist in
     /// IndexedDB for KK reconnects (§5.8). Surfaced via the `peerPublicKey` getter.
+    /// Always the QR-advertised key (validated against the live handshake), never an
+    /// empty fallback, so a later KK reconnect can't overwrite the pin with `""`.
     peer_public_key: String,
+    /// The phone's long-term Noise static PRIVATE key (base64). Persist after SAS
+    /// confirmation and pass back to [`Session::connect`] on reconnect so KK
+    /// authenticates as the SAME pinned phone (§5.8). Surfaced via the
+    /// `privateKey` getter.
+    private_key: String,
 }
 
 #[wasm_bindgen]
@@ -83,14 +95,30 @@ impl Session {
     /// holds the key to pin. After this, register [`Session::on_event`] to start
     /// receiving forwarded frames.
     #[wasm_bindgen]
-    pub async fn connect(qr: String, reconnect: bool) -> Result<Session, JsValue> {
+    pub async fn connect(
+        qr: String,
+        reconnect: bool,
+        private_key: Option<String>,
+    ) -> Result<Session, JsValue> {
         let payload: PairingPayload =
             serde_json::from_str(&qr).map_err(|e| js_err(&format!("bad QR payload: {e}")))?;
 
-        // The phone's long-term Noise identity. Generated fresh here for Phase 2;
-        // a later increment will load a persisted identity from IndexedDB so KK
-        // reconnects authenticate as the same pinned device.
-        let local = StaticKeypair::generate().map_err(|e| js_err(&e))?;
+        // The phone's long-term Noise identity. On a reconnect JS passes back the
+        // base64 private key persisted after the FIRST pairing, so KK authenticates
+        // as the SAME pinned phone (a fresh keypair would present a different static
+        // and fail the desktop's pin). On a first pairing none is supplied, so we
+        // generate one — and surface it via the `privateKey` getter for JS to
+        // persist alongside the pinned peer key (§5.8).
+        let local = match &private_key {
+            Some(b64) => {
+                let private = B64
+                    .decode(b64)
+                    .map_err(|e| js_err(&format!("bad private key: {e}")))?;
+                StaticKeypair::from_parts(Vec::new(), private)
+            }
+            None => StaticKeypair::generate().map_err(|e| js_err(&e))?,
+        };
+        let private_key_b64 = b64_encode(local.private_key());
         let transport = WasmTransport::new(local.private_key().to_vec());
 
         let paired = transport
@@ -98,30 +126,48 @@ impl Session {
             .await
             .map_err(|e| js_err(&e))?;
 
-        // base64-encode the pinned peer key (the desktop's Noise static) for JS to
-        // persist. `peer_static` is only `None` on a malformed handshake, which the
-        // transport would already have rejected — treat absence as empty.
-        let peer_public_key = paired
-            .peer_static
-            .as_deref()
-            .map(b64_encode)
-            .unwrap_or_default();
+        // The pinned key is ALWAYS the QR-advertised desktop static (`payload
+        // .public_key`), never a blind re-encode of the handshake `peer_static`
+        // (and never an empty fallback — that would let a later KK reconnect
+        // overwrite the pin with ""). On the XX first pairing we additionally
+        // VALIDATE that the live handshake authenticated the very key the QR
+        // advertised: decode `payload.public_key` and require the handshake's
+        // `peer_static` to match it byte-for-byte, so a MITM that completed a
+        // handshake as a different static can't be pinned. (On a KK reconnect the
+        // desktop static is an INPUT to the handshake — it already authenticated the
+        // pinned key — so there's nothing new to cross-check.)
+        let pinned = B64
+            .decode(&payload.public_key)
+            .map_err(|e| js_err(&format!("bad QR public key: {e}")))?;
+        if !reconnect {
+            let peer_static = paired.peer_static.as_deref().ok_or_else(|| {
+                js_err("handshake produced no peer static key (malformed handshake)")
+            })?;
+            if peer_static != pinned.as_slice() {
+                return Err(js_err(
+                    "handshake peer key does not match the scanned QR key (possible MITM)",
+                ));
+            }
+        }
+        let peer_public_key = payload.public_key.clone();
         let sas = paired.sas.clone();
 
         // Split: the recv half drives the inbound loop, the send half backs
         // `send_command`. They share the Noise transport via the channel's internal
-        // Arc<Mutex>; the send half also keeps the iroh connection alive.
+        // Arc<Mutex>; the send half also keeps the iroh connection alive. The recv
+        // half is PARKED (not yet looping) until `on_event` registers a callback —
+        // otherwise the loop would read + drop frames that arrive before JS wires up.
         let (sender, receiver) = paired.channel.split();
         let sender = Rc::new(AsyncMutex::new(Some(sender)));
         let on_event: Rc<RefCell<Option<js_sys::Function>>> = Rc::new(RefCell::new(None));
 
-        spawn_recv_loop(receiver, Rc::clone(&on_event));
-
         Ok(Session {
             sender,
             on_event,
+            receiver: Rc::new(RefCell::new(Some(receiver))),
             sas,
             peer_public_key,
+            private_key: private_key_b64,
         })
     }
 
@@ -151,12 +197,22 @@ impl Session {
     }
 
     /// Register the inbound-frame callback `(frame: SyncFrame) => void`. The recv
-    /// loop (spawned in `connect`) invokes it once per forwarded [`SyncFrame`], with
-    /// the frame converted to a native JS object via `serde-wasm-bindgen`. The store
-    /// wires this to `applyFrame`.
+    /// loop invokes it once per forwarded [`SyncFrame`], with the frame converted to
+    /// a native JS object via `serde-wasm-bindgen`. The store wires this to
+    /// `applyFrame`.
+    ///
+    /// The recv loop is started HERE, on the first registration — NOT in `connect`.
+    /// Starting it earlier would let it read + discard any frame the desktop sends
+    /// between `connect` resolving and JS wiring up `onEvent`. Parking the receiver
+    /// until a callback exists means the first frame is the first one delivered. A
+    /// later re-registration just swaps the callback (the loop reads `on_event` each
+    /// frame), so it never spawns a second loop.
     #[wasm_bindgen(js_name = onEvent)]
     pub fn on_event(&mut self, cb: js_sys::Function) {
         *self.on_event.borrow_mut() = Some(cb);
+        if let Some(receiver) = self.receiver.borrow_mut().take() {
+            spawn_recv_loop(receiver, Rc::clone(&self.on_event));
+        }
     }
 
     /// Tear down the session: drop the send half (which owns the iroh
@@ -164,6 +220,9 @@ impl Session {
     /// loop. Idempotent — safe to call on every `visibilitychange` (§5.8).
     #[wasm_bindgen]
     pub fn disconnect(&mut self) {
+        // Drop a still-parked receiver (the case where `onEvent` was never called,
+        // so no recv loop ever started) so the channel tears down fully.
+        let _ = self.receiver.borrow_mut().take();
         let sender = Rc::clone(&self.sender);
         spawn_local(async move {
             // Dropping the ChannelSender drops the Connection + Endpoint, which
@@ -185,6 +244,15 @@ impl Session {
     #[wasm_bindgen(getter, js_name = peerPublicKey)]
     pub fn peer_public_key(&self) -> String {
         self.peer_public_key.clone()
+    }
+
+    /// The phone's own long-term Noise static PRIVATE key (base64) — persist after
+    /// SAS confirmation and pass back as the third `connect` arg on reconnect so KK
+    /// authenticates as the SAME pinned phone (§5.8). NEVER log or expose it
+    /// elsewhere.
+    #[wasm_bindgen(getter, js_name = privateKey)]
+    pub fn private_key(&self) -> String {
+        self.private_key.clone()
     }
 }
 

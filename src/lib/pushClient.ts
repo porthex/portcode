@@ -209,17 +209,22 @@ export async function requestAndSubscribe(opts: RequestAndSubscribeOptions): Pro
   const vapid = opts.vapidPublicKey;
   if (!vapid) return { ok: false, reason: "no-vapid-key" };
 
-  // 4. Permission. If already granted we skip the prompt; if denied (now or
-  //    previously) we bail — never spam the prompt, the user said no.
-  let permission = notification.permission;
-  if (permission === "default") {
-    permission = await notification.requestPermission();
-  }
-  if (permission !== "granted") return { ok: false, reason: "permission-denied" };
-
-  // 5. Subscribe (idempotently). Reuse an existing subscription so a resume / repeat
-  //    call doesn't churn the push service or re-register a fresh endpoint.
+  // 4 + 5. Permission + subscribe, both inside the try so neither can throw past
+  //   this function. `requestPermission()` can reject in some hosts (e.g. when not
+  //   called from a user gesture); letting it throw would crash the best-effort
+  //   lifecycle caller, so a throw here folds into `subscribe-failed` like any other
+  //   push setup failure. A clean non-granted result still maps to
+  //   `permission-denied`. Subscribe is idempotent: reuse an existing subscription
+  //   so a resume / repeat call doesn't churn the push service.
   try {
+    // Permission. If already granted we skip the prompt; if denied (now or
+    // previously) we bail — never spam the prompt, the user said no.
+    let permission = notification.permission;
+    if (permission === "default") {
+      permission = await notification.requestPermission();
+    }
+    if (permission !== "granted") return { ok: false, reason: "permission-denied" };
+
     const registration = await sw.ready;
     const pm = registration.pushManager;
     const existing = await pm.getSubscription();

@@ -30,24 +30,26 @@
 #      the container. Serve plain HTTP on the internal port and LEAVE TLS OFF
 #      here. fly.toml / render.yaml below are wired for this shape (internal
 #      HTTP, edge TLS), which is the simplest path to a stable wss:// URL.
-[http_bind_addr]
-# Shape B (edge-terminated TLS): listen plaintext on the container's internal
-# port. Fly/Render route public :443 (wss) -> this.
-addr = "0.0.0.0:443"
+#
+# `http_bind_addr` is a SCALAR socket-address string (NOT a table). We bind the
+# UNPRIVILEGED internal port 8443 — the container runs as non-root `relay`, which
+# cannot bind <1024 (see Dockerfile). Fly/Render/compose map public :443 -> :8443.
+http_bind_addr = "0.0.0.0:8443"
 
-# Shape A (relay-terminated TLS): uncomment to have iroh-relay hold the cert.
+# Shape A (relay-terminated TLS): uncomment to have iroh-relay hold the cert. TLS
+# config stays under the `[tls]` table.
 # [tls]
 # cert_mode = "manual"        # or "lets_encrypt" for ACME
 # cert_path = "/etc/iroh-relay/cert.pem"
 # key_path  = "/etc/iroh-relay/key.pem"
-# https_bind_addr = "0.0.0.0:443"
+# https_bind_addr = "0.0.0.0:8443"
 
 # --- QUIC address discovery (the native desktop relay leg) -------------------
 # Lets native iroh nodes (the desktop) discover their reflexive address through
 # the relay. Browser clients don't use this (no UDP in the browser); the desktop
-# does. Bound to the UDP port the Dockerfile exposes.
-[quic]
-bind_addr = "0.0.0.0:3478"
+# does. This is a SCALAR boolean toggle (NOT a `[quic]` table); the discovery
+# listener uses the relay's QUIC port (the UDP port the Dockerfile exposes).
+enable_quic_addr_discovery = true
 
 # --- Limits ------------------------------------------------------------------
 # The relay carries a small CONTROL/MIRROR plane (command + frame traffic), not

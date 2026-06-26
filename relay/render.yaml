@@ -21,11 +21,16 @@ services:
     rootDir: relay
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    # Render maps its public 443 (wss) to this internal port. Matches
-    # relay.config.toml http_bind_addr and the Dockerfile EXPOSE.
+    # Render maps its public 443 (wss) to the container's internal port. That port
+    # is the UNPRIVILEGED 8443 (the non-root `relay` user can't bind <1024) —
+    # matches relay.config.toml http_bind_addr and the Dockerfile EXPOSE. Render
+    # detects the port from the Dockerfile EXPOSE; the explicit PORT env below
+    # pins it so a future EXPOSE change can't silently repoint the service.
     envVars:
       - key: IROH_VERSION
         value: "1.0.0" # lock-step with the workspace `iroh` version (see Dockerfile)
+      - key: PORT
+        value: "8443" # the relay's internal listen port (matches http_bind_addr)
     # Network health check: Render polls this path to decide the service is live.
     # iroh-relay answers a plaintext 200 on its HTTP probe path; adjust to the
     # probe your pinned iroh-relay exposes (`iroh-relay --help`).
