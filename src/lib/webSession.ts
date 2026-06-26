@@ -198,12 +198,28 @@ export interface WasmModule {
 export type WasmLoader = () => Promise<WasmModule>;
 
 /**
- * The default {@link WasmLoader}: a dynamic `import()` of the `portcode-wasm`
- * package. The specifier is held in a variable and the import is marked
- * `@vite-ignore` so neither Vite nor the TS resolver tries to statically resolve a
- * package that does not exist in this repo (it is produced by CI). When the
- * package is absent the returned promise rejects, which the connector catches to
- * fall back to the mock.
+ * The default {@link WasmLoader}: lazily loads the COMMITTED `portcode-wasm`
+ * browser artifact under `web/wasm/portcode-wasm/` (built by `wasm-pack --target
+ * web` and checked in — Vercel has no Rust, so the wasm must be prebuilt; see that
+ * dir's README and the `wasm` CI freshness job).
+ *
+ * It does two lazy things on the FIRST `connect`:
+ *   1. dynamic-`import()`s the wasm-bindgen glue module (`portcode_wasm.js`) so the
+ *      PWA shell paints before the multi-MB wasm chunk loads (§5.6), and
+ *   2. calls the glue's default `init(wasmUrl)`, passing the `_bg.wasm` URL resolved
+ *      through Vite's `?url` import so the fetch points at the content-hashed asset
+ *      the web build emits into `web-dist/assets/` (rather than the glue's own
+ *      `import.meta.url`-relative guess, which would not survive bundling).
+ *
+ * After `init()` resolves, the module's `Session` class is live; we return it as the
+ * {@link WasmModule}. Any failure (artifact missing, init throws) rejects the
+ * promise, which {@link createWasmConnector} catches to fall back to the mock so a
+ * broken/absent wasm never bricks the PWA.
+ *
+ * The `?url` import is a tiny string and the glue `import()` is lazy, so neither the
+ * 4 MB wasm nor the glue lands in the main chunk. We avoid `vite-plugin-top-level-await`
+ * (it hard-requires rollup, absent under Vite 8's rolldown bundler): the lazy
+ * dynamic-import path keeps each top-level await inside its own async chunk.
  *
  * SUBRESOURCE INTEGRITY (§5.10/§6): the wasm is delivered as a dynamically
  * `import()`ed ES module, and the SRI `integrity` attribute only applies to
@@ -216,9 +232,17 @@ export type WasmLoader = () => Promise<WasmModule>;
  * rel="modulepreload" integrity=...>` once the CI wasm artifact is wired (Phase 6).
  */
 /* c8 ignore start -- exercised only in a real browser; tests inject a fake loader. */
-export const defaultWasmLoader: WasmLoader = () => {
-  const spec = "portcode-wasm";
-  return import(/* @vite-ignore */ spec) as Promise<WasmModule>;
+export const defaultWasmLoader: WasmLoader = async () => {
+  // Resolve the wasm binary URL through Vite (`?url` → the emitted, content-hashed
+  // asset path) and lazily import the glue module. Both specifiers are static so the
+  // bundler can rewrite them, but the glue import stays dynamic so the heavy chunk is
+  // only fetched on the first connect.
+  const [{ default: init, Session }, { default: wasmUrl }] = await Promise.all([
+    import("../../web/wasm/portcode-wasm/portcode_wasm.js"),
+    import("../../web/wasm/portcode-wasm/portcode_wasm_bg.wasm?url"),
+  ]);
+  await init(wasmUrl);
+  return { Session } as unknown as WasmModule;
 };
 /* c8 ignore stop */
 
