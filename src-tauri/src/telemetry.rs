@@ -16,13 +16,21 @@
 // ── PHASE 2 — CROSS-PROCESS CONSENT (the central correctness fix) ───────────────
 // The minidump monitor (`sentry_rust_minidump::init`) re-execs THIS binary as a
 // separate "crash-reporter" process that waits for a native crash. That process has
-// its OWN address space, so an in-memory `CONSENT_LIVE` atomic set by the IPC in the
-// MAIN process is invisible to it. Consent therefore lives ON DISK: `consent_is_live`
-// reads `<app_config_dir>/.telemetry_consent` (content "1" = on; absent/anything else
-// = off, fail-safe). BOTH processes run `before_send` → `scrub_event` →
-// `consent_is_live`, so a crash event the monitor captures is dropped exactly when the
-// user hasn't opted in — and flows when they have, with no IPC to the child. The
-// atomic is kept as a fast write-through hint, but the FILE is authoritative.
+// its OWN address space, so an in-memory consent flag set by the IPC in the MAIN
+// process would be invisible to it. Consent therefore lives ON DISK:
+// `consent::consent_is_live` reads `<app_config_dir>/.telemetry_consent` (content "1"
+// = on; absent/anything else = off, fail-safe). BOTH processes run `before_send` →
+// `scrub_event` → `consent_is_live`, so a crash event the monitor captures is dropped
+// exactly when the user hasn't opted in — and flows when they have, with no IPC to
+// the child. The FILE is the single source of truth.
+//
+// ── PHASE 3 — SHARED CONSENT MODULE ─────────────────────────────────────────────
+// The consent-file primitive (`set_consent`/`consent_is_live`/path resolution) was
+// EXTRACTED to `crate::consent`, a NON-cfg-gated module that also compiles for
+// Android — because the phone's `telemetry_set_consent` command must write the same
+// flag the Android `PortcodeApplication` reads before it ever calls
+// `SentryAndroid.init`. This `#[cfg(desktop)]` module just re-uses it. See
+// `consent.rs` for the desktop-vs-mobile path agreement.
 //
 // This also fixes 1b's startup-capture gap: the client is now bound at startup (see
 // `init_desktop_with_minidump`) and gated by the on-disk file, so a user who opted in
@@ -45,29 +53,16 @@
 // transaction hook (or we adopt manual `Transaction` capture) the scrubber is ready
 // to wire in — but it is intentionally not referenced by `init` today.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use sentry::protocol::{Context, Event, Frame};
 
+// Consent-file helpers now live in the cross-target `crate::consent` module (so the
+// Android `telemetry_set_consent` command can write the same flag the Kotlin
+// `PortcodeApplication` reads). The desktop pipeline keeps using them exactly as
+// before — only the home of the primitive moved. See `consent.rs`.
+use crate::consent::{consent_is_live, set_consent};
 use crate::scrub::redact_secrets;
-
-/// This app's bundle identifier — kept in lockstep with `tauri.conf.json`'s
-/// `identifier`. Hardcoded so the consent-file path resolves WITHOUT a Tauri
-/// `AppHandle`: `init_desktop_with_minidump` runs before the builder AND in the
-/// re-exec'd crash-reporter process, neither of which has access to managed state.
-const BUNDLE_IDENTIFIER: &str = "dev.porthex.portcode";
-
-/// Name of the on-disk consent flag inside `<app_config_dir>`. Dotfile so it reads
-/// as internal state, not a user document.
-const CONSENT_FILE: &str = ".telemetry_consent";
-
-/// A fast write-through hint mirroring the on-disk consent for the MAIN process. The
-/// FILE (`consent_is_live`) is authoritative — it is what the separate crash-reporter
-/// process reads — but checking the atomic first avoids a filesystem stat on every
-/// captured event in the common (main-process) path.
-static CONSENT_LIVE: AtomicBool = AtomicBool::new(false);
 
 /// Build-time DSN, or `None` when absent/blank (dev/contributor/fork builds).
 /// `option_env!` evaluates at COMPILE time: with no `SENTRY_DSN` in the build
@@ -77,78 +72,6 @@ pub fn dsn() -> Option<&'static str> {
     match option_env!("SENTRY_DSN") {
         Some(d) if !d.trim().is_empty() => Some(d),
         _ => None,
-    }
-}
-
-// Test-only per-thread override for the consent-file path. `cargo test` runs tests in
-// parallel threads that all share this module's statics, so a THREAD-LOCAL (not a
-// global) lets each test drive its OWN on-disk consent at a unique temp path —
-// isolated, race-free, and without ever touching the user's real config dir. In
-// production this hook does not exist; `consent_path` resolves the real path.
-#[cfg(test)]
-thread_local! {
-    static CONSENT_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Absolute path of the consent file: `<app_config_dir>/.telemetry_consent`, where
-/// `<app_config_dir>` reproduces Tauri's own `app_config_dir()` =
-/// `dirs::config_dir().join(<identifier>)`. Returns `None` only if the platform has
-/// no config dir (then consent reads as off — fail safe).
-fn consent_path() -> Option<PathBuf> {
-    #[cfg(test)]
-    {
-        if let Some(p) = CONSENT_PATH_OVERRIDE.with(|c| c.borrow().clone()) {
-            return Some(p);
-        }
-    }
-    Some(
-        dirs::config_dir()?
-            .join(BUNDLE_IDENTIFIER)
-            .join(CONSENT_FILE),
-    )
-}
-
-/// The AUTHORITATIVE consent check, readable from BOTH the main and crash-reporter
-/// processes. Reads the on-disk flag: `"1"` (trimmed) ⇒ live; absent, unreadable, or
-/// any other content ⇒ off. Fails safe to OFF on every error path, so a missing dir,
-/// an IO error, or a partially-written file can never cause an event to be sent.
-fn consent_is_live() -> bool {
-    match consent_path() {
-        Some(p) => matches!(std::fs::read_to_string(&p), Ok(s) if s.trim() == "1"),
-        None => false,
-    }
-}
-
-/// The single entry point the IPC command (`telemetry_set_consent`) calls when the
-/// frontend's consent toggle changes. Writes the AUTHORITATIVE on-disk flag (so the
-/// separate crash-reporter process sees the change) and updates the fast in-memory
-/// hint. It does NOT init/close the SDK: the client is bound once at startup
-/// (`init_desktop_with_minidump`, DSN-gated), and `before_send` → `consent_is_live`
-/// gates sending — so opt-out is instant + total and opt-in is just a flag flip.
-///
-///  * `true`  → write `"1"` to the consent file.
-///  * `false` → remove the file (best-effort; a leftover-then-removed file would
-///    still read as off, but removing keeps no stale "1" around).
-///
-/// Best-effort IO: errors are swallowed. The fail-safe is OFF, so a failed write on
-/// opt-IN simply means nothing is sent (never the reverse) — the privacy-safe
-/// direction.
-pub fn set_consent(enabled: bool) {
-    CONSENT_LIVE.store(enabled, Ordering::SeqCst);
-    let Some(path) = consent_path() else { return };
-    if enabled {
-        // Ensure the parent dir exists (it normally does — settings/db live there).
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&path, "1");
-    } else {
-        // Removing is enough; if removal fails the leftover content is "1", so as a
-        // belt-and-suspenders also try to overwrite with "0" (read as off).
-        if std::fs::remove_file(&path).is_err() {
-            let _ = std::fs::write(&path, "0");
-        }
     }
 }
 
@@ -474,11 +397,14 @@ mod tests {
 
     // The scrubber is the privacy gate for Rust-host crash reporting — these tests
     // are the SHARED CONTRACT that secrets NEVER survive into an outgoing event,
-    // mirroring `src/lib/scrub.test.ts`. The gate now reads an on-disk file
-    // (`consent_is_live`) so the separate crash-reporter process can honor it, so the
-    // helper points this thread's `consent_path` at a UNIQUE temp file and writes the
+    // mirroring `src/lib/scrub.test.ts`. The gate reads an on-disk file
+    // (`crate::consent::consent_is_live`) so the separate crash-reporter process can
+    // honor it, so the helper points this thread's desktop `consent_path` at a UNIQUE
+    // temp file (via the consent module's test-only override) and `set_consent`s the
     // requested state there. Thread-local override = no races with parallel tests and
-    // no touching the user's real config dir. The temp file is removed on exit.
+    // no touching the user's real config dir. The temp file is removed on exit. The
+    // consent-FILE mechanics themselves (absent ⇒ off, write/clear, parent-dir
+    // creation) are unit-tested in `consent.rs`; here we only exercise the GATE.
     fn with_consent<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -486,78 +412,21 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        std::fs::write(&path, if enabled { "1" } else { "0" }).expect("write consent flag");
-        CONSENT_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(path.clone()));
-        // Keep the atomic in sync too, so a test that asserts via either path agrees.
-        CONSENT_LIVE.store(enabled, Ordering::SeqCst);
+        crate::consent::test_set_consent_path_override(Some(path.clone()));
+        // Drive the on-disk flag through the real writer so the gate sees it.
+        set_consent(enabled);
 
         let out = f();
 
-        CONSENT_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
-        CONSENT_LIVE.store(false, Ordering::SeqCst);
+        crate::consent::test_set_consent_path_override(None);
         let _ = std::fs::remove_file(&path);
         out
-    }
-
-    // Point this thread's consent_path at a temp file WITHOUT pre-writing it, so
-    // `set_consent`/`consent_is_live` can be exercised against a clean slate. Returns
-    // the path; the caller removes it. Resets the override on the next `reset_*`.
-    fn temp_consent_path() -> PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "portcode-test-setconsent-{}-{:?}.flag",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_file(&path); // clean slate
-        CONSENT_PATH_OVERRIDE.with(|c| *c.borrow_mut() = Some(path.clone()));
-        path
-    }
-
-    fn clear_consent_override(path: &std::path::Path) {
-        CONSENT_PATH_OVERRIDE.with(|c| *c.borrow_mut() = None);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn dsn_is_none_in_dev_builds() {
         // No SENTRY_DSN is set in the test build, so the whole pipeline is inert.
         assert!(dsn().is_none());
-    }
-
-    #[test]
-    fn consent_is_off_when_file_absent() {
-        // The fail-safe: no file ⇒ off. (Clean-slate temp path, never written.)
-        let path = temp_consent_path();
-        assert!(!consent_is_live());
-        clear_consent_override(&path);
-    }
-
-    #[test]
-    fn consent_is_off_for_non_one_content() {
-        // Only the exact trimmed content "1" arms the gate; "0"/garbage ⇒ off.
-        let path = temp_consent_path();
-        std::fs::write(&path, "0").unwrap();
-        assert!(!consent_is_live());
-        std::fs::write(&path, "yes").unwrap();
-        assert!(!consent_is_live());
-        clear_consent_override(&path);
-    }
-
-    #[test]
-    fn set_consent_writes_then_removes_the_flag() {
-        // set_consent is the cross-process gate writer: "1" on opt-in (→ live),
-        // file gone on opt-out (→ off). This is what the crash-reporter child reads.
-        let path = temp_consent_path();
-        set_consent(true);
-        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "1");
-        assert!(consent_is_live());
-
-        set_consent(false);
-        assert!(!consent_is_live());
-        // Either removed, or overwritten to "0" — both read as off.
-        assert!(!path.exists() || std::fs::read_to_string(&path).unwrap().trim() != "1");
-        clear_consent_override(&path);
     }
 
     #[test]

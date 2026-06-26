@@ -5,6 +5,11 @@
 // are the wire types the phone must decode — so gating `llm` would break mobile.
 #[cfg(desktop)]
 mod agent;
+// Cross-target crash-reporting consent flag (the on-disk opt-in). NOT cfg-gated: the
+// desktop `telemetry` module re-uses it AND the mobile `telemetry_set_consent`
+// command writes it (the Android `PortcodeApplication` reads the same flag before it
+// ever calls `SentryAndroid.init`). Compiles on every target. See `consent.rs`.
+mod consent;
 mod db;
 mod llm;
 #[cfg(desktop)]
@@ -348,17 +353,48 @@ fn resolve_permission(state: State<AppState>, id: String, decision: String) {
     permissions::resolve(&state.pending, &id, d);
 }
 
-// ── Opt-in crash reporting (Phase 1b) ────────────────────────────────────────
+// ── Opt-in crash reporting (Phase 1b desktop / Phase 3 Android) ──────────────
 
-/// Mirror the frontend's crash-reporting consent into the Rust host. Desktop-only:
-/// the phone is a pure remote client and ships no host crash reporter. The whole
-/// pipeline is inert without a build-time `SENTRY_DSN`, so this is a no-op on
-/// dev/contributor/fork builds (and the frontend swallows the error on builds where
-/// the command isn't registered). See `telemetry::set_consent`.
-#[cfg(desktop)]
+/// Mirror the frontend's crash-reporting consent into the native host, on BOTH
+/// desktop and mobile. The frontend calls `ipc.setTelemetryConsent` on every Tauri
+/// build, so this command is now registered on both targets (Phase 3).
+///
+/// It only ever WRITES the on-disk consent flag — it never inits/closes any SDK:
+///  * DESKTOP — `telemetry::set_consent` writes `<app_config_dir>/.telemetry_consent`
+///    (the flag the main process AND the re-exec'd crash-reporter child both read in
+///    `before_send`). Inert without a build-time `SENTRY_DSN`.
+///  * ANDROID — resolves the app-private config dir from the `AppHandle`
+///    (`app_config_dir()`, inside the OS sandbox — the same dir `secrets::init_dir`
+///    uses) and writes the SAME flag via `consent::set_consent_in`. The Kotlin
+///    `PortcodeApplication` reads it on next launch and refuses to init the Sentry
+///    SDK unless it is `"1"` (AND a DSN was baked in). Writing the flag NEVER arms
+///    anything by itself — the SDK is only ever initialized at process start, behind
+///    both the DSN gate and this flag, so opting in mid-session takes effect on the
+///    next launch (matching the desktop startup-bind model).
+///
+/// The whole pipeline stays inert by default: no DSN ⇒ the SDK is never initialized
+/// on either platform, so this command is a pure flag write with no telemetry effect.
 #[tauri::command]
-fn telemetry_set_consent(enabled: bool) {
-    telemetry::set_consent(enabled);
+fn telemetry_set_consent(app: AppHandle, enabled: bool) {
+    #[cfg(desktop)]
+    {
+        let _ = &app; // desktop resolves the path without an AppHandle
+        telemetry::set_consent(enabled);
+    }
+    #[cfg(mobile)]
+    {
+        // On Android `dirs::config_dir()` does NOT reliably point at the app sandbox,
+        // so resolve the app-private config dir from Tauri (it IS inside the sandbox)
+        // and write the flag there. Falls back to the temp dir if unavailable — a
+        // best-effort write whose failure mode is the privacy-safe one (flag absent ⇒
+        // Kotlin reads consent OFF ⇒ SDK never inits). See `consent.rs` /
+        // `PortcodeApplication.kt` for the exact path agreement + device-verify note.
+        let dir = app
+            .path()
+            .app_config_dir()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        consent::set_consent_in(&dir, enabled);
+    }
 }
 
 // ── Phone Sync (Phase 1b: identity + pairing surface) ────────────────────────
@@ -915,6 +951,7 @@ pub fn run() {
         rename_session,
         delete_session,
         get_messages,
+        telemetry_set_consent,
         phone_sync_status,
         phone_sync_unpair,
         phone_sync_connect,
