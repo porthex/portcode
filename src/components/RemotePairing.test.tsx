@@ -5,34 +5,57 @@ import { RemotePairing } from "./RemotePairing";
 import { useStore } from "../store/store";
 import * as ipc from "../lib/ipc";
 import * as scanner from "../lib/scanner";
+import * as webScanner from "../lib/webScanner";
+import * as platform from "../lib/platform";
 import type { ConnectInfo, SyncFrame } from "../types";
 
 // RemotePairing is the remote-mode pair/safety flow (design_handoff_mobile_remote).
 // It reads remote state from the real store and drives it through connectRemote /
-// confirmRemoteSas / disconnectRemote / reconnectRemote. We mock the IPC layer and
-// the camera scanner (TDD London style) so connect resolves a deterministic SAS
-// without a real desktop, and a scan resolves a payload without a real camera; then
-// we assert on observable DOM + store state.
+// confirmRemoteSas / disconnectRemote / reconnectRemote. We mock the IPC layer,
+// the native camera scanner, the browser (webScanner) path, and the platform sniff
+// (TDD London style) so connect resolves a deterministic SAS without a real
+// desktop, and a scan resolves a payload without a real camera; then we assert on
+// observable DOM + store state.
+//
+// Scan backend selection (detectScanMode in the component):
+//   - native: isTauri() && isMobilePlatform()
+//   - web:    isWebCameraAvailable()
+//   - none:   neither (paste only)
 vi.mock("../lib/ipc", () => ({
   phoneSyncConnect: vi.fn(),
   phoneSyncSendCommand: vi.fn(),
   phoneSyncDisconnect: vi.fn(),
   onPhoneSyncFrame: vi.fn(),
   onPhoneSyncDisconnected: vi.fn(),
+  isTauri: vi.fn(),
 }));
 vi.mock("../lib/scanner", () => ({
   isScannerAvailable: vi.fn(),
   scanQrPayload: vi.fn(),
   cancelScan: vi.fn(),
 }));
+vi.mock("../lib/webScanner", () => ({
+  isWebCameraAvailable: vi.fn(),
+  scanWithCamera: vi.fn(),
+  scanFromFile: vi.fn(),
+  // A sentinel decoder object: the component passes it straight to the (mocked)
+  // scan functions, so its identity is all that matters — never invoked here.
+  defaultQrDecoder: vi.fn(),
+}));
+vi.mock("../lib/platform", () => ({
+  isMobilePlatform: vi.fn(),
+}));
 
 const m = vi.mocked(ipc);
 const s = vi.mocked(scanner);
+const w = vi.mocked(webScanner);
+const p = vi.mocked(platform);
 const initial = useStore.getState();
 
 const codeBox = () => screen.getByLabelText("Pairing code") as HTMLTextAreaElement;
 const connectBtn = () => screen.getByRole("button", { name: "Connect" });
 const scanBtn = () => screen.getByRole("button", { name: "Scan QR code" });
+const uploadBtn = () => screen.getByRole("button", { name: /Upload a photo of the QR/ });
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -45,9 +68,12 @@ beforeEach(() => {
   m.phoneSyncDisconnect.mockResolvedValue(undefined);
   m.onPhoneSyncFrame.mockResolvedValue(() => {});
   m.onPhoneSyncDisconnected.mockResolvedValue(() => {});
-  // Default to the non-phone host (preview/desktop): paste only, no camera button.
+  // Default to the non-phone, non-camera host (preview/desktop): paste only.
+  m.isTauri.mockReturnValue(false);
+  p.isMobilePlatform.mockReturnValue(false);
   s.isScannerAvailable.mockReturnValue(false);
   s.cancelScan.mockResolvedValue(undefined);
+  w.isWebCameraAvailable.mockReturnValue(false);
 });
 
 describe("RemotePairing — pair panel", () => {
@@ -59,6 +85,8 @@ describe("RemotePairing — pair panel", () => {
     expect(codeBox()).toBeInTheDocument();
     // No camera scanner in the preview/desktop host — paste is the only path.
     expect(screen.queryByRole("button", { name: "Scan QR code" })).not.toBeInTheDocument();
+    // …and no upload affordance either (no camera backend at all).
+    expect(screen.queryByRole("button", { name: /Upload a photo/ })).not.toBeInTheDocument();
   });
 
   it("autofocuses the paste field on mount (no camera)", () => {
@@ -183,9 +211,11 @@ describe("RemotePairing — pair panel", () => {
   });
 });
 
-describe("RemotePairing — camera scan (phone)", () => {
+describe("RemotePairing — camera scan (native phone)", () => {
   beforeEach(() => {
-    s.isScannerAvailable.mockReturnValue(true);
+    // Native backend: Tauri + mobile.
+    m.isTauri.mockReturnValue(true);
+    p.isMobilePlatform.mockReturnValue(true);
   });
 
   it("offers an enabled camera viewport on the phone", () => {
@@ -210,6 +240,9 @@ describe("RemotePairing — camera scan (phone)", () => {
       await Promise.resolve();
     });
 
+    expect(s.scanQrPayload).toHaveBeenCalledTimes(1);
+    // Native path, never the web path.
+    expect(w.scanWithCamera).not.toHaveBeenCalled();
     expect(m.phoneSyncConnect).toHaveBeenCalledWith("{scanned}", false);
     expect(useStore.getState().remoteConnected).toBe(true);
     expect(useStore.getState().remoteSas).toBe("TANGO-42");
@@ -255,7 +288,7 @@ describe("RemotePairing — camera scan (phone)", () => {
     expect(m.phoneSyncConnect).not.toHaveBeenCalled();
   });
 
-  it("shows the scanning overlay while the camera is open and cancels it", async () => {
+  it("shows the scanning overlay while the camera is open and cancels it (native)", async () => {
     let release!: (o: scanner.ScanOutcome) => void;
     s.scanQrPayload.mockReturnValue(
       new Promise<scanner.ScanOutcome>((res) => {
@@ -272,6 +305,8 @@ describe("RemotePairing — camera scan (phone)", () => {
     // The viewport reports busy and the viewfinder overlay (portaled to body) is up.
     expect(scanBtn()).toHaveAttribute("aria-busy", "true");
     expect(screen.getByRole("dialog", { name: /Scanning for a pairing QR/ })).toBeInTheDocument();
+    // Native overlay carries no live <video> preview (camera is behind the webview).
+    expect(screen.queryByLabelText("Live camera preview")).not.toBeInTheDocument();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
@@ -320,6 +355,216 @@ describe("RemotePairing — camera scan (phone)", () => {
     const cancel = screen.getByRole("button", { name: "Cancel" });
     fireEvent.keyDown(dialog, { key: "Tab" });
     expect(cancel).toHaveFocus();
+  });
+});
+
+describe("RemotePairing — camera scan (web client)", () => {
+  beforeEach(() => {
+    // Web backend: not Tauri, but getUserMedia exists.
+    m.isTauri.mockReturnValue(false);
+    p.isMobilePlatform.mockReturnValue(false);
+    w.isWebCameraAvailable.mockReturnValue(true);
+  });
+
+  it("offers an enabled camera viewport on the web client", () => {
+    render(<RemotePairing />);
+    expect(scanBtn()).toBeEnabled();
+    // The idle viewport reads as "tap to open the camera", never a QR.
+    expect(screen.getByText("TAP TO SCAN")).toBeInTheDocument();
+  });
+
+  it("dials the scanned payload via the web scanner on a successful scan", async () => {
+    w.scanWithCamera.mockResolvedValue({ ok: true, value: "{web-scanned}" });
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(scanBtn());
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Routed through the WEB scanner with an AbortSignal + the default decoder.
+    expect(w.scanWithCamera).toHaveBeenCalledTimes(1);
+    const opts = w.scanWithCamera.mock.calls[0][0];
+    expect(opts.decode).toBe(webScanner.defaultQrDecoder);
+    expect(opts.signal).toBeInstanceOf(AbortSignal);
+    expect(typeof opts.deps?.makeVideo).toBe("function");
+    // …never the native path.
+    expect(s.scanQrPayload).not.toHaveBeenCalled();
+    expect(m.phoneSyncConnect).toHaveBeenCalledWith("{web-scanned}", false);
+    expect(useStore.getState().remoteConnected).toBe(true);
+    expect(useStore.getState().remoteSas).toBe("TANGO-42");
+  });
+
+  it("surfaces a denied web camera as an inline hint", async () => {
+    w.scanWithCamera.mockResolvedValue({ ok: false, reason: "denied" });
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(scanBtn());
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(/Camera access was denied/);
+    expect(useStore.getState().remoteConnected).toBe(false);
+    expect(m.phoneSyncConnect).not.toHaveBeenCalled();
+  });
+
+  it("surfaces an unexpected web scanner failure inline", async () => {
+    w.scanWithCamera.mockResolvedValue({ ok: false, reason: "error", message: "decode boom" });
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(scanBtn());
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent("decode boom");
+  });
+
+  it("shows the live <video> preview overlay and aborts the scan on Cancel", async () => {
+    let release!: (o: webScanner.WebScanOutcome) => void;
+    w.scanWithCamera.mockImplementation(
+      () =>
+        new Promise<webScanner.WebScanOutcome>((res) => {
+          release = res;
+        }),
+    );
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(scanBtn());
+      await Promise.resolve();
+    });
+
+    // The web overlay carries the live camera <video>.
+    expect(screen.getByLabelText("Live camera preview")).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: /Scanning for a pairing QR/ })).toBeInTheDocument();
+
+    const signal = w.scanWithCamera.mock.calls[0][0].signal!;
+    expect(signal.aborted).toBe(false);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      await Promise.resolve();
+    });
+    // Web Cancel aborts the loop (which releases the camera) — not the native cancel.
+    expect(signal.aborted).toBe(true);
+    expect(s.cancelScan).not.toHaveBeenCalled();
+
+    await act(async () => {
+      release({ ok: false, reason: "cancelled" });
+      await Promise.resolve();
+    });
+    expect(
+      screen.queryByRole("dialog", { name: /Scanning for a pairing QR/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("makeVideo binds the stream to the visible <video> and returns it", async () => {
+    let capturedMakeVideo!: (stream: MediaStream) => Promise<unknown>;
+    // Keep the scan pending so the overlay (and its <video>) stays mounted while we
+    // exercise the captured makeVideo seam.
+    w.scanWithCamera.mockImplementation((opts) => {
+      capturedMakeVideo = opts.deps!.makeVideo as typeof capturedMakeVideo;
+      return new Promise<webScanner.WebScanOutcome>(() => {});
+    });
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(scanBtn());
+      await Promise.resolve();
+    });
+
+    // Drive the injected seam with a fake stream while the overlay's <video> exists.
+    const play = vi
+      .spyOn(window.HTMLMediaElement.prototype, "play")
+      .mockResolvedValue(undefined as unknown as void);
+    const fakeStream = { id: "stream" } as unknown as MediaStream;
+    let result: unknown;
+    await act(async () => {
+      result = await capturedMakeVideo(fakeStream);
+    });
+
+    const video = screen.getByLabelText("Live camera preview") as HTMLVideoElement;
+    expect(result).toBe(video);
+    expect(video.srcObject).toBe(fakeStream);
+    expect(play).toHaveBeenCalled();
+    play.mockRestore();
+  });
+});
+
+describe("RemotePairing — photo-upload fallback (web client)", () => {
+  beforeEach(() => {
+    m.isTauri.mockReturnValue(false);
+    w.isWebCameraAvailable.mockReturnValue(true);
+  });
+
+  const fileInput = () => document.querySelector('input[type="file"]') as HTMLInputElement;
+  const photo = () => new File(["x"], "qr.png", { type: "image/png" });
+
+  it("offers the upload affordance and a hidden capture input", () => {
+    render(<RemotePairing />);
+    expect(uploadBtn()).toBeInTheDocument();
+    const input = fileInput();
+    expect(input).toBeInTheDocument();
+    expect(input.accept).toBe("image/*");
+    expect(input.getAttribute("capture")).toBe("environment");
+  });
+
+  it("decodes an uploaded photo and dials the payload", async () => {
+    w.scanFromFile.mockResolvedValue({ ok: true, value: "{from-photo}" });
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.change(fileInput(), { target: { files: [photo()] } });
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(w.scanFromFile).toHaveBeenCalledTimes(1);
+    expect(w.scanFromFile.mock.calls[0][1]).toBe(webScanner.defaultQrDecoder);
+    expect(m.phoneSyncConnect).toHaveBeenCalledWith("{from-photo}", false);
+    expect(useStore.getState().remoteConnected).toBe(true);
+  });
+
+  it("shows a gentle hint when the photo holds no QR (cancelled)", async () => {
+    w.scanFromFile.mockResolvedValue({ ok: false, reason: "cancelled" });
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.change(fileInput(), { target: { files: [photo()] } });
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(/No QR found in that photo/);
+    expect(m.phoneSyncConnect).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a decode error from the uploaded photo", async () => {
+    w.scanFromFile.mockResolvedValue({ ok: false, reason: "error", message: "bad image" });
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.change(fileInput(), { target: { files: [photo()] } });
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent("bad image");
+  });
+
+  it("ignores a change event with no file", async () => {
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.change(fileInput(), { target: { files: [] } });
+      await Promise.resolve();
+    });
+
+    expect(w.scanFromFile).not.toHaveBeenCalled();
   });
 });
 

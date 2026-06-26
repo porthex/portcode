@@ -1,21 +1,51 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useStore } from "../store/store";
-import { isScannerAvailable, scanQrPayload, cancelScan } from "../lib/scanner";
+import { scanQrPayload, cancelScan } from "../lib/scanner";
+import {
+  isWebCameraAvailable,
+  scanWithCamera,
+  scanFromFile,
+  defaultQrDecoder,
+  type WebScanOutcome,
+} from "../lib/webScanner";
+import { isTauri } from "../lib/ipc";
+import { isMobilePlatform } from "../lib/platform";
 
 // The remote-mode pairing flow, in the Neon-Noir mobile design language
 // (design_handoff_mobile_remote). Two full-screen states:
 //
 //   1. PAIR    — a camera viewport (corner brackets + sweeping scan line) is the
-//                primary affordance on the phone; tapping it opens the native
-//                scanner. A pasted QR payload is the fallback on every host.
+//                primary affordance on the phone; tapping it opens the scanner.
+//                A pasted QR payload is the fallback on every host.
 //   2. SAFETY  — once connected, the SAS is shown large for an out-of-band
 //                comparison (anti-MITM). Confirm hands off to the sessions list;
 //                Cancel tears the connection down.
 //
+// Two scan backends share one UX:
+//   - NATIVE (Tauri mobile): the `@tauri-apps/plugin-barcode-scanner` renders the
+//     camera preview BEHIND a transparented webview; the overlay paints only a
+//     viewfinder + Cancel (see `lib/scanner`).
+//   - WEB (the iOS-Safari web client): there is no native plugin, so we open the
+//     rear camera with `getUserMedia`, show a real on-screen `<video>` preview,
+//     and decode frames with the zxing-wasm `webScanner`. A photo-upload fallback
+//     covers locked-down devices where the live camera is denied/absent.
+//
 // The phone holds no keys and never touches files — it pairs, confirms the safety
 // code, then drives a desktop session. Wired entirely to the real store/socket
 // layer (connectRemote / confirmRemoteSas / disconnectRemote / reconnectRemote).
+
+/** Which camera backend (if any) this host can scan with. Native takes precedence
+ *  (Tauri mobile); otherwise the browser `getUserMedia` path; otherwise neither,
+ *  and the panel offers paste + photo-upload only. */
+type ScanMode = "native" | "web" | "none";
+
+function detectScanMode(): ScanMode {
+  if (isTauri() && isMobilePlatform()) return "native";
+  if (isWebCameraAvailable()) return "web";
+  return "none";
+}
+
 export function RemotePairing() {
   const connectRemote = useStore((s) => s.connectRemote);
   const remoteConnected = useStore((s) => s.remoteConnected);
@@ -24,6 +54,15 @@ export function RemotePairing() {
   const [connecting, setConnecting] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
+
+  // The visible camera preview for the WEB path. The native path renders the
+  // camera behind a transparented webview, so it needs no <video>; the web path
+  // feeds its stream into THIS element (via makeVideo) and reads frames off it.
+  const videoRef = useRef<HTMLVideoElement>(null);
+  // Aborts the in-flight web scan when the user taps Cancel / hits Escape.
+  const scanAbortRef = useRef<AbortController | null>(null);
+
+  const scanMode = detectScanMode();
 
   // Dial a payload. connectRemote never throws — it folds failures into
   // store.remoteError, which the pair panel surfaces inline. On success it flips
@@ -41,14 +80,10 @@ export function RemotePairing() {
 
   const connect = () => connectWith(qr);
 
-  // Scan the desktop's QR with the camera, then dial the decoded payload. The
-  // payload also lands in the field so a failed dial can be retried/edited.
-  const onScan = async () => {
-    if (scanning || connecting) return;
-    setScanError(null);
-    setScanning(true);
-    const outcome = await scanQrPayload();
-    setScanning(false);
+  // Map a failed scan outcome onto the inline UI, identically for both backends:
+  // denied/error surface a hint; cancelled/unavailable stay silent (the user
+  // backed out, or there is simply no live camera — paste/upload remain).
+  const handleScanOutcome = async (outcome: WebScanOutcome) => {
     if (outcome.ok) {
       setQr(outcome.value);
       await connectWith(outcome.value);
@@ -59,12 +94,81 @@ export function RemotePairing() {
     } else if (outcome.reason === "error") {
       setScanError(outcome.message || "Couldn’t start the camera. Paste the code below instead.");
     }
-    // "cancelled" / "unavailable": the user backed out — nothing to surface.
+    // "cancelled" / "unavailable": nothing to surface.
+  };
+
+  // Scan the desktop's QR with the camera, then dial the decoded payload. The
+  // payload also lands in the field so a failed dial can be retried/edited.
+  const onScan = async () => {
+    if (scanning || connecting || scanMode === "none") return;
+    setScanError(null);
+    setScanning(true);
+
+    if (scanMode === "native") {
+      const outcome = await scanQrPayload();
+      setScanning(false);
+      await handleScanOutcome(outcome);
+      return;
+    }
+
+    // WEB path: open the rear camera, feed its stream into the on-screen <video>
+    // preview, and poll frames via zxing-wasm. The AbortController lets Cancel /
+    // Escape stop the loop, which releases the camera.
+    const controller = new AbortController();
+    scanAbortRef.current = controller;
+    const outcome = await scanWithCamera({
+      decode: defaultQrDecoder,
+      signal: controller.signal,
+      deps: {
+        // Bind the live stream to the VISIBLE preview element (created by the web
+        // ScanOverlay) so the default captureFrame reads pixels off the same video
+        // the user sees. Muted + playsInline (set on the element) lets iOS Safari
+        // autoplay without a gesture.
+        makeVideo: async (stream) => {
+          const el = videoRef.current;
+          if (!el) return stream;
+          el.srcObject = stream;
+          try {
+            await el.play();
+          } catch {
+            // Autoplay can reject; frames simply stay null until it produces one.
+          }
+          return el;
+        },
+      },
+    });
+    scanAbortRef.current = null;
+    setScanning(false);
+    await handleScanOutcome(outcome);
   };
 
   const onCancelScan = async () => {
-    await cancelScan();
+    if (scanMode === "native") {
+      await cancelScan();
+    } else {
+      // WEB: abort the scan loop → scanWithCamera stops the stream tracks and
+      // releases the camera on its way out.
+      scanAbortRef.current?.abort();
+      scanAbortRef.current = null;
+    }
     setScanning(false);
+  };
+
+  // Decode a still photo of the QR (the locked-down-camera fallback). Surfaces a
+  // no-QR result as a gentle hint; success dials exactly like a live scan.
+  const onUploadPhoto = async (file: File) => {
+    if (connecting) return;
+    setScanError(null);
+    const outcome = await scanFromFile(file, defaultQrDecoder);
+    if (outcome.ok) {
+      setQr(outcome.value);
+      await connectWith(outcome.value);
+    } else if (outcome.reason === "error") {
+      setScanError(outcome.message || "Couldn’t read that photo. Paste the code below instead.");
+    } else {
+      // "cancelled" — the still image held no QR.
+      setScanError("No QR found in that photo. Try again, or paste the code below.");
+    }
   };
 
   return (
@@ -78,39 +182,53 @@ export function RemotePairing() {
           connect={connect}
           connecting={connecting}
           onScan={onScan}
+          onUploadPhoto={onUploadPhoto}
           scanning={scanning}
           scanError={scanError}
+          scanMode={scanMode}
         />
       )}
 
-      {/* The camera preview renders behind a transparented webview; this overlay
-          (outside the hidden app shell, via a body portal) is the only painted UI. */}
+      {/* The native camera renders behind a transparented webview, so its overlay
+          paints only chrome; the web overlay carries the live <video> preview. Both
+          live on a body portal so they sit outside the (possibly hidden) app shell. */}
       {scanning &&
-        createPortal(<ScanOverlay onCancel={() => void onCancelScan()} />, document.body)}
+        createPortal(
+          <ScanOverlay
+            mode={scanMode === "native" ? "native" : "web"}
+            videoRef={videoRef}
+            onCancel={() => void onCancelScan()}
+          />,
+          document.body,
+        )}
     </div>
   );
 }
 
-/** State 1 — PAIR. Camera viewport (scan) + paste-code fallback, then dial. */
+/** State 1 — PAIR. Camera viewport (scan) + paste-code/photo fallback, then dial. */
 function PairPanel({
   qr,
   setQr,
   connect,
   connecting,
   onScan,
+  onUploadPhoto,
   scanning,
   scanError,
+  scanMode,
 }: {
   qr: string;
   setQr: (v: string) => void;
   connect: () => void | Promise<void>;
   connecting: boolean;
   onScan: () => void | Promise<void>;
+  onUploadPhoto: (file: File) => void | Promise<void>;
   scanning: boolean;
   scanError: string | null;
+  scanMode: ScanMode;
 }) {
   const error = useStore((s) => s.remoteError);
-  const canScan = isScannerAvailable();
+  const canScan = scanMode !== "none";
   const canReconnect = useStore((s) => s.lastPairingQr !== null);
   const reconnectRemote = useStore((s) => s.reconnectRemote);
   const [reconnecting, setReconnecting] = useState(false);
@@ -122,6 +240,7 @@ function PairPanel({
   // if the panel happens to mount mid-flight.
   const scanRef = useRef<HTMLButtonElement>(null);
   const pasteRef = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
     if (canScan && !(scanning || connecting)) scanRef.current?.focus();
     else if (!connecting) pasteRef.current?.focus();
@@ -155,6 +274,14 @@ function PairPanel({
     }
   };
 
+  // The hidden file input drives the photo-upload fallback. Reset the value after
+  // a pick so choosing the SAME file twice still fires `change`.
+  const onPickPhoto = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (file) void onUploadPhoto(file);
+  };
+
   return (
     <div className="flex min-h-0 flex-1 flex-col px-[22px] pb-6 pt-[18px]">
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
@@ -173,7 +300,8 @@ function PairPanel({
           {canScan ? ", then scan the QR it shows." : "."}
         </p>
 
-        {/* camera viewport — the scan trigger on the phone, decorative otherwise */}
+        {/* camera viewport — the scan trigger when a camera is available, an
+            obviously-decorative "tap to scan" affordance otherwise */}
         {canScan ? (
           <button
             ref={scanRef}
@@ -184,14 +312,14 @@ function PairPanel({
             aria-busy={scanning}
             className="group relative mb-1 mt-5 aspect-square overflow-hidden rounded-[18px] border border-border bg-[linear-gradient(150deg,#080a11,#04050a)] shadow-[inset_0_0_60px_rgba(0,0,0,.6)] transition hover:border-accent-2/40 disabled:opacity-80"
           >
-            <Viewfinder showScanLine={!scanning && !connecting} />
+            <Viewfinder showScanLine={!scanning && !connecting} showHint />
           </button>
         ) : (
           <div
             aria-hidden="true"
             className="relative mb-1 mt-5 aspect-square overflow-hidden rounded-[18px] border border-border bg-[linear-gradient(150deg,#080a11,#04050a)] shadow-[inset_0_0_60px_rgba(0,0,0,.6)]"
           >
-            <Viewfinder showScanLine={!connecting} />
+            <Viewfinder showScanLine={!connecting} showHint={false} />
           </div>
         )}
 
@@ -206,6 +334,32 @@ function PairPanel({
                 ? "Point at the QR on your desktop"
                 : "Show the QR from your desktop"}
         </div>
+
+        {/* photo-upload fallback — for locked-down devices where the live camera is
+            denied/unavailable. A still photo of the QR is decoded the same way. */}
+        {canScan && (
+          <>
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              onChange={onPickPhoto}
+              disabled={connecting}
+              className="sr-only"
+              aria-hidden="true"
+              tabIndex={-1}
+            />
+            <button
+              type="button"
+              onClick={() => fileRef.current?.click()}
+              disabled={scanning || connecting}
+              className="mx-auto mt-2.5 inline-flex items-center gap-1.5 rounded-md border border-accent-2/25 bg-accent-2/[0.06] px-3 py-1.5 font-mono text-[10px] tracking-[1px] text-accent-2 transition hover:bg-accent-2/15 disabled:opacity-40"
+            >
+              <span aria-hidden="true">▣</span> Upload a photo of the QR
+            </button>
+          </>
+        )}
 
         {/* divider */}
         <div className="my-4 flex items-center gap-3 font-mono text-[10px] tracking-[2px] text-faint/70">
@@ -318,9 +472,12 @@ function PairPanel({
   );
 }
 
-/** The camera viewfinder: scan-texture, four corner brackets, a faint QR ghost,
- *  and (idle) a sweeping cyan scan line. Pure decoration — `aria-hidden`. */
-function Viewfinder({ showScanLine }: { showScanLine: boolean }) {
+/** The camera viewfinder: scan-texture, four corner brackets, and (idle) a
+ *  sweeping cyan scan line. When `showHint` is set it also paints a clearly
+ *  decorative camera/scan glyph + a "Tap to scan" label so the idle viewport
+ *  reads as "open the camera", never as a (broken) QR. Pure decoration —
+ *  `aria-hidden`. */
+function Viewfinder({ showScanLine, showHint }: { showScanLine: boolean; showHint: boolean }) {
   return (
     <span aria-hidden="true">
       <span className="absolute inset-0 [background:repeating-linear-gradient(115deg,rgba(33,230,255,.03)_0_2px,transparent_2px_9px)]" />
@@ -328,7 +485,7 @@ function Viewfinder({ showScanLine }: { showScanLine: boolean }) {
       <Bracket className="right-[26px] top-[26px] rounded-tr-[7px] border-r-[3px] border-t-[3px]" />
       <Bracket className="bottom-[26px] left-[26px] rounded-bl-[7px] border-b-[3px] border-l-[3px]" />
       <Bracket className="bottom-[26px] right-[26px] rounded-br-[7px] border-b-[3px] border-r-[3px]" />
-      <QrGhost />
+      {showHint && <ScanGlyph />}
       {showScanLine && (
         <span
           className="absolute left-[8%] right-[8%] h-0.5 bg-[linear-gradient(90deg,transparent,#21e6ff,transparent)] shadow-[0_0_14px_2px_rgba(33,230,255,.6)] motion-safe:animate-[pc-scan-v_2.4s_ease-in-out_infinite_alternate]"
@@ -347,18 +504,29 @@ function Bracket({ className }: { className: string }) {
   );
 }
 
-function QrGhost() {
+/** A plainly-decorative camera/scan glyph + "Tap to scan" — the idle affordance
+ *  in the live-camera viewport. Deliberately NOT a QR: it invites a tap to open
+ *  the camera rather than implying the phone is itself showing a code. */
+function ScanGlyph() {
   return (
-    <svg
-      className="absolute left-1/2 top-1/2 h-[46%] w-[46%] -translate-x-1/2 -translate-y-1/2 opacity-[0.16]"
-      viewBox="0 0 100 100"
-      fill="none"
-      aria-hidden="true"
-    >
-      <path d="M10 10h26v26H10zM64 10h26v26H64zM10 64h26v26H10z" stroke="#21e6ff" strokeWidth="5" />
-      <path d="M18 18h10v10H18zM72 18h10v10H72zM18 72h10v10H18z" fill="#21e6ff" />
-      <path d="M64 64h10v10H64zM80 64h10v10H80zM64 80h10v10H64zM80 80h10v10H80z" fill="#21e6ff" />
-    </svg>
+    <span className="absolute inset-0 flex flex-col items-center justify-center gap-2.5 text-accent-2">
+      <svg
+        className="h-[34%] w-[34%] opacity-80 [filter:drop-shadow(0_0_10px_rgba(33,230,255,.5))]"
+        viewBox="0 0 100 100"
+        fill="none"
+        stroke="#21e6ff"
+        strokeWidth="5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+      >
+        {/* camera body + lens — an unmistakable "open the camera" mark */}
+        <rect x="14" y="30" width="72" height="50" rx="9" />
+        <path d="M38 30l7-11h10l7 11" />
+        <circle cx="50" cy="55" r="13" />
+      </svg>
+      <span className="font-mono text-[11px] tracking-[2px] text-accent-2/90">TAP TO SCAN</span>
+    </span>
   );
 }
 
@@ -430,15 +598,30 @@ function SafetyPanel() {
   );
 }
 
-/** Full-screen overlay shown while the native camera is scanning. The page chrome
- *  goes transparent (see the `pc-scanning` class in index.css + lib/scanner) so the
- *  camera preview shows through; this paints only a viewfinder + a Cancel control.
+/** Full-screen overlay shown while the camera is scanning.
+ *
+ *  NATIVE mode: the native plugin renders the camera preview behind a
+ *  transparented webview (the `pc-scanning` class drops the app shell, see
+ *  index.css + lib/scanner); this paints only a viewfinder + Cancel ON TOP.
+ *
+ *  WEB mode: there is no camera-behind-webview, so this overlay itself renders the
+ *  live `<video>` preview (full-frame, object-cover) with the same viewfinder
+ *  chrome layered above it.
+ *
  *  Portaled to <body> so it sits outside the hidden app shell and stays visible. */
-function ScanOverlay({ onCancel }: { onCancel: () => void }) {
+function ScanOverlay({
+  mode,
+  videoRef,
+  onCancel,
+}: {
+  mode: "native" | "web";
+  videoRef: React.RefObject<HTMLVideoElement | null>;
+  onCancel: () => void;
+}) {
   const cancelRef = useRef<HTMLButtonElement>(null);
 
   // Give this aria-modal dialog the keyboard affordances every other overlay has.
-  // While scanning, `pc-scanning` sets `#root { visibility: hidden }`, dropping the
+  // In native mode `pc-scanning` sets `#root { visibility: hidden }`, dropping the
   // opener (the viewport button) out of the focus order — so without this,
   // activeElement is stranded on <body> with no keyboard path to Cancel.
   useEffect(() => {
@@ -459,7 +642,7 @@ function ScanOverlay({ onCancel }: { onCancel: () => void }) {
 
   return (
     <div
-      className="pc-scan-overlay"
+      className={mode === "web" ? "pc-scan-overlay pc-scan-overlay--web" : "pc-scan-overlay"}
       role="dialog"
       aria-modal="true"
       aria-label="Scanning for a pairing QR code"
@@ -470,6 +653,19 @@ function ScanOverlay({ onCancel }: { onCancel: () => void }) {
         }
       }}
     >
+      {/* Web: the live rear-camera preview fills the frame; the stream is bound to
+          this element by the parent's makeVideo seam, and the default captureFrame
+          reads pixels off it. Muted + playsInline so iOS Safari autoplays it. */}
+      {mode === "web" && (
+        <video
+          ref={videoRef}
+          className="pc-scan-video"
+          muted
+          playsInline
+          autoPlay
+          aria-label="Live camera preview"
+        />
+      )}
       <div className="pc-scan-frame" aria-hidden="true" />
       <p className="pc-scan-hint">Point your camera at the QR code on your desktop</p>
       <button ref={cancelRef} type="button" onClick={onCancel} className="pc-scan-cancel">
