@@ -35,6 +35,23 @@ pub struct DesktopCommandHandler {
     pub cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     pub pending: Pending,
     pub oauth_refresh: Arc<tokio::sync::Mutex<()>>,
+    /// The base64 Noise static public key of the device this handler is serving,
+    /// set per-connection by `serve_connection` AFTER the device-trust gate has
+    /// confirmed it. `None` on the shared template the listener clones (it never
+    /// dispatches commands itself). `RegisterPush` stores the phone's Web Push
+    /// subscription against this key — so a subscription can only ever be stored for
+    /// a confirmed device (the gate is what populates this), never an untrusted one.
+    pub device_key: Option<String>,
+}
+
+impl DesktopCommandHandler {
+    /// Return a per-connection clone bound to the confirmed device's key, so this
+    /// connection's `RegisterPush` persists the subscription against the right
+    /// device. Called by `serve_connection` once the trust gate has served the peer.
+    pub fn with_device_key(mut self, device_key: String) -> Self {
+        self.device_key = Some(device_key);
+        self
+    }
 }
 
 /// Map a phone-supplied permission decision string to a [`Decision`], validated
@@ -115,6 +132,30 @@ impl CommandHandler for DesktopCommandHandler {
                         db::now_ms(),
                     )
                     .map_err(|e| e.to_string())
+            }
+            // Persist this phone's Web Push subscription (§5.7/§9). The device-trust
+            // gate runs in `serve_connection` BEFORE any command reaches here, and it
+            // is what sets `self.device_key` — so a subscription is only ever stored
+            // for a CONFIRMED device. A handler with no `device_key` (the listener's
+            // shared template, which never dispatches) refuses to store anything,
+            // closing the "untrusted device registers a push subscription" hole.
+            RemoteCommand::RegisterPush {
+                endpoint,
+                p256dh,
+                auth,
+            } => {
+                let Some(device_key) = self.device_key.as_deref() else {
+                    eprintln!("phone-sync: RegisterPush with no confirmed device — ignoring");
+                    return Ok(());
+                };
+                crate::push::register_subscription(
+                    device_key,
+                    crate::secrets::PushSubscription {
+                        endpoint,
+                        p256dh,
+                        auth,
+                    },
+                )
             }
         }
     }
