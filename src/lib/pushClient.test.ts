@@ -185,6 +185,31 @@ describe("requestAndSubscribe — permission", () => {
     expect(res).toEqual({ ok: false, reason: "permission-denied" });
   });
 
+  it("folds a throwing requestPermission into 'subscribe-failed' (never throws)", async () => {
+    // Some hosts reject requestPermission() (e.g. when not called from a user
+    // gesture). Because the call is now inside the try/catch, the rejection must
+    // become a typed skip — not crash the best-effort lifecycle caller.
+    const subscribe = vi.fn();
+    const pm: PushManagerLike = { getSubscription: vi.fn(), subscribe };
+    const notification: NotificationApi = {
+      permission: "default",
+      requestPermission: vi.fn(async () => {
+        throw new Error("not allowed without a user gesture");
+      }),
+    };
+    const warn = vi.fn();
+    const res = await requestAndSubscribe({
+      vapidPublicKey: "aGVsbG8",
+      serviceWorker: fakeServiceWorker(pm),
+      notification,
+      isInstalled: () => true,
+      logger: { warn },
+    });
+    expect(res).toEqual({ ok: false, reason: "subscribe-failed" });
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalled();
+  });
+
   it("does NOT prompt when permission is already 'granted'", async () => {
     const sub = fakeSub("https://push.example/x", { p256dh: buf(9), auth: buf(8) });
     const pm: PushManagerLike = {

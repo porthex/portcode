@@ -34,6 +34,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # This job runs no git operations; don't leave the token in the checkout
+          # (matches the wasm/coverage jobs). Hardens against token exfiltration.
+          persist-credentials: false
 
       - name: Enable Corepack (pnpm)
         run: corepack enable
@@ -73,6 +77,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # This job runs no git operations; don't leave the token in the checkout
+          # (matches the wasm/coverage jobs). Hardens against token exfiltration.
+          persist-credentials: false
 
       # Tauri v2 links against GTK 3 and WebKitGTK 4.1 (NOT the 4.0 that Tauri
       # v1 used). These -dev packages must be present before any cargo command

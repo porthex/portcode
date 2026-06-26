@@ -408,4 +408,21 @@ describe("createZxingDecoder", () => {
     const out = await scanFromFile(fakeFile, decode, deps);
     expect(out).toEqual({ ok: true, value: "from-file" });
   });
+
+  it("retries the load after a rejection (does not cache the rejected promise)", async () => {
+    const readBarcodes = vi.fn().mockResolvedValue([{ isValid: true, text: "recovered" }]);
+    // First load() rejects (transient wasm-chunk fetch failure); the second succeeds.
+    const load = vi
+      .fn<() => Promise<ZxingReaderModule>>()
+      .mockRejectedValueOnce(new Error("network down"))
+      .mockResolvedValue({ readBarcodes });
+    const decode = createZxingDecoder(load);
+
+    // First decode propagates the load rejection…
+    await expect(decode(fakeImage)).rejects.toThrow("network down");
+    // …and a later scan RETRIES the load instead of being stuck on the rejected
+    // promise, so it recovers.
+    expect(await decode(fakeImage)).toBe("recovered");
+    expect(load).toHaveBeenCalledTimes(2);
+  });
 });

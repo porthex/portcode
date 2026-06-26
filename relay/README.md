@@ -127,7 +127,7 @@ When you bump `iroh` in the Rust workspace (e.g. to `1.1.0`):
 ```sh
 cd relay
 docker build --build-arg IROH_VERSION=1.0.0 -t portcode-relay:1.0.0 .
-docker run --rm -p 443:443 -p 3478:3478/udp portcode-relay:1.0.0
+docker run --rm -p 443:8443 -p 3478:3478/udp portcode-relay:1.0.0
 ```
 
 ### Fly.io

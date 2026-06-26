@@ -78,12 +78,15 @@ function createFakeConnector() {
 }
 
 describe("mock connector", () => {
-  it("connect returns the fixed ConnectInfo (incl. a mock VAPID key)", async () => {
+  it("connect returns the fixed ConnectInfo and omits the VAPID key", async () => {
     const conn = createMockConnector();
     const session = await conn.connect("ignored-qr", false);
     expect(session.sas).toBe("MOCK-SAS-1234");
     expect(session.peerPublicKey).toBe("MOCK_DESKTOP_KEY_BASE64==");
-    expect(session.vapidPublicKey).toBe("MOCK_VAPID_PUBLIC_KEY_BASE64URL");
+    // The mock advertises NO VAPID key: a fake value decodes to an invalid P-256
+    // applicationServerKey, so push-subscribe is skipped (no-vapid-key) instead of
+    // throwing. See createMockConnector + pushClient.
+    expect(session.vapidPublicKey).toBeUndefined();
   });
 
   it("sendCommand resolves to undefined", async () => {
@@ -129,12 +132,12 @@ describe("mock connector", () => {
 });
 
 describe("ipc-shaped wrappers (default mock connector)", () => {
-  it("webPhoneSyncConnect returns the mock ConnectInfo (with the VAPID key)", async () => {
+  it("webPhoneSyncConnect returns the mock ConnectInfo (no VAPID key)", async () => {
     const info: ConnectInfo = await webPhoneSyncConnect("qr");
     expect(info).toEqual({
       sas: "MOCK-SAS-1234",
       peerPublicKey: "MOCK_DESKTOP_KEY_BASE64==",
-      vapidPublicKey: "MOCK_VAPID_PUBLIC_KEY_BASE64URL",
+      vapidPublicKey: undefined,
     });
   });
 
@@ -247,9 +250,10 @@ describe("connector registry", () => {
 
 /** A fake `portcode-wasm` `Session` that records calls and lets the test drive the
  *  inbound-frame callback the way the network would. */
-function createFakeWasmSession() {
+function createFakeWasmSession(opts: { withOnDisconnected?: boolean } = {}) {
   const sent: RemoteCommand[] = [];
   let eventCb: ((f: SyncFrame) => void) | null = null;
+  let dropCb: (() => void) | null = null;
   const calls = { disconnect: 0 };
   const session: WasmSession = {
     sas: "WASM-SAS",
@@ -265,12 +269,23 @@ function createFakeWasmSession() {
       calls.disconnect += 1;
     },
   };
+  // Only newer wasm builds expose `onDisconnected`; the adapter must guard for its
+  // absence, so the fake exposes it only when asked.
+  if (opts.withOnDisconnected !== false) {
+    session.onDisconnected = (cb) => {
+      dropCb = cb;
+    };
+  }
   return {
     session,
     sent,
     calls,
     emit(f: SyncFrame) {
       eventCb?.(f);
+    },
+    /** Simulate a SPONTANEOUS transport drop the wasm side observed. */
+    emitDrop() {
+      dropCb?.();
     },
   };
 }
@@ -357,6 +372,41 @@ describe("createWasmConnector (real connector, faked wasm module)", () => {
     off();
     await session.disconnect();
     expect(onDisc).not.toHaveBeenCalled();
+  });
+
+  it("a SPONTANEOUS wasm transport drop fires onDisconnected (not just manual disconnect)", async () => {
+    const fake = createFakeWasmSession({ withOnDisconnected: true });
+    const connector = createWasmConnector(async () => ({
+      Session: { connect: async () => fake.session },
+    }));
+    const session = await connector.connect("qr", false);
+    const onDisc = vi.fn();
+    session.onDisconnected(onDisc);
+
+    // The wasm side observed the relay/connection drop on its own — no manual
+    // disconnect() call. The adapter must fan that out to the store.
+    fake.emitDrop();
+    expect(onDisc).toHaveBeenCalledTimes(1);
+
+    // A spontaneous drop does NOT release the wasm handle, so a later manual
+    // disconnect still tears it down — but the fanout is idempotent (no re-notify).
+    await session.disconnect();
+    expect(fake.calls.disconnect).toBe(1);
+    expect(onDisc).toHaveBeenCalledTimes(1);
+  });
+
+  it("tolerates a wasm Session WITHOUT onDisconnected (older build): disconnect still fans out", async () => {
+    const fake = createFakeWasmSession({ withOnDisconnected: false });
+    const connector = createWasmConnector(async () => ({
+      Session: { connect: async () => fake.session },
+    }));
+    const session = await connector.connect("qr", false);
+    const onDisc = vi.fn();
+    session.onDisconnected(onDisc);
+    // No spontaneous-drop bridge exists, but a manual disconnect still notifies.
+    await session.disconnect();
+    expect(fake.calls.disconnect).toBe(1);
+    expect(onDisc).toHaveBeenCalledTimes(1);
   });
 
   it("FALLS BACK to the mock connector when the wasm import fails (module absent)", async () => {

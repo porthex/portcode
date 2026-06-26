@@ -79,13 +79,18 @@ describe("webStorage (IndexedDB available)", () => {
     expect(await loadPinnedPeer()).toBeNull();
   });
 
-  /** Write a raw value under the pinned-peer key (bypassing savePinnedPeer's typing). */
+  /** Write a raw value under the pinned-peer key (bypassing savePinnedPeer's typing).
+   *  Settles on `tx.oncomplete`, but ALSO rejects on `open`/transaction errors and
+   *  `onblocked` so a storage failure fails the test fast instead of hanging the
+   *  promise forever. */
   async function putRaw(value: unknown): Promise<void> {
-    await new Promise<void>((resolve) => {
+    await new Promise<void>((resolve, reject) => {
       const open = indexedDB.open("portcode-sync", 1);
       open.onupgradeneeded = () => {
         open.result.createObjectStore("kv");
       };
+      open.onerror = () => reject(open.error ?? new Error("putRaw: open failed"));
+      open.onblocked = () => reject(new Error("putRaw: open blocked"));
       open.onsuccess = () => {
         const db = open.result;
         const tx = db.transaction("kv", "readwrite");
@@ -93,6 +98,10 @@ describe("webStorage (IndexedDB available)", () => {
         tx.oncomplete = () => {
           db.close();
           resolve();
+        };
+        tx.onerror = () => {
+          db.close();
+          reject(tx.error ?? new Error("putRaw: transaction failed"));
         };
       };
     });

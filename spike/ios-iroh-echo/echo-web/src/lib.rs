@@ -147,6 +147,17 @@ impl EchoClient {
                 return;
             };
             let bytes = text.into_bytes();
+            // Mirror the inbound `1 << 20` frame cap on the OUTBOUND side: reject an
+            // oversized frame BEFORE writing any bytes, so a too-large send can't put
+            // a length prefix the peer will reject mid-frame on the wire (which would
+            // desync the stream). Matches the read loop's `len > 1 << 20` guard.
+            if bytes.len() > 1 << 20 {
+                emit(
+                    &status,
+                    &format!("send: frame of {} bytes exceeds the 1 MiB cap", bytes.len()),
+                );
+                return;
+            }
             let len = (bytes.len() as u32).to_be_bytes();
             if let Err(e) = half.send.write_all(&len).await {
                 emit(&status, &format!("send error (len): {e}"));
@@ -162,20 +173,20 @@ impl EchoClient {
 
     /// Tear down the live channel. The endpoint is kept bound so a resume
     /// re-dial is fast. Idempotent — safe to call on every visibility change.
+    ///
+    /// AWAITABLE: `async`, so wasm-bindgen exposes it as a Promise that resolves
+    /// only AFTER both channel halves are dropped (the Connection torn down). The JS
+    /// `resumeReconnect` `await`s this before re-dialing, so the old connection is
+    /// fully gone before the new dial — no two-connections race on resume.
     #[wasm_bindgen]
-    pub fn disconnect(&self) {
-        let send_half = self.send_half.clone();
-        let recv_half = self.recv_half.clone();
-        let status = self.on_status.clone();
-        spawn_local(async move {
-            // Drop both halves. Dropping the send half drops the Connection, which
-            // also fails the read loop's next `read_exact` so it exits.
-            let dropped_send = send_half.lock().await.take().is_some();
-            recv_half.lock().await.take();
-            if dropped_send {
-                emit(&status, "disconnected (channel dropped)");
-            }
-        });
+    pub async fn disconnect(&self) {
+        // Drop both halves. Dropping the send half drops the Connection, which also
+        // fails the read loop's next `read_exact` so it exits.
+        let dropped_send = self.send_half.lock().await.take().is_some();
+        self.recv_half.lock().await.take();
+        if dropped_send {
+            emit(&self.on_status, "disconnected (channel dropped)");
+        }
     }
 
     fn spawn_read_loop(&self) {

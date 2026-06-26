@@ -23,8 +23,9 @@ IROH_VERSION = "1.0.0"
 
 [http_service]
 # The relay's internal plaintext HTTP/WebSocket port (matches relay.config.toml
-# http_bind_addr). Fly maps public 443 (wss) -> this with edge TLS.
-internal_port = 443
+# http_bind_addr and the Dockerfile EXPOSE). 8443 is unprivileged so the non-root
+# container user can bind it. Fly maps public 443 (wss) -> this with edge TLS.
+internal_port = 8443
 force_https = true                # redirect plaintext :80 -> :443 at the edge
 auto_stop_machines = "off"        # the relay is ALWAYS-ON infra (§3) — never idle-stop it
 auto_start_machines = true
