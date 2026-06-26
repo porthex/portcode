@@ -2132,4 +2132,191 @@ describe("remote client", () => {
       expect(useStore.getState().remoteChatOpen).toBe(false);
     });
   });
+
+  // ── Sessions sidebar organization (frontend-only overlay) ───────────────────
+  describe("sidebar organization", () => {
+    beforeEach(() => {
+      // These assert on the persisted slice, so isolate localStorage per test.
+      localStorage.clear();
+    });
+
+    it("setSortBy / setGroupBy update state and persist the choice", () => {
+      useStore.getState().setSortBy("name");
+      useStore.getState().setGroupBy("status");
+
+      expect(useStore.getState().sortBy).toBe("name");
+      expect(useStore.getState().groupBy).toBe("status");
+      expect(localStorage.getItem("pc.sortBy")).toBe("name");
+      expect(localStorage.getItem("pc.groupBy")).toBe("status");
+    });
+
+    it("addFolder appends an expanded 'New folder' and persists it", () => {
+      useStore.getState().addFolder();
+
+      const { folders } = useStore.getState();
+      expect(folders).toHaveLength(1);
+      expect(folders[0]).toMatchObject({ name: "New folder", open: true });
+      expect(typeof folders[0].id).toBe("string");
+      expect(JSON.parse(localStorage.getItem("pc.folders")!)).toHaveLength(1);
+    });
+
+    it("toggleFolder flips a folder's open flag", () => {
+      useStore.setState({ folders: [{ id: "f1", name: "Work", open: true }] });
+
+      useStore.getState().toggleFolder("f1");
+      expect(useStore.getState().folders[0].open).toBe(false);
+
+      useStore.getState().toggleFolder("f1");
+      expect(useStore.getState().folders[0].open).toBe(true);
+      // Untouched ids are left alone.
+      useStore.getState().toggleFolder("nope");
+      expect(useStore.getState().folders[0].open).toBe(true);
+    });
+
+    it("renameFolder trims a new name but ignores an empty/whitespace one", () => {
+      useStore.setState({ folders: [{ id: "f1", name: "Work", open: true }] });
+
+      useStore.getState().renameFolder("f1", "  Research  ");
+      expect(useStore.getState().folders[0].name).toBe("Research");
+
+      // A blank rename is a no-op so a folder can never lose its label.
+      useStore.getState().renameFolder("f1", "   ");
+      expect(useStore.getState().folders[0].name).toBe("Research");
+    });
+
+    it("deleteFolder removes the folder and orphans its members back to loose", () => {
+      useStore.setState({
+        folders: [
+          { id: "f1", name: "Work", open: true },
+          { id: "f2", name: "Personal", open: true },
+        ],
+        folderOf: { a: "f1", b: "f1", c: "f2" },
+      });
+
+      useStore.getState().deleteFolder("f1");
+
+      const st = useStore.getState();
+      expect(st.folders.map((f) => f.id)).toEqual(["f2"]);
+      // a + b drop their membership (back to loose); c (in f2) is untouched.
+      expect(st.folderOf).toEqual({ c: "f2" });
+      expect(JSON.parse(localStorage.getItem("pc.folderOf")!)).toEqual({ c: "f2" });
+    });
+
+    it("moveSessionToFolder sets membership, and null moves a chat back to loose", () => {
+      useStore.getState().moveSessionToFolder("a", "f1");
+      expect(useStore.getState().folderOf).toEqual({ a: "f1" });
+
+      useStore.getState().moveSessionToFolder("a", null);
+      expect(useStore.getState().folderOf).toEqual({});
+      expect(JSON.parse(localStorage.getItem("pc.folderOf")!)).toEqual({});
+    });
+
+    it("toggleArchived adds then removes a session id, persisting each time", () => {
+      useStore.getState().toggleArchived("a");
+      expect(useStore.getState().archivedIds).toEqual(["a"]);
+      expect(JSON.parse(localStorage.getItem("pc.archivedIds")!)).toEqual(["a"]);
+
+      useStore.getState().toggleArchived("a");
+      expect(useStore.getState().archivedIds).toEqual([]);
+    });
+
+    it("setSidebarCollapsed toggles the rail flag and persists it", () => {
+      useStore.getState().setSidebarCollapsed(true);
+      expect(useStore.getState().sidebarCollapsed).toBe(true);
+      expect(localStorage.getItem("pc.sidebarCollapsed")).toBe("1");
+
+      useStore.getState().setSidebarCollapsed(false);
+      expect(useStore.getState().sidebarCollapsed).toBe(false);
+      expect(localStorage.getItem("pc.sidebarCollapsed")).toBe("0");
+    });
+
+    it("setManualOrder records the order and flips sortBy to manual (sort off)", () => {
+      expect(useStore.getState().sortBy).toBe("recent");
+
+      useStore.getState().setManualOrder(["c", "a", "b"]);
+
+      const st = useStore.getState();
+      expect(st.manualOrder).toEqual(["c", "a", "b"]);
+      expect(st.sortBy).toBe("manual");
+      expect(JSON.parse(localStorage.getItem("pc.manualOrder")!)).toEqual(["c", "a", "b"]);
+      expect(localStorage.getItem("pc.sortBy")).toBe("manual");
+    });
+
+    it("deleteSession prunes the gone session's folder, archived, and manual-order entries", async () => {
+      useStore.setState({
+        sessions: [session({ id: "a" }), session({ id: "b" })],
+        activeId: "a",
+        messages: { a: [] },
+        folders: [{ id: "f1", name: "Work", open: true }],
+        folderOf: { b: "f1" },
+        archivedIds: ["b"],
+        manualOrder: ["a", "b"],
+      });
+
+      await useStore.getState().deleteSession("b");
+
+      const st = useStore.getState();
+      expect(st.sessions.map((s) => s.id)).toEqual(["a"]);
+      expect(st.folderOf).toEqual({});
+      expect(st.archivedIds).toEqual([]);
+      expect(st.manualOrder).toEqual(["a"]);
+      expect(JSON.parse(localStorage.getItem("pc.folderOf")!)).toEqual({});
+      expect(JSON.parse(localStorage.getItem("pc.archivedIds")!)).toEqual([]);
+      expect(JSON.parse(localStorage.getItem("pc.manualOrder")!)).toEqual(["a"]);
+    });
+
+    it("write actions stay resilient when localStorage throws", () => {
+      const spy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+        throw new Error("quota");
+      });
+
+      // The action must still update in-memory state even if persistence fails.
+      expect(() => useStore.getState().addFolder()).not.toThrow();
+      expect(useStore.getState().folders).toHaveLength(1);
+
+      spy.mockRestore();
+    });
+
+    it("hydrates the sidebar prefs from localStorage on init", async () => {
+      localStorage.setItem("pc.sortBy", "name");
+      localStorage.setItem("pc.groupBy", "status");
+      localStorage.setItem("pc.folders", JSON.stringify([{ id: "f1", name: "Work", open: false }]));
+      localStorage.setItem("pc.folderOf", JSON.stringify({ s1: "f1" }));
+      localStorage.setItem("pc.archivedIds", JSON.stringify(["s2"]));
+      localStorage.setItem("pc.manualOrder", JSON.stringify(["s3", "s1"]));
+      localStorage.setItem("pc.sidebarCollapsed", "1");
+
+      vi.resetModules();
+      const fresh = await import("./store");
+      const st = fresh.useStore.getState();
+
+      expect(st.sortBy).toBe("name");
+      expect(st.groupBy).toBe("status");
+      expect(st.folders).toEqual([{ id: "f1", name: "Work", open: false }]);
+      expect(st.folderOf).toEqual({ s1: "f1" });
+      expect(st.archivedIds).toEqual(["s2"]);
+      expect(st.manualOrder).toEqual(["s3", "s1"]);
+      expect(st.sidebarCollapsed).toBe(true);
+    });
+
+    it("falls back to defaults when localStorage throws on init read", async () => {
+      const spy = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+        throw new Error("blocked");
+      });
+
+      vi.resetModules();
+      const fresh = await import("./store");
+      const st = fresh.useStore.getState();
+
+      expect(st.sortBy).toBe("recent");
+      expect(st.groupBy).toBe("none");
+      expect(st.folders).toEqual([]);
+      expect(st.folderOf).toEqual({});
+      expect(st.archivedIds).toEqual([]);
+      expect(st.manualOrder).toEqual([]);
+      expect(st.sidebarCollapsed).toBe(false);
+
+      spy.mockRestore();
+    });
+  });
 });

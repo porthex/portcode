@@ -135,6 +135,15 @@ describe("FileExplorer empty state", () => {
 
     await waitFor(() => expect(m.openFolder).toHaveBeenCalledTimes(1));
   });
+
+  it("closes the explorer from its own × button (toggles filesOpen off)", () => {
+    useStore.setState({ showFiles: true });
+    render(<FileExplorer />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Close file explorer" }));
+
+    expect(useStore.getState().showFiles).toBe(false);
+  });
 });
 
 describe("FileExplorer tree", () => {

@@ -7,6 +7,7 @@ export function FileExplorer() {
   const workspace = useStore((s) => s.settings.workspace);
   const openWorkspace = useStore((s) => s.openWorkspace);
   const workspaceError = useStore((s) => s.workspaceError);
+  const toggleFiles = useStore((s) => s.toggleFiles);
   const [roots, setRoots] = useState<DirEntry[]>([]);
   // Roving-tabindex active row: the path of the single treeitem that holds
   // tabIndex 0. Null until the user focuses a row, so the first root keeps the
@@ -112,6 +113,16 @@ export function FileExplorer() {
           aria-label="Open folder"
         >
           OPEN…
+        </button>
+        {/* The explorer can now be dismissed from its own header, not just the
+            main-header folder toggle — both flip the same `filesOpen` flag. */}
+        <button
+          onClick={toggleFiles}
+          className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-faint transition-colors hover:bg-danger/10 hover:text-danger motion-reduce:transition-none"
+          title="Close file explorer"
+          aria-label="Close file explorer"
+        >
+          ✕
         </button>
       </div>
       {workspaceError && (

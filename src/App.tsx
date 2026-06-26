@@ -251,10 +251,10 @@ function TitleBar({ fileToggleRef }: { fileToggleRef?: React.Ref<HTMLButtonEleme
           aria-label="Toggle file explorer (Ctrl+B)"
           aria-pressed={showFiles}
           title="Toggle file explorer (Ctrl+B)"
-          className={`flex h-[30px] w-[30px] items-center justify-center rounded-[7px] border transition-colors ${
+          className={`flex h-[30px] w-[30px] items-center justify-center rounded-[7px] border transition-[background-color,border-color,box-shadow,color] duration-150 motion-reduce:transition-none ${
             showFiles
-              ? "border-accent-2/30 bg-accent-2/10 text-accent-2"
-              : "border-transparent text-muted hover:text-accent-2"
+              ? "border-accent-2/50 bg-accent-2/12 text-accent-2 shadow-[0_0_14px_rgba(33,230,255,0.25)]"
+              : "border-border-2 bg-panel-2/60 text-muted hover:border-accent-2/30 hover:text-accent-2"
           }`}
         >
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none">

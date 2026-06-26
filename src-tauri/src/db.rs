@@ -31,6 +31,36 @@ pub fn now_ms() -> i64 {
 // verbatim); `content` is the typed block list (same shape as `ChatMessage::content`).
 pub use portcode_sync::wire::{MessageRow, SessionRow};
 
+/// Best-effort current git branch of a session's `workspace`, read directly from
+/// `.git/HEAD` — no `git` subprocess and no extra dependency. Returns the short
+/// branch name, or `None` when there's no workspace, it isn't a git repo, or HEAD
+/// is detached (a raw commit SHA). Linked worktrees/submodules store `.git` as a
+/// file pointing at the real gitdir, which we follow.
+fn git_branch(workspace: Option<&str>) -> Option<String> {
+    let ws = workspace?;
+    let dot_git = Path::new(ws).join(".git");
+    let head_path = if dot_git.is_dir() {
+        dot_git.join("HEAD")
+    } else if dot_git.is_file() {
+        // `.git` is a file: `gitdir: <path>` (absolute, or relative to the ws).
+        let contents = std::fs::read_to_string(&dot_git).ok()?;
+        let gitdir = Path::new(contents.strip_prefix("gitdir:")?.trim());
+        let resolved = if gitdir.is_absolute() {
+            gitdir.to_path_buf()
+        } else {
+            Path::new(ws).join(gitdir)
+        };
+        resolved.join("HEAD")
+    } else {
+        return None;
+    };
+    let head = std::fs::read_to_string(head_path).ok()?;
+    // "ref: refs/heads/<name>" → <name>; a bare SHA means a detached HEAD.
+    head.trim()
+        .strip_prefix("ref: refs/heads/")
+        .map(String::from)
+}
+
 /// A phone paired for Phone Sync, keyed by its Curve25519 static public key
 /// (base64). `name` is a user-facing label; timestamps are unix millis.
 /// `confirmed` is the desktop-side trust gate: a device only graduates from
@@ -174,10 +204,12 @@ impl Db {
              FROM sessions ORDER BY updated_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
+            let workspace: Option<String> = r.get(2)?;
             Ok(SessionRow {
                 id: r.get(0)?,
                 title: r.get(1)?,
-                workspace: r.get(2)?,
+                branch: git_branch(workspace.as_deref()),
+                workspace,
                 created_at: r.get(3)?,
                 updated_at: r.get(4)?,
             })
@@ -553,6 +585,33 @@ mod tests {
         assert_eq!(rows[0].id, "b"); // newer updated_at first
         assert_eq!(rows[0].workspace.as_deref(), Some("C:/ws"));
         assert_eq!(rows[1].workspace, None);
+        // A non-existent workspace path resolves to no branch (not an error).
+        assert_eq!(rows[0].branch, None);
+    }
+
+    #[test]
+    fn git_branch_reads_head_ref_and_handles_detached() {
+        // A repo whose HEAD points at a branch resolves to that branch name.
+        let dir = std::env::temp_dir().join(format!("pc_branch_{}", now_ms()));
+        let git = dir.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+        let ws = dir.to_str().unwrap();
+        assert_eq!(git_branch(Some(ws)).as_deref(), Some("feature/x"));
+
+        // A detached HEAD (a raw commit SHA) has no branch.
+        std::fs::write(
+            git.join("HEAD"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
+        assert_eq!(git_branch(Some(ws)), None);
+
+        // No workspace, and a path that isn't a repo, both yield None.
+        assert_eq!(git_branch(None), None);
+        assert_eq!(git_branch(Some("/portcode/definitely/not/a/repo")), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
