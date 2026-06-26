@@ -18,3 +18,11 @@ When you add or change **frontend** code (`src/`):
 - If `test:coverage` reports a shortfall, cover the new lines rather than lowering the threshold.
 
 For the **Rust** core (`src-tauri/`): `cargo test` runs in CI on every PR; `cargo llvm-cov` coverage is computed on `main`/`release` only. The crate is too heavy to build on low-RAM dev machines — **verify Rust tests via CI**, not locally.
+
+## Project memory
+
+Durable, project-scoped knowledge lives in `.claude/memory/project-memory.md`. It is auto-loaded each session by the SessionStart hook and is meant to survive across sessions/devices (it's committed).
+
+- To record a new durable fact, run `/memory` (it distills + appends through the PII scrubber).
+- HARD RULE: never put personal data in project memory or any committed `.claude/` file — no emails, names, usernames, home paths, IPs, hostnames, tokens, or machine specifics. This repo is PUBLIC. A PreToolUse guard (`.claude/scripts/scrub-memory.mjs`) blocks commits that would add PII; treat it as a backstop, not permission to be careless.
+- Code-structure questions still go through graphify first (see the graphify section); project memory is for architecture decisions, conventions, gotchas, and active workstreams — not a duplicate of the graph.
