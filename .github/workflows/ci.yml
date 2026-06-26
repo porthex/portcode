@@ -237,6 +237,33 @@ jobs:
       - name: wasm-pack build the Session wrapper (interop surface)
         run: wasm-pack build --target web crates/portcode-wasm
 
+      # Freshness gate for the COMMITTED browser artifact (web/wasm/portcode-wasm/).
+      # Vercel has no Rust, so the wasm-bindgen output the PWA imports must be prebuilt
+      # and checked in (see that dir's README). Re-copy the just-built glue/types over
+      # the committed copy and fail if they drifted — i.e. someone changed the crate
+      # but forgot to refresh the committed artifact.
+      #
+      # We diff only the interop CONTRACT files (`.js` glue + `.d.ts` types): those are
+      # what the web bundle imports and must stay in lockstep with the Rust source. The
+      # `_bg.wasm` BINARY is intentionally NOT diffed — its bytes are not bit-for-bit
+      # reproducible across toolchain patch versions / build hosts, so a binary diff
+      # would flap on noise. (The binary is still rebuilt above, proving it compiles,
+      # and the .d.ts/.js contract changing is the real signal that it's stale.)
+      - name: Verify committed web/wasm artifact is fresh
+        run: |
+          cp crates/portcode-wasm/pkg/portcode_wasm.js \
+             crates/portcode-wasm/pkg/portcode_wasm.d.ts \
+             crates/portcode-wasm/pkg/portcode_wasm_bg.wasm.d.ts \
+             web/wasm/portcode-wasm/
+          if ! git diff --exit-code -- \
+              web/wasm/portcode-wasm/portcode_wasm.js \
+              web/wasm/portcode-wasm/portcode_wasm.d.ts \
+              web/wasm/portcode-wasm/portcode_wasm_bg.wasm.d.ts; then
+            echo "::error::web/wasm/portcode-wasm/ is stale — run 'wasm-pack build --target web crates/portcode-wasm' and copy the glue/types into web/wasm/portcode-wasm/ (see that dir's README), then commit."
+            exit 1
+          fi
+          echo "committed web/wasm artifact matches the rebuilt crate output — fresh."
+
   coverage:
     name: Coverage (frontend · main/release only)
     # Coverage is COUNTED only on the canonical branches — this job is gated to
