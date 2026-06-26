@@ -79,7 +79,7 @@ jobs:
           java-version: "17"
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       # compileSdk/targetSdk = 36 (src-tauri/gen/android/app/build.gradle.kts) and
       # the NDK the Rust cross-compile links against.
