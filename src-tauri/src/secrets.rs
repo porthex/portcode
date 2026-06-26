@@ -26,17 +26,6 @@ const ACCOUNT: &str = "anthropic";
 const OAUTH_ACCOUNT: &str = "anthropic-oauth";
 const DEVICE_ACCOUNT: &str = "phone-sync-device";
 const IROH_ACCOUNT: &str = "phone-sync-iroh";
-/// The Web Push VAPID **private** key (raw P-256 scalar, base64url-no-pad — the
-/// form `web_push::VapidSignatureBuilder::from_base64` expects). Stored exactly
-/// like the other key material (string in the OS credential store / app-private
-/// file); the PUBLIC key is *derived* from it and never persisted. NEVER logged,
-/// never committed (IOS_WEB_CLIENT_PLAN §9).
-const VAPID_ACCOUNT: &str = "phone-sync-vapid";
-/// The per-device Web Push subscription registry: a JSON map keyed by the device's
-/// base64 Noise static public key → its `PushSubscription` (`endpoint`/`p256dh`/
-/// `auth`). Not secret (the endpoint/keys are what the browser hands out), but kept
-/// in the same store so the desktop has one place for all phone-sync state.
-const PUSH_SUBS_ACCOUNT: &str = "phone-sync-push-subs";
 
 /// Directory for the (non-Windows) file secret store. Populated once by
 /// [`init_dir`]; resolved (with a temp fallback) by `secrets_dir`.
@@ -287,82 +276,6 @@ pub fn get_or_create_iroh_key() -> Result<iroh::SecretKey, String> {
     Ok(key)
 }
 
-// ── Web Push: VAPID key + per-device subscription store ──────────────────────
-
-/// A phone's Web Push subscription (`PushSubscription` from the browser), persisted
-/// per confirmed device so the desktop can send it pushes directly (§5.7/§9).
-/// `endpoint` is the push-service URL the desktop POSTs to; `p256dh` + `auth` are
-/// the base64url keys used to encrypt the payload (RFC 8291).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct PushSubscription {
-    pub endpoint: String,
-    pub p256dh: String,
-    pub auth: String,
-}
-
-/// Load the persisted Web Push VAPID private key (raw P-256 scalar, base64url-no-
-/// pad), generating + storing one on first run. The matching PUBLIC key is derived
-/// from this at the point of use (`web_push`'s `get_public_key`) and never stored,
-/// so this is the single secret behind the desktop's push identity.
-///
-/// Generated as 32 random bytes from the OS CSPRNG: any value in `[1, n)` is a
-/// valid P-256 scalar, and a uniformly random 32-byte value is < n (and non-zero)
-/// with overwhelming probability, so this is a valid VAPID key without pulling in a
-/// curve crate just to generate it. Stored base64url-no-pad to match the exact
-/// shape `VapidSignatureBuilder::from_base64` decodes.
-pub fn get_or_create_vapid_private() -> Result<String, String> {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
-    if let Some(existing) = backend::get(VAPID_ACCOUNT) {
-        if !existing.is_empty() {
-            return Ok(existing);
-        }
-    }
-    use rand::RngCore as _;
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    let b64 = B64URL.encode(bytes);
-    backend::set(VAPID_ACCOUNT, &b64)?;
-    Ok(b64)
-}
-
-/// The whole device→subscription map (a missing/corrupt store reads as empty).
-fn read_push_subs() -> std::collections::BTreeMap<String, PushSubscription> {
-    backend::get(PUSH_SUBS_ACCOUNT)
-        .and_then(|json| serde_json::from_str(&json).ok())
-        .unwrap_or_default()
-}
-
-/// Persist (or replace) the Web Push subscription for one device, keyed by its
-/// base64 Noise static public key (the same key the device-trust gate confirms).
-pub fn set_push_subscription(device_key_b64: &str, sub: &PushSubscription) -> Result<(), String> {
-    let mut map = read_push_subs();
-    map.insert(device_key_b64.to_string(), sub.clone());
-    let json = serde_json::to_string(&map).map_err(|e| e.to_string())?;
-    backend::set(PUSH_SUBS_ACCOUNT, &json)
-}
-
-/// The stored Web Push subscription for one device, if any.
-pub fn get_push_subscription(device_key_b64: &str) -> Option<PushSubscription> {
-    read_push_subs().remove(device_key_b64)
-}
-
-/// Every stored `(device_key_b64, subscription)` pair — the set of phones the
-/// desktop can currently push to. Used by the event hooks to fan a push out to
-/// all subscribed devices.
-pub fn list_push_subscriptions() -> Vec<(String, PushSubscription)> {
-    read_push_subs().into_iter().collect()
-}
-
-/// Forget a device's stored subscription (e.g. on unpair). Idempotent.
-pub fn remove_push_subscription(device_key_b64: &str) -> Result<(), String> {
-    let mut map = read_push_subs();
-    if map.remove(device_key_b64).is_none() {
-        return Ok(()); // nothing to do — keep it idempotent
-    }
-    let json = serde_json::to_string(&map).map_err(|e| e.to_string())?;
-    backend::set(PUSH_SUBS_ACCOUNT, &json)
-}
-
 // ── unified lookup ───────────────────────────────────────────────────────────
 
 /// Pick the credential to authenticate with. OAuth (a subscription sign-in)
@@ -412,36 +325,6 @@ mod tests {
         let back: StoredDeviceKey = serde_json::from_str(&json).unwrap();
         assert_eq!(B64.decode(back.public).unwrap(), public);
         assert_eq!(B64.decode(back.private).unwrap(), private);
-    }
-
-    // Pure encoding test (no keyring I/O): the per-device subscription map is a
-    // plain JSON object keyed by device pubkey → {endpoint, p256dh, auth}, so it
-    // round-trips and a second device's entry doesn't clobber the first.
-    #[test]
-    fn push_subscription_map_round_trips_as_json() {
-        use std::collections::BTreeMap;
-        let mut map: BTreeMap<String, PushSubscription> = BTreeMap::new();
-        map.insert(
-            "DEVICE_A==".into(),
-            PushSubscription {
-                endpoint: "https://web.push.apple.com/a".into(),
-                p256dh: "p256dh-A".into(),
-                auth: "auth-A".into(),
-            },
-        );
-        map.insert(
-            "DEVICE_B==".into(),
-            PushSubscription {
-                endpoint: "https://web.push.apple.com/b".into(),
-                p256dh: "p256dh-B".into(),
-                auth: "auth-B".into(),
-            },
-        );
-        let json = serde_json::to_string(&map).unwrap();
-        let back: BTreeMap<String, PushSubscription> = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.len(), 2);
-        assert_eq!(back["DEVICE_A=="].endpoint, "https://web.push.apple.com/a");
-        assert_eq!(back["DEVICE_B=="].auth, "auth-B");
     }
 }
 

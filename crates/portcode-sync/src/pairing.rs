@@ -47,18 +47,6 @@ pub struct PairingPayload {
     /// `EndpointId`; with n0 discovery the phone resolves the live relay/direct
     /// addresses from the id alone, so an identity-only address is enough to dial.
     pub node_addr: EndpointAddr,
-    /// The desktop's Web Push VAPID **public** key (base64url, uncompressed P-256
-    /// point), delivered to the phone so the installed PWA can call
-    /// `pushManager.subscribe({ applicationServerKey })` with it
-    /// (IOS_WEB_CLIENT_PLAN §5.7/§9). The matching PRIVATE key never leaves the
-    /// desktop's secret store and is what signs each push (§9 — "the desktop sends
-    /// Web Push directly … VAPID"). Optional + `#[serde(default)]` for
-    /// backward-compatibility (mirrors the `relay_url` pattern): a desktop that
-    /// emitted a QR before this field existed simply omits it, and a phone that
-    /// can't subscribe just doesn't receive push (the in-app decision queue stays
-    /// the source of truth). The native flow ignores it.
-    #[serde(default)]
-    pub vapid_public_key: Option<String>,
     /// The iroh relay URL the browser client should dial through (§5.5). The
     /// browser is relay-only (no UDP/hole-punch), so it needs a relay to reach the
     /// desktop. Optional + `#[serde(default)]` for backward compatibility: a
@@ -81,7 +69,6 @@ impl PairingPayload {
             public_key: B64.encode(public_key),
             nonce: B64.encode(nonce),
             node_addr,
-            vapid_public_key: None,
             relay_url: None,
         }
     }
@@ -89,14 +76,6 @@ impl PairingPayload {
     /// Attach the relay URL the browser client should dial through (§5.5).
     pub fn with_relay_url(mut self, relay_url: impl Into<String>) -> Self {
         self.relay_url = Some(relay_url.into());
-        self
-    }
-
-    /// Attach the desktop's Web Push VAPID public key (base64url) so the installed
-    /// PWA can subscribe to push with it as the `applicationServerKey` (§5.7/§9).
-    /// Builder-style so the existing `new` call sites stay backward-compatible.
-    pub fn with_vapid_public_key(mut self, vapid_public_key: impl Into<String>) -> Self {
-        self.vapid_public_key = Some(vapid_public_key.into());
         self
     }
 
@@ -192,45 +171,6 @@ mod tests {
         let back: PairingPayload = serde_json::from_value(legacy).unwrap();
         assert_eq!(back.relay_url, None);
         assert_eq!(back.relay_url_or_default(), DEFAULT_RELAY_URL);
-        assert_eq!(back.node_addr.id, addr.id);
-    }
-
-    // The VAPID public key is what the installed PWA subscribes to push with
-    // (§5.7/§9). When set it must survive the QR JSON round-trip; `new` leaves it
-    // `None` so the builder is the only way to attach one.
-    #[test]
-    fn vapid_public_key_round_trips_and_defaults_to_none() {
-        // `new` does not set it.
-        let bare = PairingPayload::new(&[1, 2, 3], &[4, 5, 6], sample_addr());
-        assert_eq!(bare.vapid_public_key, None);
-
-        // The builder attaches it and it survives serde.
-        let p = PairingPayload::new(&[1, 2, 3], &[4, 5, 6], sample_addr())
-            .with_vapid_public_key("BJ_test_vapid_pub_key");
-        assert_eq!(p.vapid_public_key.as_deref(), Some("BJ_test_vapid_pub_key"));
-        let back: PairingPayload =
-            serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
-        assert_eq!(
-            back.vapid_public_key.as_deref(),
-            Some("BJ_test_vapid_pub_key")
-        );
-    }
-
-    // Backward compatibility: a QR emitted BEFORE the `vapidPublicKey` field
-    // existed has no such key at all. `#[serde(default)]` must let it still decode
-    // (with the key defaulting to `None`) so an older desktop's QR keeps working.
-    #[test]
-    fn legacy_payload_without_vapid_key_still_decodes() {
-        let addr = sample_addr();
-        let legacy = serde_json::json!({
-            "version": PAIRING_VERSION,
-            "publicKey": B64.encode([7u8, 8, 9]),
-            "nonce": B64.encode([1u8, 2]),
-            "nodeAddr": addr,
-            // NOTE: no "vapidPublicKey" key — the pre-field wire shape.
-        });
-        let back: PairingPayload = serde_json::from_value(legacy).unwrap();
-        assert_eq!(back.vapid_public_key, None);
         assert_eq!(back.node_addr.id, addr.id);
     }
 }
