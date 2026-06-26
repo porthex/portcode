@@ -10,6 +10,12 @@ mod llm;
 #[cfg(desktop)]
 mod oauth;
 mod permissions;
+// DESKTOP-ONLY: Web Push sender (Phase 5, IOS_WEB_CLIENT_PLAN §5.7/§9). The desktop
+// is the event source and sends push directly to the phone's push service; the
+// phone is a pure client and never sends push, so this (and its `web-push`/`reqwest`
+// deps) is excluded from the mobile binary.
+#[cfg(desktop)]
+mod push;
 mod secrets;
 mod settings;
 mod sync;
@@ -422,6 +428,19 @@ fn phone_sync_begin_pairing(
         ),
     };
 
+    // Include the desktop's Web Push VAPID PUBLIC key so the installed PWA can
+    // subscribe to push with it (§5.7/§9). Lazily creates the keypair on first
+    // pairing; the private half stays in the secret store. Best-effort: if the key
+    // can't be derived (corrupt store, etc.) we still emit a working QR — the phone
+    // just can't subscribe to push and falls back to the in-app queue.
+    let payload = match push::vapid_public_key() {
+        Ok(vapid_pub) => payload.with_vapid_public_key(vapid_pub),
+        Err(e) => {
+            eprintln!("phone-sync: VAPID public key unavailable; QR omits push key: {e}");
+            payload
+        }
+    };
+
     // Arm the bounded pairing window with this nonce. A phone must scan + complete
     // the handshake within the window TTL (and the desktop user must confirm its
     // SAS) before any command surface is served.
@@ -434,6 +453,11 @@ fn phone_sync_begin_pairing(
 /// itself comes from `phone_sync_status` — no separate list command.)
 #[tauri::command]
 fn phone_sync_unpair(state: State<AppState>, public_key: String) -> Result<(), String> {
+    // Also forget any Web Push subscription stored for this device so the desktop
+    // stops trying to push to a device the user just unpaired (best-effort; a
+    // failure here must not block the unpair). `remove_push_subscription` lives in
+    // `secrets` (available on both targets), so this needs no desktop gate.
+    let _ = secrets::remove_push_subscription(&public_key);
     state
         .db
         .remove_paired_device(&public_key)
@@ -620,6 +644,13 @@ async fn serve_connection(
         return;
     }
 
+    // Bind this confirmed peer's key onto a per-connection handler clone so its
+    // `RegisterPush` persists the Web Push subscription against the right device.
+    // We reach this point only AFTER the device-trust gate served the peer, so the
+    // subscription is only ever stored for a confirmed device (§5.7/§9; gated behind
+    // the EXISTING trust gate, not weakening it).
+    let handler = handler.with_device_key(pk.clone());
+
     let (mut sender, mut receiver) = paired.channel.split();
 
     let mut live = tauri::async_runtime::spawn(async move {
@@ -680,6 +711,9 @@ fn start_listener(
         cancels,
         pending,
         oauth_refresh,
+        // The shared template carries no device key; `serve_connection` binds the
+        // confirmed peer's key onto a per-connection clone after the trust gate.
+        device_key: None,
     };
     let device_private = device.private_key().to_vec();
     let app_for_loop = app.clone();

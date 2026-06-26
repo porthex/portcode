@@ -70,6 +70,17 @@ zeroize = "1"
 # rust-version bump above).
 iroh = "1"
 
+# Phone Sync Web Push (Phase 5 of docs/IOS_WEB_CLIENT_PLAN.md §5.7/§9): the desktop
+# sends Web Push directly to the phone's push service (no extra server) using the
+# VAPID key it owns + the subscription the phone registered. We use ONLY the crate's
+# message-building + VAPID-signing + RFC-8291 payload-encryption surface
+# (`WebPushMessageBuilder` / `VapidSignatureBuilder`) and POST the result through the
+# desktop's existing `reqwest` client, so `default-features = false` drops the bundled
+# `isahc`/`hyper` HTTP clients (and their heavy transitive deps) entirely. NOTE: this
+# dep + the full desktop build are CI-gated (no GTK on the dev machine); `push.rs`'s
+# pure logic is unit-tested.
+web-push = { version = "0.11", default-features = false }
+
 # search / matching for tools
 regex = "1"
 globset = "0.4"

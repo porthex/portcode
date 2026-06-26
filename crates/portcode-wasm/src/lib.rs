@@ -67,6 +67,12 @@ pub struct Session {
     /// The desktop's pinned Noise static public key (base64), to persist in
     /// IndexedDB for KK reconnects (§5.8). Surfaced via the `peerPublicKey` getter.
     peer_public_key: String,
+    /// The desktop's Web Push VAPID public key (base64url) from the scanned QR, if
+    /// the desktop advertised one (§5.7/§9). The PWA passes this to
+    /// `pushManager.subscribe({ applicationServerKey })` so the desktop can push to
+    /// it. `None` (→ empty string via the getter) for a desktop that emitted a QR
+    /// before this field existed. Surfaced via the `vapidPublicKey` getter.
+    vapid_public_key: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -86,6 +92,10 @@ impl Session {
     pub async fn connect(qr: String, reconnect: bool) -> Result<Session, JsValue> {
         let payload: PairingPayload =
             serde_json::from_str(&qr).map_err(|e| js_err(&format!("bad QR payload: {e}")))?;
+
+        // The desktop's Web Push VAPID public key (if advertised in the QR) — the PWA
+        // needs it as the `applicationServerKey` for `pushManager.subscribe` (§5.7/§9).
+        let vapid_public_key = payload.vapid_public_key.clone();
 
         // The phone's long-term Noise identity. Generated fresh here for Phase 2;
         // a later increment will load a persisted identity from IndexedDB so KK
@@ -122,6 +132,7 @@ impl Session {
             on_event,
             sas,
             peer_public_key,
+            vapid_public_key,
         })
     }
 
@@ -185,6 +196,15 @@ impl Session {
     #[wasm_bindgen(getter, js_name = peerPublicKey)]
     pub fn peer_public_key(&self) -> String {
         self.peer_public_key.clone()
+    }
+
+    /// The desktop's Web Push VAPID public key (base64url) from the scanned QR, or
+    /// an empty string if the desktop advertised none. The PWA passes this to
+    /// `pushManager.subscribe({ applicationServerKey })` so the desktop can send it
+    /// "permission needed" / "turn finished" pushes directly (§5.7/§9).
+    #[wasm_bindgen(getter, js_name = vapidPublicKey)]
+    pub fn vapid_public_key(&self) -> String {
+        self.vapid_public_key.clone().unwrap_or_default()
     }
 }
 
