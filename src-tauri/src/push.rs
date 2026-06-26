@@ -207,7 +207,6 @@ pub async fn send_push(
 ///   * `PermissionRequest` → "permission needed" (tag `"permission"`, so a second
 ///     prompt replaces the first rather than stacking).
 ///   * `TurnEnd` → "turn finished" (tag `"turn"`).
-///
 /// Every other event (text deltas, tool calls, usage, errors) returns `None` — we
 /// must NOT push on the high-frequency streaming events.
 pub fn payload_for_event(event: &crate::llm::StreamEvent) -> Option<PushPayload> {
@@ -355,7 +354,7 @@ mod tests {
             prepared
                 .headers
                 .iter()
-                .any(|(k, v)| k == "TTL" && *v == PUSH_TTL_SECS.to_string()),
+                .any(|(k, v)| k == "TTL" && v == PUSH_TTL_SECS.to_string()),
             "missing TTL header"
         );
     }

@@ -78,9 +78,8 @@ iroh = "1"
 # desktop's existing `reqwest` client, so `default-features = false` drops the bundled
 # `isahc`/`hyper` HTTP clients (and their heavy transitive deps) entirely. NOTE: this
 # dep + the full desktop build are CI-gated (no GTK on the dev machine); `push.rs`'s
-# pure logic is unit-tested. It is declared in the non-mobile target table below —
-# web-push pulls `openssl-sys`, which can't cross-compile to Android/iOS without an
-# OpenSSL sysroot, and `push.rs` is `#[cfg(desktop)]` so mobile never needs it.
+# pure logic is unit-tested.
+web-push = { version = "0.11", default-features = false }
 
 # search / matching for tools
 regex = "1"
@@ -103,15 +102,6 @@ keyring = { version = "3", features = ["windows-native"] }
 # off the desktop/Linux CI legs entirely (it is registered under `#[cfg(mobile)]`).
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "2"
-
-# Web Push sender — DESKTOP ONLY. `push.rs` is `#[cfg(desktop)]`, and web-push pulls
-# `openssl-sys`, which fails to cross-compile to the Android/iOS targets (no OpenSSL
-# sysroot). Gating it to non-mobile keeps it off the Android probe + mobile builds
-# while the desktop (windows/macOS/Linux) legs still get it. Relocating an
-# already-resolved dep to a target table doesn't change its version/features, so
-# Cargo.lock stays valid.
-[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-web-push = { version = "0.11", default-features = false }
 
 # NOTE: `[profile.release]` moved to the workspace ROOT `Cargo.toml` — Cargo only
 # honors profiles at the workspace root and ignores (with a warning) a profile
