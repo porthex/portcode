@@ -76,9 +76,12 @@ describe("Sidebar", () => {
 
     render(<Sidebar />);
 
-    // Only the always-present "NEW SESSION" + "Settings" buttons exist; no rows.
-    expect(screen.getAllByRole("button")).toHaveLength(2);
+    // The toolbar chrome (collapse, new folder, sort, group, new session,
+    // settings) is always present, but with no sessions there are no rows — so
+    // none of the per-row controls exist.
     expect(screen.queryByTitle("Delete session")).not.toBeInTheDocument();
+    expect(screen.queryByTitle("Archive")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Delete session:/ })).not.toBeInTheDocument();
   });
 
   it("renders a single session's title", () => {
@@ -480,6 +483,574 @@ describe("Sidebar", () => {
       // The empty list has no rows to move between; the handler must not throw.
       expect(() => fireEvent.keyDown(nav, { key: "ArrowDown" })).not.toThrow();
       expect(useStore.getState().activeId).toBeNull();
+    });
+  });
+
+  describe("sort + group toolbar", () => {
+    const threeSessions = () => ({
+      sessions: [
+        session({ id: "a", title: "Apple", updatedAt: 100 }),
+        session({ id: "b", title: "Cherry", updatedAt: 300 }),
+        session({ id: "c", title: "Banana", updatedAt: 200 }),
+      ],
+      activeId: "a" as string | null,
+    });
+
+    it("opens the sort menu, checks the active option, and reorders on pick", () => {
+      useStore.setState(threeSessions());
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: /Sort sessions/ }));
+
+      // Listbox-style menu: the active option (Recent) is checked via aria-checked.
+      const recent = screen.getByRole("menuitemradio", { name: "Recent" });
+      expect(recent).toHaveAttribute("aria-checked", "true");
+      expect(screen.getByRole("menuitemradio", { name: "Name" })).toHaveAttribute(
+        "aria-checked",
+        "false",
+      );
+
+      fireEvent.click(screen.getByRole("menuitemradio", { name: "Name" }));
+
+      // Picking sets the sort and closes the menu.
+      expect(useStore.getState().sortBy).toBe("name");
+      expect(screen.queryByRole("menuitemradio", { name: "Recent" })).not.toBeInTheDocument();
+    });
+
+    it("shows the active cue on the sort button for a non-default sort", () => {
+      useStore.setState({ ...threeSessions(), sortBy: "name" });
+      render(<Sidebar />);
+
+      expect(screen.getByRole("button", { name: /Sort sessions/ }).className).toContain(
+        "pc-sess-ctrl--active",
+      );
+    });
+
+    it("keeps only one popover open at a time (opening Group closes Sort)", () => {
+      useStore.setState(threeSessions());
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: /Sort sessions/ }));
+      expect(screen.getByRole("menu", { name: "Sort sessions" })).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: /Group sessions/ }));
+      expect(screen.queryByRole("menu", { name: "Sort sessions" })).not.toBeInTheDocument();
+      expect(screen.getByRole("menu", { name: "Group sessions" })).toBeInTheDocument();
+    });
+
+    it("closes the open menu on an outside (click-catcher) click", () => {
+      useStore.setState(threeSessions());
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: /Sort sessions/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Close menu" }));
+      expect(screen.queryByRole("menu", { name: "Sort sessions" })).not.toBeInTheDocument();
+    });
+
+    it("toggles the sort menu closed when its button is clicked again", () => {
+      useStore.setState(threeSessions());
+      render(<Sidebar />);
+
+      const sortBtn = screen.getByRole("button", { name: /Sort sessions/ });
+      fireEvent.click(sortBtn);
+      expect(screen.getByRole("menu", { name: "Sort sessions" })).toBeInTheDocument();
+      fireEvent.click(sortBtn);
+      expect(screen.queryByRole("menu", { name: "Sort sessions" })).not.toBeInTheDocument();
+    });
+
+    it("group → status renders Active / Idle / Archived section headers in order", () => {
+      useStore.setState({
+        sessions: [
+          session({ id: "a", title: "Running one" }),
+          session({ id: "b", title: "Idle one" }),
+          session({ id: "c", title: "Archived one" }),
+        ],
+        activeId: "a",
+        streaming: true, // active + streaming ⇒ "running"
+        groupBy: "status",
+        archivedIds: ["c"],
+      });
+      render(<Sidebar />);
+
+      expect(screen.getByText("Active")).toBeInTheDocument();
+      expect(screen.getByText("Idle")).toBeInTheDocument();
+      expect(screen.getByText("Archived")).toBeInTheDocument();
+      // No folder UI in an automatic-grouping mode.
+      expect(screen.queryByRole("button", { name: "New folder" })).not.toBeInTheDocument();
+    });
+
+    it("group → workspace buckets by the ⎇ label", () => {
+      useStore.setState({
+        sessions: [
+          session({ id: "a", title: "One", workspace: "C:/dev/alpha" }),
+          session({ id: "b", title: "Two", workspace: "C:/dev/beta" }),
+        ],
+        activeId: "a",
+        groupBy: "workspace",
+      });
+      render(<Sidebar />);
+
+      // Group headers carry the workspace basenames.
+      expect(screen.getByText("alpha")).toBeInTheDocument();
+      expect(screen.getByText("beta")).toBeInTheDocument();
+    });
+
+    it("switches grouping mode by picking a group option", () => {
+      useStore.setState(threeSessions());
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: /Group sessions/ }));
+      fireEvent.click(screen.getByRole("menuitemradio", { name: "Workspace" }));
+
+      expect(useStore.getState().groupBy).toBe("workspace");
+    });
+  });
+
+  describe("folders", () => {
+    it("shows the New folder button only in none mode and creates an expanded empty folder", () => {
+      useStore.setState({ sessions: [session({ id: "a" })], activeId: "a", groupBy: "none" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "New folder" }));
+
+      expect(useStore.getState().folders).toHaveLength(1);
+      // A fresh, expanded folder shows the empty placeholder.
+      expect(screen.getByText("empty · move chats here")).toBeInTheDocument();
+    });
+
+    it("renders a folder with nested children behind a guide line", () => {
+      useStore.setState({
+        sessions: [
+          session({ id: "loose", title: "Loose chat" }),
+          session({ id: "kid", title: "Nested chat" }),
+        ],
+        activeId: "loose",
+        folders: [{ id: "f1", name: "Work", open: true }],
+        folderOf: { kid: "f1" },
+      });
+      render(<Sidebar />);
+
+      const nested = screen.getByRole("button", { name: /^Nested chat/ });
+      // The nested row sits inside the indentation/guide wrapper.
+      expect(nested.closest(".pc-folder-children")).not.toBeNull();
+      // The loose row does not.
+      const loose = screen.getByRole("button", { name: /^Loose chat/ });
+      expect(loose.closest(".pc-folder-children")).toBeNull();
+    });
+
+    it("collapses and expands a folder, hiding/showing its children", () => {
+      useStore.setState({
+        sessions: [session({ id: "kid", title: "Nested chat" })],
+        activeId: null,
+        folders: [{ id: "f1", name: "Work", open: true }],
+        folderOf: { kid: "f1" },
+      });
+      render(<Sidebar />);
+
+      expect(screen.getByText("Nested chat")).toBeInTheDocument();
+
+      // Clicking the folder name toggles it shut.
+      fireEvent.click(screen.getByText("Work"));
+      expect(useStore.getState().folders[0].open).toBe(false);
+      expect(screen.queryByText("Nested chat")).not.toBeInTheDocument();
+    });
+
+    it("toggles a folder from its chevron/glyph button too", () => {
+      useStore.setState({
+        sessions: [session({ id: "kid", title: "Nested chat" })],
+        activeId: null,
+        folders: [{ id: "f1", name: "Work", open: true }],
+        folderOf: { kid: "f1" },
+      });
+      render(<Sidebar />);
+
+      // The chevron+glyph control carries the folder's accessible name + count.
+      fireEvent.click(screen.getByRole("button", { name: /Work folder/ }));
+      expect(useStore.getState().folders[0].open).toBe(false);
+    });
+
+    it("renames a folder inline (double-click → edit → blur commits)", () => {
+      useStore.setState({ folders: [{ id: "f1", name: "Work", open: true }] });
+      render(<Sidebar />);
+
+      fireEvent.doubleClick(screen.getByText("Work"));
+      const input = screen.getByRole("textbox", { name: "Folder name" });
+      fireEvent.change(input, { target: { value: "Research" } });
+      fireEvent.blur(input);
+
+      expect(useStore.getState().folders[0].name).toBe("Research");
+      expect(screen.queryByRole("textbox", { name: "Folder name" })).not.toBeInTheDocument();
+    });
+
+    it("commits a rename on Enter and cancels on Escape", () => {
+      useStore.setState({ folders: [{ id: "f1", name: "Work", open: true }] });
+      render(<Sidebar />);
+
+      // Enter commits.
+      fireEvent.doubleClick(screen.getByText("Work"));
+      const input = screen.getByRole("textbox", { name: "Folder name" });
+      fireEvent.change(input, { target: { value: "Docs" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(useStore.getState().folders[0].name).toBe("Docs");
+
+      // Escape cancels — the typed value is discarded.
+      fireEvent.doubleClick(screen.getByText("Docs"));
+      const input2 = screen.getByRole("textbox", { name: "Folder name" });
+      fireEvent.change(input2, { target: { value: "Throwaway" } });
+      fireEvent.keyDown(input2, { key: "Escape" });
+      expect(useStore.getState().folders[0].name).toBe("Docs");
+    });
+
+    it("deletes a folder and orphans its chats back to the root", () => {
+      useStore.setState({
+        sessions: [session({ id: "kid", title: "Nested chat" })],
+        activeId: null,
+        folders: [{ id: "f1", name: "Work", open: true }],
+        folderOf: { kid: "f1" },
+      });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Delete folder: Work" }));
+
+      expect(useStore.getState().folders).toHaveLength(0);
+      // The chat survives at the loose root (no longer nested).
+      const orphan = screen.getByRole("button", { name: /^Nested chat/ });
+      expect(orphan.closest(".pc-folder-children")).toBeNull();
+    });
+  });
+
+  describe("archived rows + status indicators", () => {
+    it("archives a session from its row action, dimming the row and flipping the control", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Keep" }), session({ id: "b", title: "Old chat" })],
+        activeId: "a",
+      });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Archive session: Old chat" }));
+
+      expect(useStore.getState().archivedIds).toEqual(["b"]);
+      // The control now offers the inverse action…
+      expect(
+        screen.getByRole("button", { name: "Unarchive session: Old chat" }),
+      ).toBeInTheDocument();
+      // …and the row is dimmed.
+      const row = screen.getByRole("button", { name: /^Old chat/ }).closest(".pc-row--archived");
+      expect(row).not.toBeNull();
+    });
+
+    it("shows a green running dot for the streaming session and a faint dot for idle rows", () => {
+      useStore.setState({
+        sessions: [
+          session({ id: "a", title: "Running" }),
+          session({ id: "b", title: "Idle" }),
+          session({ id: "c", title: "Archived" }),
+        ],
+        activeId: "a",
+        streaming: true,
+        archivedIds: ["c"],
+      });
+      const { container } = render(<Sidebar />);
+
+      // running ⇒ success dot; idle inactive ⇒ faint pip; archived ⇒ box glyph.
+      expect(container.querySelector(".pc-dot--success")).not.toBeNull();
+      expect(container.querySelector(".pc-dot--idle")).not.toBeNull();
+      expect(screen.getByText("▢")).toBeInTheDocument();
+    });
+
+    it("shows the magenta accent dot for the open, non-streaming session", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Open" })],
+        activeId: "a",
+        streaming: false,
+      });
+      const { container } = render(<Sidebar />);
+
+      expect(container.querySelector(".pc-dot--accent")).not.toBeNull();
+    });
+  });
+
+  describe("collapsible rail", () => {
+    it("collapses to the slim rail and expands back", () => {
+      useStore.setState({ sessions: [session({ id: "a" })], activeId: "a" });
+      render(<Sidebar />);
+
+      // Collapse from the panel header.
+      fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+      expect(useStore.getState().sidebarCollapsed).toBe(true);
+
+      // The rail replaces the panel: no Sort toolbar, but an Expand affordance.
+      expect(screen.queryByRole("button", { name: /Sort sessions/ })).not.toBeInTheDocument();
+      const expand = screen.getByRole("button", { name: "Expand sidebar" });
+
+      fireEvent.click(expand);
+      expect(useStore.getState().sidebarCollapsed).toBe(false);
+      expect(screen.getByRole("button", { name: /Sort sessions/ })).toBeInTheDocument();
+    });
+
+    it("creates a session from the rail's + button", async () => {
+      useStore.setState({ sessions: [], activeId: null, sidebarCollapsed: true });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "New session" }));
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(m.createSession).toHaveBeenCalledTimes(1);
+    });
+
+    it("opens settings from the rail's gear", () => {
+      useStore.setState({
+        sessions: [],
+        activeId: null,
+        sidebarCollapsed: true,
+        showSettings: false,
+      });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+      expect(useStore.getState().showSettings).toBe(true);
+    });
+
+    it("ignores the collapsed flag when collapsible is false (the mobile drawer)", () => {
+      useStore.setState({
+        sessions: [session({ id: "a" })],
+        activeId: "a",
+        sidebarCollapsed: true,
+      });
+      render(<Sidebar collapsible={false} />);
+
+      // The drawer always shows the full panel — toolbar present, no collapse control.
+      expect(screen.getByRole("button", { name: /Sort sessions/ })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Collapse sidebar" })).not.toBeInTheDocument();
+    });
+  });
+
+  describe("drag & drop into folders", () => {
+    const dt = (id: string) => ({
+      getData: vi.fn(() => id),
+      setData: vi.fn(),
+      effectAllowed: "",
+      dropEffect: "",
+    });
+
+    it("moves a chat into a folder when dropped on it", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Drag me" })],
+        activeId: "a",
+        folders: [{ id: "f1", name: "Work", open: true }],
+        folderOf: {},
+      });
+      render(<Sidebar />);
+
+      // dragStart records the chat id on the transfer.
+      const transfer = dt("a");
+      const row = screen.getByRole("button", { name: /^Drag me/ }).closest('[draggable="true"]')!;
+      fireEvent.dragStart(row, { dataTransfer: transfer });
+      expect(transfer.setData).toHaveBeenCalledWith("text/pc-session", "a");
+
+      const folderEl = screen.getByText("Work").closest(".pc-row")!;
+      fireEvent.dragOver(folderEl, { dataTransfer: transfer });
+      expect(folderEl.className).toContain("pc-droptarget");
+
+      fireEvent.drop(folderEl, { dataTransfer: transfer });
+      expect(useStore.getState().folderOf).toEqual({ a: "f1" });
+    });
+
+    it("moves a chat back to loose when dropped on the list root", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Nested" })],
+        activeId: "a",
+        folders: [{ id: "f1", name: "Work", open: true }],
+        folderOf: { a: "f1" },
+      });
+      render(<Sidebar />);
+
+      const nav = screen.getByRole("navigation", { name: "Session list" });
+      fireEvent.drop(nav, { dataTransfer: dt("a") });
+
+      expect(useStore.getState().folderOf).toEqual({});
+    });
+
+    it("is a no-op when the drop carries no chat id", () => {
+      useStore.setState({
+        sessions: [session({ id: "a" })],
+        activeId: "a",
+        folders: [{ id: "f1", name: "Work", open: true }],
+        folderOf: { a: "f1" },
+      });
+      render(<Sidebar />);
+
+      const folderEl = screen.getByText("Work").closest(".pc-row")!;
+      fireEvent.drop(folderEl, { dataTransfer: dt("") });
+      // Unchanged — no id means nothing moves.
+      expect(useStore.getState().folderOf).toEqual({ a: "f1" });
+    });
+
+    it("clears the drop-target highlight on drag leave", () => {
+      useStore.setState({
+        sessions: [session({ id: "a" })],
+        activeId: "a",
+        folders: [{ id: "f1", name: "Work", open: true }],
+      });
+      render(<Sidebar />);
+
+      const folderEl = screen.getByText("Work").closest(".pc-row")!;
+      fireEvent.dragOver(folderEl, { dataTransfer: dt("a") });
+      expect(folderEl.className).toContain("pc-droptarget");
+      fireEvent.dragLeave(folderEl);
+      expect(folderEl.className).not.toContain("pc-droptarget");
+    });
+  });
+
+  describe("branch grouping & metadata", () => {
+    it("offers a Branch group option and buckets by git branch", () => {
+      useStore.setState({
+        sessions: [
+          session({ id: "a", title: "One", branch: "main" }),
+          session({ id: "b", title: "Two", branch: "feature/x" }),
+        ],
+        activeId: "a",
+        groupBy: "branch",
+      });
+      render(<Sidebar />);
+
+      expect(screen.getByText("main")).toBeInTheDocument();
+      expect(screen.getByText("feature/x")).toBeInTheDocument();
+    });
+
+    it("lists Branch in the group menu and selects it", () => {
+      useStore.setState({ sessions: [session({ id: "a" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: /Group sessions/ }));
+      fireEvent.click(screen.getByRole("menuitemradio", { name: "Branch" }));
+
+      expect(useStore.getState().groupBy).toBe("branch");
+    });
+
+    it("shows the real branch in the row's ⎇ metadata, with the workspace alongside", () => {
+      useStore.setState({
+        sessions: [
+          session({
+            id: "a",
+            title: "Repo chat",
+            branch: "feature/login",
+            workspace: "C:/dev/proj",
+          }),
+        ],
+        activeId: "a",
+      });
+      render(<Sidebar />);
+
+      const row = screen.getByRole("button", { name: /^Repo chat/ });
+      expect(row).toHaveTextContent("feature/login");
+      expect(row).toHaveTextContent("proj");
+    });
+
+    it("falls back to the workspace label when a session has no branch", () => {
+      useStore.setState({
+        sessions: [
+          session({ id: "a", title: "Local chat", branch: null, workspace: "C:/dev/proj" }),
+        ],
+        activeId: "a",
+      });
+      render(<Sidebar />);
+
+      expect(screen.getByRole("button", { name: /^Local chat/ })).toHaveTextContent("proj");
+    });
+  });
+
+  describe("drag-to-reorder (manual order)", () => {
+    const dt = (id: string) => ({
+      getData: vi.fn(() => id),
+      setData: vi.fn(),
+      effectAllowed: "",
+      dropEffect: "",
+    });
+
+    it("reordering one chat onto another switches the sort to manual", () => {
+      useStore.setState({
+        sessions: [
+          session({ id: "a", title: "Aaa", updatedAt: 200 }),
+          session({ id: "b", title: "Bbb", updatedAt: 100 }),
+        ],
+        activeId: "a",
+        sortBy: "recent",
+      });
+      render(<Sidebar />);
+
+      const target = screen.getByRole("button", { name: /^Bbb/ }).closest('[draggable="true"]')!;
+      fireEvent.drop(target, { dataTransfer: dt("a") });
+
+      // The list is now in manual order and the Sort control reflects it.
+      expect(useStore.getState().sortBy).toBe("manual");
+      expect(useStore.getState().manualOrder).toContain("a");
+      expect(screen.getByRole("button", { name: /Sort sessions \(Manual\)/ })).toBeInTheDocument();
+    });
+
+    it("dropping a chat onto itself is a no-op (sort stays)", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Aaa" }), session({ id: "b", title: "Bbb" })],
+        activeId: "a",
+        sortBy: "recent",
+      });
+      render(<Sidebar />);
+
+      const self = screen.getByRole("button", { name: /^Aaa/ }).closest('[draggable="true"]')!;
+      fireEvent.drop(self, { dataTransfer: dt("a") });
+
+      expect(useStore.getState().sortBy).toBe("recent");
+    });
+
+    it("shows an insertion line over the row a drag would land on", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Aaa" }), session({ id: "b", title: "Bbb" })],
+        activeId: "a",
+      });
+      render(<Sidebar />);
+
+      const target = screen.getByRole("button", { name: /^Bbb/ }).closest('[draggable="true"]')!;
+      fireEvent.dragOver(target, { dataTransfer: dt("a") });
+      expect(target.className).toContain("pc-drop-line");
+      fireEvent.dragLeave(target);
+      expect(target.className).not.toContain("pc-drop-line");
+
+      // dragEnd (e.g. dropping outside any target) also clears the indicator.
+      fireEvent.dragOver(target, { dataTransfer: dt("a") });
+      expect(target.className).toContain("pc-drop-line");
+      fireEvent.dragEnd(target);
+      expect(target.className).not.toContain("pc-drop-line");
+    });
+
+    it("rows are not draggable in an automatic grouping mode", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Aaa" })],
+        activeId: "a",
+        groupBy: "status",
+      });
+      render(<Sidebar />);
+
+      const row = screen.getByRole("button", { name: /^Aaa/ }).closest("div")?.parentElement;
+      expect(row).not.toHaveAttribute("draggable", "true");
+    });
+  });
+
+  describe("open/close animation", () => {
+    it("morphs the shell width between the panel (248) and rail (52)", () => {
+      useStore.setState({
+        sessions: [session({ id: "a" })],
+        activeId: "a",
+        sidebarCollapsed: false,
+      });
+      const { container } = render(<Sidebar />);
+
+      const shell = container.firstElementChild as HTMLElement;
+      expect(shell).toHaveStyle({ width: "248px" });
+      expect(shell.className).toContain("transition-[width]");
+
+      fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+      expect(shell).toHaveStyle({ width: "52px" });
     });
   });
 });

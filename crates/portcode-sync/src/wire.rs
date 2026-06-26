@@ -108,6 +108,10 @@ pub enum StreamEvent {
 pub struct SessionRow {
     pub id: String,
     pub title: String,
+    /// Current git branch of `workspace`, computed live on each list; None when
+    /// no workspace/repo or detached HEAD.
+    #[serde(default)]
+    pub branch: Option<String>,
     pub workspace: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,

@@ -149,6 +149,7 @@ mod tests {
             sessions: vec![SessionRow {
                 id: "s1".into(),
                 title: "Alpha".into(),
+                branch: Some("main".into()),
                 workspace: Some("C:/ws".into()),
                 created_at: 1_000_000,
                 updated_at: 2_000_000,
