@@ -348,6 +348,7 @@ mod tests {
                     sessions: vec![SessionRow {
                         id: "s1".into(),
                         title: "Alpha".into(),
+                        branch: None,
                         workspace: None,
                         created_at: 1,
                         updated_at: 2,

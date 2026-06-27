@@ -19,8 +19,52 @@ export interface Session {
   id: string;
   title: string;
   workspace: string | null;
+  /**
+   * Current git branch of `workspace`, computed live by the Rust core on each
+   * `list_sessions` (read from `.git/HEAD`, never stored). `null`/absent when
+   * there's no workspace, it isn't a git repo, or HEAD is detached. Drives the
+   * `⎇` row label and `groupBy: "branch"`.
+   */
+  branch?: string | null;
   createdAt: number;
   updatedAt: number;
+}
+
+/**
+ * Derived lifecycle state of a session row in the sidebar.
+ * - `running`  — the open session while a turn streams (the only honest "live"
+ *   signal: the store tracks a single global `streaming`, owned by the active run).
+ * - `archived` — user-archived (a frontend-only flag, see {@link SessionFolder}).
+ * - `idle`     — everything else.
+ * NOT a Rust-backed field; the core's {@link Session} model is unchanged. Derived
+ * by `deriveStatus` in `lib/sessionView`.
+ */
+export type SessionStatus = "running" | "idle" | "archived";
+
+/**
+ * How the SESSIONS list is ordered. `recent` = most-recently-updated first.
+ * `manual` is entered implicitly when the user drag-reorders the list (the sort
+ * presets switch "off") and orders by the persisted {@link Session} order.
+ */
+export type SessionSort = "recent" | "name" | "status" | "manual";
+
+/**
+ * How the SESSIONS list is grouped. `none` = the manual folder tree (drag to
+ * reorder / into folders); `status` / `branch` / `workspace` are automatic
+ * groupings that override folders.
+ */
+export type SessionGroup = "none" | "status" | "branch" | "workspace";
+
+/**
+ * A user-created folder that groups sessions in the sidebar (manual-org mode).
+ * Folders + membership (`folderOf` in the store) are a frontend-only overlay
+ * persisted to localStorage — the Rust core never sees them.
+ */
+export interface SessionFolder {
+  id: string;
+  name: string;
+  /** Expanded (children shown) vs collapsed. */
+  open: boolean;
 }
 
 /** Events streamed from the core during an agent run. */
