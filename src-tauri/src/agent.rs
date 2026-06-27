@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use futures_util::stream::StreamExt;
+use serde_json::Value;
 use tauri::AppHandle;
 use uuid::Uuid;
 
@@ -35,6 +37,11 @@ const MAX_AGENT_STEPS: usize = 50;
 /// `task` could otherwise fan out without bound, so a subagent at this depth is
 /// handed no `task` tool (and the spawner refuses past it as a backstop).
 const MAX_SUBAGENT_DEPTH: usize = 3;
+
+/// How many subagents from ONE tool-use batch run concurrently. The model can
+/// emit several `task` calls in a turn; they run in parallel up to this cap (the
+/// rest queue), so a wide fan-out can't open unbounded simultaneous model streams.
+const MAX_PARALLEL_AGENTS: usize = 4;
 
 /// Steer prepended (as a system-prompt addendum) for a subagent run. It tells the
 /// model it is an autonomous, single-shot worker whose final message is its entire
@@ -300,6 +307,12 @@ pub async fn run(
         AgentConfig::default_run()
     };
 
+    // Serializes the permission PROMPT across this run: the top-level turn and all
+    // its (possibly parallel) subagents share one lock, so only one "ask" is ever
+    // outstanding at a time and concurrent subagents can't clobber the single UI
+    // prompt slot. Created per run, never held across a tool's actual work.
+    let ask_lock = Arc::new(tokio::sync::Mutex::new(()));
+
     let result = run_inner(
         &app,
         &http,
@@ -309,6 +322,7 @@ pub async fn run(
         &agents,
         &cancel,
         &oauth_refresh,
+        &ask_lock,
         &channel,
         &session_id,
         user_text,
@@ -337,6 +351,7 @@ async fn run_inner(
     agents: &agents::Agents,
     cancel: &Arc<AtomicBool>,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
+    ask_lock: &Arc<tokio::sync::Mutex<()>>,
     channel: &str,
     session_id: &str,
     user_text: String,
@@ -390,6 +405,7 @@ async fn run_inner(
             agents: agents.clone(),
             cancel: cancel.clone(),
             refresh_lock: refresh_lock.clone(),
+            ask_lock: ask_lock.clone(),
             parent_channel: channel.to_string(),
             workspace: workspace.clone(),
             // The top-level run is not itself a registered subagent, so the
@@ -431,6 +447,7 @@ async fn run_inner(
         &snapshot,
         cred,
         refresh_lock,
+        ask_lock,
         pending,
         cancel,
         channel,
@@ -516,6 +533,7 @@ async fn run_loop_core(
     snapshot: &Settings,
     mut cred: Credential,
     refresh_lock: &tokio::sync::Mutex<()>,
+    ask_lock: &tokio::sync::Mutex<()>,
     pending: &Pending,
     cancel: &Arc<AtomicBool>,
     agent_channel: &str,
@@ -608,92 +626,99 @@ async fn run_loop_core(
         messages.push(assistant);
 
         if turn.stop_reason == "tool_use" {
-            let mut results: Vec<Block> = Vec::new();
+            // This batch's tool calls, in order. Regular tools run sequentially with
+            // the usual gate/cancel semantics; `task` calls (subagents) are deferred
+            // and run CONCURRENTLY afterwards, since they are independent and
+            // long-running. Results are slotted back in tool_use order regardless.
+            let tool_uses: Vec<(&str, &str, &Value)> = turn
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    Block::ToolUse { id, name, input } => Some((id.as_str(), name.as_str(), input)),
+                    _ => None,
+                })
+                .collect();
+            let mut slots: Vec<Option<Block>> = vec![None; tool_uses.len()];
             let mut cancelled = false;
-            for block in &turn.content {
-                if let Block::ToolUse { id, name, input } = block {
-                    // Stop must interrupt an in-flight batch: once cancelled, run no
-                    // more tools, but still post a synthetic tool_result for every
-                    // remaining ToolUse so the persisted history stays well-formed
-                    // (Anthropic requires a result for each tool_use, else it 400s).
-                    if batch_cancelled(cancelled, cancel.load(Ordering::Relaxed)) {
-                        cancelled = true;
-                        let output = CANCELLED_TOOL_RESULT.to_string();
-                        emit(
-                            app,
-                            agent_channel,
-                            StreamEvent::ToolResult {
-                                id: id.clone(),
-                                output: output.clone(),
-                                is_error: true,
-                            },
-                        );
-                        results.push(Block::ToolResult {
-                            tool_use_id: id.clone(),
-                            content: output,
-                            is_error: true,
-                        });
+            // Deferred subagent calls; each future yields (slot index, output, is_error).
+            let mut task_futs = Vec::new();
+
+            for (i, &(id, name, input)) in tool_uses.iter().enumerate() {
+                // Stop must interrupt an in-flight batch: once cancelled, run no more
+                // tools, but still post a synthetic tool_result for every remaining
+                // ToolUse so the persisted history stays well-formed (Anthropic
+                // requires a result for each tool_use, else it 400s).
+                if batch_cancelled(cancelled, cancel.load(Ordering::Relaxed)) {
+                    cancelled = true;
+                    let output = CANCELLED_TOOL_RESULT.to_string();
+                    emit(app, agent_channel, tool_result_event(id, &output, true));
+                    slots[i] = Some(tool_result_block(id, output, true));
+                    continue;
+                }
+
+                // Subagents run in parallel: defer the (non-mutating, ungated) `task`
+                // call to the concurrent phase below. A final cancel re-check first,
+                // mirroring the sequential path.
+                if name == "task" {
+                    if let Some(tool) = registry.find("task") {
+                        if cancel.load(Ordering::Relaxed) {
+                            cancelled = true;
+                            let output = CANCELLED_TOOL_RESULT.to_string();
+                            emit(app, agent_channel, tool_result_event(id, &output, true));
+                            slots[i] = Some(tool_result_block(id, output, true));
+                        } else {
+                            let input = input.clone();
+                            task_futs.push(async move {
+                                match tool.run(input, ctx).await {
+                                    Ok(out) => (i, out, false),
+                                    Err(err) => (i, err, true),
+                                }
+                            });
+                        }
                         continue;
                     }
-                    let (output, is_error) = match registry.find(name) {
-                        Some(tool) => {
-                            let decision = if tool.mutating() {
-                                // Compute the pre-apply diff (fs_write/fs_edit) so
-                                // the prompt can show the change BEFORE it's written.
-                                let diff = tool.preview(input, ctx).await;
-                                permissions::gate(
-                                    app,
-                                    session_channel,
-                                    snapshot.permission_mode,
-                                    &snapshot.rules,
-                                    &snapshot.default_policy,
-                                    pending,
-                                    cancel,
-                                    name,
-                                    &tool.summarize(input, ctx),
-                                    input,
-                                    diff,
-                                )
-                                .await
-                            } else {
-                                Decision::Allow
-                            };
-                            match decision {
-                                // Re-check cancel right before running: a Stop that
-                                // arrived during the gate (or during a prior tool in
-                                // this batch) must not let this tool execute.
-                                Decision::Allow if cancel.load(Ordering::Relaxed) => {
-                                    cancelled = true;
-                                    (CANCELLED_TOOL_RESULT.to_string(), true)
-                                }
-                                Decision::Allow => match tool.run(input.clone(), ctx).await {
-                                    Ok(out) => (out, false),
-                                    Err(err) => (err, true),
-                                },
-                                Decision::Deny => (
-                                    "Denied: the user did not approve this action.".to_string(),
-                                    true,
-                                ),
-                            }
-                        }
-                        None => (format!("Unknown tool: {name}"), true),
-                    };
-                    emit(
-                        app,
-                        agent_channel,
-                        StreamEvent::ToolResult {
-                            id: id.clone(),
-                            output: output.clone(),
-                            is_error,
-                        },
-                    );
-                    results.push(Block::ToolResult {
-                        tool_use_id: id.clone(),
-                        content: output,
-                        is_error,
-                    });
+                    // No task tool in this registry → fall through to "unknown tool".
+                }
+
+                let (output, is_error) = match registry.find(name) {
+                    Some(tool) => {
+                        gate_and_run(
+                            app,
+                            session_channel,
+                            snapshot,
+                            pending,
+                            cancel,
+                            ask_lock,
+                            tool,
+                            ctx,
+                            name,
+                            input,
+                            &mut cancelled,
+                        )
+                        .await
+                    }
+                    None => (format!("Unknown tool: {name}"), true),
+                };
+                emit(app, agent_channel, tool_result_event(id, &output, is_error));
+                slots[i] = Some(tool_result_block(id, output, is_error));
+            }
+
+            // Drive the deferred subagents concurrently, capped at MAX_PARALLEL_AGENTS,
+            // slotting each result as it finishes. The streamed ToolResult events land
+            // in completion order; the persisted batch stays in tool_use order.
+            if !task_futs.is_empty() {
+                let mut stream =
+                    futures_util::stream::iter(task_futs).buffer_unordered(MAX_PARALLEL_AGENTS);
+                while let Some((i, output, is_error)) = stream.next().await {
+                    let id = tool_uses[i].0;
+                    emit(app, agent_channel, tool_result_event(id, &output, is_error));
+                    slots[i] = Some(tool_result_block(id, output, is_error));
                 }
             }
+
+            // Every tool_use filled a slot (sequential, cancelled, or task), so this
+            // yields one result per call, in order.
+            let results: Vec<Block> = slots.into_iter().flatten().collect();
             // A tool_use turn that yields no usable tool result would post an
             // empty-content user message, which Anthropic rejects (400) and which
             // then poisons the persisted history so every later turn also 400s.
@@ -739,6 +764,85 @@ fn assistant_text(content: &[Block]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+/// The streamed `ToolResult` event for one finished tool call.
+fn tool_result_event(id: &str, output: &str, is_error: bool) -> StreamEvent {
+    StreamEvent::ToolResult {
+        id: id.to_string(),
+        output: output.to_string(),
+        is_error,
+    }
+}
+
+/// The persisted `ToolResult` content block for one finished tool call.
+fn tool_result_block(id: &str, output: String, is_error: bool) -> Block {
+    Block::ToolResult {
+        tool_use_id: id.to_string(),
+        content: output,
+        is_error,
+    }
+}
+
+/// Gate (if mutating) and run ONE tool call, returning `(output, is_error)`. Sets
+/// `*cancelled` if a Stop landed during the gate or right before the tool ran.
+///
+/// The gate prompt is serialized through `ask_lock`: only one "ask" is outstanding
+/// per run at a time, so subagents running in parallel queue their prompts rather
+/// than overwriting each other in the single permission slot (the UI shows one at
+/// a time). The lock is held only across the gate, never across a tool's work.
+#[allow(clippy::too_many_arguments)]
+async fn gate_and_run(
+    app: &AppHandle,
+    session_channel: &str,
+    snapshot: &Settings,
+    pending: &Pending,
+    cancel: &Arc<AtomicBool>,
+    ask_lock: &tokio::sync::Mutex<()>,
+    tool: &dyn tools::Tool,
+    ctx: &ToolCtx,
+    name: &str,
+    input: &Value,
+    cancelled: &mut bool,
+) -> (String, bool) {
+    let decision = if tool.mutating() {
+        // Compute the pre-apply diff (fs_write/fs_edit) so the prompt can show the
+        // change BEFORE it's written.
+        let diff = tool.preview(input, ctx).await;
+        let _prompt = ask_lock.lock().await;
+        permissions::gate(
+            app,
+            session_channel,
+            snapshot.permission_mode,
+            &snapshot.rules,
+            &snapshot.default_policy,
+            pending,
+            cancel,
+            name,
+            &tool.summarize(input, ctx),
+            input,
+            diff,
+        )
+        .await
+    } else {
+        Decision::Allow
+    };
+    match decision {
+        // Re-check cancel right before running: a Stop that arrived during the gate
+        // (or during a prior tool in this batch) must not let this tool execute.
+        Decision::Allow if cancel.load(Ordering::Relaxed) => {
+            *cancelled = true;
+            (CANCELLED_TOOL_RESULT.to_string(), true)
+        }
+        Decision::Allow => match tool.run(input.clone(), ctx).await {
+            Ok(out) => (out, false),
+            Err(err) => (err, true),
+        },
+        Decision::Deny => (
+            "Denied: the user did not approve this action.".to_string(),
+            true,
+        ),
+    }
 }
 
 /// Whether a subagent at `depth` may itself spawn children — i.e. is still under
@@ -819,6 +923,10 @@ struct AgentSpawner {
     /// last check and the child's registration, the child starts already-cancelled.
     cancel: Arc<AtomicBool>,
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-run permission-prompt serializer, shared with the parent and all
+    /// siblings, so parallel subagents queue their prompts instead of clobbering the
+    /// single UI prompt slot.
+    ask_lock: Arc<tokio::sync::Mutex<()>>,
     /// The parent's `agent://{session}` channel — where a subagent's permission
     /// prompts and lifecycle/usage events surface, and the base for the child's own
     /// stream channel.
@@ -912,6 +1020,7 @@ impl tools::Spawner for AgentSpawner {
             &snapshot,
             cred,
             &self.refresh_lock,
+            &self.ask_lock,
             &self.pending,
             &child_cancel,
             &child_channel,       // agent_channel: the subagent's private output
@@ -953,8 +1062,9 @@ mod tests {
     use super::{
         assistant_text, batch_cancelled, child_can_spawn, derive_title, finish_status,
         is_terminal_auth_error, resolve_system_prompt, session_of, spawn_status,
-        step_limit_exceeded, subagent_answer, AgentConfig, Block, ChatMessage, Db, LoopOutcome,
-        Persist, MAX_AGENT_STEPS, MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
+        step_limit_exceeded, subagent_answer, tool_result_block, tool_result_event, AgentConfig,
+        Block, ChatMessage, Db, LoopOutcome, Persist, StreamEvent, MAX_AGENT_STEPS,
+        MAX_PARALLEL_AGENTS, MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
     };
     use std::path::Path;
 
@@ -1043,6 +1153,63 @@ mod tests {
         assert_eq!(spawn_status(&ok), "ok");
         assert_eq!(spawn_status(&cancelled), "cancelled");
         assert_eq!(spawn_status(&errored), "error");
+    }
+
+    #[test]
+    fn tool_result_helpers_build_the_event_and_block() {
+        // The streamed event and the persisted block carry the same id/output/error
+        // for one finished tool call; both the sequential and parallel paths use them.
+        match tool_result_event("t1", "out", true) {
+            StreamEvent::ToolResult {
+                id,
+                output,
+                is_error,
+            } => assert_eq!(
+                (id.as_str(), output.as_str(), is_error),
+                ("t1", "out", true)
+            ),
+            other => panic!("expected a ToolResult event, got {other:?}"),
+        }
+        match tool_result_block("t1", "out".into(), false) {
+            Block::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => assert_eq!(
+                (tool_use_id.as_str(), content.as_str(), is_error),
+                ("t1", "out", false)
+            ),
+            other => panic!("expected a ToolResult block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parallel_results_are_reassembled_in_tool_use_order() {
+        // Subagents finish in arbitrary order, but each result is slotted by its
+        // tool_use index, so the persisted batch stays in the model's original order
+        // (Anthropic pairs tool_result to tool_use, and order is the safe default).
+        let ids = ["a", "b", "c"];
+        let mut slots: Vec<Option<Block>> = vec![None; ids.len()];
+        // Completions arrive out of order: c, then a, then b.
+        for (i, out) in [(2usize, "C"), (0, "A"), (1, "B")] {
+            slots[i] = Some(tool_result_block(ids[i], out.to_string(), false));
+        }
+        let results: Vec<Block> = slots.into_iter().flatten().collect();
+        let contents: Vec<&str> = results
+            .iter()
+            .map(|b| match b {
+                Block::ToolResult { content, .. } => content.as_str(),
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(contents, ["A", "B", "C"]);
+    }
+
+    #[test]
+    fn parallel_agent_cap_is_a_sane_concurrency_bound() {
+        // At least 2 (so a batch of `task` calls actually overlaps) and bounded (so a
+        // wide fan-out can't open unlimited simultaneous model streams).
+        assert!((2..=16).contains(&MAX_PARALLEL_AGENTS));
     }
 
     #[test]
