@@ -14,30 +14,30 @@ PLAN → IMPLEMENT (code + tests together) → REVIEW (adversarial, ≥3 lenses,
 
 ⬜ not started · 🟦 in progress · ✅ done (CI-green) · ⏸ paused (needs user decision)
 
-| Phase | Item                                     | Status | Notes                                                                                             |
-| ----- | ---------------------------------------- | ------ | ------------------------------------------------------------------------------------------------- |
-| 0.1   | `LlmProvider` provider seam              | ✅     | PR #82 (`nice-dijkstra-63314b`), CI-green; this branch is stacked on it                           |
-| 0.2   | Rust SSE-mock test harness               | ✅     | PR #83; pure `TurnBuilder` + 13 tests; CI green (Rust/Frontend/Smoke/Android)                     |
-| 0.3   | Injectable tool registry + system prompt | ✅     | PR #83; `AgentConfig` (registry + prompt override) threaded into `run_inner`; +5 tests; CI green  |
-| 0.4   | Multi-run store model                    | ✅     | PR #83; `runs` map + derived active-run mirror; per-run state; +6 tests; coverage green; CI green |
-| 1     | Permission modes + rules + cycling       | ⬜     |                                                                                                   |
-| 1     | Plan mode                                | ⬜     |                                                                                                   |
-| 1     | Pre-apply accept/reject/edit diff        | ⬜     |                                                                                                   |
-| 2     | Subagent runtime + `Task` tool           | ⬜     | sequential first                                                                                  |
-| 2     | Live agents panel                        | ⬜     |                                                                                                   |
-| 2     | Parallel execution + concurrency cap     | ⬜     |                                                                                                   |
-| 2     | Per-agent git worktree isolation         | ⬜     |                                                                                                   |
-| 2     | Background tasks                         | ⬜     |                                                                                                   |
-| 3     | Rename UI                                | ⬜     | backend already exists                                                                            |
-| 3     | Persist token/cost across reloads        | ⬜     |                                                                                                   |
-| 3     | Fork / branch a conversation             | ⬜     |                                                                                                   |
-| 3     | Checkpoints & rewind                     | ⬜     |                                                                                                   |
-| 3     | Context compaction + `/context` view     | ⬜     | behind `LlmProvider`                                                                              |
-| 4     | Custom slash commands                    | ⬜     |                                                                                                   |
-| 4     | Hooks                                    | ⬜     |                                                                                                   |
-| 4     | Skills                                   | ⬜     |                                                                                                   |
-| 4     | MCP client                               | ⬜     |                                                                                                   |
-| 4     | Plugins                                  | ⏸      | PAUSE — needs user trust/sandbox decision                                                         |
+| Phase | Item                                     | Status | Notes                                                                                                                             |
+| ----- | ---------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| 0.1   | `LlmProvider` provider seam              | ✅     | PR #82 (`nice-dijkstra-63314b`), CI-green; this branch is stacked on it                                                           |
+| 0.2   | Rust SSE-mock test harness               | ✅     | PR #83; pure `TurnBuilder` + 13 tests; CI green (Rust/Frontend/Smoke/Android)                                                     |
+| 0.3   | Injectable tool registry + system prompt | ✅     | PR #83; `AgentConfig` (registry + prompt override) threaded into `run_inner`; +5 tests; CI green                                  |
+| 0.4   | Multi-run store model                    | ✅     | PR #83; `runs` map + derived active-run mirror; per-run state; +6 tests; coverage green; CI green                                 |
+| 1     | Permission modes + rules + cycling       | ✅     | PR #83; A1 gate core (modes+rules, security-audited) + A2a mode UI/cycle + A2b Settings editor + guardrails; +~25 tests; CI green |
+| 1     | Plan mode                                | 🟦     | NEXT — `AgentConfig::plan_run()` + `read_only_registry()` + prompt steer (reuses 0.3 seam) + approve-to-exit                      |
+| 1     | Pre-apply accept/reject/edit diff        | ⬜     | diff DISPLAY this phase (accept/reject); in-prompt EDIT deferred to a follow-up (per user decision)                               |
+| 2     | Subagent runtime + `Task` tool           | ⬜     | sequential first                                                                                                                  |
+| 2     | Live agents panel                        | ⬜     |                                                                                                                                   |
+| 2     | Parallel execution + concurrency cap     | ⬜     |                                                                                                                                   |
+| 2     | Per-agent git worktree isolation         | ⬜     |                                                                                                                                   |
+| 2     | Background tasks                         | ⬜     |                                                                                                                                   |
+| 3     | Rename UI                                | ⬜     | backend already exists                                                                                                            |
+| 3     | Persist token/cost across reloads        | ⬜     |                                                                                                                                   |
+| 3     | Fork / branch a conversation             | ⬜     |                                                                                                                                   |
+| 3     | Checkpoints & rewind                     | ⬜     |                                                                                                                                   |
+| 3     | Context compaction + `/context` view     | ⬜     | behind `LlmProvider`                                                                                                              |
+| 4     | Custom slash commands                    | ⬜     |                                                                                                                                   |
+| 4     | Hooks                                    | ⬜     |                                                                                                                                   |
+| 4     | Skills                                   | ⬜     |                                                                                                                                   |
+| 4     | MCP client                               | ⬜     |                                                                                                                                   |
+| 4     | Plugins                                  | ⏸      | PAUSE — needs user trust/sandbox decision                                                                                         |
 
 ## Decisions log (append-only)
 
@@ -48,10 +48,12 @@ PLAN → IMPLEMENT (code + tests together) → REVIEW (adversarial, ≥3 lenses,
   satisfies the protocol's per-phase VERIFY without a sprawl of stacked PRs. `main` is
   protected; no PR is merged or marked ready without explicit user approval.
 
-## Phase 1 — design (architect plan, pending user sign-off on trust boundary)
+## Phase 1 — design (user-approved; item 1 shipped, plan mode + diff next)
 
 Phase 1 rewrites the permission gate — a security trust boundary `GOVERNANCE.md` flags as
-RFC-territory. Designed; **awaiting user confirmation before implementing.** Safe ordering:
+RFC-territory. **User confirmed the safe design** (all 5 modes, auto/bypass opt-in only;
+scoped allow-rules; diff-display-now / edit-later). Item 1 (modes + rules) is shipped
+(A1+A2a+A2b, CI-green). Safe ordering:
 
 - **A — Modes + per-tool/command rules (backward-compat = identical to today).** `permissions.rs`:
   `PermissionMode {Default,AcceptEdits,Plan,Auto,Bypass}` + `Rule {tool, command?, decision}`;
