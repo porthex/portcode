@@ -1122,6 +1122,37 @@ struct BackgroundLauncher {
     session_id: String,
 }
 
+/// Spawn a background task's off-thread waiter and register it (so a session-wide
+/// Stop can abort it) such that the registry entry is inserted BEFORE the waiter's
+/// `body` is allowed to run. Without this ordering a body that finishes instantly
+/// (a fast command) could call `background::finish` — a map remove — before the
+/// matching `background::register` insert lands, leaving a stale entry that nothing
+/// ever removes (the waiter has already exited). `body` performs the work — wait
+/// for the child, report completion — and MUST end by calling
+/// `background::finish(bg, id)`.
+fn spawn_background_task<F>(
+    bg: &background::Background,
+    id: &str,
+    session_id: &str,
+    command: &str,
+    body: F,
+) where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    // A one-shot gate: the waiter blocks at `notified()` until we release it AFTER
+    // registering. `notify_one()` stores a permit even when it runs before the
+    // waiter reaches `notified()`, so the gate is race-free regardless of which
+    // side (caller vs. spawned waiter) gets there first.
+    let registered = Arc::new(tokio::sync::Notify::new());
+    let gate = registered.clone();
+    let handle = tokio::spawn(async move {
+        gate.notified().await;
+        body.await;
+    });
+    background::register(bg, id, session_id, command, handle.abort_handle());
+    registered.notify_one();
+}
+
 impl tools::BackgroundRunner for BackgroundLauncher {
     fn launch(&self, command: String, child: tokio::process::Child) -> String {
         let id = Uuid::new_v4().to_string();
@@ -1142,32 +1173,34 @@ impl tools::BackgroundRunner for BackgroundLauncher {
         let task_command = command.clone();
         // The waiter owns the child (kill_on_drop), so aborting this task kills the
         // process — which is exactly what `background::cancel_session` does on Stop.
-        let handle = tokio::spawn(async move {
-            let (exit_code, output) = match child.wait_with_output().await {
-                Ok(out) => (
-                    out.status.code().unwrap_or(-1),
-                    tools::format_shell_output(&out),
-                ),
-                Err(e) => (-1, format!("background command failed: {e}")),
-            };
-            emit(
-                &app,
-                &channel,
-                StreamEvent::BackgroundTaskFinished {
-                    id: task_id.clone(),
-                    command: task_command,
-                    exit_code,
-                    output,
-                },
-            );
-            background::finish(&bg, &task_id);
-        });
-        background::register(
+        // `spawn_background_task` registers the entry BEFORE this body can run, so a
+        // command that finishes instantly can't remove its entry before the matching
+        // insert lands (which would otherwise leak a stale registry entry).
+        spawn_background_task(
             &self.background,
             &id,
             &self.session_id,
             &command,
-            handle.abort_handle(),
+            async move {
+                let (exit_code, output) = match child.wait_with_output().await {
+                    Ok(out) => (
+                        out.status.code().unwrap_or(-1),
+                        tools::format_shell_output(&out),
+                    ),
+                    Err(e) => (-1, format!("background command failed: {e}")),
+                };
+                emit(
+                    &app,
+                    &channel,
+                    StreamEvent::BackgroundTaskFinished {
+                        id: task_id.clone(),
+                        command: task_command,
+                        exit_code,
+                        output,
+                    },
+                );
+                background::finish(&bg, &task_id);
+            },
         );
         id
     }
@@ -1176,14 +1209,16 @@ impl tools::BackgroundRunner for BackgroundLauncher {
 #[cfg(test)]
 mod tests {
     use super::{
-        assistant_text, batch_cancelled, child_can_spawn, derive_title, finish_status,
+        assistant_text, background, batch_cancelled, child_can_spawn, derive_title, finish_status,
         is_terminal_auth_error, precheck_outcome, reassemble_results, resolve_system_prompt,
-        session_of, spawn_status, step_limit_exceeded, subagent_answer, tool_result_block,
-        tool_result_event, AgentConfig, Block, ChatMessage, Db, Decision, LoopOutcome, Persist,
-        StreamEvent, CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS, MAX_PARALLEL_AGENTS,
-        MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
+        session_of, spawn_background_task, spawn_status, step_limit_exceeded, subagent_answer,
+        tool_result_block, tool_result_event, AgentConfig, Block, ChatMessage, Db, Decision,
+        LoopOutcome, Persist, StreamEvent, CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS,
+        MAX_PARALLEL_AGENTS, MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
     };
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     fn spec_names(cfg: &AgentConfig) -> Vec<String> {
         cfg.registry
@@ -1195,6 +1230,46 @@ mod tests {
 
     fn text_block(t: &str) -> Block {
         Block::Text { text: t.into() }
+    }
+
+    // The background-task waiter is gated so its `finish` (a map remove) can never
+    // outrun the matching `register` (the insert). Drive `spawn_background_task` with
+    // a body that finishes INSTANTLY — the fast-command case that, before the gate,
+    // could remove its entry before registration and leak a stale one. The body
+    // records whether its entry was already present when it ran, then removes it.
+    // On a multi-thread runtime the waiter runs on another worker, so without the
+    // gate the body would observe `false` and leave a leaked entry behind; the gate
+    // makes both observations deterministic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_background_task_registers_before_the_body_runs_and_cleans_up() {
+        let bg = background::new();
+        let seen_registered = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+        let bg_body = bg.clone();
+        let seen_body = seen_registered.clone();
+        let id = "task-1".to_string();
+        let id_body = id.clone();
+        spawn_background_task(&bg, &id, "sess-1", "echo hi", async move {
+            // The gate guarantees the entry is registered before we get here — even
+            // though this body does no real awaiting before finishing.
+            seen_body.store(
+                bg_body.lock().unwrap().contains_key(&id_body),
+                Ordering::SeqCst,
+            );
+            background::finish(&bg_body, &id_body);
+            let _ = tx.send(());
+        });
+
+        rx.await.unwrap();
+        assert!(
+            seen_registered.load(Ordering::SeqCst),
+            "the entry must be registered before the waiter body runs"
+        );
+        assert!(
+            bg.lock().unwrap().is_empty(),
+            "no stale entry may leak after the body finishes"
+        );
     }
 
     #[test]
