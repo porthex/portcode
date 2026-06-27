@@ -13,6 +13,7 @@ use tauri::AppHandle;
 use uuid::Uuid;
 
 use crate::agents;
+use crate::background;
 use crate::db::{self, Db};
 use crate::llm::{self, Block, ChatMessage, StreamEvent};
 use crate::oauth;
@@ -256,6 +257,7 @@ pub async fn run(
     cancels: Cancels,
     pending: Pending,
     agents: agents::Agents,
+    background: background::Background,
     oauth_refresh: Arc<tokio::sync::Mutex<()>>,
     session_id: String,
     user_text: String,
@@ -320,6 +322,7 @@ pub async fn run(
         &db,
         &pending,
         &agents,
+        &background,
         &cancel,
         &oauth_refresh,
         &ask_lock,
@@ -349,6 +352,7 @@ async fn run_inner(
     db: &Arc<Db>,
     pending: &Pending,
     agents: &agents::Agents,
+    background: &background::Background,
     cancel: &Arc<AtomicBool>,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
     ask_lock: &Arc<tokio::sync::Mutex<()>>,
@@ -418,6 +422,17 @@ async fn run_inner(
     };
     let mut ctx = ToolCtx::new(workspace);
     ctx.spawner = spawner;
+    // Attach a background runner only when this run exposes `shell` (plan mode's
+    // read-only registry has none, so it can't background). Subagents don't get one
+    // in this version, so their `shell` runs foreground.
+    if registry.find("shell").is_some() {
+        ctx.background = Some(Arc::new(BackgroundLauncher {
+            app: app.clone(),
+            background: background.clone(),
+            session_channel: channel.to_string(),
+            session_id: session_id.to_string(),
+        }));
+    }
 
     // Load prior turns from the DB, then persist the new user message.
     let mut messages = db.load_chat_messages(session_id);
@@ -1033,6 +1048,9 @@ impl tools::Spawner for AgentSpawner {
         let ctx = ToolCtx {
             workspace: self.workspace.clone(),
             spawner: child_spawner,
+            // Subagents run `shell` in the foreground (no background runner) in this
+            // version, so a subagent can't spawn its own background tasks yet.
+            background: None,
         };
 
         // The subagent runs the default workspace prompt plus the "you are a
@@ -1086,6 +1104,72 @@ impl tools::Spawner for AgentSpawner {
             &outcome.final_text,
             &outcome.stop_reason,
         ))
+    }
+}
+
+/// Launches and tracks background `shell` tasks for the `shell` tool's background
+/// mode. Owns the process lifecycle: it announces the launch, waits for the child
+/// off-thread, reports completion on the session channel, and registers the
+/// waiter's abort handle so a session Stop can kill it.
+#[derive(Clone)]
+struct BackgroundLauncher {
+    app: AppHandle,
+    background: background::Background,
+    /// The session's `agent://{session}` channel — where start/finish events go.
+    /// (Lifecycle events ride the session channel because a finish can land after
+    /// the launching turn ended.)
+    session_channel: String,
+    session_id: String,
+}
+
+impl tools::BackgroundRunner for BackgroundLauncher {
+    fn launch(&self, command: String, child: tokio::process::Child) -> String {
+        let id = Uuid::new_v4().to_string();
+        // Announce the launch right away so the UI can show it as running.
+        emit(
+            &self.app,
+            &self.session_channel,
+            StreamEvent::BackgroundTaskStarted {
+                id: id.clone(),
+                command: command.clone(),
+            },
+        );
+
+        let app = self.app.clone();
+        let bg = self.background.clone();
+        let channel = self.session_channel.clone();
+        let task_id = id.clone();
+        let task_command = command.clone();
+        // The waiter owns the child (kill_on_drop), so aborting this task kills the
+        // process — which is exactly what `background::cancel_session` does on Stop.
+        let handle = tokio::spawn(async move {
+            let (exit_code, output) = match child.wait_with_output().await {
+                Ok(out) => (
+                    out.status.code().unwrap_or(-1),
+                    tools::format_shell_output(&out),
+                ),
+                Err(e) => (-1, format!("background command failed: {e}")),
+            };
+            emit(
+                &app,
+                &channel,
+                StreamEvent::BackgroundTaskFinished {
+                    id: task_id.clone(),
+                    command: task_command,
+                    exit_code,
+                    output,
+                },
+            );
+            background::finish(&bg, &task_id);
+        });
+        background::register(
+            &self.background,
+            &id,
+            &self.session_id,
+            &command,
+            handle.abort_handle(),
+        );
+        id
     }
 }
 

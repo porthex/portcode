@@ -7,6 +7,8 @@
 mod agent;
 #[cfg(desktop)]
 mod agents;
+#[cfg(desktop)]
+mod background;
 mod db;
 mod llm;
 #[cfg(desktop)]
@@ -47,6 +49,10 @@ pub struct AppState {
     /// loop that spawns subagents; the phone is a pure remote client.
     #[cfg(desktop)]
     pub agents: agents::Agents,
+    /// Live background `shell` tasks, keyed by task id, so a session Stop can kill
+    /// the ones it launched. DESKTOP-ONLY — only the desktop runs the agent loop.
+    #[cfg(desktop)]
+    pub background: background::Background,
     /// Serializes OAuth token refreshes so concurrent agent turns don't each
     /// hit the token endpoint (single-flight). Guards no data — held only for
     /// the duration of a refresh.
@@ -333,6 +339,7 @@ async fn run_agent(
     let cancels = state.cancels.clone();
     let pending = state.pending.clone();
     let agents = state.agents.clone();
+    let background = state.background.clone();
     let oauth_refresh = state.oauth_refresh.clone();
 
     // Run in the background so the command returns immediately and the frontend
@@ -346,6 +353,7 @@ async fn run_agent(
             cancels,
             pending,
             agents,
+            background,
             oauth_refresh,
             session_id,
             text,
@@ -361,8 +369,10 @@ fn cancel_agent(state: State<AppState>, session_id: String) {
     if let Some(flag) = state.cancels.lock().unwrap().get(&session_id) {
         flag.store(true, Ordering::Relaxed);
     }
-    // A session-wide Stop also cancels every subagent the run launched.
+    // A session-wide Stop also cancels every subagent the run launched...
     agents::cancel_session(&state.agents, &session_id);
+    // ...and kills its background tasks.
+    background::cancel_session(&state.background, &session_id);
     permissions::deny_all(&state.pending, &session_id);
 }
 
@@ -547,6 +557,7 @@ fn phone_sync_listen(app: AppHandle, state: State<AppState>) -> Result<(), Strin
         state.cancels.clone(),
         state.pending.clone(),
         state.agents.clone(),
+        state.background.clone(),
         state.oauth_refresh.clone(),
         state.listen_endpoint.clone(),
         state.pairing_gate.clone(),
@@ -700,6 +711,7 @@ fn start_listener(
     cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     pending: permissions::Pending,
     agents: agents::Agents,
+    background: background::Background,
     oauth_refresh: Arc<tokio::sync::Mutex<()>>,
     listen_endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
     pairing_gate: Arc<sync::pairing_gate::PairingGate>,
@@ -717,6 +729,7 @@ fn start_listener(
         cancels,
         pending,
         agents,
+        background,
         oauth_refresh,
     };
     let device_private = device.private.clone();
@@ -996,6 +1009,8 @@ pub fn run() {
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 #[cfg(desktop)]
                 agents: agents::new(),
+                #[cfg(desktop)]
+                background: background::new(),
                 oauth_refresh: Arc::new(tokio::sync::Mutex::new(())),
                 phone_client: Arc::new(Mutex::new(None)),
                 listen_endpoint: Arc::new(Mutex::new(None)),
@@ -1023,6 +1038,7 @@ pub fn run() {
                     state.cancels.clone(),
                     state.pending.clone(),
                     state.agents.clone(),
+                    state.background.clone(),
                     state.oauth_refresh.clone(),
                     state.listen_endpoint.clone(),
                     state.pairing_gate.clone(),
