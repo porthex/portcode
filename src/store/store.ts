@@ -2,6 +2,8 @@ import { create } from "zustand";
 import type {
   AgentInfo,
   AgentStatus,
+  BackgroundTaskInfo,
+  BackgroundTaskStatus,
   ContentBlock,
   Message,
   MessageRow,
@@ -69,6 +71,7 @@ interface AppState {
   messages: Record<string, Message[]>; // sessionId -> messages
   usage: Record<string, Usage>; // sessionId -> cumulative token usage
   agents: Record<string, AgentInfo[]>; // sessionId -> live subagents (the agents panel)
+  backgroundTasks: Record<string, BackgroundTaskInfo[]>; // sessionId -> background shell tasks
   settings: Settings;
   oauthStatus: OAuthStatus | null; // Claude subscription sign-in state
   oauthError: string | null; // last sign-in/out failure, surfaced in Settings
@@ -264,6 +267,107 @@ const applyAgentEvent = (
   }
 };
 
+// ── Background shell tasks (the background-tasks panel) ───────────────────────
+// Mirror the agent helpers, but background tasks intentionally OUTLIVE the turn
+// that launched them — so, unlike agents, they are never cleared on a turn
+// boundary. Exit code 0 reads as success; anything else (including the -1 the
+// backend reports for a child that failed to spawn) reads as an error.
+const bgStatus = (exitCode: number): BackgroundTaskStatus => (exitCode === 0 ? "ok" : "error");
+
+const patchBackgroundTasks = (
+  tasks: Record<string, BackgroundTaskInfo[]>,
+  sessionId: string,
+  fn: (list: BackgroundTaskInfo[]) => BackgroundTaskInfo[],
+): Record<string, BackgroundTaskInfo[]> => ({
+  ...tasks,
+  [sessionId]: fn(tasks[sessionId] ?? []),
+});
+
+// Add a newly-started task, preserving launch order; replace on a duplicate id
+// (defensive against a re-delivered started event) rather than listing it twice.
+const startBackgroundTask = (
+  list: BackgroundTaskInfo[],
+  info: BackgroundTaskInfo,
+): BackgroundTaskInfo[] =>
+  list.some((t) => t.id === info.id)
+    ? list.map((t) => (t.id === info.id ? info : t))
+    : [...list, info];
+
+// Fold one background-task StreamEvent into a session's task list. Shared by the
+// desktop persistent-listener path and the phone frame path; returns the map
+// unchanged for any other event. A `finished` event UPSERTS: it carries the full
+// command, so a finish whose `started` we somehow missed still surfaces (rather
+// than silently dropping, as an update-by-id would).
+const applyBackgroundEvent = (
+  tasks: Record<string, BackgroundTaskInfo[]>,
+  sessionId: string,
+  e: StreamEvent,
+): Record<string, BackgroundTaskInfo[]> => {
+  switch (e.type) {
+    case "background_task_started":
+      return patchBackgroundTasks(tasks, sessionId, (list) =>
+        startBackgroundTask(list, { id: e.id, command: e.command, status: "running" }),
+      );
+    case "background_task_finished": {
+      const finished: BackgroundTaskInfo = {
+        id: e.id,
+        command: e.command,
+        status: bgStatus(e.exitCode),
+        exitCode: e.exitCode,
+        output: e.output,
+      };
+      return patchBackgroundTasks(tasks, sessionId, (list) =>
+        list.some((t) => t.id === e.id)
+          ? list.map((t) => (t.id === e.id ? { ...t, ...finished } : t))
+          : [...list, finished],
+      );
+    }
+    default:
+      return tasks;
+  }
+};
+
+// Desktop persistent background-task listeners, keyed by session id. Module-scoped
+// (like `remoteWatchdog`) because they outlive any single action and must survive
+// across turns: a `background_task_finished` can land long after the launching
+// turn's per-turn listener was disposed. Each subscription folds ONLY background
+// events into `backgroundTasks` (the per-turn listener still owns the turn's own
+// deltas, so there is no double-handling). Inert in the browser/phone (the ipc
+// subscribe is a no-op off Tauri); the phone tracks background tasks via frames.
+const bgListeners = new Map<string, () => void>();
+
+// Ensure a persistent background-task listener exists for `sessionId`. Idempotent:
+// the synchronous reservation guards against a double-subscribe across the await,
+// and a teardown that lands mid-subscribe is honoured (the just-created listener
+// is torn down rather than leaked).
+const ensureBackgroundListener = async (sessionId: string): Promise<void> => {
+  if (bgListeners.has(sessionId)) return;
+  bgListeners.set(sessionId, () => {}); // reserve synchronously (re-entry guard)
+  let unlisten: () => void;
+  try {
+    unlisten = await ipc.subscribeSessionEvents(sessionId, (e) =>
+      useStore.setState((st) => ({
+        backgroundTasks: applyBackgroundEvent(st.backgroundTasks, sessionId, e),
+      })),
+    );
+  } catch {
+    bgListeners.delete(sessionId); // subscribe failed — drop the reservation
+    return;
+  }
+  if (!bgListeners.has(sessionId)) {
+    // A teardown ran during the await (the reservation is gone) — honour it.
+    unlisten();
+    return;
+  }
+  bgListeners.set(sessionId, unlisten);
+};
+
+const teardownBackgroundListener = (sessionId: string): void => {
+  const unlisten = bgListeners.get(sessionId);
+  if (unlisten) unlisten();
+  bgListeners.delete(sessionId);
+};
+
 // A turn must always reach a terminal state. If the backend hangs or dies without
 // emitting turn_end/error, this client-side watchdog force-ends the turn once the
 // run has been idle this long, so `streaming` can never get stuck true (which would
@@ -346,6 +450,7 @@ export const useStore = create<AppState>((set, get) => ({
   messages: {},
   usage: {},
   agents: {},
+  backgroundTasks: {},
   settings: DEFAULT_SETTINGS,
   oauthStatus: null,
   oauthError: null,
@@ -426,6 +531,9 @@ export const useStore = create<AppState>((set, get) => ({
           // (idle here — a fresh session has no run).
           ...projectActiveRun({ activeId: s.id, runs: st.runs }),
         }));
+        // Subscribe a persistent background-task listener so a task launched in
+        // this session is tracked even after its turn's per-turn listener is gone.
+        void ensureBackgroundListener(s.id);
         return;
       }
       const activeId = sessions[0].id;
@@ -441,6 +549,9 @@ export const useStore = create<AppState>((set, get) => ({
         // Keep the active-run mirror consistent with the activated session.
         ...projectActiveRun({ activeId, runs: st.runs }),
       }));
+      // One persistent background-task listener per known session (idempotent), so
+      // a finish that lands while a different session is on screen is still tracked.
+      sessions.forEach((s) => void ensureBackgroundListener(s.id));
     } catch (err) {
       set({ initError: errMessage(err) });
     }
@@ -498,6 +609,8 @@ export const useStore = create<AppState>((set, get) => ({
         // A brand-new session has no run yet → the mirror projects to idle.
         ...projectActiveRun({ activeId: s.id, runs: st.runs }),
       }));
+      // Track background tasks launched in the new session from the moment it exists.
+      void ensureBackgroundListener(s.id);
     } catch (err) {
       // A failed create (locked DB / core not ready) must surface instead of being a
       // swallowed unhandled rejection — callers use bare `onClick={newSession}` /
@@ -518,6 +631,9 @@ export const useStore = create<AppState>((set, get) => ({
       showSidebar: false, // close the mobile drawer on navigation
       ...projectActiveRun({ activeId: id, runs: st.runs }),
     }));
+    // Belt-and-suspenders: ensure the session being viewed has a background-task
+    // listener (idempotent — a no-op if init/newSession already subscribed it).
+    void ensureBackgroundListener(id);
     if (!get().messages[id]) {
       // Guard the load: a getMessages reject must not leave messages[id] undefined
       // (the welcome EmptyState would then win for a session with real history).
@@ -544,14 +660,24 @@ export const useStore = create<AppState>((set, get) => ({
       set({ initError: errMessage(err) });
       return;
     }
+    teardownBackgroundListener(id); // stop tracking the deleted session's tasks
     set((st) => {
       const sessions = st.sessions.filter((s) => s.id !== id);
       const messages = { ...st.messages };
       delete messages[id];
       const runs = { ...st.runs };
       delete runs[runKey(id)]; // drop the deleted session's run
+      const backgroundTasks = { ...st.backgroundTasks };
+      delete backgroundTasks[id]; // drop its background tasks
       const activeId = st.activeId === id ? (sessions[0]?.id ?? null) : st.activeId;
-      return { sessions, messages, runs, activeId, ...projectActiveRun({ activeId, runs }) };
+      return {
+        sessions,
+        messages,
+        runs,
+        backgroundTasks,
+        activeId,
+        ...projectActiveRun({ activeId, runs }),
+      };
     });
     if (get().sessions.length === 0) {
       await get().newSession();
@@ -1166,6 +1292,8 @@ export const useStore = create<AppState>((set, get) => ({
       runs: {},
       // ...and no live subagents; the desktop's live frames repopulate them.
       agents: {},
+      // ...and no background tasks; the desktop's live frames repopulate them.
+      backgroundTasks: {},
       streaming: false,
       cancel: null,
       pendingPermission: null,
@@ -1488,6 +1616,14 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
     case "agent_progress":
     case "agent_finished":
       set((st) => ({ agents: applyAgentEvent(st.agents, sessionId, e) }));
+      break;
+    case "background_task_started":
+    case "background_task_finished":
+      // Background tasks ride the same per-session frame path. They outlive the
+      // turn, so — unlike agents — they are never cleared on a turn boundary.
+      set((st) => ({
+        backgroundTasks: applyBackgroundEvent(st.backgroundTasks, sessionId, e),
+      }));
       break;
   }
 }

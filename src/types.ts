@@ -47,10 +47,39 @@ export type StreamEvent =
   /** A subagent completed a model turn — `step` is its 1-based turn count. */
   | { type: "agent_progress"; agentId: string; step: number }
   /** A subagent finished. `status` is "ok" | "cancelled" | "error". */
-  | { type: "agent_finished"; agentId: string; status: string };
+  | { type: "agent_finished"; agentId: string; status: string }
+  // ── background shell tasks (the `shell` tool's background mode) ──────────────
+  /** A `shell` command was launched in the background. Emitted on the SESSION
+   *  channel, so the persistent session listener (not the per-turn one) tracks it. */
+  | { type: "background_task_started"; id: string; command: string }
+  /** A background `shell` command finished. Can arrive AFTER the launching turn
+   *  ended, which is why it rides the persistent session listener. */
+  | {
+      type: "background_task_finished";
+      id: string;
+      command: string;
+      exitCode: number;
+      output: string;
+    };
 
 /** Terminal/live state of a subagent in the agents panel. */
 export type AgentStatus = "running" | "ok" | "cancelled" | "error";
+
+/** Live/terminal state of a background shell task. `running` until it finishes,
+ *  then `ok` (exit 0) or `error` (any non-zero / failed-to-run exit). */
+export type BackgroundTaskStatus = "running" | "ok" | "error";
+
+/** A background shell task (the `shell` tool's background mode) tracked per session
+ *  for the background-tasks panel. Outlives the turn that launched it. */
+export interface BackgroundTaskInfo {
+  id: string;
+  command: string;
+  status: BackgroundTaskStatus;
+  /** Process exit code, once finished (undefined while running). */
+  exitCode?: number;
+  /** Captured stdout/stderr, once finished (undefined while running). */
+  output?: string;
+}
 
 /** A subagent (the `task` tool) tracked for the live agents panel. */
 export interface AgentInfo {

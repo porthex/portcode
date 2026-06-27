@@ -265,4 +265,31 @@ describe("StatusHud", () => {
     render(<StatusHud />);
     expect(screen.queryByText(/AGENT/)).not.toBeInTheDocument();
   });
+
+  it("shows a running-background-tasks count only while tasks are running", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      backgroundTasks: {
+        s1: [
+          { id: "t1", command: "npm run dev", status: "running" },
+          { id: "t2", command: "make build", status: "error", exitCode: 1 }, // finished — not counted
+        ],
+      },
+    });
+
+    render(<StatusHud />);
+    expect(screen.getByText("1 BG TASK")).toBeInTheDocument();
+  });
+
+  it("omits the background-tasks segment when none are running", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      backgroundTasks: { s1: [{ id: "t1", command: "build", status: "ok", exitCode: 0 }] },
+    });
+
+    render(<StatusHud />);
+    expect(screen.queryByText(/BG TASK/)).not.toBeInTheDocument();
+  });
 });

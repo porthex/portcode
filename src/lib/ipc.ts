@@ -351,6 +351,26 @@ export async function runAgent(
   return mock.runAgent(sessionId, text, onEvent);
 }
 
+/**
+ * Subscribe to a session's agent channel PERSISTENTLY — across turns — for the
+ * background-task lifecycle events (`background_task_started` /
+ * `background_task_finished`) that can land after the launching turn's per-turn
+ * listener was torn down. Returns an unlisten handle. The handler receives every
+ * event on the channel; the caller filters to the background events it cares about
+ * (the per-turn listener owns the turn's own deltas). Inert in the browser mock —
+ * the preview launches no real background tasks.
+ */
+export async function subscribeSessionEvents(
+  sessionId: string,
+  onEvent: (e: StreamEvent) => void,
+): Promise<Unlisten> {
+  if (isTauri()) {
+    const { event } = await tauri();
+    return event.listen<StreamEvent>(`agent://${sessionId}`, (ev) => onEvent(ev.payload));
+  }
+  return mock.subscribeSessionEvents();
+}
+
 /** Stop ONE subagent (and its descendants) by id, leaving the rest of the turn
  *  running. Mirrors `cancel_agent`, but targets the live agents registry. A no-op
  *  in the browser mock (no real subagents run there). */
@@ -462,6 +482,9 @@ const mock = (() => {
     },
     async onPhoneSyncDisconnected(_cb: () => void): Promise<Unlisten> {
       return () => {}; // inert: the preview never drops a (nonexistent) session.
+    },
+    async subscribeSessionEvents(): Promise<Unlisten> {
+      return () => {}; // inert: the preview launches no real background tasks.
     },
     async resolvePermission(id: string, decision: "allow" | "deny") {
       resolvers.get(id)?.(decision);
