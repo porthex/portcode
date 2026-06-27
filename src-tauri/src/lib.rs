@@ -80,6 +80,9 @@ fn get_settings(state: State<AppState>) -> Settings {
 fn save_settings(state: State<AppState>, settings: Value) -> Settings {
     {
         let mut s = state.settings.lock().unwrap();
+        if let Some(p) = settings.get("provider").and_then(|v| v.as_str()) {
+            s.provider = p.to_string();
+        }
         if let Some(m) = settings.get("model").and_then(|v| v.as_str()) {
             s.model = m.to_string();
         }

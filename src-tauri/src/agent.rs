@@ -11,7 +11,7 @@ use tauri::AppHandle;
 use uuid::Uuid;
 
 use crate::db::{self, Db};
-use crate::llm::{self, Block, ChatMessage, StreamEvent};
+use crate::llm::{self, Block, ChatMessage, LlmProvider, StreamEvent};
 use crate::oauth;
 use crate::permissions::{self, Decision, Pending};
 use crate::secrets::{self, Credential};
@@ -249,6 +249,13 @@ async fn run_inner(
         "No credentials set. Sign in with your Claude subscription or add an Anthropic API key in Settings.",
     )?;
 
+    // Resolve the LLM provider up front, alongside the credential check above:
+    // both are pre-flight config validations that fail before any DB write (so an
+    // unconfigured run never half-persists). An unknown `provider` value fails
+    // here with a clear message instead of silently calling Anthropic. Anthropic
+    // is the only provider today; `llm::LlmProvider` is the seam others plug into.
+    let provider = llm::provider_for(&snapshot.provider)?;
+
     // No configured workspace falls back to the process working directory — but
     // never to an empty path (the old `unwrap_or_default()`), which would silently
     // root every file/shell tool at "" and produce confusing errors.
@@ -308,18 +315,19 @@ async fn run_inner(
         // Refresh an expiring OAuth token before each turn (no-op for API keys).
         cred = ensure_fresh(http, cred, refresh_lock).await?;
 
-        let turn = llm::stream_turn(
-            http,
-            &cred,
-            &snapshot.model,
-            &system,
-            &messages,
-            &tool_specs,
-            app,
-            channel,
-            cancel,
-        )
-        .await?;
+        let turn = provider
+            .stream_turn(
+                http,
+                &cred,
+                &snapshot.model,
+                &system,
+                &messages,
+                &tool_specs,
+                app,
+                channel,
+                cancel,
+            )
+            .await?;
 
         emit(
             app,

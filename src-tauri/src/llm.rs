@@ -1,7 +1,15 @@
-//! Provider-facing message types and the Anthropic streaming client.
+//! LLM message/event types, the [`LlmProvider`] trait seam, and the Anthropic
+//! streaming client.
+//!
+//! Portcode is Claude-first: `AnthropicProvider` is the only implementation
+//! today. The agent loop depends only on the [`LlmProvider`] trait, so other
+//! model providers slot in (the "any model" goal) by adding an impl + a
+//! [`provider_for`] arm — without touching the loop.
 //!
 //! `Block`/`ChatMessage` are serialized directly into the Anthropic Messages
 //! API request body, so their serde shapes intentionally match that wire format.
+//! They are the neutral vocabulary every provider speaks (also the DB + Phone
+//! Sync wire types), so a future non-Anthropic provider maps onto them.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -10,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::AppHandle;
 
+use async_trait::async_trait;
 use futures_util::StreamExt;
 
 use crate::secrets::Credential;
@@ -351,6 +360,70 @@ pub async fn stream_turn(
     })
 }
 
+/// The LLM provider seam. The agent loop depends only on this trait, so adding a
+/// model provider means adding an `impl` + a [`provider_for`] arm — the loop
+/// itself never changes. `AnthropicProvider` is the only provider today.
+#[async_trait]
+pub trait LlmProvider: Send + Sync {
+    /// Stream one assistant turn — same contract as [`stream_turn`]: emits
+    /// text/tool events as they arrive and returns the assembled turn so the
+    /// agent loop can act on any tool calls.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_turn(
+        &self,
+        http: &reqwest::Client,
+        cred: &Credential,
+        model: &str,
+        system: &str,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        app: &AppHandle,
+        channel: &str,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<TurnResult, String>;
+}
+
+/// Anthropic Messages API provider. A thin adapter over [`stream_turn`] (the
+/// Anthropic-specific client above); this is what [`provider_for`] returns for
+/// `provider = "anthropic"`. Its credential model (`x-api-key` / OAuth bearer)
+/// and the Claude Code identity block are Anthropic-specific — a second provider
+/// brings its own impl rather than reusing these.
+pub struct AnthropicProvider;
+
+#[async_trait]
+impl LlmProvider for AnthropicProvider {
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_turn(
+        &self,
+        http: &reqwest::Client,
+        cred: &Credential,
+        model: &str,
+        system: &str,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        app: &AppHandle,
+        channel: &str,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<TurnResult, String> {
+        stream_turn(
+            http, cred, model, system, messages, tools, app, channel, cancel,
+        )
+        .await
+    }
+}
+
+/// Resolve the provider named by `settings.provider`. An unknown name fails the
+/// run with a clear message instead of silently defaulting to Anthropic, so a
+/// mis-set provider surfaces immediately rather than producing confusing calls.
+pub fn provider_for(name: &str) -> Result<Box<dyn LlmProvider>, String> {
+    match name {
+        "anthropic" => Ok(Box::new(AnthropicProvider)),
+        other => Err(format!(
+            "Unknown LLM provider '{other}'. Portcode currently supports: anthropic."
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +458,26 @@ mod tests {
         assert!(
             !system.to_string().contains("Claude Code"),
             "API-key requests must not carry the Claude Code identity"
+        );
+    }
+
+    #[test]
+    fn provider_for_resolves_anthropic_and_rejects_unknown() {
+        // The only implemented provider resolves; anything else fails loudly,
+        // and the message names both the bad id and the supported one.
+        assert!(provider_for("anthropic").is_ok());
+        // Extract the error without `unwrap_err()` — that requires the `Ok` type
+        // (`Box<dyn LlmProvider>`) to be `Debug`, which a trait object is not.
+        let Err(err) = provider_for("openai") else {
+            panic!("an unknown provider must not resolve");
+        };
+        assert!(
+            err.contains("openai"),
+            "error should name the bad provider: {err}"
+        );
+        assert!(
+            err.contains("anthropic"),
+            "error should name the supported provider: {err}"
         );
     }
 }
