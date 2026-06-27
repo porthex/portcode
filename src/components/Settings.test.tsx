@@ -674,6 +674,54 @@ describe("SettingsPanel — appearance toggles", () => {
     expect(m.saveSettings).not.toHaveBeenCalled();
     expect(sw).toHaveAttribute("aria-checked", "false");
   });
+
+  // ── Interface scale: a frontend-only document-zoom preset picker ─────────────
+  it("offers the interface-scale presets in an accessible group", () => {
+    renderPanel();
+
+    const group = screen.getByRole("group", { name: "Interface scale" });
+    expect(group).toBeInTheDocument();
+    for (const label of ["Compact", "Default", "Comfortable", "Large"]) {
+      expect(within(group).getByRole("button", { name: label })).toBeInTheDocument();
+    }
+  });
+
+  it("marks the active scale with aria-pressed (not colour alone)", () => {
+    useStore.setState({ uiScale: 1 });
+    renderPanel();
+
+    const group = screen.getByRole("group", { name: "Interface scale" });
+    // The active preset is conveyed via aria-pressed so it's not colour-only.
+    expect(within(group).getByRole("button", { name: "Default" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(within(group).getByRole("button", { name: "Large" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
+  it("selecting a preset drives the store's setUiScale (client-only, no ipc.saveSettings)", () => {
+    useStore.setState({ uiScale: 1 });
+    renderPanel();
+
+    const group = screen.getByRole("group", { name: "Interface scale" });
+    fireEvent.click(within(group).getByRole("button", { name: "Large" }));
+
+    expect(useStore.getState().uiScale).toBe(1.25);
+    expect(document.documentElement.style.zoom).toBe("1.25");
+    expect(m.saveSettings).not.toHaveBeenCalled();
+    // The newly active preset now reports pressed; the prior one is released.
+    expect(within(group).getByRole("button", { name: "Large" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(within(group).getByRole("button", { name: "Default" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
 });
 
 describe("SettingsPanel — footer environment label", () => {

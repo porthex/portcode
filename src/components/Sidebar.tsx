@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState, type DragEvent, type KeyboardEvent } from "react";
 
+import { useContextMenu, type ContextMenuItem } from "./ContextMenu";
 import { isTauri } from "../lib/ipc";
 import {
   buildSidebarRows,
@@ -9,7 +10,7 @@ import {
   type SidebarRow,
 } from "../lib/sessionView";
 import { useStore } from "../store/store";
-import type { Session, SessionGroup, SessionSort, SessionStatus } from "../types";
+import type { Session, SessionFolder, SessionGroup, SessionSort, SessionStatus } from "../types";
 
 const SORT_OPTIONS: { value: SessionSort; label: string }[] = [
   { value: "recent", label: "Recent" },
@@ -96,6 +97,9 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
   // Where a drag-reorder would drop, for the insertion-line indicator.
   const [dropHint, setDropHint] = useState<DropHint | null>(null);
+
+  // Right-click context menus for session + folder rows (and the empty list area).
+  const { onContextMenu, menu: ctxMenu } = useContextMenu();
 
   const archived = useMemo(() => new Set(archivedIds), [archivedIds]);
   const { rows, visible } = useMemo(
@@ -190,6 +194,88 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
     setManualOrder(next);
   };
 
+  // Right-click items for a session row. Mutating actions are disabled while a turn
+  // streams (mirrors the per-row button guards). "Move to folder" is a flat section
+  // (a heading + one item per folder) so there's no submenu risk; "Remove from
+  // folder" only appears when the chat is in one.
+  const sessionMenuItems = (s: Session, status: SessionStatus): ContextMenuItem[] => {
+    const inFolder = folderOf[s.id] ?? null;
+    const items: ContextMenuItem[] = [
+      {
+        label: "New chat",
+        icon: <PlusGlyph />,
+        onSelect: () => void newSession(),
+        disabled: streaming,
+      },
+      {
+        label: status === "archived" ? "Unarchive" : "Archive",
+        icon: <ArchiveIcon />,
+        onSelect: () => toggleArchived(s.id),
+        disabled: streaming,
+      },
+    ];
+    // Move-to-folder section: only meaningful in the manual (folder) mode.
+    if (groupBy === "none" && folders.length > 0) {
+      let first = true;
+      for (const f of folders) {
+        items.push({
+          label: f.name,
+          icon: <FolderGlyph />,
+          headingBefore: first ? "Move to folder" : undefined,
+          separatorBefore: first || undefined,
+          onSelect: () => moveSessionToFolder(s.id, f.id),
+          disabled: inFolder === f.id,
+        });
+        first = false;
+      }
+      if (inFolder !== null) {
+        items.push({
+          label: "Remove from folder",
+          icon: <RemoveFolderGlyph />,
+          onSelect: () => moveSessionToFolder(s.id, null),
+        });
+      }
+    }
+    items.push({
+      label: "Delete",
+      icon: <TrashGlyph />,
+      danger: true,
+      separatorBefore: true,
+      onSelect: () => void deleteSession(s.id),
+      disabled: streaming,
+    });
+    return items;
+  };
+
+  // Right-click items for a folder row.
+  const folderMenuItems = (folder: SessionFolder): ContextMenuItem[] => [
+    { label: "New folder", icon: <NewFolderIcon />, onSelect: () => addFolder() },
+    { label: "Rename", icon: <RenameGlyph />, onSelect: () => startRename(folder.id, folder.name) },
+    {
+      label: "Delete folder",
+      icon: <TrashGlyph />,
+      danger: true,
+      separatorBefore: true,
+      onSelect: () => deleteFolder(folder.id),
+    },
+  ];
+
+  // Right-click items for the empty list background (loose area / no row hit).
+  const listMenuItems = (): ContextMenuItem[] => {
+    const items: ContextMenuItem[] = [
+      {
+        label: "New chat",
+        icon: <PlusGlyph />,
+        onSelect: () => void newSession(),
+        disabled: streaming,
+      },
+    ];
+    if (groupBy === "none") {
+      items.push({ label: "New folder", icon: <NewFolderIcon />, onSelect: () => addFolder() });
+    }
+    return items;
+  };
+
   // ── Row renderers (close over the handlers above; one element per SidebarRow) ──
   const renderRow = (row: SidebarRow) => {
     switch (row.kind) {
@@ -222,6 +308,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
       <div
         key={`f:${folder.id}`}
         className={`pc-row group rounded-lg px-2 py-1.5 ${dragOver ? "pc-droptarget" : ""}`}
+        onContextMenu={onContextMenu(folderMenuItems(folder))}
         onDragOver={(e) => {
           e.preventDefault();
           setDragOverFolderId(folder.id);
@@ -310,6 +397,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
       <div
         key={s.id}
         draggable={reorderable}
+        onContextMenu={onContextMenu(sessionMenuItems(s, status))}
         onDragStart={(e) => {
           e.dataTransfer.setData("text/pc-session", s.id);
           e.dataTransfer.effectAllowed = "move";
@@ -348,6 +436,32 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         }
       >
         <div className="flex items-center">
+          {reorderable && (
+            // Explicit drag handle. The title is a full-width <button>, and
+            // Chromium/WebView2 won't reliably start the parent row's native
+            // drag when the press lands on a nested interactive <button> — so
+            // grabbing a chat by its title (the obvious target) did nothing.
+            // This non-button grip is an unambiguous drag surface: it carries
+            // its own draggable/onDragStart so the gesture always initiates,
+            // and stops the event bubbling so the row's handler doesn't re-fire.
+            <span
+              draggable
+              onDragStart={(e) => {
+                e.stopPropagation();
+                e.dataTransfer.setData("text/pc-session", s.id);
+                e.dataTransfer.effectAllowed = "move";
+              }}
+              onDragEnd={() => {
+                setDropHint(null);
+                setDragOverFolderId(null);
+              }}
+              aria-hidden="true"
+              title="Drag to reorder or move into a folder"
+              className="pc-drag-handle -ml-1 mr-0.5 flex h-6 w-3.5 shrink-0 items-center justify-center text-faint opacity-0 transition-opacity group-hover:opacity-100"
+            >
+              ⠿
+            </span>
+          )}
           <button
             ref={(el) => {
               rowRefs.current[navIndex] = el;
@@ -372,7 +486,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
               </span>
             </span>
             <span
-              className={`truncate pl-3 font-mono text-[9.5px] ${
+              className={`truncate pl-3 font-mono text-[10.5px] ${
                 active ? "text-muted" : "text-faint"
               }`}
             >
@@ -438,7 +552,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         </div>
         <div className="flex min-w-0 flex-col">
           <span className="pc-wordmark pc-wordmark--glitch">PORTCODE</span>
-          <span className="pc-eyebrow-mono text-[8.5px]">PORTHEX · v0.3.1-α</span>
+          <span className="pc-eyebrow-mono text-[10px]">PORTHEX · v0.3.1-α</span>
         </div>
         {collapsible && (
           <button
@@ -471,7 +585,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
       {/* SESSIONS toolbar: label + total count, then New-folder / Sort / Group */}
       <div className="relative px-3 pb-1.5 pt-1">
         <div className="flex items-center gap-2">
-          <span className="font-mono text-[9.5px] uppercase tracking-[2px] text-faint">
+          <span className="font-mono text-[10.5px] uppercase tracking-[2px] text-faint">
             Sessions
           </span>
           <span className="pc-count" aria-hidden="true">
@@ -554,6 +668,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
       <nav
         aria-label="Session list"
         onKeyDown={onListKeyDown}
+        onContextMenu={onContextMenu(listMenuItems())}
         onDragOver={groupBy === "none" ? (e) => e.preventDefault() : undefined}
         onDrop={
           groupBy === "none"
@@ -580,7 +695,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
           Settings
           {authed && (
             <span className="ml-auto flex items-center gap-1.5" title={authTitle}>
-              <span className="font-mono text-[9px] tracking-wide text-success">
+              <span className="font-mono text-[10px] tracking-wide text-success">
                 {signedInClaude ? "CLAUDE" : "KEY SET"}
               </span>
               <span className="pc-dot pc-dot--ring" aria-hidden="true" />
@@ -590,17 +705,18 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         {/* Footer chrome — honest labels derived from real state, never fabricated
             telemetry: the live session count, the backend stack identity, and
             whether the native Rust core is attached vs the browser preview mock. */}
-        <div className="mt-2 flex justify-between px-2 font-mono text-[9px] tracking-wide text-faint">
-          <span>
+        <div className="mt-2 flex items-center justify-between gap-1.5 px-2 font-mono text-[9px] text-faint">
+          <span className="whitespace-nowrap">
             <span aria-hidden="true">◴</span>{" "}
             {sessions.length === 1 ? "1 SESSION" : `${sessions.length} SESSIONS`}
           </span>
-          <span>RUST · TOKIO</span>
-          <span>
+          <span className="truncate">RUST · TOKIO</span>
+          <span className="whitespace-nowrap">
             <span aria-hidden="true">◉</span> {isTauri() ? "CORE" : "PREVIEW"}
           </span>
         </div>
       </div>
+      {ctxMenu}
     </aside>
   );
 }
@@ -856,6 +972,70 @@ function ArchiveIcon() {
       />
       <path d="M3 5h18v3H3z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
       <path d="M10 12h4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+// ── Context-menu glyphs ──────────────────────────────────────────────────────
+function PlusGlyph() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function FolderGlyph() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M3 7a2 2 0 0 1 2-2h3l2 2h9a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function RemoveFolderGlyph() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M3 7a2 2 0 0 1 2-2h3l2 2h9a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinejoin="round"
+      />
+      <path d="M9 13h6" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function RenameGlyph() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M4 16.5V20h3.5L18 9.5 14.5 6 4 16.5Z"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinejoin="round"
+      />
+      <path d="M13 7.5 16.5 11" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function TrashGlyph() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M5 7h14M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
     </svg>
   );
 }
