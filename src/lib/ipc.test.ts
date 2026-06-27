@@ -101,6 +101,15 @@ describe("Tauri command serialization", () => {
     });
   });
 
+  it("telemetry_set_consent forwards the enabled flag", async () => {
+    const { ipc, invoke } = await load();
+    invoke.mockResolvedValue(undefined);
+    await expect(ipc.setTelemetryConsent(true)).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("telemetry_set_consent", { enabled: true });
+    await ipc.setTelemetryConsent(false);
+    expect(invoke).toHaveBeenCalledWith("telemetry_set_consent", { enabled: false });
+  });
+
   it("session commands serialize their identifiers", async () => {
     const { ipc, invoke } = await load();
     invoke.mockResolvedValue(undefined);
@@ -426,6 +435,13 @@ describe("browser fallback (no Tauri core)", () => {
   it("resolvePermission is harmless when nothing is pending", async () => {
     const { ipc } = await load();
     await expect(ipc.resolvePermission("missing", "allow")).resolves.toBeUndefined();
+  });
+
+  it("setTelemetryConsent is an inert no-op without a Rust host (no invoke)", async () => {
+    const { ipc, invoke } = await load();
+    await expect(ipc.setTelemetryConsent(true)).resolves.toBeUndefined();
+    await expect(ipc.setTelemetryConsent(false)).resolves.toBeUndefined();
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it("phoneSyncStatus returns a stable mock identity with no paired devices initially", async () => {
