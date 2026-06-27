@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use tauri::AppHandle;
 use uuid::Uuid;
 
+use crate::agents;
 use crate::db::{self, Db};
 use crate::llm::{self, Block, ChatMessage, StreamEvent};
 use crate::oauth;
@@ -247,6 +248,7 @@ pub async fn run(
     db: Arc<Db>,
     cancels: Cancels,
     pending: Pending,
+    agents: agents::Agents,
     oauth_refresh: Arc<tokio::sync::Mutex<()>>,
     session_id: String,
     user_text: String,
@@ -304,6 +306,7 @@ pub async fn run(
         &settings,
         &db,
         &pending,
+        &agents,
         &cancel,
         &oauth_refresh,
         &channel,
@@ -331,6 +334,7 @@ async fn run_inner(
     settings: &Arc<Mutex<Settings>>,
     db: &Arc<Db>,
     pending: &Pending,
+    agents: &agents::Agents,
     cancel: &Arc<AtomicBool>,
     refresh_lock: &Arc<tokio::sync::Mutex<()>>,
     channel: &str,
@@ -383,10 +387,14 @@ async fn run_inner(
             http: http.clone(),
             settings: settings.clone(),
             pending: pending.clone(),
+            agents: agents.clone(),
             cancel: cancel.clone(),
             refresh_lock: refresh_lock.clone(),
             parent_channel: channel.to_string(),
             workspace: workspace.clone(),
+            // The top-level run is not itself a registered subagent, so the
+            // children it launches have no parent agent id.
+            self_id: None,
             depth: 1,
         }))
     } else {
@@ -427,6 +435,7 @@ async fn run_inner(
         cancel,
         channel,
         channel,
+        None,
         &registry,
         &system,
         &ctx,
@@ -494,6 +503,9 @@ struct LoopOutcome {
 ///    cost rolls up into the session total instead of vanishing on an unwatched
 ///    channel). A subagent points this at its PARENT channel; the interactive run
 ///    passes its own `agent://{session}` for both.
+///  * `agent_id` is `Some` for a subagent — each completed turn then emits an
+///    `AgentProgress` on `session_channel` so the agents panel shows liveness.
+///    `None` for the interactive run (which has no panel row).
 ///  * `persist` is `Session` for the interactive run (writes to the DB) and
 ///    `Ephemeral` for a subagent (in-memory only).
 #[allow(clippy::too_many_arguments)]
@@ -508,6 +520,7 @@ async fn run_loop_core(
     cancel: &Arc<AtomicBool>,
     agent_channel: &str,
     session_channel: &str,
+    agent_id: Option<&str>,
     registry: &tools::Registry,
     system: &str,
     ctx: &ToolCtx,
@@ -565,6 +578,20 @@ async fn run_loop_core(
                 output_tokens: turn.output_tokens,
             },
         );
+
+        // Liveness for the agents panel: a subagent reports each completed turn on
+        // the session channel (where the panel listens). `steps` is its 1-based turn
+        // count. The interactive run (`agent_id == None`) has no panel row.
+        if let Some(id) = agent_id {
+            emit(
+                app,
+                session_channel,
+                StreamEvent::AgentProgress {
+                    agent_id: id.to_string(),
+                    step: steps as u32,
+                },
+            );
+        }
 
         // Track the latest assistant text so a subagent can return its final
         // answer; the closing (non-tool-use) turn overwrites any earlier text.
@@ -736,6 +763,42 @@ fn subagent_answer(description: &str, final_text: &str, stop_reason: &str) -> St
     }
 }
 
+/// The `AgentFinished` status string for a subagent that ran to completion: a
+/// cancelled run reports `"cancelled"`, anything else `"ok"`. (A subagent that
+/// errored out — `run_loop_core` returned `Err` — reports `"error"`; see
+/// [`spawn_status`].)
+fn finish_status(stop_reason: &str) -> &'static str {
+    if stop_reason == "cancelled" {
+        "cancelled"
+    } else {
+        "ok"
+    }
+}
+
+/// The terminal `AgentFinished` status for a finished spawn, error case included:
+/// an `Err` from the loop reports `"error"`, otherwise the stop reason decides
+/// ok/cancelled. Pulled out so the "ALWAYS announce a terminal status, even when
+/// the run errored" contract is unit-testable without standing up a live run (the
+/// emit + deregister that follow it are plain, inspection-verified control flow).
+fn spawn_status(result: &Result<LoopOutcome, String>) -> &'static str {
+    match result {
+        Ok(outcome) => finish_status(&outcome.stop_reason),
+        Err(_) => "error",
+    }
+}
+
+/// The session id a channel belongs to: `agent://{session}` and a subagent's
+/// `agent://{session}:{agentId}` both map to `{session}` (the colon-suffixed agent
+/// id is not part of the session). Used to register a subagent under its session.
+fn session_of(channel: &str) -> &str {
+    channel
+        .strip_prefix("agent://")
+        .unwrap_or(channel)
+        .split(':')
+        .next()
+        .unwrap_or(channel)
+}
+
 /// Launches subagents for the `task` tool. Holds owned clones of everything a
 /// child run needs, so it can outlive the call that built it and spawn children on
 /// demand. One per parent run; cloned (with `depth + 1`) onto each child it
@@ -746,16 +809,25 @@ struct AgentSpawner {
     http: reqwest::Client,
     settings: Arc<Mutex<Settings>>,
     pending: Pending,
-    /// Shared with the parent run: a Stop on the parent flips this flag and the
-    /// child loop observes it, so cancelling a parent cancels its subagents too.
-    /// (A per-subagent Stop is a later increment.)
+    /// Live-subagent registry: each child registers its OWN cancel flag here so the
+    /// agents panel can Stop one without the others, and a session-wide Stop can
+    /// flip them all.
+    agents: agents::Agents,
+    /// The cancel flag of the agent that OWNS this spawner — the top-level run's
+    /// flag for the root spawner, or a subagent's own flag for a child spawner.
+    /// Only used to race-close: if the owner was cancelled between the parent's
+    /// last check and the child's registration, the child starts already-cancelled.
     cancel: Arc<AtomicBool>,
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
     /// The parent's `agent://{session}` channel — where a subagent's permission
-    /// prompts surface (so the existing prompt UI handles them) and the base for
-    /// the child's own stream channel.
+    /// prompts and lifecycle/usage events surface, and the base for the child's own
+    /// stream channel.
     parent_channel: String,
     workspace: PathBuf,
+    /// The id of the subagent that owns this spawner, or `None` for the top-level
+    /// run. A launched child records this as its `parent_id` (for cancel cascade and
+    /// the panel's structure).
+    self_id: Option<String>,
     /// The depth the children THIS spawner launches run at (top-level run → 1).
     depth: usize,
 }
@@ -778,11 +850,31 @@ impl tools::Spawner for AgentSpawner {
         let provider = llm::provider_for(&snapshot.provider)?;
 
         let agent_id = Uuid::new_v4().to_string();
+        let session_id = session_of(&self.parent_channel).to_string();
         // The child's own stream channel, distinct from the parent's so its deltas
-        // never fold into the parent transcript. No desktop listener subscribes to
-        // it yet (the live agents panel is a later increment), so for now a subagent
-        // is visible only through its permission prompts and its final result.
-        let child_channel = format!("{}:{}", self.parent_channel, agent_id);
+        // never fold into the parent transcript. The agents panel tracks the child
+        // via the lifecycle/progress events on the SESSION channel (below), not this
+        // private channel, so it still has no desktop listener.
+        let child_channel = format!("agent://{session_id}:{agent_id}");
+
+        // Register the child's OWN cancel flag so a per-agent or session-wide Stop
+        // can reach it. Race-close: if this spawner's owner was already cancelled
+        // (a Stop that landed during the launch), start the child cancelled so it
+        // stops on its first loop check rather than running a full turn.
+        let child_cancel =
+            agents::register(&self.agents, &agent_id, &session_id, self.self_id.clone());
+        if self.cancel.load(Ordering::Relaxed) {
+            child_cancel.store(true, Ordering::Relaxed);
+        }
+        emit(
+            &self.app,
+            &self.parent_channel,
+            StreamEvent::AgentStarted {
+                agent_id: agent_id.clone(),
+                description: spec.description.clone(),
+                parent_id: self.self_id.clone(),
+            },
+        );
 
         // A child may spawn its own children only while still under the cap; at the
         // last allowed depth it gets no spawner and no `task` tool (a leaf).
@@ -790,6 +882,8 @@ impl tools::Spawner for AgentSpawner {
         let registry = tools::subagent_registry(can_spawn);
         let child_spawner: Option<Arc<dyn tools::Spawner>> = if can_spawn {
             Some(Arc::new(AgentSpawner {
+                cancel: child_cancel.clone(),
+                self_id: Some(agent_id.clone()),
                 depth: self.depth + 1,
                 ..self.clone()
             }))
@@ -811,7 +905,7 @@ impl tools::Spawner for AgentSpawner {
             }],
         }];
 
-        let outcome = run_loop_core(
+        let result = run_loop_core(
             &self.app,
             &self.http,
             provider.as_ref(),
@@ -819,18 +913,33 @@ impl tools::Spawner for AgentSpawner {
             cred,
             &self.refresh_lock,
             &self.pending,
-            &self.cancel,
+            &child_cancel,
             &child_channel,       // agent_channel: the subagent's private output
-            &self.parent_channel, // session_channel: prompts + usage roll up here
+            &self.parent_channel, // session_channel: prompts + usage + lifecycle
+            Some(&agent_id),
             &registry,
             &system,
             &ctx,
             messages,
             &Persist::Ephemeral,
         )
-        .await?;
+        .await;
+
+        // ALWAYS announce completion and deregister, on success OR error, so the
+        // panel never shows a ghost agent and the registry never leaks a flag.
+        let status = spawn_status(&result);
+        emit(
+            &self.app,
+            &self.parent_channel,
+            StreamEvent::AgentFinished {
+                agent_id: agent_id.clone(),
+                status: status.to_string(),
+            },
+        );
+        agents::finish(&self.agents, &agent_id);
 
         // The subagent's final assistant text IS its answer to the launching agent.
+        let outcome = result?;
         Ok(subagent_answer(
             &spec.description,
             &outcome.final_text,
@@ -842,9 +951,10 @@ impl tools::Spawner for AgentSpawner {
 #[cfg(test)]
 mod tests {
     use super::{
-        assistant_text, batch_cancelled, child_can_spawn, derive_title, is_terminal_auth_error,
-        resolve_system_prompt, step_limit_exceeded, subagent_answer, AgentConfig, Block,
-        ChatMessage, Db, Persist, MAX_AGENT_STEPS, MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
+        assistant_text, batch_cancelled, child_can_spawn, derive_title, finish_status,
+        is_terminal_auth_error, resolve_system_prompt, session_of, spawn_status,
+        step_limit_exceeded, subagent_answer, AgentConfig, Block, ChatMessage, Db, LoopOutcome,
+        Persist, MAX_AGENT_STEPS, MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
     };
     use std::path::Path;
 
@@ -905,6 +1015,44 @@ mod tests {
         assert!(note.contains("without a text summary"));
         assert!(note.contains("audit deps"));
         assert!(note.contains("cancelled"));
+    }
+
+    #[test]
+    fn finish_status_maps_cancelled_vs_done() {
+        // A subagent that ran to completion reports "ok"; a Stop reports "cancelled".
+        // (The error case — run_loop_core returned Err — is set at the call site.)
+        assert_eq!(finish_status("end_turn"), "ok");
+        assert_eq!(finish_status("max_tokens"), "ok");
+        assert_eq!(finish_status("cancelled"), "cancelled");
+    }
+
+    #[test]
+    fn spawn_status_reports_a_terminal_state_for_every_outcome_including_error() {
+        // The panel's AgentFinished is emitted for ALL three exits — a clean finish,
+        // a Stop, and a hard error (the loop returned Err) — so a subagent never
+        // hangs in the panel as "running" and the registry never leaks its flag.
+        let ok = Ok(LoopOutcome {
+            stop_reason: "end_turn".into(),
+            final_text: "done".into(),
+        });
+        let cancelled = Ok(LoopOutcome {
+            stop_reason: "cancelled".into(),
+            final_text: String::new(),
+        });
+        let errored: Result<LoopOutcome, String> = Err("boom".into());
+        assert_eq!(spawn_status(&ok), "ok");
+        assert_eq!(spawn_status(&cancelled), "cancelled");
+        assert_eq!(spawn_status(&errored), "error");
+    }
+
+    #[test]
+    fn session_of_recovers_the_session_from_a_channel() {
+        // The top-level channel is the session id verbatim; a subagent's
+        // colon-suffixed channel still resolves to the same session.
+        assert_eq!(session_of("agent://sess-1"), "sess-1");
+        assert_eq!(session_of("agent://sess-1:agent-abc"), "sess-1");
+        // Defensive: a bare/unexpected channel passes through rather than panicking.
+        assert_eq!(session_of("sess-1"), "sess-1");
     }
 
     #[test]

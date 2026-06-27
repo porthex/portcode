@@ -40,7 +40,29 @@ export type StreamEvent =
     }
   | { type: "usage"; inputTokens: number; outputTokens: number }
   | { type: "turn_end"; stopReason: string }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  // ── subagents (the `task` tool) — see AgentInfo / the live agents panel ──
+  /** A subagent started. `parentId` is the launching subagent, absent at top level. */
+  | { type: "agent_started"; agentId: string; description: string; parentId?: string }
+  /** A subagent completed a model turn — `step` is its 1-based turn count. */
+  | { type: "agent_progress"; agentId: string; step: number }
+  /** A subagent finished. `status` is "ok" | "cancelled" | "error". */
+  | { type: "agent_finished"; agentId: string; status: string };
+
+/** Terminal/live state of a subagent in the agents panel. */
+export type AgentStatus = "running" | "ok" | "cancelled" | "error";
+
+/** A subagent (the `task` tool) tracked for the live agents panel. */
+export interface AgentInfo {
+  id: string;
+  description: string;
+  /** The launching subagent's id, or undefined for a top-level launch. */
+  parentId?: string;
+  /** "running" until an `agent_finished` arrives, then its terminal status. */
+  status: AgentStatus;
+  /** Latest reported turn count (`agent_progress`); 0 before the first turn. */
+  step: number;
+}
 
 export interface PendingPermission {
   id: string;
@@ -214,6 +236,7 @@ export interface ConnectInfo {
 export type RemoteCommand =
   | { cmd: "run"; session_id: string; text: string }
   | { cmd: "cancel"; session_id: string }
+  | { cmd: "cancel_agent"; agent_id: string }
   | { cmd: "permission"; id: string; decision: string }
   | { cmd: "create_session"; title?: string | null };
 

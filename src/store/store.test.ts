@@ -29,6 +29,7 @@ vi.mock("../lib/ipc", () => ({
   resolvePermission: vi.fn(),
   openFolder: vi.fn(),
   runAgent: vi.fn(),
+  cancelAgentById: vi.fn(),
   oauthStatus: vi.fn(),
   startOauthLogin: vi.fn(),
   oauthLogout: vi.fn(),
@@ -77,6 +78,7 @@ beforeEach(() => {
   m.resolvePermission.mockResolvedValue(undefined);
   m.openFolder.mockResolvedValue(null);
   m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}), dispose: vi.fn() });
+  m.cancelAgentById.mockResolvedValue(undefined);
   m.oauthStatus.mockResolvedValue(signedOut);
   m.startOauthLogin.mockResolvedValue(signedOut);
   m.oauthLogout.mockResolvedValue(undefined);
@@ -2213,5 +2215,130 @@ describe("remote client", () => {
       expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(1);
       expect(useStore.getState().remoteConnected).toBe(false);
     });
+  });
+});
+
+describe("live subagents (agents panel)", () => {
+  // Drive the desktop event path: send() wires onEvent, which we capture and feed
+  // the agent lifecycle events the Rust spawner emits on the session channel.
+  const startTurn = async (id = "a") => {
+    let emit!: (e: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
+    useStore.setState({
+      sessions: [session({ id, title: "New chat" })],
+      activeId: id,
+      messages: { [id]: [] },
+    });
+    await useStore.getState().send("go");
+    return emit;
+  };
+
+  it("tracks a subagent's lifecycle: started → progress → finished", async () => {
+    const emit = await startTurn();
+
+    emit({ type: "agent_started", agentId: "g1", description: "audit deps" });
+    let a = useStore.getState().agents.a;
+    expect(a).toHaveLength(1);
+    expect(a[0]).toMatchObject({ id: "g1", description: "audit deps", status: "running", step: 0 });
+
+    emit({ type: "agent_progress", agentId: "g1", step: 3 });
+    expect(useStore.getState().agents.a[0].step).toBe(3);
+
+    emit({ type: "agent_finished", agentId: "g1", status: "ok" });
+    a = useStore.getState().agents.a;
+    expect(a[0].status).toBe("ok");
+    expect(a[0].step).toBe(3); // progress preserved
+  });
+
+  it("keeps multiple subagents in start order and records parentage", async () => {
+    const emit = await startTurn();
+
+    emit({ type: "agent_started", agentId: "g1", description: "first" });
+    emit({ type: "agent_started", agentId: "g2", description: "second", parentId: "g1" });
+
+    const a = useStore.getState().agents.a;
+    expect(a.map((x) => x.id)).toEqual(["g1", "g2"]);
+    expect(a[1].parentId).toBe("g1");
+  });
+
+  it("maps the finish status string, defaulting an unknown value to ok", async () => {
+    const emit = await startTurn();
+    emit({ type: "agent_started", agentId: "c", description: "x" });
+    emit({ type: "agent_finished", agentId: "c", status: "cancelled" });
+    expect(useStore.getState().agents.a[0].status).toBe("cancelled");
+
+    emit({ type: "agent_started", agentId: "e", description: "y" });
+    emit({ type: "agent_finished", agentId: "e", status: "kaboom" });
+    expect(useStore.getState().agents.a.find((x) => x.id === "e")?.status).toBe("ok");
+  });
+
+  it("clears the previous turn's subagents when a new turn starts", async () => {
+    const emit = await startTurn();
+    emit({ type: "agent_started", agentId: "g1", description: "old" });
+    expect(useStore.getState().agents.a).toHaveLength(1);
+    emit({ type: "turn_end", stopReason: "end_turn" });
+
+    // The next turn on the same session starts with an empty panel.
+    await useStore.getState().send("again");
+    expect(useStore.getState().agents.a).toEqual([]);
+  });
+
+  it("ignores a progress/finished event for an agent it never saw start", async () => {
+    const emit = await startTurn();
+    emit({ type: "agent_progress", agentId: "ghost", step: 2 });
+    emit({ type: "agent_finished", agentId: "ghost", status: "ok" });
+    expect(useStore.getState().agents.a).toEqual([]);
+  });
+
+  it("folds agent events from a phone live frame onto their session", () => {
+    useStore.setState({ activeId: "a", agents: {} });
+    const frame = (event: StreamEvent): SyncFrame => ({ t: "live", session_id: "a", event });
+
+    useStore
+      .getState()
+      .applyFrame(frame({ type: "agent_started", agentId: "g1", description: "remote" }));
+    useStore.getState().applyFrame(frame({ type: "agent_progress", agentId: "g1", step: 2 }));
+    expect(useStore.getState().agents.a[0]).toMatchObject({ description: "remote", step: 2 });
+  });
+
+  it("clears the prior turn's subagents at the start of a new remote turn (phone path)", () => {
+    // The phone has no local send() for the turn — the desktop drives it — so the
+    // per-turn reset must happen on the turn_start frame, symmetric to the desktop.
+    useStore.setState({
+      activeId: "a",
+      agents: { a: [{ id: "old", description: "prior turn", status: "ok", step: 4 }] },
+    });
+    const frame = (event: StreamEvent): SyncFrame => ({ t: "live", session_id: "a", event });
+
+    useStore.getState().applyFrame(frame({ type: "turn_start", messageId: "m2" }));
+    // The stale finished subagent from the previous turn is gone.
+    expect(useStore.getState().agents.a).toEqual([]);
+
+    // This turn's subagents repopulate the now-empty panel (no accumulation).
+    useStore
+      .getState()
+      .applyFrame(frame({ type: "agent_started", agentId: "new", description: "fresh" }));
+    expect(useStore.getState().agents.a.map((x) => x.id)).toEqual(["new"]);
+  });
+
+  it("cancelAgent calls the per-agent IPC on the desktop", async () => {
+    await useStore.getState().cancelAgent("g1");
+    expect(m.cancelAgentById).toHaveBeenCalledWith("g1");
+    expect(m.phoneSyncSendCommand).not.toHaveBeenCalled();
+  });
+
+  it("cancelAgent sends a cancel_agent command in remote mode", async () => {
+    useStore.setState({ remoteConnected: true });
+    await useStore.getState().cancelAgent("g1");
+    expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({ cmd: "cancel_agent", agent_id: "g1" });
+    expect(m.cancelAgentById).not.toHaveBeenCalled();
+  });
+
+  it("cancelAgent swallows an IPC failure so the panel never throws", async () => {
+    m.cancelAgentById.mockRejectedValueOnce(new Error("ipc boom"));
+    await expect(useStore.getState().cancelAgent("g1")).resolves.toBeUndefined();
   });
 });

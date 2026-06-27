@@ -26,16 +26,19 @@ pub struct Cursor {
 }
 
 /// A command the phone issues to drive the always-on desktop. Each maps onto an
-/// existing desktop capability (`run_agent` / `cancel_agent` / `resolve_permission`
-/// / `create_session`) — the phone never runs tools or touches the workspace
-/// itself.
+/// existing desktop capability (`run_agent` / `cancel_agent` / `cancel_agent_by_id`
+/// / `resolve_permission` / `create_session`) — the phone never runs tools or
+/// touches the workspace itself.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum RemoteCommand {
     /// Start/continue a turn — proxies to `run_agent`.
     Run { session_id: String, text: String },
-    /// Stop the active turn — proxies to `cancel_agent`.
+    /// Stop the active turn (and its subagents) — proxies to `cancel_agent`.
     Cancel { session_id: String },
+    /// Stop ONE subagent (and its descendants) from the agents panel — proxies to
+    /// `cancel_agent_by_id`. Leaves the rest of the session running.
+    CancelAgent { agent_id: String },
     /// Answer a permission gate — proxies to `resolve_permission`.
     Permission { id: String, decision: String },
     /// Open a new session — proxies to `create_session`.
@@ -167,6 +170,9 @@ mod tests {
         for command in [
             RemoteCommand::Cancel {
                 session_id: "s1".into(),
+            },
+            RemoteCommand::CancelAgent {
+                agent_id: "a1".into(),
             },
             RemoteCommand::Permission {
                 id: "p1".into(),

@@ -1,5 +1,7 @@
 import { create } from "zustand";
 import type {
+  AgentInfo,
+  AgentStatus,
   ContentBlock,
   Message,
   MessageRow,
@@ -66,6 +68,7 @@ interface AppState {
   activeId: string | null;
   messages: Record<string, Message[]>; // sessionId -> messages
   usage: Record<string, Usage>; // sessionId -> cumulative token usage
+  agents: Record<string, AgentInfo[]>; // sessionId -> live subagents (the agents panel)
   settings: Settings;
   oauthStatus: OAuthStatus | null; // Claude subscription sign-in state
   oauthError: string | null; // last sign-in/out failure, surfaced in Settings
@@ -126,6 +129,7 @@ interface AppState {
   deleteSession: (id: string) => Promise<void>;
   send: (text: string) => Promise<void>;
   stop: () => Promise<void>;
+  cancelAgent: (agentId: string) => Promise<void>;
   setShowSettings: (v: boolean) => void;
   setShowPalette: (v: boolean) => void;
   setAmbientRain: (v: boolean) => void;
@@ -199,6 +203,66 @@ const patchActiveRun = (
 };
 
 const now = () => Date.now();
+
+// ── Live subagents (the agents panel) ────────────────────────────────────────
+// The agent lifecycle events (agent_started / agent_progress / agent_finished)
+// maintain a per-session list of subagents. These pure helpers let the desktop
+// `onEvent` path and the phone `applyRemoteEvent` path update the map identically.
+
+// Map the wire status string to the AgentStatus union (defensive: an unknown
+// value reads as a finished "ok" rather than widening the type).
+const toAgentStatus = (s: string): AgentStatus =>
+  s === "running" || s === "cancelled" || s === "error" ? s : "ok";
+
+const patchAgents = (
+  agents: Record<string, AgentInfo[]>,
+  sessionId: string,
+  fn: (list: AgentInfo[]) => AgentInfo[],
+): Record<string, AgentInfo[]> => ({ ...agents, [sessionId]: fn(agents[sessionId] ?? []) });
+
+// Add a newly-started agent, preserving start order; replace on a duplicate id
+// (defensive against a re-delivered agent_started) rather than listing it twice.
+const startAgent = (list: AgentInfo[], info: AgentInfo): AgentInfo[] =>
+  list.some((a) => a.id === info.id)
+    ? list.map((a) => (a.id === info.id ? info : a))
+    : [...list, info];
+
+// Patch one agent by id; a no-op when the id isn't present (e.g. a progress /
+// finished event arriving for an agent whose start we never saw).
+const updateAgent = (list: AgentInfo[], id: string, patch: Partial<AgentInfo>): AgentInfo[] =>
+  list.map((a) => (a.id === id ? { ...a, ...patch } : a));
+
+// Fold one agent lifecycle StreamEvent into a session's agent list. Shared by the
+// desktop and phone event paths; returns the agents map unchanged for any other
+// event so callers can route the three agent events through one branch.
+const applyAgentEvent = (
+  agents: Record<string, AgentInfo[]>,
+  sessionId: string,
+  e: StreamEvent,
+): Record<string, AgentInfo[]> => {
+  switch (e.type) {
+    case "agent_started":
+      return patchAgents(agents, sessionId, (list) =>
+        startAgent(list, {
+          id: e.agentId,
+          description: e.description,
+          parentId: e.parentId,
+          status: "running",
+          step: 0,
+        }),
+      );
+    case "agent_progress":
+      return patchAgents(agents, sessionId, (list) =>
+        updateAgent(list, e.agentId, { step: e.step }),
+      );
+    case "agent_finished":
+      return patchAgents(agents, sessionId, (list) =>
+        updateAgent(list, e.agentId, { status: toAgentStatus(e.status) }),
+      );
+    default:
+      return agents;
+  }
+};
 
 // A turn must always reach a terminal state. If the backend hangs or dies without
 // emitting turn_end/error, this client-side watchdog force-ends the turn once the
@@ -281,6 +345,7 @@ export const useStore = create<AppState>((set, get) => ({
   activeId: null,
   messages: {},
   usage: {},
+  agents: {},
   settings: DEFAULT_SETTINGS,
   oauthStatus: null,
   oauthError: null,
@@ -596,6 +661,8 @@ export const useStore = create<AppState>((set, get) => ({
           ...st.messages,
           [activeId]: [...msgs, userMsg, assistant],
         },
+        // Each turn's agents panel starts empty; this turn's subagents repopulate it.
+        agents: { ...st.agents, [activeId]: [] },
       };
     });
 
@@ -696,6 +763,11 @@ export const useStore = create<AppState>((set, get) => ({
           settle(false);
           setRun(set, activeId, { streaming: false, cancel: null, pendingPermission: null });
           break;
+        case "agent_started":
+        case "agent_progress":
+        case "agent_finished":
+          set((st) => ({ agents: applyAgentEvent(st.agents, activeId, e) }));
+          break;
       }
     };
 
@@ -763,6 +835,22 @@ export const useStore = create<AppState>((set, get) => ({
       /* the cancel_agent IPC failed; recover the UI anyway so the composer isn't stuck */
     } finally {
       patchActiveRun(set, get, { streaming: false, cancel: null, pendingPermission: null });
+    }
+  },
+
+  // Stop ONE subagent (and its descendants) from the agents panel, leaving the
+  // top-level turn running. The real status arrives back as an `agent_finished`
+  // event (status "cancelled"), which updates the panel row.
+  async cancelAgent(agentId: string) {
+    if (get().remoteConnected) {
+      // The subagent runs on the desktop; cancel it over the link.
+      await get().sendRemoteCommand({ cmd: "cancel_agent", agent_id: agentId });
+      return;
+    }
+    try {
+      await ipc.cancelAgentById(agentId);
+    } catch {
+      /* best-effort: the subagent will also stop on the session-wide Stop */
     }
   },
 
@@ -1076,6 +1164,8 @@ export const useStore = create<AppState>((set, get) => ({
       remoteVerified: false,
       // A fresh dial inherits no live runs — reset the whole map and the mirror.
       runs: {},
+      // ...and no live subagents; the desktop's live frames repopulate them.
+      agents: {},
       streaming: false,
       cancel: null,
       pendingPermission: null,
@@ -1318,6 +1408,12 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
           // representable without flipping the visible composer.
           ...runPatch(st, sessionId, { streaming: true }),
           messages: { ...st.messages, [sessionId]: [...msgs, assistant] },
+          // Each turn's agents panel starts empty. The desktop clears it in send();
+          // the phone has no local send() for the turn (the desktop drives it), so
+          // turn_start — the per-turn boundary where the assistant bubble is created
+          // — is the symmetric place to reset it, else finished subagents from prior
+          // turns would accumulate in the panel for the whole connected session.
+          agents: { ...st.agents, [sessionId]: [] },
         };
       });
       break;
@@ -1387,6 +1483,11 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
     case "turn_end":
       if (useStore.getState().activeId === sessionId) clearRemoteWatchdog();
       setRun(set, sessionId, { streaming: false, pendingPermission: null });
+      break;
+    case "agent_started":
+    case "agent_progress":
+    case "agent_finished":
+      set((st) => ({ agents: applyAgentEvent(st.agents, sessionId, e) }));
       break;
   }
 }

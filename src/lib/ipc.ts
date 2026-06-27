@@ -351,6 +351,16 @@ export async function runAgent(
   return mock.runAgent(sessionId, text, onEvent);
 }
 
+/** Stop ONE subagent (and its descendants) by id, leaving the rest of the turn
+ *  running. Mirrors `cancel_agent`, but targets the live agents registry. A no-op
+ *  in the browser mock (no real subagents run there). */
+export async function cancelAgentById(agentId: string): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("cancel_agent_by_id", { agentId });
+  }
+}
+
 // ── Browser mock ──────────────────────────────────────────────────────────────
 // A deterministic fake agent so the UI is alive without the Rust core.
 

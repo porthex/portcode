@@ -14,31 +14,31 @@ PLAN → IMPLEMENT (code + tests together) → REVIEW (adversarial, ≥3 lenses,
 
 ⬜ not started · 🟦 in progress · ✅ done (CI-green) · ⏸ paused (needs user decision)
 
-| Phase | Item                                     | Status | Notes                                                                                                                                                                         |
-| ----- | ---------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0.1   | `LlmProvider` provider seam              | ✅     | PR #82 (`nice-dijkstra-63314b`), CI-green; this branch is stacked on it                                                                                                       |
-| 0.2   | Rust SSE-mock test harness               | ✅     | PR #83; pure `TurnBuilder` + 13 tests; CI green (Rust/Frontend/Smoke/Android)                                                                                                 |
-| 0.3   | Injectable tool registry + system prompt | ✅     | PR #83; `AgentConfig` (registry + prompt override) threaded into `run_inner`; +5 tests; CI green                                                                              |
-| 0.4   | Multi-run store model                    | ✅     | PR #83; `runs` map + derived active-run mirror; per-run state; +6 tests; coverage green; CI green                                                                             |
-| 1     | Permission modes + rules + cycling       | ✅     | PR #83; A1 gate core (modes+rules, security-audited) + A2a mode UI/cycle + A2b Settings editor + guardrails; +~25 tests; CI green                                             |
-| 1     | Plan mode                                | ✅     | read-only `plan_run()` registry + plan steer + gate-denies-mutating (defense-in-depth) + approve-to-exit banner; CI green                                                     |
-| 1     | Pre-apply accept/reject diff             | ✅     | `Tool::preview()` (shared `compute_edit` so preview==run) → `diff` on `PermissionRequest` → colour-coded prompt diff; CI green                                                |
-| 1     | Pre-apply EDIT-in-prompt (deferred)      | ⏭     | DEFERRED follow-up (user decision): `Decision::AllowEdited` + `RemoteCommand.content` + desktop-only edit UI                                                                  |
-| 2     | Subagent runtime + `Task` tool           | 🟦     | PR1: `Spawner`/`SubagentSpec` on `ToolCtx`, `run_loop_core` + `Persist` (ephemeral children), `task` tool, depth cap; +11 tests; local clippy/test green; review + CI pending |
-| 2     | Live agents panel                        | ⬜     |                                                                                                                                                                               |
-| 2     | Parallel execution + concurrency cap     | ⬜     |                                                                                                                                                                               |
-| 2     | Per-agent git worktree isolation         | ⬜     |                                                                                                                                                                               |
-| 2     | Background tasks                         | ⬜     |                                                                                                                                                                               |
-| 3     | Rename UI                                | ⬜     | backend already exists                                                                                                                                                        |
-| 3     | Persist token/cost across reloads        | ⬜     |                                                                                                                                                                               |
-| 3     | Fork / branch a conversation             | ⬜     |                                                                                                                                                                               |
-| 3     | Checkpoints & rewind                     | ⬜     |                                                                                                                                                                               |
-| 3     | Context compaction + `/context` view     | ⬜     | behind `LlmProvider`                                                                                                                                                          |
-| 4     | Custom slash commands                    | ⬜     |                                                                                                                                                                               |
-| 4     | Hooks                                    | ⬜     |                                                                                                                                                                               |
-| 4     | Skills                                   | ⬜     |                                                                                                                                                                               |
-| 4     | MCP client                               | ⬜     |                                                                                                                                                                               |
-| 4     | Plugins                                  | ⏸      | PAUSE — needs user trust/sandbox decision                                                                                                                                     |
+| Phase | Item                                     | Status | Notes                                                                                                                                                                                                                   |
+| ----- | ---------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0.1   | `LlmProvider` provider seam              | ✅     | PR #82 (`nice-dijkstra-63314b`), CI-green; this branch is stacked on it                                                                                                                                                 |
+| 0.2   | Rust SSE-mock test harness               | ✅     | PR #83; pure `TurnBuilder` + 13 tests; CI green (Rust/Frontend/Smoke/Android)                                                                                                                                           |
+| 0.3   | Injectable tool registry + system prompt | ✅     | PR #83; `AgentConfig` (registry + prompt override) threaded into `run_inner`; +5 tests; CI green                                                                                                                        |
+| 0.4   | Multi-run store model                    | ✅     | PR #83; `runs` map + derived active-run mirror; per-run state; +6 tests; coverage green; CI green                                                                                                                       |
+| 1     | Permission modes + rules + cycling       | ✅     | PR #83; A1 gate core (modes+rules, security-audited) + A2a mode UI/cycle + A2b Settings editor + guardrails; +~25 tests; CI green                                                                                       |
+| 1     | Plan mode                                | ✅     | read-only `plan_run()` registry + plan steer + gate-denies-mutating (defense-in-depth) + approve-to-exit banner; CI green                                                                                               |
+| 1     | Pre-apply accept/reject diff             | ✅     | `Tool::preview()` (shared `compute_edit` so preview==run) → `diff` on `PermissionRequest` → colour-coded prompt diff; CI green                                                                                          |
+| 1     | Pre-apply EDIT-in-prompt (deferred)      | ⏭     | DEFERRED follow-up (user decision): `Decision::AllowEdited` + `RemoteCommand.content` + desktop-only edit UI                                                                                                            |
+| 2     | Subagent runtime + `Task` tool           | ✅     | PR1: `Spawner`/`SubagentSpec` on `ToolCtx`, `run_loop_core` + `Persist` (ephemeral children), `task` tool, depth cap; +11 tests; 4-lens review 0 defects; CI green (commit 4e92f0d)                                     |
+| 2     | Live agents panel                        | 🟦     | PR2: 3 lifecycle StreamEvents + `agents.rs` per-agent cancel registry + `CancelAgent` triple-touch + store `agents` map + StatusHud "N agents" + `AgentsPanel` (per-agent Stop); +30 tests; local green; review pending |
+| 2     | Parallel execution + concurrency cap     | ⬜     |                                                                                                                                                                                                                         |
+| 2     | Per-agent git worktree isolation         | ⬜     |                                                                                                                                                                                                                         |
+| 2     | Background tasks                         | ⬜     |                                                                                                                                                                                                                         |
+| 3     | Rename UI                                | ⬜     | backend already exists                                                                                                                                                                                                  |
+| 3     | Persist token/cost across reloads        | ⬜     |                                                                                                                                                                                                                         |
+| 3     | Fork / branch a conversation             | ⬜     |                                                                                                                                                                                                                         |
+| 3     | Checkpoints & rewind                     | ⬜     |                                                                                                                                                                                                                         |
+| 3     | Context compaction + `/context` view     | ⬜     | behind `LlmProvider`                                                                                                                                                                                                    |
+| 4     | Custom slash commands                    | ⬜     |                                                                                                                                                                                                                         |
+| 4     | Hooks                                    | ⬜     |                                                                                                                                                                                                                         |
+| 4     | Skills                                   | ⬜     |                                                                                                                                                                                                                         |
+| 4     | MCP client                               | ⬜     |                                                                                                                                                                                                                         |
+| 4     | Plugins                                  | ⏸      | PAUSE — needs user trust/sandbox decision                                                                                                                                                                               |
 
 ## Decisions log (append-only)
 
@@ -94,6 +94,17 @@ Safe increment order (each its own CI-green commit):
 Open product decisions (recommended defaults): caps depth=3/parallel=4; subagents phone-visible
 (panel+Stop); child transcripts ephemeral; **worktree edits ephemeral/isolated (no auto-merge —
 the UX-weighty one)**; background completion = in-app event only.
+
+**PR2 shipped** (live agents panel; local Rust+frontend+coverage green). Backend: 3 lifecycle
+`StreamEvent`s (`AgentStarted`/`AgentProgress`/`AgentFinished`) emitted on the SESSION channel;
+a desktop-only `agents.rs` registry giving each subagent its OWN cancel flag (`register`/`finish`/
+`cancel_session`/`cancel_one` with descendant cascade); `CancelAgent` `RemoteCommand` (full
+triple-touch + server arm + `cancel_agent_by_id` command); `spawn` race-closes + ALWAYS emits
+`AgentFinished` + deregisters (Ok and Err). Frontend: a per-session `agents` map (cleared per turn
+on BOTH desktop `send()` and the phone's `turn_start`), `StatusHud` "N agents", and an `AgentsPanel`
+with per-agent Stop. A 4-lens adversarial review (cancel/wire/store/concurrency) found 1 real
+defect — the phone path didn't clear agents per turn (finished subagents accumulated) — now fixed +
+tested, plus a low spawn-status test gap closed via the extracted `spawn_status` helper. +30 tests.
 
 **PR1 shipped** (local clippy/test green; adversarial 4-lens review — security/concurrency/
 soundness/coverage — found 0 confirmed defects). Implemented as designed, with one refinement:
