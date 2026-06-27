@@ -31,6 +31,18 @@ vi.mock("./components/CommandPalette", () => ({
 vi.mock("./components/RemotePairing", () => ({
   RemotePairing: () => <div data-testid="remote-pairing" />,
 }));
+vi.mock("./components/CrashConsentPrompt", () => ({
+  CrashConsentPrompt: () => <div data-testid="crash-consent-prompt" />,
+}));
+
+// App calls telemetry on mount (main.tsx-style pre-init is separate) and from the
+// crashReporting sync effect. Stub it so this suite never depends on a build-time
+// DSN (`telemetryConfigured`) or touches the real Sentry client.
+vi.mock("./lib/telemetry", () => ({
+  initTelemetry: vi.fn(),
+  shutdownTelemetry: vi.fn(),
+  telemetryConfigured: vi.fn(() => false),
+}));
 
 // `isTauri` is consumed by App's TitleBar; the rest of the surface is what the
 // store's `init()` path invokes. A single mock of this module covers both the
