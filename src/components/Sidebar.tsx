@@ -1,4 +1,4 @@
-import { useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 
 import { isTauri } from "../lib/ipc";
 import { useStore } from "../store/store";
@@ -24,17 +24,44 @@ export function Sidebar() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const canRename = !streaming && !remoteConnected;
+  // Synchronous "which row owns the editor" mirror, cleared the INSTANT the editor
+  // closes. The input fires a trailing blur as it unmounts after Enter/Escape;
+  // gating the close on this ref makes that stray blur a no-op instead of a second
+  // (or, after Escape, an unwanted) commit.
+  const editingRef = useRef<string | null>(null);
+  // The row to refocus once the editor unmounts (set at close, consumed by the
+  // effect) — otherwise commit/cancel drops focus to <body> and keyboard users
+  // lose their place in the list.
+  const refocusRef = useRef<string | null>(null);
 
   const beginEdit = (s: Session) => {
     if (!canRename) return;
+    editingRef.current = s.id;
     setEditingId(s.id);
     setDraft(s.title);
   };
-  const commitEdit = () => {
-    if (editingId !== null) void renameSession(editingId, draft);
+  // Close the editor exactly once (the ref guard absorbs the unmount blur),
+  // optionally committing the draft, and queue focus back to the edited row.
+  const closeEditor = (commit: boolean) => {
+    const id = editingRef.current;
+    if (id === null) return; // already closed → ignore a trailing blur
+    editingRef.current = null;
+    refocusRef.current = id;
+    if (commit) void renameSession(id, draft);
     setEditingId(null);
   };
-  const cancelEdit = () => setEditingId(null);
+  const commitEdit = () => closeEditor(true);
+  const cancelEdit = () => closeEditor(false);
+
+  // When the editor closes, return focus to the edited row's select button (the
+  // input has unmounted by now, so this runs post-render). Keyed on editingId so it
+  // fires exactly on the edit→view transition.
+  useEffect(() => {
+    if (editingId !== null || refocusRef.current === null) return;
+    const idx = sessions.findIndex((s) => s.id === refocusRef.current);
+    refocusRef.current = null;
+    if (idx >= 0) rowRefs.current[idx]?.focus();
+  }, [editingId, sessions]);
   const onEditKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") {
       e.preventDefault();
