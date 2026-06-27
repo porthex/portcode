@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useStore } from "../store/store";
-import { estimateCost } from "../types";
+import { DANGER_MODES, estimateCost } from "../types";
 
 // Auto-grow cap; kept in sync with the textarea's inline maxHeight so the JS
 // target and the CSS clip agree (otherwise the grow stops short at the smaller).
@@ -124,13 +124,45 @@ export function Composer() {
         </div>
       </div>
       <div className="mt-[7px] flex w-full max-w-none items-center justify-between font-mono text-[10.5px] text-faint">
-        <span className="min-w-0 truncate">
-          <span className="text-muted">ENTER</span> send ·{" "}
-          <span className="text-muted">SHIFT+ENTER</span> newline
+        <span className="flex min-w-0 items-center gap-2">
+          <ModePill />
+          <span className="min-w-0 truncate">
+            <span className="text-muted">ENTER</span> send ·{" "}
+            <span className="text-muted">SHIFT+ENTER</span> newline
+          </span>
         </span>
         <UsageMeter />
       </div>
     </div>
+  );
+}
+
+/**
+ * The permission-mode pill — Portcode's native equivalent of the Shift+Tab mode
+ * cycle. Clicking advances through the safe trio (default → accept edits → plan);
+ * auto/bypass are Settings-only opt-in and never reached here. Shown in a danger
+ * colour with a warning glyph when a loosened mode is active. Desktop-only — the
+ * mode is a desktop-side gate setting the phone observes but doesn't drive.
+ */
+function ModePill() {
+  const mode = useStore((s) => s.settings.permissionMode);
+  const cycle = useStore((s) => s.cyclePermissionMode);
+  const remoteMode = useStore((s) => s.remoteMode);
+  if (remoteMode) return null;
+  const danger = DANGER_MODES.includes(mode);
+  return (
+    <button
+      type="button"
+      onClick={() => void cycle()}
+      title="Permission mode — click to cycle (default → accept edits → plan)"
+      aria-label={`Permission mode: ${mode}. Click to cycle.`}
+      className={`pc-mode-pill shrink-0 rounded px-1.5 py-0.5 uppercase ${
+        danger ? "text-danger" : "text-muted hover:text-fg"
+      }`}
+    >
+      {danger ? "⚠ " : ""}
+      {mode}
+    </button>
   );
 }
 

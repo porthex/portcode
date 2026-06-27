@@ -7,15 +7,17 @@ import type {
   PairingPayload,
   PairingRequest,
   PendingPermission,
+  PermissionMode,
   PhoneSyncStatus,
   RemoteCommand,
+  Rule,
   Session,
   Settings,
   StreamEvent,
   SyncFrame,
   Usage,
 } from "../types";
-import { DEFAULT_SETTINGS } from "../types";
+import { CYCLE_MODES, DEFAULT_SETTINGS } from "../types";
 import * as ipc from "../lib/ipc";
 import { isMobilePlatform } from "../lib/platform";
 
@@ -43,6 +45,21 @@ const EMPTY_RUN: RunState = { streaming: false, cancel: null, pendingPermission:
 // `${sessionId}:${agentId}`) — without touching the StreamEvent wire shape, which
 // already carries the session id every write site keys off.
 const runKey = (sessionId: string): string => sessionId;
+
+// Build the scoped allow-RULE that "Always allow" adds, instead of flipping the
+// global policy to allow-everything. For a `shell` call it scopes to that exact
+// command (a literal prefix — narrower and safer than a blanket allow); for any
+// other tool it allows just that tool. A shell call without a command string
+// falls back to a tool-level allow.
+const scopedAllowRule = (p: PendingPermission): Rule => {
+  if (p.tool === "shell") {
+    const command = (p.input as { command?: unknown } | null)?.command;
+    if (typeof command === "string" && command.length > 0) {
+      return { tool: "shell", command, decision: "allow" };
+    }
+  }
+  return { tool: p.tool, decision: "allow" };
+};
 
 interface AppState {
   sessions: Session[];
@@ -114,6 +131,7 @@ interface AppState {
   setAmbientRain: (v: boolean) => void;
   setScanlines: (v: boolean) => void;
   updateSettings: (s: Partial<Settings>) => Promise<void>;
+  cyclePermissionMode: () => Promise<void>;
   refreshOAuthStatus: () => Promise<void>;
   loginWithClaude: () => Promise<void>;
   logoutClaude: () => Promise<void>;
@@ -777,7 +795,15 @@ export const useStore = create<AppState>((set, get) => ({
     patchActiveRun(set, get, { pendingPermission: null });
     await ipc.resolvePermission(id, decision);
     if (always && decision === "allow") {
-      await get().updateSettings({ defaultPolicy: "allow" });
+      // "Always allow" adds a SCOPED allow-rule for this tool (and, for shell,
+      // this command) instead of flipping the global policy to allow-everything.
+      // Skip if an equivalent rule already exists so repeated clicks don't pile up
+      // duplicates.
+      const rule = scopedAllowRule(p);
+      const rules = get().settings.rules;
+      if (!rules.some((r) => r.tool === rule.tool && r.command === rule.command)) {
+        await get().updateSettings({ rules: [...rules, rule] });
+      }
     }
   },
 
@@ -849,6 +875,17 @@ export const useStore = create<AppState>((set, get) => ({
     } catch (err) {
       set({ settingsError: errMessage(err) });
     }
+  },
+
+  async cyclePermissionMode() {
+    // Advance through the SAFE trio only (default → acceptEdits → plan). auto and
+    // bypass are deliberately excluded from the quick-cycle (Settings-only opt-in),
+    // and cycling out of one of them lands back at the start (default) rather than
+    // stepping deeper into a permissive mode.
+    const cur = get().settings.permissionMode;
+    const i = CYCLE_MODES.indexOf(cur);
+    const next: PermissionMode = CYCLE_MODES[(i + 1) % CYCLE_MODES.length] ?? "default";
+    await get().updateSettings({ permissionMode: next });
   },
 
   async refreshOAuthStatus() {

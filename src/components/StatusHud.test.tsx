@@ -181,6 +181,33 @@ describe("StatusHud", () => {
     expect(screen.getByText("POLICY: DENY")).toBeInTheDocument();
   });
 
+  it("shows the permission MODE (not the legacy policy) when a non-default mode is active", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      settings: settings({ permissionMode: "acceptEdits" }),
+    });
+
+    render(<StatusHud />);
+
+    expect(screen.getByText("MODE: ACCEPTEDITS")).toBeInTheDocument();
+    expect(screen.queryByText(/POLICY:/)).not.toBeInTheDocument();
+  });
+
+  it("flags a loosened auto/bypass mode with a danger style and warning glyph", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      settings: settings({ permissionMode: "bypass" }),
+    });
+
+    render(<StatusHud />);
+
+    const seg = screen.getByText(/MODE: BYPASS/);
+    expect(seg.textContent).toContain("⚠");
+    expect(seg).toHaveClass("text-danger");
+  });
+
   it("trims the desktop-dense segments on the phone (remote mode)", () => {
     useStore.setState({
       sessions: [session({ workspace: "C:/dev/porthex/portcode" })],

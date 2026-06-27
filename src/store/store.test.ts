@@ -937,15 +937,48 @@ describe("resolvePermission", () => {
     expect(useStore.getState().pendingPermission).toBeNull();
   });
 
-  it("persists allow-always as the new default policy", async () => {
+  it("allow-always adds a SCOPED allow-rule for the tool (not a global policy flip)", async () => {
     useStore.setState({
       pendingPermission: { id: "p1", tool: "fs_edit", summary: "x", input: {} },
     });
 
     await useStore.getState().resolvePermission("allow", true);
 
-    expect(m.saveSettings).toHaveBeenCalledWith({ defaultPolicy: "allow" });
+    // A non-shell tool scopes to the tool itself, not allow-everything.
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      rules: [{ tool: "fs_edit", decision: "allow" }],
+    });
     expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
+  });
+
+  it("allow-always for a shell call scopes the rule to that command", async () => {
+    useStore.setState({
+      pendingPermission: {
+        id: "p2",
+        tool: "shell",
+        summary: "git status",
+        input: { command: "git status" },
+      },
+    });
+
+    await useStore.getState().resolvePermission("allow", true);
+
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      rules: [{ tool: "shell", command: "git status", decision: "allow" }],
+    });
+  });
+
+  it("allow-always does not add a duplicate rule if an equivalent one exists", async () => {
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS, rules: [{ tool: "fs_edit", decision: "allow" }] },
+      pendingPermission: { id: "p3", tool: "fs_edit", summary: "x", input: {} },
+    });
+
+    await useStore.getState().resolvePermission("allow", true);
+
+    // The gate is still answered, but no redundant settings save is made.
+    expect(m.resolvePermission).toHaveBeenCalledWith("p3", "allow");
+    expect(m.saveSettings).not.toHaveBeenCalled();
   });
 
   it("answers the gate FIRST and persists allow-always after (ordered)", async () => {
@@ -1109,6 +1142,35 @@ describe("multi-run model (runs collection)", () => {
     expect(st.cancel).toBeNull();
     // The concurrent background run is undisturbed.
     expect(st.runs.b).toEqual({ streaming: true, cancel: null, pendingPermission: null });
+  });
+});
+
+describe("cyclePermissionMode", () => {
+  it("advances through the safe trio default → acceptEdits → plan → default", async () => {
+    const seed = (permissionMode: "default" | "acceptEdits" | "plan") =>
+      useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode } });
+
+    seed("default");
+    await useStore.getState().cyclePermissionMode();
+    expect(m.saveSettings).toHaveBeenLastCalledWith({ permissionMode: "acceptEdits" });
+
+    seed("acceptEdits");
+    await useStore.getState().cyclePermissionMode();
+    expect(m.saveSettings).toHaveBeenLastCalledWith({ permissionMode: "plan" });
+
+    seed("plan");
+    await useStore.getState().cyclePermissionMode();
+    expect(m.saveSettings).toHaveBeenLastCalledWith({ permissionMode: "default" });
+  });
+
+  it("never cycles INTO auto/bypass, and cycling out of one lands on default", async () => {
+    // auto/bypass are Settings-only opt-in; the quick-cycle must not reach them,
+    // and stepping the cycle while in one returns to the safe start.
+    for (const danger of ["auto", "bypass"] as const) {
+      useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: danger } });
+      await useStore.getState().cyclePermissionMode();
+      expect(m.saveSettings).toHaveBeenLastCalledWith({ permissionMode: "default" });
+    }
   });
 });
 

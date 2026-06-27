@@ -315,6 +315,8 @@ describe("browser fallback (no Tauri core)", () => {
       defaultPolicy: "ask",
       workspace: null,
       typingAnimation: true,
+      permissionMode: "default",
+      rules: [],
     });
     expect(invoke).not.toHaveBeenCalled();
   });
