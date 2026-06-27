@@ -107,7 +107,42 @@ oauth-2025-04-20` request shape are reverse-engineered from the public Claude
 
 ## Privacy note
 
-Portcode sends **no telemetry** and has no phone-home. Your prompts, code, and
-keys (or subscription tokens) stay on your machine and only go to the LLM
-provider you configured. Please keep that in mind when attaching reproduction
+By default Portcode sends **no telemetry** and has no phone-home. Your prompts,
+code, and keys (or subscription tokens) stay on your machine and only go to the
+LLM provider you configured. Please keep that in mind when attaching reproduction
 material.
+
+### Crash reporting (opt-in, off by default)
+
+Portcode includes an **optional** crash/error reporting capability to help fix
+bugs. It is **off by default** and never reports unless BOTH are true:
+
+1. you explicitly enable it (a one-time first-run prompt, or **Settings → Privacy**), and
+2. the build was compiled with a reporting key (DSN).
+
+The DSN is injected only into **official signed release builds** and is never
+checked into the source tree, so development, contributor, and fork builds
+**cannot report at all** — the pipeline is a compile-time no-op there.
+
+When you do enable it:
+
+- **Reports are scrubbed before they leave.** Each event is rebuilt from an
+  allowlist of safe fields, then every surviving string is run through a secret
+  redactor that strips `sk-ant-…`/`sk-…` API keys, OAuth/bearer tokens, emails,
+  IP addresses, home-directory paths, and long key-shaped blobs. Breadcrumb
+  payloads, request bodies, environment, local variables, and source context are
+  dropped wholesale. **Your prompts, code, and file contents are not sent.**
+- **Scope:** unexpected errors and crashes, plus sampled, scrubbed performance
+  traces in the app window. Ordinary handled errors (network failures, denied
+  permissions, bad input) are not reported.
+- **Region:** events go to a **Sentry project hosted in the EU**.
+- **Opting out is instant and total** — toggle it off in Settings and nothing
+  further is sent.
+
+**Native crashes on desktop include a memory snapshot.** To diagnose segfaults
+and aborts the desktop captures a **minidump** — a snapshot of process memory at
+the moment of the crash. The minidump is attached to the report and, unlike the
+event fields above, **cannot be scrubbed**: it may contain fragments of whatever
+was in memory, which can include secrets. It is still fully consent-gated — no
+report (minidump included) is sent while reporting is off. Enable crash reporting
+only if you accept that trade-off.
