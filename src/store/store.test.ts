@@ -427,6 +427,26 @@ describe("deleteSession", () => {
     expect(st.activeId).toBe("a"); // unchanged
     expect(st.messages.a).toEqual([]); // not removed
   });
+
+  it("drops the deleted session's run from the run map (no leak)", async () => {
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      messages: { a: [], b: [] },
+      // Both sessions are idle but each has an entry in the run map.
+      runs: {
+        a: { streaming: false, cancel: null, pendingPermission: null },
+        b: { streaming: false, cancel: null, pendingPermission: null },
+      },
+    });
+
+    await useStore.getState().deleteSession("b");
+
+    const st = useStore.getState();
+    expect(st.runs.b).toBeUndefined(); // the deleted session's run is gone
+    expect(Object.keys(st.runs)).toEqual(["a"]); // only the surviving run remains
+    expect(st.activeId).toBe("a"); // active unchanged (we deleted the other one)
+  });
 });
 
 describe("send", () => {
@@ -1005,6 +1025,93 @@ describe("resolvePermission", () => {
   });
 });
 
+describe("multi-run model (runs collection)", () => {
+  // Fold a live frame for an arbitrary session into the run map (the path the
+  // phone uses for a desktop turn). turn_start/turn_end drive the per-run state.
+  const live = (sessionId: string, event: StreamEvent) =>
+    useStore.getState().applyFrame({ t: "live", session_id: sessionId, event });
+
+  it("represents two sessions streaming concurrently, with the mirror tracking only the active one", () => {
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      runs: {},
+    });
+
+    live("a", { type: "turn_start", messageId: "ma" });
+    live("b", { type: "turn_start", messageId: "mb" });
+
+    const st = useStore.getState();
+    // BOTH runs stream in the map — the capability a single global flag could
+    // never represent (the foundation for a parallel-agents UI).
+    expect(st.runs.a.streaming).toBe(true);
+    expect(st.runs.b.streaming).toBe(true);
+    // The visible mirror reflects only the active session ("a").
+    expect(st.streaming).toBe(true);
+  });
+
+  it("the active-run mirror re-projects when the active session changes", async () => {
+    // "a" is idle, "b" has a live background run.
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      runs: {
+        a: { streaming: false, cancel: null, pendingPermission: null },
+        b: { streaming: true, cancel: null, pendingPermission: null },
+      },
+      streaming: false,
+    });
+    // selectSession is blocked only while the ACTIVE session streams; "a" is idle,
+    // so the switch goes through and the mirror must follow "b"'s run.
+    await useStore.getState().selectSession("b");
+    expect(useStore.getState().streaming).toBe(true);
+  });
+
+  it("clearing one session's run leaves another's untouched", () => {
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      runs: {},
+    });
+    live("a", { type: "turn_start", messageId: "ma" });
+    live("b", { type: "turn_start", messageId: "mb" });
+
+    live("b", { type: "turn_end", stopReason: "end_turn" }); // end only "b"
+
+    const st = useStore.getState();
+    expect(st.runs.a.streaming).toBe(true); // "a" still streaming
+    expect(st.runs.b.streaming).toBe(false); // "b" done
+    expect(st.streaming).toBe(true); // mirror still reflects active "a"
+  });
+
+  it("stop() clears the ACTIVE run (and its mirror) while leaving a concurrent run untouched", async () => {
+    // Both the active "a" and a background "b" are streaming in the map; stop()
+    // must clear only "a" (the run on screen) and re-project, not touch "b". This
+    // exercises patchActiveRun's activeId-present branch (the production path).
+    const cancel = vi.fn(async () => {});
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      runs: {
+        a: { streaming: true, cancel, pendingPermission: null },
+        b: { streaming: true, cancel: null, pendingPermission: null },
+      },
+      streaming: true,
+      cancel,
+    });
+
+    await useStore.getState().stop();
+
+    const st = useStore.getState();
+    expect(cancel).toHaveBeenCalledOnce(); // the active run's handle was aborted
+    expect(st.runs.a).toEqual({ streaming: false, cancel: null, pendingPermission: null });
+    expect(st.streaming).toBe(false); // mirror re-projected from "a"
+    expect(st.cancel).toBeNull();
+    // The concurrent background run is undisturbed.
+    expect(st.runs.b).toEqual({ streaming: true, cancel: null, pendingPermission: null });
+  });
+});
+
 describe("draft + UI setters", () => {
   it("appendDraft inserts a single separating space only when needed", () => {
     const { setDraft, appendDraft } = useStore.getState();
@@ -1562,28 +1669,33 @@ describe("remote client", () => {
       const bgLive = (event: StreamEvent) =>
         useStore.getState().applyFrame({ t: "live", session_id: "bg", event });
 
-      it("turn_start for a background session appends its message but doesn't flip streaming", () => {
-        useStore.setState({ activeId: "active", streaming: false });
+      it("turn_start for a background session appends its message and tracks its own run, without flipping the visible composer", () => {
+        useStore.setState({ activeId: "active", runs: {}, streaming: false });
 
         bgLive({ type: "turn_start", messageId: "b1" });
 
         const st = useStore.getState();
-        expect(st.streaming).toBe(false); // visible composer untouched
+        expect(st.streaming).toBe(false); // visible composer (mirror = active run) untouched
+        // ...but the background run IS now streaming in the run map — the whole
+        // point of the multi-run model: N runs are independently representable.
+        expect(st.runs.bg.streaming).toBe(true);
         expect(st.messages.bg).toEqual([
           { id: "b1", role: "assistant", blocks: [], createdAt: expect.any(Number) },
         ]);
       });
 
-      it("permission_request for a background session does NOT pop a prompt", () => {
-        useStore.setState({ activeId: "active", pendingPermission: null });
+      it("permission_request for a background session is recorded on its run but does NOT pop the visible prompt", () => {
+        useStore.setState({ activeId: "active", runs: {}, pendingPermission: null });
 
         bgLive({ type: "permission_request", id: "p9", tool: "fs_edit", summary: "x", input: {} });
 
-        expect(useStore.getState().pendingPermission).toBeNull();
+        const st = useStore.getState();
+        expect(st.pendingPermission).toBeNull(); // the visible gate stays closed
+        expect(st.runs.bg.pendingPermission?.id).toBe("p9"); // but the bg run holds it
       });
 
       it("text_delta still folds into the background session's message", () => {
-        useStore.setState({ activeId: "active" });
+        useStore.setState({ activeId: "active", runs: {} });
         bgLive({ type: "turn_start", messageId: "b1" });
 
         bgLive({ type: "text_delta", text: "hi" });
@@ -1591,9 +1703,18 @@ describe("remote client", () => {
         expect(useStore.getState().messages.bg[0].blocks).toEqual([{ kind: "text", text: "hi" }]);
       });
 
-      it("turn_end / error for a background session leave the visible turn flags alone", () => {
+      it("turn_end / error for a background session leave the ACTIVE session's visible flags alone but end the bg run", () => {
+        // Seed the ACTIVE session as a live turn IN THE RUN MAP — the visible
+        // mirror derives from it, so a background turn ending must not disturb it.
         useStore.setState({
           activeId: "active",
+          runs: {
+            active: {
+              streaming: true,
+              cancel: null,
+              pendingPermission: { id: "p", tool: "t", summary: "s", input: {} },
+            },
+          },
           streaming: true,
           pendingPermission: { id: "p", tool: "t", summary: "s", input: {} },
         });
@@ -1604,7 +1725,8 @@ describe("remote client", () => {
         // The visible turn flags belong to the active session, not the background one.
         expect(st.streaming).toBe(true);
         expect(st.pendingPermission).not.toBeNull();
-        // ...but the background message still got the inline error.
+        // ...the background run has ended, and its message got the inline error.
+        expect(st.runs.bg.streaming).toBe(false);
         const text = st.messages.bg[0].blocks
           .map((b) => (b.kind === "text" ? b.text : ""))
           .join("");

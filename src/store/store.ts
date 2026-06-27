@@ -19,6 +19,31 @@ import { DEFAULT_SETTINGS } from "../types";
 import * as ipc from "../lib/ipc";
 import { isMobilePlatform } from "../lib/platform";
 
+// ── Per-run state ─────────────────────────────────────────────────────────────
+// The streaming/cancel/pendingPermission of a single agent run. Today there is at
+// most one run per session (the Rust core refuses a 2nd concurrent run per
+// session), so the runs map is keyed by session id; but modelling it as a
+// COLLECTION is what lets multiple concurrent agents each carry their own run
+// state — the foundation a parallel-agents UI builds on. The top-level
+// `streaming`/`cancel`/`pendingPermission` fields are kept as a derived MIRROR of
+// the active session's run (see `projectActiveRun`), so every existing component
+// and selector keeps reading a single "global" view unchanged.
+interface RunState {
+  streaming: boolean;
+  // The handle that aborts this run. Always null on the phone (the cancel handle
+  // belongs to the desktop-local agent run; the phone stops via a remote command).
+  cancel: (() => Promise<void>) | null;
+  pendingPermission: PendingPermission | null;
+}
+
+const EMPTY_RUN: RunState = { streaming: false, cancel: null, pendingPermission: null };
+
+// Single source of truth for the run-map key. The identity of a session id today;
+// the one place to change when a future subagent run needs a composite id (e.g.
+// `${sessionId}:${agentId}`) — without touching the StreamEvent wire shape, which
+// already carries the session id every write site keys off.
+const runKey = (sessionId: string): string => sessionId;
+
 interface AppState {
   sessions: Session[];
   activeId: string | null;
@@ -36,6 +61,12 @@ interface AppState {
   pairingRequest: PairingRequest | null;
   pairingRequestUnlisten: (() => void) | null; // tears down the pairing-request subscription
   creatingSession: boolean; // a newSession() create is in flight (re-entry guard)
+  runs: Record<string, RunState>; // runKey(sessionId) -> per-run state (the N-run model)
+  // ── Active-run mirror (derived from runs[activeId]) ─────────────────────────
+  // These three reflect the ACTIVE session's run, so every component/selector and
+  // every re-entry guard keeps reading one "global" view. They are recomputed by
+  // `projectActiveRun` in every set() that mutates `runs` or `activeId`; never
+  // write them directly — write the run via `setRun`/`runPatch` and they follow.
   streaming: boolean;
   showSettings: boolean;
   showFiles: boolean;
@@ -102,6 +133,52 @@ interface AppState {
   disconnectRemote: () => Promise<void>;
   reconnectRemote: () => Promise<void>;
 }
+
+// Project the active session's run onto the three mirror fields. Called in every
+// set() that changes `runs` or `activeId`, so `streaming`/`cancel`/
+// `pendingPermission` always reflect the run on screen. A session with no run (or
+// no active session) reads as the empty run, i.e. idle.
+const projectActiveRun = (
+  st: Pick<AppState, "activeId" | "runs">,
+): Pick<AppState, "streaming" | "cancel" | "pendingPermission"> => {
+  const r = (st.activeId ? st.runs[runKey(st.activeId)] : undefined) ?? EMPTY_RUN;
+  return { streaming: r.streaming, cancel: r.cancel, pendingPermission: r.pendingPermission };
+};
+
+// Build the state patch that applies `patch` to `sessionId`'s run and re-projects
+// the active-run mirror in the SAME set(). Combine its result with other fields
+// (e.g. a `messages` update) by spreading it. This is the only place run state is
+// written, so the mirror can never drift from `runs`.
+const runPatch = (
+  st: Pick<AppState, "activeId" | "runs">,
+  sessionId: string,
+  patch: Partial<RunState>,
+): Pick<AppState, "runs" | "streaming" | "cancel" | "pendingPermission"> => {
+  const key = runKey(sessionId);
+  const runs = { ...st.runs, [key]: { ...(st.runs[key] ?? EMPTY_RUN), ...patch } };
+  return { runs, ...projectActiveRun({ activeId: st.activeId, runs }) };
+};
+
+// Convenience wrapper around `runPatch` for the common "just patch this run" case.
+const setRun = (
+  set: (fn: (st: AppState) => Partial<AppState>) => void,
+  sessionId: string,
+  patch: Partial<RunState>,
+): void => set((st) => runPatch(st, sessionId, patch));
+
+// Patch the ACTIVE session's run — for actions (stop / resolvePermission) that
+// always target the run on screen. With an active session it goes through
+// `runPatch` (run + mirror stay in lockstep); with no active session it clears
+// just the named mirror fields, so the visible flags always clear regardless.
+// (`Partial<RunState>`'s keys are all mirror fields, so it doubles as the patch.)
+const patchActiveRun = (
+  set: (fn: (st: AppState) => Partial<AppState>) => void,
+  get: () => AppState,
+  patch: Partial<RunState>,
+): void => {
+  const activeId = get().activeId;
+  set((st) => (activeId ? runPatch(st, activeId, patch) : patch));
+};
 
 const now = () => Date.now();
 
@@ -195,6 +272,7 @@ export const useStore = create<AppState>((set, get) => ({
   pairingRequest: null,
   pairingRequestUnlisten: null,
   creatingSession: false,
+  runs: {},
   streaming: false,
   showSettings: false,
   showFiles: false,
@@ -253,7 +331,7 @@ export const useStore = create<AppState>((set, get) => ({
       if (sessions.length === 0) {
         const s = makeSession();
         await ipc.createSession(s.id, s.title, s.workspace);
-        set({
+        set((st) => ({
           settings,
           oauthStatus,
           phoneSync,
@@ -261,12 +339,15 @@ export const useStore = create<AppState>((set, get) => ({
           activeId: s.id,
           messages: { [s.id]: [] },
           initError: null,
-        });
+          // Keep the active-run mirror consistent with the newly active session
+          // (idle here — a fresh session has no run).
+          ...projectActiveRun({ activeId: s.id, runs: st.runs }),
+        }));
         return;
       }
       const activeId = sessions[0].id;
       const msgs = await ipc.getMessages(activeId);
-      set({
+      set((st) => ({
         settings,
         oauthStatus,
         phoneSync,
@@ -274,7 +355,9 @@ export const useStore = create<AppState>((set, get) => ({
         activeId,
         messages: { [activeId]: msgs },
         initError: null,
-      });
+        // Keep the active-run mirror consistent with the activated session.
+        ...projectActiveRun({ activeId, runs: st.runs }),
+      }));
     } catch (err) {
       set({ initError: errMessage(err) });
     }
@@ -329,6 +412,8 @@ export const useStore = create<AppState>((set, get) => ({
         activeId: s.id,
         messages: { ...st.messages, [s.id]: [] },
         showSidebar: false, // close the mobile drawer on navigation
+        // A brand-new session has no run yet → the mirror projects to idle.
+        ...projectActiveRun({ activeId: s.id, runs: st.runs }),
       }));
     } catch (err) {
       // A failed create (locked DB / core not ready) must surface instead of being a
@@ -342,7 +427,14 @@ export const useStore = create<AppState>((set, get) => ({
 
   async selectSession(id) {
     if (get().streaming) return;
-    set({ activeId: id, showSidebar: false }); // close the mobile drawer on navigation
+    // Switch the active session and re-project the mirror onto its run (idle today,
+    // since you can't switch while the active session streams; a background run on
+    // the target session would surface here once concurrent runs exist).
+    set((st) => ({
+      activeId: id,
+      showSidebar: false, // close the mobile drawer on navigation
+      ...projectActiveRun({ activeId: id, runs: st.runs }),
+    }));
     if (!get().messages[id]) {
       // Guard the load: a getMessages reject must not leave messages[id] undefined
       // (the welcome EmptyState would then win for a session with real history).
@@ -373,8 +465,10 @@ export const useStore = create<AppState>((set, get) => ({
       const sessions = st.sessions.filter((s) => s.id !== id);
       const messages = { ...st.messages };
       delete messages[id];
+      const runs = { ...st.runs };
+      delete runs[runKey(id)]; // drop the deleted session's run
       const activeId = st.activeId === id ? (sessions[0]?.id ?? null) : st.activeId;
-      return { sessions, messages, activeId };
+      return { sessions, messages, runs, activeId, ...projectActiveRun({ activeId, runs }) };
     });
     if (get().sessions.length === 0) {
       await get().newSession();
@@ -413,7 +507,7 @@ export const useStore = create<AppState>((set, get) => ({
     // path (turn_end/error, the drop listener, the send catch, disconnectRemote)
     // already clears streaming:false, so the composer can't get stranded.
     if (get().remoteConnected) {
-      set({ streaming: true });
+      setRun(set, activeId, { streaming: true });
       // Remote idle watchdog (symmetric with the local one below). The desktop is
       // authoritative, but if its agent dies/hangs without ever emitting
       // turn_end/error AND the channel stays up (no drop fires), nothing would clear
@@ -425,7 +519,9 @@ export const useStore = create<AppState>((set, get) => ({
       clearRemoteWatchdog();
       remoteLastActivity = now();
       remoteWatchdog = setInterval(() => {
-        // The turn already ended or was stopped elsewhere — just clean up.
+        // The turn already ended or was stopped elsewhere — just clean up. The
+        // remote turn runs on the active session, so the active-run mirror is the
+        // right "still streaming?" signal here.
         if (!get().streaming) {
           clearRemoteWatchdog();
           return;
@@ -436,8 +532,9 @@ export const useStore = create<AppState>((set, get) => ({
         clearRemoteWatchdog();
         const sid = get().activeId;
         set((st) => ({
-          streaming: false,
-          pendingPermission: null,
+          ...(sid !== null
+            ? runPatch(st, sid, { streaming: false, pendingPermission: null })
+            : projectActiveRun(st)),
           messages:
             sid !== null
               ? patchLast(st.messages, sid, (b) =>
@@ -476,7 +573,7 @@ export const useStore = create<AppState>((set, get) => ({
       );
       return {
         sessions,
-        streaming: true,
+        ...runPatch(st, activeId, { streaming: true }),
         messages: {
           ...st.messages,
           [activeId]: [...msgs, userMsg, assistant],
@@ -499,6 +596,12 @@ export const useStore = create<AppState>((set, get) => ({
     // So we (a) tear the per-turn event listener down the instant a turn ends — a
     // leaked listener folds the NEXT turn's deltas into this message — and (b) run a
     // client-side watchdog that force-ends a silent turn so the app always recovers.
+    // The run-map key for this turn's session, captured up front so the watchdog
+    // and the post-await Stop check read THIS run's streaming flag (the
+    // authoritative source) rather than the active-session mirror — correct even
+    // if the active session were to change out from under a long-running turn.
+    const myKey = runKey(activeId);
+    const isStreaming = () => get().runs[myKey]?.streaming ?? false;
     let run: Awaited<ReturnType<typeof ipc.runAgent>> | null = null;
     let settled = false;
     let lastActivity = now();
@@ -542,7 +645,7 @@ export const useStore = create<AppState>((set, get) => ({
           ]);
           break;
         case "permission_request":
-          set({
+          setRun(set, activeId, {
             pendingPermission: {
               id: e.id,
               tool: e.tool,
@@ -568,18 +671,18 @@ export const useStore = create<AppState>((set, get) => ({
         case "error":
           apply((blocks) => appendText(blocks, `\n\n**Error:** ${e.message}`));
           settle(false);
-          set({ streaming: false, cancel: null, pendingPermission: null });
+          setRun(set, activeId, { streaming: false, cancel: null, pendingPermission: null });
           break;
         case "turn_end":
           settle(false);
-          set({ streaming: false, cancel: null, pendingPermission: null });
+          setRun(set, activeId, { streaming: false, cancel: null, pendingPermission: null });
           break;
       }
     };
 
     watchdog = setInterval(() => {
       // The turn already ended or was stopped elsewhere (e.g. Stop) — just clean up.
-      if (settled || !get().streaming) {
+      if (settled || !isStreaming()) {
         settle(false);
         return;
       }
@@ -602,7 +705,7 @@ export const useStore = create<AppState>((set, get) => ({
         // handle still needs its listener torn down. The terminal event already issued
         // any backend cancel it needed, so just dispose — no spurious cancel_agent.
         handle.dispose();
-      } else if (!get().streaming) {
+      } else if (!isStreaming()) {
         // The turn isn't settled, but streaming already flipped false — the user
         // pressed Stop DURING the await window, when the cancel handle was still null
         // so stop() couldn't abort the backend. Honor that Stop authoritatively now:
@@ -612,7 +715,7 @@ export const useStore = create<AppState>((set, get) => ({
         settle(true);
       } else {
         // Stop aborts the run AND clears this turn's watchdog (owned by this closure).
-        set({
+        setRun(set, activeId, {
           cancel: async () => {
             settle(false);
             await handle.cancel();
@@ -631,7 +734,7 @@ export const useStore = create<AppState>((set, get) => ({
       clearRemoteWatchdog(); // the turn is over — stop the idle watchdog
       const activeId = get().activeId;
       if (activeId) await get().sendRemoteCommand({ cmd: "cancel", session_id: activeId });
-      set({ streaming: false, pendingPermission: null });
+      patchActiveRun(set, get, { streaming: false, pendingPermission: null });
       return;
     }
     const c = get().cancel;
@@ -640,7 +743,7 @@ export const useStore = create<AppState>((set, get) => ({
     } catch {
       /* the cancel_agent IPC failed; recover the UI anyway so the composer isn't stuck */
     } finally {
-      set({ streaming: false, cancel: null, pendingPermission: null });
+      patchActiveRun(set, get, { streaming: false, cancel: null, pendingPermission: null });
     }
   },
 
@@ -658,7 +761,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (get().remoteConnected) {
       const current = get().pendingPermission;
       if (current && current.id !== id) return;
-      set({ pendingPermission: null });
+      patchActiveRun(set, get, { pendingPermission: null });
       await get().sendRemoteCommand({ cmd: "permission", id, decision });
       return;
     }
@@ -671,7 +774,7 @@ export const useStore = create<AppState>((set, get) => ({
     // Answer the backend gate FIRST (and clear the banner), so a later
     // best-effort policy save can't strand the prompt or leave the gate
     // unanswered if updateSettings rejects.
-    set({ pendingPermission: null });
+    patchActiveRun(set, get, { pendingPermission: null });
     await ipc.resolvePermission(id, decision);
     if (always && decision === "allow") {
       await get().updateSettings({ defaultPolicy: "allow" });
@@ -878,16 +981,24 @@ export const useStore = create<AppState>((set, get) => ({
             st.activeId && ids.includes(st.activeId)
               ? st.activeId
               : (frame.sessions[0]?.id ?? null);
-          return { sessions: frame.sessions, activeId };
+          return {
+            sessions: frame.sessions,
+            activeId,
+            ...projectActiveRun({ activeId, runs: st.runs }),
+          };
         });
         break;
       case "message_delta":
-        set((st) => ({
-          // Catch-up is authoritative for this session: REPLACE its message list.
-          // This is what reconciles any optimistic user message we appended.
-          messages: { ...st.messages, [frame.session_id]: frame.messages.map(rowToMessage) },
-          activeId: st.activeId ?? frame.session_id,
-        }));
+        set((st) => {
+          const activeId = st.activeId ?? frame.session_id;
+          return {
+            // Catch-up is authoritative for this session: REPLACE its message list.
+            // This is what reconciles any optimistic user message we appended.
+            messages: { ...st.messages, [frame.session_id]: frame.messages.map(rowToMessage) },
+            activeId,
+            ...projectActiveRun({ activeId, runs: st.runs }),
+          };
+        });
         break;
       case "live":
         // Keep the remote idle watchdog alive: any live frame for the active session
@@ -925,7 +1036,10 @@ export const useStore = create<AppState>((set, get) => ({
       remoteUnlisten: null,
       remoteError: null,
       remoteVerified: false,
+      // A fresh dial inherits no live runs — reset the whole map and the mirror.
+      runs: {},
       streaming: false,
+      cancel: null,
       pendingPermission: null,
     });
     let unlistenFrame: (() => void) | null = null;
@@ -962,7 +1076,10 @@ export const useStore = create<AppState>((set, get) => ({
           remoteConnected: false,
           remoteVerified: false,
           remoteDropped: true,
+          // The channel is dead — every remote-driven run is gone.
+          runs: {},
           streaming: false,
+          cancel: null,
           pendingPermission: null,
         });
       });
@@ -1039,7 +1156,13 @@ export const useStore = create<AppState>((set, get) => ({
         }));
       }
       clearRemoteWatchdog(); // the turn can't proceed on a dropped link
-      set({ remoteDropped: true, streaming: false });
+      set({
+        remoteDropped: true,
+        runs: {},
+        streaming: false,
+        cancel: null,
+        pendingPermission: null,
+      });
     }
   },
 
@@ -1066,7 +1189,10 @@ export const useStore = create<AppState>((set, get) => ({
       // connectRemote's own finally clears this in steady state, so this is a no-op
       // when no dial is in flight.
       remoteConnecting: false,
-      streaming: false, // the turn is over — don't strand a stuck composer
+      // The turn is over — don't strand a stuck composer; drop every run too.
+      runs: {},
+      streaming: false,
+      cancel: null,
       pendingPermission: null,
     });
     writeStr("pc.lastPairingQr", null); // forget the remembered desktop too
@@ -1132,16 +1258,15 @@ type RemoteSetter = (fn: (st: AppState) => Partial<AppState>) => void;
 // `cancel` (that handle belongs to a local desktop run).
 //
 // Per-session message patching is always applied (a background session must still
-// build its history). But the GLOBAL UI flags — `streaming` and `pendingPermission`
-// — drive the visible composer/HUD and the permission gate, so they are only
-// touched when the frame's session is the one on screen. Otherwise a background
-// session's turn would flip the visible composer or pop a permission prompt the
-// user has no context for (and would answer blind).
+// build its history). Run state (`streaming`/`pendingPermission`) is written onto
+// the FRAME'S session run via `runPatch`/`setRun`; the active-run MIRROR then
+// surfaces it on the visible composer/HUD/permission gate only when that session
+// is the one on screen. So a background session's turn updates its own run without
+// flipping the visible composer or popping a prompt the user has no context for.
 function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent): void {
   switch (e.type) {
     case "turn_start":
       set((st) => {
-        const isActive = st.activeId === sessionId;
         const msgs = st.messages[sessionId] ?? [];
         const assistant: Message = {
           id: e.messageId,
@@ -1150,8 +1275,10 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
           createdAt: now(),
         };
         return {
-          // Only flip the visible streaming indicator for the active session.
-          ...(isActive ? { streaming: true } : {}),
+          // Mark this session's run streaming; the mirror surfaces it only when the
+          // session is active (runPatch re-projects), so a background run is now
+          // representable without flipping the visible composer.
+          ...runPatch(st, sessionId, { streaming: true }),
           messages: { ...st.messages, [sessionId]: [...msgs, assistant] },
         };
       });
@@ -1178,11 +1305,12 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       }));
       break;
     case "permission_request":
-      set((st) =>
-        st.activeId === sessionId
-          ? { pendingPermission: { id: e.id, tool: e.tool, summary: e.summary, input: e.input } }
-          : {},
-      );
+      // Store the request on its session's run; the mirror only pops the prompt
+      // when that session is active, so a background permission never hijacks the
+      // visible gate (the user would otherwise answer it blind).
+      setRun(set, sessionId, {
+        pendingPermission: { id: e.id, tool: e.tool, summary: e.summary, input: e.input },
+      });
       break;
     case "usage":
       set((st) => {
@@ -1207,13 +1335,14 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
         messages: patchLast(st.messages, sessionId, (b) =>
           appendText(b, `\n\n**Error:** ${e.message}`),
         ),
-        // Only clear the visible turn flags when this is the active session.
-        ...(st.activeId === sessionId ? { streaming: false, pendingPermission: null } : {}),
+        // End this session's run; the mirror clears the visible flags only when it
+        // is the active session.
+        ...runPatch(st, sessionId, { streaming: false, pendingPermission: null }),
       }));
       break;
     case "turn_end":
       if (useStore.getState().activeId === sessionId) clearRemoteWatchdog();
-      set((st) => (st.activeId === sessionId ? { streaming: false, pendingPermission: null } : {}));
+      setRun(set, sessionId, { streaming: false, pendingPermission: null });
       break;
   }
 }
