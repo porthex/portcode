@@ -55,14 +55,46 @@ export interface DirEntry {
 
 export type ToolPolicy = "allow" | "ask" | "deny";
 
+/**
+ * The permission MODE — the coarse default behaviour of the gate. Mirrors the
+ * Rust `PermissionMode`. `auto` auto-allows every mutating tool and `bypass`
+ * skips the gate entirely, so both are opt-in only and shown with a danger
+ * indicator; the quick-cycle covers only the safe trio.
+ */
+export type PermissionMode = "default" | "acceptEdits" | "plan" | "auto" | "bypass";
+
+/** Permission modes reachable by the quick-cycle affordance — the safe trio.
+ *  `auto`/`bypass` are deliberately excluded (Settings-only opt-in). */
+export const CYCLE_MODES: PermissionMode[] = ["default", "acceptEdits", "plan"];
+
+/** Modes that loosen the gate and must be surfaced as dangerous. */
+export const DANGER_MODES: PermissionMode[] = ["auto", "bypass"];
+
+/**
+ * A per-tool / per-command permission rule. Mirrors the Rust `Rule`. Evaluated
+ * before the mode default, first match wins. `command` is a literal shell
+ * command PREFIX (an allow-list convenience, never a guarantee — anything
+ * chained after the prefix matches too).
+ */
+export interface Rule {
+  tool: string;
+  command?: string;
+  decision: ToolPolicy;
+}
+
 export interface Settings {
   provider: "anthropic";
   model: string;
   apiKeySet: boolean;
+  /** Legacy global policy; the `default` mode's fallthrough (back-compat). */
   defaultPolicy: ToolPolicy;
   workspace: string | null;
   /** Reveal the agent's reply with a terminal-style typing animation. */
   typingAnimation: boolean;
+  /** The active permission mode (default/acceptEdits/plan/auto/bypass). */
+  permissionMode: PermissionMode;
+  /** Per-tool/command permission rules, evaluated before the mode default. */
+  rules: Rule[];
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -72,6 +104,8 @@ export const DEFAULT_SETTINGS: Settings = {
   defaultPolicy: "ask",
   workspace: null,
   typingAnimation: true,
+  permissionMode: "default",
+  rules: [],
 };
 
 /**

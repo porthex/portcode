@@ -146,7 +146,7 @@ describe("PermissionPrompt", () => {
     expect(useStore.getState().pendingPermission).toBeNull();
   });
 
-  it("Always allow persists the allow-always policy as well", async () => {
+  it("Always allow adds a scoped allow-rule for the tool (not a global policy flip)", async () => {
     useStore.setState({ pendingPermission: pending() });
 
     render(<PermissionPrompt />);
@@ -154,7 +154,9 @@ describe("PermissionPrompt", () => {
 
     await flush();
 
-    expect(m.saveSettings).toHaveBeenCalledWith({ defaultPolicy: "allow" });
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      rules: [{ tool: "fs_edit", decision: "allow" }],
+    });
     expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
     expect(useStore.getState().pendingPermission).toBeNull();
   });

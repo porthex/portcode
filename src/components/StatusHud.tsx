@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 
 import { useStore } from "../store/store";
-import { MODELS, type Message } from "../types";
+import { DANGER_MODES, MODELS, type Message } from "../types";
 
 /** "claude-opus-4-8" -> "OPUS 4.8" */
 function modelLabel(id: string): string {
@@ -41,6 +41,7 @@ export function StatusHud() {
   const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
   const model = useStore((s) => s.settings.model);
   const policy = useStore((s) => s.settings.defaultPolicy);
+  const mode = useStore((s) => s.settings.permissionMode);
   const streaming = useStore((s) => s.streaming);
   const usage = useStore((s) => (s.activeId ? s.usage[s.activeId] : undefined));
   const messages = useStore((s) => (s.activeId ? s.messages[s.activeId] : undefined));
@@ -66,7 +67,19 @@ export function StatusHud() {
       {/* The phone trims the HUD to essentials so the 7 desktop segments don't
           overflow a narrow screen — policy and the redundant workspace segment
           (the ⎇ branch above already names the workspace) are desktop-only. */}
-      {!remoteMode && <div className="pc-hud-seg text-warn">POLICY: {policy.toUpperCase()}</div>}
+      {/* In `default` mode the gate behaviour IS the legacy policy, so show that;
+          otherwise show the active MODE, and flag the loosened auto/bypass modes
+          in a danger colour with a warning glyph so a relaxed gate is never hidden. */}
+      {!remoteMode &&
+        (mode === "default" ? (
+          <div className="pc-hud-seg text-warn">POLICY: {policy.toUpperCase()}</div>
+        ) : (
+          <div
+            className={`pc-hud-seg ${DANGER_MODES.includes(mode) ? "text-danger" : "text-warn"}`}
+          >
+            {DANGER_MODES.includes(mode) ? "⚠ " : ""}MODE: {mode.toUpperCase()}
+          </div>
+        ))}
       {!remoteMode && (
         <div className="pc-hud-seg text-violet">
           <span aria-hidden="true">{"◆"}</span> WORKSPACE {workspaceConnected ? "LINKED" : "LOCAL"}
