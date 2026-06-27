@@ -65,6 +65,15 @@
   font-display: swap;
   src: url("./fonts/jetbrains-mono-600.woff2") format("woff2");
 }
+/* Kept for the PORTCODE wordmark ONLY (its squared brand identity); the rest of
+   the UI uses IBM Plex Sans. See `.pc-wordmark`. */
+@font-face {
+  font-family: "Chakra Petch";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("./fonts/chakra-petch-700.woff2") format("woff2");
+}
 
 @theme {
   /* ---- Surfaces (wet-asphalt blacks, blue-shifted) ---- */
@@ -459,7 +468,9 @@ input[type="radio"]:not(:disabled) {
    WORDMARK
    ========================================================================= */
 .pc-wordmark {
-  font-family: var(--font-display);
+  /* The PORTCODE wordmark keeps its squared Chakra Petch identity; everything
+     else uses --font-display (IBM Plex Sans). Falls back to it if Chakra fails. */
+  font-family: "Chakra Petch", var(--font-display);
   font-weight: 700;
   font-size: 16px;
   letter-spacing: 2.5px;
