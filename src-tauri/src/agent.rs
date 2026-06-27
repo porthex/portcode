@@ -425,6 +425,8 @@ async fn run_inner(
                                 permissions::gate(
                                     app,
                                     channel,
+                                    snapshot.permission_mode,
+                                    &snapshot.rules,
                                     &snapshot.default_policy,
                                     pending,
                                     cancel,
