@@ -20,6 +20,8 @@ vi.mock("../lib/ipc", () => ({
   createSession: vi.fn(),
   getMessages: vi.fn(),
   deleteSession: vi.fn(),
+  renameSession: vi.fn(),
+  subscribeSessionEvents: vi.fn(),
   saveSettings: vi.fn(),
   resolvePermission: vi.fn(),
   openFolder: vi.fn(),
@@ -57,6 +59,8 @@ beforeEach(() => {
   m.getMessages.mockResolvedValue([]);
   m.createSession.mockResolvedValue(undefined);
   m.deleteSession.mockResolvedValue(undefined);
+  m.renameSession.mockResolvedValue(undefined);
+  m.subscribeSessionEvents.mockResolvedValue(() => {});
 });
 
 describe("Sidebar", () => {
@@ -480,6 +484,98 @@ describe("Sidebar", () => {
       // The empty list has no rows to move between; the handler must not throw.
       expect(() => fireEvent.keyDown(nav, { key: "ArrowDown" })).not.toThrow();
       expect(useStore.getState().activeId).toBeNull();
+    });
+  });
+
+  describe("inline rename", () => {
+    it("renames a session via the pencil button, committing on Enter", async () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Old name" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Old name" }));
+      const input = screen.getByRole("textbox", { name: "Rename session: Old name" });
+      fireEvent.change(input, { target: { value: "New name" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      await Promise.resolve();
+
+      expect(m.renameSession).toHaveBeenCalledWith("a", "New name");
+      expect(useStore.getState().sessions[0].title).toBe("New name");
+    });
+
+    it("enters rename mode on a double-click of the title", () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "DblTitle" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.doubleClick(screen.getByText("DblTitle"));
+      // The title becomes an editable input seeded with the current title.
+      expect(screen.getByRole("textbox", { name: "Rename session: DblTitle" })).toHaveValue(
+        "DblTitle",
+      );
+    });
+
+    it("Escape cancels the edit without renaming", () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Keep me" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Keep me" }));
+      const input = screen.getByRole("textbox", { name: "Rename session: Keep me" });
+      fireEvent.change(input, { target: { value: "discarded" } });
+      fireEvent.keyDown(input, { key: "Escape" });
+
+      expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+      expect(screen.getByText("Keep me")).toBeInTheDocument();
+      expect(m.renameSession).not.toHaveBeenCalled();
+    });
+
+    it("commits the rename on blur", async () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Before" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Before" }));
+      const input = screen.getByRole("textbox", { name: "Rename session: Before" });
+      fireEvent.change(input, { target: { value: "After" } });
+      fireEvent.blur(input);
+      await Promise.resolve();
+
+      expect(m.renameSession).toHaveBeenCalledWith("a", "After");
+    });
+
+    it("offers no rename affordance while a turn is streaming", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Busy" })],
+        activeId: "a",
+        streaming: true,
+      });
+      render(<Sidebar />);
+      expect(
+        screen.queryByRole("button", { name: "Rename session: Busy" }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("offers no rename affordance when driving a remote desktop", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Remote" })],
+        activeId: "a",
+        remoteConnected: true,
+      });
+      render(<Sidebar />);
+      expect(
+        screen.queryByRole("button", { name: "Rename session: Remote" }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("keeps edit-mode key handling local (no stray list navigation)", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "First" }), session({ id: "b", title: "Second" })],
+        activeId: "a",
+      });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: First" }));
+      const input = screen.getByRole("textbox", { name: "Rename session: First" });
+      fireEvent.keyDown(input, { key: "ArrowDown" });
+      // The roving list nav underneath must not move the selection while editing.
+      expect(useStore.getState().activeId).toBe("a");
     });
   });
 });

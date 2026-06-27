@@ -1,4 +1,4 @@
-import { useRef, type KeyboardEvent } from "react";
+import { useRef, useState, type KeyboardEvent } from "react";
 
 import { isTauri } from "../lib/ipc";
 import { useStore } from "../store/store";
@@ -10,10 +10,42 @@ export function Sidebar() {
   const newSession = useStore((s) => s.newSession);
   const selectSession = useStore((s) => s.selectSession);
   const deleteSession = useStore((s) => s.deleteSession);
+  const renameSession = useStore((s) => s.renameSession);
   const setShowSettings = useStore((s) => s.setShowSettings);
   const settings = useStore((s) => s.settings);
   const oauthStatus = useStore((s) => s.oauthStatus);
   const streaming = useStore((s) => s.streaming);
+  const remoteConnected = useStore((s) => s.remoteConnected);
+
+  // Inline rename state. A row enters edit mode (the title becomes an input) via
+  // its pencil button or a double-click; Enter / blur commits, Escape cancels.
+  // Rename is a desktop-local DB write, so the affordance is offered only when not
+  // streaming and not driving a remote desktop (which has no rename command).
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const canRename = !streaming && !remoteConnected;
+
+  const beginEdit = (s: Session) => {
+    if (!canRename) return;
+    setEditingId(s.id);
+    setDraft(s.title);
+  };
+  const commitEdit = () => {
+    if (editingId !== null) void renameSession(editingId, draft);
+    setEditingId(null);
+  };
+  const cancelEdit = () => setEditingId(null);
+  const onEditKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      commitEdit();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancelEdit();
+    }
+    // Don't let arrow/Home/End bubble to the list's roving-nav while editing.
+    e.stopPropagation();
+  };
 
   const signedInClaude = !!oauthStatus?.signedIn;
   const authed = signedInClaude || settings.apiKeySet;
@@ -108,53 +140,79 @@ export function Sidebar() {
               }
             >
               <div className="flex items-center">
-                <button
-                  ref={(el) => {
-                    rowRefs.current[i] = el;
-                  }}
-                  onClick={() => selectSession(s.id)}
-                  disabled={streaming}
-                  tabIndex={active ? 0 : -1}
-                  aria-current={active ? "true" : undefined}
-                  className={`flex min-w-0 flex-1 flex-col text-left ${
-                    streaming ? "cursor-not-allowed" : ""
-                  }`}
-                  title={streaming ? "Finish or stop the current turn first" : s.title}
-                >
-                  <span className="relative flex items-center">
-                    {active && (
-                      <span
-                        className="pc-dot pc-dot--accent absolute left-[3px] top-1/2 -translate-y-1/2"
-                        aria-hidden="true"
-                      />
-                    )}
-                    <span
-                      className={`truncate pl-3 text-[13px] ${active ? "text-fg" : "text-muted"}`}
+                {editingId === s.id ? (
+                  <input
+                    autoFocus
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    onKeyDown={onEditKeyDown}
+                    onBlur={commitEdit}
+                    aria-label={`Rename session: ${s.title}`}
+                    className="min-w-0 flex-1 rounded border border-accent/40 bg-panel-2 px-2 py-1 text-[13px] text-fg outline-none focus:border-accent"
+                  />
+                ) : (
+                  <>
+                    <button
+                      ref={(el) => {
+                        rowRefs.current[i] = el;
+                      }}
+                      onClick={() => selectSession(s.id)}
+                      onDoubleClick={() => beginEdit(s)}
+                      disabled={streaming}
+                      tabIndex={active ? 0 : -1}
+                      aria-current={active ? "true" : undefined}
+                      className={`flex min-w-0 flex-1 flex-col text-left ${
+                        streaming ? "cursor-not-allowed" : ""
+                      }`}
+                      title={streaming ? "Finish or stop the current turn first" : s.title}
                     >
-                      {s.title}
-                    </span>
-                  </span>
-                  <span
-                    className={`truncate pl-3 font-mono text-[9.5px] ${
-                      active ? "text-muted" : "text-faint"
-                    }`}
-                  >
-                    <span aria-hidden="true">⎇</span> {workspaceLabel(s.workspace)} ·{" "}
-                    {relativeTime(s.updatedAt)}
-                  </span>
-                </button>
-                <button
-                  onClick={() => deleteSession(s.id)}
-                  disabled={streaming}
-                  tabIndex={active ? 0 : -1}
-                  className={`ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-danger/10 hover:text-danger group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none ${
-                    streaming ? "cursor-not-allowed opacity-50" : ""
-                  }`}
-                  aria-label={`Delete session: ${s.title}`}
-                  title={streaming ? "Finish or stop the current turn first" : "Delete session"}
-                >
-                  ✕
-                </button>
+                      <span className="relative flex items-center">
+                        {active && (
+                          <span
+                            className="pc-dot pc-dot--accent absolute left-[3px] top-1/2 -translate-y-1/2"
+                            aria-hidden="true"
+                          />
+                        )}
+                        <span
+                          className={`truncate pl-3 text-[13px] ${active ? "text-fg" : "text-muted"}`}
+                        >
+                          {s.title}
+                        </span>
+                      </span>
+                      <span
+                        className={`truncate pl-3 font-mono text-[9.5px] ${
+                          active ? "text-muted" : "text-faint"
+                        }`}
+                      >
+                        <span aria-hidden="true">⎇</span> {workspaceLabel(s.workspace)} ·{" "}
+                        {relativeTime(s.updatedAt)}
+                      </span>
+                    </button>
+                    {canRename && (
+                      <button
+                        onClick={() => beginEdit(s)}
+                        tabIndex={active ? 0 : -1}
+                        className="ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-accent/10 hover:text-accent group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none"
+                        aria-label={`Rename session: ${s.title}`}
+                        title="Rename session"
+                      >
+                        ✎
+                      </button>
+                    )}
+                    <button
+                      onClick={() => deleteSession(s.id)}
+                      disabled={streaming}
+                      tabIndex={active ? 0 : -1}
+                      className={`ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-danger/10 hover:text-danger group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none ${
+                        streaming ? "cursor-not-allowed opacity-50" : ""
+                      }`}
+                      aria-label={`Delete session: ${s.title}`}
+                      title={streaming ? "Finish or stop the current turn first" : "Delete session"}
+                    >
+                      ✕
+                    </button>
+                  </>
+                )}
               </div>
             </div>
           );
