@@ -29,6 +29,21 @@ const REFRESH_SKEW_SECS: i64 = 60;
 /// stops with a clear error instead of looping.
 const MAX_AGENT_STEPS: usize = 50;
 
+/// Maximum subagent nesting depth. The user-facing run is depth 0; a subagent it
+/// launches is depth 1, and so on. A confused or injected agent that keeps calling
+/// `task` could otherwise fan out without bound, so a subagent at this depth is
+/// handed no `task` tool (and the spawner refuses past it as a backstop).
+const MAX_SUBAGENT_DEPTH: usize = 3;
+
+/// Steer prepended (as a system-prompt addendum) for a subagent run. It tells the
+/// model it is an autonomous, single-shot worker whose final message is its entire
+/// return value — paired with the subagent tool set in [`tools::subagent_registry`].
+const SUBAGENT_STEER: &str = "You are a SUBAGENT launched to carry out one specific, well-scoped task \
+on behalf of another agent. Work independently with your tools and finish with a single, self-contained \
+summary of what you found or did — that final message is your ENTIRE return value to the agent that \
+launched you, so make it stand on its own. You cannot ask the launching agent questions; make reasonable \
+assumptions and state any you made.";
+
 /// True once the per-run step counter has passed the ceiling. `step` is 1-based
 /// (the count of the turn about to run), so step `MAX_AGENT_STEPS` is allowed and
 /// `MAX_AGENT_STEPS + 1` is the first one rejected.
@@ -317,7 +332,7 @@ async fn run_inner(
     db: &Arc<Db>,
     pending: &Pending,
     cancel: &Arc<AtomicBool>,
-    refresh_lock: &tokio::sync::Mutex<()>,
+    refresh_lock: &Arc<tokio::sync::Mutex<()>>,
     channel: &str,
     session_id: &str,
     user_text: String,
@@ -325,7 +340,7 @@ async fn run_inner(
 ) -> Result<String, String> {
     let snapshot = { settings.lock().unwrap().clone() };
 
-    let mut cred = secrets::load_credential().ok_or(
+    let cred = secrets::load_credential().ok_or(
         "No credentials set. Sign in with your Claude subscription or add an Anthropic API key in Settings.",
     )?;
 
@@ -356,9 +371,29 @@ async fn run_inner(
         system_prompt: system_override,
         prompt_steer,
     } = config;
-    let tool_specs = registry.specs();
     let system = resolve_system_prompt(system_override, prompt_steer, &workspace);
-    let ctx = ToolCtx { workspace };
+
+    // Attach a subagent spawner only when this run actually exposes the `task`
+    // tool. Plan mode's read-only registry has no `task`, so it gets no spawner and
+    // can never launch a (mutating) subagent — defense-in-depth with the gate,
+    // which already denies mutating tools in plan mode.
+    let spawner: Option<Arc<dyn tools::Spawner>> = if registry.find("task").is_some() {
+        Some(Arc::new(AgentSpawner {
+            app: app.clone(),
+            http: http.clone(),
+            settings: settings.clone(),
+            pending: pending.clone(),
+            cancel: cancel.clone(),
+            refresh_lock: refresh_lock.clone(),
+            parent_channel: channel.to_string(),
+            workspace: workspace.clone(),
+            depth: 1,
+        }))
+    } else {
+        None
+    };
+    let mut ctx = ToolCtx::new(workspace);
+    ctx.spawner = spawner;
 
     // Load prior turns from the DB, then persist the new user message.
     let mut messages = db.load_chat_messages(session_id);
@@ -378,7 +413,110 @@ async fn run_inner(
     }
     db.touch_session(session_id, db::now_ms());
 
+    // The interactive run is its own session: agent output, permission prompts,
+    // and usage all flow on the same `agent://{session}` channel, and every
+    // message persists to the session.
+    let outcome = run_loop_core(
+        app,
+        http,
+        provider.as_ref(),
+        &snapshot,
+        cred,
+        refresh_lock,
+        pending,
+        cancel,
+        channel,
+        channel,
+        &registry,
+        &system,
+        &ctx,
+        messages,
+        &Persist::Session { db, session_id },
+    )
+    .await?;
+    Ok(outcome.stop_reason)
+}
+
+/// Where a run's transcript goes. The interactive run persists every message to
+/// its SQLite session; a subagent is **ephemeral** — it keeps the transcript only
+/// in memory, so it never pollutes the parent thread or the database.
+enum Persist<'a> {
+    Session { db: &'a Db, session_id: &'a str },
+    Ephemeral,
+}
+
+impl Persist<'_> {
+    /// Append a freshly produced message to the durable store, if any. `what`
+    /// names the message for the error path ("the reply" / "tool results").
+    fn append(&self, msg: &ChatMessage, what: &str) -> Result<(), String> {
+        match self {
+            Persist::Session { db, session_id } => db
+                .try_append_message(session_id, msg, db::now_ms())
+                .map(|_| ())
+                .map_err(|e| format!("Failed to save {what}: {e}")),
+            Persist::Ephemeral => Ok(()),
+        }
+    }
+
+    /// Bump the session's last-activity timestamp (no-op for an ephemeral run).
+    fn touch(&self) {
+        if let Persist::Session { db, session_id } = self {
+            db.touch_session(session_id, db::now_ms());
+        }
+    }
+}
+
+/// The result of running an agent loop to completion.
+struct LoopOutcome {
+    /// The terminal stop reason ("end_turn", "cancelled", …).
+    stop_reason: String,
+    /// The text of the final assistant message — a subagent's answer to whoever
+    /// launched it. Empty if the run ended before producing any assistant text.
+    final_text: String,
+}
+
+/// The shared agent loop: stream a turn, run any requested tools (mutating tools
+/// pass through the permission gate), repeat until the model finishes, is
+/// cancelled, or hits the step ceiling.
+///
+/// Lifted out of [`run_inner`] so the interactive run and a subagent share ONE
+/// loop and can never drift apart. They differ only in their parameters — in
+/// particular the two channels, which split per-agent output from session-level
+/// events:
+///
+///  * `agent_channel` carries THIS agent's private turn output — text/tool deltas
+///    and tool results. The interactive run uses `agent://{session}`; a subagent
+///    uses its own `agent://{session}:{agentId}` so its work never folds into the
+///    parent transcript.
+///  * `session_channel` carries events that belong to the owning SESSION rather
+///    than the individual agent: permission prompts (so a subagent's prompts reach
+///    the existing prompt UI and a paired phone) and token usage (so a subagent's
+///    cost rolls up into the session total instead of vanishing on an unwatched
+///    channel). A subagent points this at its PARENT channel; the interactive run
+///    passes its own `agent://{session}` for both.
+///  * `persist` is `Session` for the interactive run (writes to the DB) and
+///    `Ephemeral` for a subagent (in-memory only).
+#[allow(clippy::too_many_arguments)]
+async fn run_loop_core(
+    app: &AppHandle,
+    http: &reqwest::Client,
+    provider: &dyn llm::LlmProvider,
+    snapshot: &Settings,
+    mut cred: Credential,
+    refresh_lock: &tokio::sync::Mutex<()>,
+    pending: &Pending,
+    cancel: &Arc<AtomicBool>,
+    agent_channel: &str,
+    session_channel: &str,
+    registry: &tools::Registry,
+    system: &str,
+    ctx: &ToolCtx,
+    mut messages: Vec<ChatMessage>,
+    persist: &Persist<'_>,
+) -> Result<LoopOutcome, String> {
+    let tool_specs = registry.specs();
     let final_stop;
+    let mut final_text = String::new();
     let mut steps: usize = 0;
 
     loop {
@@ -406,30 +544,40 @@ async fn run_inner(
                 http,
                 &cred,
                 &snapshot.model,
-                &system,
+                system,
                 &messages,
                 &tool_specs,
                 app,
-                channel,
+                agent_channel,
                 cancel,
             )
             .await?;
 
+        // Usage is a SESSION-level event: route it to `session_channel` so a
+        // subagent's token cost rolls up into the parent session's total rather
+        // than streaming to an unwatched child channel and being lost. For the
+        // interactive run the two channels are identical, so this is unchanged.
         emit(
             app,
-            channel,
+            session_channel,
             StreamEvent::Usage {
                 input_tokens: turn.input_tokens,
                 output_tokens: turn.output_tokens,
             },
         );
 
+        // Track the latest assistant text so a subagent can return its final
+        // answer; the closing (non-tool-use) turn overwrites any earlier text.
+        let text = assistant_text(&turn.content);
+        if !text.is_empty() {
+            final_text = text;
+        }
+
         let assistant = ChatMessage {
             role: "assistant".into(),
             content: turn.content.clone(),
         };
-        db.try_append_message(session_id, &assistant, db::now_ms())
-            .map_err(|e| format!("Failed to save the reply: {e}"))?;
+        persist.append(&assistant, "the reply")?;
         messages.push(assistant);
 
         if turn.stop_reason == "tool_use" {
@@ -446,7 +594,7 @@ async fn run_inner(
                         let output = CANCELLED_TOOL_RESULT.to_string();
                         emit(
                             app,
-                            channel,
+                            agent_channel,
                             StreamEvent::ToolResult {
                                 id: id.clone(),
                                 output: output.clone(),
@@ -465,17 +613,17 @@ async fn run_inner(
                             let decision = if tool.mutating() {
                                 // Compute the pre-apply diff (fs_write/fs_edit) so
                                 // the prompt can show the change BEFORE it's written.
-                                let diff = tool.preview(input, &ctx).await;
+                                let diff = tool.preview(input, ctx).await;
                                 permissions::gate(
                                     app,
-                                    channel,
+                                    session_channel,
                                     snapshot.permission_mode,
                                     &snapshot.rules,
                                     &snapshot.default_policy,
                                     pending,
                                     cancel,
                                     name,
-                                    &tool.summarize(input, &ctx),
+                                    &tool.summarize(input, ctx),
                                     input,
                                     diff,
                                 )
@@ -491,7 +639,7 @@ async fn run_inner(
                                     cancelled = true;
                                     (CANCELLED_TOOL_RESULT.to_string(), true)
                                 }
-                                Decision::Allow => match tool.run(input.clone(), &ctx).await {
+                                Decision::Allow => match tool.run(input.clone(), ctx).await {
                                     Ok(out) => (out, false),
                                     Err(err) => (err, true),
                                 },
@@ -505,7 +653,7 @@ async fn run_inner(
                     };
                     emit(
                         app,
-                        channel,
+                        agent_channel,
                         StreamEvent::ToolResult {
                             id: id.clone(),
                             output: output.clone(),
@@ -531,8 +679,7 @@ async fn run_inner(
                 role: "user".into(),
                 content: results,
             };
-            db.try_append_message(session_id, &tool_msg, db::now_ms())
-                .map_err(|e| format!("Failed to save tool results: {e}"))?;
+            persist.append(&tool_msg, "tool results")?;
             messages.push(tool_msg);
             // If the batch was cancelled mid-flight, stop here rather than starting
             // another model turn. The tool results above are already persisted, so the
@@ -548,15 +695,156 @@ async fn run_inner(
         }
     }
 
-    db.touch_session(session_id, db::now_ms());
-    Ok(final_stop)
+    persist.touch();
+    Ok(LoopOutcome {
+        stop_reason: final_stop,
+        final_text,
+    })
+}
+
+/// Concatenate the text blocks of an assistant turn (ignoring tool-use blocks).
+fn assistant_text(content: &[Block]) -> String {
+    content
+        .iter()
+        .filter_map(|b| match b {
+            Block::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Whether a subagent at `depth` may itself spawn children — i.e. is still under
+/// the nesting cap. A subagent AT the cap is a leaf: it gets no spawner and no
+/// `task` tool.
+fn child_can_spawn(depth: usize) -> bool {
+    depth < MAX_SUBAGENT_DEPTH
+}
+
+/// The string a subagent returns to its launcher: its final assistant text, or a
+/// short note (naming the subagent by its `description`) when it produced none, so
+/// the launcher always receives something legible rather than an empty tool result.
+fn subagent_answer(description: &str, final_text: &str, stop_reason: &str) -> String {
+    let trimmed = final_text.trim();
+    if trimmed.is_empty() {
+        format!(
+            "(The subagent \"{description}\" finished without a text summary; \
+             stop reason: {stop_reason}.)"
+        )
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Launches subagents for the `task` tool. Holds owned clones of everything a
+/// child run needs, so it can outlive the call that built it and spawn children on
+/// demand. One per parent run; cloned (with `depth + 1`) onto each child it
+/// launches, so nesting stays depth-bounded.
+#[derive(Clone)]
+struct AgentSpawner {
+    app: AppHandle,
+    http: reqwest::Client,
+    settings: Arc<Mutex<Settings>>,
+    pending: Pending,
+    /// Shared with the parent run: a Stop on the parent flips this flag and the
+    /// child loop observes it, so cancelling a parent cancels its subagents too.
+    /// (A per-subagent Stop is a later increment.)
+    cancel: Arc<AtomicBool>,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The parent's `agent://{session}` channel — where a subagent's permission
+    /// prompts surface (so the existing prompt UI handles them) and the base for
+    /// the child's own stream channel.
+    parent_channel: String,
+    workspace: PathBuf,
+    /// The depth the children THIS spawner launches run at (top-level run → 1).
+    depth: usize,
+}
+
+#[async_trait::async_trait]
+impl tools::Spawner for AgentSpawner {
+    async fn spawn(&self, spec: tools::SubagentSpec) -> Result<String, String> {
+        // Depth ceiling (a backstop to the registry omission): never launch a child
+        // deeper than the cap, so a confused or injected agent can't fork forever.
+        if self.depth > MAX_SUBAGENT_DEPTH {
+            return Err(format!(
+                "Subagent nesting limit reached (maximum depth {MAX_SUBAGENT_DEPTH})."
+            ));
+        }
+
+        let snapshot = { self.settings.lock().unwrap().clone() };
+        let cred = secrets::load_credential().ok_or(
+            "No credentials set. Sign in with your Claude subscription or add an Anthropic API key in Settings.",
+        )?;
+        let provider = llm::provider_for(&snapshot.provider)?;
+
+        let agent_id = Uuid::new_v4().to_string();
+        // The child's own stream channel, distinct from the parent's so its deltas
+        // never fold into the parent transcript. No desktop listener subscribes to
+        // it yet (the live agents panel is a later increment), so for now a subagent
+        // is visible only through its permission prompts and its final result.
+        let child_channel = format!("{}:{}", self.parent_channel, agent_id);
+
+        // A child may spawn its own children only while still under the cap; at the
+        // last allowed depth it gets no spawner and no `task` tool (a leaf).
+        let can_spawn = child_can_spawn(self.depth);
+        let registry = tools::subagent_registry(can_spawn);
+        let child_spawner: Option<Arc<dyn tools::Spawner>> = if can_spawn {
+            Some(Arc::new(AgentSpawner {
+                depth: self.depth + 1,
+                ..self.clone()
+            }))
+        } else {
+            None
+        };
+        let ctx = ToolCtx {
+            workspace: self.workspace.clone(),
+            spawner: child_spawner,
+        };
+
+        // The subagent runs the default workspace prompt plus the "you are a
+        // subagent" steer, with the task as its first (and only seeded) user turn.
+        let system = resolve_system_prompt(None, Some(SUBAGENT_STEER.to_string()), &self.workspace);
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: vec![Block::Text {
+                text: spec.prompt.clone(),
+            }],
+        }];
+
+        let outcome = run_loop_core(
+            &self.app,
+            &self.http,
+            provider.as_ref(),
+            &snapshot,
+            cred,
+            &self.refresh_lock,
+            &self.pending,
+            &self.cancel,
+            &child_channel,       // agent_channel: the subagent's private output
+            &self.parent_channel, // session_channel: prompts + usage roll up here
+            &registry,
+            &system,
+            &ctx,
+            messages,
+            &Persist::Ephemeral,
+        )
+        .await?;
+
+        // The subagent's final assistant text IS its answer to the launching agent.
+        Ok(subagent_answer(
+            &spec.description,
+            &outcome.final_text,
+            &outcome.stop_reason,
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        batch_cancelled, derive_title, is_terminal_auth_error, resolve_system_prompt,
-        step_limit_exceeded, AgentConfig, MAX_AGENT_STEPS,
+        assistant_text, batch_cancelled, child_can_spawn, derive_title, is_terminal_auth_error,
+        resolve_system_prompt, step_limit_exceeded, subagent_answer, AgentConfig, Block,
+        ChatMessage, Db, Persist, MAX_AGENT_STEPS, MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
     };
     use std::path::Path;
 
@@ -566,6 +854,106 @@ mod tests {
             .iter()
             .map(|s| s["name"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    fn text_block(t: &str) -> Block {
+        Block::Text { text: t.into() }
+    }
+
+    #[test]
+    fn assistant_text_concatenates_text_and_ignores_tool_blocks() {
+        // The subagent's answer is its text only; tool-use blocks (and their ids)
+        // never bleed into the returned summary.
+        let content = vec![
+            text_block("First. "),
+            Block::ToolUse {
+                id: "t1".into(),
+                name: "fs_read".into(),
+                input: serde_json::json!({ "path": "x" }),
+            },
+            text_block("Second."),
+        ];
+        assert_eq!(assistant_text(&content), "First. Second.");
+        // A turn with no text (pure tool-use) yields the empty string, which the
+        // caller treats as "no answer yet".
+        assert_eq!(
+            assistant_text(&[Block::ToolUse {
+                id: "t".into(),
+                name: "shell".into(),
+                input: serde_json::json!({}),
+            }]),
+            ""
+        );
+        assert_eq!(assistant_text(&[]), "");
+    }
+
+    #[test]
+    fn child_can_spawn_is_true_below_the_cap_and_false_at_or_above_it() {
+        // A subagent under the nesting cap may fan out; one AT the cap is a leaf.
+        assert!(child_can_spawn(1));
+        assert!(child_can_spawn(MAX_SUBAGENT_DEPTH - 1));
+        assert!(!child_can_spawn(MAX_SUBAGENT_DEPTH));
+        assert!(!child_can_spawn(MAX_SUBAGENT_DEPTH + 1));
+    }
+
+    #[test]
+    fn subagent_answer_returns_trimmed_text_or_a_note_when_empty() {
+        assert_eq!(subagent_answer("audit", "  done.\n", "end_turn"), "done.");
+        // No text → a legible note naming the subagent and carrying the stop reason,
+        // never an empty result.
+        let note = subagent_answer("audit deps", "   ", "cancelled");
+        assert!(note.contains("without a text summary"));
+        assert!(note.contains("audit deps"));
+        assert!(note.contains("cancelled"));
+    }
+
+    #[test]
+    fn subagent_steer_marks_the_run_as_a_subagent() {
+        // The steer must tell the model its final message is the entire return value
+        // (so it writes a self-contained summary rather than chatting).
+        assert!(SUBAGENT_STEER.contains("SUBAGENT"));
+        assert!(SUBAGENT_STEER.contains("return value"));
+    }
+
+    #[test]
+    fn persist_ephemeral_appends_nothing_and_touch_is_a_noop() {
+        // A subagent keeps its transcript only in memory: append/touch must succeed
+        // without any backing store (there is none) and never error.
+        let p = Persist::Ephemeral;
+        assert!(p
+            .append(
+                &ChatMessage {
+                    role: "assistant".into(),
+                    content: vec![text_block("hi")]
+                },
+                "the reply"
+            )
+            .is_ok());
+        p.touch(); // must not panic
+    }
+
+    #[test]
+    fn persist_session_writes_through_to_the_database() {
+        // The interactive run persists every message; Persist::Session delegates to
+        // the DB so a later reload sees exactly what the loop produced.
+        let db = Db::open(Path::new(":memory:")).expect("in-memory db");
+        db.create_session("s1", "T", None, 1).unwrap();
+        let p = Persist::Session {
+            db: &db,
+            session_id: "s1",
+        };
+        p.append(
+            &ChatMessage {
+                role: "assistant".into(),
+                content: vec![text_block("hello from the loop")],
+            },
+            "the reply",
+        )
+        .unwrap();
+        p.touch();
+        let loaded = db.load_chat_messages("s1");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(assistant_text(&loaded[0].content), "hello from the loop");
     }
 
     #[test]
@@ -609,7 +997,7 @@ mod tests {
         let cfg = AgentConfig::default_run();
         assert_eq!(
             spec_names(&cfg),
-            ["fs_read", "list", "glob", "grep", "fs_write", "fs_edit", "shell"]
+            ["fs_read", "list", "glob", "grep", "fs_write", "fs_edit", "shell", "task"]
         );
         assert!(cfg.system_prompt.is_none());
         assert!(cfg.prompt_steer.is_none());
