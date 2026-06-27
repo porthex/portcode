@@ -97,6 +97,15 @@ impl SyncHub {
             .strip_prefix(AGENT_CHANNEL_PREFIX)
             .unwrap_or(channel)
             .to_string();
+        // Subagent stream channels are `agent://{session}:{agentId}`, so the
+        // recovered id carries a ':'. The phone has no view for a subagent's private
+        // transcript, and `applyRemoteEvent` keys frames by session id — mirroring
+        // these would only spawn a phantom session. Skip them. (A subagent's
+        // permission prompts route on the PARENT channel, so they still reach the
+        // phone.) A real session id is a UUID and never contains ':'.
+        if session_id.contains(':') {
+            return false;
+        }
         self.tx.send(SyncFrame::Live { session_id, event }).is_ok()
     }
 
@@ -199,6 +208,30 @@ mod tests {
         assert!(matches!(
             rx.try_recv(),
             Ok(SyncFrame::Live { session_id, .. }) if session_id == "s1"
+        ));
+    }
+
+    #[test]
+    fn publish_skips_subagent_channels_to_avoid_phantom_phone_sessions() {
+        // A subagent's stream channel is `agent://{session}:{agentId}`. The phone
+        // can't render a subagent's private transcript and keys frames by session
+        // id, so mirroring one would only create a phantom session — publish must
+        // drop it (returning false) even with a live subscriber. A subagent's
+        // permission prompts ride the parent `agent://{session}` channel, which is
+        // NOT skipped, so they still reach the phone.
+        let hub = SyncHub::new();
+        let mut rx = hub.subscribe();
+        assert_eq!(hub.subscriber_count(), 1);
+
+        assert!(!hub.publish("agent://sess-1:agent-abc", delta()));
+        // Nothing was broadcast for the subagent channel.
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        // The parent channel for the same session is still mirrored.
+        assert!(hub.publish("agent://sess-1", delta()));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SyncFrame::Live { session_id, .. }) if session_id == "sess-1"
         ));
     }
 

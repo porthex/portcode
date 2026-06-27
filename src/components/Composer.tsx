@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useStore } from "../store/store";
-import { estimateCost } from "../types";
+import { DANGER_MODES, estimateCost } from "../types";
 
 // Auto-grow cap; kept in sync with the textarea's inline maxHeight so the JS
 // target and the CSS clip agree (otherwise the grow stops short at the smaller).
@@ -75,6 +75,7 @@ export function Composer() {
 
   return (
     <div className="border-t border-border bg-panel/80 px-6 pb-3 pt-3.5">
+      <PlanModeBanner />
       <div className="pc-neon-frame w-full max-w-none transition-[opacity,filter] duration-200 motion-reduce:transition-none">
         <div className="flex items-end gap-2.5 rounded-[12px] bg-panel px-3 py-2.5">
           <textarea
@@ -124,13 +125,76 @@ export function Composer() {
         </div>
       </div>
       <div className="mt-[7px] flex w-full max-w-none items-center justify-between font-mono text-[10.5px] text-faint">
-        <span className="min-w-0 truncate">
-          <span className="text-muted">ENTER</span> send ·{" "}
-          <span className="text-muted">SHIFT+ENTER</span> newline
+        <span className="flex min-w-0 items-center gap-2">
+          <ModePill />
+          <span className="min-w-0 truncate">
+            <span className="text-muted">ENTER</span> send ·{" "}
+            <span className="text-muted">SHIFT+ENTER</span> newline
+          </span>
         </span>
         <UsageMeter />
       </div>
     </div>
+  );
+}
+
+/**
+ * The plan-mode banner + "Exit plan mode" affordance (the approve-to-apply
+ * control). Shown only while plan mode is active; desktop-only (the mode is a
+ * desktop-side gate setting). Exiting switches back to the Default mode so the
+ * next message can mutate the workspace.
+ */
+function PlanModeBanner() {
+  const mode = useStore((s) => s.settings.permissionMode);
+  const updateSettings = useStore((s) => s.updateSettings);
+  const remoteMode = useStore((s) => s.remoteMode);
+  if (remoteMode || mode !== "plan") return null;
+  return (
+    <div
+      role="status"
+      className="mb-2.5 flex items-center justify-between gap-3 rounded-lg border border-accent-2/40 bg-accent-2/10 px-3 py-2 text-[11.5px] text-accent-2"
+    >
+      <span>
+        <strong>Plan mode</strong> — the agent will design a plan and won’t modify files. Approve to
+        apply.
+      </span>
+      <button
+        type="button"
+        onClick={() => void updateSettings({ permissionMode: "default" })}
+        className="shrink-0 rounded border border-accent-2/50 bg-accent-2/15 px-2.5 py-1 text-accent-2 hover:bg-accent-2/25"
+      >
+        Exit plan mode
+      </button>
+    </div>
+  );
+}
+
+/**
+ * The permission-mode pill — Portcode's native equivalent of the Shift+Tab mode
+ * cycle. Clicking advances through the safe trio (default → accept edits → plan);
+ * auto/bypass are Settings-only opt-in and never reached here. Shown in a danger
+ * colour with a warning glyph when a loosened mode is active. Desktop-only — the
+ * mode is a desktop-side gate setting the phone observes but doesn't drive.
+ */
+function ModePill() {
+  const mode = useStore((s) => s.settings.permissionMode);
+  const cycle = useStore((s) => s.cyclePermissionMode);
+  const remoteMode = useStore((s) => s.remoteMode);
+  if (remoteMode) return null;
+  const danger = DANGER_MODES.includes(mode);
+  return (
+    <button
+      type="button"
+      onClick={() => void cycle()}
+      title="Permission mode — click to cycle (default → accept edits → plan)"
+      aria-label={`Permission mode: ${mode}. Click to cycle.`}
+      className={`pc-mode-pill shrink-0 rounded px-1.5 py-0.5 uppercase ${
+        danger ? "text-danger" : "text-muted hover:text-fg"
+      }`}
+    >
+      {danger ? "⚠ " : ""}
+      {mode}
+    </button>
   );
 }
 

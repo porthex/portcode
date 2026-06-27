@@ -49,6 +49,9 @@ pub enum RemoteCommand {
     Run { session_id: String, text: String },
     /// Stop the active turn — proxies to `cancel_agent`.
     Cancel { session_id: String },
+    /// Stop ONE subagent (and its descendants) from the agents panel — proxies to
+    /// `cancel_agent_by_id`. Leaves the rest of the session running.
+    CancelAgent { agent_id: String },
     /// Answer a permission gate — proxies to `resolve_permission`.
     Permission { id: String, decision: String },
     /// Open a new session — proxies to `create_session`.
