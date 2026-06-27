@@ -10,6 +10,9 @@ import type {
   PhoneSyncStatus,
   RemoteCommand,
   Session,
+  SessionFolder,
+  SessionGroup,
+  SessionSort,
   Settings,
   StreamEvent,
   SyncFrame,
@@ -40,7 +43,19 @@ interface AppState {
   showSettings: boolean;
   showFiles: boolean;
   showSidebar: boolean; // mobile: the session-list drawer (overlay) is open
+  sidebarCollapsed: boolean; // desktop: the inline rail is collapsed to a 52px strip
   showPalette: boolean;
+
+  // ── Sessions sidebar organization (frontend-only overlay, persisted) ─────────
+  // The Rust `Session` model is unchanged; folders/membership/archived/sort/group
+  // live entirely client-side in localStorage. See lib/sessionView for the pure
+  // ordering/grouping logic these drive.
+  sortBy: SessionSort; // list order: recent | name | status | manual (drag-reordered)
+  groupBy: SessionGroup; // grouping: none (folder tree) | status | branch | workspace
+  folders: SessionFolder[]; // user folders (manual-org mode)
+  folderOf: Record<string, string | null>; // sessionId → folderId (absent/null = loose)
+  archivedIds: string[]; // sessions the user archived
+  manualOrder: string[]; // drag-reordered session ids (honoured when sortBy === "manual")
   ambientRain: boolean; // decorative neon-rain backdrop (off by default)
   scanlines: boolean; // CRT scanline overlay (off by default)
   draft: string;
@@ -74,6 +89,18 @@ interface AppState {
   toggleFiles: () => void;
   toggleSidebar: () => void;
   setShowSidebar: (v: boolean) => void;
+  setSidebarCollapsed: (v: boolean) => void;
+
+  // Sidebar organization actions (all persist their slice to localStorage).
+  setSortBy: (v: SessionSort) => void;
+  setGroupBy: (v: SessionGroup) => void;
+  setManualOrder: (ids: string[]) => void; // drag-reorder: records order + flips sortBy to manual
+  addFolder: () => void;
+  toggleFolder: (id: string) => void;
+  renameFolder: (id: string, name: string) => void;
+  deleteFolder: (id: string) => void; // members fall back to loose
+  moveSessionToFolder: (sessionId: string, folderId: string | null) => void;
+  toggleArchived: (sessionId: string) => void;
   setDraft: (v: string) => void;
   appendDraft: (v: string) => void;
   openWorkspace: () => Promise<void>;
@@ -174,6 +201,36 @@ const writeStr = (k: string, v: string | null): void => {
   }
 };
 
+// JSON prefs (sidebar folders + membership + archived ids — frontend-only
+// organization overlays, never secrets). Same best-effort localStorage
+// discipline: a parse error or disabled storage falls back to the default.
+const readJSON = <T>(k: string, fallback: T): T => {
+  try {
+    const raw = localStorage.getItem(k);
+    return raw === null ? fallback : (JSON.parse(raw) as T);
+  } catch {
+    return fallback;
+  }
+};
+const writeJSON = (k: string, v: unknown): void => {
+  try {
+    localStorage.setItem(k, JSON.stringify(v));
+  } catch {
+    /* storage disabled / over quota / not serializable — ignore */
+  }
+};
+
+// Validated reads for the enumerated sidebar prefs, so a stale/garbage value
+// can never put the list into an undefined sort/group mode.
+const readSort = (): SessionSort => {
+  const v = readStr("pc.sortBy");
+  return v === "name" || v === "status" ? v : "recent";
+};
+const readGroup = (): SessionGroup => {
+  const v = readStr("pc.groupBy");
+  return v === "workspace" || v === "status" ? v : "none";
+};
+
 const uid = () =>
   typeof crypto !== "undefined" && crypto.randomUUID
     ? crypto.randomUUID()
@@ -185,6 +242,9 @@ function makeSession(): Session {
     id: uid(),
     title: "New chat",
     workspace: null,
+    // Branch is computed by the core from the workspace's git HEAD on the next
+    // list; a fresh, workspace-less chat has none until then.
+    branch: null,
     createdAt: t,
     updatedAt: t,
   };
@@ -208,7 +268,14 @@ export const useStore = create<AppState>((set, get) => ({
   showSettings: false,
   showFiles: false,
   showSidebar: false,
+  sidebarCollapsed: readPref("pc.sidebarCollapsed"),
   showPalette: false,
+  sortBy: readSort(),
+  groupBy: readGroup(),
+  folders: readJSON<SessionFolder[]>("pc.folders", []),
+  folderOf: readJSON<Record<string, string | null>>("pc.folderOf", {}),
+  archivedIds: readJSON<string[]>("pc.archivedIds", []),
+  manualOrder: readJSON<string[]>("pc.manualOrder", []),
   ambientRain: readPref("pc.ambientRain"),
   scanlines: readPref("pc.scanlines"),
   draft: "",
@@ -391,7 +458,25 @@ export const useStore = create<AppState>((set, get) => ({
       const messages = { ...st.messages };
       delete messages[id];
       const activeId = st.activeId === id ? (sessions[0]?.id ?? null) : st.activeId;
-      return { sessions, messages, activeId };
+      // Drop the gone session's sidebar-org entries so stale folder membership /
+      // archived state can't accumulate in localStorage across deletions.
+      let folderOf = st.folderOf;
+      if (id in folderOf) {
+        folderOf = { ...st.folderOf };
+        delete folderOf[id];
+        writeJSON("pc.folderOf", folderOf);
+      }
+      let archivedIds = st.archivedIds;
+      if (archivedIds.includes(id)) {
+        archivedIds = archivedIds.filter((x) => x !== id);
+        writeJSON("pc.archivedIds", archivedIds);
+      }
+      let manualOrder = st.manualOrder;
+      if (manualOrder.includes(id)) {
+        manualOrder = manualOrder.filter((x) => x !== id);
+        writeJSON("pc.manualOrder", manualOrder);
+      }
+      return { sessions, messages, activeId, folderOf, archivedIds, manualOrder };
     });
     if (get().sessions.length === 0) {
       await get().newSession();
@@ -723,6 +808,94 @@ export const useStore = create<AppState>((set, get) => ({
 
   setShowSidebar(v) {
     set({ showSidebar: v });
+  },
+
+  setSidebarCollapsed(v) {
+    writePref("pc.sidebarCollapsed", v);
+    set({ sidebarCollapsed: v });
+  },
+
+  // ── Sessions sidebar organization ───────────────────────────────────────────
+  setSortBy(v) {
+    writeStr("pc.sortBy", v);
+    set({ sortBy: v });
+  },
+
+  setGroupBy(v) {
+    writeStr("pc.groupBy", v);
+    set({ groupBy: v });
+  },
+
+  setManualOrder(ids) {
+    // A drag-reorder switches the list to manual order: persist the order and
+    // flip sortBy to "manual" so the presets visibly turn off (the handoff's
+    // "in case of reordering, sort by goes off").
+    writeJSON("pc.manualOrder", ids);
+    writeStr("pc.sortBy", "manual");
+    set({ manualOrder: ids, sortBy: "manual" });
+  },
+
+  addFolder() {
+    const folder: SessionFolder = { id: uid(), name: "New folder", open: true };
+    set((st) => {
+      const folders = [...st.folders, folder];
+      writeJSON("pc.folders", folders);
+      return { folders };
+    });
+  },
+
+  toggleFolder(id) {
+    set((st) => {
+      const folders = st.folders.map((f) => (f.id === id ? { ...f, open: !f.open } : f));
+      writeJSON("pc.folders", folders);
+      return { folders };
+    });
+  },
+
+  renameFolder(id, name) {
+    // Ignore an empty/whitespace rename so a folder can never lose its label.
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    set((st) => {
+      const folders = st.folders.map((f) => (f.id === id ? { ...f, name: trimmed } : f));
+      writeJSON("pc.folders", folders);
+      return { folders };
+    });
+  },
+
+  deleteFolder(id) {
+    set((st) => {
+      const folders = st.folders.filter((f) => f.id !== id);
+      // Orphan the folder's members back to loose (drop their membership entries)
+      // so they reappear at the root rather than vanishing into a dead folder id.
+      const folderOf: Record<string, string | null> = {};
+      for (const [sid, fid] of Object.entries(st.folderOf)) {
+        if (fid !== id) folderOf[sid] = fid;
+      }
+      writeJSON("pc.folders", folders);
+      writeJSON("pc.folderOf", folderOf);
+      return { folders, folderOf };
+    });
+  },
+
+  moveSessionToFolder(sessionId, folderId) {
+    set((st) => {
+      const folderOf = { ...st.folderOf };
+      if (folderId === null) delete folderOf[sessionId];
+      else folderOf[sessionId] = folderId;
+      writeJSON("pc.folderOf", folderOf);
+      return { folderOf };
+    });
+  },
+
+  toggleArchived(sessionId) {
+    set((st) => {
+      const archivedIds = st.archivedIds.includes(sessionId)
+        ? st.archivedIds.filter((x) => x !== sessionId)
+        : [...st.archivedIds, sessionId];
+      writeJSON("pc.archivedIds", archivedIds);
+      return { archivedIds };
+    });
   },
 
   setDraft(v) {

@@ -171,6 +171,25 @@ textarea:focus-visible {
   box-shadow: 0 0 0 2px rgba(33, 230, 255, 0.6);
 }
 
+/* Hand cursor on anything clickable (Claude-Code style). Disabled controls keep
+   the default arrow, and any element that opts into cursor-not-allowed always
+   pairs it with :disabled, so :not(:disabled) leaves those untouched. */
+button:not(:disabled),
+[role="button"]:not([aria-disabled="true"]),
+[role="switch"],
+[role="tab"],
+[role="menuitem"],
+[role="menuitemradio"],
+[role="treeitem"],
+summary,
+label[for],
+a[href],
+select:not(:disabled),
+input[type="checkbox"]:not(:disabled),
+input[type="radio"]:not(:disabled) {
+  cursor: pointer;
+}
+
 /* =========================================================================
    MOTION
    ========================================================================= */
@@ -305,6 +324,32 @@ textarea:focus-visible {
     box-shadow: 0 0 0 0 rgba(52, 255, 158, 0);
   }
 }
+/* Sort/Group popover entrance — a quick fade + tiny scale/translate from the
+   anchoring toolbar. Geometry (scale/translate), so neutralized under
+   prefers-reduced-motion below. */
+@keyframes pcPop {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+/* Soft cross-fade for the sessions sidebar's panel↔rail swap (the width morph is
+   a Tailwind transition on the wrapper; this fades the swapped content in). */
+@keyframes pcFadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.pc-fade-in {
+  animation: pcFadeIn 0.2s ease both;
+}
 
 @media (prefers-reduced-motion: reduce) {
   /* Reduced-motion: gate only large/ambient MOVEMENT. The digital rain
@@ -342,6 +387,17 @@ textarea:focus-visible {
     animation: none !important;
   }
   .pc-flash {
+    animation: none !important;
+  }
+  /* The Sort/Group popover scales+translates in (geometry). The base .pc-pop rule
+     sets no resting opacity/transform, so removing the animation renders it in
+     place, fully visible. */
+  .pc-pop {
+    animation: none !important;
+  }
+  /* The sidebar panel/rail cross-fade is opacity-only, but neutralize it too so
+     the swap is instant for reduced-motion users (matches the other enters). */
+  .pc-fade-in {
     animation: none !important;
   }
 }
@@ -971,6 +1027,234 @@ textarea:focus-visible {
   background: linear-gradient(90deg, rgba(255, 46, 126, 0.14), rgba(33, 230, 255, 0.06));
   color: #fff;
   box-shadow: inset 2px 0 0 var(--color-accent);
+}
+
+/* =========================================================================
+   SESSIONS SIDEBAR — toolbar, sort/group popover, folders, archived rows
+   ========================================================================= */
+
+/* Compact Sort/Group/New-folder toolbar control. Resting = muted; the
+   `--active` modifier (menu open OR a non-default value selected) lights cyan as
+   a quiet "filter active" cue. Hover animates light only. */
+.pc-sess-ctrl {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 7px;
+  border-radius: 7px;
+  border: 1px solid var(--color-border);
+  background: var(--color-panel-2);
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.4px;
+  cursor: pointer;
+  transition:
+    background 0.16s ease,
+    border-color 0.16s ease,
+    color 0.16s ease,
+    box-shadow 0.16s ease;
+}
+.pc-sess-ctrl:hover {
+  border-color: rgba(33, 230, 255, 0.35);
+  color: var(--color-accent-2);
+}
+.pc-sess-ctrl--active {
+  background: rgba(33, 230, 255, 0.1);
+  border-color: rgba(33, 230, 255, 0.45);
+  color: var(--color-accent-2);
+  box-shadow: 0 0 12px rgba(33, 230, 255, 0.1);
+}
+
+/* The popover panel anchored under a toolbar control. */
+.pc-pop {
+  position: absolute;
+  z-index: 20;
+  min-width: 128px;
+  padding: 4px;
+  border-radius: 9px;
+  background: #0c0e16;
+  border: 1px solid var(--color-border-2);
+  box-shadow:
+    0 12px 30px rgba(0, 0, 0, 0.55),
+    0 0 0 1px rgba(0, 0, 0, 0.35);
+  animation: pcPop 0.14s ease both;
+}
+.pc-pop__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+  font-size: 12px;
+  color: var(--color-muted);
+  transition:
+    background 0.14s ease,
+    color 0.14s ease;
+}
+.pc-pop__item:hover {
+  background: rgba(33, 230, 255, 0.07);
+  color: var(--color-fg);
+}
+.pc-pop__item[aria-checked="true"] {
+  color: var(--color-fg);
+}
+/* The check marker reserves its column on every item (visibility, not display)
+   so the labels stay aligned whether or not the item is the active one. */
+.pc-pop__check {
+  width: 12px;
+  flex-shrink: 0;
+  color: var(--color-accent-2);
+}
+
+/* Group section header: mono label + count badge + a fading divider rule, with
+   extra top space so grouped sections read as clearly separated (not a hairline). */
+.pc-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 6px 5px;
+}
+.pc-group-head__label {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--color-muted);
+  white-space: nowrap;
+}
+.pc-group-head__rule {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(to right, var(--color-border-2), transparent);
+}
+
+/* Small numeric count badge (toolbar total + group/folder counts). */
+.pc-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 15px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--color-panel-2);
+  border: 1px solid var(--color-border);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 1;
+  color: var(--color-faint);
+}
+
+/* Folder row + the nested-children guide line. */
+.pc-folder-children {
+  margin-left: 13px;
+  padding-left: 8px;
+  border-left: 1px solid var(--color-border);
+}
+.pc-folder-empty {
+  padding: 6px 10px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--color-faint);
+}
+/* The active drop target while dragging a chat over a folder (light-only cue). */
+.pc-droptarget {
+  background: rgba(33, 230, 255, 0.08);
+  border-color: rgba(33, 230, 255, 0.4) !important;
+  box-shadow: inset 2px 0 0 var(--color-accent-2);
+}
+
+/* Reorder insertion line — drawn above/below the row a dragged chat would land
+   at, so drag-to-reorder has a clear target (light-only: a glowing cyan rule). */
+.pc-drop-line {
+  position: relative;
+}
+.pc-drop-line::after {
+  content: "";
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--color-accent-2);
+  box-shadow: 0 0 8px var(--color-accent-2);
+  pointer-events: none;
+}
+.pc-drop-line--before::after {
+  top: -3px;
+}
+.pc-drop-line--after::after {
+  bottom: -3px;
+}
+
+/* Archived rows: dimmed everywhere, brightening to full on hover. Opacity is a
+   light property (no geometry), so it's left on under reduced motion. */
+.pc-row--archived {
+  opacity: 0.72;
+  transition: opacity 0.16s ease;
+}
+.pc-row--archived:hover {
+  opacity: 1;
+}
+
+/* The idle status dot — a faint, static pip (no glow-pulse, unlike .pc-dot). */
+.pc-dot--idle {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--color-faint);
+  opacity: 0.7;
+}
+
+/* =========================================================================
+   COLLAPSED SIDEBAR RAIL (52px)
+   ========================================================================= */
+.pc-rail-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  border: 1px solid var(--color-border);
+  background: var(--color-panel-2);
+  color: var(--color-muted);
+  cursor: pointer;
+  transition:
+    background 0.16s ease,
+    border-color 0.16s ease,
+    color 0.16s ease,
+    box-shadow 0.16s ease;
+}
+.pc-rail-btn:hover {
+  border-color: rgba(33, 230, 255, 0.4);
+  color: var(--color-accent-2);
+}
+.pc-rail-btn--accent {
+  border-color: rgba(255, 46, 126, 0.4);
+  color: #ff7eb0;
+  background: rgba(255, 46, 126, 0.08);
+}
+.pc-rail-btn--accent:hover {
+  border-color: rgba(255, 46, 126, 0.6);
+  color: #ff9ec6;
+  box-shadow: 0 0 14px rgba(255, 46, 126, 0.22);
+}
+.pc-rail-btn--cyan {
+  border-color: rgba(33, 230, 255, 0.4);
+  color: var(--color-accent-2);
+  background: rgba(33, 230, 255, 0.08);
+}
+.pc-rail-btn--cyan:hover {
+  box-shadow: var(--shadow-glow-cyan);
 }
 
 /* =========================================================================

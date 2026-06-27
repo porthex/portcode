@@ -21,6 +21,11 @@ export type RemoteCommand = { cmd: "run"; session_id: string; text: string } | {
 export interface SessionRow {
     id: string;
     title: string;
+    /**
+     * Current git branch of `workspace`, computed live on each list; None when
+     * no workspace/repo or detached HEAD.
+     */
+    branch?: string | null;
     workspace: string | null;
     createdAt: number;
     updatedAt: number;
