@@ -26,6 +26,11 @@ vi.mock("../lib/ipc", () => ({
   getMessages: vi.fn(),
   deleteSession: vi.fn(),
   renameSession: vi.fn(),
+  saveDraft: vi.fn(),
+  getDraft: vi.fn(),
+  getDrafts: vi.fn(),
+  getUsage: vi.fn(),
+  getAllUsage: vi.fn(),
   saveSettings: vi.fn(),
   resolvePermission: vi.fn(),
   openFolder: vi.fn(),
@@ -78,6 +83,11 @@ beforeEach(() => {
   m.createSession.mockResolvedValue(undefined);
   m.deleteSession.mockResolvedValue(undefined);
   m.renameSession.mockResolvedValue(undefined);
+  m.saveDraft.mockResolvedValue(undefined);
+  m.getDraft.mockResolvedValue(null);
+  m.getDrafts.mockResolvedValue([]);
+  m.getUsage.mockResolvedValue({ sessionId: "s1", input: 0, output: 0 });
+  m.getAllUsage.mockResolvedValue([]);
   m.saveSettings.mockImplementation(async (s) => ({ ...DEFAULT_SETTINGS, ...s }));
   m.resolvePermission.mockResolvedValue(undefined);
   m.openFolder.mockResolvedValue(null);
@@ -356,6 +366,31 @@ describe("deleteSession", () => {
     expect(st.sessions.map((s) => s.id)).toEqual(["b"]);
     expect(st.activeId).toBe("b");
     expect(st.messages.a).toBeUndefined();
+  });
+
+  it("prunes the gone session's usage + draft to stay in lockstep with the backend", () => {
+    // The backend (db.rs) deletes the drafts + usage rows on delete_session; the
+    // frontend must mirror that, or the deleted session's tokens keep inflating the
+    // HUD workspace-total spend (and a dead draft lingers) until a restart.
+    localStorage.setItem("pc.drafts", JSON.stringify({ a: "unsent a", b: "unsent b" }));
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      messages: { a: [], b: [] },
+      drafts: { a: "unsent a", b: "unsent b" },
+      usage: { a: { input: 1000, output: 200 }, b: { input: 50, output: 5 } },
+    });
+
+    return useStore
+      .getState()
+      .deleteSession("a")
+      .then(() => {
+        const st = useStore.getState();
+        expect(st.usage).toEqual({ b: { input: 50, output: 5 } });
+        expect(st.drafts).toEqual({ b: "unsent b" });
+        // The localStorage mirror is pruned too, so mergeDrafts won't resurrect it.
+        expect(JSON.parse(localStorage.getItem("pc.drafts")!)).toEqual({ b: "unsent b" });
+      });
   });
 
   it("spawns a fresh session when the last one is deleted", async () => {
@@ -1270,22 +1305,217 @@ describe("cyclePermissionMode", () => {
 });
 
 describe("draft + UI setters", () => {
+  const draftOf = (id: string) => useStore.getState().drafts[id];
+
+  // setDraft schedules a ~400ms debounced backend write; fake timers keep that
+  // pending timer from firing into a later test's saveDraft assertions.
   it("appendDraft inserts a single separating space only when needed", () => {
-    const { setDraft, appendDraft } = useStore.getState();
+    vi.useFakeTimers();
+    try {
+      useStore.setState({ activeId: "s1" });
+      const { setDraft, appendDraft } = useStore.getState();
 
-    setDraft("");
-    appendDraft("@a.ts"); // empty draft -> no leading space
-    expect(useStore.getState().draft).toBe("@a.ts ");
+      setDraft("");
+      appendDraft("@a.ts"); // empty draft -> no leading space
+      expect(draftOf("s1")).toBe("@a.ts ");
 
-    setDraft("foo"); // no trailing space -> separator added
-    appendDraft("bar");
-    expect(useStore.getState().draft).toBe("foo bar ");
+      setDraft("foo"); // no trailing space -> separator added
+      appendDraft("bar");
+      expect(draftOf("s1")).toBe("foo bar ");
 
-    setDraft("foo "); // already trailing space -> no double space
-    appendDraft("bar");
-    expect(useStore.getState().draft).toBe("foo bar ");
+      setDraft("foo "); // already trailing space -> no double space
+      appendDraft("bar");
+      expect(draftOf("s1")).toBe("foo bar ");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
+  it("keeps drafts isolated per session and mirrors them to localStorage", () => {
+    vi.useFakeTimers();
+    try {
+      useStore.setState({ activeId: "a" });
+      useStore.getState().setDraft("draft for a");
+      useStore.setState({ activeId: "b" });
+      useStore.getState().setDraft("draft for b");
+
+      // A draft typed in one session never bleeds into another (the bug per-session
+      // drafts fix). Each is keyed by its own session id.
+      expect(useStore.getState().drafts).toEqual({ a: "draft for a", b: "draft for b" });
+      // Optimistic localStorage mirror is written synchronously for instant restore.
+      expect(JSON.parse(localStorage.getItem("pc.drafts")!)).toEqual({
+        a: "draft for a",
+        b: "draft for b",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clearing a draft drops its key from the map and the mirror", () => {
+    vi.useFakeTimers();
+    try {
+      useStore.setState({ activeId: "a" });
+      useStore.getState().setDraft("something");
+      useStore.getState().setDraft("");
+      expect(useStore.getState().drafts).toEqual({});
+      expect(JSON.parse(localStorage.getItem("pc.drafts")!)).toEqual({});
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("debounces the durable draft save (~400ms), coalescing keystrokes", () => {
+    vi.useFakeTimers();
+    try {
+      useStore.setState({ activeId: "a" });
+      useStore.getState().setDraft("h");
+      useStore.getState().setDraft("he");
+      useStore.getState().setDraft("hel");
+      // No backend write yet — the debounce coalesces the burst.
+      expect(m.saveDraft).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(400);
+      // Exactly one durable write, carrying the latest value.
+      expect(m.saveDraft).toHaveBeenCalledTimes(1);
+      expect(m.saveDraft).toHaveBeenCalledWith("a", "hel");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("composer drafts on send", () => {
+  beforeEach(() => {
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: { a: [] },
+    });
+  });
+
+  it("clears the sent session's draft everywhere, flushing the backend immediately", async () => {
+    vi.useFakeTimers();
+    try {
+      useStore.getState().setDraft("a half-written thought");
+      expect(useStore.getState().drafts.a).toBe("a half-written thought");
+
+      await useStore.getState().send("ship it");
+
+      // The open loop is closed: in-memory map + localStorage mirror cleared, and the
+      // durable backend cleared IMMEDIATELY (not waiting on the debounce) so a fast
+      // restart can't restore a just-sent draft.
+      expect(useStore.getState().drafts.a).toBeUndefined();
+      expect(JSON.parse(localStorage.getItem("pc.drafts")!)).toEqual({});
+      expect(m.saveDraft).toHaveBeenLastCalledWith("a", "");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("composer presence phase", () => {
+  // Start a real local turn and hand back the captured stream-event emitter so each
+  // test can drive presence transitions from real events.
+  const startTurn = async (): Promise<(e: StreamEvent) => void> => {
+    let emit!: (e: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
+    useStore.setState({ sessions: [session({ id: "a" })], activeId: "a", messages: { a: [] } });
+    await useStore.getState().send("do a thing");
+    return emit;
+  };
+
+  it("acknowledges the send instantly with the received phase", async () => {
+    const emit = await startTurn();
+    // Turn-taking receipt: the phase flips to "received" the moment the turn is sent.
+    expect(useStore.getState().composerPhase).toBe("received");
+    emit({ type: "turn_end", stopReason: "end_turn" });
+  });
+
+  it("settles received → thinking on the first real stream event", async () => {
+    const emit = await startTurn();
+    expect(useStore.getState().composerPhase).toBe("received");
+    emit({ type: "text_delta", text: "Hi" });
+    expect(useStore.getState().composerPhase).toBe("thinking");
+    emit({ type: "turn_end", stopReason: "end_turn" });
+  });
+
+  it("falls back to thinking after ~900ms when the first byte is slow", async () => {
+    vi.useFakeTimers();
+    try {
+      const emit = await startTurn();
+      expect(useStore.getState().composerPhase).toBe("received");
+      // No real event yet — the fallback timer (NOT padded latency) advances the
+      // phase so the presence doesn't sit on "reading…" forever.
+      vi.advanceTimersByTime(900);
+      expect(useStore.getState().composerPhase).toBe("thinking");
+      emit({ type: "turn_end", stopReason: "end_turn" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns to idle on turn_end and on a turn error", async () => {
+    const emit = await startTurn();
+    emit({ type: "text_delta", text: "x" });
+    emit({ type: "turn_end", stopReason: "end_turn" });
+    expect(useStore.getState().composerPhase).toBe("idle");
+
+    const emit2 = await startTurn();
+    emit2({ type: "error", message: "boom" });
+    expect(useStore.getState().composerPhase).toBe("idle");
+  });
+
+  it("relabels to stopping the instant Stop is pressed, then idle once it resolves", async () => {
+    const emit = await startTurn();
+    emit({ type: "text_delta", text: "x" });
+    expect(useStore.getState().composerPhase).toBe("thinking");
+    // stop() sets "stopping" synchronously, before awaiting the backend cancel — so
+    // the intent is acknowledged immediately (the <100ms relabel).
+    const stopping = useStore.getState().stop();
+    expect(useStore.getState().composerPhase).toBe("stopping");
+    await stopping;
+    expect(useStore.getState().composerPhase).toBe("idle");
+    expect(useStore.getState().streaming).toBe(false);
+  });
+});
+
+describe("init draft + usage hydration", () => {
+  it("merges backend drafts under the localStorage mirror and restores usage", async () => {
+    // The optimistic mirror (already in state from the synchronous load) holds a
+    // FRESHER draft for `a`; the backend has a stale `a` plus `b` the mirror lacks.
+    useStore.setState({ drafts: { a: "fresh local a" } });
+    m.listSessions.mockResolvedValue([session({ id: "a" }), session({ id: "b" })]);
+    m.getDrafts.mockResolvedValue([
+      { sessionId: "a", text: "stale backend a" },
+      { sessionId: "b", text: "backend b" },
+    ]);
+    m.getAllUsage.mockResolvedValue([{ sessionId: "a", input: 1000, output: 200 }]);
+
+    await useStore.getState().init();
+
+    const st = useStore.getState();
+    // Mirror wins for `a` (never staler than the debounced backend); backend fills `b`.
+    expect(st.drafts).toEqual({ a: "fresh local a", b: "backend b" });
+    // Cumulative usage restored so the per-session meter + HUD spend survive restart.
+    expect(st.usage).toEqual({ a: { input: 1000, output: 200 } });
+  });
+
+  it("survives a core that predates the draft/usage commands (no init error)", async () => {
+    m.getDrafts.mockRejectedValue(new Error("unknown command"));
+    m.getAllUsage.mockRejectedValue(new Error("unknown command"));
+    m.listSessions.mockResolvedValue([session({ id: "a" })]);
+
+    await useStore.getState().init();
+
+    // The resilient .catch(() => []) keeps startup green; no spurious init error panel.
+    expect(useStore.getState().initError).toBeNull();
+  });
+});
+
+describe("UI setters", () => {
   it("toggleFiles flips and the show* setters take explicit values", () => {
     const before = useStore.getState().showFiles;
     useStore.getState().toggleFiles();

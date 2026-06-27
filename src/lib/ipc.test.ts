@@ -118,6 +118,35 @@ describe("Tauri command serialization", () => {
     expect(invoke).toHaveBeenCalledWith("get_messages", { sessionId: "s1" });
   });
 
+  it("draft commands serialize their identifiers", async () => {
+    const { ipc, invoke } = await load();
+    invoke.mockResolvedValue(undefined);
+    await ipc.saveDraft("s1", "half a thought");
+    expect(invoke).toHaveBeenCalledWith("save_draft", { sessionId: "s1", text: "half a thought" });
+
+    invoke.mockResolvedValue("restored");
+    await expect(ipc.getDraft("s1")).resolves.toBe("restored");
+    expect(invoke).toHaveBeenCalledWith("get_draft", { sessionId: "s1" });
+
+    const rows = [{ sessionId: "s1", text: "x" }];
+    invoke.mockResolvedValue(rows);
+    await expect(ipc.getDrafts()).resolves.toBe(rows);
+    expect(invoke).toHaveBeenCalledWith("get_drafts");
+  });
+
+  it("usage commands invoke their core counterparts", async () => {
+    const { ipc, invoke } = await load();
+    const one = { sessionId: "s1", input: 100, output: 20 };
+    invoke.mockResolvedValue(one);
+    await expect(ipc.getUsage("s1")).resolves.toBe(one);
+    expect(invoke).toHaveBeenCalledWith("get_usage", { sessionId: "s1" });
+
+    const all = [one];
+    invoke.mockResolvedValue(all);
+    await expect(ipc.getAllUsage()).resolves.toBe(all);
+    expect(invoke).toHaveBeenCalledWith("get_all_usage");
+  });
+
   it("list_dir passes the optional sub-path through", async () => {
     const { ipc, invoke } = await load();
     invoke.mockResolvedValue([]);
@@ -359,6 +388,18 @@ describe("browser fallback (no Tauri core)", () => {
     await expect(ipc.createSession("id", "title", null)).resolves.toBeUndefined();
     await expect(ipc.renameSession("id", "new")).resolves.toBeUndefined();
     await expect(ipc.deleteSession("id")).resolves.toBeUndefined();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("draft + usage commands degrade cleanly without a core", async () => {
+    // Web/preview has no desktop DB — the store's localStorage mirror is the
+    // persistence — so these no-op / return empty instead of touching invoke.
+    const { ipc, invoke } = await load();
+    await expect(ipc.saveDraft("s1", "x")).resolves.toBeUndefined();
+    await expect(ipc.getDraft("s1")).resolves.toBeNull();
+    await expect(ipc.getDrafts()).resolves.toEqual([]);
+    await expect(ipc.getUsage("s1")).resolves.toEqual({ sessionId: "s1", input: 0, output: 0 });
+    await expect(ipc.getAllUsage()).resolves.toEqual([]);
     expect(invoke).not.toHaveBeenCalled();
   });
 

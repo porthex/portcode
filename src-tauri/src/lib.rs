@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use tauri::{AppHandle, Manager, State};
 
-use crate::db::{Db, SessionRow, UiMessage};
+use crate::db::{Db, DraftRow, SessionRow, UiMessage, UsageRow};
 use crate::settings::Settings;
 
 pub struct AppState {
@@ -244,6 +244,46 @@ fn delete_session(state: State<AppState>, id: String) -> Result<(), String> {
 #[tauri::command]
 fn get_messages(state: State<AppState>, session_id: String) -> Vec<UiMessage> {
     state.db.ui_messages(&session_id)
+}
+
+// ── drafts (composer open-loop persistence) ──────────────────────────────────
+
+/// Persist (or clear, when blank) one session's unsent composer draft. Debounced
+/// from the store so keystrokes don't hammer SQLite.
+#[tauri::command]
+fn save_draft(state: State<AppState>, session_id: String, text: String) -> Result<(), String> {
+    state
+        .db
+        .save_draft(&session_id, &text, db::now_ms())
+        .map_err(|e| e.to_string())
+}
+
+/// The stored draft for a session, or `null` when there is none.
+#[tauri::command]
+fn get_draft(state: State<AppState>, session_id: String) -> Option<String> {
+    state.db.get_draft(&session_id)
+}
+
+/// Every stored draft — the init-bundle hydration for the frontend's per-session
+/// draft map (authoritative over the optimistic localStorage mirror).
+#[tauri::command]
+fn get_drafts(state: State<AppState>) -> Vec<DraftRow> {
+    state.db.all_drafts()
+}
+
+// ── usage (cumulative per-session token spend) ───────────────────────────────
+
+/// Cumulative token usage for one session (zeros when none recorded).
+#[tauri::command]
+fn get_usage(state: State<AppState>, session_id: String) -> UsageRow {
+    state.db.get_usage(&session_id)
+}
+
+/// Every session's cumulative usage — restores the per-session token meters and
+/// the workspace-total spend in the status HUD across a restart.
+#[tauri::command]
+fn get_all_usage(state: State<AppState>) -> Vec<UsageRow> {
+    state.db.all_usage()
 }
 
 // ── workspace file tree ──────────────────────────────────────────────────────
@@ -1168,6 +1208,11 @@ pub fn run() {
         rename_session,
         delete_session,
         get_messages,
+        save_draft,
+        get_draft,
+        get_drafts,
+        get_usage,
+        get_all_usage,
         list_dir,
         run_agent,
         cancel_agent,
@@ -1201,6 +1246,11 @@ pub fn run() {
         rename_session,
         delete_session,
         get_messages,
+        save_draft,
+        get_draft,
+        get_drafts,
+        get_usage,
+        get_all_usage,
         phone_sync_status,
         phone_sync_unpair,
         phone_sync_connect,

@@ -79,6 +79,26 @@ pub struct PairedDevice {
     pub confirmed: bool,
 }
 
+/// A persisted composer draft for one session. camelCase to match the frontend
+/// `DraftEntry` (the `get_drafts` init bundle hydrates the per-session draft map).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftRow {
+    pub session_id: String,
+    pub text: String,
+}
+
+/// Cumulative token usage for one session. camelCase to match the frontend
+/// `SessionUsage` (the `get_all_usage` bundle hydrates the usage map + the
+/// workspace-total spend in the status HUD).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRow {
+    pub session_id: String,
+    pub input: i64,
+    pub output: i64,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum UiBlock {
@@ -163,6 +183,25 @@ impl Db {
                 paired_at INTEGER NOT NULL,
                 last_seen INTEGER NOT NULL,
                 confirmed INTEGER NOT NULL DEFAULT 0
+            );
+            -- An unsent composer draft per session (Zeigarnik open-loop: an
+            -- unfinished message survives a restart). One row per session; cleared
+            -- on a real send. No FK to `sessions` so a draft can outlive a brief
+            -- window where the session row hasn't been created yet (the frontend
+            -- creates the session first in practice, but we stay defensive).
+            CREATE TABLE IF NOT EXISTS drafts (
+                session_id TEXT PRIMARY KEY,
+                text TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            -- Cumulative token usage per session (input/output), accumulated across
+            -- every turn so the running cost survives a restart. Upserted additively
+            -- on each `usage` stream event (see agent.rs).
+            CREATE TABLE IF NOT EXISTS usage (
+                session_id TEXT PRIMARY KEY,
+                input INTEGER NOT NULL DEFAULT 0,
+                output INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
             );",
         )?;
         // ADDITIVE migration: a `paired_devices` table created before the
@@ -262,8 +301,124 @@ impl Db {
     pub fn delete_session(&self, id: &str) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
+        // Drop the session's draft + cumulative usage too, so a deleted session
+        // leaves no orphaned rows that would skew the workspace-total spend.
+        conn.execute("DELETE FROM drafts WHERE session_id = ?1", params![id])?;
+        conn.execute("DELETE FROM usage WHERE session_id = ?1", params![id])?;
         conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    // ── drafts (composer open-loop persistence) ──────────────────────────────
+
+    /// Upsert (or clear) one session's unsent draft. An empty/whitespace-only
+    /// `text` DELETES the row instead of storing a blank — a real send clears the
+    /// draft, and `get_draft` of an absent row reads as "no draft" (`None`), so the
+    /// table never accumulates empty rows.
+    pub fn save_draft(&self, session_id: &str, text: &str, ts: i64) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        if text.trim().is_empty() {
+            conn.execute(
+                "DELETE FROM drafts WHERE session_id = ?1",
+                params![session_id],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO drafts (session_id, text, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session_id) DO UPDATE SET text = ?2, updated_at = ?3",
+                params![session_id, text, ts],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The stored draft for a session, or `None` when there is none.
+    pub fn get_draft(&self, session_id: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT text FROM drafts WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    }
+
+    /// Every stored draft (the init-bundle hydration for the frontend's per-session
+    /// draft map). A DB read error degrades to an empty list, never an error.
+    pub fn all_drafts(&self) -> Vec<DraftRow> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn.prepare("SELECT session_id, text FROM drafts") else {
+            return Vec::new();
+        };
+        let rows = stmt.query_map([], |r| {
+            Ok(DraftRow {
+                session_id: r.get(0)?,
+                text: r.get(1)?,
+            })
+        });
+        let Ok(rows) = rows else { return Vec::new() };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    // ── usage (cumulative per-session token spend) ───────────────────────────
+
+    /// Accumulate token usage for a session (additive upsert). Called once per
+    /// `usage` stream event so the running total survives a restart. Negative
+    /// deltas are ignored at the call site; here we simply add.
+    pub fn add_usage(
+        &self,
+        session_id: &str,
+        input: i64,
+        output: i64,
+        ts: i64,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO usage (session_id, input, output, updated_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(session_id) DO UPDATE SET
+                 input = input + ?2, output = output + ?3, updated_at = ?4",
+            params![session_id, input, output, ts],
+        )?;
+        Ok(())
+    }
+
+    /// Cumulative usage for one session (zeros when none recorded).
+    pub fn get_usage(&self, session_id: &str) -> UsageRow {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT input, output FROM usage WHERE session_id = ?1",
+            params![session_id],
+            |r| {
+                Ok(UsageRow {
+                    session_id: session_id.to_string(),
+                    input: r.get(0)?,
+                    output: r.get(1)?,
+                })
+            },
+        )
+        .unwrap_or(UsageRow {
+            session_id: session_id.to_string(),
+            input: 0,
+            output: 0,
+        })
+    }
+
+    /// Every session's cumulative usage (init-bundle hydration + the basis for the
+    /// workspace-total spend). A DB read error degrades to an empty list.
+    pub fn all_usage(&self) -> Vec<UsageRow> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn.prepare("SELECT session_id, input, output FROM usage") else {
+            return Vec::new();
+        };
+        let rows = stmt.query_map([], |r| {
+            Ok(UsageRow {
+                session_id: r.get(0)?,
+                input: r.get(1)?,
+                output: r.get(2)?,
+            })
+        });
+        let Ok(rows) = rows else { return Vec::new() };
+        rows.filter_map(|r| r.ok()).collect()
     }
 
     fn next_seq(conn: &Connection, session_id: &str) -> i64 {
@@ -945,5 +1100,130 @@ mod tests {
     fn remove_paired_device_is_idempotent() {
         let db = mem_db();
         assert!(db.remove_paired_device("nope").is_ok());
+    }
+
+    // ── drafts (composer open-loop persistence) ──────────────────────────────
+
+    #[test]
+    fn save_and_get_draft_round_trips() {
+        let db = mem_db();
+        assert_eq!(db.get_draft("s"), None); // nothing stored yet
+        db.save_draft("s", "half a thought", 100).unwrap();
+        assert_eq!(db.get_draft("s").as_deref(), Some("half a thought"));
+        // Upsert overwrites in place (still one row).
+        db.save_draft("s", "a fuller thought", 200).unwrap();
+        assert_eq!(db.get_draft("s").as_deref(), Some("a fuller thought"));
+        assert_eq!(db.all_drafts().len(), 1);
+    }
+
+    #[test]
+    fn saving_an_empty_draft_clears_the_row() {
+        let db = mem_db();
+        db.save_draft("s", "typed something", 100).unwrap();
+        assert!(db.get_draft("s").is_some());
+        // A real send clears the draft: an empty string deletes the row rather than
+        // persisting a blank, so get_draft reads as "no draft".
+        db.save_draft("s", "", 200).unwrap();
+        assert_eq!(db.get_draft("s"), None);
+        assert!(db.all_drafts().is_empty());
+        // Whitespace-only is treated the same as empty (it never round-trips a draft).
+        db.save_draft("s", "   \n  ", 300).unwrap();
+        assert_eq!(db.get_draft("s"), None);
+    }
+
+    #[test]
+    fn drafts_are_isolated_per_session() {
+        let db = mem_db();
+        db.save_draft("a", "draft for a", 1).unwrap();
+        db.save_draft("b", "draft for b", 1).unwrap();
+        assert_eq!(db.get_draft("a").as_deref(), Some("draft for a"));
+        assert_eq!(db.get_draft("b").as_deref(), Some("draft for b"));
+        let mut all = db.all_drafts();
+        all.sort_by(|x, y| x.session_id.cmp(&y.session_id));
+        assert_eq!(
+            all,
+            vec![
+                DraftRow {
+                    session_id: "a".into(),
+                    text: "draft for a".into()
+                },
+                DraftRow {
+                    session_id: "b".into(),
+                    text: "draft for b".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn deleting_a_session_drops_its_draft_and_usage() {
+        let db = mem_db();
+        db.create_session("a", "A", None, 1).unwrap();
+        db.save_draft("a", "unsent", 2).unwrap();
+        db.add_usage("a", 100, 50, 3).unwrap();
+        db.delete_session("a").unwrap();
+        assert_eq!(db.get_draft("a"), None);
+        assert_eq!(
+            db.get_usage("a"),
+            UsageRow {
+                session_id: "a".into(),
+                input: 0,
+                output: 0
+            }
+        );
+    }
+
+    // ── usage (cumulative per-session token spend) ───────────────────────────
+
+    #[test]
+    fn usage_accumulates_additively_across_events() {
+        let db = mem_db();
+        // Unknown session reads as zeros, not an error.
+        assert_eq!(
+            db.get_usage("s"),
+            UsageRow {
+                session_id: "s".into(),
+                input: 0,
+                output: 0
+            }
+        );
+        db.add_usage("s", 1000, 200, 10).unwrap();
+        db.add_usage("s", 500, 300, 20).unwrap();
+        assert_eq!(
+            db.get_usage("s"),
+            UsageRow {
+                session_id: "s".into(),
+                input: 1500,
+                output: 500
+            }
+        );
+    }
+
+    #[test]
+    fn all_usage_reports_every_session() {
+        let db = mem_db();
+        db.add_usage("a", 100, 10, 1).unwrap();
+        db.add_usage("b", 200, 20, 1).unwrap();
+        let mut all = db.all_usage();
+        all.sort_by(|x, y| x.session_id.cmp(&y.session_id));
+        assert_eq!(
+            all,
+            vec![
+                UsageRow {
+                    session_id: "a".into(),
+                    input: 100,
+                    output: 10
+                },
+                UsageRow {
+                    session_id: "b".into(),
+                    input: 200,
+                    output: 20
+                },
+            ]
+        );
+        // The workspace-total spend is the sum across sessions.
+        let total_in: i64 = all.iter().map(|u| u.input).sum();
+        let total_out: i64 = all.iter().map(|u| u.output).sum();
+        assert_eq!((total_in, total_out), (300, 30));
     }
 }
