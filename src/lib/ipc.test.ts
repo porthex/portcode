@@ -51,6 +51,19 @@ describe("isTauri", () => {
   });
 });
 
+describe("web-client mode flag", () => {
+  it("defaults to off and round-trips through setWebClientMode", async () => {
+    const { ipc } = await load();
+    // A fresh module graph hasn't had the PWA entry flip the flag, so the raw
+    // flag reads false; setWebClientMode is the only way it turns on.
+    expect(ipc.isWebClientMode()).toBe(false);
+    ipc.setWebClientMode(true);
+    expect(ipc.isWebClientMode()).toBe(true);
+    ipc.setWebClientMode(false);
+    expect(ipc.isWebClientMode()).toBe(false);
+  });
+});
+
 describe("Tauri command serialization", () => {
   beforeEach(enterTauri);
 
@@ -101,6 +114,15 @@ describe("Tauri command serialization", () => {
     });
   });
 
+  it("telemetry_set_consent forwards the enabled flag", async () => {
+    const { ipc, invoke } = await load();
+    invoke.mockResolvedValue(undefined);
+    await expect(ipc.setTelemetryConsent(true)).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("telemetry_set_consent", { enabled: true });
+    await ipc.setTelemetryConsent(false);
+    expect(invoke).toHaveBeenCalledWith("telemetry_set_consent", { enabled: false });
+  });
+
   it("session commands serialize their identifiers", async () => {
     const { ipc, invoke } = await load();
     invoke.mockResolvedValue(undefined);
@@ -112,10 +134,40 @@ describe("Tauri command serialization", () => {
       id: "s1",
       title: "Title",
       workspace: "C:/ws",
+      model: undefined,
     });
     expect(invoke).toHaveBeenCalledWith("rename_session", { id: "s1", title: "Renamed" });
     expect(invoke).toHaveBeenCalledWith("delete_session", { id: "s1" });
     expect(invoke).toHaveBeenCalledWith("get_messages", { sessionId: "s1" });
+  });
+
+  it("draft commands serialize their identifiers", async () => {
+    const { ipc, invoke } = await load();
+    invoke.mockResolvedValue(undefined);
+    await ipc.saveDraft("s1", "half a thought");
+    expect(invoke).toHaveBeenCalledWith("save_draft", { sessionId: "s1", text: "half a thought" });
+
+    invoke.mockResolvedValue("restored");
+    await expect(ipc.getDraft("s1")).resolves.toBe("restored");
+    expect(invoke).toHaveBeenCalledWith("get_draft", { sessionId: "s1" });
+
+    const rows = [{ sessionId: "s1", text: "x" }];
+    invoke.mockResolvedValue(rows);
+    await expect(ipc.getDrafts()).resolves.toBe(rows);
+    expect(invoke).toHaveBeenCalledWith("get_drafts");
+  });
+
+  it("usage commands invoke their core counterparts", async () => {
+    const { ipc, invoke } = await load();
+    const one = { sessionId: "s1", input: 100, output: 20 };
+    invoke.mockResolvedValue(one);
+    await expect(ipc.getUsage("s1")).resolves.toBe(one);
+    expect(invoke).toHaveBeenCalledWith("get_usage", { sessionId: "s1" });
+
+    const all = [one];
+    invoke.mockResolvedValue(all);
+    await expect(ipc.getAllUsage()).resolves.toBe(all);
+    expect(invoke).toHaveBeenCalledWith("get_all_usage");
   });
 
   it("list_dir passes the optional sub-path through", async () => {
@@ -274,10 +326,14 @@ describe("Tauri command serialization", () => {
     invoke.mockResolvedValue(undefined);
 
     const onEvent = vi.fn();
-    const handle = await ipc.runAgent("sess-1", "hello", onEvent);
+    const handle = await ipc.runAgent("sess-1", "hello", "claude-opus-4-8", onEvent);
 
     expect(listen).toHaveBeenCalledWith("agent://sess-1", expect.any(Function));
-    expect(invoke).toHaveBeenCalledWith("run_agent", { sessionId: "sess-1", text: "hello" });
+    expect(invoke).toHaveBeenCalledWith("run_agent", {
+      sessionId: "sess-1",
+      text: "hello",
+      model: "claude-opus-4-8",
+    });
 
     // Core events arrive wrapped as `{ payload }`; the bridge unwraps them.
     registered({ payload: { type: "text_delta", text: "hi" } });
@@ -294,17 +350,30 @@ describe("Tauri command serialization", () => {
     listen.mockImplementation(async () => unlisten);
     invoke.mockResolvedValue(undefined);
 
-    const handle = await ipc.runAgent("sess-2", "hi", vi.fn());
+    const handle = await ipc.runAgent("sess-2", "hi", "claude-opus-4-8", vi.fn());
     handle.dispose();
 
     // A normal turn end just stops listening — it must NOT fire cancel_agent.
     expect(unlisten).toHaveBeenCalledTimes(1);
     expect(invoke).not.toHaveBeenCalledWith("cancel_agent", { sessionId: "sess-2" });
   });
+
+  it("cancelAgentById invokes cancel_agent_by_id with the agent id", async () => {
+    const { ipc, invoke } = await load();
+    invoke.mockResolvedValue(undefined);
+    await ipc.cancelAgentById("agent-7");
+    expect(invoke).toHaveBeenCalledWith("cancel_agent_by_id", { agentId: "agent-7" });
+  });
 });
 
 describe("browser fallback (no Tauri core)", () => {
   beforeEach(exitTauri);
+
+  it("cancelAgentById is a no-op without a Tauri core", async () => {
+    const { ipc, invoke } = await load();
+    await expect(ipc.cancelAgentById("agent-7")).resolves.toBeUndefined();
+    expect(invoke).not.toHaveBeenCalled();
+  });
 
   it("getSettings returns the mock defaults without touching invoke", async () => {
     const { ipc, invoke } = await load();
@@ -315,6 +384,8 @@ describe("browser fallback (no Tauri core)", () => {
       defaultPolicy: "ask",
       workspace: null,
       typingAnimation: true,
+      permissionMode: "default",
+      rules: [],
     });
     expect(invoke).not.toHaveBeenCalled();
   });
@@ -347,6 +418,18 @@ describe("browser fallback (no Tauri core)", () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
+  it("draft + usage commands degrade cleanly without a core", async () => {
+    // Web/preview has no desktop DB — the store's localStorage mirror is the
+    // persistence — so these no-op / return empty instead of touching invoke.
+    const { ipc, invoke } = await load();
+    await expect(ipc.saveDraft("s1", "x")).resolves.toBeUndefined();
+    await expect(ipc.getDraft("s1")).resolves.toBeNull();
+    await expect(ipc.getDrafts()).resolves.toEqual([]);
+    await expect(ipc.getUsage("s1")).resolves.toEqual({ sessionId: "s1", input: 0, output: 0 });
+    await expect(ipc.getAllUsage()).resolves.toEqual([]);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
   it("listDir walks the canned tree and returns [] for unknown paths", async () => {
     const { ipc } = await load();
     const root = await ipc.listDir();
@@ -365,6 +448,13 @@ describe("browser fallback (no Tauri core)", () => {
   it("resolvePermission is harmless when nothing is pending", async () => {
     const { ipc } = await load();
     await expect(ipc.resolvePermission("missing", "allow")).resolves.toBeUndefined();
+  });
+
+  it("setTelemetryConsent is an inert no-op without a Rust host (no invoke)", async () => {
+    const { ipc, invoke } = await load();
+    await expect(ipc.setTelemetryConsent(true)).resolves.toBeUndefined();
+    await expect(ipc.setTelemetryConsent(false)).resolves.toBeUndefined();
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it("phoneSyncStatus returns a stable mock identity with no paired devices initially", async () => {
@@ -468,7 +558,7 @@ describe("browser fallback agent stream", () => {
     vi.useFakeTimers();
 
     const events: StreamEvent[] = [];
-    await ipc.runAgent("s", "hi", (e) => events.push(e));
+    await ipc.runAgent("s", "hi", "claude-opus-4-8", (e) => events.push(e));
     await vi.runAllTimersAsync();
 
     const types = events.map((e) => e.type);
@@ -486,7 +576,7 @@ describe("browser fallback agent stream", () => {
     vi.useFakeTimers();
 
     const events: StreamEvent[] = [];
-    const { cancel } = await ipc.runAgent("s", "hi", (e) => events.push(e));
+    const { cancel } = await ipc.runAgent("s", "hi", "claude-opus-4-8", (e) => events.push(e));
     await vi.advanceTimersByTimeAsync(3000);
 
     expect(events.some((e) => e.type === "permission_request")).toBe(true);
@@ -501,7 +591,7 @@ describe("browser fallback agent stream", () => {
     vi.useFakeTimers();
 
     const onEvent = vi.fn();
-    const { cancel } = await ipc.runAgent("s", "hi", onEvent);
+    const { cancel } = await ipc.runAgent("s", "hi", "claude-opus-4-8", onEvent);
     await cancel();
     await vi.runAllTimersAsync();
 
@@ -530,6 +620,7 @@ describe("web-client mode (WASM transport routing)", () => {
     let frameCb: ((f: SyncFrame) => void) | null = null;
     let disconnectedCb: (() => void) | null = null;
     let disconnected = false;
+    let rejected = false;
 
     const session: WebSession = {
       sas: "WEB-SAS",
@@ -548,6 +639,10 @@ describe("web-client mode (WASM transport routing)", () => {
         return () => {
           disconnectedCb = null;
         };
+      },
+      async reject() {
+        rejected = true;
+        disconnectedCb?.();
       },
       async disconnect() {
         disconnected = true;
@@ -568,6 +663,7 @@ describe("web-client mode (WASM transport routing)", () => {
       calls,
       fireFrame: (f: SyncFrame) => frameCb?.(f),
       isDisconnected: () => disconnected,
+      isRejected: () => rejected,
     };
   }
 
@@ -609,6 +705,32 @@ describe("web-client mode (WASM transport routing)", () => {
 
     await ipc.phoneSyncConnect("qr-2");
     expect(rec.calls).toEqual([{ qr: "qr-2", reconnect: false }]);
+  });
+
+  it("phoneSyncReject routes to the web transport's reject (not disconnect)", async () => {
+    const { ipc, webSession } = await loadWeb();
+    const rec = recordingConnector();
+    webSession.setWebSessionConnector(rec.connector);
+    ipc.setWebClientMode(true);
+
+    await ipc.phoneSyncConnect("qr", false);
+    await ipc.phoneSyncReject();
+
+    // Routed through the session's reject (carries the pairing_reject frame), and the
+    // current session is cleared (a later disconnect is a no-op).
+    expect(rec.isRejected()).toBe(true);
+    expect(rec.isDisconnected()).toBe(false);
+  });
+
+  it("phoneSyncReject on native invokes phone_sync_disconnect (reject-frame is a web concern)", async () => {
+    const { ipc } = await loadWeb();
+    ipc.setWebClientMode(true);
+    enterTauri();
+    const { invoke } = await import("@tauri-apps/api/core");
+    vi.mocked(invoke).mockResolvedValue(undefined);
+
+    await ipc.phoneSyncReject();
+    expect(invoke).toHaveBeenCalledWith("phone_sync_disconnect");
   });
 
   it("Tauri always wins over web-client mode", async () => {

@@ -264,6 +264,109 @@ jobs:
           fi
           echo "committed web/wasm artifact matches the rebuilt crate output — fresh."
 
+  # ── Auto-regenerate + commit the prebuilt browser wasm artifact ──────────────
+  # The committed web/wasm/portcode-wasm/ output is what the deployed PWA loads, but
+  # Vercel/most dev machines have no Rust/wasm toolchain to rebuild it. So when a PR
+  # changes the wasm crates, this job rebuilds the artifact with wasm-pack and COMMITS
+  # the refreshed output back onto the PR branch — no local toolchain needed.
+  #
+  # Scope/safety:
+  #   * SAME-REPO PRs only — a fork PR gets a read-only token and cannot push (fork
+  #     contributors must rebuild + commit locally; the `wasm` freshness gate tells
+  #     them so). Never runs on main/release (the freshness gate guards those).
+  #   * Only does work when a wasm crate actually changed in the PR (cheap skip
+  #     otherwise) so unrelated PRs don't pay a wasm rebuild.
+  #   * Commits only when the DETERMINISTIC glue (.js/.d.ts contract) drifts; the
+  #     non-bit-reproducible `_bg.wasm` binary is bundled into that same commit but
+  #     never the sole trigger — so a noisy binary rebuild can't cause a commit loop.
+  #     (A behaviour-only crate change that leaves the glue identical would not be
+  #     re-committed here — rare; force a rebuild + commit locally if that happens.)
+  wasm-artifact:
+    name: WASM artifact (rebuild + commit on wasm-crate change)
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout the PR branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Detect whether a wasm crate changed in this PR
+        id: changed
+        run: |
+          if git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD \
+               -- crates/portcode-wasm crates/portcode-sync | grep -q .; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "no wasm-crate changes in this PR — skipping the artifact rebuild."
+          fi
+
+      - name: Install LLVM clang
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm
+
+      - name: Materialize pinned Rust toolchain + wasm target
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo registry and build
+        if: steps.changed.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          key: wasm
+          # Read the wasm job's cache; never write from here (avoid cache churn).
+          save-if: ${{ false }}
+
+      - name: Install wasm-pack
+        if: steps.changed.outputs.run == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: wasm-pack build the Session wrapper
+        if: steps.changed.outputs.run == 'true'
+        run: wasm-pack build --target web crates/portcode-wasm
+
+      - name: Copy the regenerated artifact into web/wasm
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          cp crates/portcode-wasm/pkg/portcode_wasm.js \
+             crates/portcode-wasm/pkg/portcode_wasm.d.ts \
+             crates/portcode-wasm/pkg/portcode_wasm_bg.wasm \
+             crates/portcode-wasm/pkg/portcode_wasm_bg.wasm.d.ts \
+             web/wasm/portcode-wasm/
+
+      - name: Commit + push the artifact when the glue contract drifted
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          # Gate the commit on the DETERMINISTIC glue/types only (the .js + .d.ts
+          # interop contract). The `_bg.wasm` binary is git-add'ed alongside so the
+          # behaviour ships, but is never the sole trigger (its bytes aren't
+          # bit-reproducible, which would otherwise loop).
+          if git diff --quiet -- \
+               web/wasm/portcode-wasm/portcode_wasm.js \
+               web/wasm/portcode-wasm/portcode_wasm.d.ts \
+               web/wasm/portcode-wasm/portcode_wasm_bg.wasm.d.ts; then
+            echo "wasm glue contract unchanged — nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add web/wasm/portcode-wasm/
+          git commit -m "build(web): regenerate portcode-wasm artifact"
+          git push origin "HEAD:${{ github.head_ref }}"
+
   coverage:
     name: Coverage (frontend · main/release only)
     # Coverage is COUNTED only on the canonical branches — this job is gated to

@@ -1,7 +1,15 @@
-//! Provider-facing message types and the Anthropic streaming client.
+//! LLM message/event types, the [`LlmProvider`] trait seam, and the Anthropic
+//! streaming client.
+//!
+//! Portcode is Claude-first: `AnthropicProvider` is the only implementation
+//! today. The agent loop depends only on the [`LlmProvider`] trait, so other
+//! model providers slot in (the "any model" goal) by adding an impl + a
+//! [`provider_for`] arm — without touching the loop.
 //!
 //! `Block`/`ChatMessage` are serialized directly into the Anthropic Messages
 //! API request body, so their serde shapes intentionally match that wire format.
+//! They are the neutral vocabulary every provider speaks (also the DB + Phone
+//! Sync wire types), so a future non-Anthropic provider maps onto them.
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -10,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::AppHandle;
 
+use async_trait::async_trait;
 use futures_util::StreamExt;
 
 use crate::secrets::Credential;
@@ -53,6 +62,7 @@ fn build_system(cred: &Credential, system: &str) -> Value {
 // resolve to the SAME types as before.
 pub use portcode_sync::wire::{Block, ChatMessage, StreamEvent};
 
+#[derive(Debug)]
 pub struct TurnResult {
     pub content: Vec<Block>,
     pub stop_reason: String,
@@ -80,6 +90,162 @@ enum Building {
         name: String,
         json: String,
     },
+}
+
+/// Incremental assembler for one streamed assistant turn.
+///
+/// This is the SSE event → state-machine logic that [`stream_turn`]'s read loop
+/// drives, lifted out of the live HTTP path so it is pure and synchronous:
+/// [`process`](TurnBuilder::process) decodes one SSE `data:` payload, folds it
+/// into the in-progress turn, and *returns* the [`StreamEvent`]s to emit (rather
+/// than emitting them itself); [`finish`](TurnBuilder::finish) validates that the
+/// turn completed and produces the [`TurnResult`]. `stream_turn` keeps all the
+/// live I/O (HTTP, cancel, read timeout) and emits whatever `process` hands back,
+/// so observable behavior is unchanged — but the parser can now be unit-tested
+/// from a scripted sequence of Anthropic SSE lines, with no network or runtime.
+struct TurnBuilder {
+    blocks: Vec<Block>,
+    current: Option<Building>,
+    stop_reason: String,
+    input_tokens: u32,
+    output_tokens: u32,
+}
+
+impl TurnBuilder {
+    fn new() -> Self {
+        Self {
+            blocks: Vec::new(),
+            current: None,
+            // Anthropic omits `stop_reason` until the closing `message_delta`;
+            // default to the common terminal value so a stream that ends without
+            // one (or is read mid-flight in a test) still reports sensibly.
+            stop_reason: String::from("end_turn"),
+            input_tokens: 0,
+            output_tokens: 0,
+        }
+    }
+
+    /// Decode one SSE `data:` payload (the text *after* the `data:` prefix) and
+    /// fold it into the in-progress turn, returning the events to emit, in order.
+    ///
+    /// Empty/whitespace payloads and JSON we can't parse or don't model are
+    /// ignored (no events, no error) — the Anthropic stream interleaves
+    /// keep-alives, `[DONE]`-style markers, and event types we don't act on. A
+    /// `type: "error"` event is surfaced as `Err` so the caller aborts the turn.
+    fn process(&mut self, data: &str) -> Result<Vec<StreamEvent>, String> {
+        let data = data.trim();
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            return Ok(Vec::new());
+        };
+
+        let mut events = Vec::new();
+        match v["type"].as_str() {
+            Some("message_start") => {
+                if let Some(n) = v["message"]["usage"]["input_tokens"].as_u64() {
+                    self.input_tokens = n as u32;
+                }
+            }
+            Some("content_block_start") => {
+                let cb = &v["content_block"];
+                self.current = match cb["type"].as_str() {
+                    Some("text") => Some(Building::Text(String::new())),
+                    Some("tool_use") => Some(Building::Tool {
+                        id: cb["id"].as_str().unwrap_or_default().to_string(),
+                        name: cb["name"].as_str().unwrap_or_default().to_string(),
+                        json: String::new(),
+                    }),
+                    _ => None,
+                };
+            }
+            Some("content_block_delta") => {
+                let d = &v["delta"];
+                match d["type"].as_str() {
+                    Some("text_delta") => {
+                        if let Some(t) = d["text"].as_str() {
+                            // Only surface text we also accumulate into the current
+                            // text block, so the live UI can never show text that the
+                            // persisted message ends up missing.
+                            if let Some(Building::Text(s)) = self.current.as_mut() {
+                                s.push_str(t);
+                                events.push(StreamEvent::TextDelta { text: t.into() });
+                            }
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some(pj) = d["partial_json"].as_str() {
+                            if let Some(Building::Tool { json, .. }) = self.current.as_mut() {
+                                json.push_str(pj);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("content_block_stop") => match self.current.take() {
+                Some(Building::Text(s)) => self.blocks.push(Block::Text { text: s }),
+                Some(Building::Tool { id, name, json }) => {
+                    let input: Value = if json.trim().is_empty() {
+                        json!({})
+                    } else {
+                        serde_json::from_str(&json).unwrap_or_else(|_| json!({}))
+                    };
+                    events.push(StreamEvent::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                    });
+                    self.blocks.push(Block::ToolUse { id, name, input });
+                }
+                None => {}
+            },
+            Some("message_delta") => {
+                if let Some(sr) = v["delta"]["stop_reason"].as_str() {
+                    self.stop_reason = sr.to_string();
+                }
+                if let Some(n) = v["usage"]["output_tokens"].as_u64() {
+                    self.output_tokens = n as u32;
+                }
+            }
+            Some("error") => {
+                let msg = v["error"]["message"]
+                    .as_str()
+                    .unwrap_or("unknown streaming error");
+                return Err(msg.to_string());
+            }
+            _ => {}
+        }
+        Ok(events)
+    }
+
+    /// Record that the user cancelled the turn. A cancelled turn legitimately
+    /// stops mid-block, so this suppresses the truncation error in [`finish`].
+    fn mark_cancelled(&mut self) {
+        self.stop_reason = String::from("cancelled");
+    }
+
+    /// Finalize the turn into a [`TurnResult`].
+    ///
+    /// If the stream ended while a content block was still open (no
+    /// `content_block_stop`) and the turn was not cancelled, the response was
+    /// truncated — surface it instead of silently dropping the block. A
+    /// half-built tool call would otherwise just vanish and the turn would look
+    /// fine.
+    fn finish(self) -> Result<TurnResult, String> {
+        if self.current.is_some() && self.stop_reason != "cancelled" {
+            return Err(
+                "The response was cut off before it finished. Please try again.".to_string(),
+            );
+        }
+        Ok(TurnResult {
+            content: self.blocks,
+            stop_reason: self.stop_reason,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+        })
+    }
 }
 
 fn emit(app: &AppHandle, channel: &str, ev: StreamEvent) {
@@ -147,16 +313,11 @@ pub async fn stream_turn(
 
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
-
-    let mut blocks: Vec<Block> = Vec::new();
-    let mut current: Option<Building> = None;
-    let mut stop_reason = String::from("end_turn");
-    let mut input_tokens: u32 = 0;
-    let mut output_tokens: u32 = 0;
+    let mut builder = TurnBuilder::new();
 
     loop {
         if cancel.load(Ordering::Relaxed) {
-            stop_reason = "cancelled".into();
+            builder.mark_cancelled();
             break;
         }
         // Bound each read so a stalled connection can't park the turn forever with no
@@ -184,109 +345,79 @@ pub async fn stream_turn(
             let Some(data) = line.strip_prefix("data:") else {
                 continue;
             };
-            let data = data.trim();
-            if data.is_empty() {
-                continue;
-            }
-            let Ok(v) = serde_json::from_str::<Value>(data) else {
-                continue;
-            };
-
-            match v["type"].as_str() {
-                Some("message_start") => {
-                    if let Some(n) = v["message"]["usage"]["input_tokens"].as_u64() {
-                        input_tokens = n as u32;
-                    }
-                }
-                Some("content_block_start") => {
-                    let cb = &v["content_block"];
-                    current = match cb["type"].as_str() {
-                        Some("text") => Some(Building::Text(String::new())),
-                        Some("tool_use") => Some(Building::Tool {
-                            id: cb["id"].as_str().unwrap_or_default().to_string(),
-                            name: cb["name"].as_str().unwrap_or_default().to_string(),
-                            json: String::new(),
-                        }),
-                        _ => None,
-                    };
-                }
-                Some("content_block_delta") => {
-                    let d = &v["delta"];
-                    match d["type"].as_str() {
-                        Some("text_delta") => {
-                            if let Some(t) = d["text"].as_str() {
-                                // Only surface text we also accumulate into the current
-                                // text block, so the live UI can never show text that the
-                                // persisted message ends up missing.
-                                if let Some(Building::Text(s)) = current.as_mut() {
-                                    s.push_str(t);
-                                    emit(app, channel, StreamEvent::TextDelta { text: t.into() });
-                                }
-                            }
-                        }
-                        Some("input_json_delta") => {
-                            if let Some(pj) = d["partial_json"].as_str() {
-                                if let Some(Building::Tool { json, .. }) = current.as_mut() {
-                                    json.push_str(pj);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Some("content_block_stop") => match current.take() {
-                    Some(Building::Text(s)) => blocks.push(Block::Text { text: s }),
-                    Some(Building::Tool { id, name, json }) => {
-                        let input: Value = if json.trim().is_empty() {
-                            json!({})
-                        } else {
-                            serde_json::from_str(&json).unwrap_or_else(|_| json!({}))
-                        };
-                        emit(
-                            app,
-                            channel,
-                            StreamEvent::ToolUse {
-                                id: id.clone(),
-                                name: name.clone(),
-                                input: input.clone(),
-                            },
-                        );
-                        blocks.push(Block::ToolUse { id, name, input });
-                    }
-                    None => {}
-                },
-                Some("message_delta") => {
-                    if let Some(sr) = v["delta"]["stop_reason"].as_str() {
-                        stop_reason = sr.to_string();
-                    }
-                    if let Some(n) = v["usage"]["output_tokens"].as_u64() {
-                        output_tokens = n as u32;
-                    }
-                }
-                Some("error") => {
-                    let msg = v["error"]["message"]
-                        .as_str()
-                        .unwrap_or("unknown streaming error");
-                    return Err(msg.to_string());
-                }
-                _ => {}
+            // The pure parser folds the event into the turn and tells us what to
+            // emit; the live path only owns the side effect of emitting it.
+            for ev in builder.process(data)? {
+                emit(app, channel, ev);
             }
         }
     }
 
-    // If the stream ended while a content block was still open (no content_block_stop),
-    // the response was truncated — surface it instead of silently dropping the block.
-    // A half-built tool call would otherwise just vanish and the turn would look fine.
-    if current.is_some() && stop_reason != "cancelled" {
-        return Err("The response was cut off before it finished. Please try again.".to_string());
-    }
+    builder.finish()
+}
 
-    Ok(TurnResult {
-        content: blocks,
-        stop_reason,
-        input_tokens,
-        output_tokens,
-    })
+/// The LLM provider seam. The agent loop depends only on this trait, so adding a
+/// model provider means adding an `impl` + a [`provider_for`] arm — the loop
+/// itself never changes. `AnthropicProvider` is the only provider today.
+#[async_trait]
+pub trait LlmProvider: Send + Sync {
+    /// Stream one assistant turn — same contract as [`stream_turn`]: emits
+    /// text/tool events as they arrive and returns the assembled turn so the
+    /// agent loop can act on any tool calls.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_turn(
+        &self,
+        http: &reqwest::Client,
+        cred: &Credential,
+        model: &str,
+        system: &str,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        app: &AppHandle,
+        channel: &str,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<TurnResult, String>;
+}
+
+/// Anthropic Messages API provider. A thin adapter over [`stream_turn`] (the
+/// Anthropic-specific client above); this is what [`provider_for`] returns for
+/// `provider = "anthropic"`. Its credential model (`x-api-key` / OAuth bearer)
+/// and the Claude Code identity block are Anthropic-specific — a second provider
+/// brings its own impl rather than reusing these.
+pub struct AnthropicProvider;
+
+#[async_trait]
+impl LlmProvider for AnthropicProvider {
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_turn(
+        &self,
+        http: &reqwest::Client,
+        cred: &Credential,
+        model: &str,
+        system: &str,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        app: &AppHandle,
+        channel: &str,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<TurnResult, String> {
+        stream_turn(
+            http, cred, model, system, messages, tools, app, channel, cancel,
+        )
+        .await
+    }
+}
+
+/// Resolve the provider named by `settings.provider`. An unknown name fails the
+/// run with a clear message instead of silently defaulting to Anthropic, so a
+/// mis-set provider surfaces immediately rather than producing confusing calls.
+pub fn provider_for(name: &str) -> Result<Box<dyn LlmProvider>, String> {
+    match name {
+        "anthropic" => Ok(Box::new(AnthropicProvider)),
+        other => Err(format!(
+            "Unknown LLM provider '{other}'. Portcode currently supports: anthropic."
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -324,5 +455,267 @@ mod tests {
             !system.to_string().contains("Claude Code"),
             "API-key requests must not carry the Claude Code identity"
         );
+    }
+
+    #[test]
+    fn provider_for_resolves_anthropic_and_rejects_unknown() {
+        // The only implemented provider resolves; anything else fails loudly,
+        // and the message names both the bad id and the supported one.
+        assert!(provider_for("anthropic").is_ok());
+        // Extract the error without `unwrap_err()` — that requires the `Ok` type
+        // (`Box<dyn LlmProvider>`) to be `Debug`, which a trait object is not.
+        let Err(err) = provider_for("openai") else {
+            panic!("an unknown provider must not resolve");
+        };
+        assert!(
+            err.contains("openai"),
+            "error should name the bad provider: {err}"
+        );
+        assert!(
+            err.contains("anthropic"),
+            "error should name the supported provider: {err}"
+        );
+    }
+
+    // ---- TurnBuilder: the SSE event → turn state machine ----------------------
+    //
+    // These drive the *pure* parser with scripted Anthropic SSE `data:` payloads
+    // (the JSON after the `data:` prefix), so the streaming assembly logic is
+    // covered without a live HTTP stream, a Tauri runtime, or the network.
+
+    /// Run a fresh `TurnBuilder` through a script of SSE payloads, collecting
+    /// every emitted event in order. Panics if any payload yields an error event
+    /// (assert the error path with `process` directly instead).
+    fn drive(lines: &[&str]) -> (TurnBuilder, Vec<StreamEvent>) {
+        let mut b = TurnBuilder::new();
+        let mut events = Vec::new();
+        for line in lines {
+            events.extend(b.process(line).expect("no error event in this script"));
+        }
+        (b, events)
+    }
+
+    #[test]
+    fn assembles_text_turn_with_usage_and_stop_reason() {
+        let (b, events) = drive(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":11}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello, "}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#,
+        ]);
+        // Each text delta is surfaced live, in arrival order.
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::TextDelta {
+                    text: "Hello, ".into()
+                },
+                StreamEvent::TextDelta {
+                    text: "world".into()
+                },
+            ]
+        );
+        let result = b.finish().expect("a closed text turn finalizes");
+        assert_eq!(result.input_tokens, 11);
+        assert_eq!(result.output_tokens, 7);
+        assert_eq!(result.stop_reason, "end_turn");
+        assert_eq!(result.content.len(), 1);
+        match &result.content[0] {
+            Block::Text { text } => assert_eq!(text, "Hello, world"),
+            other => panic!("expected a single text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assembles_tool_use_block_and_emits_tooluse_event_on_stop() {
+        let (b, events) = drive(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"fs_read"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"a.txt\"}"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}"#,
+        ]);
+        // The ToolUse event lands once, at content_block_stop, with the full
+        // JSON reassembled from its partial_json fragments.
+        assert_eq!(
+            events,
+            vec![StreamEvent::ToolUse {
+                id: "toolu_1".into(),
+                name: "fs_read".into(),
+                input: json!({ "path": "a.txt" }),
+            }]
+        );
+        let result = b.finish().expect("a closed tool turn finalizes");
+        assert_eq!(result.stop_reason, "tool_use");
+        assert_eq!(result.output_tokens, 3);
+        match &result.content[0] {
+            Block::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "fs_read");
+                assert_eq!(input, &json!({ "path": "a.txt" }));
+            }
+            other => panic!("expected a tool_use block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_use_with_no_input_defaults_to_empty_object() {
+        let (b, events) = drive(&[
+            r#"{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_x","name":"list"}}"#,
+            r#"{"type":"content_block_stop"}"#,
+        ]);
+        assert_eq!(
+            events,
+            vec![StreamEvent::ToolUse {
+                id: "toolu_x".into(),
+                name: "list".into(),
+                input: json!({}),
+            }]
+        );
+        match &b.finish().expect("finalizes").content[0] {
+            Block::ToolUse { input, .. } => assert_eq!(input, &json!({})),
+            other => panic!("expected tool_use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_use_with_malformed_json_falls_back_to_empty_object() {
+        // A truncated/garbled argument stream must not poison the turn; it
+        // degrades to an empty-object input rather than failing to parse.
+        let (b, _events) = drive(&[
+            r#"{"type":"content_block_start","content_block":{"type":"tool_use","id":"t","name":"n"}}"#,
+            r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{not valid"}}"#,
+            r#"{"type":"content_block_stop"}"#,
+        ]);
+        match &b.finish().expect("finalizes").content[0] {
+            Block::ToolUse { input, .. } => assert_eq!(input, &json!({})),
+            other => panic!("expected tool_use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_event_is_surfaced_as_err() {
+        let mut b = TurnBuilder::new();
+        let err = b
+            .process(r#"{"type":"error","error":{"message":"overloaded_error"}}"#)
+            .expect_err("an error event must abort the turn");
+        assert!(err.contains("overloaded_error"), "got: {err}");
+    }
+
+    #[test]
+    fn error_event_without_message_uses_fallback() {
+        let mut b = TurnBuilder::new();
+        let err = b
+            .process(r#"{"type":"error","error":{}}"#)
+            .expect_err("still an error");
+        assert_eq!(err, "unknown streaming error");
+    }
+
+    #[test]
+    fn unclosed_block_finishes_as_truncation_error() {
+        // A block is opened but never closed (the stream was cut off): the turn
+        // must surface a truncation error rather than drop the partial block.
+        let (b, _events) = drive(&[
+            r#"{"type":"content_block_start","content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}"#,
+        ]);
+        let err = b
+            .finish()
+            .expect_err("an open block at end is a truncation");
+        assert!(err.contains("cut off"), "got: {err}");
+    }
+
+    #[test]
+    fn cancelled_turn_with_open_block_finishes_ok() {
+        // Cancellation legitimately stops mid-block, so finish() must not treat
+        // the still-open block as a truncation.
+        let mut b = TurnBuilder::new();
+        b.process(r#"{"type":"content_block_start","content_block":{"type":"text","text":""}}"#)
+            .unwrap();
+        b.process(r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}"#)
+            .unwrap();
+        b.mark_cancelled();
+        let result = b
+            .finish()
+            .expect("a cancelled turn is not a truncation error");
+        assert_eq!(result.stop_reason, "cancelled");
+    }
+
+    #[test]
+    fn empty_and_unparseable_payloads_are_ignored() {
+        let mut b = TurnBuilder::new();
+        assert!(b.process("").unwrap().is_empty());
+        assert!(b.process("   ").unwrap().is_empty());
+        assert!(b.process("not json at all").unwrap().is_empty());
+        assert!(b.process(r#"{"type":"ping"}"#).unwrap().is_empty());
+        // None of that moved the cursor or produced content.
+        let result = b.finish().expect("finalizes");
+        assert!(result.content.is_empty());
+        assert_eq!(result.stop_reason, "end_turn");
+    }
+
+    #[test]
+    fn text_delta_without_open_text_block_is_dropped() {
+        // A stray text delta with no current block must not panic or emit.
+        let mut b = TurnBuilder::new();
+        let events = b
+            .process(r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}"#)
+            .unwrap();
+        assert!(events.is_empty());
+        assert!(b.finish().unwrap().content.is_empty());
+    }
+
+    #[test]
+    fn input_json_delta_without_open_tool_block_is_dropped() {
+        // The tool-arg counterpart: a stray input_json_delta with no current
+        // block must also be silently dropped, leaving the turn empty.
+        let mut b = TurnBuilder::new();
+        let events = b
+            .process(
+                r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"x\":1}"}}"#,
+            )
+            .unwrap();
+        assert!(events.is_empty());
+        assert!(b.finish().unwrap().content.is_empty());
+    }
+
+    #[test]
+    fn fresh_builder_finishes_with_default_stop_reason() {
+        assert_eq!(TurnBuilder::new().finish().unwrap().stop_reason, "end_turn");
+    }
+
+    #[test]
+    fn assembles_mixed_text_then_tool_turn_in_order() {
+        let (b, events) = drive(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":20}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Let me read it."}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_2","name":"fs_read"}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"x\"}"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":15}}"#,
+        ]);
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::TextDelta {
+                    text: "Let me read it.".into()
+                },
+                StreamEvent::ToolUse {
+                    id: "toolu_2".into(),
+                    name: "fs_read".into(),
+                    input: json!({ "path": "x" }),
+                },
+            ]
+        );
+        let result = b.finish().unwrap();
+        assert_eq!(result.content.len(), 2);
+        assert_eq!(result.input_tokens, 20);
+        assert_eq!(result.output_tokens, 15);
+        assert!(matches!(result.content[0], Block::Text { .. }));
+        assert!(matches!(result.content[1], Block::ToolUse { .. }));
     }
 }

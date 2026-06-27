@@ -25,6 +25,7 @@ vi.mock("../lib/ipc", () => ({
   phoneSyncConnect: vi.fn(),
   phoneSyncSendCommand: vi.fn(),
   phoneSyncDisconnect: vi.fn(),
+  phoneSyncReject: vi.fn(),
   onPhoneSyncFrame: vi.fn(),
   onPhoneSyncDisconnected: vi.fn(),
   isTauri: vi.fn(),
@@ -610,7 +611,7 @@ describe("RemotePairing — safety panel", () => {
     expect(useStore.getState().remoteVerified).toBe(true);
   });
 
-  it("Cancel drops the channel via the store", async () => {
+  it("Cancel rejects the pairing via the store (sends a reject, drops the channel)", async () => {
     useStore.setState({ remoteConnected: true, remoteVerified: false, remoteSas: "TANGO-42" });
     render(<RemotePairing />);
 
@@ -620,8 +621,65 @@ describe("RemotePairing — safety panel", () => {
       await Promise.resolve();
     });
 
-    expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(1);
-    expect(useStore.getState().remoteConnected).toBe(false);
+    // Cancel now REJECTS (sends a pairing_reject + tears down), not a bare disconnect.
+    expect(m.phoneSyncReject).toHaveBeenCalledTimes(1);
+    expect(m.phoneSyncDisconnect).not.toHaveBeenCalled();
+    const st = useStore.getState();
+    expect(st.remoteConnected).toBe(false);
+    expect(st.remoteRejected).toBe(true);
+  });
+
+  it("Confirm is gated off once the desktop rejected (a desktop reject closes the door)", () => {
+    // A desktop pairing_reject flips remoteConnected→false + remoteRejected→true, so
+    // the safety panel isn't shown; but if state momentarily has SAS + rejected, the
+    // Confirm button must be non-actionable. Force the panel by keeping connected but
+    // rejected to assert the gate directly.
+    useStore.setState({
+      remoteConnected: true,
+      remoteSas: "TANGO-42",
+      remoteRejected: true,
+    });
+    render(<RemotePairing />);
+    expect(screen.getByRole("button", { name: /It matches/ })).toBeDisabled();
+  });
+});
+
+describe("RemotePairing — rejected panel", () => {
+  it("renders the rejected banner when the pairing was declined", () => {
+    useStore.setState({ remoteConnected: false, remoteRejected: true, remoteRejectReason: null });
+    render(<RemotePairing />);
+
+    expect(screen.getByText("⛌ PAIRING DECLINED")).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: /Connection rejected on the other device/ }),
+    ).toBeInTheDocument();
+    // The pair panel and safety panel are both gone.
+    expect(screen.queryByText("◧ REMOTE MODE")).not.toBeInTheDocument();
+    expect(screen.queryByText("⛨ SECURITY CHECK")).not.toBeInTheDocument();
+  });
+
+  it("shows a desktop-supplied reason when present", () => {
+    useStore.setState({
+      remoteConnected: false,
+      remoteRejected: true,
+      remoteRejectReason: "Codes didn't match",
+    });
+    render(<RemotePairing />);
+    expect(screen.getByText("Codes didn't match")).toBeInTheDocument();
+  });
+
+  it("'Pair again' clears the rejection and returns to the pair screen", async () => {
+    useStore.setState({ remoteConnected: false, remoteRejected: true });
+    render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Pair again" }));
+      await Promise.resolve();
+    });
+
+    expect(useStore.getState().remoteRejected).toBe(false);
+    // Back on the pair panel.
+    expect(screen.getByText("◧ REMOTE MODE")).toBeInTheDocument();
   });
 });
 

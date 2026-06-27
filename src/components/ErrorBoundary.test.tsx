@@ -3,12 +3,18 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 
 import { ErrorBoundary } from "./ErrorBoundary";
+import * as telemetry from "../lib/telemetry";
 
 // ErrorBoundary is a dependency-free class boundary: a render throw below it
 // swaps in a recoverable fallback (the default Neon-Noir panel or a caller's
-// custom render) instead of unmounting the whole tree. These tests drive every
-// branch — happy path, default fallback + Reload, custom fallback + reset — by
-// rendering a child that throws on demand.
+// custom render) instead of unmounting the whole tree, AND — when crash reporting
+// is active — forwards the error to `reportError`. These tests drive every branch
+// — happy path, default fallback + Reload, custom fallback + reset, telemetry
+// hand-off — by rendering a child that throws on demand.
+
+// `reportError` is the only telemetry surface the boundary touches; mock it so the
+// tests assert the hand-off without initializing the real (DSN-gated) SDK.
+vi.mock("../lib/telemetry", () => ({ reportError: vi.fn() }));
 
 // A child that throws on render when `boom` is set. React renders the throwing
 // tree (logging the error) before getDerivedStateFromError swaps in the fallback.
@@ -203,5 +209,19 @@ describe("ErrorBoundary", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "retry" }));
     expect(onReset).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards the caught render error to reportError (telemetry)", () => {
+    // componentDidCatch hands the (normalized) Error to the telemetry layer, which
+    // is itself a scrubbed no-op unless reporting is active.
+    render(
+      <ErrorBoundary>
+        <Boom message="reported boom" />
+      </ErrorBoundary>,
+    );
+    const reported = vi.mocked(telemetry.reportError);
+    expect(reported).toHaveBeenCalledTimes(1);
+    expect(reported.mock.calls[0][0]).toBeInstanceOf(Error);
+    expect(reported.mock.calls[0][0]).toHaveProperty("message", "reported boom");
   });
 });

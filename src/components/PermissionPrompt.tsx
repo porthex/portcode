@@ -58,6 +58,7 @@ export function PermissionPrompt() {
             </span>
           </span>
         </div>
+        {pending.diff && pending.diff.trim() && <DiffView diff={pending.diff} />}
         <div className="flex flex-wrap gap-[9px]">
           <button
             onClick={() => void resolve("allow")}
@@ -81,5 +82,35 @@ export function PermissionPrompt() {
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * The pre-apply unified diff for a file write/edit, shown so the user can see
+ * exactly what would change BEFORE approving. Added/removed lines are coloured;
+ * the body scrolls so a large change can't push the Allow/Deny buttons offscreen.
+ */
+function DiffView({ diff }: { diff: string }) {
+  return (
+    <pre
+      aria-label="Proposed change"
+      className="pc-diff max-h-48 overflow-auto rounded border border-border bg-panel-2 px-2.5 py-2 font-mono text-[11px] leading-[1.5]"
+    >
+      {diff.split("\n").map((line, i) => {
+        const cls =
+          line.startsWith("+") && !line.startsWith("+++")
+            ? "text-accent-2"
+            : line.startsWith("-") && !line.startsWith("---")
+              ? "text-danger"
+              : line.startsWith("@@")
+                ? "text-violet"
+                : "text-muted";
+        return (
+          <div key={i} className={cls}>
+            {line || " "}
+          </div>
+        );
+      })}
+    </pre>
   );
 }

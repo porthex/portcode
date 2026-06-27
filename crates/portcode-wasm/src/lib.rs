@@ -157,7 +157,27 @@ impl Session {
         // Arc<Mutex>; the send half also keeps the iroh connection alive. The recv
         // half is PARKED (not yet looping) until `on_event` registers a callback —
         // otherwise the loop would read + drop frames that arrive before JS wires up.
-        let (sender, receiver) = paired.channel.split();
+        let (mut sender, receiver) = paired.channel.split();
+
+        // KEYSTONE: kick off catch-up by sending `Hello` over the freshly-split send
+        // half. The desktop's `serve_catch_up` BLOCKS on this frame before it sends
+        // the `SessionList` (and before the connection handler reaches the live/
+        // command loops), so without it the phone gets no session list and its
+        // commands are never read. Empty `cursors` = full catch-up: the desktop
+        // replies with the current `SessionList` and zero per-cursor deltas. The
+        // reply sits buffered on the channel until the recv loop is started by
+        // `on_event`, so it is delivered through the SAME path as live frames (no
+        // early-frame drop — that's exactly why the receiver is parked). `device_id`
+        // is ignored by the desktop (`serve_catch_up` matches `Hello { cursors, .. }`)
+        // — a stable literal is all it needs.
+        sender
+            .send_frame(&SyncFrame::Hello {
+                device_id: "web".to_string(),
+                cursors: vec![],
+            })
+            .await
+            .map_err(|e| js_err(&format!("failed to send Hello: {e}")))?;
+
         let sender = Rc::new(AsyncMutex::new(Some(sender)));
         let on_event: Rc<RefCell<Option<js_sys::Function>>> = Rc::new(RefCell::new(None));
 
@@ -230,6 +250,44 @@ impl Session {
             // `run_client_recv` returns, ending the loop.
             let _ = sender.lock().await.take();
         });
+    }
+
+    /// Decline this session during SAS verification: tell the desktop the user
+    /// rejected the pairing (so its confirm/reject prompt cancels instead of
+    /// parking for the full timeout), then tear the connection down.
+    ///
+    /// Sends a `PairingReject { reason: None }` over the still-open send half BEFORE
+    /// dropping it — the desktop's `serve_connection` selects on this frame and
+    /// drops the connection promptly. A send error is non-fatal (the channel may
+    /// already be gone); we tear down regardless so the local session is always
+    /// cleaned up. The store wires this to the "reject" button in the SAS dialog.
+    ///
+    /// Takes `&self` (not `&mut self`) — like `send_command`/`disconnect`, the inner
+    /// state is behind `Rc<RefCell>`/`Rc<AsyncMutex>`, so teardown works through a
+    /// shared borrow; the returned `Promise` resolves once the reject frame is sent
+    /// (or fails) and the channel is dropped.
+    #[wasm_bindgen]
+    pub async fn reject(&self) {
+        // Drop a still-parked receiver (the `onEvent`-never-called case) so the
+        // channel tears down fully, mirroring `disconnect`.
+        let _ = self.receiver.borrow_mut().take();
+        // Take the send half OUT of the shared slot so dropping it (at the end of
+        // this fn) closes the QUIC stream, ending the recv loop. Send the reject
+        // over it FIRST, while it is still open.
+        let tx = self.sender.lock().await.take();
+        if let Some(mut tx) = tx {
+            if let Err(e) = tx
+                .send_frame(&SyncFrame::PairingReject { reason: None })
+                .await
+            {
+                // Best-effort: the desktop may have already dropped us. Log; `tx` is
+                // dropped at the end of this scope either way, tearing the channel
+                // down.
+                console_log(&format!("reject: failed to send PairingReject: {e}"));
+            }
+        } else {
+            console_log("reject: session already disconnected");
+        }
     }
 
     /// The Short Authentication String to compare out-of-band before trusting the

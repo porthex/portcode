@@ -4,6 +4,7 @@
 import type {
   ConnectInfo,
   DirEntry,
+  DraftEntry,
   Message,
   OAuthStatus,
   PairingPayload,
@@ -11,6 +12,7 @@ import type {
   PhoneSyncStatus,
   RemoteCommand,
   Session,
+  SessionUsage,
   Settings,
   StreamEvent,
   SyncFrame,
@@ -20,6 +22,7 @@ import {
   webOnPhoneSyncFrame,
   webPhoneSyncConnect,
   webPhoneSyncDisconnect,
+  webPhoneSyncReject,
   webPhoneSyncSendCommand,
 } from "./webSession";
 
@@ -220,6 +223,26 @@ export async function phoneSyncDisconnect(): Promise<void> {
   return mock.phoneSyncDisconnect();
 }
 
+/**
+ * Decline the pairing from the phone: send a `pairing_reject` frame to the desktop
+ * (so it learns the SAS was rejected, not merely that the link dropped), then tear
+ * the session down. Idempotent.
+ *
+ * In web-client mode this routes to the wasm transport's `reject` (the carrier of
+ * the new `pairing_reject` frame). On native (Tauri) the reject-frame protocol is a
+ * web/wasm concern, so we fall back to the existing `phone_sync_disconnect` command,
+ * which safely closes the channel.
+ */
+export async function phoneSyncReject(): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("phone_sync_disconnect");
+    return;
+  }
+  if (webClientActive()) return webPhoneSyncReject();
+  return mock.phoneSyncDisconnect();
+}
+
 /** Subscribe to frames forwarded from the paired desktop (live events + catch-up).
  *  Returns an unlisten handle. */
 export async function onPhoneSyncFrame(cb: (frame: SyncFrame) => void): Promise<Unlisten> {
@@ -252,6 +275,20 @@ export async function resolvePermission(id: string, decision: "allow" | "deny"):
   return mock.resolvePermission(id, decision);
 }
 
+// ── Crash reporting consent (mirror to the Rust host) ─────────────────────────
+
+/** Tell the Rust host the user's crash-reporting consent changed. Desktop-only on
+ *  the core side; the command is absent on mobile and on DSN-less dev builds it's a
+ *  no-op, so callers should swallow errors (the host gate stays the source of
+ *  truth). No browser-mock fallback: in `vite`/preview there is no Rust host to
+ *  inform, and the frontend SDK is driven separately by `lib/telemetry`. */
+export async function setTelemetryConsent(enabled: boolean): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("telemetry_set_consent", { enabled });
+  }
+}
+
 // ── sessions / history ────────────────────────────────────────────────────────
 
 export async function listSessions(): Promise<Session[]> {
@@ -266,10 +303,11 @@ export async function createSession(
   id: string,
   title?: string,
   workspace?: string | null,
+  model?: string,
 ): Promise<void> {
   if (isTauri()) {
     const { core } = await tauri();
-    await core.invoke("create_session", { id, title, workspace });
+    await core.invoke("create_session", { id, title, workspace, model });
   }
 }
 
@@ -291,6 +329,62 @@ export async function getMessages(sessionId: string): Promise<Message[]> {
   if (isTauri()) {
     const { core } = await tauri();
     return core.invoke<Message[]>("get_messages", { sessionId });
+  }
+  return [];
+}
+
+// ── composer drafts (open-loop persistence) ───────────────────────────────────
+//
+// The DURABLE store. Under Tauri these reach the SQLite `drafts` table; outside
+// Tauri (web client / vite preview) the desktop DB doesn't exist, so — exactly
+// like listSessions/getMessages — they no-op / return empty and the store's
+// optimistic localStorage mirror IS the web-mode persistence. So a command added
+// only on the Rust side can't break the browser build.
+
+/** Persist (or clear, when blank) a session's unsent draft. Debounced by the store. */
+export async function saveDraft(sessionId: string, text: string): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("save_draft", { sessionId, text });
+  }
+}
+
+/** The durably-stored draft for a session, or null when none / not under Tauri. */
+export async function getDraft(sessionId: string): Promise<string | null> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<string | null>("get_draft", { sessionId });
+  }
+  return null;
+}
+
+/** Every durably-stored draft — the authoritative startup hydration for the
+ *  per-session draft map. Empty outside Tauri (the localStorage mirror restores). */
+export async function getDrafts(): Promise<DraftEntry[]> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<DraftEntry[]>("get_drafts");
+  }
+  return [];
+}
+
+// ── usage (cumulative per-session token spend) ────────────────────────────────
+
+/** Cumulative usage for one session (zeros when none / not under Tauri). */
+export async function getUsage(sessionId: string): Promise<SessionUsage> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<SessionUsage>("get_usage", { sessionId });
+  }
+  return { sessionId, input: 0, output: 0 };
+}
+
+/** Every session's cumulative usage — restores per-session meters and the
+ *  workspace-total spend across a restart. Empty outside Tauri. */
+export async function getAllUsage(): Promise<SessionUsage[]> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<SessionUsage[]>("get_all_usage");
   }
   return [];
 }
@@ -339,6 +433,7 @@ export interface AgentRunHandle {
 export async function runAgent(
   sessionId: string,
   text: string,
+  model: string,
   onEvent: (e: StreamEvent) => void,
 ): Promise<AgentRunHandle> {
   if (isTauri()) {
@@ -347,7 +442,7 @@ export async function runAgent(
     const unlisten: Unlisten = await event.listen<StreamEvent>(channel, (ev) =>
       onEvent(ev.payload),
     );
-    await core.invoke("run_agent", { sessionId, text });
+    await core.invoke("run_agent", { sessionId, text, model });
     return {
       cancel: async () => {
         await core.invoke("cancel_agent", { sessionId });
@@ -356,7 +451,37 @@ export async function runAgent(
       dispose: unlisten,
     };
   }
-  return mock.runAgent(sessionId, text, onEvent);
+  return mock.runAgent(sessionId, text, model, onEvent);
+}
+
+/**
+ * Subscribe to a session's agent channel PERSISTENTLY — across turns — for the
+ * background-task lifecycle events (`background_task_started` /
+ * `background_task_finished`) that can land after the launching turn's per-turn
+ * listener was torn down. Returns an unlisten handle. The handler receives every
+ * event on the channel; the caller filters to the background events it cares about
+ * (the per-turn listener owns the turn's own deltas). Inert in the browser mock —
+ * the preview launches no real background tasks.
+ */
+export async function subscribeSessionEvents(
+  sessionId: string,
+  onEvent: (e: StreamEvent) => void,
+): Promise<Unlisten> {
+  if (isTauri()) {
+    const { event } = await tauri();
+    return event.listen<StreamEvent>(`agent://${sessionId}`, (ev) => onEvent(ev.payload));
+  }
+  return mock.subscribeSessionEvents();
+}
+
+/** Stop ONE subagent (and its descendants) by id, leaving the rest of the turn
+ *  running. Mirrors `cancel_agent`, but targets the live agents registry. A no-op
+ *  in the browser mock (no real subagents run there). */
+export async function cancelAgentById(agentId: string): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("cancel_agent_by_id", { agentId });
+  }
 }
 
 // ── Browser mock ──────────────────────────────────────────────────────────────
@@ -370,6 +495,8 @@ const mock = (() => {
     defaultPolicy: "ask",
     workspace: null,
     typingAnimation: true,
+    permissionMode: "default",
+    rules: [],
   };
 
   // Fake subscription-auth state so the sign-in UX is testable without Tauri.
@@ -459,6 +586,9 @@ const mock = (() => {
     async onPhoneSyncDisconnected(_cb: () => void): Promise<Unlisten> {
       return () => {}; // inert: the preview never drops a (nonexistent) session.
     },
+    async subscribeSessionEvents(): Promise<Unlisten> {
+      return () => {}; // inert: the preview launches no real background tasks.
+    },
     async resolvePermission(id: string, decision: "allow" | "deny") {
       resolvers.get(id)?.(decision);
       resolvers.delete(id);
@@ -489,7 +619,12 @@ const mock = (() => {
       };
       return tree[sub ?? ""] ?? [];
     },
-    async runAgent(_sessionId: string, text: string, onEvent: (e: StreamEvent) => void) {
+    async runAgent(
+      _sessionId: string,
+      text: string,
+      _model: string,
+      onEvent: (e: StreamEvent) => void,
+    ) {
       let cancelled = false;
       (async () => {
         await delay(120);

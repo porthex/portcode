@@ -29,6 +29,7 @@ const session = (over: Partial<Session> = {}): Session => ({
   id: "s1",
   title: "Chat",
   workspace: null,
+  model: "claude-opus-4-8",
   createdAt: 1,
   updatedAt: 1,
   ...over,
@@ -168,17 +169,45 @@ describe("StatusHud", () => {
     expect(idleDot).not.toHaveClass("pc-dot--ring");
   });
 
-  it("renders the model and policy from settings", () => {
+  it("renders the active session's model and the policy from settings", () => {
     useStore.setState({
-      sessions: [session()],
+      sessions: [session({ model: "claude-sonnet-4-6" })],
       activeId: "s1",
-      settings: settings({ model: "claude-sonnet-4-6", defaultPolicy: "deny" }),
+      settings: settings({ defaultPolicy: "deny" }),
     });
 
     render(<StatusHud />);
 
+    // The model segment now reads the ACTIVE SESSION's model, not settings.model.
     expect(screen.getByText("SONNET 4.6")).toBeInTheDocument();
     expect(screen.getByText("POLICY: DENY")).toBeInTheDocument();
+  });
+
+  it("shows the permission MODE (not the legacy policy) when a non-default mode is active", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      settings: settings({ permissionMode: "acceptEdits" }),
+    });
+
+    render(<StatusHud />);
+
+    expect(screen.getByText("MODE: ACCEPTEDITS")).toBeInTheDocument();
+    expect(screen.queryByText(/POLICY:/)).not.toBeInTheDocument();
+  });
+
+  it("flags a loosened auto/bypass mode with a danger style and warning glyph", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      settings: settings({ permissionMode: "bypass" }),
+    });
+
+    render(<StatusHud />);
+
+    const seg = screen.getByText(/MODE: BYPASS/);
+    expect(seg.textContent).toContain("⚠");
+    expect(seg).toHaveClass("text-danger");
   });
 
   it("trims the desktop-dense segments on the phone (remote mode)", () => {
@@ -209,5 +238,92 @@ describe("StatusHud", () => {
     render(<StatusHud />);
 
     expect(screen.getByText(`${(1540).toLocaleString()} tok`)).toBeInTheDocument();
+  });
+
+  it("shows a running-subagents count only while subagents are running", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      agents: {
+        s1: [
+          { id: "a1", description: "x", status: "running", step: 1 },
+          { id: "a2", description: "y", status: "running", step: 2 },
+          { id: "a3", description: "z", status: "ok", step: 4 }, // finished — not counted
+        ],
+      },
+    });
+
+    render(<StatusHud />);
+    expect(screen.getByText("2 AGENTS")).toBeInTheDocument();
+  });
+
+  it("omits the subagents segment when none are running", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      agents: { s1: [{ id: "a1", description: "x", status: "ok", step: 3 }] },
+    });
+
+    render(<StatusHud />);
+    expect(screen.queryByText(/AGENT/)).not.toBeInTheDocument();
+  });
+
+  it("shows a running-background-tasks count only while tasks are running", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      backgroundTasks: {
+        s1: [
+          { id: "t1", command: "npm run dev", status: "running" },
+          { id: "t2", command: "make build", status: "error", exitCode: 1 }, // finished — not counted
+        ],
+      },
+    });
+
+    render(<StatusHud />);
+    expect(screen.getByText("1 BG TASK")).toBeInTheDocument();
+  });
+
+  it("omits the background-tasks segment when none are running", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      backgroundTasks: { s1: [{ id: "t1", command: "build", status: "ok", exitCode: 0 }] },
+    });
+
+    render(<StatusHud />);
+    expect(screen.queryByText(/BG TASK/)).not.toBeInTheDocument();
+  });
+
+  it("surfaces cumulative spend summed across ALL sessions (survives restart)", () => {
+    // The kind of usage map init() rehydrates from SQLite — two sessions' spend.
+    useStore.setState({
+      sessions: [session({ id: "s1" }), session({ id: "s2" })],
+      activeId: "s1",
+      usage: { s1: { input: 1000, output: 200 }, s2: { input: 3000, output: 600 } },
+    });
+
+    render(<StatusHud />);
+
+    // Σ sums every session and prices at the current (opus) model:
+    // (4000*5 + 800*25)/1e6 = 0.04 -> $0.04.
+    expect(screen.getByText("Σ $0.04")).toBeInTheDocument();
+  });
+
+  it("omits the spend segment when nothing has been spent", () => {
+    useStore.setState({ sessions: [session()], activeId: "s1" });
+    render(<StatusHud />);
+    expect(screen.queryByText(/^Σ /)).toBeNull();
+  });
+
+  it("drops the spend segment on the phone (remote mode) to fit a narrow bar", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      remoteMode: true,
+      usage: { s1: { input: 5000, output: 1000 } },
+    });
+    render(<StatusHud />);
+    expect(screen.queryByText(/^Σ /)).toBeNull();
   });
 });

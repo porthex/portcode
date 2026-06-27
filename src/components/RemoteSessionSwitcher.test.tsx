@@ -14,6 +14,7 @@ const session = (over: Partial<Session> = {}): Session => ({
   id: "s1",
   title: "Alpha",
   workspace: "C:/dev/portcode",
+  model: "claude-opus-4-8",
   createdAt: 1,
   updatedAt: Date.now(),
   ...over,

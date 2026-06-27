@@ -49,6 +49,9 @@ pub enum RemoteCommand {
     Run { session_id: String, text: String },
     /// Stop the active turn — proxies to `cancel_agent`.
     Cancel { session_id: String },
+    /// Stop ONE subagent (and its descendants) from the agents panel — proxies to
+    /// `cancel_agent_by_id`. Leaves the rest of the session running.
+    CancelAgent { agent_id: String },
     /// Answer a permission gate — proxies to `resolve_permission`.
     Permission { id: String, decision: String },
     /// Open a new session — proxies to `create_session`.
@@ -82,6 +85,12 @@ pub enum SyncFrame {
     Command { command: RemoteCommand },
     /// phone → desktop: "applied through this seq" (lets the desktop trim resends).
     Ack { session_id: String, seq: i64 },
+    /// EITHER direction, during pairing: the peer declined the SAS verification.
+    /// A reject is otherwise a silent local disconnect the other end never learns
+    /// about — this frame lets the rejecter tell the peer BEFORE dropping, so the
+    /// desktop prompt cancels (no 60s park) and the phone surfaces the decline
+    /// instead of a bare connection drop. `reason` is an optional human string.
+    PairingReject { reason: Option<String> },
 }
 
 #[cfg(test)]
@@ -151,6 +160,7 @@ mod tests {
                 title: "Alpha".into(),
                 branch: Some("main".into()),
                 workspace: Some("C:/ws".into()),
+                model: Some("claude-opus-4-8".into()),
                 created_at: 1_000_000,
                 updated_at: 2_000_000,
             }],
@@ -172,6 +182,25 @@ mod tests {
                 created_at: 12345,
             }],
         });
+    }
+
+    #[test]
+    fn pairing_reject_round_trips_with_and_without_a_reason() {
+        // With a reason: the tag + reason both survive.
+        let with_reason = SyncFrame::PairingReject {
+            reason: Some("declined".into()),
+        };
+        let json = serde_json::to_string(&with_reason).expect("encode");
+        assert!(json.contains("\"t\":\"pairing_reject\""), "{json}");
+        assert!(json.contains("\"reason\":\"declined\""), "{json}");
+        round_trips(&with_reason);
+
+        // Without a reason: serde encodes the Option as JSON null.
+        let no_reason = SyncFrame::PairingReject { reason: None };
+        let json = serde_json::to_string(&no_reason).expect("encode");
+        assert!(json.contains("\"t\":\"pairing_reject\""), "{json}");
+        assert!(json.contains("\"reason\":null"), "{json}");
+        round_trips(&no_reason);
     }
 
     #[test]
