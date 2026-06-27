@@ -364,15 +364,17 @@ async fn run_inner(
     config: AgentConfig,
     model: Option<String>,
 ) -> Result<String, String> {
-    let snapshot = { settings.lock().unwrap().clone() };
+    let mut snapshot = { settings.lock().unwrap().clone() };
 
     // Prefer the per-session model threaded from the frontend; fall back to the
-    // global settings default when it is absent or empty.
+    // global settings default when it is absent or empty. Apply it onto the snapshot
+    // so the shared run loop (which reads `snapshot.model`) uses the per-session model.
     let active_model = model
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| snapshot.model.clone());
+    snapshot.model = active_model;
 
-    let mut cred = secrets::load_credential().ok_or(
+    let cred = secrets::load_credential().ok_or(
         "No credentials set. Sign in with your Claude subscription or add an Anthropic API key in Settings.",
     )?;
 
@@ -514,6 +516,22 @@ impl Persist<'_> {
             db.touch_session(session_id, db::now_ms());
         }
     }
+
+    /// Persist this turn's token usage into the session's cumulative total. No-op for
+    /// an ephemeral subagent run — its cost already rolls up to the parent session
+    /// via the `Usage` event emitted on the session channel.
+    fn add_usage(&self, input_tokens: u32, output_tokens: u32) {
+        if let Persist::Session { db, session_id } = self {
+            // Best-effort: a failed usage write must not abort the turn — the live
+            // in-memory counter already reflected this event.
+            let _ = db.add_usage(
+                session_id,
+                i64::from(input_tokens),
+                i64::from(output_tokens),
+                db::now_ms(),
+            );
+        }
+    }
 }
 
 /// The result of running an agent loop to completion.
@@ -598,7 +616,7 @@ async fn run_loop_core(
             .stream_turn(
                 http,
                 &cred,
-                &active_model,
+                &snapshot.model,
                 system,
                 &messages,
                 &tool_specs,
@@ -621,14 +639,10 @@ async fn run_loop_core(
             },
         );
         // Persist the cumulative token spend so the running total (and per-session
-        // meter) survives a restart. Best-effort: a failed usage write must not abort
-        // the turn — the live in-memory counter already reflected this event.
-        let _ = db.add_usage(
-            session_id,
-            i64::from(turn.input_tokens),
-            i64::from(turn.output_tokens),
-            db::now_ms(),
-        );
+        // meter) survives a restart, via the Persist abstraction (Session writes;
+        // an ephemeral subagent no-ops — its cost rolls up through the Usage event
+        // on the session channel above).
+        persist.add_usage(turn.input_tokens, turn.output_tokens);
 
         // Liveness for the agents panel: a subagent reports each completed turn on
         // the session channel (where the panel listens). `steps` is its 1-based turn
@@ -1493,7 +1507,7 @@ mod tests {
         // The interactive run persists every message; Persist::Session delegates to
         // the DB so a later reload sees exactly what the loop produced.
         let db = Db::open(Path::new(":memory:")).expect("in-memory db");
-        db.create_session("s1", "T", None, 1).unwrap();
+        db.create_session("s1", "T", None, None, 1).unwrap();
         let p = Persist::Session {
             db: &db,
             session_id: "s1",
