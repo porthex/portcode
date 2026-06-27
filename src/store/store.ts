@@ -79,6 +79,8 @@ interface AppState {
   remoteError: string | null; // last connect failure, surfaced in the connect UI
   remoteUnlisten: (() => void) | null; // tears down the frame subscription (private; mirrors `cancel`)
   remoteDropped: boolean; // the live session ended unexpectedly — the UI offers a reconnect
+  remoteRejected: boolean; // the pairing was declined (this phone rejected the SAS, or the desktop did) — the UI shows a "rejected" notice
+  remoteRejectReason: string | null; // optional human-readable reason from an inbound desktop `pairing_reject`; null when none/locally-initiated
   remoteConnecting: boolean; // a connectRemote dial is in flight (private re-entry guard)
   lastPairingQr: string | null; // last successful pairing payload, kept for one-tap reconnect
   remoteChatOpen: boolean; // remote: a session is open (chat view) vs. the sessions list
@@ -129,6 +131,7 @@ interface AppState {
   resolvePermission: (decision: "allow" | "deny", always?: boolean) => Promise<void>;
   setRemoteMode: (v: boolean) => void;
   confirmRemoteSas: () => void;
+  rejectRemoteSas: () => Promise<void>;
   applyFrame: (frame: SyncFrame) => void;
   connectRemote: (qr: string, verified?: boolean) => Promise<void>;
   sendRemoteCommand: (command: RemoteCommand) => Promise<void>;
@@ -318,6 +321,8 @@ export const useStore = create<AppState>((set, get) => ({
   remoteError: null,
   remoteUnlisten: null,
   remoteDropped: false,
+  remoteRejected: false,
+  remoteRejectReason: null,
   remoteConnecting: false,
   // Remembered across launches so the phone can reconnect without re-scanning the
   // QR (Android frequently kills backgrounded apps). Public payload — no secret.
@@ -1081,8 +1086,50 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   // The user confirmed the SAS matches the desktop's — open the remote session.
+  // No-op once the pairing was rejected (by this phone or the desktop): a stale
+  // Confirm click must not re-open a session the reject already closed.
   confirmRemoteSas() {
+    if (get().remoteRejected) return;
     set({ remoteVerified: true });
+  },
+
+  // The user decided the SAS does NOT match (or chose to cancel at the safety gate):
+  // reject the pairing. When connected, send the `pairing_reject` frame to the
+  // desktop (so it learns the SAS was rejected, not just that the link dropped), then
+  // tear the session down exactly like disconnectRemote and mark the pairing rejected
+  // so the UI shows a distinct "rejected" notice rather than the generic pair screen.
+  async rejectRemoteSas() {
+    clearRemoteWatchdog(); // user-initiated teardown — the turn is over
+    const wasConnected = get().remoteConnected;
+    const unlisten = get().remoteUnlisten;
+    // Mirror disconnectRemote's teardown: flip the connection flags FIRST (before the
+    // async reject) so no command is dispatched onto the closing channel, forget the
+    // remembered pairing, and clear turn state. Then mark the pairing rejected.
+    set({
+      remoteConnected: false,
+      remoteVerified: false,
+      remoteSas: null,
+      remotePeerKey: null,
+      remoteVapidKey: null,
+      remoteDropped: false,
+      remoteRejected: true,
+      // Locally-initiated reject carries no desktop-supplied reason.
+      remoteRejectReason: null,
+      lastPairingQr: null,
+      remoteUnlisten: null,
+      // Doubles as an abort sentinel for an in-flight connectRemote dial (same as
+      // disconnectRemote): a dial resolving after this sees remoteConnecting false
+      // and bails before registering listeners.
+      remoteConnecting: false,
+      remoteChatOpen: false,
+      streaming: false,
+      pendingPermission: null,
+    });
+    writeStr("pc.lastPairingQr", null); // forget the remembered desktop too
+    if (unlisten) unlisten();
+    // Only reach for the channel if there was a live session — a reject from a
+    // not-connected state just sets the flag (mirrors the idempotent disconnect).
+    if (wasConnected) await ipc.phoneSyncReject();
   },
 
   applyFrame(frame) {
@@ -1113,6 +1160,34 @@ export const useStore = create<AppState>((set, get) => ({
         if (frame.session_id === get().activeId) remoteLastActivity = now();
         applyRemoteEvent(set, frame.session_id, frame.event);
         break;
+      case "pairing_reject": {
+        // The desktop declined the pairing (the REACT direction: the desktop user
+        // rejected the SAS). The phone must stop — drop the session and show the
+        // "rejected on the other device" notice. Tear down like a disconnect: clear
+        // connection/verification/SAS, stop the idle watchdog, and unsubscribe.
+        clearRemoteWatchdog();
+        const unlisten = get().remoteUnlisten;
+        if (unlisten) unlisten();
+        // Forget the remembered desktop — a rejected pairing must not offer one-tap
+        // reconnect back into the desktop that just declined.
+        writeStr("pc.lastPairingQr", null);
+        set({
+          remoteConnected: false,
+          remoteVerified: false,
+          remoteSas: null,
+          remotePeerKey: null,
+          remoteVapidKey: null,
+          remoteDropped: false,
+          remoteRejected: true,
+          remoteRejectReason: frame.reason ?? null,
+          lastPairingQr: null,
+          remoteUnlisten: null,
+          remoteChatOpen: false,
+          streaming: false,
+          pendingPermission: null,
+        });
+        break;
+      }
       // command / ack / hello are phone-originated or not actionable inbound.
       case "command":
       case "ack":
@@ -1144,6 +1219,10 @@ export const useStore = create<AppState>((set, get) => ({
       remoteError: null,
       remoteVerified: false,
       remoteChatOpen: false,
+      // A fresh dial clears any prior rejection so the pair UI starts clean (the
+      // "rejected on the other device" notice must not linger across a re-pair).
+      remoteRejected: false,
+      remoteRejectReason: null,
       streaming: false,
       pendingPermission: null,
     });
@@ -1337,12 +1416,18 @@ export const useStore = create<AppState>((set, get) => ({
     set({ remoteChatOpen: false });
   },
 
-  // Forget the remembered desktop and clear the dropped flag so the UI falls back
-  // to the fresh pairing screen ("Pair a different desktop" from the drop screen).
-  // The channel is already down here, so there's nothing to tear down.
+  // Forget the remembered desktop and clear the dropped/rejected flags so the UI
+  // falls back to the fresh pairing screen ("Pair a different desktop" from the drop
+  // screen, or "Pair again" from the rejected screen). The channel is already down
+  // here, so there's nothing to tear down.
   forgetRemotePairing() {
     writeStr("pc.lastPairingQr", null);
-    set({ lastPairingQr: null, remoteDropped: false });
+    set({
+      lastPairingQr: null,
+      remoteDropped: false,
+      remoteRejected: false,
+      remoteRejectReason: null,
+    });
   },
 
   // Network presence, driven by the browser's online/offline events (see App).

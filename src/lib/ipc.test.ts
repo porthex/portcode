@@ -530,6 +530,7 @@ describe("web-client mode (WASM transport routing)", () => {
     let frameCb: ((f: SyncFrame) => void) | null = null;
     let disconnectedCb: (() => void) | null = null;
     let disconnected = false;
+    let rejected = false;
 
     const session: WebSession = {
       sas: "WEB-SAS",
@@ -548,6 +549,10 @@ describe("web-client mode (WASM transport routing)", () => {
         return () => {
           disconnectedCb = null;
         };
+      },
+      async reject() {
+        rejected = true;
+        disconnectedCb?.();
       },
       async disconnect() {
         disconnected = true;
@@ -568,6 +573,7 @@ describe("web-client mode (WASM transport routing)", () => {
       calls,
       fireFrame: (f: SyncFrame) => frameCb?.(f),
       isDisconnected: () => disconnected,
+      isRejected: () => rejected,
     };
   }
 
@@ -609,6 +615,32 @@ describe("web-client mode (WASM transport routing)", () => {
 
     await ipc.phoneSyncConnect("qr-2");
     expect(rec.calls).toEqual([{ qr: "qr-2", reconnect: false }]);
+  });
+
+  it("phoneSyncReject routes to the web transport's reject (not disconnect)", async () => {
+    const { ipc, webSession } = await loadWeb();
+    const rec = recordingConnector();
+    webSession.setWebSessionConnector(rec.connector);
+    ipc.setWebClientMode(true);
+
+    await ipc.phoneSyncConnect("qr", false);
+    await ipc.phoneSyncReject();
+
+    // Routed through the session's reject (carries the pairing_reject frame), and the
+    // current session is cleared (a later disconnect is a no-op).
+    expect(rec.isRejected()).toBe(true);
+    expect(rec.isDisconnected()).toBe(false);
+  });
+
+  it("phoneSyncReject on native invokes phone_sync_disconnect (reject-frame is a web concern)", async () => {
+    const { ipc } = await loadWeb();
+    ipc.setWebClientMode(true);
+    enterTauri();
+    const { invoke } = await import("@tauri-apps/api/core");
+    vi.mocked(invoke).mockResolvedValue(undefined);
+
+    await ipc.phoneSyncReject();
+    expect(invoke).toHaveBeenCalledWith("phone_sync_disconnect");
   });
 
   it("Tauri always wins over web-client mode", async () => {

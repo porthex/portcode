@@ -532,7 +532,16 @@ async fn serve_connection(
 ) {
     use base64::Engine as _;
     use sync::pairing_gate::ServeDecision;
+    use sync::protocol::{Cursor, SyncFrame};
     use tauri::Emitter as _;
+
+    // On the first-pairing (`Prompt`) path the desktop reads the phone's early
+    // `Hello` itself while watching for a `PairingReject` (see below), so by the
+    // time catch-up runs the `Hello` is already consumed. Stash its cursors here so
+    // catch-up answers them via `serve_catch_up_with_cursors` instead of re-reading
+    // a `Hello` that will never come again. `None` on the already-trusted `Serve`
+    // path, where `serve_catch_up` reads the `Hello` normally.
+    let mut prefetched_cursors: Option<Vec<Cursor>> = None;
 
     // ── DEVICE-TRUST GATE ────────────────────────────────────────────────────
     // Completing the keyless XX handshake does NOT authorize a peer. Identify the
@@ -580,20 +589,90 @@ async fn serve_connection(
                 }),
             );
 
-            let confirmed =
-                match tokio::time::timeout(sync::pairing_gate::PAIRING_CONFIRM_TIMEOUT, rx).await {
-                    // The user confirmed: `confirm_pairing` already persisted the key
-                    // as confirmed before resolving this oneshot.
-                    Ok(Ok(true)) => true,
-                    // Rejected, or the sender was dropped (forgotten) — do not serve.
-                    Ok(Ok(false)) | Ok(Err(_)) => false,
-                    // Timed out — clean up the pending entry and do not serve.
-                    Err(_) => {
-                        pairing_gate.forget_pending(&request_id);
-                        false
-                    }
-                };
+            // Await the desktop user's decision, but ALSO watch the channel: the
+            // phone sends its catch-up `Hello` as soon as the handshake completes
+            // (before either side confirms the SAS), and the phone user can decline
+            // — sending a `PairingReject` — while we're parked on this prompt. So we
+            // loop, selecting the decision against an inbound frame:
+            //   * `Hello`         → stash its cursors and keep waiting (this is the
+            //                       catch-up kickoff, consumed here so catch-up uses
+            //                       `serve_catch_up_with_cursors` afterward);
+            //   * `PairingReject` → the phone declined: stop waiting, drop promptly
+            //                       (no 60s park), no outbound reject (phone knows);
+            //   * any other frame / error / close → protocol violation or a dead
+            //                       connection: stop waiting and drop.
+            // `desktop_rejected` records whether WE (the desktop user) declined, so
+            // we can tell the phone afterward.
+            let decision_fut =
+                tokio::time::timeout(sync::pairing_gate::PAIRING_CONFIRM_TIMEOUT, rx);
+            tokio::pin!(decision_fut);
+            let mut desktop_rejected = false;
+            let confirmed = loop {
+                tokio::select! {
+                    decision = &mut decision_fut => break match decision {
+                        // The user confirmed: `confirm_pairing` already persisted the
+                        // key as confirmed before resolving this oneshot.
+                        Ok(Ok(true)) => true,
+                        // The user rejected — note it so we send the phone a reject.
+                        Ok(Ok(false)) => {
+                            desktop_rejected = true;
+                            false
+                        }
+                        // The sender was dropped (forgotten) — do not serve.
+                        Ok(Err(_)) => false,
+                        // Timed out — clean up the pending entry and do not serve.
+                        Err(_) => {
+                            pairing_gate.forget_pending(&request_id);
+                            false
+                        }
+                    },
+                    inbound = paired.channel.recv_frame() => match inbound {
+                        // The phone's early catch-up kickoff: keep its cursors and
+                        // keep waiting for the desktop user's decision.
+                        Ok(SyncFrame::Hello { cursors, .. }) => {
+                            prefetched_cursors = Some(cursors);
+                        }
+                        // The phone declined: drop now instead of parking 60s. No
+                        // outbound reject — the phone already knows + is tearing down.
+                        Ok(SyncFrame::PairingReject { .. }) => {
+                            eprintln!("phone-sync: phone rejected pairing — dropping connection");
+                            pairing_gate.forget_pending(&request_id);
+                            break false;
+                        }
+                        Ok(other) => {
+                            eprintln!(
+                                "phone-sync: unexpected frame before pairing confirmed: \
+                                 {other:?} — dropping connection"
+                            );
+                            pairing_gate.forget_pending(&request_id);
+                            break false;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "phone-sync: connection ended while awaiting pairing: {e} \
+                                 — dropping connection"
+                            );
+                            pairing_gate.forget_pending(&request_id);
+                            break false;
+                        }
+                    },
+                }
+            };
             if !confirmed {
+                // If WE declined, tell the phone before dropping so it surfaces the
+                // decline instead of a bare disconnect. Best-effort: a send failure
+                // (channel already gone) is logged, not fatal — we drop either way.
+                if desktop_rejected {
+                    if let Err(e) = paired
+                        .channel
+                        .send_frame(&SyncFrame::PairingReject {
+                            reason: Some("declined".into()),
+                        })
+                        .await
+                    {
+                        eprintln!("phone-sync: failed to send reject to phone: {e}");
+                    }
+                }
                 eprintln!("phone-sync: pairing not confirmed — dropping connection");
                 return;
             }
@@ -614,8 +693,17 @@ async fn serve_connection(
         }
     };
 
-    // Catch-up runs on the full-duplex channel (SecureChannel: FrameChannel).
-    if let Err(e) = sync::session::serve_catch_up(&mut paired.channel, &db).await {
+    // Catch-up runs on the full-duplex channel (SecureChannel: FrameChannel). If the
+    // first-pairing path already consumed the phone's `Hello` (while watching for a
+    // reject), answer the stashed cursors directly; otherwise read the `Hello` here
+    // (the already-trusted reconnect path).
+    let catch_up = match prefetched_cursors {
+        Some(cursors) => {
+            sync::session::serve_catch_up_with_cursors(&mut paired.channel, &db, cursors).await
+        }
+        None => sync::session::serve_catch_up(&mut paired.channel, &db).await,
+    };
+    if let Err(e) = catch_up {
         eprintln!("phone-sync: catch-up failed: {e}");
         return;
     }

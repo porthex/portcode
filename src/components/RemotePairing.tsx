@@ -49,6 +49,7 @@ function detectScanMode(): ScanMode {
 export function RemotePairing() {
   const connectRemote = useStore((s) => s.connectRemote);
   const remoteConnected = useStore((s) => s.remoteConnected);
+  const remoteRejected = useStore((s) => s.remoteRejected);
 
   const [qr, setQr] = useState("");
   const [connecting, setConnecting] = useState(false);
@@ -175,6 +176,8 @@ export function RemotePairing() {
     <div className="relative flex min-h-0 flex-1 flex-col bg-bg text-fg">
       {remoteConnected ? (
         <SafetyPanel />
+      ) : remoteRejected ? (
+        <RejectedPanel />
       ) : (
         <PairPanel
           qr={qr}
@@ -534,7 +537,11 @@ function ScanGlyph() {
 function SafetyPanel() {
   const sas = useStore((s) => s.remoteSas);
   const confirmRemoteSas = useStore((s) => s.confirmRemoteSas);
-  const disconnectRemote = useStore((s) => s.disconnectRemote);
+  const rejectRemoteSas = useStore((s) => s.rejectRemoteSas);
+  // Gate Confirm on a STILL-LIVE, un-rejected connection: a desktop `pairing_reject`
+  // (or a local reject) closes the door, so Confirm must not verify a dead session.
+  const remoteConnected = useStore((s) => s.remoteConnected);
+  const remoteRejected = useStore((s) => s.remoteRejected);
 
   // Land initial focus on the SAS code, NOT the affirmative confirm: focusing
   // "It matches — Confirm" would let a queued/habitual Enter verify the connection
@@ -582,18 +589,70 @@ function SafetyPanel() {
       <div className="flex flex-col gap-2.5">
         <button
           onClick={() => confirmRemoteSas()}
-          disabled={!sas}
+          disabled={!sas || !remoteConnected || remoteRejected}
           className="h-[54px] w-full rounded-[13px] border border-accent bg-accent font-display text-[15px] font-bold tracking-[0.8px] text-bg shadow-glow-accent transition hover:shadow-[0_0_34px_rgba(255,46,126,.75)] hover:brightness-110 disabled:opacity-40 disabled:shadow-none disabled:hover:brightness-100"
         >
           ✓ It matches — Confirm
         </button>
         <button
-          onClick={() => void disconnectRemote()}
+          onClick={() => void rejectRemoteSas()}
           className="h-12 w-full rounded-[13px] border border-border-2 bg-panel-2/60 font-display text-[14px] font-semibold tracking-[0.5px] text-[#a9b2c4] transition hover:border-danger/50 hover:text-danger"
         >
           It doesn’t match — Cancel
         </button>
       </div>
+    </div>
+  );
+}
+
+/** State 3 — REJECTED. The pairing was declined on the OTHER device (the desktop
+ *  user rejected the SAS), or cancelled here at the safety gate. The connection is
+ *  already down — this is a terminal notice with a single "start over" action. */
+function RejectedPanel() {
+  const reason = useStore((s) => s.remoteRejectReason);
+  const forgetRemotePairing = useStore((s) => s.forgetRemotePairing);
+
+  // Land focus on the start-over action so the panel is operable from the keyboard.
+  const againRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    againRef.current?.focus();
+  }, []);
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col px-[22px] pb-6 pt-5">
+      <p className="font-mono text-[10px] tracking-[3px] text-danger [text-shadow:0_0_8px_rgba(255,46,126,.4)]">
+        ⛌ PAIRING DECLINED
+      </p>
+      <h1 className="mb-1.5 mt-[9px] font-display text-[25px] font-bold leading-[1.14] tracking-[0.3px] text-fg">
+        Connection rejected on the other device
+      </h1>
+      <p className="text-[13px] leading-[1.5] text-muted">
+        The desktop declined this pairing. For your security the connection was closed — nothing on
+        your desktop was shared.
+      </p>
+
+      <div className="flex min-h-0 flex-1 items-center justify-center py-4">
+        <div
+          role="alert"
+          className="w-full rounded-[18px] border border-danger/40 bg-danger/[0.07] px-[18px] py-[28px] text-center shadow-[0_0_40px_rgba(255,46,126,.12)]"
+        >
+          <p className="mb-3 font-mono text-[10px] tracking-[3px] text-danger/80">DECLINED</p>
+          <p className="text-[14px] leading-[1.5] text-[#ffd2d5]">The pairing wasn’t accepted.</p>
+          {reason && (
+            <p className="mt-2.5 break-words font-mono text-[12px] leading-[1.5] text-[#a9889a]">
+              {reason}
+            </p>
+          )}
+        </div>
+      </div>
+
+      <button
+        ref={againRef}
+        onClick={() => forgetRemotePairing()}
+        className="h-[54px] w-full rounded-[13px] border border-accent-2/40 bg-accent-2/10 font-display text-[15px] font-semibold tracking-[0.5px] text-accent-2 transition hover:bg-accent-2/20 hover:shadow-glow-cyan"
+      >
+        Pair again
+      </button>
     </div>
   );
 }
