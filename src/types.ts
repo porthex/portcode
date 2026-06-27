@@ -79,16 +79,71 @@ export type StreamEvent =
       tool: string;
       summary: string;
       input: unknown;
+      /** Pre-apply unified diff for file tools; absent for shell/other. */
+      diff?: string;
     }
   | { type: "usage"; inputTokens: number; outputTokens: number }
   | { type: "turn_end"; stopReason: string }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  // ── subagents (the `task` tool) — see AgentInfo / the live agents panel ──
+  /** A subagent started. `parentId` is the launching subagent, absent at top level. */
+  | { type: "agent_started"; agentId: string; description: string; parentId?: string }
+  /** A subagent completed a model turn — `step` is its 1-based turn count. */
+  | { type: "agent_progress"; agentId: string; step: number }
+  /** A subagent finished. `status` is "ok" | "cancelled" | "error". */
+  | { type: "agent_finished"; agentId: string; status: string }
+  // ── background shell tasks (the `shell` tool's background mode) ──────────────
+  /** A `shell` command was launched in the background. Emitted on the SESSION
+   *  channel, so the persistent session listener (not the per-turn one) tracks it. */
+  | { type: "background_task_started"; id: string; command: string }
+  /** A background `shell` command finished. Can arrive AFTER the launching turn
+   *  ended, which is why it rides the persistent session listener. */
+  | {
+      type: "background_task_finished";
+      id: string;
+      command: string;
+      exitCode: number;
+      output: string;
+    };
+
+/** Terminal/live state of a subagent in the agents panel. */
+export type AgentStatus = "running" | "ok" | "cancelled" | "error";
+
+/** Live/terminal state of a background shell task. `running` until it finishes,
+ *  then `ok` (exit 0) or `error` (any non-zero / failed-to-run exit). */
+export type BackgroundTaskStatus = "running" | "ok" | "error";
+
+/** A background shell task (the `shell` tool's background mode) tracked per session
+ *  for the background-tasks panel. Outlives the turn that launched it. */
+export interface BackgroundTaskInfo {
+  id: string;
+  command: string;
+  status: BackgroundTaskStatus;
+  /** Process exit code, once finished (undefined while running). */
+  exitCode?: number;
+  /** Captured stdout/stderr, once finished (undefined while running). */
+  output?: string;
+}
+
+/** A subagent (the `task` tool) tracked for the live agents panel. */
+export interface AgentInfo {
+  id: string;
+  description: string;
+  /** The launching subagent's id, or undefined for a top-level launch. */
+  parentId?: string;
+  /** "running" until an `agent_finished` arrives, then its terminal status. */
+  status: AgentStatus;
+  /** Latest reported turn count (`agent_progress`); 0 before the first turn. */
+  step: number;
+}
 
 export interface PendingPermission {
   id: string;
   tool: string;
   summary: string;
   input: unknown;
+  /** Pre-apply unified diff for file tools; absent for shell/other. */
+  diff?: string;
 }
 
 export interface DirEntry {
@@ -99,14 +154,46 @@ export interface DirEntry {
 
 export type ToolPolicy = "allow" | "ask" | "deny";
 
+/**
+ * The permission MODE — the coarse default behaviour of the gate. Mirrors the
+ * Rust `PermissionMode`. `auto` auto-allows every mutating tool and `bypass`
+ * skips the gate entirely, so both are opt-in only and shown with a danger
+ * indicator; the quick-cycle covers only the safe trio.
+ */
+export type PermissionMode = "default" | "acceptEdits" | "plan" | "auto" | "bypass";
+
+/** Permission modes reachable by the quick-cycle affordance — the safe trio.
+ *  `auto`/`bypass` are deliberately excluded (Settings-only opt-in). */
+export const CYCLE_MODES: PermissionMode[] = ["default", "acceptEdits", "plan"];
+
+/** Modes that loosen the gate and must be surfaced as dangerous. */
+export const DANGER_MODES: PermissionMode[] = ["auto", "bypass"];
+
+/**
+ * A per-tool / per-command permission rule. Mirrors the Rust `Rule`. Evaluated
+ * before the mode default, first match wins. `command` is a literal shell
+ * command PREFIX (an allow-list convenience, never a guarantee — anything
+ * chained after the prefix matches too).
+ */
+export interface Rule {
+  tool: string;
+  command?: string;
+  decision: ToolPolicy;
+}
+
 export interface Settings {
   provider: "anthropic";
   model: string;
   apiKeySet: boolean;
+  /** Legacy global policy; the `default` mode's fallthrough (back-compat). */
   defaultPolicy: ToolPolicy;
   workspace: string | null;
   /** Reveal the agent's reply with a terminal-style typing animation. */
   typingAnimation: boolean;
+  /** The active permission mode (default/acceptEdits/plan/auto/bypass). */
+  permissionMode: PermissionMode;
+  /** Per-tool/command permission rules, evaluated before the mode default. */
+  rules: Rule[];
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -116,6 +203,8 @@ export const DEFAULT_SETTINGS: Settings = {
   defaultPolicy: "ask",
   workspace: null,
   typingAnimation: true,
+  permissionMode: "default",
+  rules: [],
 };
 
 /**
@@ -231,6 +320,7 @@ export interface ConnectInfo {
 export type RemoteCommand =
   | { cmd: "run"; session_id: string; text: string }
   | { cmd: "cancel"; session_id: string }
+  | { cmd: "cancel_agent"; agent_id: string }
   | { cmd: "permission"; id: string; decision: string }
   | { cmd: "create_session"; title?: string | null }
   /**

@@ -301,10 +301,23 @@ describe("Tauri command serialization", () => {
     expect(unlisten).toHaveBeenCalledTimes(1);
     expect(invoke).not.toHaveBeenCalledWith("cancel_agent", { sessionId: "sess-2" });
   });
+
+  it("cancelAgentById invokes cancel_agent_by_id with the agent id", async () => {
+    const { ipc, invoke } = await load();
+    invoke.mockResolvedValue(undefined);
+    await ipc.cancelAgentById("agent-7");
+    expect(invoke).toHaveBeenCalledWith("cancel_agent_by_id", { agentId: "agent-7" });
+  });
 });
 
 describe("browser fallback (no Tauri core)", () => {
   beforeEach(exitTauri);
+
+  it("cancelAgentById is a no-op without a Tauri core", async () => {
+    const { ipc, invoke } = await load();
+    await expect(ipc.cancelAgentById("agent-7")).resolves.toBeUndefined();
+    expect(invoke).not.toHaveBeenCalled();
+  });
 
   it("getSettings returns the mock defaults without touching invoke", async () => {
     const { ipc, invoke } = await load();
@@ -315,6 +328,8 @@ describe("browser fallback (no Tauri core)", () => {
       defaultPolicy: "ask",
       workspace: null,
       typingAnimation: true,
+      permissionMode: "default",
+      rules: [],
     });
     expect(invoke).not.toHaveBeenCalled();
   });

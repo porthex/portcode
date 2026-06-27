@@ -5,6 +5,10 @@
 // are the wire types the phone must decode — so gating `llm` would break mobile.
 #[cfg(desktop)]
 mod agent;
+#[cfg(desktop)]
+mod agents;
+#[cfg(desktop)]
+mod background;
 mod db;
 mod llm;
 #[cfg(desktop)]
@@ -40,6 +44,15 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     pub pending: permissions::Pending,
+    /// Live subagents (the `task` tool), keyed by agent id, so the agents panel can
+    /// Stop one without the rest. DESKTOP-ONLY — only the desktop runs the agent
+    /// loop that spawns subagents; the phone is a pure remote client.
+    #[cfg(desktop)]
+    pub agents: agents::Agents,
+    /// Live background `shell` tasks, keyed by task id, so a session Stop can kill
+    /// the ones it launched. DESKTOP-ONLY — only the desktop runs the agent loop.
+    #[cfg(desktop)]
+    pub background: background::Background,
     /// Serializes OAuth token refreshes so concurrent agent turns don't each
     /// hit the token endpoint (single-flight). Guards no data — held only for
     /// the duration of a refresh.
@@ -80,6 +93,9 @@ fn get_settings(state: State<AppState>) -> Settings {
 fn save_settings(state: State<AppState>, settings: Value) -> Settings {
     {
         let mut s = state.settings.lock().unwrap();
+        if let Some(p) = settings.get("provider").and_then(|v| v.as_str()) {
+            s.provider = p.to_string();
+        }
         if let Some(m) = settings.get("model").and_then(|v| v.as_str()) {
             s.model = m.to_string();
         }
@@ -94,6 +110,19 @@ fn save_settings(state: State<AppState>, settings: Value) -> Settings {
         }
         if let Some(t) = settings.get("typingAnimation").and_then(|v| v.as_bool()) {
             s.typing_animation = t;
+        }
+        // Permission mode + rules. Parse defensively: an unknown mode or a
+        // malformed rule list is IGNORED (keep the prior, safer value) rather than
+        // coerced — a bad save must never silently downgrade the permission gate.
+        if let Some(v) = settings.get("permissionMode") {
+            if let Ok(mode) = serde_json::from_value::<permissions::PermissionMode>(v.clone()) {
+                s.permission_mode = mode;
+            }
+        }
+        if let Some(v) = settings.get("rules") {
+            if let Ok(rules) = serde_json::from_value::<Vec<permissions::Rule>>(v.clone()) {
+                s.rules = rules;
+            }
         }
         s.save(&state.config_dir);
     }
@@ -309,6 +338,8 @@ async fn run_agent(
     let db = state.db.clone();
     let cancels = state.cancels.clone();
     let pending = state.pending.clone();
+    let agents = state.agents.clone();
+    let background = state.background.clone();
     let oauth_refresh = state.oauth_refresh.clone();
 
     // Run in the background so the command returns immediately and the frontend
@@ -321,6 +352,8 @@ async fn run_agent(
             db,
             cancels,
             pending,
+            agents,
+            background,
             oauth_refresh,
             session_id,
             text,
@@ -336,7 +369,19 @@ fn cancel_agent(state: State<AppState>, session_id: String) {
     if let Some(flag) = state.cancels.lock().unwrap().get(&session_id) {
         flag.store(true, Ordering::Relaxed);
     }
+    // A session-wide Stop also cancels every subagent the run launched...
+    agents::cancel_session(&state.agents, &session_id);
+    // ...and kills its background tasks.
+    background::cancel_session(&state.background, &session_id);
     permissions::deny_all(&state.pending, &session_id);
+}
+
+/// Stop ONE subagent (and its descendants) from the agents panel, leaving the rest
+/// of the session — including the top-level turn — running.
+#[cfg(desktop)]
+#[tauri::command]
+fn cancel_agent_by_id(state: State<AppState>, agent_id: String) {
+    agents::cancel_one(&state.agents, &agent_id);
 }
 
 #[cfg(desktop)]
@@ -511,6 +556,8 @@ fn phone_sync_listen(app: AppHandle, state: State<AppState>) -> Result<(), Strin
         state.db.clone(),
         state.cancels.clone(),
         state.pending.clone(),
+        state.agents.clone(),
+        state.background.clone(),
         state.oauth_refresh.clone(),
         state.listen_endpoint.clone(),
         state.pairing_gate.clone(),
@@ -751,6 +798,8 @@ fn start_listener(
     db: Arc<Db>,
     cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     pending: permissions::Pending,
+    agents: agents::Agents,
+    background: background::Background,
     oauth_refresh: Arc<tokio::sync::Mutex<()>>,
     listen_endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
     pairing_gate: Arc<sync::pairing_gate::PairingGate>,
@@ -767,6 +816,8 @@ fn start_listener(
         db: db.clone(),
         cancels,
         pending,
+        agents,
+        background,
         oauth_refresh,
     };
     let app_for_loop = app.clone();
@@ -1050,6 +1101,10 @@ pub fn run() {
                 db: Arc::new(db),
                 cancels: Arc::new(Mutex::new(HashMap::new())),
                 pending: Arc::new(Mutex::new(HashMap::new())),
+                #[cfg(desktop)]
+                agents: agents::new(),
+                #[cfg(desktop)]
+                background: background::new(),
                 oauth_refresh: Arc::new(tokio::sync::Mutex::new(())),
                 phone_client: Arc::new(Mutex::new(None)),
                 listen_endpoint: Arc::new(Mutex::new(None)),
@@ -1076,6 +1131,8 @@ pub fn run() {
                     state.db.clone(),
                     state.cancels.clone(),
                     state.pending.clone(),
+                    state.agents.clone(),
+                    state.background.clone(),
                     state.oauth_refresh.clone(),
                     state.listen_endpoint.clone(),
                     state.pairing_gate.clone(),
@@ -1114,6 +1171,7 @@ pub fn run() {
         list_dir,
         run_agent,
         cancel_agent,
+        cancel_agent_by_id,
         resolve_permission,
         phone_sync_status,
         phone_sync_begin_pairing,

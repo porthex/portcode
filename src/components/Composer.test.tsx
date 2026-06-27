@@ -3,7 +3,7 @@ import { render, screen, fireEvent, act } from "@testing-library/react";
 
 import { Composer } from "./Composer";
 import { useStore } from "../store/store";
-import type { Usage } from "../types";
+import { DEFAULT_SETTINGS, type Usage } from "../types";
 
 // The Composer is a thin view over the real store: it binds `draft` and calls
 // the store's send/stop actions, which reach the IPC bridge. We mock only the
@@ -13,6 +13,7 @@ import type { Usage } from "../types";
 vi.mock("../lib/ipc", () => ({
   runAgent: vi.fn(),
   openFolder: vi.fn(),
+  saveSettings: vi.fn(),
 }));
 
 import * as ipc from "../lib/ipc";
@@ -33,6 +34,7 @@ beforeEach(() => {
   // without ever touching a real backend.
   m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}), dispose: vi.fn() });
   m.openFolder.mockResolvedValue(null);
+  m.saveSettings.mockImplementation(async (s) => ({ ...DEFAULT_SETTINGS, ...s }));
 });
 
 describe("Composer textarea", () => {
@@ -435,5 +437,61 @@ describe("Composer UsageMeter", () => {
     expect(screen.getByText("5.0k tok")).toBeInTheDocument();
     expect(screen.getByText("$0.0000")).toBeInTheDocument();
     expect(screen.getByText("no-such-model")).toBeInTheDocument();
+  });
+});
+
+describe("Composer permission-mode pill", () => {
+  it("renders the current mode and cycles it on click", async () => {
+    useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "default" } });
+    render(<Composer />);
+
+    const pill = screen.getByRole("button", { name: /Permission mode: default/i });
+    expect(pill).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(pill);
+    });
+
+    // Cycles default → acceptEdits via updateSettings → saveSettings.
+    expect(m.saveSettings).toHaveBeenCalledWith({ permissionMode: "acceptEdits" });
+  });
+
+  it("is hidden on the phone (remote mode) — the mode is a desktop-side gate setting", () => {
+    useStore.setState({ remoteMode: true, settings: { ...DEFAULT_SETTINGS } });
+    render(<Composer />);
+
+    expect(screen.queryByRole("button", { name: /Permission mode/i })).not.toBeInTheDocument();
+  });
+});
+
+describe("Composer plan-mode banner", () => {
+  it("shows the banner in plan mode and exits to default on click", async () => {
+    useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "plan" } });
+    render(<Composer />);
+
+    expect(screen.getByText("Plan mode")).toBeInTheDocument();
+    const exit = screen.getByRole("button", { name: /Exit plan mode/i });
+
+    await act(async () => {
+      fireEvent.click(exit);
+    });
+    expect(m.saveSettings).toHaveBeenCalledWith({ permissionMode: "default" });
+  });
+
+  it("is hidden when not in plan mode", () => {
+    useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "default" } });
+    render(<Composer />);
+
+    expect(screen.queryByRole("button", { name: /Exit plan mode/i })).not.toBeInTheDocument();
+  });
+
+  it("is hidden on the phone even in plan mode", () => {
+    useStore.setState({
+      remoteMode: true,
+      settings: { ...DEFAULT_SETTINGS, permissionMode: "plan" },
+    });
+    render(<Composer />);
+
+    expect(screen.queryByRole("button", { name: /Exit plan mode/i })).not.toBeInTheDocument();
   });
 });

@@ -181,6 +181,33 @@ describe("StatusHud", () => {
     expect(screen.getByText("POLICY: DENY")).toBeInTheDocument();
   });
 
+  it("shows the permission MODE (not the legacy policy) when a non-default mode is active", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      settings: settings({ permissionMode: "acceptEdits" }),
+    });
+
+    render(<StatusHud />);
+
+    expect(screen.getByText("MODE: ACCEPTEDITS")).toBeInTheDocument();
+    expect(screen.queryByText(/POLICY:/)).not.toBeInTheDocument();
+  });
+
+  it("flags a loosened auto/bypass mode with a danger style and warning glyph", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      settings: settings({ permissionMode: "bypass" }),
+    });
+
+    render(<StatusHud />);
+
+    const seg = screen.getByText(/MODE: BYPASS/);
+    expect(seg.textContent).toContain("⚠");
+    expect(seg).toHaveClass("text-danger");
+  });
+
   it("trims the desktop-dense segments on the phone (remote mode)", () => {
     useStore.setState({
       sessions: [session({ workspace: "C:/dev/porthex/portcode" })],
@@ -209,5 +236,60 @@ describe("StatusHud", () => {
     render(<StatusHud />);
 
     expect(screen.getByText(`${(1540).toLocaleString()} tok`)).toBeInTheDocument();
+  });
+
+  it("shows a running-subagents count only while subagents are running", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      agents: {
+        s1: [
+          { id: "a1", description: "x", status: "running", step: 1 },
+          { id: "a2", description: "y", status: "running", step: 2 },
+          { id: "a3", description: "z", status: "ok", step: 4 }, // finished — not counted
+        ],
+      },
+    });
+
+    render(<StatusHud />);
+    expect(screen.getByText("2 AGENTS")).toBeInTheDocument();
+  });
+
+  it("omits the subagents segment when none are running", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      agents: { s1: [{ id: "a1", description: "x", status: "ok", step: 3 }] },
+    });
+
+    render(<StatusHud />);
+    expect(screen.queryByText(/AGENT/)).not.toBeInTheDocument();
+  });
+
+  it("shows a running-background-tasks count only while tasks are running", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      backgroundTasks: {
+        s1: [
+          { id: "t1", command: "npm run dev", status: "running" },
+          { id: "t2", command: "make build", status: "error", exitCode: 1 }, // finished — not counted
+        ],
+      },
+    });
+
+    render(<StatusHud />);
+    expect(screen.getByText("1 BG TASK")).toBeInTheDocument();
+  });
+
+  it("omits the background-tasks segment when none are running", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      backgroundTasks: { s1: [{ id: "t1", command: "build", status: "ok", exitCode: 0 }] },
+    });
+
+    render(<StatusHud />);
+    expect(screen.queryByText(/BG TASK/)).not.toBeInTheDocument();
   });
 });

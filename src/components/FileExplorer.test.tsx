@@ -27,7 +27,13 @@ const entry = (over: Partial<DirEntry> = {}): DirEntry => ({
 });
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  // resetAllMocks (not clearAllMocks) so any queued `mockResolvedValueOnce` values
+  // are DRAINED between tests. clearAllMocks only wipes call history, leaving a
+  // prior test's unconsumed `listDir` Once at the head of the queue — which the
+  // next test's mount would then consume, rendering a stale tree. That cross-test
+  // leak is timing-dependent (whether every Once is consumed before a test ends),
+  // so it surfaced as a flaky FileExplorer failure under CI load.
+  vi.resetAllMocks();
   // Restore a pristine store between tests (zustand has no built-in reset).
   useStore.setState(initialState, true);
 

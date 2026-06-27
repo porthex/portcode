@@ -3,6 +3,8 @@ import { useStore } from "../store/store";
 import { MessageView } from "./Message";
 import { Composer } from "./Composer";
 import { PermissionPrompt } from "./PermissionPrompt";
+import { AgentsPanel } from "./AgentsPanel";
+import { BackgroundTasksPanel } from "./BackgroundTasksPanel";
 import type { Message } from "../types";
 
 // Stable reference so the selector never returns a fresh array (which would
@@ -135,6 +137,8 @@ export function Chat() {
           </button>
         )}
       </div>
+      <AgentsPanel />
+      <BackgroundTasksPanel />
       <PermissionPrompt />
       <Composer />
     </div>
