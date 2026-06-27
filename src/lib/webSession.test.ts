@@ -1,7 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { WasmModule, WasmSession, WebSession, WebSessionConnector } from "./webSession";
+import type {
+  WasmLoader,
+  WasmModule,
+  WasmSession,
+  WebSession,
+  WebSessionConnector,
+} from "./webSession";
 import {
+  WasmUnavailableError,
   createMockConnector,
   createWasmConnector,
   resetWebSessionConnector,
@@ -10,6 +17,7 @@ import {
   webOnPhoneSyncFrame,
   webPhoneSyncConnect,
   webPhoneSyncDisconnect,
+  webPhoneSyncReject,
   webPhoneSyncSendCommand,
 } from "./webSession";
 
@@ -35,7 +43,7 @@ function createFakeConnector() {
   const frameCbs = new Set<(f: SyncFrame) => void>();
   const disconnectedCbs = new Set<() => void>();
   const sent: RemoteCommand[] = [];
-  const calls = { connect: 0, disconnect: 0 };
+  const calls = { connect: 0, disconnect: 0, reject: 0 };
   let lastConnect: { qr: string; reconnect: boolean } | null = null;
 
   const connector: WebSessionConnector = {
@@ -55,6 +63,10 @@ function createFakeConnector() {
         onDisconnected(cb) {
           disconnectedCbs.add(cb);
           return () => disconnectedCbs.delete(cb);
+        },
+        async reject() {
+          calls.reject += 1;
+          for (const cb of disconnectedCbs) cb();
         },
         async disconnect() {
           calls.disconnect += 1;
@@ -101,6 +113,15 @@ describe("mock connector", () => {
     const cb = vi.fn();
     session.onDisconnected(cb);
     await session.disconnect();
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it("reject notifies registered disconnected callbacks (inert preview teardown)", async () => {
+    const conn = createMockConnector();
+    const session = await conn.connect("qr", false);
+    const cb = vi.fn();
+    session.onDisconnected(cb);
+    await expect(session.reject()).resolves.toBeUndefined();
     expect(cb).toHaveBeenCalledTimes(1);
   });
 
@@ -161,6 +182,10 @@ describe("ipc-shaped wrappers (default mock connector)", () => {
   it("webPhoneSyncDisconnect is idempotent with no current session", async () => {
     await expect(webPhoneSyncDisconnect()).resolves.toBeUndefined();
     await expect(webPhoneSyncDisconnect()).resolves.toBeUndefined();
+  });
+
+  it("webPhoneSyncReject is a no-op with no current session", async () => {
+    await expect(webPhoneSyncReject()).resolves.toBeUndefined();
   });
 
   it("webOnPhoneSyncFrame returns a no-op unlisten with no current session", () => {
@@ -240,6 +265,27 @@ describe("connector registry", () => {
     await webPhoneSyncSendCommand({ cmd: "cancel", session_id: "s1" });
     expect(fake.sent).toEqual([]);
   });
+
+  it("webPhoneSyncReject routes to the current session's reject and clears it", async () => {
+    const fake = createFakeConnector();
+    setWebSessionConnector(fake.connector);
+    await webPhoneSyncConnect("qr");
+
+    const cb = vi.fn();
+    webOnPhoneSyncDisconnected(cb);
+    await webPhoneSyncReject();
+
+    // Routes to reject (NOT disconnect) and notifies the drop listener.
+    expect(fake.calls.reject).toBe(1);
+    expect(fake.calls.disconnect).toBe(0);
+    expect(cb).toHaveBeenCalledTimes(1);
+
+    // The current session is cleared, so a later send/reject is a no-op.
+    await webPhoneSyncSendCommand({ cmd: "cancel", session_id: "s1" });
+    expect(fake.sent).toEqual([]);
+    await expect(webPhoneSyncReject()).resolves.toBeUndefined();
+    expect(fake.calls.reject).toBe(1);
+  });
 });
 
 // ── Real WASM-backed connector ───────────────────────────────────────────────
@@ -250,11 +296,11 @@ describe("connector registry", () => {
 
 /** A fake `portcode-wasm` `Session` that records calls and lets the test drive the
  *  inbound-frame callback the way the network would. */
-function createFakeWasmSession(opts: { withOnDisconnected?: boolean } = {}) {
+function createFakeWasmSession(opts: { withOnDisconnected?: boolean; withReject?: boolean } = {}) {
   const sent: RemoteCommand[] = [];
   let eventCb: ((f: SyncFrame) => void) | null = null;
   let dropCb: (() => void) | null = null;
-  const calls = { disconnect: 0 };
+  const calls = { disconnect: 0, reject: 0 };
   const session: WasmSession = {
     sas: "WASM-SAS",
     peerPublicKey: "WASM_KEY==",
@@ -274,6 +320,13 @@ function createFakeWasmSession(opts: { withOnDisconnected?: boolean } = {}) {
   if (opts.withOnDisconnected !== false) {
     session.onDisconnected = (cb) => {
       dropCb = cb;
+    };
+  }
+  // `reject` is also only on newer wasm builds; default present, omit when asked so
+  // the adapter's fallback-to-disconnect path can be exercised.
+  if (opts.withReject !== false) {
+    session.reject = () => {
+      calls.reject += 1;
     };
   }
   return {
@@ -374,6 +427,45 @@ describe("createWasmConnector (real connector, faked wasm module)", () => {
     expect(onDisc).not.toHaveBeenCalled();
   });
 
+  it("reject calls the wasm reject (not disconnect), fans out, and is idempotent with disconnect", async () => {
+    const fake = createFakeWasmSession();
+    const connector = createWasmConnector(async () => ({
+      Session: { connect: async () => fake.session },
+    }));
+    const session = await connector.connect("qr", false);
+
+    const onDisc = vi.fn();
+    session.onDisconnected(onDisc);
+    await session.reject();
+
+    // Routes to the wasm `reject` (carries the pairing_reject frame), not disconnect.
+    expect(fake.calls.reject).toBe(1);
+    expect(fake.calls.disconnect).toBe(0);
+    expect(onDisc).toHaveBeenCalledTimes(1);
+
+    // A later disconnect is a no-op (reject already released the handle + fanned out).
+    await session.disconnect();
+    expect(fake.calls.disconnect).toBe(0);
+    expect(onDisc).toHaveBeenCalledTimes(1);
+  });
+
+  it("reject falls back to disconnect when the wasm Session has no reject (older build)", async () => {
+    const fake = createFakeWasmSession({ withReject: false });
+    const connector = createWasmConnector(async () => ({
+      Session: { connect: async () => fake.session },
+    }));
+    const session = await connector.connect("qr", false);
+
+    const onDisc = vi.fn();
+    session.onDisconnected(onDisc);
+    await session.reject();
+
+    // No wasm `reject` to call → the channel still closes via `disconnect`.
+    expect(fake.calls.reject).toBe(0);
+    expect(fake.calls.disconnect).toBe(1);
+    expect(onDisc).toHaveBeenCalledTimes(1);
+  });
+
   it("a SPONTANEOUS wasm transport drop fires onDisconnected (not just manual disconnect)", async () => {
     const fake = createFakeWasmSession({ withOnDisconnected: true });
     const connector = createWasmConnector(async () => ({
@@ -409,25 +501,40 @@ describe("createWasmConnector (real connector, faked wasm module)", () => {
     expect(onDisc).toHaveBeenCalledTimes(1);
   });
 
-  it("FALLS BACK to the mock connector when the wasm import fails (module absent)", async () => {
+  it("SURFACES the load failure (Fix C): connect rejects with WasmUnavailableError, not a silent mock", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    // Loader rejects exactly as a missing `portcode-wasm` package would.
-    const load = vi.fn(() => Promise.reject(new Error("Cannot find module 'portcode-wasm'")));
+    const cause = new Error("Cannot find module 'portcode-wasm'");
+    // Loader rejects exactly as a missing/broken `portcode-wasm` artifact would.
+    const load = vi.fn(() => Promise.reject(cause));
     const connector = createWasmConnector(load);
 
-    const session = await connector.connect("qr", false);
-    // The mock's fixed identity proves we fell back rather than threw.
-    expect(session.sas).toBe("MOCK-SAS-1234");
-    expect(session.peerPublicKey).toBe("MOCK_DESKTOP_KEY_BASE64==");
+    // A real wasm-load failure must be VISIBLE — connect rejects (so connectRemote's
+    // catch sets remoteError) instead of silently degrading to the inert mock.
+    await expect(connector.connect("qr", false)).rejects.toBeInstanceOf(WasmUnavailableError);
+    // The original cause is preserved for diagnostics, and we logged once.
+    await connector.connect("qr", false).catch((e: unknown) => {
+      expect((e as WasmUnavailableError).reason).toBe(cause);
+    });
     expect(warn).toHaveBeenCalled();
 
-    // The fallback session is a working mock session.
-    await expect(session.sendCommand({ cmd: "cancel", session_id: "s1" })).resolves.toBeUndefined();
+    warn.mockRestore();
+  });
 
-    // A second connect reuses the cached fallback without re-importing.
-    const again = await connector.connect("qr2", true);
-    expect(again.sas).toBe("MOCK-SAS-1234");
-    expect(load).toHaveBeenCalledTimes(1);
+  it("retries the load on a later connect after a failure (failure is not cached)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fake = createFakeWasmSession();
+    // First load rejects; second succeeds — a transient first-load failure must recover.
+    const load = vi
+      .fn<WasmLoader>()
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValueOnce({ Session: { connect: async () => fake.session } });
+    const connector = createWasmConnector(load);
+
+    await expect(connector.connect("qr", false)).rejects.toBeInstanceOf(WasmUnavailableError);
+    // The memo was cleared, so this re-asks the loader and succeeds.
+    const session = await connector.connect("qr", false);
+    expect(session.sas).toBe("WASM-SAS");
+    expect(load).toHaveBeenCalledTimes(2);
     warn.mockRestore();
   });
 

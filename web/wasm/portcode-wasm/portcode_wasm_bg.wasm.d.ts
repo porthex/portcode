@@ -7,6 +7,7 @@ export const session_disconnect: (a: number) => void;
 export const session_onEvent: (a: number, b: any) => void;
 export const session_peerPublicKey: (a: number) => [number, number];
 export const session_privateKey: (a: number) => [number, number];
+export const session_reject: (a: number) => any;
 export const session_sas: (a: number) => [number, number];
 export const session_sendCommand: (a: number, b: any) => [number, number];
 export const start: () => void;
