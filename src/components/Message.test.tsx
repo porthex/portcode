@@ -342,6 +342,61 @@ describe("MessageView — typing animation", () => {
   });
 });
 
+describe("MessageView — right-click context menu", () => {
+  let writeText: ReturnType<typeof vi.fn>;
+  beforeEach(() => {
+    writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+  });
+
+  it("copies the user message text from the context menu", () => {
+    const { container } = render(
+      <MessageView message={message("user", [{ kind: "text", text: "Hello there" }])} />,
+    );
+
+    fireEvent.contextMenu(container.firstElementChild as HTMLElement);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy message text" }));
+
+    expect(writeText).toHaveBeenCalledWith("Hello there");
+  });
+
+  it("copies the joined assistant text from the context menu", () => {
+    const { container } = render(
+      <MessageView
+        message={message("assistant", [
+          { kind: "text", text: "part one " },
+          { kind: "tool_use", id: "t1", name: "fs_read", input: {} },
+          { kind: "text", text: "part two" },
+        ])}
+      />,
+    );
+
+    fireEvent.contextMenu(container.firstElementChild as HTMLElement);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy message text" }));
+
+    // Only the text blocks are joined (tool_use is skipped).
+    expect(writeText).toHaveBeenCalledWith("part one part two");
+  });
+
+  it("disables Copy message text when the message has no text", () => {
+    const { container } = render(
+      <MessageView
+        message={message("assistant", [{ kind: "tool_use", id: "t1", name: "shell", input: {} }])}
+      />,
+    );
+
+    fireEvent.contextMenu(container.firstElementChild as HTMLElement);
+    const item = screen.getByRole("menuitem", { name: "Copy message text" });
+    expect(item).toHaveAttribute("aria-disabled", "true");
+
+    fireEvent.click(item);
+    expect(writeText).not.toHaveBeenCalled();
+  });
+});
+
 describe("MessageView — scramble decode (active turn)", () => {
   // useScramble runs off requestAnimationFrame; drive it with a manual queue so
   // the decode advances by exact frames. One callback is scheduled per tick.
