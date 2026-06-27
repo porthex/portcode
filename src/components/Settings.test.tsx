@@ -621,6 +621,86 @@ describe("SettingsPanel — default tool permission", () => {
   });
 });
 
+describe("SettingsPanel — permission modes & rules", () => {
+  it("switches to a safe mode through ipc.saveSettings", async () => {
+    renderPanel({ permissionMode: "default" });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept edits" }));
+    });
+
+    expect(m.saveSettings).toHaveBeenCalledWith({ permissionMode: "acceptEdits" });
+  });
+
+  it("requires an explicit acknowledgment before enabling a danger mode (auto)", async () => {
+    renderPanel({ permissionMode: "default" });
+
+    // Clicking Auto does NOT switch immediately — it asks for confirmation first.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Auto/i }));
+    });
+    expect(m.saveSettings).not.toHaveBeenCalled();
+    const confirm = screen.getByRole("button", { name: /Enable Auto/i });
+
+    // Confirming engages the mode.
+    await act(async () => {
+      fireEvent.click(confirm);
+    });
+    expect(m.saveSettings).toHaveBeenCalledWith({ permissionMode: "auto" });
+  });
+
+  it("cancelling the danger acknowledgment does not switch the mode", async () => {
+    renderPanel({ permissionMode: "default" });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Bypass/i }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    });
+
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("adds a per-tool rule through ipc.saveSettings", async () => {
+    renderPanel(); // form defaults: shell + ask
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    });
+
+    expect(m.saveSettings).toHaveBeenCalledWith({ rules: [{ tool: "shell", decision: "ask" }] });
+  });
+
+  it("warns when an allow rule would match every shell command (over-broad)", () => {
+    renderPanel(); // tool=shell, command empty
+    fireEvent.change(screen.getByLabelText("Rule decision"), { target: { value: "allow" } });
+
+    expect(screen.getByText(/matches every shell command/i)).toBeInTheDocument();
+  });
+
+  it("removes an existing rule through ipc.saveSettings", async () => {
+    renderPanel({ rules: [{ tool: "fs_edit", decision: "allow" }] });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove rule 1" }));
+    });
+
+    expect(m.saveSettings).toHaveBeenCalledWith({ rules: [] });
+  });
+
+  it("does not add a duplicate rule", async () => {
+    // The default form (shell + ask) matches the seeded rule, so adding is a no-op.
+    renderPanel({ rules: [{ tool: "shell", decision: "ask" }] });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    });
+
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+});
+
 describe("SettingsPanel — appearance toggles", () => {
   // APPEARANCE now renders three role="switch" buttons, so each must be queried
   // by its accessible name rather than the bare switch role.
