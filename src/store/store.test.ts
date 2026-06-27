@@ -33,6 +33,7 @@ vi.mock("../lib/ipc", () => ({
   getAllUsage: vi.fn(),
   saveSettings: vi.fn(),
   resolvePermission: vi.fn(),
+  setTelemetryConsent: vi.fn(),
   openFolder: vi.fn(),
   runAgent: vi.fn(),
   subscribeSessionEvents: vi.fn(),
@@ -91,6 +92,7 @@ beforeEach(() => {
   m.getAllUsage.mockResolvedValue([]);
   m.saveSettings.mockImplementation(async (s) => ({ ...DEFAULT_SETTINGS, ...s }));
   m.resolvePermission.mockResolvedValue(undefined);
+  m.setTelemetryConsent.mockResolvedValue(undefined);
   m.openFolder.mockResolvedValue(null);
   m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}), dispose: vi.fn() });
   m.subscribeSessionEvents.mockResolvedValue(() => {});
@@ -1668,6 +1670,35 @@ describe("uiScale (interface scale)", () => {
     const fresh = await import("./store");
 
     expect(fresh.useStore.getState().uiScale).toBe(1);
+  });
+});
+
+describe("crashReporting (telemetry consent)", () => {
+  it("setCrashReporting persists the consent choice as a tri-state pref", () => {
+    useStore.getState().setCrashReporting(true);
+    expect(useStore.getState().crashReporting).toBe(true);
+    expect(localStorage.getItem("pc.crashReporting")).toBe("1");
+
+    useStore.getState().setCrashReporting(false);
+    expect(useStore.getState().crashReporting).toBe(false);
+    expect(localStorage.getItem("pc.crashReporting")).toBe("0");
+  });
+
+  it("setCrashReporting mirrors the consent choice to the Rust host (both ways)", () => {
+    useStore.getState().setCrashReporting(true);
+    expect(m.setTelemetryConsent).toHaveBeenCalledWith(true);
+
+    useStore.getState().setCrashReporting(false);
+    expect(m.setTelemetryConsent).toHaveBeenCalledWith(false);
+  });
+
+  it("setCrashReporting still applies the choice when the host mirror rejects", () => {
+    // DSN-less dev builds / the mobile build (command unregistered) reject the
+    // invoke; the consent choice must still persist (the host gate is authoritative).
+    m.setTelemetryConsent.mockRejectedValueOnce(new Error("command not found"));
+    expect(() => useStore.getState().setCrashReporting(true)).not.toThrow();
+    expect(useStore.getState().crashReporting).toBe(true);
+    expect(localStorage.getItem("pc.crashReporting")).toBe("1");
   });
 });
 

@@ -123,6 +123,7 @@ interface AppState {
   // The composer's live presence phase, driven by REAL turn/stream events (never
   // padded). Surfaced in the role="status" region beside the composer.
   composerPhase: ComposerPhase;
+  crashReporting: boolean | null; // opt-in crash/error reporting; null = not yet asked (show first-run prompt)
   cancel: (() => Promise<void>) | null;
   pendingPermission: PendingPermission | null;
 
@@ -183,6 +184,7 @@ interface AppState {
   setAmbientRain: (v: boolean) => void;
   setScanlines: (v: boolean) => void;
   setUiScale: (n: number) => void;
+  setCrashReporting: (v: boolean) => void;
   updateSettings: (s: Partial<Settings>) => Promise<void>;
   cyclePermissionMode: () => Promise<void>;
   refreshOAuthStatus: () => Promise<void>;
@@ -581,6 +583,18 @@ const writePref = (k: string, v: boolean): void => {
   }
 };
 
+// Tri-state pref: null when never set (e.g. crash-reporting consent not yet
+// asked), otherwise the stored boolean. Lets a first-run prompt distinguish
+// "declined" from "not yet decided".
+const readTriPref = (k: string): boolean | null => {
+  try {
+    const v = localStorage.getItem(k);
+    return v === null ? null : v === "1";
+  } catch {
+    return null;
+  }
+};
+
 // String prefs (e.g. the remembered pairing payload — public connection info, not
 // a secret). Same best-effort localStorage discipline as the boolean prefs.
 const readStr = (k: string): string | null => {
@@ -704,6 +718,7 @@ export const useStore = create<AppState>((set, get) => ({
   // the backend round-trip; init() then merges the authoritative backend drafts.
   drafts: readJSON<Record<string, string>>("pc.drafts", {}),
   composerPhase: "idle",
+  crashReporting: readTriPref("pc.crashReporting"),
   cancel: null,
   pendingPermission: null,
   initError: null,
@@ -1439,6 +1454,17 @@ export const useStore = create<AppState>((set, get) => ({
     writeStr("pc.uiScale", String(n));
     applyUiScale(n);
     set({ uiScale: n });
+  },
+
+  // Persist the consent choice; the frontend SDK init/shutdown is driven by an
+  // effect in App watching `crashReporting`, so the store stays free of any
+  // telemetry-SDK import (keeps it pure + its tests lightweight). We ALSO mirror
+  // the choice to the Rust host (best-effort: swallow errors so the mobile build —
+  // where the command isn't registered — and DSN-less dev builds don't throw).
+  setCrashReporting(v) {
+    writePref("pc.crashReporting", v);
+    set({ crashReporting: v });
+    void ipc.setTelemetryConsent(v).catch(() => {});
   },
 
   toggleFiles() {

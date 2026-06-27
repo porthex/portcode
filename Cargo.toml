@@ -29,6 +29,12 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+# Phase 2 (Sentry) symbolication: emit full debug info so `sentry-cli debug-files
+# upload` can resolve minidump + native stack frames server-side. On Windows MSVC
+# (the signed release target) debug info goes to a SEPARATE `.pdb`, so `strip = true`
+# (which strips the shipped `.exe`) and `debug = true` coexist — the `.pdb` is
+# uploaded, the binary stays stripped.
+debug = true
 
 # Size flags for the wasm `Session` bundle (§5.3). Profiles are honored only at the
 # workspace root, so the per-package override lives HERE rather than in

@@ -22,6 +22,9 @@ export default defineConfig({
   build: {
     target: "es2021",
     minify: "esbuild",
-    sourcemap: false,
+    // Emit JS sourcemaps ONLY when a Sentry auth token is present (release CI), so
+    // they can be uploaded to Sentry for readable webview stack traces and then are
+    // not shipped in the bundle. Dev/contributor builds (no token) emit none.
+    sourcemap: !!process.env.SENTRY_AUTH_TOKEN,
   },
 });

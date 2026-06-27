@@ -1,4 +1,5 @@
 import React from "react";
+import { reportError } from "../lib/telemetry";
 
 interface Props {
   children: React.ReactNode;
@@ -8,7 +9,6 @@ interface Props {
   // Notified after a recoverable reset so a parent can re-key/refetch if needed.
   onReset?: () => void;
 }
-
 interface State {
   error: Error | null;
 }
@@ -17,8 +17,11 @@ interface State {
 // boundary (a malformed markdown/highlight edge case, a circular tool input that
 // breaks JSON.stringify, an unexpected block shape from the core) would otherwise
 // unmount the whole tree and leave a blank window with no way out but restarting.
-// Catch it here and render a recoverable fallback instead. Dependency-free
-// (class component) so it never touches the lockfile.
+// Catch it here and render a recoverable fallback instead. When crash reporting is
+// active the error is also forwarded to Sentry via `reportError` (a scrubbed no-op
+// otherwise, and it never throws); the fallback is shown regardless of consent —
+// it's a UX safety net, not telemetry. Dependency-free (class component) so it
+// never touches the lockfile.
 export class ErrorBoundary extends React.Component<Props, State> {
   state: State = { error: null };
 
@@ -30,7 +33,10 @@ export class ErrorBoundary extends React.Component<Props, State> {
   }
 
   componentDidCatch(error: unknown, info: React.ErrorInfo): void {
-    // No telemetry yet — log so the throw is at least visible in dev/devtools.
+    // Forward to telemetry (no-op unless reporting is active; never throws),
+    // normalizing a non-Error throw so Sentry always receives a real Error.
+    reportError(error instanceof Error ? error : new Error(String(error)));
+    // Surface in the dev console too so the throw is visible in devtools.
     console.error("ErrorBoundary caught a render error:", error, info.componentStack);
   }
 
