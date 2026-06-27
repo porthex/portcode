@@ -21,8 +21,9 @@ PLAN → IMPLEMENT (code + tests together) → REVIEW (adversarial, ≥3 lenses,
 | 0.3   | Injectable tool registry + system prompt | ✅     | PR #83; `AgentConfig` (registry + prompt override) threaded into `run_inner`; +5 tests; CI green                                  |
 | 0.4   | Multi-run store model                    | ✅     | PR #83; `runs` map + derived active-run mirror; per-run state; +6 tests; coverage green; CI green                                 |
 | 1     | Permission modes + rules + cycling       | ✅     | PR #83; A1 gate core (modes+rules, security-audited) + A2a mode UI/cycle + A2b Settings editor + guardrails; +~25 tests; CI green |
-| 1     | Plan mode                                | 🟦     | NEXT — `AgentConfig::plan_run()` + `read_only_registry()` + prompt steer (reuses 0.3 seam) + approve-to-exit                      |
-| 1     | Pre-apply accept/reject/edit diff        | ⬜     | diff DISPLAY this phase (accept/reject); in-prompt EDIT deferred to a follow-up (per user decision)                               |
+| 1     | Plan mode                                | ✅     | read-only `plan_run()` registry + plan steer + gate-denies-mutating (defense-in-depth) + approve-to-exit banner; CI green         |
+| 1     | Pre-apply accept/reject diff             | ✅     | `Tool::preview()` (shared `compute_edit` so preview==run) → `diff` on `PermissionRequest` → colour-coded prompt diff; CI green    |
+| 1     | Pre-apply EDIT-in-prompt (deferred)      | ⏭     | DEFERRED follow-up (user decision): `Decision::AllowEdited` + `RemoteCommand.content` + desktop-only edit UI                      |
 | 2     | Subagent runtime + `Task` tool           | ⬜     | sequential first                                                                                                                  |
 | 2     | Live agents panel                        | ⬜     |                                                                                                                                   |
 | 2     | Parallel execution + concurrency cap     | ⬜     |                                                                                                                                   |
