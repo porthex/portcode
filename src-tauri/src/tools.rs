@@ -36,6 +36,16 @@ pub trait Tool: Send + Sync {
         self.name().to_string()
     }
 
+    /// A pre-apply preview of the change as a unified diff, shown in the
+    /// permission prompt BEFORE the tool runs. `None` (the default) means there
+    /// is nothing to preview — read-only tools, or a mutating tool whose change
+    /// can't be diffed (e.g. shell). A file tool computes the proposed new
+    /// content WITHOUT writing it, so the diff shown is exactly what `run` would
+    /// apply (they share the same logic — see `compute_edit`).
+    async fn preview(&self, _input: &Value, _ctx: &ToolCtx) -> Option<String> {
+        None
+    }
+
     async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String, String>;
 }
 
@@ -219,6 +229,35 @@ fn unified_diff(old: &str, new: &str) -> String {
     let mut ud = diff.unified_diff();
     ud.context_radius(3);
     ud.to_string()
+}
+
+/// Apply an `fs_edit` replacement to `content`, returning the updated text and
+/// the number of replacements. Shared by `FsEdit::run` and `FsEdit::preview` so
+/// the diff shown in the permission prompt can NEVER diverge from what gets
+/// written. Errors (string not found, ambiguous without `replace_all`) carry the
+/// path `p` for a clear message.
+fn compute_edit(
+    content: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+    p: &str,
+) -> Result<(String, usize), String> {
+    let count = content.matches(old).count();
+    if count == 0 {
+        return Err(format!("'old_string' not found in {p}"));
+    }
+    if count > 1 && !replace_all {
+        return Err(format!(
+            "'old_string' appears {count} times in {p}; pass replace_all=true or provide more context"
+        ));
+    }
+    let updated = if replace_all {
+        content.replace(old, new)
+    } else {
+        content.replacen(old, new, 1)
+    };
+    Ok((updated, count))
 }
 
 // ── read-only tools ──────────────────────────────────────────────────────────
@@ -462,6 +501,21 @@ impl Tool for FsWrite {
             _ => self.name().to_string(),
         }
     }
+    /// Preview the write as a diff of the existing file (or empty) against the
+    /// proposed contents, without writing anything. `None` on bad args / a path
+    /// that fails the sandbox resolution (the gate surfaces that anyway).
+    async fn preview(&self, input: &Value, ctx: &ToolCtx) -> Option<String> {
+        let base = base_dir(ctx).ok()?;
+        let p = str_arg(input, "path").ok()?;
+        let content = str_arg(input, "content").ok()?;
+        let full = resolve_for_write(&base, p).ok()?;
+        let old = if full.exists() {
+            tokio::fs::read_to_string(&full).await.unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Some(unified_diff(&old, content))
+    }
     async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String, String> {
         let base = base_dir(ctx)?;
         let p = str_arg(&input, "path")?;
@@ -518,6 +572,24 @@ impl Tool for FsEdit {
     fn mutating(&self) -> bool {
         true
     }
+    /// Preview the edit as a diff without writing — exactly the change `run`
+    /// would apply (both go through `compute_edit`). Returns `None` if anything
+    /// the gate would surface as an error anyway (bad args, file missing,
+    /// string not found) so the prompt falls back to the one-line summary.
+    async fn preview(&self, input: &Value, ctx: &ToolCtx) -> Option<String> {
+        let base = base_dir(ctx).ok()?;
+        let p = str_arg(input, "path").ok()?;
+        let old = str_arg(input, "old_string").ok()?;
+        let new = str_arg(input, "new_string").ok()?;
+        let replace_all = input
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let full = resolve_existing(&base, p).ok()?;
+        let content = tokio::fs::read_to_string(&full).await.ok()?;
+        let (updated, _) = compute_edit(&content, old, new, replace_all, p).ok()?;
+        Some(unified_diff(&content, &updated))
+    }
     async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String, String> {
         let base = base_dir(ctx)?;
         let p = str_arg(&input, "path")?;
@@ -533,20 +605,7 @@ impl Tool for FsEdit {
             .await
             .map_err(|e| format!("failed to read '{p}': {e}"))?;
 
-        let count = content.matches(old).count();
-        if count == 0 {
-            return Err(format!("'old_string' not found in {p}"));
-        }
-        if count > 1 && !replace_all {
-            return Err(format!(
-                "'old_string' appears {count} times in {p}; pass replace_all=true or provide more context"
-            ));
-        }
-        let updated = if replace_all {
-            content.replace(old, new)
-        } else {
-            content.replacen(old, new, 1)
-        };
+        let (updated, count) = compute_edit(&content, old, new, replace_all, p)?;
         tokio::fs::write(&full, &updated)
             .await
             .map_err(|e| format!("failed to write '{p}': {e}"))?;
@@ -857,6 +916,62 @@ mod tests {
         assert!(out.contains("Created"));
         let written = workspace.join("nested").join("dir").join("file.txt");
         assert_eq!(std::fs::read_to_string(&written).unwrap(), "hello");
+
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn compute_edit_handles_single_all_and_error_cases() {
+        let (out, n) = compute_edit("a b", "a", "X", false, "f").unwrap();
+        assert_eq!((out.as_str(), n), ("X b", 1));
+        let (out, n) = compute_edit("a a", "a", "X", true, "f").unwrap();
+        assert_eq!((out.as_str(), n), ("X X", 2));
+        assert!(compute_edit("abc", "z", "X", false, "f").is_err()); // not found
+        assert!(compute_edit("a a", "a", "X", false, "f").is_err()); // ambiguous
+    }
+
+    #[tokio::test]
+    async fn fs_write_preview_shows_a_diff_without_writing() {
+        let workspace = unique_temp_dir("preview_write");
+        let ctx = ToolCtx {
+            workspace: workspace.clone(),
+        };
+        let file = workspace.join("f.txt");
+        std::fs::write(&file, "old line\n").unwrap();
+
+        let diff = FsWrite
+            .preview(&json!({ "path": "f.txt", "content": "new line\n" }), &ctx)
+            .await
+            .expect("a write to an existing file previews a diff");
+        assert!(diff.contains("-old line"));
+        assert!(diff.contains("+new line"));
+        // The preview must NOT touch the file.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old line\n");
+
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_edit_preview_matches_what_run_writes() {
+        let workspace = unique_temp_dir("preview_edit");
+        let ctx = ToolCtx {
+            workspace: workspace.clone(),
+        };
+        let file = workspace.join("f.txt");
+        std::fs::write(&file, "let x = 1;\n").unwrap();
+
+        let input = json!({ "path": "f.txt", "old_string": "1", "new_string": "2" });
+        let preview = FsEdit.preview(&input, &ctx).await.expect("previews a diff");
+        assert!(preview.contains("-let x = 1;"));
+        assert!(preview.contains("+let x = 2;"));
+        // Preview leaves the file untouched...
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "let x = 1;\n");
+
+        // ...and run() applies exactly the previewed change (shared compute_edit).
+        let out = FsEdit.run(input, &ctx).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "let x = 2;\n");
+        assert!(out.contains("-let x = 1;"));
+        assert!(out.contains("+let x = 2;"));
 
         std::fs::remove_dir_all(&workspace).ok();
     }

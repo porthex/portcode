@@ -211,6 +211,7 @@ pub async fn gate(
     tool: &str,
     summary: &str,
     input: &Value,
+    diff: Option<String>,
 ) -> Decision {
     // A command constraint only applies to shell calls; pull the command string
     // so a shell rule's prefix can match it.
@@ -254,6 +255,7 @@ pub async fn gate(
             tool: tool.to_string(),
             summary: summary.to_string(),
             input: input.clone(),
+            diff,
         },
     );
 

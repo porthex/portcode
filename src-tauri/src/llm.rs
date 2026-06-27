@@ -108,6 +108,11 @@ pub enum StreamEvent {
         tool: String,
         summary: String,
         input: Value,
+        /// A pre-apply unified diff for file tools (fs_write/fs_edit), shown in
+        /// the prompt before the change is written. Optional + skipped when None,
+        /// so older decoders (and the phone) tolerate its absence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<String>,
     },
     Usage {
         #[serde(rename = "inputTokens")]

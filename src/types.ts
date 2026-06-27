@@ -35,6 +35,8 @@ export type StreamEvent =
       tool: string;
       summary: string;
       input: unknown;
+      /** Pre-apply unified diff for file tools; absent for shell/other. */
+      diff?: string;
     }
   | { type: "usage"; inputTokens: number; outputTokens: number }
   | { type: "turn_end"; stopReason: string }
@@ -45,6 +47,8 @@ export interface PendingPermission {
   tool: string;
   summary: string;
   input: unknown;
+  /** Pre-apply unified diff for file tools; absent for shell/other. */
+  diff?: string;
 }
 
 export interface DirEntry {
