@@ -289,10 +289,11 @@ export async function createSession(
   id: string,
   title?: string,
   workspace?: string | null,
+  model?: string,
 ): Promise<void> {
   if (isTauri()) {
     const { core } = await tauri();
-    await core.invoke("create_session", { id, title, workspace });
+    await core.invoke("create_session", { id, title, workspace, model });
   }
 }
 
@@ -418,6 +419,7 @@ export interface AgentRunHandle {
 export async function runAgent(
   sessionId: string,
   text: string,
+  model: string,
   onEvent: (e: StreamEvent) => void,
 ): Promise<AgentRunHandle> {
   if (isTauri()) {
@@ -426,7 +428,7 @@ export async function runAgent(
     const unlisten: Unlisten = await event.listen<StreamEvent>(channel, (ev) =>
       onEvent(ev.payload),
     );
-    await core.invoke("run_agent", { sessionId, text });
+    await core.invoke("run_agent", { sessionId, text, model });
     return {
       cancel: async () => {
         await core.invoke("cancel_agent", { sessionId });
@@ -435,7 +437,7 @@ export async function runAgent(
       dispose: unlisten,
     };
   }
-  return mock.runAgent(sessionId, text, onEvent);
+  return mock.runAgent(sessionId, text, model, onEvent);
 }
 
 /**
@@ -603,7 +605,12 @@ const mock = (() => {
       };
       return tree[sub ?? ""] ?? [];
     },
-    async runAgent(_sessionId: string, text: string, onEvent: (e: StreamEvent) => void) {
+    async runAgent(
+      _sessionId: string,
+      text: string,
+      _model: string,
+      onEvent: (e: StreamEvent) => void,
+    ) {
       let cancelled = false;
       (async () => {
         await delay(120);

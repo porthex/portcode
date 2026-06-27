@@ -160,6 +160,7 @@ mod tests {
                 title: "Alpha".into(),
                 branch: Some("main".into()),
                 workspace: Some("C:/ws".into()),
+                model: Some("claude-opus-4-8".into()),
                 created_at: 1_000_000,
                 updated_at: 2_000_000,
             }],
