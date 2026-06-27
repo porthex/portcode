@@ -61,7 +61,10 @@ use sentry::protocol::{Context, Event, Frame};
 // Android `telemetry_set_consent` command can write the same flag the Kotlin
 // `PortcodeApplication` reads). The desktop pipeline keeps using them exactly as
 // before — only the home of the primitive moved. See `consent.rs`.
-use crate::consent::{consent_is_live, set_consent};
+// `set_consent` is re-exported at crate visibility so the desktop arm of
+// `lib::telemetry_set_consent` can call `telemetry::set_consent` (its documented
+// path); `consent_is_live` is the edge gate used by `scrub_event` below.
+pub(crate) use crate::consent::{consent_is_live, set_consent};
 use crate::scrub::redact_secrets;
 
 /// Build-time DSN, or `None` when absent/blank (dev/contributor/fork builds).
