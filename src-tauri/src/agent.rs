@@ -638,9 +638,11 @@ async fn run_loop_core(
                     _ => None,
                 })
                 .collect();
-            let mut slots: Vec<Option<Block>> = vec![None; tool_uses.len()];
             let mut cancelled = false;
-            // Deferred subagent calls; each future yields (slot index, output, is_error).
+            // Each finished call records (tool_use index, output, is_error); the batch
+            // is reassembled in tool_use order at the end (subagents finish out of order).
+            let mut done: Vec<(usize, String, bool)> = Vec::new();
+            // Deferred subagent calls; each future yields (tool_use index, output, is_error).
             let mut task_futs = Vec::new();
 
             for (i, &(id, name, input)) in tool_uses.iter().enumerate() {
@@ -652,7 +654,7 @@ async fn run_loop_core(
                     cancelled = true;
                     let output = CANCELLED_TOOL_RESULT.to_string();
                     emit(app, agent_channel, tool_result_event(id, &output, true));
-                    slots[i] = Some(tool_result_block(id, output, true));
+                    done.push((i, output, true));
                     continue;
                 }
 
@@ -665,7 +667,7 @@ async fn run_loop_core(
                             cancelled = true;
                             let output = CANCELLED_TOOL_RESULT.to_string();
                             emit(app, agent_channel, tool_result_event(id, &output, true));
-                            slots[i] = Some(tool_result_block(id, output, true));
+                            done.push((i, output, true));
                         } else {
                             let input = input.clone();
                             task_futs.push(async move {
@@ -700,25 +702,29 @@ async fn run_loop_core(
                     None => (format!("Unknown tool: {name}"), true),
                 };
                 emit(app, agent_channel, tool_result_event(id, &output, is_error));
-                slots[i] = Some(tool_result_block(id, output, is_error));
+                done.push((i, output, is_error));
             }
 
             // Drive the deferred subagents concurrently, capped at MAX_PARALLEL_AGENTS,
-            // slotting each result as it finishes. The streamed ToolResult events land
-            // in completion order; the persisted batch stays in tool_use order.
+            // recording each result as it finishes. The streamed ToolResult events land
+            // in completion order; the persisted batch is reassembled in tool_use order.
             if !task_futs.is_empty() {
                 let mut stream =
                     futures_util::stream::iter(task_futs).buffer_unordered(MAX_PARALLEL_AGENTS);
                 while let Some((i, output, is_error)) = stream.next().await {
-                    let id = tool_uses[i].0;
-                    emit(app, agent_channel, tool_result_event(id, &output, is_error));
-                    slots[i] = Some(tool_result_block(id, output, is_error));
+                    emit(
+                        app,
+                        agent_channel,
+                        tool_result_event(tool_uses[i].0, &output, is_error),
+                    );
+                    done.push((i, output, is_error));
                 }
             }
 
-            // Every tool_use filled a slot (sequential, cancelled, or task), so this
-            // yields one result per call, in order.
-            let results: Vec<Block> = slots.into_iter().flatten().collect();
+            // One result per call, reassembled in tool_use order from the (possibly
+            // out-of-order) completions above.
+            let ids: Vec<&str> = tool_uses.iter().map(|&(id, _, _)| id).collect();
+            let results = reassemble_results(&ids, done);
             // A tool_use turn that yields no usable tool result would post an
             // empty-content user message, which Anthropic rejects (400) and which
             // then poisons the persisted history so every later turn also 400s.
@@ -784,6 +790,34 @@ fn tool_result_block(id: &str, output: String, is_error: bool) -> Block {
     }
 }
 
+/// Reassemble one result block per tool call, in tool_use ORDER, from
+/// `(index, output, is_error)` completions that may arrive in any order (parallel
+/// subagents finish out of order). Each block's `tool_use_id` is the id at its
+/// original index, so the persisted batch matches the model's tool_use order
+/// regardless of completion order — which is what Anthropic expects.
+fn reassemble_results(ids: &[&str], done: Vec<(usize, String, bool)>) -> Vec<Block> {
+    let mut slots: Vec<Option<Block>> = vec![None; ids.len()];
+    for (i, output, is_error) in done {
+        slots[i] = Some(tool_result_block(ids[i], output, is_error));
+    }
+    slots.into_iter().flatten().collect()
+}
+
+/// Given the gate's `decision` and whether a Stop has landed since, decide a tool
+/// call's outcome WITHOUT running it: `Some((output, is_error, sets_cancelled))`
+/// for a terminal outcome (denied, or cancelled before it could run), or `None`
+/// meaning "allowed — run the tool". Keeps the cancel-interrupt and deny semantics
+/// in a pure, unit-testable function.
+fn precheck_outcome(decision: Decision, cancelled_now: bool) -> Option<(&'static str, bool, bool)> {
+    match decision {
+        // A Stop that arrived during the gate (or a prior tool in this batch) must
+        // not let this tool execute — and it cancels the rest of the batch.
+        Decision::Allow if cancelled_now => Some((CANCELLED_TOOL_RESULT, true, true)),
+        Decision::Allow => None,
+        Decision::Deny => Some(("Denied: the user did not approve this action.", true, false)),
+    }
+}
+
 /// Gate (if mutating) and run ONE tool call, returning `(output, is_error)`. Sets
 /// `*cancelled` if a Stop landed during the gate or right before the tool ran.
 ///
@@ -827,21 +861,19 @@ async fn gate_and_run(
     } else {
         Decision::Allow
     };
-    match decision {
-        // Re-check cancel right before running: a Stop that arrived during the gate
-        // (or during a prior tool in this batch) must not let this tool execute.
-        Decision::Allow if cancel.load(Ordering::Relaxed) => {
-            *cancelled = true;
-            (CANCELLED_TOOL_RESULT.to_string(), true)
+    // Re-check cancel right before running: a Stop during the gate must not let this
+    // tool execute. `precheck_outcome` resolves the terminal cases; `None` means run.
+    match precheck_outcome(decision, cancel.load(Ordering::Relaxed)) {
+        Some((output, is_error, sets_cancelled)) => {
+            if sets_cancelled {
+                *cancelled = true;
+            }
+            (output.to_string(), is_error)
         }
-        Decision::Allow => match tool.run(input.clone(), ctx).await {
+        None => match tool.run(input.clone(), ctx).await {
             Ok(out) => (out, false),
             Err(err) => (err, true),
         },
-        Decision::Deny => (
-            "Denied: the user did not approve this action.".to_string(),
-            true,
-        ),
     }
 }
 
@@ -1061,10 +1093,11 @@ impl tools::Spawner for AgentSpawner {
 mod tests {
     use super::{
         assistant_text, batch_cancelled, child_can_spawn, derive_title, finish_status,
-        is_terminal_auth_error, resolve_system_prompt, session_of, spawn_status,
-        step_limit_exceeded, subagent_answer, tool_result_block, tool_result_event, AgentConfig,
-        Block, ChatMessage, Db, LoopOutcome, Persist, StreamEvent, MAX_AGENT_STEPS,
-        MAX_PARALLEL_AGENTS, MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
+        is_terminal_auth_error, precheck_outcome, reassemble_results, resolve_system_prompt,
+        session_of, spawn_status, step_limit_exceeded, subagent_answer, tool_result_block,
+        tool_result_event, AgentConfig, Block, ChatMessage, Db, Decision, LoopOutcome, Persist,
+        StreamEvent, CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS, MAX_PARALLEL_AGENTS,
+        MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
     };
     use std::path::Path;
 
@@ -1184,25 +1217,56 @@ mod tests {
     }
 
     #[test]
-    fn parallel_results_are_reassembled_in_tool_use_order() {
-        // Subagents finish in arbitrary order, but each result is slotted by its
-        // tool_use index, so the persisted batch stays in the model's original order
-        // (Anthropic pairs tool_result to tool_use, and order is the safe default).
+    fn reassemble_results_orders_by_tool_use_index_under_scrambled_completion() {
+        // The production reassembly: subagents finish out of order, but each result
+        // is placed by the index its future returned, and paired to the id at THAT
+        // index — so the persisted batch is in tool_use order with correct id pairing
+        // (Anthropic pairs tool_result to tool_use; order is the safe default).
         let ids = ["a", "b", "c"];
-        let mut slots: Vec<Option<Block>> = vec![None; ids.len()];
-        // Completions arrive out of order: c, then a, then b.
-        for (i, out) in [(2usize, "C"), (0, "A"), (1, "B")] {
-            slots[i] = Some(tool_result_block(ids[i], out.to_string(), false));
-        }
-        let results: Vec<Block> = slots.into_iter().flatten().collect();
-        let contents: Vec<&str> = results
+        // Completions arrive scrambled: c, then a, then b; with mixed is_error.
+        let done = vec![
+            (2usize, "C".to_string(), false),
+            (0, "A".to_string(), true),
+            (1, "B".to_string(), false),
+        ];
+        let results = reassemble_results(&ids, done);
+        let got: Vec<(&str, &str, bool)> = results
             .iter()
             .map(|b| match b {
-                Block::ToolResult { content, .. } => content.as_str(),
-                _ => "?",
+                Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => (tool_use_id.as_str(), content.as_str(), *is_error),
+                _ => ("?", "?", false),
             })
-            .collect();
-        assert_eq!(contents, ["A", "B", "C"]);
+            .collect::<Vec<_>>();
+        // In tool_use order; each result carries the id at its ORIGINAL index, not its
+        // completion position; is_error is preserved per result.
+        assert_eq!(
+            got,
+            [("a", "A", true), ("b", "B", false), ("c", "C", false)]
+        );
+    }
+
+    #[test]
+    fn precheck_outcome_runs_on_allow_denies_on_deny_and_cancels_on_a_late_stop() {
+        // Allowed and no Stop landed → run the tool.
+        assert_eq!(precheck_outcome(Decision::Allow, false), None);
+        // Allowed, but a Stop arrived during the gate → don't run; cancel the batch.
+        assert_eq!(
+            precheck_outcome(Decision::Allow, true),
+            Some((CANCELLED_TOOL_RESULT, true, true))
+        );
+        // Denied → a terminal error result that does NOT cancel the rest of the
+        // batch, whether or not a Stop also landed.
+        for stop in [false, true] {
+            let (output, is_error, sets_cancelled) =
+                precheck_outcome(Decision::Deny, stop).expect("deny is terminal");
+            assert!(output.contains("Denied"));
+            assert!(is_error);
+            assert!(!sets_cancelled);
+        }
     }
 
     #[test]
