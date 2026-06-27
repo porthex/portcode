@@ -197,7 +197,7 @@ mod tests {
         // sequence (SessionList then one MessageDelta per cursor) must be identical
         // to `serve_catch_up`'s — we read it off the phone end directly.
         let db = Db::open(Path::new(":memory:")).unwrap();
-        db.create_session("s1", "Alpha", None, 100).unwrap();
+        db.create_session("s1", "Alpha", None, None, 100).unwrap();
         db.append_message("s1", &user("first"), 101); // seq 0
         db.append_message("s1", &user("second"), 102); // seq 1
 

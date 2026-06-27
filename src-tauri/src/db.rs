@@ -1167,7 +1167,7 @@ mod tests {
     #[test]
     fn deleting_a_session_drops_its_draft_and_usage() {
         let db = mem_db();
-        db.create_session("a", "A", None, 1).unwrap();
+        db.create_session("a", "A", None, None, 1).unwrap();
         db.save_draft("a", "unsent", 2).unwrap();
         db.add_usage("a", 100, 50, 3).unwrap();
         db.delete_session("a").unwrap();
