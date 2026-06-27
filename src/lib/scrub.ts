@@ -112,17 +112,35 @@ function scrubFrame(frame: StackFrame): StackFrame {
   return {
     function: frame.function,
     filename: typeof frame.filename === "string" ? redactSecrets(frame.filename) : frame.filename,
-    module: frame.module,
+    // Redact `module` too (parity with the Rust scrubber) — a bundle path here can
+    // embed a home dir even though it's usually app-relative.
+    module: typeof frame.module === "string" ? redactSecrets(frame.module) : frame.module,
     lineno: frame.lineno,
     colno: frame.colno,
     in_app: frame.in_app,
   };
 }
 
+/** Breadcrumb categories dropped WHOLESALE: `console`/`navigation` can carry URLs
+ *  and paths, and `agent`/`llm`/`ipc` breadcrumbs originate from the very payloads
+ *  (prompts, code, tool I/O) that must never leave the machine. Even a redacted
+ *  message from these is more signal than is worth the leak risk. */
+const DROPPED_BREADCRUMB_CATEGORIES: ReadonlySet<string> = new Set([
+  "console",
+  "navigation",
+  "agent",
+  "llm",
+  "ipc",
+]);
+
 /** Keep a breadcrumb's shape (category/level/type/timestamp) and a redacted
  *  message, but DROP its `data` payload wholesale — that's where IPC args, URLs,
- *  and tool I/O would otherwise ride along. */
-function scrubBreadcrumb(b: Breadcrumb): Breadcrumb {
+ *  and tool I/O would otherwise ride along. A breadcrumb in a dropped category is
+ *  removed entirely (returns `null`). */
+function scrubBreadcrumb(b: Breadcrumb): Breadcrumb | null {
+  if (typeof b.category === "string" && DROPPED_BREADCRUMB_CATEGORIES.has(b.category)) {
+    return null;
+  }
   return {
     type: b.type,
     category: b.category,
@@ -189,7 +207,9 @@ export function scrubEvent(event: ErrorEvent): ErrorEvent | null {
   }
 
   if (event.breadcrumbs?.length) {
-    safe.breadcrumbs = event.breadcrumbs.map(scrubBreadcrumb);
+    safe.breadcrumbs = event.breadcrumbs
+      .map(scrubBreadcrumb)
+      .filter((b): b is Breadcrumb => b !== null);
   }
 
   // Belt-and-suspenders: deep-redact every remaining string. Even allowlisted

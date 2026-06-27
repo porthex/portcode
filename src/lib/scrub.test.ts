@@ -113,10 +113,17 @@ function pollutedEvent(): ErrorEvent {
     tags: { apiKey: "sk-ant-tagleak123456" },
     contexts: { device: { name: "Memphis-PC" }, app: { app_version: "5.0.0" } },
     breadcrumbs: [
+      // `ipc` is a dropped category — this whole breadcrumb must vanish.
       {
         category: "ipc",
         message: "phone_sync_connect /home/alice/secret",
         data: { qr: "sk-ant-bc-leak123456", token: "Bearer zzz" },
+      },
+      // `ui` is NOT dropped — it survives, but message-redacted + data-stripped.
+      {
+        category: "ui",
+        message: "clicked sk-ant-uicrumb-leak123456 at /home/alice/x",
+        data: { handler: "sk-ant-uicrumbdata-leak123456" },
       },
     ],
     exception: {
@@ -129,6 +136,7 @@ function pollutedEvent(): ErrorEvent {
               {
                 function: "scan",
                 filename: "C:\\Users\\Memphi$\\app\\scanner.ts",
+                module: "C:\\Users\\Memphi$\\app\\scanner",
                 abs_path: "C:\\Users\\Memphi$\\app\\scanner.ts",
                 lineno: 10,
                 colno: 2,
@@ -155,6 +163,8 @@ describe("scrubEvent", () => {
       "sk-ant-msg-leak123456",
       "sk-ant-frame-leak123456",
       "sk-ant-ctx-leak123456",
+      "sk-ant-uicrumb-leak123456",
+      "sk-ant-uicrumbdata-leak123456",
       "a667066706670@gmail.com",
       "Memphi$",
       "Memphis-PC",
@@ -184,16 +194,26 @@ describe("scrubEvent", () => {
     expect(out?.exception?.values?.[0]?.type).toBe("TypeError");
     expect(frame?.function).toBe("scan");
     expect(frame?.filename).toBe("C:\\Users\\~user\\app\\scanner.ts");
+    // `module` is redacted too (home dir stripped) — parity with the Rust scrubber.
+    expect((frame as Record<string, unknown>).module).toBe("C:\\Users\\~user\\app\\scanner");
     // source context + locals + abs_path are dropped wholesale.
     expect(frame).not.toHaveProperty("vars");
     expect(frame).not.toHaveProperty("context_line");
     expect(frame).not.toHaveProperty("abs_path");
   });
 
-  it("scrubs breadcrumbs: redacts the message, drops the data payload", () => {
+  it("drops whole breadcrumb categories (ipc/agent/llm/console/navigation)", () => {
+    const out = scrubEvent(pollutedEvent());
+    // The `ipc` crumb is gone entirely; only the `ui` crumb survives.
+    expect(out?.breadcrumbs).toHaveLength(1);
+    expect((out?.breadcrumbs?.[0] as Record<string, unknown>).category).toBe("ui");
+  });
+
+  it("scrubs a surviving breadcrumb: redacts the message, drops the data payload", () => {
     const out = scrubEvent(pollutedEvent());
     const bc = out?.breadcrumbs?.[0] as Record<string, unknown>;
-    expect(bc.message).toBe("phone_sync_connect /home/~user/secret");
+    expect(bc.category).toBe("ui");
+    expect(bc.message).toBe("clicked [redacted-api-key] at /home/~user/x");
     expect(bc.data).toBeUndefined();
   });
 

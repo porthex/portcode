@@ -61,6 +61,10 @@ export function initTelemetry(consent: boolean | null): boolean {
     release: (import.meta.env.VITE_APP_VERSION as string | undefined) || undefined,
     // Never let Sentry attach IP/cookies/headers or other default PII.
     sendDefaultPii: false,
+    // Attach a stack trace to events captured from a bare message (a
+    // `captureMessage` on a "should never happen" branch) so they're debuggable.
+    // Only frames are kept — the scrubber drops abs paths / source context / vars.
+    attachStacktrace: true,
     // Sample performance transactions to cap volume/cost.
     tracesSampleRate: 0.15,
     integrations: [Sentry.browserTracingIntegration()],

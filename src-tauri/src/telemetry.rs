@@ -225,8 +225,17 @@ fn scrub_event(mut event: Event<'static>) -> Option<Event<'static>> {
     }
     event.template = None;
 
-    // Breadcrumbs: keep type/category/level/timestamp + a redacted message; DROP
+    // Breadcrumbs: DROP whole categories that originate from sensitive payloads
+    // (`agent`/`llm`/`ipc`) or carry URLs/paths (`console`/`navigation`). For the
+    // survivors, keep type/category/level/timestamp + a redacted message and DROP
     // the `data` payload wholesale (it's where IPC args / URLs / tool I/O ride).
+    const DROPPED_CATEGORIES: &[&str] = &["console", "navigation", "agent", "llm", "ipc"];
+    event.breadcrumbs.values.retain(|crumb| {
+        !crumb
+            .category
+            .as_deref()
+            .is_some_and(|c| DROPPED_CATEGORIES.contains(&c))
+    });
     for crumb in event.breadcrumbs.values.iter_mut() {
         if let Some(msg) = crumb.message.take() {
             crumb.message = Some(redact_secrets(&msg));
@@ -514,6 +523,16 @@ mod tests {
         crumb
             .data
             .insert("qr".to_string(), Value::from("sk-ant-bc-leak123456"));
+        // A breadcrumb in a NON-dropped category — it must SURVIVE the category
+        // filter, but with its message redacted and its `data` stripped.
+        let mut kept_crumb = Breadcrumb {
+            category: Some("ui".to_string()),
+            message: Some("clicked sk-ant-uicrumb-leak123456 at /home/alice/x".to_string()),
+            ..Default::default()
+        };
+        kept_crumb
+            .data
+            .insert("k".to_string(), Value::from("sk-ant-uicrumbdata-leak123456"));
 
         let mut event = Event {
             server_name: Some("DESKTOP-SECRET".into()),
@@ -527,6 +546,7 @@ mod tests {
         event.exception.values.push(exc);
         event.threads.values.push(thread);
         event.breadcrumbs.values.push(crumb);
+        event.breadcrumbs.values.push(kept_crumb);
         // A debug image whose `name` is a local binary path.
         event
             .debug_meta
@@ -573,6 +593,8 @@ mod tests {
             "sk-ant-logmsg-leak123456",
             "sk-ant-logparam-leak123456",
             "sk-ant-culprit-leak123456",
+            "sk-ant-uicrumb-leak123456",
+            "sk-ant-uicrumbdata-leak123456",
             "a667066706670@gmail.com",
             "Memphi$",
             "DESKTOP-SECRET",
@@ -601,12 +623,14 @@ mod tests {
         assert!(frame.post_context.is_empty());
         assert!(frame.vars.is_empty());
 
-        // Breadcrumb message redacted, data dropped.
+        // The `ipc`-category breadcrumb is DROPPED wholesale; only the `ui`
+        // breadcrumb survives — message redacted, data stripped.
+        assert_eq!(out.breadcrumbs.values.len(), 1);
         let crumb = &out.breadcrumbs.values[0];
-        assert_eq!(
-            crumb.message.as_deref(),
-            Some("phone_sync_connect /home/~user/secret")
-        );
+        assert_eq!(crumb.category.as_deref(), Some("ui"));
+        let msg = crumb.message.as_deref().unwrap_or("");
+        assert!(!msg.contains("sk-ant-uicrumb-leak123456"), "breadcrumb secret survived");
+        assert!(!msg.contains("alice"), "breadcrumb home path survived");
         assert!(crumb.data.is_empty());
     }
 
