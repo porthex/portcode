@@ -1,7 +1,15 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { useStore } from "../store/store";
-import { MODELS, type PairingPayload, type PairingRequest, type ToolPolicy } from "../types";
+import {
+  DANGER_MODES,
+  MODELS,
+  type PairingPayload,
+  type PairingRequest,
+  type PermissionMode,
+  type Rule,
+  type ToolPolicy,
+} from "../types";
 import * as ipc from "../lib/ipc";
 
 export function SettingsPanel() {
@@ -338,27 +346,7 @@ export function SettingsPanel() {
           </section>
 
           {/* PERMISSIONS */}
-          <section className={remoteMode ? "hidden" : undefined}>
-            <div className="pc-eyebrow pc-eyebrow--amber">PERMISSIONS</div>
-            <div className="flex gap-2">
-              {(["allow", "ask", "deny"] as ToolPolicy[]).map((p) => (
-                <button
-                  key={p}
-                  onClick={() => void updateSettings({ defaultPolicy: p })}
-                  className={`flex-1 rounded-lg border px-3 py-2.5 text-[12.5px] capitalize transition-colors ${
-                    settings.defaultPolicy === p
-                      ? "border-accent-2/50 bg-accent-2/10 text-accent-2"
-                      : "border-border bg-panel-2 text-muted hover:border-accent-2/40"
-                  }`}
-                >
-                  {p}
-                </button>
-              ))}
-            </div>
-            <p className="mt-1.5 text-[11px] text-faint">
-              Controls write / edit / shell tools. Read-only tools always run.
-            </p>
-          </section>
+          <PermissionSettings />
 
           {/* APPEARANCE */}
           <section>
@@ -657,6 +645,262 @@ function PairingCode({ payload, onDone }: { payload: PairingPayload; onDone: () 
         )}
       </div>
     </div>
+  );
+}
+
+const PERM_TOOLS = ["fs_read", "list", "glob", "grep", "fs_write", "fs_edit", "shell", "*"];
+
+const MODE_INFO: Record<PermissionMode, { label: string; hint: string }> = {
+  default: { label: "Default", hint: "Use the policy below (ask / allow / deny)." },
+  acceptEdits: {
+    label: "Accept edits",
+    hint: "Auto-allow file writes & edits; still ask for shell.",
+  },
+  plan: { label: "Plan", hint: "Read-only — deny every mutating tool." },
+  auto: { label: "Auto", hint: "Auto-allow EVERY mutating tool, including shell." },
+  bypass: { label: "Bypass", hint: "Skip the permission gate entirely." },
+};
+const MODE_ORDER: PermissionMode[] = ["default", "acceptEdits", "plan", "auto", "bypass"];
+
+/**
+ * The permission mode + per-tool/command rule editor. auto/bypass require an
+ * explicit danger acknowledgment to engage, and an over-broad allow rule (any
+ * tool, or shell with no command prefix) is flagged loudly — the UI guardrails
+ * the security review of the gate flagged as the layer that must enforce them.
+ */
+function PermissionSettings() {
+  const settings = useStore((s) => s.settings);
+  const updateSettings = useStore((s) => s.updateSettings);
+  // Permission config is a desktop-side setting; on the phone the section is
+  // hidden (the phone observes the active mode via the HUD but doesn't edit it).
+  const remoteMode = useStore((s) => s.remoteMode);
+  const mode = settings.permissionMode;
+  const rules = settings.rules;
+
+  const [confirmMode, setConfirmMode] = useState<PermissionMode | null>(null);
+  const [ruleTool, setRuleTool] = useState("shell");
+  const [ruleCommand, setRuleCommand] = useState("");
+  const [ruleDecision, setRuleDecision] = useState<ToolPolicy>("ask");
+
+  const pickMode = (m: PermissionMode) => {
+    if (DANGER_MODES.includes(m)) {
+      setConfirmMode(m); // require an explicit acknowledgment before engaging
+    } else {
+      setConfirmMode(null);
+      void updateSettings({ permissionMode: m });
+    }
+  };
+
+  // An allow rule that matches everything (any tool, or shell with no command
+  // prefix) is the footgun the gate security review flagged — warn loudly.
+  const overBroadAllow =
+    ruleDecision === "allow" &&
+    (ruleTool === "*" || (ruleTool === "shell" && ruleCommand.trim() === ""));
+
+  const addRule = () => {
+    const command = ruleTool === "shell" && ruleCommand.trim() ? ruleCommand : undefined;
+    const rule: Rule = command
+      ? { tool: ruleTool, command, decision: ruleDecision }
+      : { tool: ruleTool, decision: ruleDecision };
+    if (
+      rules.some(
+        (r) => r.tool === rule.tool && r.command === rule.command && r.decision === rule.decision,
+      )
+    ) {
+      return; // exact duplicate — no-op
+    }
+    void updateSettings({ rules: [...rules, rule] });
+    setRuleCommand("");
+  };
+
+  const removeRule = (i: number) =>
+    void updateSettings({ rules: rules.filter((_, idx) => idx !== i) });
+
+  return (
+    <section className={remoteMode ? "hidden" : undefined}>
+      <div className="pc-eyebrow pc-eyebrow--amber">PERMISSIONS</div>
+
+      <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
+        {MODE_ORDER.map((m) => {
+          const danger = DANGER_MODES.includes(m);
+          const active = mode === m;
+          return (
+            <button
+              key={m}
+              type="button"
+              onClick={() => pickMode(m)}
+              title={MODE_INFO[m].hint}
+              aria-pressed={active}
+              className={`rounded-lg border px-2 py-2 text-[11.5px] capitalize transition-colors ${
+                active
+                  ? danger
+                    ? "border-danger/60 bg-danger/10 text-danger"
+                    : "border-accent-2/50 bg-accent-2/10 text-accent-2"
+                  : `border-border bg-panel-2 hover:border-accent-2/40 ${
+                      danger ? "text-danger/80" : "text-muted"
+                    }`
+              }`}
+            >
+              {danger ? "⚠ " : ""}
+              {MODE_INFO[m].label}
+            </button>
+          );
+        })}
+      </div>
+      <p className="mt-1.5 text-[11px] text-faint">{MODE_INFO[mode].hint}</p>
+
+      {confirmMode && (
+        <div
+          role="alert"
+          className="mt-2 rounded-lg border border-danger/50 bg-danger/10 p-2.5 text-[11.5px] text-danger"
+        >
+          <p>
+            ⚠ <strong className="capitalize">{MODE_INFO[confirmMode].label}</strong> lets the agent
+            run mutating tools — including shell commands — without asking. Only enable it if you
+            trust the task.
+          </p>
+          <div className="mt-2 flex gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                void updateSettings({ permissionMode: confirmMode });
+                setConfirmMode(null);
+              }}
+              className="rounded border border-danger/60 bg-danger/15 px-2.5 py-1 capitalize text-danger"
+            >
+              Enable {MODE_INFO[confirmMode].label}
+            </button>
+            <button
+              type="button"
+              onClick={() => setConfirmMode(null)}
+              className="rounded border border-border bg-panel-2 px-2.5 py-1 text-muted"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-3">
+        <div className="mb-1 text-[11px] text-faint">
+          Default-mode policy (used when the mode is Default)
+        </div>
+        <div className="flex gap-2">
+          {(["allow", "ask", "deny"] as ToolPolicy[]).map((p) => (
+            <button
+              key={p}
+              type="button"
+              onClick={() => void updateSettings({ defaultPolicy: p })}
+              className={`flex-1 rounded-lg border px-3 py-2 text-[12.5px] capitalize transition-colors ${
+                settings.defaultPolicy === p
+                  ? "border-accent-2/50 bg-accent-2/10 text-accent-2"
+                  : "border-border bg-panel-2 text-muted hover:border-accent-2/40"
+              }`}
+            >
+              {p}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="mt-3">
+        <div className="mb-1 text-[11px] text-faint">
+          Rules — first match wins, evaluated before the mode default
+        </div>
+        {rules.length === 0 ? (
+          <p className="text-[11px] text-faint">
+            No rules yet. The mode above applies to every tool.
+          </p>
+        ) : (
+          <ul className="flex flex-col gap-1">
+            {rules.map((r, i) => (
+              <li
+                key={`${r.tool}|${r.command ?? ""}|${r.decision}`}
+                className="flex items-center justify-between gap-2 rounded border border-border bg-panel-2 px-2 py-1 text-[11.5px]"
+              >
+                <span className="min-w-0 truncate font-mono">
+                  <span className="text-fg">{r.tool}</span>
+                  {r.command ? <span className="text-muted"> “{r.command}”</span> : null}{" "}
+                  <span
+                    className={
+                      r.decision === "allow"
+                        ? "text-accent-2"
+                        : r.decision === "deny"
+                          ? "text-danger"
+                          : "text-warn"
+                    }
+                  >
+                    → {r.decision}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => removeRule(i)}
+                  aria-label={`Remove rule ${i + 1}`}
+                  className="shrink-0 px-1 text-muted hover:text-danger"
+                >
+                  ×
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <select
+            aria-label="Rule tool"
+            value={ruleTool}
+            onChange={(e) => setRuleTool(e.target.value)}
+            className="rounded border border-border bg-panel-2 px-2 py-1 text-[11.5px] text-fg"
+          >
+            {PERM_TOOLS.map((t) => (
+              <option key={t} value={t}>
+                {t === "*" ? "any tool (*)" : t}
+              </option>
+            ))}
+          </select>
+          {ruleTool === "shell" && (
+            <input
+              aria-label="Command prefix"
+              value={ruleCommand}
+              onChange={(e) => setRuleCommand(e.target.value)}
+              placeholder="command prefix (e.g. git )"
+              className="min-w-0 flex-1 rounded border border-border bg-panel-2 px-2 py-1 text-[11.5px] text-fg"
+            />
+          )}
+          <select
+            aria-label="Rule decision"
+            value={ruleDecision}
+            onChange={(e) => setRuleDecision(e.target.value as ToolPolicy)}
+            className="rounded border border-border bg-panel-2 px-2 py-1 text-[11.5px] text-fg"
+          >
+            {(["allow", "ask", "deny"] as ToolPolicy[]).map((d) => (
+              <option key={d} value={d}>
+                {d}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            onClick={addRule}
+            className="rounded border border-accent-2/50 bg-accent-2/10 px-2.5 py-1 text-[11.5px] text-accent-2"
+          >
+            Add rule
+          </button>
+        </div>
+        {overBroadAllow && (
+          <p role="alert" className="mt-1.5 text-[11px] text-danger">
+            ⚠ This allow rule matches {ruleTool === "*" ? "every tool" : "every shell command"} —
+            anything chained after a trusted prefix runs without asking. Prefer a specific tool and
+            command prefix.
+          </p>
+        )}
+        <p className="mt-1.5 text-[11px] text-faint">
+          A command prefix is a literal match — “git ” also matches “git x; rm -rf y”. It’s a
+          convenience, not a guarantee.
+        </p>
+      </div>
+    </section>
   );
 }
 
