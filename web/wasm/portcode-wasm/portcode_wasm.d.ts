@@ -48,7 +48,7 @@ export type StreamEvent = { type: "turn_start"; messageId: string } | { type: "t
 /**
  * Everything that crosses the encrypted channel, in both directions.
  */
-export type SyncFrame = { t: "hello"; device_id: string; cursors: Cursor[] } | { t: "session_list"; sessions: SessionRow[] } | { t: "message_delta"; session_id: string; messages: MessageRow[] } | { t: "live"; session_id: string; event: StreamEvent } | { t: "command"; command: RemoteCommand } | { t: "ack"; session_id: string; seq: number };
+export type SyncFrame = { t: "hello"; device_id: string; cursors: Cursor[] } | { t: "session_list"; sessions: SessionRow[] } | { t: "message_delta"; session_id: string; messages: MessageRow[] } | { t: "live"; session_id: string; event: StreamEvent } | { t: "command"; command: RemoteCommand } | { t: "ack"; session_id: string; seq: number } | { t: "pairing_reject"; reason: string | null };
 
 /**
  * One end\'s high-water mark for a session: \"I already hold every message up to
@@ -152,6 +152,23 @@ export class Session {
      */
     onEvent(cb: Function): void;
     /**
+     * Decline this session during SAS verification: tell the desktop the user
+     * rejected the pairing (so its confirm/reject prompt cancels instead of
+     * parking for the full timeout), then tear the connection down.
+     *
+     * Sends a `PairingReject { reason: None }` over the still-open send half BEFORE
+     * dropping it — the desktop's `serve_connection` selects on this frame and
+     * drops the connection promptly. A send error is non-fatal (the channel may
+     * already be gone); we tear down regardless so the local session is always
+     * cleaned up. The store wires this to the "reject" button in the SAS dialog.
+     *
+     * Takes `&self` (not `&mut self`) — like `send_command`/`disconnect`, the inner
+     * state is behind `Rc<RefCell>`/`Rc<AsyncMutex>`, so teardown works through a
+     * shared borrow; the returned `Promise` resolves once the reject frame is sent
+     * (or fails) and the channel is dropped.
+     */
+    reject(): Promise<void>;
+    /**
      * Push one [`RemoteCommand`] to the desktop. `cmd` is the JS object form of a
      * `RemoteCommand` (`Run`/`Cancel`/`Permission`/`CreateSession`), converted via
      * `serde-wasm-bindgen`. No-op error if the session was already disconnected.
@@ -192,6 +209,7 @@ export interface InitOutput {
     readonly session_onEvent: (a: number, b: any) => void;
     readonly session_peerPublicKey: (a: number) => [number, number];
     readonly session_privateKey: (a: number) => [number, number];
+    readonly session_reject: (a: number) => any;
     readonly session_sas: (a: number) => [number, number];
     readonly session_sendCommand: (a: number, b: any) => [number, number];
     readonly start: () => void;

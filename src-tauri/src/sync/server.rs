@@ -13,14 +13,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use crate::agent;
 use crate::db::{self, Db};
 use crate::permissions::{self, Decision, Pending};
 use crate::settings::Settings;
-use crate::sync::protocol::RemoteCommand;
+use crate::sync::protocol::{RemoteCommand, SyncFrame};
 use crate::sync::session::CommandHandler;
+use crate::sync::SyncHub;
 
 /// Owned, `Send + 'static` capture of the `AppState` pieces a phone's remote
 /// commands drive. Cloned from `AppState` when the listener starts; the inner
@@ -104,7 +105,11 @@ impl CommandHandler for DesktopCommandHandler {
                 Ok(())
             }
             // Mirror `create_session`. The phone supplies only a title; the desktop
-            // mints the id (the phone learns it from the next catch-up SessionList).
+            // mints the id. AFTER creating, re-push a fresh `SessionList` onto the
+            // SyncHub so the new session appears on the phone immediately — without
+            // it the created session would be invisible until the next
+            // reconnect/catch-up (the catch-up `SessionList` is sent once, on Hello,
+            // and `forward_live` only ever carried `Live` frames before this).
             RemoteCommand::CreateSession { title } => {
                 let id = uuid::Uuid::new_v4().to_string();
                 self.db
@@ -114,7 +119,21 @@ impl CommandHandler for DesktopCommandHandler {
                         None,
                         db::now_ms(),
                     )
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string())?;
+                // Best-effort fan-out of the updated list. A `list_sessions` read
+                // error here must not fail the (already-committed) create, so log +
+                // continue; the phone still picks the session up on next catch-up.
+                if let Some(hub) = self.app.try_state::<SyncHub>() {
+                    match self.db.list_sessions() {
+                        Ok(sessions) => {
+                            hub.publish_frame(SyncFrame::SessionList { sessions });
+                        }
+                        Err(e) => {
+                            eprintln!("phone-sync: list_sessions after create failed: {e}");
+                        }
+                    }
+                }
+                Ok(())
             }
         }
     }

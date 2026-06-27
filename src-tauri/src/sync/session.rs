@@ -12,7 +12,7 @@
 //! `SessionList` then one `MessageDelta` per requested cursor.
 
 use crate::db::Db;
-use crate::sync::protocol::SyncFrame;
+use crate::sync::protocol::{Cursor, SyncFrame};
 
 // Re-export the shared session surface so every existing `crate::sync::session::…`
 // path (in `lib.rs`, `server.rs`, `client.rs`, and their tests) keeps resolving.
@@ -44,7 +44,21 @@ pub async fn serve_catch_up<C: FrameChannel + ?Sized>(
         SyncFrame::Hello { cursors, .. } => cursors,
         other => return Err(format!("expected Hello, got {other:?}")),
     };
+    serve_catch_up_with_cursors(channel, db, cursors).await
+}
 
+/// Desktop side: the catch-up REPLY, given the phone's cursors already read from
+/// its `Hello`. Sends the current `SessionList` then one `MessageDelta` per cursor.
+///
+/// Split out from [`serve_catch_up`] for the first-pairing path: there the desktop
+/// reads the phone's early `Hello` itself (while watching the pre-trust channel for
+/// a `PairingReject`, see `serve_connection`), so by the time catch-up runs the
+/// `Hello` is already consumed and only the cursors remain to be answered.
+pub async fn serve_catch_up_with_cursors<C: FrameChannel + ?Sized>(
+    channel: &mut C,
+    db: &Db,
+    cursors: Vec<Cursor>,
+) -> Result<(), String> {
     channel
         .send(&SyncFrame::SessionList {
             sessions: db.list_sessions().map_err(|e| e.to_string())?,
@@ -173,5 +187,52 @@ mod tests {
 
         assert_eq!(catch_up.deltas.len(), 1);
         assert!(catch_up.deltas[0].1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_catch_up_with_cursors_skips_the_hello_and_answers_directly() {
+        // The first-pairing path: the desktop has ALREADY read the phone's `Hello`
+        // (while watching for a reject), so it answers the stashed cursors via
+        // `serve_catch_up_with_cursors` WITHOUT reading another `Hello`. The reply
+        // sequence (SessionList then one MessageDelta per cursor) must be identical
+        // to `serve_catch_up`'s — we read it off the phone end directly.
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        db.create_session("s1", "Alpha", None, 100).unwrap();
+        db.append_message("s1", &user("first"), 101); // seq 0
+        db.append_message("s1", &user("second"), 102); // seq 1
+
+        let (mut desktop, mut phone) = mem_pair();
+        let cursors = vec![Cursor {
+            session_id: "s1".into(),
+            seq: -1, // phone holds nothing → full history
+        }];
+
+        // No `Hello` is sent: the helper must NOT block on one. Run serve + a manual
+        // phone reader concurrently.
+        let (serve_res, ()) = tokio::join!(
+            serve_catch_up_with_cursors(&mut desktop, &db, cursors),
+            async {
+                match phone.recv().await.unwrap() {
+                    SyncFrame::SessionList { sessions } => {
+                        assert_eq!(sessions.len(), 1);
+                        assert_eq!(sessions[0].id, "s1");
+                    }
+                    other => panic!("expected SessionList, got {other:?}"),
+                }
+                match phone.recv().await.unwrap() {
+                    SyncFrame::MessageDelta {
+                        session_id,
+                        messages,
+                    } => {
+                        assert_eq!(session_id, "s1");
+                        assert_eq!(messages.len(), 2); // both rows, phone had none
+                        assert_eq!(messages[0].seq, 0);
+                        assert_eq!(messages[1].seq, 1);
+                    }
+                    other => panic!("expected MessageDelta, got {other:?}"),
+                }
+            },
+        );
+        serve_res.unwrap();
     }
 }
