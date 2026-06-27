@@ -127,6 +127,30 @@ pub enum StreamEvent {
     Error {
         message: String,
     },
+    /// A subagent (the `task` tool) started. Emitted on the SESSION channel so the
+    /// live agents panel sees it even though the subagent's own deltas stream on a
+    /// private `agent://{session}:{agentId}` channel. `parent_id` is the launching
+    /// subagent's id when nested (absent for a top-level launch).
+    AgentStarted {
+        #[serde(rename = "agentId")]
+        agent_id: String,
+        description: String,
+        #[serde(rename = "parentId", default, skip_serializing_if = "Option::is_none")]
+        parent_id: Option<String>,
+    },
+    /// A subagent completed a model turn — a cheap liveness signal for the panel.
+    /// `step` is its 1-based turn count.
+    AgentProgress {
+        #[serde(rename = "agentId")]
+        agent_id: String,
+        step: u32,
+    },
+    /// A subagent finished. `status` is `"ok"`, `"cancelled"`, or `"error"`.
+    AgentFinished {
+        #[serde(rename = "agentId")]
+        agent_id: String,
+        status: String,
+    },
 }
 
 #[derive(Debug)]

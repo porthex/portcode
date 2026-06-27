@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use tauri::AppHandle;
 
 use crate::agent;
+use crate::agents;
 use crate::db::{self, Db};
 use crate::permissions::{self, Decision, Pending};
 use crate::settings::Settings;
@@ -34,6 +35,7 @@ pub struct DesktopCommandHandler {
     pub db: Arc<Db>,
     pub cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     pub pending: Pending,
+    pub agents: agents::Agents,
     pub oauth_refresh: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -66,6 +68,7 @@ impl CommandHandler for DesktopCommandHandler {
                 let db = self.db.clone();
                 let cancels = self.cancels.clone();
                 let pending = self.pending.clone();
+                let agents = self.agents.clone();
                 let oauth_refresh = self.oauth_refresh.clone();
                 tauri::async_runtime::spawn(async move {
                     agent::run(
@@ -75,6 +78,7 @@ impl CommandHandler for DesktopCommandHandler {
                         db,
                         cancels,
                         pending,
+                        agents,
                         oauth_refresh,
                         session_id,
                         text,
@@ -83,13 +87,21 @@ impl CommandHandler for DesktopCommandHandler {
                 });
                 Ok(())
             }
-            // Mirror `cancel_agent`: set an EXISTING flag (agent::run inserts it)
-            // + deny pending gates. Guard dropped at the `if let` end; no await.
+            // Mirror `cancel_agent`: set an EXISTING flag (agent::run inserts it),
+            // cascade to the session's subagents, and deny pending gates. Guard
+            // dropped at the `if let` end; no await.
             RemoteCommand::Cancel { session_id } => {
                 if let Some(flag) = self.cancels.lock().unwrap().get(&session_id) {
                     flag.store(true, Ordering::Relaxed);
                 }
+                agents::cancel_session(&self.agents, &session_id);
                 permissions::deny_all(&self.pending, &session_id);
+                Ok(())
+            }
+            // Mirror `cancel_agent_by_id`: stop ONE subagent (and its descendants),
+            // leaving the rest of the session running.
+            RemoteCommand::CancelAgent { agent_id } => {
+                agents::cancel_one(&self.agents, &agent_id);
                 Ok(())
             }
             // Mirror `resolve_permission`, but validate the decision string against

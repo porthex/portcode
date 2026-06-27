@@ -237,4 +237,32 @@ describe("StatusHud", () => {
 
     expect(screen.getByText(`${(1540).toLocaleString()} tok`)).toBeInTheDocument();
   });
+
+  it("shows a running-subagents count only while subagents are running", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      agents: {
+        s1: [
+          { id: "a1", description: "x", status: "running", step: 1 },
+          { id: "a2", description: "y", status: "running", step: 2 },
+          { id: "a3", description: "z", status: "ok", step: 4 }, // finished — not counted
+        ],
+      },
+    });
+
+    render(<StatusHud />);
+    expect(screen.getByText("2 AGENTS")).toBeInTheDocument();
+  });
+
+  it("omits the subagents segment when none are running", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      agents: { s1: [{ id: "a1", description: "x", status: "ok", step: 3 }] },
+    });
+
+    render(<StatusHud />);
+    expect(screen.queryByText(/AGENT/)).not.toBeInTheDocument();
+  });
 });

@@ -46,6 +46,8 @@ export function StatusHud() {
   const usage = useStore((s) => (s.activeId ? s.usage[s.activeId] : undefined));
   const messages = useStore((s) => (s.activeId ? s.messages[s.activeId] : undefined));
   const remoteMode = useStore((s) => s.remoteMode);
+  const agents = useStore((s) => (s.activeId ? s.agents[s.activeId] : undefined));
+  const runningAgents = agents ? agents.filter((a) => a.status === "running").length : 0;
   const tokens = usage ? usage.input + usage.output : 0;
 
   const workspaceConnected = Boolean(session?.workspace);
@@ -91,6 +93,12 @@ export function StatusHud() {
       {!remoteMode && (
         <div className="pc-hud-seg pc-hud-seg--right text-faint">
           {toolUses === 1 ? "1 TOOL CALL" : `${toolUses} TOOL CALLS`}
+        </div>
+      )}
+      {runningAgents > 0 && (
+        <div className="pc-hud-seg pc-hud-seg--right text-accent-2">
+          <span className="pc-dot pc-dot--ring" aria-hidden="true" />
+          {runningAgents === 1 ? "1 AGENT" : `${runningAgents} AGENTS`}
         </div>
       )}
       <div className="pc-hud-seg pc-hud-seg--right text-faint">{tokens.toLocaleString()} tok</div>
