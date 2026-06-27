@@ -244,6 +244,20 @@ export async function resolvePermission(id: string, decision: "allow" | "deny"):
   return mock.resolvePermission(id, decision);
 }
 
+// ── Crash reporting consent (mirror to the Rust host) ─────────────────────────
+
+/** Tell the Rust host the user's crash-reporting consent changed. Desktop-only on
+ *  the core side; the command is absent on mobile and on DSN-less dev builds it's a
+ *  no-op, so callers should swallow errors (the host gate stays the source of
+ *  truth). No browser-mock fallback: in `vite`/preview there is no Rust host to
+ *  inform, and the frontend SDK is driven separately by `lib/telemetry`. */
+export async function setTelemetryConsent(enabled: boolean): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("telemetry_set_consent", { enabled });
+  }
+}
+
 // ── sessions / history ────────────────────────────────────────────────────────
 
 export async function listSessions(): Promise<Session[]> {

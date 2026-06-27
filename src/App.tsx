@@ -8,7 +8,9 @@ import { CommandPalette } from "./components/CommandPalette";
 import { StatusHud } from "./components/StatusHud";
 import { NeonRain } from "./components/NeonRain";
 import { RemotePairing } from "./components/RemotePairing";
+import { CrashConsentPrompt } from "./components/CrashConsentPrompt";
 import { isTauri } from "./lib/ipc";
+import { initTelemetry, shutdownTelemetry, telemetryConfigured } from "./lib/telemetry";
 
 export default function App() {
   const init = useStore((s) => s.init);
@@ -21,6 +23,7 @@ export default function App() {
   const remoteConnected = useStore((s) => s.remoteConnected);
   const remoteVerified = useStore((s) => s.remoteVerified);
   const remoteDropped = useStore((s) => s.remoteDropped);
+  const crashReporting = useStore((s) => s.crashReporting);
 
   // A stable target for keyboard focus after the file rail collapses: the
   // TitleBar file-toggle button stays visible and tabbable, so it's where a
@@ -63,6 +66,14 @@ export default function App() {
     }
     prevRemoteLive.current = remoteLive;
   }, [remoteLive]);
+
+  // Keep the crash-reporting SDK in sync with the consent toggle. `initTelemetry`
+  // is idempotent and a no-op without consent+DSN, so this safely covers opting in
+  // (start) and opting out (flush + disable).
+  useEffect(() => {
+    if (crashReporting === true) initTelemetry(true);
+    else shutdownTelemetry();
+  }, [crashReporting]);
 
   // Release the live remote frame subscription if the app tree unmounts (HMR, a
   // root remount) so a stale native listener can't survive into a new store
@@ -184,6 +195,11 @@ export default function App() {
           <CommandPalette />
         </>
       )}
+
+      {/* First-run crash-reporting consent — only when the choice is unmade AND
+          this build can actually report (a DSN was baked in). Off-by-default: no
+          choice means nothing is ever sent. */}
+      {crashReporting === null && telemetryConfigured() && <CrashConsentPrompt />}
     </div>
   );
 }

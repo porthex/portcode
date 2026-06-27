@@ -57,6 +57,20 @@ jobs:
       AZURE_TS_CERT_PROFILE: ${{ secrets.AZURE_TS_CERT_PROFILE }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      # ── Sentry crash reporting (Phase 2) — ALL secret-gated ──────────────────
+      # DSN is injected at BUILD time so release bundles ship ARMED SDKs (the Rust
+      # host reads option_env!("SENTRY_DSN"); the webview reads VITE_SENTRY_DSN).
+      # With no SENTRY_DSN secret the SDKs stay inert (zero telemetry by default).
+      # SENTRY_AUTH_TOKEN gates the symbolication upload below — absent ⇒ skipped,
+      # never a hard-fail. SENTRY_URL is the region host (owner sets the EU host,
+      # e.g. https://de.sentry.io/); unset falls back to sentry.io.
+      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+      VITE_SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+      SENTRY_ENVIRONMENT: production
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+      SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+      SENTRY_URL: ${{ secrets.SENTRY_URL }}
 
     steps:
       - name: Checkout
@@ -116,6 +130,29 @@ jobs:
           "dir=$dir"                >> $env:GITHUB_OUTPUT
           "version=$ver"            >> $env:GITHUB_OUTPUT
           Write-Host "Installer: $($exe.FullName)  (v$ver)"
+
+      # ── Sentry symbolication (Phase 2, SECRET-GATED) ──────────────────────────
+      # Makes crash reports readable: uploads the Rust/native debug symbols (.pdb,
+      # debug-id matched — this is what symbolicates desktop MINIDUMPS + Rust panics)
+      # and the webview JS sourcemaps (release matched). The release name is the BARE
+      # app version, matching what the SDKs report (Rust = CARGO_PKG_VERSION; webview
+      # = app version). Skipped cleanly without SENTRY_AUTH_TOKEN so dry runs / forks
+      # never hard-fail. (`[profile.release] debug = true` emits the .pdb; `strip`
+      # still strips the shipped .exe.)
+      - name: Upload debug symbols + sourcemaps to Sentry
+        if: env.SENTRY_AUTH_TOKEN != ''
+        shell: pwsh
+        run: |
+          $rel = "${{ steps.artifact.outputs.version }}"
+          npx -y @sentry/cli@3.5.1 debug-files upload --include-sources src-tauri/target/release
+          npx -y @sentry/cli@3.5.1 releases new $rel
+          npx -y @sentry/cli@3.5.1 releases files $rel upload-sourcemaps ./dist
+          npx -y @sentry/cli@3.5.1 releases finalize $rel
+
+      - name: Note — Sentry symbolication skipped (no SENTRY_AUTH_TOKEN)
+        if: env.SENTRY_AUTH_TOKEN == ''
+        shell: pwsh
+        run: Write-Host "::warning title=No symbolication::SENTRY_AUTH_TOKEN absent — skipping debug-file + sourcemap upload. Crashes will be unsymbolicated. Expected for dry runs/forks."
 
       # ── Authenticode signing via Azure Trusted Signing (SECRET-GATED) ─────────
       # Signs the installer in place so SmartScreen / Defender trust it. Skipped

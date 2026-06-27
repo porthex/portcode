@@ -43,6 +43,7 @@ interface AppState {
   showPalette: boolean;
   ambientRain: boolean; // decorative neon-rain backdrop (off by default)
   scanlines: boolean; // CRT scanline overlay (off by default)
+  crashReporting: boolean | null; // opt-in crash/error reporting; null = not yet asked (show first-run prompt)
   draft: string;
   cancel: (() => Promise<void>) | null;
   pendingPermission: PendingPermission | null;
@@ -82,6 +83,7 @@ interface AppState {
   setShowPalette: (v: boolean) => void;
   setAmbientRain: (v: boolean) => void;
   setScanlines: (v: boolean) => void;
+  setCrashReporting: (v: boolean) => void;
   updateSettings: (s: Partial<Settings>) => Promise<void>;
   refreshOAuthStatus: () => Promise<void>;
   loginWithClaude: () => Promise<void>;
@@ -147,6 +149,18 @@ const writePref = (k: string, v: boolean): void => {
   }
 };
 
+// Tri-state pref: null when never set (e.g. crash-reporting consent not yet
+// asked), otherwise the stored boolean. Lets a first-run prompt distinguish
+// "declined" from "not yet decided".
+const readTriPref = (k: string): boolean | null => {
+  try {
+    const v = localStorage.getItem(k);
+    return v === null ? null : v === "1";
+  } catch {
+    return null;
+  }
+};
+
 // String prefs (e.g. the remembered pairing payload — public connection info, not
 // a secret). Same best-effort localStorage discipline as the boolean prefs.
 const readStr = (k: string): string | null => {
@@ -202,6 +216,7 @@ export const useStore = create<AppState>((set, get) => ({
   showPalette: false,
   ambientRain: readPref("pc.ambientRain"),
   scanlines: readPref("pc.scanlines"),
+  crashReporting: readTriPref("pc.crashReporting"),
   draft: "",
   cancel: null,
   pendingPermission: null,
@@ -694,6 +709,17 @@ export const useStore = create<AppState>((set, get) => ({
   setScanlines(v) {
     writePref("pc.scanlines", v);
     set({ scanlines: v });
+  },
+
+  // Persist the consent choice; the frontend SDK init/shutdown is driven by an
+  // effect in App watching `crashReporting`, so the store stays free of any
+  // telemetry-SDK import (keeps it pure + its tests lightweight). We ALSO mirror
+  // the choice to the Rust host (best-effort: swallow errors so the mobile build —
+  // where the command isn't registered — and DSN-less dev builds don't throw).
+  setCrashReporting(v) {
+    writePref("pc.crashReporting", v);
+    set({ crashReporting: v });
+    void ipc.setTelemetryConsent(v).catch(() => {});
   },
 
   toggleFiles() {
