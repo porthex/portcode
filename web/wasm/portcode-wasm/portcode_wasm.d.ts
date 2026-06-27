@@ -13,7 +13,7 @@ export type ReadableStreamType = "bytes";
  * / `create_session`) — the phone never runs tools or touches the workspace
  * itself.
  */
-export type RemoteCommand = { cmd: "run"; session_id: string; text: string } | { cmd: "cancel"; session_id: string } | { cmd: "permission"; id: string; decision: string } | { cmd: "create_session"; title: string | null };
+export type RemoteCommand = { cmd: "run"; session_id: string; text: string } | { cmd: "cancel"; session_id: string } | { cmd: "cancel_agent"; agent_id: string } | { cmd: "permission"; id: string; decision: string } | { cmd: "create_session"; title: string | null };
 
 /**
  * A session header row. (Was `crate::db::SessionRow`.)
@@ -27,6 +27,12 @@ export interface SessionRow {
      */
     branch?: string | null;
     workspace: string | null;
+    /**
+     * The per-session model id (per-session-model feature). Optional + serde-default
+     * so older rows / wire payloads without it still decode; the call site falls back
+     * to the global default model when it is None.
+     */
+    model?: string | null;
     createdAt: number;
     updatedAt: number;
 }
@@ -43,7 +49,7 @@ export type Block = { type: "text"; text: string } | { type: "tool_use"; id: str
  * (it is forwarded verbatim inside `protocol::SyncFrame::Live`).
  * (Was `crate::llm::StreamEvent`.)
  */
-export type StreamEvent = { type: "turn_start"; messageId: string } | { type: "text_delta"; text: string } | { type: "tool_use"; id: string; name: string; input: Value } | { type: "tool_result"; id: string; output: string; isError: boolean } | { type: "permission_request"; id: string; tool: string; summary: string; input: Value } | { type: "usage"; inputTokens: number; outputTokens: number } | { type: "turn_end"; stopReason: string } | { type: "error"; message: string };
+export type StreamEvent = { type: "turn_start"; messageId: string } | { type: "text_delta"; text: string } | { type: "tool_use"; id: string; name: string; input: Value } | { type: "tool_result"; id: string; output: string; isError: boolean } | { type: "permission_request"; id: string; tool: string; summary: string; input: Value; diff?: string } | { type: "usage"; inputTokens: number; outputTokens: number } | { type: "turn_end"; stopReason: string } | { type: "error"; message: string } | { type: "agent_started"; agentId: string; description: string; parentId?: string } | { type: "agent_progress"; agentId: string; step: number } | { type: "agent_finished"; agentId: string; status: string } | { type: "background_task_started"; id: string; command: string } | { type: "background_task_finished"; id: string; command: string; exitCode: number; output: string };
 
 /**
  * Everything that crosses the encrypted channel, in both directions.
@@ -227,15 +233,15 @@ export interface InitOutput {
     readonly intounderlyingsource_cancel: (a: number) => void;
     readonly intounderlyingsource_pull: (a: number, b: any) => any;
     readonly ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h16decc9546f74ec6: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen__convert__closures_____invoke__h16d3652e7206b186: (a: number, b: number, c: any, d: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__he9067c4a56f1bae1: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h75c6535ff146cad0: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__he37016d9acbffb42: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h6515b6a5bd3141dc: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h9475d4745f285939: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h459ccb5a59206e34: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hf2b6b48a937b9ed4: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__haeef4d57e6a88c91: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen__convert__closures_____invoke__h29f3221e742a74f6: (a: number, b: number, c: any, d: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h68ec937c7cebd819: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__ha7800a8575fd78d5: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__hc6a33f57e9316770: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__hd51a085c8f3dffa7: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h732d2251e9086dd9: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h069bff72c256f5f0: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__hfe7f4cbcccf4f5d6: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;
