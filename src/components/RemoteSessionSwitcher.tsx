@@ -121,7 +121,7 @@ export function RemoteSessionSwitcher({ onClose }: { onClose: () => void }) {
                   </div>
                 </div>
                 {active && (
-                  <span className="shrink-0 font-mono text-[9.5px] text-success">ACTIVE</span>
+                  <span className="shrink-0 font-mono text-[10.5px] text-success">ACTIVE</span>
                 )}
               </button>
             );

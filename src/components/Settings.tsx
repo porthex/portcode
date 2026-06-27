@@ -17,8 +17,10 @@ export function SettingsPanel() {
 
   const ambientRain = useStore((s) => s.ambientRain);
   const scanlines = useStore((s) => s.scanlines);
+  const uiScale = useStore((s) => s.uiScale);
   const setAmbientRain = useStore((s) => s.setAmbientRain);
   const setScanlines = useStore((s) => s.setScanlines);
+  const setUiScale = useStore((s) => s.setUiScale);
 
   const phoneSync = useStore((s) => s.phoneSync);
   const pairingPayload = useStore((s) => s.pairingPayload);
@@ -382,6 +384,7 @@ export function SettingsPanel() {
                 on={scanlines}
                 onToggle={() => setScanlines(!scanlines)}
               />
+              <ScaleRow value={uiScale} onSelect={setUiScale} />
             </div>
           </section>
 
@@ -655,6 +658,51 @@ function PairingCode({ payload, onDone }: { payload: PairingPayload; onDone: () 
             {json}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+/** The selectable interface-scale presets (a frontend-only `document.zoom`).
+ *  Kept small + named so the picker reads as discrete steps, not a free slider. */
+const UI_SCALES: { value: number; label: string }[] = [
+  { value: 0.9, label: "Compact" },
+  { value: 1, label: "Default" },
+  { value: 1.1, label: "Comfortable" },
+  { value: 1.25, label: "Large" },
+];
+
+/** Interface-scale row: a segmented set of preset buttons wired to the store's
+ *  uiScale/setUiScale. The active option is indicated with aria-pressed (not by
+ *  colour alone) so it's conveyed to assistive tech and high-contrast users. */
+function ScaleRow({ value, onSelect }: { value: number; onSelect: (n: number) => void }) {
+  return (
+    <div className="flex flex-col gap-2 py-1.5">
+      <div>
+        <div className="text-[12.5px] font-medium text-fg">Interface scale</div>
+        <div className="text-[11px] text-faint mt-0.5">
+          Resize the whole interface for comfort or density.
+        </div>
+      </div>
+      <div role="group" aria-label="Interface scale" className="flex gap-2">
+        {UI_SCALES.map((s) => {
+          const active = value === s.value;
+          return (
+            <button
+              key={s.value}
+              type="button"
+              aria-pressed={active}
+              onClick={() => onSelect(s.value)}
+              className={`flex-1 rounded-lg border px-2 py-2 text-[12px] transition-colors ${
+                active
+                  ? "border-accent-2/50 bg-accent-2/10 text-accent-2"
+                  : "border-border bg-panel-2 text-muted hover:border-accent-2/40"
+              }`}
+            >
+              {s.label}
+            </button>
+          );
+        })}
       </div>
     </div>
   );
