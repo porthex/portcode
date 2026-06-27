@@ -1043,6 +1043,74 @@ describe("draft + UI setters", () => {
     useStore.getState().setShowSidebar(true);
     expect(useStore.getState().showSidebar).toBe(true);
   });
+
+  it("setAmbientRain / setScanlines flip the decorative flags and persist them", () => {
+    localStorage.clear();
+
+    useStore.getState().setAmbientRain(true);
+    expect(useStore.getState().ambientRain).toBe(true);
+    expect(localStorage.getItem("pc.ambientRain")).toBe("1");
+
+    useStore.getState().setScanlines(true);
+    expect(useStore.getState().scanlines).toBe(true);
+    expect(localStorage.getItem("pc.scanlines")).toBe("1");
+  });
+});
+
+describe("uiScale (interface scale)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    // Reset the document zoom that prior tests / the module init may have set.
+    document.documentElement.style.zoom = "";
+  });
+
+  it("defaults to 1 (no zoom applied) until set", () => {
+    expect(useStore.getState().uiScale).toBe(1);
+  });
+
+  it("setUiScale updates state, persists a string number, and applies document zoom", () => {
+    useStore.getState().setUiScale(1.25);
+
+    expect(useStore.getState().uiScale).toBe(1.25);
+    // Persisted as a plain string number under the documented key.
+    expect(localStorage.getItem("pc.uiScale")).toBe("1.25");
+    // Applied to the whole document via the `zoom` property (Chromium/WebView2).
+    expect(document.documentElement.style.zoom).toBe("1.25");
+  });
+
+  it("stays resilient when localStorage throws", () => {
+    const spy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota");
+    });
+
+    expect(() => useStore.getState().setUiScale(0.9)).not.toThrow();
+    // In-memory state + the applied zoom still update even if persistence fails.
+    expect(useStore.getState().uiScale).toBe(0.9);
+    expect(document.documentElement.style.zoom).toBe("0.9");
+
+    spy.mockRestore();
+  });
+
+  it("hydrates the persisted scale on init and applies it to the document", async () => {
+    localStorage.setItem("pc.uiScale", "1.1");
+    document.documentElement.style.zoom = "";
+
+    vi.resetModules();
+    const fresh = await import("./store");
+
+    expect(fresh.useStore.getState().uiScale).toBe(1.1);
+    // The module applies the restored scale once at creation.
+    expect(document.documentElement.style.zoom).toBe("1.1");
+  });
+
+  it("falls back to 1 for a missing or garbage persisted value", async () => {
+    localStorage.setItem("pc.uiScale", "not-a-number");
+
+    vi.resetModules();
+    const fresh = await import("./store");
+
+    expect(fresh.useStore.getState().uiScale).toBe(1);
+  });
 });
 
 describe("oauth (Claude subscription sign-in)", () => {

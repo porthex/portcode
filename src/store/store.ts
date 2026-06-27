@@ -58,6 +58,7 @@ interface AppState {
   manualOrder: string[]; // drag-reordered session ids (honoured when sortBy === "manual")
   ambientRain: boolean; // decorative neon-rain backdrop (off by default)
   scanlines: boolean; // CRT scanline overlay (off by default)
+  uiScale: number; // interface zoom factor (1 = default); applied via documentElement.style.zoom
   draft: string;
   cancel: (() => Promise<void>) | null;
   pendingPermission: PendingPermission | null;
@@ -113,6 +114,7 @@ interface AppState {
   setShowPalette: (v: boolean) => void;
   setAmbientRain: (v: boolean) => void;
   setScanlines: (v: boolean) => void;
+  setUiScale: (n: number) => void;
   updateSettings: (s: Partial<Settings>) => Promise<void>;
   refreshOAuthStatus: () => Promise<void>;
   loginWithClaude: () => Promise<void>;
@@ -201,6 +203,25 @@ const writeStr = (k: string, v: string | null): void => {
   }
 };
 
+// Interface scale (a numeric UI-zoom factor, persisted as a string number).
+// Same best-effort localStorage discipline as the other prefs; a missing or
+// garbage value falls back to 1 (no scaling) so the UI can never load broken.
+const readUiScale = (): number => {
+  const raw = readStr("pc.uiScale");
+  const n = raw === null ? NaN : Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 1;
+};
+// Apply the scale to the whole document. Chromium/WebView2 supports the `zoom`
+// property, which scales the entire UI crisply (unlike a transform). Guarded for
+// non-DOM environments (the no-op preview/test bootstrap before the DOM exists).
+const applyUiScale = (n: number): void => {
+  try {
+    document.documentElement.style.zoom = String(n);
+  } catch {
+    /* no document (SSR / early init) — ignore */
+  }
+};
+
 // JSON prefs (sidebar folders + membership + archived ids — frontend-only
 // organization overlays, never secrets). Same best-effort localStorage
 // discipline: a parse error or disabled storage falls back to the default.
@@ -278,6 +299,7 @@ export const useStore = create<AppState>((set, get) => ({
   manualOrder: readJSON<string[]>("pc.manualOrder", []),
   ambientRain: readPref("pc.ambientRain"),
   scanlines: readPref("pc.scanlines"),
+  uiScale: readUiScale(),
   draft: "",
   cancel: null,
   pendingPermission: null,
@@ -796,6 +818,12 @@ export const useStore = create<AppState>((set, get) => ({
   setScanlines(v) {
     writePref("pc.scanlines", v);
     set({ scanlines: v });
+  },
+
+  setUiScale(n) {
+    writeStr("pc.uiScale", String(n));
+    applyUiScale(n);
+    set({ uiScale: n });
   },
 
   toggleFiles() {
@@ -1331,6 +1359,11 @@ export const useStore = create<AppState>((set, get) => ({
     if (!get().lastPairingQr) set({ lastPairingQr: qr });
   },
 }));
+
+// Restore the persisted interface scale once at store creation, so a reload picks
+// up the user's last choice (the initial-state read above only seeds the value;
+// this is what actually applies `zoom` to the document on a cold load).
+applyUiScale(useStore.getState().uiScale);
 
 function appendText(blocks: ContentBlock[], text: string): ContentBlock[] {
   const last = blocks[blocks.length - 1];
