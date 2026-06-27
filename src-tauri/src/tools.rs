@@ -85,6 +85,19 @@ pub fn default_registry() -> Registry {
     ])
 }
 
+/// The read-only subset of the default registry — no `fs_write`/`fs_edit`/`shell`.
+/// Plan mode hands the agent this set so it can inspect the workspace but never
+/// mutate it (defense-in-depth with the permission gate, which also denies every
+/// mutating tool in plan mode).
+pub fn read_only_registry() -> Registry {
+    Registry::new(vec![
+        Box::new(FsRead),
+        Box::new(ListDir),
+        Box::new(GlobTool),
+        Box::new(GrepTool),
+    ])
+}
+
 // ── path helpers ─────────────────────────────────────────────────────────────
 
 fn base_dir(ctx: &ToolCtx) -> Result<PathBuf, String> {
@@ -943,6 +956,19 @@ mod tests {
             spec_names(&default_registry()),
             ["fs_read", "list", "glob", "grep", "fs_write", "fs_edit", "shell"]
         );
+    }
+
+    #[test]
+    fn read_only_registry_omits_every_mutating_tool() {
+        // Plan mode's tool set: the read-only tools only — no fs_write/fs_edit/shell.
+        let reg = read_only_registry();
+        assert_eq!(spec_names(&reg), ["fs_read", "list", "glob", "grep"]);
+        for mutating in ["fs_write", "fs_edit", "shell"] {
+            assert!(
+                reg.find(mutating).is_none(),
+                "{mutating} must not be in the read-only registry"
+            );
+        }
     }
 
     #[test]

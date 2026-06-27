@@ -92,7 +92,21 @@ pub(crate) struct AgentConfig {
     /// System-prompt override. `None` derives the default workspace prompt once
     /// the workspace is resolved (see [`resolve_system_prompt`]).
     system_prompt: Option<String>,
+    /// An extra steer appended AFTER the resolved system prompt (e.g. the
+    /// plan-mode "design only" instruction). Kept separate from the override so a
+    /// steer can ride on top of the default workspace prompt — which embeds the
+    /// workspace root — rather than replacing it.
+    prompt_steer: Option<String>,
 }
+
+/// Plan-mode steer appended to the system prompt. Paired with the read-only
+/// registry so the model both *can't* mutate (no write/edit/shell tools) and
+/// *knows* it shouldn't — it should design and explain instead.
+const PLAN_MODE_STEER: &str = "You are in PLAN MODE. Do NOT modify anything in this turn: \
+the file-writing, editing, and shell tools are intentionally unavailable. Investigate with the \
+read-only tools, then lay out a clear, concrete plan for the change — the files you'd touch and \
+what you'd do in each — and explain your approach. Tell the user to approve the plan (exit plan \
+mode) when they want you to apply it.";
 
 impl AgentConfig {
     /// The standard interactive run: the default tool registry and the default
@@ -101,15 +115,34 @@ impl AgentConfig {
         Self {
             registry: tools::default_registry(),
             system_prompt: None,
+            prompt_steer: None,
+        }
+    }
+
+    /// Plan mode: a READ-ONLY tool registry (no write/edit/shell) plus the
+    /// plan-mode steer on top of the default workspace prompt. Defense-in-depth
+    /// with the permission gate, which also denies every mutating tool when the
+    /// permission mode is `Plan`.
+    pub(crate) fn plan_run() -> Self {
+        Self {
+            registry: tools::read_only_registry(),
+            system_prompt: None,
+            prompt_steer: Some(PLAN_MODE_STEER.to_string()),
         }
     }
 }
 
 /// Resolve the system prompt for a run: the explicit override if one was given,
-/// otherwise the default workspace prompt. Kept separate and pure so the
-/// override seam is unit-testable without standing up a full run.
-fn resolve_system_prompt(over: Option<String>, workspace: &Path) -> String {
-    over.unwrap_or_else(|| system_prompt(workspace))
+/// otherwise the default workspace prompt, with an optional steer appended. Kept
+/// separate and pure so the prompt seam is unit-testable without standing up a
+/// full run.
+fn resolve_system_prompt(over: Option<String>, steer: Option<String>, workspace: &Path) -> String {
+    let mut prompt = over.unwrap_or_else(|| system_prompt(workspace));
+    if let Some(steer) = steer {
+        prompt.push_str("\n\n");
+        prompt.push_str(&steer);
+    }
+    prompt
 }
 
 fn derive_title(text: &str) -> String {
@@ -241,6 +274,15 @@ pub async fn run(
         },
     );
 
+    // Plan mode swaps in the read-only registry + plan steer; every other mode
+    // uses the default run. Both the desktop `run_agent` command and the phone's
+    // Run command funnel through `run`, so this single check covers both paths.
+    let config = if settings.lock().unwrap().permission_mode == permissions::PermissionMode::Plan {
+        AgentConfig::plan_run()
+    } else {
+        AgentConfig::default_run()
+    };
+
     let result = run_inner(
         &app,
         &http,
@@ -252,9 +294,7 @@ pub async fn run(
         &channel,
         &session_id,
         user_text,
-        // The standard interactive run: default tools + default prompt. The
-        // injectable config is the seam subagents / plan mode will use.
-        AgentConfig::default_run(),
+        config,
     )
     .await;
 
@@ -314,9 +354,10 @@ async fn run_inner(
     let AgentConfig {
         registry,
         system_prompt: system_override,
+        prompt_steer,
     } = config;
     let tool_specs = registry.specs();
-    let system = resolve_system_prompt(system_override, &workspace);
+    let system = resolve_system_prompt(system_override, prompt_steer, &workspace);
     let ctx = ToolCtx { workspace };
 
     // Load prior turns from the DB, then persist the new user message.
@@ -515,11 +556,23 @@ mod tests {
     };
     use std::path::Path;
 
+    fn spec_names(cfg: &AgentConfig) -> Vec<String> {
+        cfg.registry
+            .specs()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
     #[test]
     fn resolve_system_prompt_prefers_an_explicit_override() {
-        // A subagent / plan-mode run supplies its own prompt; the override wins
-        // verbatim and the default workspace prompt is not consulted.
-        let prompt = resolve_system_prompt(Some("CUSTOM SUBAGENT PROMPT".into()), Path::new("/ws"));
+        // A subagent run supplies its own prompt; the override wins verbatim and
+        // the default workspace prompt is not consulted.
+        let prompt = resolve_system_prompt(
+            Some("CUSTOM SUBAGENT PROMPT".into()),
+            None,
+            Path::new("/ws"),
+        );
         assert_eq!(prompt, "CUSTOM SUBAGENT PROMPT");
     }
 
@@ -527,28 +580,45 @@ mod tests {
     fn resolve_system_prompt_falls_back_to_the_default_workspace_prompt() {
         // No override → the default workspace prompt, which embeds the workspace
         // root so the model knows where it is operating.
-        let prompt = resolve_system_prompt(None, Path::new("/tmp/some-workspace"));
+        let prompt = resolve_system_prompt(None, None, Path::new("/tmp/some-workspace"));
         assert!(prompt.contains("Workspace root:"));
         assert!(prompt.contains("/tmp/some-workspace"));
     }
 
     #[test]
-    fn default_run_config_uses_the_standard_registry_and_no_prompt_override() {
-        // The interactive run is unchanged by the refactor: the full default
-        // tool set (read off the specs the loop would send) and no prompt
-        // override (so it derives the workspace prompt).
+    fn resolve_system_prompt_appends_a_steer_after_the_workspace_prompt() {
+        // A steer (e.g. plan mode) rides on TOP of the workspace prompt rather
+        // than replacing it, so the workspace root is still present.
+        let prompt =
+            resolve_system_prompt(None, Some("PLAN STEER".into()), Path::new("/tmp/ws-here"));
+        assert!(prompt.contains("Workspace root:"));
+        assert!(prompt.contains("/tmp/ws-here"));
+        assert!(prompt.contains("PLAN STEER"));
+        // The steer comes after the base prompt.
+        assert!(prompt.find("Workspace root:") < prompt.find("PLAN STEER"));
+    }
+
+    #[test]
+    fn default_run_config_uses_the_standard_registry_and_no_override_or_steer() {
+        // The interactive run is unchanged: the full default tool set and no
+        // prompt override / steer (so it derives the workspace prompt).
         let cfg = AgentConfig::default_run();
-        let names: Vec<String> = cfg
-            .registry
-            .specs()
-            .iter()
-            .map(|s| s["name"].as_str().unwrap().to_string())
-            .collect();
         assert_eq!(
-            names,
+            spec_names(&cfg),
             ["fs_read", "list", "glob", "grep", "fs_write", "fs_edit", "shell"]
         );
         assert!(cfg.system_prompt.is_none());
+        assert!(cfg.prompt_steer.is_none());
+    }
+
+    #[test]
+    fn plan_run_config_is_read_only_and_carries_the_plan_steer() {
+        // Plan mode hands the model only the read-only tools (no write/edit/shell)
+        // and a steer that tells it to design rather than mutate.
+        let cfg = AgentConfig::plan_run();
+        assert_eq!(spec_names(&cfg), ["fs_read", "list", "glob", "grep"]);
+        let steer = cfg.prompt_steer.expect("plan mode carries a steer");
+        assert!(steer.contains("PLAN MODE"));
     }
 
     #[test]
