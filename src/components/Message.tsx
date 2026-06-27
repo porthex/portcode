@@ -5,6 +5,7 @@ import rehypeHighlight from "rehype-highlight";
 import type { ContentBlock, Message } from "../types";
 import { useStore } from "../store/store";
 import { usePrefersReducedMotion, useScramble } from "../lib/useScramble";
+import { useContextMenu, type ContextMenuItem } from "./ContextMenu";
 import { ToolCall } from "./ToolCall";
 
 // Hoisted to module scope so they're referentially stable across renders —
@@ -50,8 +51,25 @@ export const MessageView = memo(function MessageView({
     return m;
   }, [message.blocks]);
 
+  // Right-click → copy the message's text. Disabled when the message has no text
+  // (e.g. a tool-only assistant turn). Plain text inside the bubble keeps its own
+  // native selection menu; this is the convenience "copy the whole message".
+  const { onContextMenu, menu } = useContextMenu();
+  const text = textOf(message);
+  const menuItems: ContextMenuItem[] = [
+    {
+      label: "Copy message text",
+      icon: <CopyGlyph />,
+      onSelect: () => void navigator.clipboard?.writeText?.(text).catch(() => {}),
+      disabled: text.length === 0,
+    },
+  ];
+
   return (
-    <div className={`mb-5 flex gap-[11px] ${isUser ? "justify-end" : "pc-msg-enter"}`}>
+    <div
+      className={`mb-5 flex gap-[11px] ${isUser ? "justify-end" : "pc-msg-enter"}`}
+      onContextMenu={onContextMenu(menuItems)}
+    >
       {!isUser && <Avatar />}
       <div className={`min-w-0 ${isUser ? "max-w-[82%]" : "flex-1"}`}>
         {isUser ? (
@@ -82,6 +100,7 @@ export const MessageView = memo(function MessageView({
           </div>
         )}
       </div>
+      {menu}
     </div>
   );
 });
@@ -158,6 +177,20 @@ function textOf(m: Message): string {
     .filter((b) => b.kind === "text")
     .map((b) => (b.kind === "text" ? b.text : ""))
     .join("");
+}
+
+function CopyGlyph() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" strokeWidth="1.6" />
+      <path
+        d="M5 15V6a1 1 0 0 1 1-1h9"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
 }
 
 function Avatar() {

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, within } from "@testing-library/react";
 
 import { DEFAULT_SETTINGS, type Session, type Settings } from "../types";
 import { useStore } from "../store/store";
@@ -857,6 +857,70 @@ describe("Sidebar", () => {
       expect(useStore.getState().folderOf).toEqual({ a: "f1" });
     });
 
+    // Regression: the title is a full-width <button>, so grabbing a chat by its
+    // text never started the parent row's native drag in Chromium/WebView2 ("it
+    // won't let you add a chat to a folder"). A non-button grip handle gives an
+    // unambiguous drag surface whose own dragStart seeds the transfer.
+    it("renders a non-button drag handle that seeds the transfer in none mode", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Drag me" })],
+        activeId: "a",
+        folders: [{ id: "f1", name: "Work", open: true }],
+        folderOf: {},
+        groupBy: "none",
+      });
+      const { container } = render(<Sidebar />);
+
+      const handle = container.querySelector<HTMLElement>(".pc-drag-handle")!;
+      expect(handle).not.toBeNull();
+      // A grip — NOT a <button> — so the press can't be swallowed by an
+      // interactive child, and it's hidden from the a11y tree (drag is mouse-only).
+      expect(handle.tagName).toBe("SPAN");
+      expect(handle.getAttribute("draggable")).toBe("true");
+      expect(handle).toHaveAttribute("aria-hidden", "true");
+
+      // The handle is its own drag source: dragStart on it records the chat id.
+      const transfer = dt("a");
+      fireEvent.dragStart(handle, { dataTransfer: transfer });
+      expect(transfer.setData).toHaveBeenCalledWith("text/pc-session", "a");
+    });
+
+    it("moves a chat into a folder when the drag starts from the grip handle", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Drag me" })],
+        activeId: "a",
+        folders: [{ id: "f1", name: "Work", open: true }],
+        folderOf: {},
+        groupBy: "none",
+      });
+      const { container } = render(<Sidebar />);
+
+      const handle = container.querySelector<HTMLElement>(".pc-drag-handle")!;
+      const transfer = dt("a");
+      fireEvent.dragStart(handle, { dataTransfer: transfer });
+
+      const folderEl = screen.getByText("Work").closest(".pc-row")!;
+      fireEvent.dragOver(folderEl, { dataTransfer: transfer });
+      fireEvent.drop(folderEl, { dataTransfer: transfer });
+      expect(useStore.getState().folderOf).toEqual({ a: "f1" });
+
+      // dragEnd from the handle clears the transient drop-target highlight.
+      fireEvent.dragEnd(handle);
+      expect(folderEl.className).not.toContain("pc-droptarget");
+    });
+
+    it("omits the drag handle in an automatic grouping mode", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Drag me" })],
+        activeId: "a",
+        groupBy: "status",
+      });
+      const { container } = render(<Sidebar />);
+
+      // Rows aren't draggable when grouped automatically, so no grip is offered.
+      expect(container.querySelector(".pc-drag-handle")).toBeNull();
+    });
+
     it("moves a chat back to loose when dropped on the list root", () => {
       useStore.setState({
         sessions: [session({ id: "a", title: "Nested" })],
@@ -1033,6 +1097,196 @@ describe("Sidebar", () => {
 
       const row = screen.getByRole("button", { name: /^Aaa/ }).closest("div")?.parentElement;
       expect(row).not.toHaveAttribute("draggable", "true");
+    });
+  });
+
+  describe("right-click context menu", () => {
+    it("opens a session menu with the common actions on right-click", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Chat A" })],
+        activeId: "a",
+      });
+      render(<Sidebar />);
+
+      const row = screen.getByRole("button", { name: /^Chat A/ }).closest("[draggable]")!;
+      fireEvent.contextMenu(row);
+
+      const menu = screen.getByRole("menu");
+      expect(within(menu).getByRole("menuitem", { name: "New chat" })).toBeInTheDocument();
+      expect(within(menu).getByRole("menuitem", { name: "Archive" })).toBeInTheDocument();
+      expect(within(menu).getByRole("menuitem", { name: "Delete" })).toBeInTheDocument();
+    });
+
+    it("archives the session from its context menu", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Chat A" })],
+        activeId: "a",
+      });
+      render(<Sidebar />);
+
+      fireEvent.contextMenu(
+        screen.getByRole("button", { name: /^Chat A/ }).closest("[draggable]")!,
+      );
+      fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
+
+      expect(useStore.getState().archivedIds).toEqual(["a"]);
+    });
+
+    it("labels the archive action Unarchive for an archived session", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Chat A" })],
+        activeId: null,
+        archivedIds: ["a"],
+      });
+      render(<Sidebar />);
+
+      fireEvent.contextMenu(
+        screen.getByRole("button", { name: /^Chat A/ }).closest("[draggable]")!,
+      );
+      expect(screen.getByRole("menuitem", { name: "Unarchive" })).toBeInTheDocument();
+    });
+
+    it("deletes the session from its context menu", async () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Keep" }), session({ id: "b", title: "Remove" })],
+        activeId: "a",
+        messages: { a: [], b: [] },
+      });
+      render(<Sidebar />);
+
+      fireEvent.contextMenu(
+        screen.getByRole("button", { name: /^Remove/ }).closest("[draggable]")!,
+      );
+      fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(m.deleteSession).toHaveBeenCalledWith("b");
+    });
+
+    it("marks the Delete item as destructive (danger styling)", () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Chat A" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.contextMenu(
+        screen.getByRole("button", { name: /^Chat A/ }).closest("[draggable]")!,
+      );
+      expect(screen.getByRole("menuitem", { name: "Delete" })).toHaveClass("pc-ctx__item--danger");
+    });
+
+    it("disables mutating session actions while a turn streams", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Chat A" })],
+        activeId: "a",
+        streaming: true,
+      });
+      render(<Sidebar />);
+
+      fireEvent.contextMenu(
+        screen.getByRole("button", { name: /^Chat A/ }).closest("[draggable]")!,
+      );
+      expect(screen.getByRole("menuitem", { name: "Delete" })).toHaveAttribute(
+        "aria-disabled",
+        "true",
+      );
+      expect(screen.getByRole("menuitem", { name: "Archive" })).toHaveAttribute(
+        "aria-disabled",
+        "true",
+      );
+    });
+
+    it("offers Move to folder items and moves the chat into the picked folder", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Chat A" })],
+        activeId: "a",
+        folders: [{ id: "f1", name: "Work", open: true }],
+        folderOf: {},
+        groupBy: "none",
+      });
+      render(<Sidebar />);
+
+      fireEvent.contextMenu(
+        screen.getByRole("button", { name: /^Chat A/ }).closest("[draggable]")!,
+      );
+      // The folder appears under a "Move to folder" heading.
+      expect(screen.getByText("Move to folder")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("menuitem", { name: "Work" }));
+
+      expect(useStore.getState().folderOf).toEqual({ a: "f1" });
+    });
+
+    it("offers Remove from folder for a chat already in one, and disables its current folder", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Chat A" })],
+        activeId: "a",
+        folders: [{ id: "f1", name: "Work", open: true }],
+        folderOf: { a: "f1" },
+        groupBy: "none",
+      });
+      render(<Sidebar />);
+
+      fireEvent.contextMenu(
+        screen.getByRole("button", { name: /^Chat A/ }).closest("[draggable]")!,
+      );
+      // The current folder is disabled (can't move where it already is).
+      expect(screen.getByRole("menuitem", { name: "Work" })).toHaveAttribute(
+        "aria-disabled",
+        "true",
+      );
+      fireEvent.click(screen.getByRole("menuitem", { name: "Remove from folder" }));
+
+      expect(useStore.getState().folderOf).toEqual({});
+    });
+
+    it("opens a folder context menu with New folder / Rename / Delete folder", () => {
+      useStore.setState({
+        sessions: [],
+        activeId: null,
+        folders: [{ id: "f1", name: "Work", open: true }],
+      });
+      render(<Sidebar />);
+
+      const folderRow = screen.getByText("Work").closest(".pc-row")!;
+      fireEvent.contextMenu(folderRow);
+
+      const menu = screen.getByRole("menu");
+      expect(within(menu).getByRole("menuitem", { name: "New folder" })).toBeInTheDocument();
+      expect(within(menu).getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
+      expect(within(menu).getByRole("menuitem", { name: "Delete folder" })).toBeInTheDocument();
+    });
+
+    it("triggers inline rename from the folder context menu", () => {
+      useStore.setState({ folders: [{ id: "f1", name: "Work", open: true }] });
+      render(<Sidebar />);
+
+      fireEvent.contextMenu(screen.getByText("Work").closest(".pc-row")!);
+      fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
+
+      // The inline rename editor appears, pre-filled with the folder name.
+      expect(screen.getByRole("textbox", { name: "Folder name" })).toHaveValue("Work");
+    });
+
+    it("deletes a folder from its context menu", () => {
+      useStore.setState({ folders: [{ id: "f1", name: "Work", open: true }] });
+      render(<Sidebar />);
+
+      fireEvent.contextMenu(screen.getByText("Work").closest(".pc-row")!);
+      fireEvent.click(screen.getByRole("menuitem", { name: "Delete folder" }));
+
+      expect(useStore.getState().folders).toHaveLength(0);
+    });
+
+    it("offers New chat / New folder from the empty list background", () => {
+      useStore.setState({ sessions: [], activeId: null, groupBy: "none" });
+      render(<Sidebar />);
+
+      const nav = screen.getByRole("navigation", { name: "Session list" });
+      fireEvent.contextMenu(nav);
+
+      const menu = screen.getByRole("menu");
+      expect(within(menu).getByRole("menuitem", { name: "New chat" })).toBeInTheDocument();
+      expect(within(menu).getByRole("menuitem", { name: "New folder" })).toBeInTheDocument();
     });
   });
 
