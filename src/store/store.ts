@@ -332,17 +332,29 @@ const applyBackgroundEvent = (
 // across turns: a `background_task_finished` can land long after the launching
 // turn's per-turn listener was disposed. Each subscription folds ONLY background
 // events into `backgroundTasks` (the per-turn listener still owns the turn's own
-// deltas, so there is no double-handling). Inert in the browser/phone (the ipc
-// subscribe is a no-op off Tauri); the phone tracks background tasks via frames.
+// deltas, so there is no double-handling). Installed only on a DESKTOP that drives
+// its own local agent — never in remote mode (see `ensureBackgroundListener`); the
+// phone/remote client tracks background tasks via forwarded frames instead.
 const bgListeners = new Map<string, () => void>();
 
-// Ensure a persistent background-task listener exists for `sessionId`. Idempotent:
-// the synchronous reservation guards against a double-subscribe across the await,
-// and a teardown that lands mid-subscribe is honoured (the just-created listener
-// is torn down rather than leaked).
+// Ensure a persistent background-task listener exists for `sessionId`.
+//
+// Skipped entirely in remote mode: the phone (and a desktop acting as a remote
+// client) receives background events as forwarded frames, so a local
+// `agent://{session}` Tauri listener there would be inert AND leak for the app's
+// lifetime (nothing emits on that channel, and teardown only runs on delete). The
+// other call sites (init/newSession) already early-return in remote mode; this is
+// the central guard that also covers selectSession.
+//
+// Idempotent and race-safe: a UNIQUE reservation token is stored synchronously
+// (re-entry guard), and the slot is only CLAIMED after the await if it is still
+// that same token — so a teardown, or a fresh reservation, that lands mid-subscribe
+// can't be clobbered (we tear our own just-created listener down instead).
 const ensureBackgroundListener = async (sessionId: string): Promise<void> => {
+  if (useStore.getState().remoteMode) return;
   if (bgListeners.has(sessionId)) return;
-  bgListeners.set(sessionId, () => {}); // reserve synchronously (re-entry guard)
+  const token = () => {};
+  bgListeners.set(sessionId, token); // reserve synchronously (re-entry guard)
   let unlisten: () => void;
   try {
     unlisten = await ipc.subscribeSessionEvents(sessionId, (e) =>
@@ -351,11 +363,14 @@ const ensureBackgroundListener = async (sessionId: string): Promise<void> => {
       })),
     );
   } catch {
-    bgListeners.delete(sessionId); // subscribe failed — drop the reservation
+    // Subscribe failed — release only OUR reservation (a concurrent retry may have
+    // already replaced it), never another's.
+    if (bgListeners.get(sessionId) === token) bgListeners.delete(sessionId);
     return;
   }
-  if (!bgListeners.has(sessionId)) {
-    // A teardown ran during the await (the reservation is gone) — honour it.
+  if (bgListeners.get(sessionId) !== token) {
+    // A teardown removed our reservation, or a newer ensure replaced it, during the
+    // await — tear our just-created listener down rather than leak or clobber it.
     unlisten();
     return;
   }
@@ -366,6 +381,16 @@ const teardownBackgroundListener = (sessionId: string): void => {
   const unlisten = bgListeners.get(sessionId);
   if (unlisten) unlisten();
   bgListeners.delete(sessionId);
+};
+
+// Tear down EVERY desktop persistent background-task listener. Called when a device
+// dials into remote-client mode (the persistent path must never coexist with the
+// remote-frame path on one device, which would otherwise re-populate the just-reset
+// `backgroundTasks` map). Exported so tests can reset the module-scoped registry
+// between cases.
+export const teardownAllBackgroundListeners = (): void => {
+  bgListeners.forEach((unlisten) => unlisten());
+  bgListeners.clear();
 };
 
 // A turn must always reach a terminal state. If the backend hangs or dies without
@@ -1277,6 +1302,12 @@ export const useStore = create<AppState>((set, get) => ({
     // connect can never leave two live listeners feeding the store.
     const prev = get().remoteUnlisten;
     if (prev) prev();
+    // Entering remote-client mode: drop any desktop persistent background-task
+    // listeners this device installed while driving its own local agent, so they
+    // can't fire and re-populate the `backgroundTasks` map we reset just below (the
+    // remote path tracks tasks via frames instead). A no-op on the phone, which
+    // never installs them.
+    teardownAllBackgroundListeners();
     // A fresh dial is unverified until the user compares the new SAS.
     // Reset connection AND turn state. A fresh dial / reconnect must never inherit a
     // stale `streaming`/`pendingPermission` from a turn the previous session left

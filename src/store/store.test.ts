@@ -13,7 +13,7 @@ import {
   type SyncFrame,
 } from "../types";
 import * as ipc from "../lib/ipc";
-import { useStore } from "./store";
+import { teardownAllBackgroundListeners, useStore } from "./store";
 
 // The store is the app's brain: it orchestrates the IPC bridge and folds the
 // agent's streamed events into renderable message blocks. We mock the IPC layer
@@ -2360,6 +2360,11 @@ describe("background shell tasks (background-tasks panel)", () => {
     event,
   });
 
+  // The desktop listener registry (`bgListeners`) is module-scoped, so it leaks
+  // across tests; clear it before each so subscribe/idempotency assertions start
+  // from a clean slate (mirrors the store reset in the global beforeEach).
+  beforeEach(() => teardownAllBackgroundListeners());
+
   it("tracks a background task's lifecycle: started → finished (ok)", () => {
     useStore.setState({ activeId: "a", backgroundTasks: {} });
     const f = useStore.getState().applyFrame;
@@ -2536,5 +2541,98 @@ describe("background shell tasks (background-tasks panel)", () => {
     await flush();
     const calls = m.subscribeSessionEvents.mock.calls.filter((c) => c[0] === "bgt-fail");
     expect(calls).toHaveLength(2);
+  });
+
+  it("installs at most one persistent listener per session (idempotent)", async () => {
+    m.subscribeSessionEvents.mockResolvedValue(() => {});
+    useStore.setState({
+      sessions: [session({ id: "bgt-idem" })],
+      activeId: "bgt-idem",
+      messages: { "bgt-idem": [] },
+    });
+    await useStore.getState().selectSession("bgt-idem");
+    await flush();
+    await useStore.getState().selectSession("bgt-idem");
+    await flush();
+    const calls = m.subscribeSessionEvents.mock.calls.filter((c) => c[0] === "bgt-idem");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("never installs a desktop listener in remote mode (the phone uses frames)", async () => {
+    useStore.setState({
+      remoteMode: true,
+      sessions: [session({ id: "bgt-remote" })],
+      activeId: "bgt-remote",
+      messages: { "bgt-remote": [] },
+    });
+    await useStore.getState().selectSession("bgt-remote");
+    await flush();
+    const calls = m.subscribeSessionEvents.mock.calls.filter((c) => c[0] === "bgt-remote");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("honours a teardown that lands while the subscribe is still in flight", async () => {
+    // The subscribe stays pending until we resolve it by hand, so we can interleave
+    // a teardown (deleteSession) in the gap — the documented race. The just-resolved
+    // listener must tear itself down (its reservation is gone), not leak.
+    let resolveSub!: (un: () => void) => void;
+    m.subscribeSessionEvents.mockImplementation(
+      () => new Promise<() => void>((r) => (resolveSub = r)),
+    );
+    useStore.setState({
+      sessions: [session({ id: "bgt-race" }), session({ id: "bgt-keep" })],
+      activeId: "bgt-race",
+      messages: { "bgt-race": [], "bgt-keep": [] },
+    });
+    void useStore.getState().selectSession("bgt-race"); // starts the (pending) subscribe
+    await flush();
+    await useStore.getState().deleteSession("bgt-race"); // teardown before it resolves
+
+    const unlisten = vi.fn();
+    resolveSub(unlisten); // the subscribe finally resolves...
+    await flush();
+    expect(unlisten).toHaveBeenCalled(); // ...and the orphaned listener tore itself down
+  });
+
+  it("tears down desktop listeners when the device dials into remote mode", async () => {
+    const unlisten = vi.fn();
+    m.subscribeSessionEvents.mockResolvedValue(unlisten);
+    useStore.setState({
+      sessions: [session({ id: "bgt-conn" })],
+      activeId: "bgt-conn",
+      messages: { "bgt-conn": [] },
+    });
+    await useStore.getState().selectSession("bgt-conn"); // desktop installs the listener
+    await flush();
+    await useStore.getState().connectRemote("qr");
+    expect(unlisten).toHaveBeenCalled(); // the persistent path is dropped on going remote
+  });
+
+  it("the per-turn listener ignores background events (the persistent listener owns them)", async () => {
+    // During a turn BOTH listeners receive every `agent://{session}` event; only the
+    // persistent one must act on background events. Drive a background event through
+    // the per-turn onEvent and assert it changes nothing — no double-count.
+    let perTurn!: (e: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      perTurn = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
+    useStore.setState({
+      sessions: [session({ id: "bgt-turn" })],
+      activeId: "bgt-turn",
+      messages: { "bgt-turn": [] },
+    });
+    await useStore.getState().send("go");
+
+    perTurn({ type: "background_task_started", id: "t1", command: "serve" });
+    perTurn({
+      type: "background_task_finished",
+      id: "t1",
+      command: "serve",
+      exitCode: 0,
+      output: "",
+    });
+    // The per-turn listener has no background case → background state is untouched.
+    expect(useStore.getState().backgroundTasks["bgt-turn"]).toBeUndefined();
   });
 });
