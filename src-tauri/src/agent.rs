@@ -11,7 +11,7 @@ use tauri::AppHandle;
 use uuid::Uuid;
 
 use crate::db::{self, Db};
-use crate::llm::{self, Block, ChatMessage, LlmProvider, StreamEvent};
+use crate::llm::{self, Block, ChatMessage, StreamEvent};
 use crate::oauth;
 use crate::permissions::{self, Decision, Pending};
 use crate::secrets::{self, Credential};
