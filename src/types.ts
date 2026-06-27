@@ -267,7 +267,11 @@ export type SyncFrame =
   | { t: "live"; session_id: string; event: StreamEvent }
   | { t: "command"; command: RemoteCommand }
   | { t: "ack"; session_id: string; seq: number }
-  | { t: "hello"; device_id: string; cursors: { sessionId: string; seq: number }[] };
+  | { t: "hello"; device_id: string; cursors: { sessionId: string; seq: number }[] }
+  // The desktop declined the pairing (SAS mismatch / user reject). The phone must
+  // stop: it drops the session and shows a "rejected on the other device" notice.
+  // `reason` is an optional human-readable note; absent/null when none was given.
+  | { t: "pairing_reject"; reason?: string | null };
 
 // Anthropic list prices, USD per million tokens (input / output).
 export const MODEL_PRICING: Record<string, { in: number; out: number }> = {

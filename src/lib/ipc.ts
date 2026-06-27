@@ -20,6 +20,7 @@ import {
   webOnPhoneSyncFrame,
   webPhoneSyncConnect,
   webPhoneSyncDisconnect,
+  webPhoneSyncReject,
   webPhoneSyncSendCommand,
 } from "./webSession";
 
@@ -217,6 +218,26 @@ export async function phoneSyncDisconnect(): Promise<void> {
     return;
   }
   if (webClientActive()) return webPhoneSyncDisconnect();
+  return mock.phoneSyncDisconnect();
+}
+
+/**
+ * Decline the pairing from the phone: send a `pairing_reject` frame to the desktop
+ * (so it learns the SAS was rejected, not merely that the link dropped), then tear
+ * the session down. Idempotent.
+ *
+ * In web-client mode this routes to the wasm transport's `reject` (the carrier of
+ * the new `pairing_reject` frame). On native (Tauri) the reject-frame protocol is a
+ * web/wasm concern, so we fall back to the existing `phone_sync_disconnect` command,
+ * which safely closes the channel.
+ */
+export async function phoneSyncReject(): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("phone_sync_disconnect");
+    return;
+  }
+  if (webClientActive()) return webPhoneSyncReject();
   return mock.phoneSyncDisconnect();
 }
 

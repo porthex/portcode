@@ -38,6 +38,7 @@ vi.mock("../lib/ipc", () => ({
   phoneSyncConnect: vi.fn(),
   phoneSyncSendCommand: vi.fn(),
   phoneSyncDisconnect: vi.fn(),
+  phoneSyncReject: vi.fn(),
   onPhoneSyncFrame: vi.fn(),
   onPhoneSyncDisconnected: vi.fn(),
   onPhoneSyncPairingRequest: vi.fn(),
@@ -90,6 +91,7 @@ beforeEach(() => {
   m.phoneSyncConnect.mockResolvedValue({ sas: "SAS-1", peerPublicKey: "PEER==" });
   m.phoneSyncSendCommand.mockResolvedValue(undefined);
   m.phoneSyncDisconnect.mockResolvedValue(undefined);
+  m.phoneSyncReject.mockResolvedValue(undefined);
   m.onPhoneSyncFrame.mockResolvedValue(() => {});
   m.onPhoneSyncDisconnected.mockResolvedValue(() => {});
   m.onPhoneSyncPairingRequest.mockResolvedValue(() => {});
@@ -1519,6 +1521,45 @@ describe("remote client", () => {
       expect(after.messages).toBe(before.messages);
       expect(after.activeId).toBe(before.activeId);
     });
+
+    it("pairing_reject drops the session and marks it rejected (REACT: desktop declined)", () => {
+      const unlisten = vi.fn();
+      useStore.setState({
+        remoteConnected: true,
+        remoteVerified: true,
+        remoteSas: "SAS-1",
+        remotePeerKey: "PEER==",
+        remoteChatOpen: true,
+        lastPairingQr: "QR",
+        remoteUnlisten: unlisten,
+        streaming: true,
+      });
+
+      useStore.getState().applyFrame({ t: "pairing_reject", reason: "Codes didn't match" });
+
+      // The frame subscription is torn down (the desktop closed the door).
+      expect(unlisten).toHaveBeenCalledTimes(1);
+      const st = useStore.getState();
+      expect(st.remoteRejected).toBe(true);
+      expect(st.remoteRejectReason).toBe("Codes didn't match");
+      expect(st.remoteConnected).toBe(false);
+      expect(st.remoteVerified).toBe(false);
+      expect(st.remoteSas).toBeNull();
+      expect(st.remoteChatOpen).toBe(false);
+      expect(st.streaming).toBe(false);
+      // A rejected desktop is forgotten (no one-tap reconnect into it).
+      expect(st.lastPairingQr).toBeNull();
+    });
+
+    it("pairing_reject with no reason sets a null reason", () => {
+      useStore.setState({ remoteConnected: true, remoteSas: "SAS-1" });
+
+      useStore.getState().applyFrame({ t: "pairing_reject" });
+
+      const st = useStore.getState();
+      expect(st.remoteRejected).toBe(true);
+      expect(st.remoteRejectReason).toBeNull();
+    });
   });
 
   describe("live stream reducer", () => {
@@ -1702,6 +1743,57 @@ describe("remote client", () => {
 
       expect(useStore.getState().remoteVerified).toBe(true);
     });
+
+    it("confirmRemoteSas is a no-op once the pairing was rejected", () => {
+      // A stale Confirm click (e.g. an inbound desktop reject landed first) must not
+      // re-open a session the reject already closed.
+      useStore.setState({ remoteRejected: true, remoteVerified: false });
+
+      useStore.getState().confirmRemoteSas();
+
+      expect(useStore.getState().remoteVerified).toBe(false);
+    });
+  });
+
+  describe("rejectRemoteSas", () => {
+    it("rejects a live connection: sends the reject, tears down, and marks rejected", async () => {
+      const unlisten = vi.fn();
+      useStore.setState({
+        remoteConnected: true,
+        remoteVerified: true,
+        remoteSas: "SAS-1",
+        remotePeerKey: "PEER==",
+        remoteChatOpen: true,
+        lastPairingQr: "QR",
+        remoteUnlisten: unlisten,
+      });
+
+      await useStore.getState().rejectRemoteSas();
+
+      // The reject frame goes out over the link (not a bare disconnect).
+      expect(m.phoneSyncReject).toHaveBeenCalledTimes(1);
+      expect(m.phoneSyncDisconnect).not.toHaveBeenCalled();
+      // The frame subscription was torn down.
+      expect(unlisten).toHaveBeenCalledTimes(1);
+      const st = useStore.getState();
+      expect(st.remoteRejected).toBe(true);
+      expect(st.remoteConnected).toBe(false);
+      expect(st.remoteVerified).toBe(false);
+      expect(st.remoteSas).toBeNull();
+      expect(st.remotePeerKey).toBeNull();
+      expect(st.remoteChatOpen).toBe(false);
+      // The remembered pairing is forgotten — a rejected desktop isn't offered reconnect.
+      expect(st.lastPairingQr).toBeNull();
+    });
+
+    it("from a not-connected state, just sets rejected without reaching the channel", async () => {
+      useStore.setState({ remoteConnected: false });
+
+      await useStore.getState().rejectRemoteSas();
+
+      expect(m.phoneSyncReject).not.toHaveBeenCalled();
+      expect(useStore.getState().remoteRejected).toBe(true);
+    });
   });
 
   describe("connectRemote", () => {
@@ -1746,6 +1838,19 @@ describe("remote client", () => {
       await useStore.getState().connectRemote("QR");
 
       expect(useStore.getState().remoteVerified).toBe(false);
+    });
+
+    it("clears a prior rejection on a fresh dial", async () => {
+      // A re-pair must start clean — a lingering "rejected" notice can't carry over
+      // into a new connection attempt.
+      useStore.setState({ remoteRejected: true, remoteRejectReason: "old reason" });
+
+      await useStore.getState().connectRemote("QR");
+
+      const st = useStore.getState();
+      expect(st.remoteRejected).toBe(false);
+      expect(st.remoteRejectReason).toBeNull();
+      expect(st.remoteConnected).toBe(true);
     });
 
     it("records the error and stays disconnected when the dial fails", async () => {

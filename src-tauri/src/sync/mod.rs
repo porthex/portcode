@@ -99,6 +99,27 @@ impl SyncHub {
             .to_string();
         self.tx.send(SyncFrame::Live { session_id, event }).is_ok()
     }
+
+    /// Publish an arbitrary [`SyncFrame`] to attached sync sessions. Returns `true`
+    /// if it reached at least one subscriber.
+    ///
+    /// Unlike [`publish`](Self::publish) (which wraps an agent event into a `Live`
+    /// frame), this forwards a fully-formed frame as-is — used to re-push a fresh
+    /// `SessionList` when the session set changes (e.g. a phone `CreateSession`), so
+    /// a created session becomes visible on the phone WITHOUT waiting for the next
+    /// reconnect/catch-up. The same `receiver_count()` fast-path applies: a no-op
+    /// when no phone is attached.
+    // DESKTOP-ONLY: the only caller is the desktop sync SERVER's command handler
+    // (`server::DesktopCommandHandler`, itself `#[cfg(desktop)]`). Gating it here
+    // keeps the mobile build (which never serves) free of an unused method under
+    // `-D warnings`.
+    #[cfg(desktop)]
+    pub fn publish_frame(&self, frame: SyncFrame) -> bool {
+        if self.subscriber_count() == 0 {
+            return false;
+        }
+        self.tx.send(frame).is_ok()
+    }
 }
 
 /// The single sanctioned way to emit a live agent event.
