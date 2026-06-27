@@ -18,17 +18,33 @@ pub struct ToolCtx {
     /// the primary guard. Implemented by the agent runtime so tools never depend on
     /// the agent loop internals; they only know this trait.
     pub spawner: Option<Arc<dyn Spawner>>,
+    /// Adopts a `shell` command launched in the background (`shell` with
+    /// `background: true`). `None` when this run can't background — the tool then
+    /// reports that background mode is unavailable rather than blocking.
+    pub background: Option<Arc<dyn BackgroundRunner>>,
 }
 
 impl ToolCtx {
-    /// A context with no spawner — read-only / no-subagent runs, and the default
-    /// in tests. The interactive run attaches a spawner via the struct literal.
+    /// A context with no spawner / background runner — read-only runs and the
+    /// default in tests. The interactive run attaches them via field assignment.
     pub fn new(workspace: PathBuf) -> Self {
         Self {
             workspace,
             spawner: None,
+            background: None,
         }
     }
+}
+
+/// What the `shell` tool needs to launch a long-running command in the background,
+/// without knowing how a run is wired. Implemented by `agent::BackgroundLauncher`,
+/// which owns the process lifecycle: it waits for the child off-thread, reports
+/// start/finish via stream events, and lets a session Stop kill it. The tool
+/// builds and spawns the child; the runner ADOPTS it.
+pub trait BackgroundRunner: Send + Sync {
+    /// Adopt an already-spawned background process, returning a short task id. The
+    /// runner waits for the child elsewhere and announces completion itself.
+    fn launch(&self, command: String, child: tokio::process::Child) -> String;
 }
 
 /// What the [`Task`] tool needs to launch a subagent, without knowing how a run
@@ -691,6 +707,62 @@ fn shell_invocation(shell: &str) -> Result<(&'static str, &'static [&'static str
     }
 }
 
+/// Build the configured shell command (program + leading args, workspace cwd,
+/// piped stdout/stderr, kill-on-drop, and the Windows no-console-window flag),
+/// shared by the foreground `shell` run and a background launch so both behave
+/// identically.
+fn build_shell_command(
+    command: &str,
+    shell: &str,
+    workspace: &Path,
+) -> Result<tokio::process::Command, String> {
+    let (program, leading_args) = shell_invocation(shell)?;
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(leading_args)
+        .arg(command)
+        .current_dir(workspace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    // Windows: stop a console window from flashing open every time the agent runs a
+    // shell command. Spawning a console-subsystem exe (powershell/pwsh/cmd) from the
+    // GUI app otherwise allocates a new console; CREATE_NO_WINDOW suppresses it.
+    // `creation_flags` is tokio's own inherent (safe) method — no trait import — so
+    // this respects `unsafe_code = "deny"` and the cfg-gate compiles to nothing on
+    // Linux CI.
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    Ok(cmd)
+}
+
+/// Format a finished process's combined stdout/stderr and exit code into the
+/// agent-facing result string. Shared by the foreground run and the background
+/// waiter so both report identically.
+pub(crate) fn format_shell_output(out: &std::process::Output) -> String {
+    let mut buf = String::new();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !stdout.trim().is_empty() {
+        buf.push_str(&stdout);
+    }
+    if !stderr.trim().is_empty() {
+        if !buf.is_empty() {
+            buf.push('\n');
+        }
+        buf.push_str("[stderr]\n");
+        buf.push_str(&stderr);
+    }
+    let code = out.status.code().unwrap_or(-1);
+    if buf.trim().is_empty() {
+        buf = "(no output)".into();
+    }
+    format!("{}\n\n[exit code {code}]", truncate_chars(buf, 100_000))
+}
+
 #[async_trait]
 impl Tool for Shell {
     fn name(&self) -> &'static str {
@@ -701,7 +773,9 @@ impl Tool for Shell {
          powershell.exe); set `shell` to \"pwsh\" for PowerShell 7+ or \"cmd\" for the legacy \
          Windows command prompt. PowerShell and cmd differ in quoting, path, and exit-code \
          semantics, so write the command for the shell you select. Returns combined stdout/stderr \
-         and the exit code."
+         and the exit code. Set `background: true` for a long-running command (server, build, \
+         watcher): it returns immediately with a task id and reports its result when it finishes, \
+         instead of blocking."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -712,6 +786,10 @@ impl Tool for Shell {
                     "type": "string",
                     "enum": ["powershell", "pwsh", "cmd"],
                     "description": "Shell to run the command in. \"powershell\" = Windows PowerShell 5.1 (default), \"pwsh\" = PowerShell 7+, \"cmd\" = legacy command prompt."
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Run in the background: return immediately with a task id and report the result when the command finishes, rather than blocking (use for servers/builds/watchers). Default false."
                 }
             },
             "required": ["command"]
@@ -726,58 +804,42 @@ impl Tool for Shell {
             .get("shell")
             .and_then(|v| v.as_str())
             .unwrap_or("powershell");
-        let (program, leading_args) = shell_invocation(shell)?;
+        let background = input
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(leading_args)
-            .arg(command)
-            .current_dir(&ctx.workspace)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        // Resolve the background runner BEFORE spawning, so an unavailable
+        // background mode errors without leaving an orphan process.
+        let runner = if background {
+            Some(
+                ctx.background
+                    .as_ref()
+                    .ok_or_else(|| "Background tasks are not available in this run.".to_string())?,
+            )
+        } else {
+            None
+        };
 
-        // Windows: stop a console window from flashing open every time the agent runs
-        // a shell command. Spawning a console-subsystem exe (powershell/pwsh/cmd) from
-        // the GUI app otherwise allocates a new console; CREATE_NO_WINDOW suppresses it.
-        // `creation_flags` is tokio's own inherent (safe) Command method — no trait
-        // import needed — so this respects `unsafe_code = "deny"` and the cfg-gate
-        // compiles to nothing on Linux CI.
-        #[cfg(windows)]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-
+        let mut cmd = build_shell_command(command, shell, &ctx.workspace)?;
         let child = cmd
             .spawn()
             .map_err(|e| format!("failed to start {shell}: {e}"))?;
+
+        if let Some(runner) = runner {
+            // Hand the live child to the runner; it waits and reports completion.
+            let id = runner.launch(command.to_string(), child);
+            return Ok(format!(
+                "Started background task {id}: {command}\nIt runs without blocking; \
+                 its result is reported when it finishes."
+            ));
+        }
 
         let out = tokio::time::timeout(Duration::from_secs(120), child.wait_with_output())
             .await
             .map_err(|_| "command timed out after 120s".to_string())?
             .map_err(|e| format!("command failed: {e}"))?;
-
-        let mut buf = String::new();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if !stdout.trim().is_empty() {
-            buf.push_str(&stdout);
-        }
-        if !stderr.trim().is_empty() {
-            if !buf.is_empty() {
-                buf.push('\n');
-            }
-            buf.push_str("[stderr]\n");
-            buf.push_str(&stderr);
-        }
-        let code = out.status.code().unwrap_or(-1);
-        if buf.trim().is_empty() {
-            buf = "(no output)".into();
-        }
-        Ok(format!(
-            "{}\n\n[exit code {code}]",
-            truncate_chars(buf, 100_000)
-        ))
+        Ok(format_shell_output(&out))
     }
 }
 
@@ -1132,6 +1194,60 @@ mod tests {
     }
 
     #[test]
+    fn build_shell_command_rejects_an_unknown_shell_and_accepts_known_ones() {
+        // Propagates the shell_invocation error (no process is spawned here).
+        assert!(build_shell_command("echo hi", "bash", Path::new(".")).is_err());
+        assert!(build_shell_command("echo hi", "cmd", Path::new(".")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn shell_background_without_a_runner_reports_unavailable_without_spawning() {
+        // background=true on a ctx with no BackgroundRunner must fail closed BEFORE
+        // building/spawning anything (so it's safe to assert cross-platform — no
+        // PowerShell needed on Linux CI).
+        let ctx = ToolCtx::new(base());
+        let err = Shell
+            .run(json!({ "command": "echo hi", "background": true }), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not available"), "got: {err}");
+    }
+
+    // `std::process::Output` can only be hand-built with a raw exit status on Unix,
+    // and CI's coverage run is Linux, so gate this to unix. The formatting logic
+    // itself is platform-agnostic.
+    #[cfg(unix)]
+    #[test]
+    fn format_shell_output_combines_streams_marks_stderr_and_shows_exit_code() {
+        use std::os::unix::process::ExitStatusExt;
+        let ok = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"hello\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        let s = format_shell_output(&ok);
+        assert!(s.contains("hello"));
+        assert!(s.contains("[exit code 0]"));
+        assert!(!s.contains("[stderr]")); // no stderr → no label
+
+        let with_err = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: b"boom\n".to_vec(),
+        };
+        let s2 = format_shell_output(&with_err);
+        assert!(s2.contains("[stderr]"));
+        assert!(s2.contains("boom"));
+
+        let empty = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert!(format_shell_output(&empty).contains("(no output)"));
+    }
+
+    #[test]
     fn unified_diff_marks_added_and_removed_lines() {
         let d = unified_diff("a\nb\n", "a\nc\n");
         assert!(d.contains("-b"));
@@ -1235,6 +1351,7 @@ mod tests {
         let ctx = ToolCtx {
             workspace: base(),
             spawner: Some(Arc::new(RecordingSpawner { seen: seen.clone() })),
+            background: None,
         };
         let out = Task
             .run(

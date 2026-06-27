@@ -151,6 +151,21 @@ pub enum StreamEvent {
         agent_id: String,
         status: String,
     },
+    /// A `shell` command was launched in the background (the `background` mode).
+    BackgroundTaskStarted {
+        id: String,
+        command: String,
+    },
+    /// A background `shell` command finished. Emitted on the SESSION channel — it
+    /// can arrive AFTER the launching turn ended, so it is delivered to a persistent
+    /// session listener rather than the per-turn one.
+    BackgroundTaskFinished {
+        id: String,
+        command: String,
+        #[serde(rename = "exitCode")]
+        exit_code: i32,
+        output: String,
+    },
 }
 
 #[derive(Debug)]

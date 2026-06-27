@@ -17,6 +17,7 @@ use tauri::AppHandle;
 
 use crate::agent;
 use crate::agents;
+use crate::background;
 use crate::db::{self, Db};
 use crate::permissions::{self, Decision, Pending};
 use crate::settings::Settings;
@@ -36,6 +37,7 @@ pub struct DesktopCommandHandler {
     pub cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     pub pending: Pending,
     pub agents: agents::Agents,
+    pub background: background::Background,
     pub oauth_refresh: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -69,6 +71,7 @@ impl CommandHandler for DesktopCommandHandler {
                 let cancels = self.cancels.clone();
                 let pending = self.pending.clone();
                 let agents = self.agents.clone();
+                let background = self.background.clone();
                 let oauth_refresh = self.oauth_refresh.clone();
                 tauri::async_runtime::spawn(async move {
                     agent::run(
@@ -79,6 +82,7 @@ impl CommandHandler for DesktopCommandHandler {
                         cancels,
                         pending,
                         agents,
+                        background,
                         oauth_refresh,
                         session_id,
                         text,
@@ -95,6 +99,7 @@ impl CommandHandler for DesktopCommandHandler {
                     flag.store(true, Ordering::Relaxed);
                 }
                 agents::cancel_session(&self.agents, &session_id);
+                background::cancel_session(&self.background, &session_id);
                 permissions::deny_all(&self.pending, &session_id);
                 Ok(())
             }
