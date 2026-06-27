@@ -669,6 +669,7 @@ export const useStore = create<AppState>((set, get) => ({
               tool: e.tool,
               summary: e.summary,
               input: e.input,
+              diff: e.diff,
             },
           });
           break;
@@ -1346,7 +1347,13 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       // when that session is active, so a background permission never hijacks the
       // visible gate (the user would otherwise answer it blind).
       setRun(set, sessionId, {
-        pendingPermission: { id: e.id, tool: e.tool, summary: e.summary, input: e.input },
+        pendingPermission: {
+          id: e.id,
+          tool: e.tool,
+          summary: e.summary,
+          input: e.input,
+          diff: e.diff,
+        },
       });
       break;
     case "usage":

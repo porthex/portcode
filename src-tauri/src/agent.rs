@@ -463,6 +463,9 @@ async fn run_inner(
                     let (output, is_error) = match registry.find(name) {
                         Some(tool) => {
                             let decision = if tool.mutating() {
+                                // Compute the pre-apply diff (fs_write/fs_edit) so
+                                // the prompt can show the change BEFORE it's written.
+                                let diff = tool.preview(input, &ctx).await;
                                 permissions::gate(
                                     app,
                                     channel,
@@ -474,6 +477,7 @@ async fn run_inner(
                                     name,
                                     &tool.summarize(input, &ctx),
                                     input,
+                                    diff,
                                 )
                                 .await
                             } else {

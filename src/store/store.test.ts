@@ -501,9 +501,17 @@ describe("send", () => {
     emit({ type: "usage", inputTokens: 10, outputTokens: 5 });
     expect(useStore.getState().usage.a).toEqual({ input: 110, output: 45 });
 
-    // a permission request surfaces as a pending prompt
-    emit({ type: "permission_request", id: "p1", tool: "fs_edit", summary: "x", input: {} });
+    // a permission request surfaces as a pending prompt, carrying its diff
+    emit({
+      type: "permission_request",
+      id: "p1",
+      tool: "fs_edit",
+      summary: "x",
+      input: {},
+      diff: "-a\n+b\n",
+    });
     expect(useStore.getState().pendingPermission?.id).toBe("p1");
+    expect(useStore.getState().pendingPermission?.diff).toBe("-a\n+b\n");
 
     // turn_end clears streaming + any pending prompt
     emit({ type: "turn_end", stopReason: "end_turn" });
@@ -1662,13 +1670,20 @@ describe("remote client", () => {
       expect(useStore.getState().messages.s1).toBeUndefined();
     });
 
-    it("permission_request surfaces a pending prompt for the active session", () => {
+    it("permission_request surfaces a pending prompt (with its diff) for the active session", () => {
       useStore.setState({ activeId: "s1" });
 
       useStore.getState().applyFrame({
         t: "live",
         session_id: "s1",
-        event: { type: "permission_request", id: "p1", tool: "fs_edit", summary: "x", input: {} },
+        event: {
+          type: "permission_request",
+          id: "p1",
+          tool: "fs_edit",
+          summary: "x",
+          input: {},
+          diff: "-a\n+b\n",
+        },
       });
 
       expect(useStore.getState().pendingPermission).toEqual({
@@ -1676,6 +1691,7 @@ describe("remote client", () => {
         tool: "fs_edit",
         summary: "x",
         input: {},
+        diff: "-a\n+b\n",
       });
     });
 

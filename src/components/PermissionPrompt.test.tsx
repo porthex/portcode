@@ -174,6 +174,26 @@ describe("PermissionPrompt", () => {
     expect(useStore.getState().pendingPermission).toBeNull();
   });
 
+  it("renders the pre-apply diff when one is attached to the request", () => {
+    useStore.setState({
+      pendingPermission: pending({ diff: "--- a\n+++ b\n-old line\n+new line\n" }),
+    });
+
+    render(<PermissionPrompt />);
+
+    expect(screen.getByLabelText("Proposed change")).toBeInTheDocument();
+    expect(screen.getByText("-old line")).toBeInTheDocument();
+    expect(screen.getByText("+new line")).toBeInTheDocument();
+  });
+
+  it("shows no diff block when the request has no diff (e.g. a shell command)", () => {
+    useStore.setState({ pendingPermission: pending() });
+
+    render(<PermissionPrompt />);
+
+    expect(screen.queryByLabelText("Proposed change")).not.toBeInTheDocument();
+  });
+
   it("restores focus to the Chat log region when the prompt clears mid-turn", () => {
     const log = mountLogRegion();
     useStore.setState({ pendingPermission: pending(), remoteMode: false });
