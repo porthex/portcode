@@ -483,13 +483,43 @@ describe("renameSession", () => {
     expect(useStore.getState().sessions[0].title).toBe("A");
   });
 
-  it("reverts the optimistic title and surfaces an error when the write fails", async () => {
+  it("reverts the optimistic title on a failed write WITHOUT hijacking the init panel", async () => {
     m.renameSession.mockRejectedValueOnce(new Error("locked db"));
     useStore.setState({ sessions: [session({ id: "a", title: "Original" })], activeId: "a" });
     await useStore.getState().renameSession("a", "Doomed");
     const st = useStore.getState();
-    expect(st.sessions[0].title).toBe("Original"); // reverted
-    expect(st.initError).toMatch(/locked db/);
+    expect(st.sessions[0].title).toBe("Original"); // reverted — the visible signal
+    // A per-row rename failure must NOT route through initError (the full-screen
+    // "Couldn't start Portcode" panel, which would wipe a populated conversation).
+    expect(st.initError).toBeNull();
+  });
+
+  it("a failing revert does not clobber a title changed during the in-flight write", async () => {
+    // The write is pending; meanwhile a newer title lands (a second rename / a
+    // send()-derived title). When the write then fails, the revert must be a no-op.
+    let reject!: (e: unknown) => void;
+    m.renameSession.mockImplementationOnce(() => new Promise((_, rej) => (reject = rej)));
+    useStore.setState({ sessions: [session({ id: "a", title: "Original" })], activeId: "a" });
+    const pending = useStore.getState().renameSession("a", "Optimistic");
+    // A newer write supersedes the optimistic title before the IPC settles.
+    useStore.setState((st) => ({
+      sessions: st.sessions.map((s) => (s.id === "a" ? { ...s, title: "Newer" } : s)),
+    }));
+    reject(new Error("boom"));
+    await pending;
+    // The revert saw the title was no longer "Optimistic", so "Newer" survives.
+    expect(useStore.getState().sessions[0].title).toBe("Newer");
+  });
+
+  it("does not rename mid-stream (a turn is in flight)", async () => {
+    useStore.setState({
+      sessions: [session({ id: "a", title: "Busy" })],
+      activeId: "a",
+      streaming: true,
+    });
+    await useStore.getState().renameSession("a", "Nope");
+    expect(m.renameSession).not.toHaveBeenCalled();
+    expect(useStore.getState().sessions[0].title).toBe("Busy");
   });
 
   it("does not rename in remote mode (the phone has no rename command)", async () => {

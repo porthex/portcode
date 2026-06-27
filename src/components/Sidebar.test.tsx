@@ -577,5 +577,58 @@ describe("Sidebar", () => {
       // The roving list nav underneath must not move the selection while editing.
       expect(useStore.getState().activeId).toBe("a");
     });
+
+    it("returns focus to the row's select button after committing (Enter)", () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Focusable" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Focusable" }));
+      fireEvent.keyDown(screen.getByRole("textbox", { name: "Rename session: Focusable" }), {
+        key: "Enter",
+      });
+      // Focus lands back on the row's select button, not <body>.
+      expect(screen.getByRole("button", { name: /^Focusable/ })).toHaveFocus();
+    });
+
+    it("returns focus to the row's select button after cancelling (Escape)", () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Focusable" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Focusable" }));
+      fireEvent.keyDown(screen.getByRole("textbox", { name: "Rename session: Focusable" }), {
+        key: "Escape",
+      });
+      expect(screen.getByRole("button", { name: /^Focusable/ })).toHaveFocus();
+    });
+
+    it("a trailing blur after Escape does not commit a second time", () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Stable" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Stable" }));
+      const input = screen.getByRole("textbox", { name: "Rename session: Stable" });
+      fireEvent.change(input, { target: { value: "changed" } });
+      fireEvent.keyDown(input, { key: "Escape" });
+      // The editor closed on Escape; the unmounting input's blur must be a no-op.
+      fireEvent.blur(input);
+
+      expect(m.renameSession).not.toHaveBeenCalled();
+      expect(screen.getByText("Stable")).toBeInTheDocument();
+    });
+
+    it("a trailing blur after Enter does not commit a second time", () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Once" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Once" }));
+      const input = screen.getByRole("textbox", { name: "Rename session: Once" });
+      fireEvent.change(input, { target: { value: "Twice" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      fireEvent.blur(input); // the unmounting input's trailing blur
+
+      // Exactly one commit, from the Enter — the stray blur is absorbed.
+      expect(m.renameSession).toHaveBeenCalledTimes(1);
+      expect(m.renameSession).toHaveBeenCalledWith("a", "Twice");
+    });
   });
 });

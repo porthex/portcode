@@ -729,23 +729,34 @@ export const useStore = create<AppState>((set, get) => ({
     // rather than desync the optimistic title against the desktop's authoritative
     // session_list frame (the Sidebar hides the affordance in remote mode anyway).
     if (get().remoteConnected) return;
+    // Mirror the sibling session actions (newSession/selectSession/deleteSession):
+    // never mutate a session mid-turn. The Sidebar already hides the affordance
+    // while streaming, but the store action is the authoritative guard.
+    if (get().streaming) return;
     const trimmed = title.trim();
     const session = get().sessions.find((s) => s.id === id);
     if (!session) return;
     // Ignore a no-op / empty rename (an empty title would render a blank row).
     if (trimmed === "" || trimmed === session.title) return;
     const previous = session.title;
-    // Optimistically apply so the row updates immediately; revert + surface on a
-    // failed write (locked DB / core not ready) so the title never silently lies.
+    // Optimistically apply so the row updates immediately.
     set((st) => ({
       sessions: st.sessions.map((s) => (s.id === id ? { ...s, title: trimmed } : s)),
     }));
     try {
       await ipc.renameSession(id, trimmed);
-    } catch (err) {
+    } catch {
+      // Revert on a failed write (locked DB / core not ready) — the title snapping
+      // back IS the user-visible signal. Two deliberate choices: (1) revert ONLY
+      // if the title is still our optimistic value, so a newer rename or a
+      // send()-derived title that landed during the in-flight write isn't
+      // clobbered; (2) do NOT route this through `initError` — that's the
+      // full-screen "Couldn't start Portcode" panel, which would wipe a populated
+      // conversation for a transient per-row failure.
       set((st) => ({
-        sessions: st.sessions.map((s) => (s.id === id ? { ...s, title: previous } : s)),
-        initError: errMessage(err),
+        sessions: st.sessions.map((s) =>
+          s.id === id && s.title === trimmed ? { ...s, title: previous } : s,
+        ),
       }));
     }
   },
