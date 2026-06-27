@@ -1312,4 +1312,245 @@ describe("Sidebar", () => {
       expect(shell).toHaveStyle({ width: "52px" });
     });
   });
+
+  // Inline session rename: the Claude-Code-parity backend (renameSession /
+  // ipc.renameSession / the rename_session command) landed on this branch, but the
+  // sidebar trigger was dropped in the merge. These cover the grafted UI: entering
+  // edit mode (pencil + double-click), committing (Enter/blur), cancelling
+  // (Escape), the store-guarded no-ops (empty/whitespace/unchanged), the
+  // streaming/remote affordance gating, local key handling, the trailing-blur
+  // guard, and the focus-return effect — including the navIndex-keyed path where a
+  // row's `visible` index differs from its raw `sessions` index (folder mode).
+  describe("inline rename", () => {
+    it("renames a session via the pencil button, committing on Enter", async () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Old name" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Old name" }));
+      const input = screen.getByRole("textbox", { name: "Rename session: Old name" });
+      fireEvent.change(input, { target: { value: "New name" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      await Promise.resolve();
+
+      expect(m.renameSession).toHaveBeenCalledWith("a", "New name");
+      expect(useStore.getState().sessions[0].title).toBe("New name");
+    });
+
+    it("enters rename mode on a double-click of the title", () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "DblTitle" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.doubleClick(screen.getByText("DblTitle"));
+      // The title becomes an editable input seeded with the current title.
+      expect(screen.getByRole("textbox", { name: "Rename session: DblTitle" })).toHaveValue(
+        "DblTitle",
+      );
+    });
+
+    it("commits the rename on blur", async () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Before" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Before" }));
+      const input = screen.getByRole("textbox", { name: "Rename session: Before" });
+      fireEvent.change(input, { target: { value: "After" } });
+      fireEvent.blur(input);
+      await Promise.resolve();
+
+      expect(m.renameSession).toHaveBeenCalledWith("a", "After");
+      expect(useStore.getState().sessions[0].title).toBe("After");
+    });
+
+    it("Escape cancels the edit without renaming", () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Keep me" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Keep me" }));
+      const input = screen.getByRole("textbox", { name: "Rename session: Keep me" });
+      fireEvent.change(input, { target: { value: "discarded" } });
+      fireEvent.keyDown(input, { key: "Escape" });
+
+      expect(screen.queryByRole("textbox", { name: /^Rename session:/ })).not.toBeInTheDocument();
+      expect(screen.getByText("Keep me")).toBeInTheDocument();
+      expect(m.renameSession).not.toHaveBeenCalled();
+    });
+
+    it("treats an unchanged title as a no-op (editor closes, no write)", async () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Same" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Same" }));
+      const input = screen.getByRole("textbox", { name: "Rename session: Same" });
+      // Commit without changing the text.
+      fireEvent.keyDown(input, { key: "Enter" });
+      await Promise.resolve();
+
+      // The store action guards an unchanged title — no IPC write, title intact.
+      expect(m.renameSession).not.toHaveBeenCalled();
+      expect(useStore.getState().sessions[0].title).toBe("Same");
+    });
+
+    it("treats a whitespace-only / empty title as a no-op (no rename)", async () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Original" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Original" }));
+      const input = screen.getByRole("textbox", { name: "Rename session: Original" });
+      fireEvent.change(input, { target: { value: "   " } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      await Promise.resolve();
+
+      // A blank/whitespace title would render an empty row; the store action drops it.
+      expect(m.renameSession).not.toHaveBeenCalled();
+      expect(useStore.getState().sessions[0].title).toBe("Original");
+    });
+
+    it("offers no rename affordance while a turn is streaming", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Busy" })],
+        activeId: "a",
+        streaming: true,
+      });
+      render(<Sidebar />);
+
+      // No pencil button, and a double-click can't open the editor either.
+      expect(
+        screen.queryByRole("button", { name: "Rename session: Busy" }),
+      ).not.toBeInTheDocument();
+      fireEvent.doubleClick(screen.getByText("Busy"));
+      expect(screen.queryByRole("textbox", { name: /^Rename session:/ })).not.toBeInTheDocument();
+    });
+
+    it("offers no rename affordance when driving a remote desktop", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Remote" })],
+        activeId: "a",
+        remoteConnected: true,
+      });
+      render(<Sidebar />);
+
+      // Rename has no RemoteCommand, so the affordance is hidden in remote mode…
+      expect(
+        screen.queryByRole("button", { name: "Rename session: Remote" }),
+      ).not.toBeInTheDocument();
+      // …and the double-click path is inert too.
+      fireEvent.doubleClick(screen.getByText("Remote"));
+      expect(screen.queryByRole("textbox", { name: /^Rename session:/ })).not.toBeInTheDocument();
+    });
+
+    it("keeps edit-mode key handling local (no stray list navigation)", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "First" }), session({ id: "b", title: "Second" })],
+        activeId: "a",
+      });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: First" }));
+      const input = screen.getByRole("textbox", { name: "Rename session: First" });
+      fireEvent.keyDown(input, { key: "ArrowDown" });
+      // The roving list nav underneath must not move the selection while editing.
+      expect(useStore.getState().activeId).toBe("a");
+    });
+
+    it("a trailing blur after Escape does not commit a second time", () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Stable" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Stable" }));
+      const input = screen.getByRole("textbox", { name: "Rename session: Stable" });
+      fireEvent.change(input, { target: { value: "changed" } });
+      fireEvent.keyDown(input, { key: "Escape" });
+      // The editor closed on Escape; the unmounting input's blur must be a no-op.
+      fireEvent.blur(input);
+
+      expect(m.renameSession).not.toHaveBeenCalled();
+      expect(screen.getByText("Stable")).toBeInTheDocument();
+    });
+
+    it("a trailing blur after Enter does not commit a second time", () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Once" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Once" }));
+      const input = screen.getByRole("textbox", { name: "Rename session: Once" });
+      fireEvent.change(input, { target: { value: "Twice" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      fireEvent.blur(input); // the unmounting input's trailing blur
+
+      // Exactly one commit, from the Enter — the stray blur is absorbed by the ref guard.
+      expect(m.renameSession).toHaveBeenCalledTimes(1);
+      expect(m.renameSession).toHaveBeenCalledWith("a", "Twice");
+    });
+
+    it("returns focus to the row's select button after committing (Enter)", () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Focusable" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Focusable" }));
+      fireEvent.keyDown(screen.getByRole("textbox", { name: "Rename session: Focusable" }), {
+        key: "Enter",
+      });
+      // Focus lands back on the row's select button, not <body>.
+      expect(screen.getByRole("button", { name: /^Focusable/ })).toHaveFocus();
+    });
+
+    it("returns focus to the row's select button after cancelling (Escape)", () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Focusable" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Focusable" }));
+      fireEvent.keyDown(screen.getByRole("textbox", { name: "Rename session: Focusable" }), {
+        key: "Escape",
+      });
+      expect(screen.getByRole("button", { name: /^Focusable/ })).toHaveFocus();
+    });
+
+    // The refocus effect is keyed by the row's position in the flat `visible` list
+    // (its navIndex), not its index in the raw `sessions` array. Folder mode makes
+    // those differ: a loose chat renders ABOVE the folder's children, so a nested
+    // chat whose `sessions` index is 0 has a non-zero navIndex. Renaming it must
+    // still return focus to ITS button — proving the navIndex adaptation, which a
+    // naive `sessions.findIndex` would get wrong.
+    it("returns focus to the correct row in folder mode (navIndex ≠ sessions index)", () => {
+      useStore.setState({
+        // `sessions` order: nested first (index 0), loose second (index 1).
+        sessions: [
+          session({ id: "kid", title: "Nested chat" }),
+          session({ id: "loose", title: "Loose chat" }),
+        ],
+        activeId: "loose",
+        groupBy: "none",
+        folders: [{ id: "f1", name: "Work", open: true }],
+        folderOf: { kid: "f1" },
+      });
+      render(<Sidebar />);
+
+      // Visible order is loose (navIndex 0) then nested (navIndex 1); rename the
+      // nested row, whose sessions index (0) differs from its navIndex (1).
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Nested chat" }));
+      fireEvent.keyDown(screen.getByRole("textbox", { name: "Rename session: Nested chat" }), {
+        key: "Escape",
+      });
+
+      expect(screen.getByRole("button", { name: /^Nested chat/ })).toHaveFocus();
+    });
+
+    it("collapses the row's other actions to just the editor while renaming", () => {
+      useStore.setState({ sessions: [session({ id: "a", title: "Solo" })], activeId: "a" });
+      render(<Sidebar />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Rename session: Solo" }));
+      // While editing, the archive/delete/pencil controls give way to the input.
+      expect(screen.getByRole("textbox", { name: "Rename session: Solo" })).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "Delete session: Solo" }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "Archive session: Solo" }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "Rename session: Solo" }),
+      ).not.toBeInTheDocument();
+    });
+  });
 });
