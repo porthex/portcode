@@ -51,6 +51,19 @@ describe("isTauri", () => {
   });
 });
 
+describe("web-client mode flag", () => {
+  it("defaults to off and round-trips through setWebClientMode", async () => {
+    const { ipc } = await load();
+    // A fresh module graph hasn't had the PWA entry flip the flag, so the raw
+    // flag reads false; setWebClientMode is the only way it turns on.
+    expect(ipc.isWebClientMode()).toBe(false);
+    ipc.setWebClientMode(true);
+    expect(ipc.isWebClientMode()).toBe(true);
+    ipc.setWebClientMode(false);
+    expect(ipc.isWebClientMode()).toBe(false);
+  });
+});
+
 describe("Tauri command serialization", () => {
   beforeEach(enterTauri);
 
