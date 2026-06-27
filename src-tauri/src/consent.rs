@@ -13,6 +13,7 @@
 //! Consent lives ON DISK as a one-byte flag inside the app's private config dir:
 //!   * content trimmed to `"1"` ⇒ consent is LIVE (opt-in)
 //!   * absent, unreadable, or ANY other content ⇒ OFF (the fail-safe)
+//!
 //! Every read fails safe to OFF, so a missing dir, an IO error, or a partially
 //! written file can never arm reporting. This is the same flag the desktop's
 //! separate (re-exec'd) crash-reporter process reads, and the same flag the Android
@@ -90,6 +91,7 @@ pub fn test_set_consent_path_override(path: Option<PathBuf>) {
 /// The consent file inside an explicit app-config dir. Used by the MOBILE command
 /// (which resolves the dir from the Tauri `AppHandle`) and by tests. Pure path join
 /// — no IO, no platform assumptions.
+#[allow(dead_code)]
 pub fn consent_path_in(dir: &Path) -> PathBuf {
     dir.join(CONSENT_FILE)
 }
@@ -127,6 +129,7 @@ pub fn set_consent(enabled: bool) {
 /// dir. The Android `telemetry_set_consent` command resolves `dir` from the Tauri
 /// `AppHandle` (`app_config_dir()`, inside the sandbox) and calls this. Best-effort
 /// IO with the same OFF fail-safe as the desktop writer.
+#[allow(dead_code)]
 pub fn set_consent_in(dir: &Path, enabled: bool) {
     set_consent_at(&consent_path_in(dir), enabled);
 }
