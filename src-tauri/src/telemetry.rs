@@ -530,9 +530,10 @@ mod tests {
             message: Some("clicked sk-ant-uicrumb-leak123456 at /home/alice/x".to_string()),
             ..Default::default()
         };
-        kept_crumb
-            .data
-            .insert("k".to_string(), Value::from("sk-ant-uicrumbdata-leak123456"));
+        kept_crumb.data.insert(
+            "k".to_string(),
+            Value::from("sk-ant-uicrumbdata-leak123456"),
+        );
 
         let mut event = Event {
             server_name: Some("DESKTOP-SECRET".into()),
@@ -629,7 +630,10 @@ mod tests {
         let crumb = &out.breadcrumbs.values[0];
         assert_eq!(crumb.category.as_deref(), Some("ui"));
         let msg = crumb.message.as_deref().unwrap_or("");
-        assert!(!msg.contains("sk-ant-uicrumb-leak123456"), "breadcrumb secret survived");
+        assert!(
+            !msg.contains("sk-ant-uicrumb-leak123456"),
+            "breadcrumb secret survived"
+        );
         assert!(!msg.contains("alice"), "breadcrumb home path survived");
         assert!(crumb.data.is_empty());
     }
