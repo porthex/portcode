@@ -687,6 +687,10 @@ input[type="radio"]:not(:disabled) {
   background: var(--color-warn);
   box-shadow: 0 0 8px var(--color-warn);
 }
+.pc-dot--danger {
+  background: var(--color-danger);
+  box-shadow: 0 0 8px var(--color-danger);
+}
 .pc-dot--ring {
   background: var(--color-success);
   box-shadow: 0 0 8px var(--color-success);
@@ -1403,8 +1407,12 @@ input[type="radio"]:not(:disabled) {
 }
 
 /* =========================================================================
-   COMPOSER — animated neon frame + send
+   COMPOSER — state-bearing neon frame + stacked send↔stop
    ========================================================================= */
+/* The frame is STILL + glowing at rest; the gradient only FLOWS while a turn is
+   streaming (`data-busy`). Motion encodes state (signal-detection / alarm fatigue)
+   instead of being perpetual wallpaper. The busy flow collapses to the static idle
+   gradient under prefers-reduced-motion. */
 .pc-neon-frame {
   position: relative;
   border-radius: 13px;
@@ -1417,9 +1425,12 @@ input[type="radio"]:not(:disabled) {
     rgba(255, 46, 126, 0.55)
   );
   background-size: 300% 100%;
-  animation: pcBorder 6s linear infinite;
   box-shadow: 0 0 22px rgba(33, 230, 255, 0.1);
 }
+.pc-neon-frame[data-busy="true"] {
+  animation: pcBorder 6s linear infinite;
+}
+
 .pc-send {
   display: flex;
   align-items: center;
@@ -1449,6 +1460,104 @@ input[type="radio"]:not(:disabled) {
   box-shadow: none;
   cursor: default;
   filter: none;
+}
+
+/* Stacked send↔stop crossfade. Both controls fill the same 34px slot; only
+   opacity/transform animate (~130ms) so the swap doesn't blink (change-blindness /
+   Norman gulf of evaluation). The hidden rule is class+class so it beats
+   `.pc-send:disabled`'s 0.4 dim — a streaming (disabled) Send must read as fully
+   gone, not merely faded behind the Stop. */
+.pc-action {
+  position: absolute;
+  inset: 0;
+  transition:
+    opacity 0.13s ease,
+    transform 0.13s ease,
+    box-shadow 0.2s ease,
+    filter 0.2s ease;
+}
+.pc-action--shown {
+  opacity: 1;
+  transform: scale(1);
+}
+.pc-send.pc-action--hidden,
+.pc-stop.pc-action--hidden {
+  opacity: 0;
+  transform: scale(0.86);
+  pointer-events: none;
+}
+/* 44px effective hit target (Fitts / WCAG 2.5.5) without enlarging the 34px glyph:
+   an invisible overlay extends the clickable area. The hidden control has
+   pointer-events:none (its overlay too), so only the visible button's area is live. */
+.pc-send::before,
+.pc-stop::before {
+  content: "";
+  position: absolute;
+  inset: -5px;
+}
+
+/* Armed cue (motor anticipation): a one-shot pulse the moment Send becomes fireable
+   (disabled→enabled). Geometry, so neutralized under prefers-reduced-motion. */
+@keyframes pcArm {
+  0% {
+    transform: scale(1);
+    box-shadow: 0 0 16px rgba(255, 46, 126, 0.45);
+  }
+  45% {
+    transform: scale(1.13);
+    box-shadow: 0 0 28px rgba(255, 46, 126, 0.85);
+  }
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 16px rgba(255, 46, 126, 0.45);
+  }
+}
+.pc-armed {
+  animation: pcArm 0.3s ease-out;
+}
+
+.pc-stop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  border: 0;
+  cursor: pointer;
+  background: rgba(255, 77, 87, 0.2);
+  color: var(--color-danger);
+  box-shadow: 0 0 16px rgba(255, 77, 87, 0.3);
+}
+.pc-stop:not(:disabled):hover {
+  background: rgba(255, 77, 87, 0.3);
+  box-shadow: 0 0 26px rgba(255, 77, 87, 0.55);
+}
+.pc-stop:active {
+  filter: brightness(0.9);
+}
+/* The instant the user clicks Stop (composerPhase === "stopping"): acknowledge the
+   intent (<100ms) by dimming + relabeling, before the backend cancel resolves.
+   Declared after .pc-action--shown so its 0.55 opacity wins while still streaming. */
+.pc-stop--stopping {
+  opacity: 0.55;
+  filter: saturate(0.7);
+  cursor: default;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* The send↔stop crossfade and the armed pulse animate geometry — neutralize both
+     so the swap is instant and the pulse silent. The frame's busy flow is gated
+     separately below. */
+  .pc-action {
+    transition: none;
+  }
+  .pc-armed {
+    animation: none;
+  }
+  .pc-neon-frame[data-busy="true"] {
+    animation: none;
+  }
 }
 
 /* =========================================================================

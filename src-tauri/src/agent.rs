@@ -611,6 +611,15 @@ async fn run_loop_core(
                 output_tokens: turn.output_tokens,
             },
         );
+        // Persist the cumulative token spend so the running total (and per-session
+        // meter) survives a restart. Best-effort: a failed usage write must not abort
+        // the turn — the live in-memory counter already reflected this event.
+        let _ = db.add_usage(
+            session_id,
+            i64::from(turn.input_tokens),
+            i64::from(turn.output_tokens),
+            db::now_ms(),
+        );
 
         // Liveness for the agents panel: a subagent reports each completed turn on
         // the session channel (where the panel listens). `steps` is its 1-based turn

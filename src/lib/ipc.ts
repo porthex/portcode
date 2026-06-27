@@ -4,6 +4,7 @@
 import type {
   ConnectInfo,
   DirEntry,
+  DraftEntry,
   Message,
   OAuthStatus,
   PairingPayload,
@@ -11,6 +12,7 @@ import type {
   PhoneSyncStatus,
   RemoteCommand,
   Session,
+  SessionUsage,
   Settings,
   StreamEvent,
   SyncFrame,
@@ -312,6 +314,62 @@ export async function getMessages(sessionId: string): Promise<Message[]> {
   if (isTauri()) {
     const { core } = await tauri();
     return core.invoke<Message[]>("get_messages", { sessionId });
+  }
+  return [];
+}
+
+// ── composer drafts (open-loop persistence) ───────────────────────────────────
+//
+// The DURABLE store. Under Tauri these reach the SQLite `drafts` table; outside
+// Tauri (web client / vite preview) the desktop DB doesn't exist, so — exactly
+// like listSessions/getMessages — they no-op / return empty and the store's
+// optimistic localStorage mirror IS the web-mode persistence. So a command added
+// only on the Rust side can't break the browser build.
+
+/** Persist (or clear, when blank) a session's unsent draft. Debounced by the store. */
+export async function saveDraft(sessionId: string, text: string): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("save_draft", { sessionId, text });
+  }
+}
+
+/** The durably-stored draft for a session, or null when none / not under Tauri. */
+export async function getDraft(sessionId: string): Promise<string | null> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<string | null>("get_draft", { sessionId });
+  }
+  return null;
+}
+
+/** Every durably-stored draft — the authoritative startup hydration for the
+ *  per-session draft map. Empty outside Tauri (the localStorage mirror restores). */
+export async function getDrafts(): Promise<DraftEntry[]> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<DraftEntry[]>("get_drafts");
+  }
+  return [];
+}
+
+// ── usage (cumulative per-session token spend) ────────────────────────────────
+
+/** Cumulative usage for one session (zeros when none / not under Tauri). */
+export async function getUsage(sessionId: string): Promise<SessionUsage> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<SessionUsage>("get_usage", { sessionId });
+  }
+  return { sessionId, input: 0, output: 0 };
+}
+
+/** Every session's cumulative usage — restores per-session meters and the
+ *  workspace-total spend across a restart. Empty outside Tauri. */
+export async function getAllUsage(): Promise<SessionUsage[]> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<SessionUsage[]>("get_all_usage");
   }
   return [];
 }
