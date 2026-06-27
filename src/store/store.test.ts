@@ -29,6 +29,7 @@ vi.mock("../lib/ipc", () => ({
   resolvePermission: vi.fn(),
   openFolder: vi.fn(),
   runAgent: vi.fn(),
+  subscribeSessionEvents: vi.fn(),
   cancelAgentById: vi.fn(),
   oauthStatus: vi.fn(),
   startOauthLogin: vi.fn(),
@@ -78,6 +79,7 @@ beforeEach(() => {
   m.resolvePermission.mockResolvedValue(undefined);
   m.openFolder.mockResolvedValue(null);
   m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}), dispose: vi.fn() });
+  m.subscribeSessionEvents.mockResolvedValue(() => {});
   m.cancelAgentById.mockResolvedValue(undefined);
   m.oauthStatus.mockResolvedValue(signedOut);
   m.startOauthLogin.mockResolvedValue(signedOut);
@@ -2340,5 +2342,199 @@ describe("live subagents (agents panel)", () => {
   it("cancelAgent swallows an IPC failure so the panel never throws", async () => {
     m.cancelAgentById.mockRejectedValueOnce(new Error("ipc boom"));
     await expect(useStore.getState().cancelAgent("g1")).resolves.toBeUndefined();
+  });
+});
+
+describe("background shell tasks (background-tasks panel)", () => {
+  // Drain microtasks AND macrotasks so a `void`-ed (fire-and-forget) background
+  // subscription has finished installing its unlisten before we assert on it.
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  // Background events ride a per-session frame on the phone and a persistent
+  // session listener on the desktop, both folding through the same reducer. The
+  // phone `applyFrame` path is the cleanest way to exercise that reducer — it
+  // never touches the module-scoped desktop listener registry.
+  const bgFrame = (session_id: string, event: StreamEvent): SyncFrame => ({
+    t: "live",
+    session_id,
+    event,
+  });
+
+  it("tracks a background task's lifecycle: started → finished (ok)", () => {
+    useStore.setState({ activeId: "a", backgroundTasks: {} });
+    const f = useStore.getState().applyFrame;
+    f(bgFrame("a", { type: "background_task_started", id: "t1", command: "npm run dev" }));
+    let t = useStore.getState().backgroundTasks.a;
+    expect(t).toHaveLength(1);
+    expect(t[0]).toMatchObject({ id: "t1", command: "npm run dev", status: "running" });
+    expect(t[0].exitCode).toBeUndefined();
+
+    f(
+      bgFrame("a", {
+        type: "background_task_finished",
+        id: "t1",
+        command: "npm run dev",
+        exitCode: 0,
+        output: "served",
+      }),
+    );
+    t = useStore.getState().backgroundTasks.a;
+    expect(t[0]).toMatchObject({ status: "ok", exitCode: 0, output: "served" });
+  });
+
+  it("maps a non-zero exit code to an error status", () => {
+    useStore.setState({ activeId: "a", backgroundTasks: {} });
+    const f = useStore.getState().applyFrame;
+    f(bgFrame("a", { type: "background_task_started", id: "t1", command: "make" }));
+    f(
+      bgFrame("a", {
+        type: "background_task_finished",
+        id: "t1",
+        command: "make",
+        exitCode: 2,
+        output: "boom",
+      }),
+    );
+    expect(useStore.getState().backgroundTasks.a[0]).toMatchObject({
+      status: "error",
+      exitCode: 2,
+    });
+  });
+
+  it("keeps multiple tasks in launch order and replaces a duplicate start", () => {
+    useStore.setState({ activeId: "a", backgroundTasks: {} });
+    const f = useStore.getState().applyFrame;
+    f(bgFrame("a", { type: "background_task_started", id: "t1", command: "first" }));
+    f(bgFrame("a", { type: "background_task_started", id: "t2", command: "second" }));
+    f(bgFrame("a", { type: "background_task_started", id: "t1", command: "first-again" }));
+    const t = useStore.getState().backgroundTasks.a;
+    expect(t.map((x) => x.id)).toEqual(["t1", "t2"]);
+    expect(t[0].command).toBe("first-again");
+  });
+
+  it("upserts a finished event whose start it never saw", () => {
+    useStore.setState({ activeId: "a", backgroundTasks: {} });
+    useStore.getState().applyFrame(
+      bgFrame("a", {
+        type: "background_task_finished",
+        id: "orphan",
+        command: "probe",
+        exitCode: 0,
+        output: "ok",
+      }),
+    );
+    const t = useStore.getState().backgroundTasks.a;
+    expect(t).toHaveLength(1);
+    expect(t[0]).toMatchObject({ id: "orphan", command: "probe", status: "ok" });
+  });
+
+  it("keeps background tasks across a turn boundary (they outlive the turn)", () => {
+    // Unlike subagents (cleared on turn_start), a background task must survive into
+    // the next turn — its finish can land turns after it was launched.
+    useStore.setState({
+      activeId: "a",
+      backgroundTasks: { a: [{ id: "t1", command: "npm run dev", status: "running" }] },
+      agents: { a: [{ id: "g", description: "x", status: "running", step: 1 }] },
+    });
+    useStore.getState().applyFrame(bgFrame("a", { type: "turn_start", messageId: "m2" }));
+    // The subagent panel resets...
+    expect(useStore.getState().agents.a).toEqual([]);
+    // ...but the running background task is untouched.
+    expect(useStore.getState().backgroundTasks.a).toHaveLength(1);
+    expect(useStore.getState().backgroundTasks.a[0].id).toBe("t1");
+  });
+
+  it("records a background task on its OWN session even when another is active", () => {
+    useStore.setState({ activeId: "active", backgroundTasks: {} });
+    useStore
+      .getState()
+      .applyFrame(bgFrame("other", { type: "background_task_started", id: "t1", command: "bg" }));
+    expect(useStore.getState().backgroundTasks.other).toHaveLength(1);
+    expect(useStore.getState().backgroundTasks.active).toBeUndefined();
+  });
+
+  // ── desktop persistent-listener wiring ──────────────────────────────────────
+  it("subscribes a persistent session listener and folds its background events", async () => {
+    let emit!: (e: StreamEvent) => void;
+    m.subscribeSessionEvents.mockImplementation(async (_sid, onEvent) => {
+      emit = onEvent;
+      return () => {};
+    });
+    useStore.setState({
+      sessions: [session({ id: "bgt-desk" })],
+      activeId: "bgt-desk",
+      messages: { "bgt-desk": [] },
+    });
+    await useStore.getState().selectSession("bgt-desk");
+    expect(m.subscribeSessionEvents).toHaveBeenCalledWith("bgt-desk", expect.any(Function));
+
+    emit({ type: "background_task_started", id: "t1", command: "serve" });
+    expect(useStore.getState().backgroundTasks["bgt-desk"]).toHaveLength(1);
+    emit({ type: "background_task_finished", id: "t1", command: "serve", exitCode: 0, output: "" });
+    expect(useStore.getState().backgroundTasks["bgt-desk"][0].status).toBe("ok");
+  });
+
+  it("subscribes a background listener for every session on init", async () => {
+    m.listSessions.mockResolvedValue([
+      session({ id: "bgt-init-1" }),
+      session({ id: "bgt-init-2" }),
+    ]);
+    m.getMessages.mockResolvedValue([]);
+    await useStore.getState().init();
+    expect(m.subscribeSessionEvents).toHaveBeenCalledWith("bgt-init-1", expect.any(Function));
+    expect(m.subscribeSessionEvents).toHaveBeenCalledWith("bgt-init-2", expect.any(Function));
+  });
+
+  it("subscribes a background listener for a newly created session", async () => {
+    useStore.setState({ sessions: [], activeId: null, messages: {} });
+    await useStore.getState().newSession();
+    const newId = useStore.getState().activeId;
+    expect(newId).toBeTruthy();
+    expect(m.subscribeSessionEvents).toHaveBeenCalledWith(newId, expect.any(Function));
+  });
+
+  it("tears the listener down and drops the tasks when a session is deleted", async () => {
+    const unlisten = vi.fn();
+    m.subscribeSessionEvents.mockResolvedValue(unlisten);
+    useStore.setState({
+      sessions: [session({ id: "bgt-del" }), session({ id: "bgt-keep" })],
+      activeId: "bgt-del",
+      messages: { "bgt-del": [], "bgt-keep": [] },
+      backgroundTasks: { "bgt-del": [{ id: "t1", command: "x", status: "running" }] },
+    });
+    await useStore.getState().selectSession("bgt-del"); // installs the listener
+    await flush(); // let the fire-and-forget subscription finish installing
+    await useStore.getState().deleteSession("bgt-del");
+    expect(unlisten).toHaveBeenCalled();
+    expect(useStore.getState().backgroundTasks["bgt-del"]).toBeUndefined();
+  });
+
+  it("resets background tasks on a fresh remote dial", async () => {
+    useStore.setState({
+      backgroundTasks: { a: [{ id: "t", command: "x", status: "running" }] },
+    });
+    await useStore.getState().connectRemote("qr");
+    expect(useStore.getState().backgroundTasks).toEqual({});
+  });
+
+  it("survives a failed background subscription and can retry it later", async () => {
+    m.subscribeSessionEvents.mockRejectedValueOnce(new Error("listen boom"));
+    useStore.setState({
+      sessions: [session({ id: "bgt-fail" })],
+      activeId: "bgt-fail",
+      messages: { "bgt-fail": [] },
+    });
+    // The subscribe is fire-and-forget; a rejected one must be swallowed (no
+    // unhandled rejection) and must not break selecting the session.
+    await expect(useStore.getState().selectSession("bgt-fail")).resolves.toBeUndefined();
+    await flush(); // let the rejected subscribe settle (the reservation is dropped)
+
+    // Because the failed reservation was released, a later select retries the
+    // subscribe rather than treating the session as already-listening.
+    m.subscribeSessionEvents.mockResolvedValueOnce(() => {});
+    await useStore.getState().selectSession("bgt-fail");
+    await flush();
+    const calls = m.subscribeSessionEvents.mock.calls.filter((c) => c[0] === "bgt-fail");
+    expect(calls).toHaveLength(2);
   });
 });
