@@ -98,6 +98,19 @@ fn save_settings(state: State<AppState>, settings: Value) -> Settings {
         if let Some(t) = settings.get("typingAnimation").and_then(|v| v.as_bool()) {
             s.typing_animation = t;
         }
+        // Permission mode + rules. Parse defensively: an unknown mode or a
+        // malformed rule list is IGNORED (keep the prior, safer value) rather than
+        // coerced — a bad save must never silently downgrade the permission gate.
+        if let Some(v) = settings.get("permissionMode") {
+            if let Ok(mode) = serde_json::from_value::<permissions::PermissionMode>(v.clone()) {
+                s.permission_mode = mode;
+            }
+        }
+        if let Some(v) = settings.get("rules") {
+            if let Ok(rules) = serde_json::from_value::<Vec<permissions::Rule>>(v.clone()) {
+                s.rules = rules;
+            }
+        }
         s.save(&state.config_dir);
     }
     get_settings(state)
