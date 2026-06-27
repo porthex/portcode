@@ -76,6 +76,42 @@ use fenced code blocks with a language tag.",
     )
 }
 
+/// Per-run agent configuration: the tool registry and the system prompt the
+/// loop runs with.
+///
+/// Both were hard-wired inside [`run_inner`]; pulling them into a config makes a
+/// run parameterizable instead. A subagent brings its own tool set and prompt;
+/// plan mode swaps in a read-only registry; the interactive run uses the
+/// defaults. The agent loop depends only on this config — never on which
+/// tools/prompt a particular run happens to use — which is the seam the
+/// subagent runtime and plan mode build on. [`AgentConfig::default_run`]
+/// reproduces the previous behavior exactly.
+pub(crate) struct AgentConfig {
+    /// The tools this run may call.
+    registry: tools::Registry,
+    /// System-prompt override. `None` derives the default workspace prompt once
+    /// the workspace is resolved (see [`resolve_system_prompt`]).
+    system_prompt: Option<String>,
+}
+
+impl AgentConfig {
+    /// The standard interactive run: the default tool registry and the default
+    /// (workspace-derived) system prompt.
+    pub(crate) fn default_run() -> Self {
+        Self {
+            registry: tools::default_registry(),
+            system_prompt: None,
+        }
+    }
+}
+
+/// Resolve the system prompt for a run: the explicit override if one was given,
+/// otherwise the default workspace prompt. Kept separate and pure so the
+/// override seam is unit-testable without standing up a full run.
+fn resolve_system_prompt(over: Option<String>, workspace: &Path) -> String {
+    over.unwrap_or_else(|| system_prompt(workspace))
+}
+
 fn derive_title(text: &str) -> String {
     let t = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if t.chars().count() > 42 {
@@ -216,6 +252,9 @@ pub async fn run(
         &channel,
         &session_id,
         user_text,
+        // The standard interactive run: default tools + default prompt. The
+        // injectable config is the seam subagents / plan mode will use.
+        AgentConfig::default_run(),
     )
     .await;
 
@@ -242,6 +281,7 @@ async fn run_inner(
     channel: &str,
     session_id: &str,
     user_text: String,
+    config: AgentConfig,
 ) -> Result<String, String> {
     let snapshot = { settings.lock().unwrap().clone() };
 
@@ -269,9 +309,14 @@ async fn run_inner(
         })?,
     };
 
-    let registry = tools::default_registry();
+    // The tool set and system prompt come from the per-run config rather than
+    // being hard-wired, so a subagent / plan-mode run can supply its own.
+    let AgentConfig {
+        registry,
+        system_prompt: system_override,
+    } = config;
     let tool_specs = registry.specs();
-    let system = system_prompt(&workspace);
+    let system = resolve_system_prompt(system_override, &workspace);
     let ctx = ToolCtx { workspace };
 
     // Load prior turns from the DB, then persist the new user message.
@@ -463,8 +508,46 @@ async fn run_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        batch_cancelled, derive_title, is_terminal_auth_error, step_limit_exceeded, MAX_AGENT_STEPS,
+        batch_cancelled, derive_title, is_terminal_auth_error, resolve_system_prompt,
+        step_limit_exceeded, AgentConfig, MAX_AGENT_STEPS,
     };
+    use std::path::Path;
+
+    #[test]
+    fn resolve_system_prompt_prefers_an_explicit_override() {
+        // A subagent / plan-mode run supplies its own prompt; the override wins
+        // verbatim and the default workspace prompt is not consulted.
+        let prompt = resolve_system_prompt(Some("CUSTOM SUBAGENT PROMPT".into()), Path::new("/ws"));
+        assert_eq!(prompt, "CUSTOM SUBAGENT PROMPT");
+    }
+
+    #[test]
+    fn resolve_system_prompt_falls_back_to_the_default_workspace_prompt() {
+        // No override → the default workspace prompt, which embeds the workspace
+        // root so the model knows where it is operating.
+        let prompt = resolve_system_prompt(None, Path::new("/tmp/some-workspace"));
+        assert!(prompt.contains("Workspace root:"));
+        assert!(prompt.contains("/tmp/some-workspace"));
+    }
+
+    #[test]
+    fn default_run_config_uses_the_standard_registry_and_no_prompt_override() {
+        // The interactive run is unchanged by the refactor: the full default
+        // tool set (read off the specs the loop would send) and no prompt
+        // override (so it derives the workspace prompt).
+        let cfg = AgentConfig::default_run();
+        let names: Vec<String> = cfg
+            .registry
+            .specs()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["fs_read", "list", "glob", "grep", "fs_write", "fs_edit", "shell"]
+        );
+        assert!(cfg.system_prompt.is_none());
+    }
 
     #[test]
     fn step_limit_allows_up_to_the_ceiling_then_rejects() {

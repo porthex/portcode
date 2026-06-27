@@ -44,6 +44,14 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// Build a registry from an explicit tool set. [`default_registry`] is the
+    /// standard interactive set; a subagent or plan mode builds its own
+    /// (restricted or specialized) tool list through this same constructor, so
+    /// the agent loop stays registry-agnostic.
+    pub fn new(tools: Vec<Box<dyn Tool>>) -> Self {
+        Registry { tools }
+    }
+
     pub fn specs(&self) -> Vec<Value> {
         self.tools
             .iter()
@@ -66,17 +74,15 @@ impl Registry {
 }
 
 pub fn default_registry() -> Registry {
-    Registry {
-        tools: vec![
-            Box::new(FsRead),
-            Box::new(ListDir),
-            Box::new(GlobTool),
-            Box::new(GrepTool),
-            Box::new(FsWrite),
-            Box::new(FsEdit),
-            Box::new(Shell),
-        ],
-    }
+    Registry::new(vec![
+        Box::new(FsRead),
+        Box::new(ListDir),
+        Box::new(GlobTool),
+        Box::new(GrepTool),
+        Box::new(FsWrite),
+        Box::new(FsEdit),
+        Box::new(Shell),
+    ])
 }
 
 // ── path helpers ─────────────────────────────────────────────────────────────
@@ -919,5 +925,38 @@ mod tests {
             "foo"
         );
         assert_eq!(FsRead.summarize(&json!({}), &ctx), "fs_read"); // no recognized key → tool name
+    }
+
+    /// The tool names a registry advertises to the model, in order — read off
+    /// the same `specs()` the agent loop sends, so the test sees exactly what
+    /// the model would.
+    fn spec_names(reg: &Registry) -> Vec<String> {
+        reg.specs()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn default_registry_exposes_the_standard_tool_set_in_order() {
+        assert_eq!(
+            spec_names(&default_registry()),
+            ["fs_read", "list", "glob", "grep", "fs_write", "fs_edit", "shell"]
+        );
+    }
+
+    #[test]
+    fn registry_new_builds_a_custom_restricted_tool_set() {
+        // The shape a constrained subagent / plan mode would use: a read-only
+        // registry that exposes only the non-mutating tools and omits the
+        // mutating ones entirely. The agent loop never changes — only the set
+        // of tools it is handed does.
+        let reg = Registry::new(vec![Box::new(FsRead), Box::new(ListDir)]);
+        assert_eq!(spec_names(&reg), ["fs_read", "list"]);
+        assert!(reg.find("fs_read").is_some());
+        assert!(
+            reg.find("fs_write").is_none(),
+            "a restricted registry must not resolve a tool it doesn't contain"
+        );
     }
 }
