@@ -143,6 +143,40 @@ export interface Usage {
   output: number;
 }
 
+/**
+ * One session's cumulative token usage, as returned by the `get_usage` /
+ * `get_all_usage` IPC commands (mirrors the Rust `UsageRow`, camelCase). The
+ * `get_all_usage` bundle hydrates the in-memory usage map on startup so per-session
+ * meters — and the workspace-total spend in the status HUD — survive a restart.
+ */
+export interface SessionUsage {
+  sessionId: string;
+  input: number;
+  output: number;
+}
+
+/**
+ * One session's persisted unsent composer draft, as returned by the `get_drafts`
+ * IPC command (mirrors the Rust `DraftRow`, camelCase). The bundle is the
+ * authoritative restore on startup; an optimistic localStorage mirror gives the
+ * instant restore before this resolves (Zeigarnik open-loop).
+ */
+export interface DraftEntry {
+  sessionId: string;
+  text: string;
+}
+
+/**
+ * The composer's live presence phase, driven by REAL turn/stream events (never
+ * padded latency). Surfaced in the `role="status"` region beside the composer:
+ * - `idle`     — at rest ("ready when you are").
+ * - `received` — the instant a turn is sent, before the first byte ("got it — reading…").
+ * - `thinking` — the first real stream event arrived, or a 900ms settle fallback fired
+ *   ("thinking with you…").
+ * - `stopping` — the user pressed Stop; acknowledged in <100ms before the cancel resolves.
+ */
+export type ComposerPhase = "idle" | "received" | "thinking" | "stopping";
+
 // ── Phone Sync ────────────────────────────────────────────────────────────────
 
 /** A phone that has been paired with this desktop device. */

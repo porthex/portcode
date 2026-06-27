@@ -14,6 +14,9 @@ vi.mock("../lib/ipc", () => ({
   listDir: vi.fn(),
   openFolder: vi.fn(),
   saveSettings: vi.fn(),
+  // appendDraft → setDraft debounces a durable saveDraft; mock it so the timer
+  // never reaches a real backend.
+  saveDraft: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -286,6 +289,8 @@ describe("FileExplorer tree", () => {
   });
 
   it("clicking a file appends its path to the composer draft instead of fetching", async () => {
+    // appendDraft now keys the draft by the active session, so one must be active.
+    useStore.setState({ activeId: "s1" });
     m.listDir.mockResolvedValueOnce([
       entry({ name: "notes.md", path: "docs/notes.md", isDir: false }),
     ]);
@@ -295,8 +300,8 @@ describe("FileExplorer tree", () => {
 
     fireEvent.click(fileBtn);
 
-    // appendDraft folded the path into the real store; no second listDir.
-    await waitFor(() => expect(useStore.getState().draft).toBe("docs/notes.md "));
+    // appendDraft folded the path into the active session's draft; no second listDir.
+    await waitFor(() => expect(useStore.getState().drafts.s1).toBe("docs/notes.md "));
     expect(m.listDir).toHaveBeenCalledTimes(1);
   });
 });

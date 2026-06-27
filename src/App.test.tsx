@@ -73,6 +73,9 @@ vi.mock("./lib/ipc", () => ({
   listSessions: vi.fn(),
   createSession: vi.fn(),
   getMessages: vi.fn(),
+  // store.init() hydrates per-session drafts + cumulative usage on mount.
+  getDrafts: vi.fn(),
+  getAllUsage: vi.fn(),
   // store.init() restores subscription sign-in via ipc.oauthStatus() on mount.
   oauthStatus: vi.fn(),
   startOauthLogin: vi.fn(),
@@ -100,6 +103,8 @@ beforeEach(() => {
   m.listSessions.mockResolvedValue([]);
   m.createSession.mockResolvedValue(undefined);
   m.getMessages.mockResolvedValue([]);
+  m.getDrafts.mockResolvedValue([]);
+  m.getAllUsage.mockResolvedValue([]);
   m.oauthStatus.mockResolvedValue({ signedIn: false, expiresAt: null, account: null, tier: null });
   m.phoneSyncStatus.mockResolvedValue({ devicePublicKey: "DEVICE==", paired: [] });
   m.phoneSyncDisconnect.mockResolvedValue(undefined);
