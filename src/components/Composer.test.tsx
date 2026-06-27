@@ -3,7 +3,7 @@ import { render, screen, fireEvent, act } from "@testing-library/react";
 
 import { Composer } from "./Composer";
 import { useStore } from "../store/store";
-import { DEFAULT_SETTINGS, type ComposerPhase, type Usage } from "../types";
+import { DEFAULT_SETTINGS, type ComposerPhase, type Session, type Usage } from "../types";
 
 // The Composer is a thin view over the real store: it binds the ACTIVE session's
 // draft and calls the store's send/stop actions, which reach the IPC bridge. We
@@ -13,6 +13,8 @@ import { DEFAULT_SETTINGS, type ComposerPhase, type Usage } from "../types";
 vi.mock("../lib/ipc", () => ({
   runAgent: vi.fn(),
   openFolder: vi.fn(),
+  // setSessionModel (via updateSettings) lands here; echo the patch so the
+  // store's updateSettings resolves and commits the new settings.model.
   saveSettings: vi.fn(),
   saveDraft: vi.fn(),
 }));
@@ -45,6 +47,16 @@ beforeEach(() => {
   m.openFolder.mockResolvedValue(null);
   m.saveSettings.mockImplementation(async (s) => ({ ...DEFAULT_SETTINGS, ...s }));
   m.saveDraft.mockResolvedValue(undefined);
+});
+
+const session = (over: Partial<Session> = {}): Session => ({
+  id: "a",
+  title: "New chat",
+  workspace: null,
+  model: "claude-opus-4-8",
+  createdAt: 1,
+  updatedAt: 1,
+  ...over,
 });
 
 describe("Composer textarea", () => {
@@ -164,7 +176,16 @@ describe("Composer send button", () => {
 
   it("submits on click: clears the active draft and forwards the text to send", async () => {
     useStore.setState({
-      sessions: [{ id: "a", title: "New chat", workspace: null, createdAt: 1, updatedAt: 1 }],
+      sessions: [
+        {
+          id: "a",
+          title: "New chat",
+          workspace: null,
+          model: "claude-opus-4-8",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
       activeId: "a",
       messages: { a: [] },
       drafts: { a: "Refactor the parser" },
@@ -177,12 +198,26 @@ describe("Composer send button", () => {
     expect(useStore.getState().drafts.a).toBeUndefined();
     await Promise.resolve();
     await Promise.resolve();
-    expect(m.runAgent).toHaveBeenCalledWith("a", "Refactor the parser", expect.any(Function));
+    expect(m.runAgent).toHaveBeenCalledWith(
+      "a",
+      "Refactor the parser",
+      "claude-opus-4-8",
+      expect.any(Function),
+    );
   });
 
   it("collapses the textarea to an explicit px height on submit (not 'auto')", async () => {
     useStore.setState({
-      sessions: [{ id: "a", title: "New chat", workspace: null, createdAt: 1, updatedAt: 1 }],
+      sessions: [
+        {
+          id: "a",
+          title: "New chat",
+          workspace: null,
+          model: "claude-opus-4-8",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
       activeId: "a",
       messages: { a: [] },
     });
@@ -205,6 +240,7 @@ describe("Composer send button", () => {
     expect(m.runAgent).toHaveBeenCalledWith(
       "a",
       "line one\nline two\nline three",
+      "claude-opus-4-8",
       expect.any(Function),
     );
   });
@@ -213,7 +249,16 @@ describe("Composer send button", () => {
 describe("Composer key handling", () => {
   const seedSession = (draft: string) =>
     useStore.setState({
-      sessions: [{ id: "a", title: "New chat", workspace: null, createdAt: 1, updatedAt: 1 }],
+      sessions: [
+        {
+          id: "a",
+          title: "New chat",
+          workspace: null,
+          model: "claude-opus-4-8",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
       activeId: "a",
       messages: { a: [] },
       drafts: { a: draft },
@@ -227,7 +272,12 @@ describe("Composer key handling", () => {
     expect(useStore.getState().drafts.a).toBeUndefined();
     await Promise.resolve();
     await Promise.resolve();
-    expect(m.runAgent).toHaveBeenCalledWith("a", "ship it", expect.any(Function));
+    expect(m.runAgent).toHaveBeenCalledWith(
+      "a",
+      "ship it",
+      "claude-opus-4-8",
+      expect.any(Function),
+    );
   });
 
   it("does not submit on the Enter that commits an IME composition", async () => {
@@ -534,5 +584,56 @@ describe("Composer plan-mode banner", () => {
     render(<Composer />);
 
     expect(screen.queryByRole("button", { name: /Exit plan mode/i })).not.toBeInTheDocument();
+  });
+});
+
+describe("Composer ModelPicker", () => {
+  it("reflects the active session's model and groups options by provider", () => {
+    useStore.setState({
+      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      activeId: "a",
+      messages: { a: [] },
+    });
+    render(<Composer />);
+
+    const picker = screen.getByRole("combobox", { name: "Model" }) as HTMLSelectElement;
+    expect(picker.value).toBe("claude-opus-4-8");
+    // Provider-grouped: the Anthropic <optgroup> wraps the model options.
+    const groups = picker.querySelectorAll("optgroup");
+    expect(groups).toHaveLength(1);
+    expect(groups[0].label).toBe("Anthropic");
+    expect(screen.getByRole("option", { name: "Claude Sonnet 4.6" })).toBeInTheDocument();
+  });
+
+  it("changing the model updates the active session AND the last-used default", async () => {
+    useStore.setState({
+      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      activeId: "a",
+      messages: { a: [] },
+    });
+    render(<Composer />);
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Model" }), {
+      target: { value: "claude-sonnet-4-6" },
+    });
+
+    // setSessionModel updates the session synchronously, then awaits the
+    // last-used sync into settings.model (updateSettings -> ipc.saveSettings).
+    expect(useStore.getState().sessions[0].model).toBe("claude-sonnet-4-6");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(m.saveSettings).toHaveBeenCalledWith({ model: "claude-sonnet-4-6" });
+    expect(useStore.getState().settings.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("is disabled while a turn is streaming", () => {
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: { a: [] },
+      streaming: true,
+    });
+    render(<Composer />);
+    expect(screen.getByRole("combobox", { name: "Model" })).toBeDisabled();
   });
 });

@@ -350,6 +350,7 @@ mod tests {
                         title: "Alpha".into(),
                         branch: None,
                         workspace: None,
+                        model: None,
                         created_at: 1,
                         updated_at: 2,
                     }],

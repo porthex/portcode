@@ -131,7 +131,7 @@ mod tests {
     #[tokio::test]
     async fn catch_up_delivers_the_session_list_and_per_cursor_deltas() {
         let db = Db::open(Path::new(":memory:")).unwrap();
-        db.create_session("s1", "Alpha", None, 100).unwrap();
+        db.create_session("s1", "Alpha", None, None, 100).unwrap();
         db.append_message("s1", &user("first"), 101);
         db.append_message("s1", &user("second"), 102);
 
@@ -166,7 +166,7 @@ mod tests {
     #[tokio::test]
     async fn catch_up_for_an_up_to_date_cursor_returns_an_empty_delta() {
         let db = Db::open(Path::new(":memory:")).unwrap();
-        db.create_session("s1", "Alpha", None, 100).unwrap();
+        db.create_session("s1", "Alpha", None, None, 100).unwrap();
         db.append_message("s1", &user("only"), 101); // seq 0
 
         let (mut desktop, mut phone) = mem_pair();

@@ -112,6 +112,7 @@ describe("Tauri command serialization", () => {
       id: "s1",
       title: "Title",
       workspace: "C:/ws",
+      model: undefined,
     });
     expect(invoke).toHaveBeenCalledWith("rename_session", { id: "s1", title: "Renamed" });
     expect(invoke).toHaveBeenCalledWith("delete_session", { id: "s1" });
@@ -303,10 +304,14 @@ describe("Tauri command serialization", () => {
     invoke.mockResolvedValue(undefined);
 
     const onEvent = vi.fn();
-    const handle = await ipc.runAgent("sess-1", "hello", onEvent);
+    const handle = await ipc.runAgent("sess-1", "hello", "claude-opus-4-8", onEvent);
 
     expect(listen).toHaveBeenCalledWith("agent://sess-1", expect.any(Function));
-    expect(invoke).toHaveBeenCalledWith("run_agent", { sessionId: "sess-1", text: "hello" });
+    expect(invoke).toHaveBeenCalledWith("run_agent", {
+      sessionId: "sess-1",
+      text: "hello",
+      model: "claude-opus-4-8",
+    });
 
     // Core events arrive wrapped as `{ payload }`; the bridge unwraps them.
     registered({ payload: { type: "text_delta", text: "hi" } });
@@ -323,7 +328,7 @@ describe("Tauri command serialization", () => {
     listen.mockImplementation(async () => unlisten);
     invoke.mockResolvedValue(undefined);
 
-    const handle = await ipc.runAgent("sess-2", "hi", vi.fn());
+    const handle = await ipc.runAgent("sess-2", "hi", "claude-opus-4-8", vi.fn());
     handle.dispose();
 
     // A normal turn end just stops listening — it must NOT fire cancel_agent.
@@ -524,7 +529,7 @@ describe("browser fallback agent stream", () => {
     vi.useFakeTimers();
 
     const events: StreamEvent[] = [];
-    await ipc.runAgent("s", "hi", (e) => events.push(e));
+    await ipc.runAgent("s", "hi", "claude-opus-4-8", (e) => events.push(e));
     await vi.runAllTimersAsync();
 
     const types = events.map((e) => e.type);
@@ -542,7 +547,7 @@ describe("browser fallback agent stream", () => {
     vi.useFakeTimers();
 
     const events: StreamEvent[] = [];
-    const { cancel } = await ipc.runAgent("s", "hi", (e) => events.push(e));
+    const { cancel } = await ipc.runAgent("s", "hi", "claude-opus-4-8", (e) => events.push(e));
     await vi.advanceTimersByTimeAsync(3000);
 
     expect(events.some((e) => e.type === "permission_request")).toBe(true);
@@ -557,7 +562,7 @@ describe("browser fallback agent stream", () => {
     vi.useFakeTimers();
 
     const onEvent = vi.fn();
-    const { cancel } = await ipc.runAgent("s", "hi", onEvent);
+    const { cancel } = await ipc.runAgent("s", "hi", "claude-opus-4-8", onEvent);
     await cancel();
     await vi.runAllTimersAsync();
 

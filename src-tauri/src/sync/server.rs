@@ -87,6 +87,10 @@ impl CommandHandler for DesktopCommandHandler {
                         oauth_refresh,
                         session_id,
                         text,
+                        // The phone's Run command carries no per-session model override,
+                        // so use the desktop default — `agent::run` falls back to
+                        // settings.model on None, matching the pre-per-session behavior.
+                        None,
                     )
                     .await;
                 });
@@ -133,7 +137,8 @@ impl CommandHandler for DesktopCommandHandler {
                     .create_session(
                         &id,
                         title.as_deref().unwrap_or("New chat"),
-                        None,
+                        None, // workspace
+                        None, // model — phone-created sessions use the desktop default
                         db::now_ms(),
                     )
                     .map_err(|e| e.to_string())?;

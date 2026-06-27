@@ -157,6 +157,11 @@ pub struct SessionRow {
     #[serde(default)]
     pub branch: Option<String>,
     pub workspace: Option<String>,
+    /// The per-session model id (per-session-model feature). Optional + serde-default
+    /// so older rows / wire payloads without it still decode; the call site falls back
+    /// to the global default model when it is None.
+    #[serde(default)]
+    pub model: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
