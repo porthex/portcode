@@ -130,6 +130,7 @@ interface AppState {
   newSession: () => Promise<void>;
   selectSession: (id: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
+  renameSession: (id: string, title: string) => Promise<void>;
   send: (text: string) => Promise<void>;
   stop: () => Promise<void>;
   cancelAgent: (agentId: string) => Promise<void>;
@@ -719,6 +720,33 @@ export const useStore = create<AppState>((set, get) => ({
       } catch {
         set((st) => ({ loadErrors: { ...st.loadErrors, [aid]: true } }));
       }
+    }
+  },
+
+  async renameSession(id, title) {
+    // Rename is a desktop-local DB write (the `rename_session` Tauri command); the
+    // phone has no equivalent RemoteCommand, so a remote client can't rename — bail
+    // rather than desync the optimistic title against the desktop's authoritative
+    // session_list frame (the Sidebar hides the affordance in remote mode anyway).
+    if (get().remoteConnected) return;
+    const trimmed = title.trim();
+    const session = get().sessions.find((s) => s.id === id);
+    if (!session) return;
+    // Ignore a no-op / empty rename (an empty title would render a blank row).
+    if (trimmed === "" || trimmed === session.title) return;
+    const previous = session.title;
+    // Optimistically apply so the row updates immediately; revert + surface on a
+    // failed write (locked DB / core not ready) so the title never silently lies.
+    set((st) => ({
+      sessions: st.sessions.map((s) => (s.id === id ? { ...s, title: trimmed } : s)),
+    }));
+    try {
+      await ipc.renameSession(id, trimmed);
+    } catch (err) {
+      set((st) => ({
+        sessions: st.sessions.map((s) => (s.id === id ? { ...s, title: previous } : s)),
+        initError: errMessage(err),
+      }));
     }
   },
 

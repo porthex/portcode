@@ -25,6 +25,7 @@ vi.mock("../lib/ipc", () => ({
   createSession: vi.fn(),
   getMessages: vi.fn(),
   deleteSession: vi.fn(),
+  renameSession: vi.fn(),
   saveSettings: vi.fn(),
   resolvePermission: vi.fn(),
   openFolder: vi.fn(),
@@ -75,6 +76,7 @@ beforeEach(() => {
   m.getMessages.mockResolvedValue([]);
   m.createSession.mockResolvedValue(undefined);
   m.deleteSession.mockResolvedValue(undefined);
+  m.renameSession.mockResolvedValue(undefined);
   m.saveSettings.mockImplementation(async (s) => ({ ...DEFAULT_SETTINGS, ...s }));
   m.resolvePermission.mockResolvedValue(undefined);
   m.openFolder.mockResolvedValue(null);
@@ -450,6 +452,55 @@ describe("deleteSession", () => {
     expect(st.runs.b).toBeUndefined(); // the deleted session's run is gone
     expect(Object.keys(st.runs)).toEqual(["a"]); // only the surviving run remains
     expect(st.activeId).toBe("a"); // active unchanged (we deleted the other one)
+  });
+});
+
+describe("renameSession", () => {
+  it("optimistically applies the trimmed title and persists it via IPC", async () => {
+    useStore.setState({ sessions: [session({ id: "a", title: "Old" })], activeId: "a" });
+    await useStore.getState().renameSession("a", "  Fresh title  ");
+    expect(useStore.getState().sessions[0].title).toBe("Fresh title");
+    expect(m.renameSession).toHaveBeenCalledWith("a", "Fresh title");
+  });
+
+  it("ignores an empty / whitespace-only rename", async () => {
+    useStore.setState({ sessions: [session({ id: "a", title: "Keep" })], activeId: "a" });
+    await useStore.getState().renameSession("a", "   ");
+    expect(useStore.getState().sessions[0].title).toBe("Keep");
+    expect(m.renameSession).not.toHaveBeenCalled();
+  });
+
+  it("ignores a no-op rename to the same title", async () => {
+    useStore.setState({ sessions: [session({ id: "a", title: "Same" })], activeId: "a" });
+    await useStore.getState().renameSession("a", "Same");
+    expect(m.renameSession).not.toHaveBeenCalled();
+  });
+
+  it("ignores a rename for an unknown session id", async () => {
+    useStore.setState({ sessions: [session({ id: "a", title: "A" })], activeId: "a" });
+    await useStore.getState().renameSession("ghost", "X");
+    expect(m.renameSession).not.toHaveBeenCalled();
+    expect(useStore.getState().sessions[0].title).toBe("A");
+  });
+
+  it("reverts the optimistic title and surfaces an error when the write fails", async () => {
+    m.renameSession.mockRejectedValueOnce(new Error("locked db"));
+    useStore.setState({ sessions: [session({ id: "a", title: "Original" })], activeId: "a" });
+    await useStore.getState().renameSession("a", "Doomed");
+    const st = useStore.getState();
+    expect(st.sessions[0].title).toBe("Original"); // reverted
+    expect(st.initError).toMatch(/locked db/);
+  });
+
+  it("does not rename in remote mode (the phone has no rename command)", async () => {
+    useStore.setState({
+      sessions: [session({ id: "a", title: "Phone" })],
+      activeId: "a",
+      remoteConnected: true,
+    });
+    await useStore.getState().renameSession("a", "Nope");
+    expect(m.renameSession).not.toHaveBeenCalled();
+    expect(useStore.getState().sessions[0].title).toBe("Phone");
   });
 });
 
