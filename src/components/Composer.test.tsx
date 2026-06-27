@@ -463,3 +463,35 @@ describe("Composer permission-mode pill", () => {
     expect(screen.queryByRole("button", { name: /Permission mode/i })).not.toBeInTheDocument();
   });
 });
+
+describe("Composer plan-mode banner", () => {
+  it("shows the banner in plan mode and exits to default on click", async () => {
+    useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "plan" } });
+    render(<Composer />);
+
+    expect(screen.getByText("Plan mode")).toBeInTheDocument();
+    const exit = screen.getByRole("button", { name: /Exit plan mode/i });
+
+    await act(async () => {
+      fireEvent.click(exit);
+    });
+    expect(m.saveSettings).toHaveBeenCalledWith({ permissionMode: "default" });
+  });
+
+  it("is hidden when not in plan mode", () => {
+    useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "default" } });
+    render(<Composer />);
+
+    expect(screen.queryByRole("button", { name: /Exit plan mode/i })).not.toBeInTheDocument();
+  });
+
+  it("is hidden on the phone even in plan mode", () => {
+    useStore.setState({
+      remoteMode: true,
+      settings: { ...DEFAULT_SETTINGS, permissionMode: "plan" },
+    });
+    render(<Composer />);
+
+    expect(screen.queryByRole("button", { name: /Exit plan mode/i })).not.toBeInTheDocument();
+  });
+});
