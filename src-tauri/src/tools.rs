@@ -7,10 +7,47 @@ use serde_json::{json, Value};
 use similar::TextDiff;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub struct ToolCtx {
     pub workspace: PathBuf,
+    /// Launches subagents for the [`Task`] tool. `None` when this run can't spawn
+    /// (plan mode, or a subagent already at the nesting cap) — in which case `task`
+    /// isn't in the registry at all, so this is the runtime backstop rather than
+    /// the primary guard. Implemented by the agent runtime so tools never depend on
+    /// the agent loop internals; they only know this trait.
+    pub spawner: Option<Arc<dyn Spawner>>,
+}
+
+impl ToolCtx {
+    /// A context with no spawner — read-only / no-subagent runs, and the default
+    /// in tests. The interactive run attaches a spawner via the struct literal.
+    pub fn new(workspace: PathBuf) -> Self {
+        Self {
+            workspace,
+            spawner: None,
+        }
+    }
+}
+
+/// What the [`Task`] tool needs to launch a subagent, without knowing how a run
+/// is actually wired. Implemented by `agent::AgentSpawner` and attached to
+/// [`ToolCtx`], so the tool layer stays decoupled from the agent loop.
+#[async_trait]
+pub trait Spawner: Send + Sync {
+    /// Run a subagent to completion and return its final text answer — the
+    /// summary the launching agent receives as the tool result. An `Err` is
+    /// surfaced to the launching model as a tool error.
+    async fn spawn(&self, spec: SubagentSpec) -> Result<String, String>;
+}
+
+/// A subagent launch request: a short human label (for telemetry / a future
+/// agents panel) and the full, self-contained task prompt the subagent runs.
+#[derive(Clone, Debug)]
+pub struct SubagentSpec {
+    pub description: String,
+    pub prompt: String,
 }
 
 #[async_trait]
@@ -92,7 +129,29 @@ pub fn default_registry() -> Registry {
         Box::new(FsWrite),
         Box::new(FsEdit),
         Box::new(Shell),
+        Box::new(Task),
     ])
+}
+
+/// The tool set handed to a subagent: the full interactive set, plus the `task`
+/// tool only when the subagent may still spawn its own children (`can_spawn`).
+/// At the maximum nesting depth `can_spawn` is false, so a leaf subagent is never
+/// even offered `task` — the depth cap is enforced by omission here, with the
+/// spawner refusing as a backstop.
+pub fn subagent_registry(can_spawn: bool) -> Registry {
+    let mut tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(FsRead),
+        Box::new(ListDir),
+        Box::new(GlobTool),
+        Box::new(GrepTool),
+        Box::new(FsWrite),
+        Box::new(FsEdit),
+        Box::new(Shell),
+    ];
+    if can_spawn {
+        tools.push(Box::new(Task));
+    }
+    Registry::new(tools)
 }
 
 /// The read-only subset of the default registry — no `fs_write`/`fs_edit`/`shell`.
@@ -722,6 +781,57 @@ impl Tool for Shell {
     }
 }
 
+/// Launch an autonomous subagent. The subagent gets its own tools and a fresh
+/// context, works through the task on its own, and returns a single final summary
+/// — its only output to the launching agent. The launch itself is NOT gated
+/// (`mutating()` stays false): every mutating tool the subagent runs still goes
+/// through the permission gate, so nothing it does escapes the user's control.
+struct Task;
+
+#[async_trait]
+impl Tool for Task {
+    fn name(&self) -> &'static str {
+        "task"
+    }
+    fn description(&self) -> &'static str {
+        "Launch a subagent to handle a complex, well-scoped task autonomously. The \
+         subagent has its own tools and a fresh context, works through the task on its \
+         own, and returns a single final summary — its only output back to you. Use it \
+         to offload focused research or a self-contained multi-step change so it does \
+         not consume this conversation's context. The subagent CANNOT ask you \
+         questions, so put everything it needs in `prompt`."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "description": { "type": "string", "description": "A short (3-5 word) label for the task." },
+                "prompt": { "type": "string", "description": "The full, self-contained task for the subagent to carry out autonomously." }
+            },
+            "required": ["description", "prompt"]
+        })
+    }
+    async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String, String> {
+        let prompt = str_arg(&input, "prompt")?.to_string();
+        let description = input
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("subagent")
+            .to_string();
+        let spawner = ctx.spawner.as_ref().ok_or_else(|| {
+            "Subagents are not available in this run (nested too deep, or this run is \
+             read-only)."
+                .to_string()
+        })?;
+        spawner
+            .spawn(SubagentSpec {
+                description,
+                prompt,
+            })
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,9 +950,7 @@ mod tests {
             return;
         }
 
-        let ctx = ToolCtx {
-            workspace: workspace.clone(),
-        };
+        let ctx = ToolCtx::new(workspace.clone());
         let err = FsWrite
             .run(json!({ "path": "escape/pwned.txt", "content": "x" }), &ctx)
             .await
@@ -873,9 +981,7 @@ mod tests {
             return;
         }
 
-        let ctx = ToolCtx {
-            workspace: workspace.clone(),
-        };
+        let ctx = ToolCtx::new(workspace.clone());
         let err = FsEdit
             .run(
                 json!({
@@ -903,9 +1009,7 @@ mod tests {
     #[tokio::test]
     async fn fs_write_creates_a_missing_parent_inside_the_workspace() {
         let workspace = unique_temp_dir("normal_write");
-        let ctx = ToolCtx {
-            workspace: workspace.clone(),
-        };
+        let ctx = ToolCtx::new(workspace.clone());
         let out = FsWrite
             .run(
                 json!({ "path": "nested/dir/file.txt", "content": "hello" }),
@@ -933,9 +1037,7 @@ mod tests {
     #[tokio::test]
     async fn fs_write_preview_shows_a_diff_without_writing() {
         let workspace = unique_temp_dir("preview_write");
-        let ctx = ToolCtx {
-            workspace: workspace.clone(),
-        };
+        let ctx = ToolCtx::new(workspace.clone());
         let file = workspace.join("f.txt");
         std::fs::write(&file, "old line\n").unwrap();
 
@@ -954,9 +1056,7 @@ mod tests {
     #[tokio::test]
     async fn fs_edit_preview_matches_what_run_writes() {
         let workspace = unique_temp_dir("preview_edit");
-        let ctx = ToolCtx {
-            workspace: workspace.clone(),
-        };
+        let ctx = ToolCtx::new(workspace.clone());
         let file = workspace.join("f.txt");
         std::fs::write(&file, "let x = 1;\n").unwrap();
 
@@ -979,9 +1079,7 @@ mod tests {
     #[tokio::test]
     async fn fs_write_summarize_shows_the_resolved_destination() {
         let workspace = unique_temp_dir("summarize");
-        let ctx = ToolCtx {
-            workspace: workspace.clone(),
-        };
+        let ctx = ToolCtx::new(workspace.clone());
         let summary = FsWrite.summarize(&json!({ "path": "sub/f.txt" }), &ctx);
         // Resolved to an absolute path under the (canonicalized) workspace, not the
         // raw "sub/f.txt".
@@ -1042,7 +1140,7 @@ mod tests {
 
     #[test]
     fn summarize_prefers_path_command_pattern_then_falls_back_to_name() {
-        let ctx = ToolCtx { workspace: base() };
+        let ctx = ToolCtx::new(base());
         assert_eq!(
             FsRead.summarize(&json!({ "path": "src/x.rs" }), &ctx),
             "src/x.rs"
@@ -1069,8 +1167,86 @@ mod tests {
     fn default_registry_exposes_the_standard_tool_set_in_order() {
         assert_eq!(
             spec_names(&default_registry()),
+            ["fs_read", "list", "glob", "grep", "fs_write", "fs_edit", "shell", "task"]
+        );
+    }
+
+    #[test]
+    fn subagent_registry_includes_task_only_when_it_may_spawn() {
+        // A subagent under the nesting cap gets the full set + `task` so it can fan
+        // out further; a leaf subagent (at the cap) is never even offered `task`.
+        assert_eq!(
+            spec_names(&subagent_registry(true)),
+            ["fs_read", "list", "glob", "grep", "fs_write", "fs_edit", "shell", "task"]
+        );
+        let leaf = subagent_registry(false);
+        assert_eq!(
+            spec_names(&leaf),
             ["fs_read", "list", "glob", "grep", "fs_write", "fs_edit", "shell"]
         );
+        assert!(
+            leaf.find("task").is_none(),
+            "a leaf subagent must not resolve the task tool"
+        );
+    }
+
+    #[test]
+    fn tool_ctx_new_has_no_spawner() {
+        // The no-subagent default (tests, read-only runs): `task` has nothing to
+        // call, so it must fail closed rather than panic.
+        let ctx = ToolCtx::new(base());
+        assert!(ctx.spawner.is_none());
+    }
+
+    #[tokio::test]
+    async fn task_tool_without_a_spawner_fails_closed() {
+        // `task` is in a registry but the run attached no spawner (e.g. nested too
+        // deep): it must return a clear error, never panic or silently no-op.
+        let ctx = ToolCtx::new(base());
+        let err = Task
+            .run(
+                json!({ "description": "x", "prompt": "do the thing" }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("not available"), "got: {err}");
+        // `task` is never gated: the subagent's own tools carry the permission.
+        assert!(!Task.mutating());
+    }
+
+    #[tokio::test]
+    async fn task_tool_forwards_the_spec_and_returns_the_subagent_answer() {
+        use std::sync::Mutex;
+        // A stand-in spawner records the spec it was handed and returns a canned
+        // answer, proving the tool wires `description`/`prompt` through and surfaces
+        // the subagent's result verbatim as the tool output.
+        struct RecordingSpawner {
+            seen: Arc<Mutex<Option<SubagentSpec>>>,
+        }
+        #[async_trait]
+        impl Spawner for RecordingSpawner {
+            async fn spawn(&self, spec: SubagentSpec) -> Result<String, String> {
+                *self.seen.lock().unwrap() = Some(spec.clone());
+                Ok(format!("did: {}", spec.description))
+            }
+        }
+        let seen = Arc::new(Mutex::new(None));
+        let ctx = ToolCtx {
+            workspace: base(),
+            spawner: Some(Arc::new(RecordingSpawner { seen: seen.clone() })),
+        };
+        let out = Task
+            .run(
+                json!({ "description": "audit deps", "prompt": "find vulnerable crates" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "did: audit deps");
+        let spec = seen.lock().unwrap().clone().expect("spawner was invoked");
+        assert_eq!(spec.description, "audit deps");
+        assert_eq!(spec.prompt, "find vulnerable crates");
     }
 
     #[test]
