@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type DragEvent, type KeyboardEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent } from "react";
 
 import { useContextMenu, type ContextMenuItem } from "./ContextMenu";
 import { isTauri } from "../lib/ipc";
@@ -53,9 +53,11 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   const sessions = useStore((s) => s.sessions);
   const activeId = useStore((s) => s.activeId);
   const streaming = useStore((s) => s.streaming);
+  const remoteConnected = useStore((s) => s.remoteConnected);
   const newSession = useStore((s) => s.newSession);
   const selectSession = useStore((s) => s.selectSession);
   const deleteSession = useStore((s) => s.deleteSession);
+  const renameSession = useStore((s) => s.renameSession);
   const setShowSettings = useStore((s) => s.setShowSettings);
   const settings = useStore((s) => s.settings);
   const oauthStatus = useStore((s) => s.oauthStatus);
@@ -93,6 +95,21 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   const [editingFolderId, setEditingFolderId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
   const renameCancelled = useRef(false);
+  // Inline session rename (grafted from the Claude-Code-parity work, whose backend
+  // — renameSession/ipc.renameSession/the rename_session command — already landed
+  // on this branch but whose UI trigger was dropped in the merge). `editingId` is
+  // the row showing the editor; `draft` its working title. `editingRef` mirrors the
+  // editing id synchronously so the trailing blur fired as the input unmounts is
+  // absorbed (a stale closure would otherwise re-commit). `refocusRef` carries the
+  // id whose select button should regain focus once the editor closes.
+  const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const editingRef = useRef<string | null>(null);
+  const refocusRef = useRef<string | null>(null);
+  // Renames are a desktop-local DB write with no remote equivalent, and (like the
+  // sibling row actions) are never allowed mid-turn — so the affordance is hidden
+  // in both states. The store action guards these too; this just keeps the UI honest.
+  const canRename = !streaming && !remoteConnected;
   // The folder currently under a dragged chat (drop-target highlight).
   const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
   // Where a drag-reorder would drop, for the insertion-line indicator.
@@ -128,6 +145,49 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   // Roving-tabindex stops for arrow-key navigation, indexed by position in the
   // flat `visible` list (so nav follows the on-screen order, not raw insertion).
   const rowRefs = useRef<(HTMLButtonElement | null)[]>([]);
+
+  // ── Inline session rename handlers ─────────────────────────────────────────
+  const beginEdit = (s: Session) => {
+    if (!canRename) return;
+    editingRef.current = s.id;
+    setEditingSessionId(s.id);
+    setDraft(s.title);
+  };
+  // Close the editor exactly once (the ref guard absorbs the unmount blur),
+  // optionally committing the draft, and queue focus back to the edited row.
+  const closeEditor = (commit: boolean) => {
+    const id = editingRef.current;
+    if (id === null) return; // already closed → ignore a trailing blur
+    editingRef.current = null;
+    refocusRef.current = id;
+    if (commit) void renameSession(id, draft);
+    setEditingSessionId(null);
+  };
+  const commitEdit = () => closeEditor(true);
+  const cancelEdit = () => closeEditor(false);
+  const onEditKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      commitEdit();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancelEdit();
+    }
+    // Keep arrows/Home/End local so the list's roving-nav doesn't fire while editing.
+    e.stopPropagation();
+  };
+  // When the editor closes, return focus to the edited row's select button (the
+  // input has unmounted by now, so this runs post-render). Adapted from parity's
+  // `sessions.findIndex(...)`: this sidebar keys `rowRefs` by the FLATTENED VISIBLE
+  // row order (each session row's `navIndex` === its index in `visible`), so we
+  // refocus by the row's position in `visible`, not in the raw `sessions` array
+  // (which would point at the wrong slot once folders/grouping reorder the list).
+  useEffect(() => {
+    if (editingSessionId !== null || refocusRef.current === null) return;
+    const idx = visible.findIndex((s) => s.id === refocusRef.current);
+    refocusRef.current = null;
+    if (idx >= 0) rowRefs.current[idx]?.focus();
+  }, [editingSessionId, visible]);
 
   const onListKeyDown = (e: KeyboardEvent<HTMLElement>) => {
     if (streaming || visible.length === 0) return;
@@ -462,67 +522,96 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
               ⠿
             </span>
           )}
-          <button
-            ref={(el) => {
-              rowRefs.current[navIndex] = el;
-            }}
-            onClick={() => selectSession(s.id)}
-            disabled={streaming}
-            tabIndex={isTabStop ? 0 : -1}
-            aria-current={active ? "true" : undefined}
-            className={`flex min-w-0 flex-1 flex-col text-left ${
-              streaming ? "cursor-not-allowed" : ""
-            }`}
-            title={streaming ? "Finish or stop the current turn first" : s.title}
-          >
-            <span className="relative flex items-center">
-              <RowIndicator status={status} active={active} />
+          {editingSessionId === s.id ? (
+            <input
+              autoFocus
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={onEditKeyDown}
+              onBlur={commitEdit}
+              aria-label={`Rename session: ${s.title}`}
+              className="min-w-0 flex-1 rounded border border-accent/40 bg-panel-2 px-2 py-1 text-[13px] text-fg outline-none focus:border-accent"
+            />
+          ) : (
+            <button
+              ref={(el) => {
+                rowRefs.current[navIndex] = el;
+              }}
+              onClick={() => selectSession(s.id)}
+              onDoubleClick={() => beginEdit(s)}
+              disabled={streaming}
+              tabIndex={isTabStop ? 0 : -1}
+              aria-current={active ? "true" : undefined}
+              className={`flex min-w-0 flex-1 flex-col text-left ${
+                streaming ? "cursor-not-allowed" : ""
+              }`}
+              title={streaming ? "Finish or stop the current turn first" : s.title}
+            >
+              <span className="relative flex items-center">
+                <RowIndicator status={status} active={active} />
+                <span
+                  className={`truncate pl-3 text-[13px] ${
+                    active ? "text-fg" : isArchived ? "text-faint" : "text-muted"
+                  }`}
+                >
+                  {s.title}
+                </span>
+              </span>
               <span
-                className={`truncate pl-3 text-[13px] ${
-                  active ? "text-fg" : isArchived ? "text-faint" : "text-muted"
+                className={`truncate pl-3 font-mono text-[10.5px] ${
+                  active ? "text-muted" : "text-faint"
                 }`}
               >
-                {s.title}
+                <span aria-hidden="true">⎇</span> {meta} · {relativeTime(s.updatedAt)}
               </span>
-            </span>
-            <span
-              className={`truncate pl-3 font-mono text-[10.5px] ${
-                active ? "text-muted" : "text-faint"
-              }`}
+            </button>
+          )}
+          {canRename && editingSessionId !== s.id && (
+            <button
+              onClick={() => beginEdit(s)}
+              tabIndex={isTabStop ? 0 : -1}
+              className="ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-accent/10 hover:text-accent group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none"
+              aria-label={`Rename session: ${s.title}`}
+              title="Rename session"
             >
-              <span aria-hidden="true">⎇</span> {meta} · {relativeTime(s.updatedAt)}
-            </span>
-          </button>
-          <button
-            onClick={() => toggleArchived(s.id)}
-            disabled={streaming}
-            tabIndex={isTabStop ? 0 : -1}
-            className={`ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-accent-2/10 hover:text-accent-2 group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none ${
-              streaming ? "cursor-not-allowed opacity-50" : ""
-            }`}
-            aria-label={`${status === "archived" ? "Unarchive" : "Archive"} session: ${s.title}`}
-            title={
-              streaming
-                ? "Finish or stop the current turn first"
-                : status === "archived"
-                  ? "Unarchive"
-                  : "Archive"
-            }
-          >
-            <ArchiveIcon />
-          </button>
-          <button
-            onClick={() => deleteSession(s.id)}
-            disabled={streaming}
-            tabIndex={isTabStop ? 0 : -1}
-            className={`ml-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-danger/10 hover:text-danger group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none ${
-              streaming ? "cursor-not-allowed opacity-50" : ""
-            }`}
-            aria-label={`Delete session: ${s.title}`}
-            title={streaming ? "Finish or stop the current turn first" : "Delete session"}
-          >
-            ✕
-          </button>
+              <RenameGlyph />
+            </button>
+          )}
+          {/* Row actions collapse to just the editor while this row is being renamed. */}
+          {editingSessionId !== s.id && (
+            <>
+              <button
+                onClick={() => toggleArchived(s.id)}
+                disabled={streaming}
+                tabIndex={isTabStop ? 0 : -1}
+                className={`ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-accent-2/10 hover:text-accent-2 group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none ${
+                  streaming ? "cursor-not-allowed opacity-50" : ""
+                }`}
+                aria-label={`${status === "archived" ? "Unarchive" : "Archive"} session: ${s.title}`}
+                title={
+                  streaming
+                    ? "Finish or stop the current turn first"
+                    : status === "archived"
+                      ? "Unarchive"
+                      : "Archive"
+                }
+              >
+                <ArchiveIcon />
+              </button>
+              <button
+                onClick={() => deleteSession(s.id)}
+                disabled={streaming}
+                tabIndex={isTabStop ? 0 : -1}
+                className={`ml-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-danger/10 hover:text-danger group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none ${
+                  streaming ? "cursor-not-allowed opacity-50" : ""
+                }`}
+                aria-label={`Delete session: ${s.title}`}
+                title={streaming ? "Finish or stop the current turn first" : "Delete session"}
+              >
+                ✕
+              </button>
+            </>
+          )}
         </div>
       </div>
     );
