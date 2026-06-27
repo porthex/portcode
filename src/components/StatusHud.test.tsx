@@ -210,4 +210,36 @@ describe("StatusHud", () => {
 
     expect(screen.getByText(`${(1540).toLocaleString()} tok`)).toBeInTheDocument();
   });
+
+  it("surfaces cumulative spend summed across ALL sessions (survives restart)", () => {
+    // The kind of usage map init() rehydrates from SQLite — two sessions' spend.
+    useStore.setState({
+      sessions: [session({ id: "s1" }), session({ id: "s2" })],
+      activeId: "s1",
+      usage: { s1: { input: 1000, output: 200 }, s2: { input: 3000, output: 600 } },
+    });
+
+    render(<StatusHud />);
+
+    // Σ sums every session and prices at the current (opus) model:
+    // (4000*5 + 800*25)/1e6 = 0.04 -> $0.04.
+    expect(screen.getByText("Σ $0.04")).toBeInTheDocument();
+  });
+
+  it("omits the spend segment when nothing has been spent", () => {
+    useStore.setState({ sessions: [session()], activeId: "s1" });
+    render(<StatusHud />);
+    expect(screen.queryByText(/^Σ /)).toBeNull();
+  });
+
+  it("drops the spend segment on the phone (remote mode) to fit a narrow bar", () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      remoteMode: true,
+      usage: { s1: { input: 5000, output: 1000 } },
+    });
+    render(<StatusHud />);
+    expect(screen.queryByText(/^Σ /)).toBeNull();
+  });
 });

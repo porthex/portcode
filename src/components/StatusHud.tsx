@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 
 import { useStore } from "../store/store";
-import { MODELS, type Message } from "../types";
+import { estimateCost, MODELS, type Message } from "../types";
 
 /** "claude-opus-4-8" -> "OPUS 4.8" */
 function modelLabel(id: string): string {
@@ -43,6 +43,7 @@ export function StatusHud() {
   const policy = useStore((s) => s.settings.defaultPolicy);
   const streaming = useStore((s) => s.streaming);
   const usage = useStore((s) => (s.activeId ? s.usage[s.activeId] : undefined));
+  const usageMap = useStore((s) => s.usage);
   const messages = useStore((s) => (s.activeId ? s.messages[s.activeId] : undefined));
   const remoteMode = useStore((s) => s.remoteMode);
   const tokens = usage ? usage.input + usage.output : 0;
@@ -52,6 +53,20 @@ export function StatusHud() {
   // doesn't re-scan the transcript. A real message change — including each
   // streaming text delta, since patchLast rebuilds the array — still recomputes.
   const toolUses = useMemo(() => countToolUses(messages), [messages]);
+
+  // Cumulative spend across every session, persisted in SQLite and rehydrated on
+  // startup (B2) so the running total survives a restart — a transparency/trust cue
+  // (Fogg credibility). An estimate: it prices the summed tokens at the CURRENT
+  // model (per-model splits aren't stored), matching the per-session UsageMeter.
+  const totalCost = useMemo(() => {
+    let input = 0;
+    let output = 0;
+    for (const u of Object.values(usageMap)) {
+      input += u.input;
+      output += u.output;
+    }
+    return estimateCost(model, { input, output });
+  }, [usageMap, model]);
 
   return (
     <footer className="pc-hud">
@@ -81,6 +96,16 @@ export function StatusHud() {
         </div>
       )}
       <div className="pc-hud-seg pc-hud-seg--right text-faint">{tokens.toLocaleString()} tok</div>
+      {/* Cumulative spend (all sessions), survives restarts. Phone trims the HUD to
+          essentials, so this desktop-only segment doesn't crowd a narrow screen. */}
+      {!remoteMode && totalCost > 0 && (
+        <div
+          className="pc-hud-seg pc-hud-seg--right tabular-nums text-success"
+          title="Total estimated spend across all sessions (priced at the current model)"
+        >
+          Σ ${totalCost.toFixed(totalCost < 0.01 ? 4 : 2)}
+        </div>
+      )}
       <div className="pc-hud-seg pc-hud-seg--right text-success">
         <span
           className={`pc-dot ${streaming ? "pc-dot--ring" : "pc-dot--success"}`}

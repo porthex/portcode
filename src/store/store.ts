@@ -1,6 +1,8 @@
 import { create } from "zustand";
 import type {
+  ComposerPhase,
   ContentBlock,
+  DraftEntry,
   Message,
   MessageRow,
   OAuthStatus,
@@ -13,6 +15,7 @@ import type {
   SessionFolder,
   SessionGroup,
   SessionSort,
+  SessionUsage,
   Settings,
   StreamEvent,
   SyncFrame,
@@ -58,7 +61,13 @@ interface AppState {
   manualOrder: string[]; // drag-reordered session ids (honoured when sortBy === "manual")
   ambientRain: boolean; // decorative neon-rain backdrop (off by default)
   scanlines: boolean; // CRT scanline overlay (off by default)
-  draft: string;
+  // Per-session unsent composer drafts (Zeigarnik open-loop). Keyed by sessionId
+  // so a half-written message can't bleed across sessions; persisted via the
+  // backend (durable) with an optimistic localStorage mirror for instant restore.
+  drafts: Record<string, string>;
+  // The composer's live presence phase, driven by REAL turn/stream events (never
+  // padded). Surfaced in the role="status" region beside the composer.
+  composerPhase: ComposerPhase;
   cancel: (() => Promise<void>) | null;
   pendingPermission: PendingPermission | null;
 
@@ -163,6 +172,100 @@ const clearRemoteWatchdog = (): void => {
     clearInterval(remoteWatchdog);
     remoteWatchdog = null;
   }
+};
+
+// ── Draft persistence ─────────────────────────────────────────────────────────
+// The optimistic localStorage mirror (written synchronously by setDraft) gives the
+// instant restore; the durable backend write is DEBOUNCED so a burst of keystrokes
+// doesn't hammer SQLite. One timer per session, keyed so switching sessions can't
+// drop a pending save. A send (or any clear) flushes immediately instead.
+const DRAFT_SAVE_DEBOUNCE_MS = 400;
+const draftSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+const flushPendingDraftSave = (sessionId: string): void => {
+  const t = draftSaveTimers.get(sessionId);
+  if (t !== undefined) {
+    clearTimeout(t);
+    draftSaveTimers.delete(sessionId);
+  }
+};
+
+// Fire the durable backend write. Best-effort: a backend reject is swallowed (the
+// localStorage mirror already holds the value). Wrapped so the debounce timer can
+// never throw an unhandled error — tolerating a test IPC mock that omits saveDraft
+// (a missing fn throws synchronously) or returns a non-promise.
+const fireDraftSave = (sessionId: string, text: string): void => {
+  try {
+    void Promise.resolve(ipc.saveDraft(sessionId, text)).catch(() => {});
+  } catch {
+    /* ipc.saveDraft unavailable in this environment — drop the durable write */
+  }
+};
+
+// Persist a session's draft to the durable backend. `immediate` (send/clear) skips
+// the debounce and cancels any pending one so a just-sent draft can't be resurrected
+// by a stale timer.
+const persistDraft = (sessionId: string, text: string, immediate: boolean): void => {
+  flushPendingDraftSave(sessionId);
+  if (immediate) {
+    fireDraftSave(sessionId, text);
+    return;
+  }
+  draftSaveTimers.set(
+    sessionId,
+    setTimeout(() => {
+      draftSaveTimers.delete(sessionId);
+      fireDraftSave(sessionId, text);
+    }, DRAFT_SAVE_DEBOUNCE_MS),
+  );
+};
+
+// Merge the durable backend drafts under the optimistic localStorage mirror. The
+// mirror is written on every keystroke (synchronous) and so is never staler than
+// the debounced backend — it WINS on conflict, while the backend fills in keys the
+// mirror lacks (e.g. localStorage was evicted but SQLite survived).
+const mergeDrafts = (
+  mirror: Record<string, string>,
+  rows: DraftEntry[],
+): Record<string, string> => {
+  const out: Record<string, string> = {};
+  for (const r of rows) if (r.text) out[r.sessionId] = r.text;
+  return { ...out, ...mirror };
+};
+
+const usageFromRows = (rows: SessionUsage[]): Record<string, Usage> => {
+  const out: Record<string, Usage> = {};
+  for (const r of rows) out[r.sessionId] = { input: r.input, output: r.output };
+  return out;
+};
+
+// ── Composer presence settle ──────────────────────────────────────────────────
+// The instant a turn is sent we show "got it — reading…"; the first REAL stream
+// event settles it to "thinking with you…". This timer is the FALLBACK for a turn
+// that takes a beat to produce its first byte — it is NOT padded latency: the real
+// event (text_delta/tool_use), when it arrives first, settles the phase and cancels
+// this timer (see onEvent / applyRemoteEvent).
+const COMPOSER_SETTLE_MS = 900;
+let settleTimer: ReturnType<typeof setTimeout> | null = null;
+
+const clearSettleTimer = (): void => {
+  if (settleTimer !== null) {
+    clearTimeout(settleTimer);
+    settleTimer = null;
+  }
+};
+
+// Arm the received→thinking settle fallback. Re-reads live state when it fires so it
+// only advances a turn that is still streaming and still in the "received" phase.
+const armSettleTimer = (): void => {
+  clearSettleTimer();
+  settleTimer = setTimeout(() => {
+    settleTimer = null;
+    const st = useStore.getState();
+    if (st.streaming && st.composerPhase === "received") {
+      useStore.setState({ composerPhase: "thinking" });
+    }
+  }, COMPOSER_SETTLE_MS);
 };
 
 // Frontend-only UI preferences (decorative overlays). Cosmetic client state,
@@ -278,7 +381,10 @@ export const useStore = create<AppState>((set, get) => ({
   manualOrder: readJSON<string[]>("pc.manualOrder", []),
   ambientRain: readPref("pc.ambientRain"),
   scanlines: readPref("pc.scanlines"),
-  draft: "",
+  // Hydrate the optimistic mirror synchronously so a reload restores drafts BEFORE
+  // the backend round-trip; init() then merges the authoritative backend drafts.
+  drafts: readJSON<Record<string, string>>("pc.drafts", {}),
+  composerPhase: "idle",
   cancel: null,
   pendingPermission: null,
   initError: null,
@@ -328,11 +434,19 @@ export const useStore = create<AppState>((set, get) => ({
     // createSession/getMessages) are guarded so a failed startup surfaces an
     // error+retry panel instead of a permanently blank welcome shell.
     try {
-      const [settings, oauthStatus, phoneSync] = await Promise.all([
+      const [settings, oauthStatus, phoneSync, backendDrafts, allUsage] = await Promise.all([
         ipc.getSettings(),
         ipc.oauthStatus().catch(() => null),
         ipc.phoneSyncStatus().catch(() => null),
+        // Resilient: an older core that predates these commands must not block
+        // startup — fall back to empty (the localStorage mirror still restores drafts).
+        ipc.getDrafts().catch(() => []),
+        ipc.getAllUsage().catch(() => []),
       ]);
+      // Authoritative durable drafts merged under the already-hydrated optimistic
+      // mirror; usage restored so per-session meters + workspace spend survive restart.
+      const drafts = mergeDrafts(get().drafts, backendDrafts);
+      const usage = usageFromRows(allUsage);
       const sessions = await ipc.listSessions();
       if (sessions.length === 0) {
         const s = makeSession();
@@ -341,6 +455,8 @@ export const useStore = create<AppState>((set, get) => ({
           settings,
           oauthStatus,
           phoneSync,
+          drafts,
+          usage,
           sessions: [s],
           activeId: s.id,
           messages: { [s.id]: [] },
@@ -354,6 +470,8 @@ export const useStore = create<AppState>((set, get) => ({
         settings,
         oauthStatus,
         phoneSync,
+        drafts,
+        usage,
         sessions,
         activeId,
         messages: { [activeId]: msgs },
@@ -458,6 +576,23 @@ export const useStore = create<AppState>((set, get) => ({
       const messages = { ...st.messages };
       delete messages[id];
       const activeId = st.activeId === id ? (sessions[0]?.id ?? null) : st.activeId;
+      // Prune the gone session's usage + draft to stay in lockstep with the backend
+      // (db.rs deletes both rows on delete_session). Otherwise the deleted session's
+      // tokens keep inflating the HUD's workspace-total spend until a restart re-reads
+      // the (pruned) backend totals — a non-deterministic, trust-eroding drift — and a
+      // dead draft lingers in the mirror that mergeDrafts would keep re-preserving.
+      let usage = st.usage;
+      if (id in usage) {
+        usage = { ...st.usage };
+        delete usage[id];
+      }
+      let drafts = st.drafts;
+      if (id in drafts) {
+        drafts = { ...st.drafts };
+        delete drafts[id];
+        writeJSON("pc.drafts", drafts);
+      }
+      flushPendingDraftSave(id); // cancel any in-flight debounced save for the gone session
       // Drop the gone session's sidebar-org entries so stale folder membership /
       // archived state can't accumulate in localStorage across deletions.
       let folderOf = st.folderOf;
@@ -476,7 +611,7 @@ export const useStore = create<AppState>((set, get) => ({
         manualOrder = manualOrder.filter((x) => x !== id);
         writeJSON("pc.manualOrder", manualOrder);
       }
-      return { sessions, messages, activeId, folderOf, archivedIds, manualOrder };
+      return { sessions, messages, activeId, usage, drafts, folderOf, archivedIds, manualOrder };
     });
     if (get().sessions.length === 0) {
       await get().newSession();
@@ -503,6 +638,25 @@ export const useStore = create<AppState>((set, get) => ({
     // Trim once so the stored user bubble and the forwarded command match the
     // derived (trimmed) title — a padded draft otherwise renders odd blank lines.
     const body = text.trim();
+
+    // Close the open loop: the message is on its way, so clear this session's draft
+    // everywhere — the in-memory map, the optimistic mirror, and (immediately,
+    // cancelling any pending debounce) the durable backend — so a fast restart can't
+    // restore a just-sent draft.
+    set((st) => {
+      if (!(activeId in st.drafts)) return {};
+      const drafts = { ...st.drafts };
+      delete drafts[activeId];
+      writeJSON("pc.drafts", drafts);
+      return { drafts };
+    });
+    persistDraft(activeId, "", true);
+
+    // Turn-taking receipt (Doherty <400ms): acknowledge the send instantly ("got it
+    // — reading…"); the first REAL stream event settles it to "thinking…", with a
+    // 900ms fallback for a slow first byte. Honest — never padded latency.
+    set({ composerPhase: "received" });
+    armSettleTimer();
 
     // Remote mode: this device is the phone driving a paired desktop. Forward the
     // turn as a `run` command instead of running the local agent — the desktop is
@@ -536,10 +690,12 @@ export const useStore = create<AppState>((set, get) => ({
         // No live frame for the whole idle window → treat the desktop as hung and
         // recover, so the composer can't stay disabled forever.
         clearRemoteWatchdog();
+        clearSettleTimer();
         const sid = get().activeId;
         set((st) => ({
           streaming: false,
           pendingPermission: null,
+          composerPhase: "idle",
           messages:
             sid !== null
               ? patchLast(st.messages, sid, (b) =>
@@ -624,9 +780,20 @@ export const useStore = create<AppState>((set, get) => ({
       lastActivity = now();
       switch (e.type) {
         case "text_delta":
+          // First real byte settles the receipt into "thinking with you…" (and
+          // cancels the fallback timer). Only advance from "received" so a Stop
+          // in flight ("stopping…") isn't overwritten by a late delta.
+          if (get().composerPhase === "received") {
+            clearSettleTimer();
+            set({ composerPhase: "thinking" });
+          }
           apply((blocks) => appendText(blocks, e.text));
           break;
         case "tool_use":
+          if (get().composerPhase === "received") {
+            clearSettleTimer();
+            set({ composerPhase: "thinking" });
+          }
           apply((blocks) => [
             ...blocks,
             { kind: "tool_use", id: e.id, name: e.name, input: e.input },
@@ -670,11 +837,13 @@ export const useStore = create<AppState>((set, get) => ({
         case "error":
           apply((blocks) => appendText(blocks, `\n\n**Error:** ${e.message}`));
           settle(false);
-          set({ streaming: false, cancel: null, pendingPermission: null });
+          clearSettleTimer();
+          set({ streaming: false, cancel: null, pendingPermission: null, composerPhase: "idle" });
           break;
         case "turn_end":
           settle(false);
-          set({ streaming: false, cancel: null, pendingPermission: null });
+          clearSettleTimer();
+          set({ streaming: false, cancel: null, pendingPermission: null, composerPhase: "idle" });
           break;
       }
     };
@@ -727,13 +896,17 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async stop() {
+    // Acknowledge the Stop intent in <100ms — before the backend cancel resolves —
+    // by relabeling the presence to "stopping…" and stopping the settle fallback.
+    clearSettleTimer();
+    set({ composerPhase: "stopping" });
     // Remote mode: the turn runs on the desktop, so stop it with a Cancel command
     // over the link (there is no local `cancel` handle on the phone).
     if (get().remoteConnected) {
       clearRemoteWatchdog(); // the turn is over — stop the idle watchdog
       const activeId = get().activeId;
       if (activeId) await get().sendRemoteCommand({ cmd: "cancel", session_id: activeId });
-      set({ streaming: false, pendingPermission: null });
+      set({ streaming: false, pendingPermission: null, composerPhase: "idle" });
       return;
     }
     const c = get().cancel;
@@ -742,7 +915,7 @@ export const useStore = create<AppState>((set, get) => ({
     } catch {
       /* the cancel_agent IPC failed; recover the UI anyway so the composer isn't stuck */
     } finally {
-      set({ streaming: false, cancel: null, pendingPermission: null });
+      set({ streaming: false, cancel: null, pendingPermission: null, composerPhase: "idle" });
     }
   },
 
@@ -899,14 +1072,26 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   setDraft(v) {
-    set({ draft: v });
+    const id = get().activeId;
+    if (!id) return; // no active session → nowhere to key the draft
+    set((st) => {
+      const drafts = { ...st.drafts };
+      // Keep the mirror tidy: an emptied draft drops its key (matches the backend,
+      // which deletes a blank row) so a cleared draft never round-trips back.
+      if (v) drafts[id] = v;
+      else delete drafts[id];
+      writeJSON("pc.drafts", drafts); // optimistic mirror — instant restore on reload
+      return { drafts };
+    });
+    persistDraft(id, v, false); // debounced durable write
   },
 
   appendDraft(v) {
-    set((st) => {
-      const sep = st.draft && !st.draft.endsWith(" ") ? " " : "";
-      return { draft: st.draft + sep + v + " " };
-    });
+    const id = get().activeId;
+    if (!id) return;
+    const cur = get().drafts[id] ?? "";
+    const sep = cur && !cur.endsWith(" ") ? " " : "";
+    get().setDraft(cur + sep + v + " ");
   },
 
   async openWorkspace() {
@@ -1111,6 +1296,7 @@ export const useStore = create<AppState>((set, get) => ({
     // so without this a reconnect lands in a disabled composer + a dead permission
     // prompt. If the desktop turn is genuinely still live, its catch-up/live frames
     // re-establish `streaming` after the dial.
+    clearSettleTimer();
     set({
       remoteUnlisten: null,
       remoteError: null,
@@ -1118,6 +1304,7 @@ export const useStore = create<AppState>((set, get) => ({
       remoteChatOpen: false,
       streaming: false,
       pendingPermission: null,
+      composerPhase: "idle",
     });
     let unlistenFrame: (() => void) | null = null;
     let unlistenDrop: (() => void) | null = null;
@@ -1149,6 +1336,7 @@ export const useStore = create<AppState>((set, get) => ({
         // connection flags, so neither the interim nor the reconnected session is
         // stuck on a stale `streaming`/`pendingPermission`.
         clearRemoteWatchdog();
+        clearSettleTimer();
         set({
           remoteConnected: false,
           remoteVerified: false,
@@ -1156,6 +1344,7 @@ export const useStore = create<AppState>((set, get) => ({
           remoteChatOpen: false,
           streaming: false,
           pendingPermission: null,
+          composerPhase: "idle",
         });
       });
       // Remember the desktop across launches (public payload — no secret).
@@ -1239,12 +1428,14 @@ export const useStore = create<AppState>((set, get) => ({
         }));
       }
       clearRemoteWatchdog(); // the turn can't proceed on a dropped link
-      set({ remoteDropped: true, streaming: false });
+      clearSettleTimer();
+      set({ remoteDropped: true, streaming: false, composerPhase: "idle" });
     }
   },
 
   async disconnectRemote() {
     clearRemoteWatchdog(); // user-initiated teardown — the turn is over
+    clearSettleTimer();
     const unlisten = get().remoteUnlisten;
     // Flip the connection flags FIRST, before the async teardown. `remoteConnected`
     // is the routing source of truth for send/stop/resolvePermission, so clearing it
@@ -1271,6 +1462,7 @@ export const useStore = create<AppState>((set, get) => ({
       remoteChatOpen: false,
       streaming: false, // the turn is over — don't strand a stuck composer
       pendingPermission: null,
+      composerPhase: "idle",
     });
     writeStr("pc.lastPairingQr", null); // forget the remembered desktop too
     if (unlisten) unlisten();
@@ -1385,6 +1577,16 @@ type RemoteSetter = (fn: (st: AppState) => Partial<AppState>) => void;
 // session's turn would flip the visible composer or pop a permission prompt the
 // user has no context for (and would answer blind).
 function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent): void {
+  // First real byte for the on-screen session settles the receipt into "thinking…"
+  // and cancels the fallback timer — mirrors the local onEvent. Background-session
+  // frames never touch the visible presence.
+  const settleActivePresence = (): void => {
+    const st = useStore.getState();
+    if (st.activeId === sessionId && st.composerPhase === "received") {
+      clearSettleTimer();
+      set(() => ({ composerPhase: "thinking" }));
+    }
+  };
   switch (e.type) {
     case "turn_start":
       set((st) => {
@@ -1404,11 +1606,13 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       });
       break;
     case "text_delta":
+      settleActivePresence();
       set((st) => ({
         messages: patchLast(st.messages, sessionId, (b) => appendText(b, e.text)),
       }));
       break;
     case "tool_use":
+      settleActivePresence();
       set((st) => ({
         messages: patchLast(st.messages, sessionId, (b) => [
           ...b,
@@ -1449,18 +1653,30 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       // A terminal frame for the active session ends the turn — stop the remote idle
       // watchdog (it self-clears on its next tick once streaming is false, but clear
       // it eagerly so it can't fire a spurious timeout in the meantime).
-      if (useStore.getState().activeId === sessionId) clearRemoteWatchdog();
+      if (useStore.getState().activeId === sessionId) {
+        clearRemoteWatchdog();
+        clearSettleTimer();
+      }
       set((st) => ({
         messages: patchLast(st.messages, sessionId, (b) =>
           appendText(b, `\n\n**Error:** ${e.message}`),
         ),
         // Only clear the visible turn flags when this is the active session.
-        ...(st.activeId === sessionId ? { streaming: false, pendingPermission: null } : {}),
+        ...(st.activeId === sessionId
+          ? { streaming: false, pendingPermission: null, composerPhase: "idle" }
+          : {}),
       }));
       break;
     case "turn_end":
-      if (useStore.getState().activeId === sessionId) clearRemoteWatchdog();
-      set((st) => (st.activeId === sessionId ? { streaming: false, pendingPermission: null } : {}));
+      if (useStore.getState().activeId === sessionId) {
+        clearRemoteWatchdog();
+        clearSettleTimer();
+      }
+      set((st) =>
+        st.activeId === sessionId
+          ? { streaming: false, pendingPermission: null, composerPhase: "idle" }
+          : {},
+      );
       break;
   }
 }
