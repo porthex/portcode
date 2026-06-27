@@ -70,6 +70,12 @@ export interface WebSession {
   onFrame(cb: (f: SyncFrame) => void): Unlisten;
   /** Subscribe to the "session dropped" signal. Returns an unlisten handle. */
   onDisconnected(cb: () => void): Unlisten;
+  /**
+   * Decline the pairing from the phone side: send a `pairing_reject` frame to the
+   * desktop, then disconnect. Used when the user taps "It doesn't match — Cancel"
+   * so the desktop learns the SAS was rejected (not just that the link dropped).
+   */
+  reject(): Promise<void>;
   /** Tear down the session. Idempotent. */
   disconnect(): Promise<void>;
 }
@@ -133,6 +139,13 @@ export function createMockConnector(): WebSessionConnector {
             disconnectedCbs.delete(cb);
           };
         },
+        async reject(): Promise<void> {
+          // No real desktop to send the reject frame to; mirror `disconnect` so the
+          // preview/test still tears the (inert) session down and notifies listeners.
+          for (const cb of disconnectedCbs) cb();
+          frameCbs.clear();
+          disconnectedCbs.clear();
+        },
         async disconnect(): Promise<void> {
           for (const cb of disconnectedCbs) cb();
           frameCbs.clear();
@@ -181,6 +194,13 @@ export interface WasmSession {
    * the `onDisconnected` fanout so a spontaneous drop reaches the store.
    */
   onDisconnected?(cb: () => void): void;
+  /**
+   * Decline the pairing: send the `PairingReject` frame, then disconnect. Added on
+   * the Rust `Session` alongside `disconnect` (no args). The adapter calls this for
+   * {@link WebSession.reject}; an older wasm build without it falls back to a plain
+   * `disconnect()` so the channel still closes.
+   */
+  reject?(): void | Promise<void>;
   /** Tear down the session (drops the channel; ends the loops). */
   disconnect(): void | Promise<void>;
 }
@@ -296,6 +316,18 @@ function adaptWasmSession(ws: WasmSession): WebSession {
         disconnectedCbs.delete(cb);
       };
     },
+    async reject(): Promise<void> {
+      // Decline the pairing: send the reject frame + disconnect via the wasm
+      // `reject()`. Shares the once-only teardown guard with `disconnect` (a reject
+      // releases the wasm handle, so a later manual disconnect must not re-release).
+      // Older wasm builds lack `reject` — fall back to a plain disconnect so the
+      // channel still closes (the desktop just won't learn the SAS was rejected).
+      if (toreDown) return;
+      toreDown = true;
+      if (ws.reject) await ws.reject();
+      else await ws.disconnect();
+      fanoutDisconnect();
+    },
     async disconnect(): Promise<void> {
       // Tear down the wasm session at most once (a spontaneous drop fires the
       // fanout but does NOT release the wasm handle, so a later manual disconnect
@@ -310,26 +342,54 @@ function adaptWasmSession(ws: WasmSession): WebSession {
 }
 
 /**
+ * The error a {@link createWasmConnector}'s `connect` rejects with when the real
+ * `portcode-wasm` module fails to load. Distinct (named) so the store/UI can tell a
+ * genuine wasm-load failure apart from an ordinary dial error and surface it as
+ * "the secure transport couldn't load" rather than a misleading no-op.
+ */
+export class WasmUnavailableError extends Error {
+  /** The underlying load failure (import reject / init throw). Kept as an own field
+   *  rather than the standard `Error.cause` (not in the ES2021 lib target). */
+  readonly reason: unknown;
+  constructor(reason: unknown) {
+    super(
+      "The secure connection module couldn't load. Reload the app and try again — " +
+        "if this keeps happening the build may be incomplete.",
+    );
+    this.name = "WasmUnavailableError";
+    this.reason = reason;
+  }
+}
+
+/**
  * Build the real WASM-backed {@link WebSessionConnector}. It lazily loads the
- * `portcode-wasm` module on the first {@link WebSessionConnector.connect}; on load
- * failure (module absent) it logs ONCE and permanently delegates to the mock
- * connector so the PWA keeps working until CI wires the wasm in.
+ * `portcode-wasm` module on the first {@link WebSessionConnector.connect}.
+ *
+ * NON-SILENT FALLBACK (Fix C): a load FAILURE is SURFACED, not swallowed — `connect`
+ * rejects with a {@link WasmUnavailableError} (after logging once). This propagates
+ * through `webPhoneSyncConnect` → `phoneSyncConnect` → `store.connectRemote`'s catch,
+ * which sets `remoteError`, so a real-device wasm failure is visible in the pair UI
+ * instead of masquerading as a connect that "fetched nothing". The inert mock is
+ * still reachable for tests/preview via the default connector registry + injected
+ * fake loaders — we just don't auto-degrade a real injected-wasm failure to it.
  *
  * @param load injectable module loader (defaults to {@link defaultWasmLoader});
  *   tests pass a fake to avoid resolving the real package.
  */
 export function createWasmConnector(load: WasmLoader = defaultWasmLoader): WebSessionConnector {
-  // Memoize the load so we import once and reuse the resolved module / fallback.
-  let mod: Promise<WasmModule | null> | null = null;
-  const fallback = createMockConnector();
+  // Memoize the load so we import once and reuse the resolved module across dials.
+  // A rejected load is intentionally NOT cached as a sentinel: each connect re-asks
+  // so a transient first-load failure (e.g. offline at launch) can recover on retry.
+  let mod: Promise<WasmModule> | null = null;
 
-  function loadModule(): Promise<WasmModule | null> {
+  function loadModule(): Promise<WasmModule> {
     if (mod === null) {
       mod = load().catch((e: unknown) => {
-        // Expected here until CI builds portcode-wasm: degrade to the mock so the
-        // shipped PWA still pairs (against the inert preview) instead of throwing.
-        console.warn("[webSession] portcode-wasm unavailable; falling back to mock connector:", e);
-        return null;
+        // Surface, don't silently degrade: a real wasm-load failure must reach the
+        // UI. Clear the memo so a later connect can retry the load.
+        mod = null;
+        console.warn("[webSession] portcode-wasm failed to load:", e);
+        throw new WasmUnavailableError(e);
       });
     }
     return mod;
@@ -338,7 +398,6 @@ export function createWasmConnector(load: WasmLoader = defaultWasmLoader): WebSe
   return {
     async connect(qr: string, reconnect: boolean): Promise<WebSession> {
       const m = await loadModule();
-      if (m === null) return fallback.connect(qr, reconnect);
       const ws = await m.Session.connect(qr, reconnect);
       return adaptWasmSession(ws);
     },
@@ -402,6 +461,18 @@ export async function webPhoneSyncDisconnect(): Promise<void> {
   const session = current;
   current = null;
   await session?.disconnect();
+}
+
+/**
+ * Decline the pairing on the current session: send the `pairing_reject` frame to the
+ * desktop, then clear + tear down. Idempotent (no-op if not connected). Mirrors
+ * {@link webPhoneSyncDisconnect} but routes through the session's `reject` so the
+ * desktop learns the SAS was rejected, not merely that the link dropped.
+ */
+export async function webPhoneSyncReject(): Promise<void> {
+  const session = current;
+  current = null;
+  await session?.reject();
 }
 
 /**

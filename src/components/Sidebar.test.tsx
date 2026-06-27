@@ -20,6 +20,8 @@ vi.mock("../lib/ipc", () => ({
   createSession: vi.fn(),
   getMessages: vi.fn(),
   deleteSession: vi.fn(),
+  renameSession: vi.fn(),
+  subscribeSessionEvents: vi.fn(),
   saveSettings: vi.fn(),
   resolvePermission: vi.fn(),
   openFolder: vi.fn(),
@@ -39,6 +41,7 @@ const session = (over: Partial<Session> = {}): Session => ({
   id: "s1",
   title: "Chat",
   workspace: null,
+  model: "claude-opus-4-8",
   createdAt: 1,
   updatedAt: 1,
   ...over,
@@ -57,6 +60,8 @@ beforeEach(() => {
   m.getMessages.mockResolvedValue([]);
   m.createSession.mockResolvedValue(undefined);
   m.deleteSession.mockResolvedValue(undefined);
+  m.renameSession.mockResolvedValue(undefined);
+  m.subscribeSessionEvents.mockResolvedValue(() => {});
 });
 
 describe("Sidebar", () => {

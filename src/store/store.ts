@@ -1,32 +1,83 @@
 import { create } from "zustand";
 import type {
+  AgentInfo,
+  AgentStatus,
+  BackgroundTaskInfo,
+  BackgroundTaskStatus,
+  ComposerPhase,
   ContentBlock,
+  DraftEntry,
   Message,
   MessageRow,
   OAuthStatus,
   PairingPayload,
   PairingRequest,
   PendingPermission,
+  PermissionMode,
   PhoneSyncStatus,
   RemoteCommand,
+  Rule,
   Session,
   SessionFolder,
   SessionGroup,
   SessionSort,
+  SessionUsage,
   Settings,
   StreamEvent,
   SyncFrame,
   Usage,
 } from "../types";
-import { DEFAULT_SETTINGS } from "../types";
+import { CYCLE_MODES, DEFAULT_SETTINGS } from "../types";
 import * as ipc from "../lib/ipc";
 import { isMobilePlatform } from "../lib/platform";
+
+// ── Per-run state ─────────────────────────────────────────────────────────────
+// The streaming/cancel/pendingPermission of a single agent run. Today there is at
+// most one run per session (the Rust core refuses a 2nd concurrent run per
+// session), so the runs map is keyed by session id; but modelling it as a
+// COLLECTION is what lets multiple concurrent agents each carry their own run
+// state — the foundation a parallel-agents UI builds on. The top-level
+// `streaming`/`cancel`/`pendingPermission` fields are kept as a derived MIRROR of
+// the active session's run (see `projectActiveRun`), so every existing component
+// and selector keeps reading a single "global" view unchanged.
+interface RunState {
+  streaming: boolean;
+  // The handle that aborts this run. Always null on the phone (the cancel handle
+  // belongs to the desktop-local agent run; the phone stops via a remote command).
+  cancel: (() => Promise<void>) | null;
+  pendingPermission: PendingPermission | null;
+}
+
+const EMPTY_RUN: RunState = { streaming: false, cancel: null, pendingPermission: null };
+
+// Single source of truth for the run-map key. The identity of a session id today;
+// the one place to change when a future subagent run needs a composite id (e.g.
+// `${sessionId}:${agentId}`) — without touching the StreamEvent wire shape, which
+// already carries the session id every write site keys off.
+const runKey = (sessionId: string): string => sessionId;
+
+// Build the scoped allow-RULE that "Always allow" adds, instead of flipping the
+// global policy to allow-everything. For a `shell` call it scopes to that exact
+// command (a literal prefix — narrower and safer than a blanket allow); for any
+// other tool it allows just that tool. A shell call without a command string
+// falls back to a tool-level allow.
+const scopedAllowRule = (p: PendingPermission): Rule => {
+  if (p.tool === "shell") {
+    const command = (p.input as { command?: unknown } | null)?.command;
+    if (typeof command === "string" && command.length > 0) {
+      return { tool: "shell", command, decision: "allow" };
+    }
+  }
+  return { tool: p.tool, decision: "allow" };
+};
 
 interface AppState {
   sessions: Session[];
   activeId: string | null;
   messages: Record<string, Message[]>; // sessionId -> messages
   usage: Record<string, Usage>; // sessionId -> cumulative token usage
+  agents: Record<string, AgentInfo[]>; // sessionId -> live subagents (the agents panel)
+  backgroundTasks: Record<string, BackgroundTaskInfo[]>; // sessionId -> background shell tasks
   settings: Settings;
   oauthStatus: OAuthStatus | null; // Claude subscription sign-in state
   oauthError: string | null; // last sign-in/out failure, surfaced in Settings
@@ -39,6 +90,12 @@ interface AppState {
   pairingRequest: PairingRequest | null;
   pairingRequestUnlisten: (() => void) | null; // tears down the pairing-request subscription
   creatingSession: boolean; // a newSession() create is in flight (re-entry guard)
+  runs: Record<string, RunState>; // runKey(sessionId) -> per-run state (the N-run model)
+  // ── Active-run mirror (derived from runs[activeId]) ─────────────────────────
+  // These three reflect the ACTIVE session's run, so every component/selector and
+  // every re-entry guard keeps reading one "global" view. They are recomputed by
+  // `projectActiveRun` in every set() that mutates `runs` or `activeId`; never
+  // write them directly — write the run via `setRun`/`runPatch` and they follow.
   streaming: boolean;
   showSettings: boolean;
   showFiles: boolean;
@@ -59,7 +116,14 @@ interface AppState {
   ambientRain: boolean; // decorative neon-rain backdrop (off by default)
   scanlines: boolean; // CRT scanline overlay (off by default)
   uiScale: number; // interface zoom factor (1 = default); applied via documentElement.style.zoom
-  draft: string;
+  // Per-session unsent composer drafts (Zeigarnik open-loop). Keyed by sessionId
+  // so a half-written message can't bleed across sessions; persisted via the
+  // backend (durable) with an optimistic localStorage mirror for instant restore.
+  drafts: Record<string, string>;
+  // The composer's live presence phase, driven by REAL turn/stream events (never
+  // padded). Surfaced in the role="status" region beside the composer.
+  composerPhase: ComposerPhase;
+  crashReporting: boolean | null; // opt-in crash/error reporting; null = not yet asked (show first-run prompt)
   cancel: (() => Promise<void>) | null;
   pendingPermission: PendingPermission | null;
 
@@ -79,6 +143,8 @@ interface AppState {
   remoteError: string | null; // last connect failure, surfaced in the connect UI
   remoteUnlisten: (() => void) | null; // tears down the frame subscription (private; mirrors `cancel`)
   remoteDropped: boolean; // the live session ended unexpectedly — the UI offers a reconnect
+  remoteRejected: boolean; // the pairing was declined (this phone rejected the SAS, or the desktop did) — the UI shows a "rejected" notice
+  remoteRejectReason: string | null; // optional human-readable reason from an inbound desktop `pairing_reject`; null when none/locally-initiated
   remoteConnecting: boolean; // a connectRemote dial is in flight (private re-entry guard)
   lastPairingQr: string | null; // last successful pairing payload, kept for one-tap reconnect
   remoteChatOpen: boolean; // remote: a session is open (chat view) vs. the sessions list
@@ -108,14 +174,19 @@ interface AppState {
   newSession: () => Promise<void>;
   selectSession: (id: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
+  renameSession: (id: string, title: string) => Promise<void>;
+  setSessionModel: (model: string) => Promise<void>;
   send: (text: string) => Promise<void>;
   stop: () => Promise<void>;
+  cancelAgent: (agentId: string) => Promise<void>;
   setShowSettings: (v: boolean) => void;
   setShowPalette: (v: boolean) => void;
   setAmbientRain: (v: boolean) => void;
   setScanlines: (v: boolean) => void;
   setUiScale: (n: number) => void;
+  setCrashReporting: (v: boolean) => void;
   updateSettings: (s: Partial<Settings>) => Promise<void>;
+  cyclePermissionMode: () => Promise<void>;
   refreshOAuthStatus: () => Promise<void>;
   loginWithClaude: () => Promise<void>;
   logoutClaude: () => Promise<void>;
@@ -129,6 +200,7 @@ interface AppState {
   resolvePermission: (decision: "allow" | "deny", always?: boolean) => Promise<void>;
   setRemoteMode: (v: boolean) => void;
   confirmRemoteSas: () => void;
+  rejectRemoteSas: () => Promise<void>;
   applyFrame: (frame: SyncFrame) => void;
   connectRemote: (qr: string, verified?: boolean) => Promise<void>;
   sendRemoteCommand: (command: RemoteCommand) => Promise<void>;
@@ -141,7 +213,239 @@ interface AppState {
   hydrateRememberedQr: (qr: string) => void;
 }
 
+// Project the active session's run onto the three mirror fields. Called in every
+// set() that changes `runs` or `activeId`, so `streaming`/`cancel`/
+// `pendingPermission` always reflect the run on screen. A session with no run (or
+// no active session) reads as the empty run, i.e. idle.
+const projectActiveRun = (
+  st: Pick<AppState, "activeId" | "runs">,
+): Pick<AppState, "streaming" | "cancel" | "pendingPermission"> => {
+  const r = (st.activeId ? st.runs[runKey(st.activeId)] : undefined) ?? EMPTY_RUN;
+  return { streaming: r.streaming, cancel: r.cancel, pendingPermission: r.pendingPermission };
+};
+
+// Build the state patch that applies `patch` to `sessionId`'s run and re-projects
+// the active-run mirror in the SAME set(). Combine its result with other fields
+// (e.g. a `messages` update) by spreading it. This is the only place run state is
+// written, so the mirror can never drift from `runs`.
+const runPatch = (
+  st: Pick<AppState, "activeId" | "runs">,
+  sessionId: string,
+  patch: Partial<RunState>,
+): Pick<AppState, "runs" | "streaming" | "cancel" | "pendingPermission"> => {
+  const key = runKey(sessionId);
+  const runs = { ...st.runs, [key]: { ...(st.runs[key] ?? EMPTY_RUN), ...patch } };
+  return { runs, ...projectActiveRun({ activeId: st.activeId, runs }) };
+};
+
+// Convenience wrapper around `runPatch` for the common "just patch this run" case.
+const setRun = (
+  set: (fn: (st: AppState) => Partial<AppState>) => void,
+  sessionId: string,
+  patch: Partial<RunState>,
+): void => set((st) => runPatch(st, sessionId, patch));
+
+// Patch the ACTIVE session's run — for actions (stop / resolvePermission) that
+// always target the run on screen. With an active session it goes through
+// `runPatch` (run + mirror stay in lockstep); with no active session it clears
+// just the named mirror fields, so the visible flags always clear regardless.
+// (`Partial<RunState>`'s keys are all mirror fields, so it doubles as the patch.)
+const patchActiveRun = (
+  set: (fn: (st: AppState) => Partial<AppState>) => void,
+  get: () => AppState,
+  patch: Partial<RunState>,
+): void => {
+  const activeId = get().activeId;
+  set((st) => (activeId ? runPatch(st, activeId, patch) : patch));
+};
+
 const now = () => Date.now();
+
+// ── Live subagents (the agents panel) ────────────────────────────────────────
+// The agent lifecycle events (agent_started / agent_progress / agent_finished)
+// maintain a per-session list of subagents. These pure helpers let the desktop
+// `onEvent` path and the phone `applyRemoteEvent` path update the map identically.
+
+// Map the wire status string to the AgentStatus union (defensive: an unknown
+// value reads as a finished "ok" rather than widening the type).
+const toAgentStatus = (s: string): AgentStatus =>
+  s === "running" || s === "cancelled" || s === "error" ? s : "ok";
+
+const patchAgents = (
+  agents: Record<string, AgentInfo[]>,
+  sessionId: string,
+  fn: (list: AgentInfo[]) => AgentInfo[],
+): Record<string, AgentInfo[]> => ({ ...agents, [sessionId]: fn(agents[sessionId] ?? []) });
+
+// Add a newly-started agent, preserving start order; replace on a duplicate id
+// (defensive against a re-delivered agent_started) rather than listing it twice.
+const startAgent = (list: AgentInfo[], info: AgentInfo): AgentInfo[] =>
+  list.some((a) => a.id === info.id)
+    ? list.map((a) => (a.id === info.id ? info : a))
+    : [...list, info];
+
+// Patch one agent by id; a no-op when the id isn't present (e.g. a progress /
+// finished event arriving for an agent whose start we never saw).
+const updateAgent = (list: AgentInfo[], id: string, patch: Partial<AgentInfo>): AgentInfo[] =>
+  list.map((a) => (a.id === id ? { ...a, ...patch } : a));
+
+// Fold one agent lifecycle StreamEvent into a session's agent list. Shared by the
+// desktop and phone event paths; returns the agents map unchanged for any other
+// event so callers can route the three agent events through one branch.
+const applyAgentEvent = (
+  agents: Record<string, AgentInfo[]>,
+  sessionId: string,
+  e: StreamEvent,
+): Record<string, AgentInfo[]> => {
+  switch (e.type) {
+    case "agent_started":
+      return patchAgents(agents, sessionId, (list) =>
+        startAgent(list, {
+          id: e.agentId,
+          description: e.description,
+          parentId: e.parentId,
+          status: "running",
+          step: 0,
+        }),
+      );
+    case "agent_progress":
+      return patchAgents(agents, sessionId, (list) =>
+        updateAgent(list, e.agentId, { step: e.step }),
+      );
+    case "agent_finished":
+      return patchAgents(agents, sessionId, (list) =>
+        updateAgent(list, e.agentId, { status: toAgentStatus(e.status) }),
+      );
+    default:
+      return agents;
+  }
+};
+
+// ── Background shell tasks (the background-tasks panel) ───────────────────────
+// Mirror the agent helpers, but background tasks intentionally OUTLIVE the turn
+// that launched them — so, unlike agents, they are never cleared on a turn
+// boundary. Exit code 0 reads as success; anything else (including the -1 the
+// backend reports for a child that failed to spawn) reads as an error.
+const bgStatus = (exitCode: number): BackgroundTaskStatus => (exitCode === 0 ? "ok" : "error");
+
+const patchBackgroundTasks = (
+  tasks: Record<string, BackgroundTaskInfo[]>,
+  sessionId: string,
+  fn: (list: BackgroundTaskInfo[]) => BackgroundTaskInfo[],
+): Record<string, BackgroundTaskInfo[]> => ({
+  ...tasks,
+  [sessionId]: fn(tasks[sessionId] ?? []),
+});
+
+// Add a newly-started task, preserving launch order; replace on a duplicate id
+// (defensive against a re-delivered started event) rather than listing it twice.
+const startBackgroundTask = (
+  list: BackgroundTaskInfo[],
+  info: BackgroundTaskInfo,
+): BackgroundTaskInfo[] =>
+  list.some((t) => t.id === info.id)
+    ? list.map((t) => (t.id === info.id ? info : t))
+    : [...list, info];
+
+// Fold one background-task StreamEvent into a session's task list. Shared by the
+// desktop persistent-listener path and the phone frame path; returns the map
+// unchanged for any other event. A `finished` event UPSERTS: it carries the full
+// command, so a finish whose `started` we somehow missed still surfaces (rather
+// than silently dropping, as an update-by-id would).
+const applyBackgroundEvent = (
+  tasks: Record<string, BackgroundTaskInfo[]>,
+  sessionId: string,
+  e: StreamEvent,
+): Record<string, BackgroundTaskInfo[]> => {
+  switch (e.type) {
+    case "background_task_started":
+      return patchBackgroundTasks(tasks, sessionId, (list) =>
+        startBackgroundTask(list, { id: e.id, command: e.command, status: "running" }),
+      );
+    case "background_task_finished": {
+      const finished: BackgroundTaskInfo = {
+        id: e.id,
+        command: e.command,
+        status: bgStatus(e.exitCode),
+        exitCode: e.exitCode,
+        output: e.output,
+      };
+      return patchBackgroundTasks(tasks, sessionId, (list) =>
+        list.some((t) => t.id === e.id)
+          ? list.map((t) => (t.id === e.id ? { ...t, ...finished } : t))
+          : [...list, finished],
+      );
+    }
+    default:
+      return tasks;
+  }
+};
+
+// Desktop persistent background-task listeners, keyed by session id. Module-scoped
+// (like `remoteWatchdog`) because they outlive any single action and must survive
+// across turns: a `background_task_finished` can land long after the launching
+// turn's per-turn listener was disposed. Each subscription folds ONLY background
+// events into `backgroundTasks` (the per-turn listener still owns the turn's own
+// deltas, so there is no double-handling). Installed only on a DESKTOP that drives
+// its own local agent — never in remote mode (see `ensureBackgroundListener`); the
+// phone/remote client tracks background tasks via forwarded frames instead.
+const bgListeners = new Map<string, () => void>();
+
+// Ensure a persistent background-task listener exists for `sessionId`.
+//
+// Skipped entirely in remote mode: the phone (and a desktop acting as a remote
+// client) receives background events as forwarded frames, so a local
+// `agent://{session}` Tauri listener there would be inert AND leak for the app's
+// lifetime (nothing emits on that channel, and teardown only runs on delete). The
+// other call sites (init/newSession) already early-return in remote mode; this is
+// the central guard that also covers selectSession.
+//
+// Idempotent and race-safe: a UNIQUE reservation token is stored synchronously
+// (re-entry guard), and the slot is only CLAIMED after the await if it is still
+// that same token — so a teardown, or a fresh reservation, that lands mid-subscribe
+// can't be clobbered (we tear our own just-created listener down instead).
+const ensureBackgroundListener = async (sessionId: string): Promise<void> => {
+  if (useStore.getState().remoteMode) return;
+  if (bgListeners.has(sessionId)) return;
+  const token = () => {};
+  bgListeners.set(sessionId, token); // reserve synchronously (re-entry guard)
+  let unlisten: () => void;
+  try {
+    unlisten = await ipc.subscribeSessionEvents(sessionId, (e) =>
+      useStore.setState((st) => ({
+        backgroundTasks: applyBackgroundEvent(st.backgroundTasks, sessionId, e),
+      })),
+    );
+  } catch {
+    // Subscribe failed — release only OUR reservation (a concurrent retry may have
+    // already replaced it), never another's.
+    if (bgListeners.get(sessionId) === token) bgListeners.delete(sessionId);
+    return;
+  }
+  if (bgListeners.get(sessionId) !== token) {
+    // A teardown removed our reservation, or a newer ensure replaced it, during the
+    // await — tear our just-created listener down rather than leak or clobber it.
+    unlisten();
+    return;
+  }
+  bgListeners.set(sessionId, unlisten);
+};
+
+const teardownBackgroundListener = (sessionId: string): void => {
+  const unlisten = bgListeners.get(sessionId);
+  if (unlisten) unlisten();
+  bgListeners.delete(sessionId);
+};
+
+// Tear down EVERY desktop persistent background-task listener. Called when a device
+// dials into remote-client mode (the persistent path must never coexist with the
+// remote-frame path on one device, which would otherwise re-populate the just-reset
+// `backgroundTasks` map). Exported so tests can reset the module-scoped registry
+// between cases.
+export const teardownAllBackgroundListeners = (): void => {
+  bgListeners.forEach((unlisten) => unlisten());
+  bgListeners.clear();
+};
 
 // A turn must always reach a terminal state. If the backend hangs or dies without
 // emitting turn_end/error, this client-side watchdog force-ends the turn once the
@@ -167,6 +471,100 @@ const clearRemoteWatchdog = (): void => {
   }
 };
 
+// ── Draft persistence ─────────────────────────────────────────────────────────
+// The optimistic localStorage mirror (written synchronously by setDraft) gives the
+// instant restore; the durable backend write is DEBOUNCED so a burst of keystrokes
+// doesn't hammer SQLite. One timer per session, keyed so switching sessions can't
+// drop a pending save. A send (or any clear) flushes immediately instead.
+const DRAFT_SAVE_DEBOUNCE_MS = 400;
+const draftSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+const flushPendingDraftSave = (sessionId: string): void => {
+  const t = draftSaveTimers.get(sessionId);
+  if (t !== undefined) {
+    clearTimeout(t);
+    draftSaveTimers.delete(sessionId);
+  }
+};
+
+// Fire the durable backend write. Best-effort: a backend reject is swallowed (the
+// localStorage mirror already holds the value). Wrapped so the debounce timer can
+// never throw an unhandled error — tolerating a test IPC mock that omits saveDraft
+// (a missing fn throws synchronously) or returns a non-promise.
+const fireDraftSave = (sessionId: string, text: string): void => {
+  try {
+    void Promise.resolve(ipc.saveDraft(sessionId, text)).catch(() => {});
+  } catch {
+    /* ipc.saveDraft unavailable in this environment — drop the durable write */
+  }
+};
+
+// Persist a session's draft to the durable backend. `immediate` (send/clear) skips
+// the debounce and cancels any pending one so a just-sent draft can't be resurrected
+// by a stale timer.
+const persistDraft = (sessionId: string, text: string, immediate: boolean): void => {
+  flushPendingDraftSave(sessionId);
+  if (immediate) {
+    fireDraftSave(sessionId, text);
+    return;
+  }
+  draftSaveTimers.set(
+    sessionId,
+    setTimeout(() => {
+      draftSaveTimers.delete(sessionId);
+      fireDraftSave(sessionId, text);
+    }, DRAFT_SAVE_DEBOUNCE_MS),
+  );
+};
+
+// Merge the durable backend drafts under the optimistic localStorage mirror. The
+// mirror is written on every keystroke (synchronous) and so is never staler than
+// the debounced backend — it WINS on conflict, while the backend fills in keys the
+// mirror lacks (e.g. localStorage was evicted but SQLite survived).
+const mergeDrafts = (
+  mirror: Record<string, string>,
+  rows: DraftEntry[],
+): Record<string, string> => {
+  const out: Record<string, string> = {};
+  for (const r of rows) if (r.text) out[r.sessionId] = r.text;
+  return { ...out, ...mirror };
+};
+
+const usageFromRows = (rows: SessionUsage[]): Record<string, Usage> => {
+  const out: Record<string, Usage> = {};
+  for (const r of rows) out[r.sessionId] = { input: r.input, output: r.output };
+  return out;
+};
+
+// ── Composer presence settle ──────────────────────────────────────────────────
+// The instant a turn is sent we show "got it — reading…"; the first REAL stream
+// event settles it to "thinking with you…". This timer is the FALLBACK for a turn
+// that takes a beat to produce its first byte — it is NOT padded latency: the real
+// event (text_delta/tool_use), when it arrives first, settles the phase and cancels
+// this timer (see onEvent / applyRemoteEvent).
+const COMPOSER_SETTLE_MS = 900;
+let settleTimer: ReturnType<typeof setTimeout> | null = null;
+
+const clearSettleTimer = (): void => {
+  if (settleTimer !== null) {
+    clearTimeout(settleTimer);
+    settleTimer = null;
+  }
+};
+
+// Arm the received→thinking settle fallback. Re-reads live state when it fires so it
+// only advances a turn that is still streaming and still in the "received" phase.
+const armSettleTimer = (): void => {
+  clearSettleTimer();
+  settleTimer = setTimeout(() => {
+    settleTimer = null;
+    const st = useStore.getState();
+    if (st.streaming && st.composerPhase === "received") {
+      useStore.setState({ composerPhase: "thinking" });
+    }
+  }, COMPOSER_SETTLE_MS);
+};
+
 // Frontend-only UI preferences (decorative overlays). Cosmetic client state,
 // not the Rust core's Settings — persisted in localStorage so they work the
 // same in preview and native without an IPC round-trip.
@@ -182,6 +580,18 @@ const writePref = (k: string, v: boolean): void => {
     localStorage.setItem(k, v ? "1" : "0");
   } catch {
     /* storage disabled / over quota — ignore */
+  }
+};
+
+// Tri-state pref: null when never set (e.g. crash-reporting consent not yet
+// asked), otherwise the stored boolean. Lets a first-run prompt distinguish
+// "declined" from "not yet decided".
+const readTriPref = (k: string): boolean | null => {
+  try {
+    const v = localStorage.getItem(k);
+    return v === null ? null : v === "1";
+  } catch {
+    return null;
   }
 };
 
@@ -257,7 +667,7 @@ const uid = () =>
     ? crypto.randomUUID()
     : Math.random().toString(36).slice(2);
 
-function makeSession(): Session {
+function makeSession(model: string): Session {
   const t = now();
   return {
     id: uid(),
@@ -266,6 +676,7 @@ function makeSession(): Session {
     // Branch is computed by the core from the workspace's git HEAD on the next
     // list; a fresh, workspace-less chat has none until then.
     branch: null,
+    model,
     createdAt: t,
     updatedAt: t,
   };
@@ -276,6 +687,8 @@ export const useStore = create<AppState>((set, get) => ({
   activeId: null,
   messages: {},
   usage: {},
+  agents: {},
+  backgroundTasks: {},
   settings: DEFAULT_SETTINGS,
   oauthStatus: null,
   oauthError: null,
@@ -285,6 +698,7 @@ export const useStore = create<AppState>((set, get) => ({
   pairingRequest: null,
   pairingRequestUnlisten: null,
   creatingSession: false,
+  runs: {},
   streaming: false,
   showSettings: false,
   showFiles: false,
@@ -300,7 +714,11 @@ export const useStore = create<AppState>((set, get) => ({
   ambientRain: readPref("pc.ambientRain"),
   scanlines: readPref("pc.scanlines"),
   uiScale: readUiScale(),
-  draft: "",
+  // Hydrate the optimistic mirror synchronously so a reload restores drafts BEFORE
+  // the backend round-trip; init() then merges the authoritative backend drafts.
+  drafts: readJSON<Record<string, string>>("pc.drafts", {}),
+  composerPhase: "idle",
+  crashReporting: readTriPref("pc.crashReporting"),
   cancel: null,
   pendingPermission: null,
   initError: null,
@@ -318,6 +736,8 @@ export const useStore = create<AppState>((set, get) => ({
   remoteError: null,
   remoteUnlisten: null,
   remoteDropped: false,
+  remoteRejected: false,
+  remoteRejectReason: null,
   remoteConnecting: false,
   // Remembered across launches so the phone can reconnect without re-scanning the
   // QR (Android frequently kills backgrounded apps). Public payload — no secret.
@@ -350,37 +770,63 @@ export const useStore = create<AppState>((set, get) => ({
     // createSession/getMessages) are guarded so a failed startup surfaces an
     // error+retry panel instead of a permanently blank welcome shell.
     try {
-      const [settings, oauthStatus, phoneSync] = await Promise.all([
+      const [settings, oauthStatus, phoneSync, backendDrafts, allUsage] = await Promise.all([
         ipc.getSettings(),
         ipc.oauthStatus().catch(() => null),
         ipc.phoneSyncStatus().catch(() => null),
+        // Resilient: an older core that predates these commands must not block
+        // startup — fall back to empty (the localStorage mirror still restores drafts).
+        ipc.getDrafts().catch(() => []),
+        ipc.getAllUsage().catch(() => []),
       ]);
-      const sessions = await ipc.listSessions();
-      if (sessions.length === 0) {
-        const s = makeSession();
-        await ipc.createSession(s.id, s.title, s.workspace);
-        set({
+      // Authoritative durable drafts merged under the already-hydrated optimistic
+      // mirror; usage restored so per-session meters + workspace spend survive restart.
+      const drafts = mergeDrafts(get().drafts, backendDrafts);
+      const usage = usageFromRows(allUsage);
+      const loaded = await ipc.listSessions();
+      if (loaded.length === 0) {
+        const s = makeSession(settings.model);
+        await ipc.createSession(s.id, s.title, s.workspace, s.model);
+        set((st) => ({
           settings,
           oauthStatus,
           phoneSync,
+          drafts,
+          usage,
           sessions: [s],
           activeId: s.id,
           messages: { [s.id]: [] },
           initError: null,
-        });
+          // Keep the active-run mirror consistent with the newly active session
+          // (idle here — a fresh session has no run).
+          ...projectActiveRun({ activeId: s.id, runs: st.runs }),
+        }));
+        // Subscribe a persistent background-task listener so a task launched in
+        // this session is tracked even after its turn's per-turn listener is gone.
+        void ensureBackgroundListener(s.id);
         return;
       }
+      // Old DB rows predate per-session model (null/absent) — coalesce to the
+      // last-used default so Session.model stays a non-null string.
+      const sessions = loaded.map((row) => ({ ...row, model: row.model ?? settings.model }));
       const activeId = sessions[0].id;
       const msgs = await ipc.getMessages(activeId);
-      set({
+      set((st) => ({
         settings,
         oauthStatus,
         phoneSync,
+        drafts,
+        usage,
         sessions,
         activeId,
         messages: { [activeId]: msgs },
         initError: null,
-      });
+        // Keep the active-run mirror consistent with the activated session.
+        ...projectActiveRun({ activeId, runs: st.runs }),
+      }));
+      // One persistent background-task listener per known session (idempotent), so
+      // a finish that lands while a different session is on screen is still tracked.
+      sessions.forEach((s) => void ensureBackgroundListener(s.id));
     } catch (err) {
       set({ initError: errMessage(err) });
     }
@@ -428,14 +874,18 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
     try {
-      const s = makeSession();
-      await ipc.createSession(s.id, s.title, s.workspace);
+      const s = makeSession(get().settings.model);
+      await ipc.createSession(s.id, s.title, s.workspace, s.model);
       set((st) => ({
         sessions: [s, ...st.sessions],
         activeId: s.id,
         messages: { ...st.messages, [s.id]: [] },
         showSidebar: false, // close the mobile drawer on navigation
+        // A brand-new session has no run yet → the mirror projects to idle.
+        ...projectActiveRun({ activeId: s.id, runs: st.runs }),
       }));
+      // Track background tasks launched in the new session from the moment it exists.
+      void ensureBackgroundListener(s.id);
     } catch (err) {
       // A failed create (locked DB / core not ready) must surface instead of being a
       // swallowed unhandled rejection — callers use bare `onClick={newSession}` /
@@ -448,7 +898,17 @@ export const useStore = create<AppState>((set, get) => ({
 
   async selectSession(id) {
     if (get().streaming) return;
-    set({ activeId: id, showSidebar: false }); // close the mobile drawer on navigation
+    // Switch the active session and re-project the mirror onto its run (idle today,
+    // since you can't switch while the active session streams; a background run on
+    // the target session would surface here once concurrent runs exist).
+    set((st) => ({
+      activeId: id,
+      showSidebar: false, // close the mobile drawer on navigation
+      ...projectActiveRun({ activeId: id, runs: st.runs }),
+    }));
+    // Belt-and-suspenders: ensure the session being viewed has a background-task
+    // listener (idempotent — a no-op if init/newSession already subscribed it).
+    void ensureBackgroundListener(id);
     if (!get().messages[id]) {
       // Guard the load: a getMessages reject must not leave messages[id] undefined
       // (the welcome EmptyState would then win for a session with real history).
@@ -475,11 +935,33 @@ export const useStore = create<AppState>((set, get) => ({
       set({ initError: errMessage(err) });
       return;
     }
+    teardownBackgroundListener(id); // stop tracking the deleted session's tasks
     set((st) => {
       const sessions = st.sessions.filter((s) => s.id !== id);
       const messages = { ...st.messages };
       delete messages[id];
+      const runs = { ...st.runs };
+      delete runs[runKey(id)]; // drop the deleted session's run
+      const backgroundTasks = { ...st.backgroundTasks };
+      delete backgroundTasks[id]; // drop its background tasks
       const activeId = st.activeId === id ? (sessions[0]?.id ?? null) : st.activeId;
+      // Prune the gone session's usage + draft to stay in lockstep with the backend
+      // (db.rs deletes both rows on delete_session). Otherwise the deleted session's
+      // tokens keep inflating the HUD's workspace-total spend until a restart re-reads
+      // the (pruned) backend totals — a non-deterministic, trust-eroding drift — and a
+      // dead draft lingers in the mirror that mergeDrafts would keep re-preserving.
+      let usage = st.usage;
+      if (id in usage) {
+        usage = { ...st.usage };
+        delete usage[id];
+      }
+      let drafts = st.drafts;
+      if (id in drafts) {
+        drafts = { ...st.drafts };
+        delete drafts[id];
+        writeJSON("pc.drafts", drafts);
+      }
+      flushPendingDraftSave(id); // cancel any in-flight debounced save for the gone session
       // Drop the gone session's sidebar-org entries so stale folder membership /
       // archived state can't accumulate in localStorage across deletions.
       let folderOf = st.folderOf;
@@ -498,7 +980,19 @@ export const useStore = create<AppState>((set, get) => ({
         manualOrder = manualOrder.filter((x) => x !== id);
         writeJSON("pc.manualOrder", manualOrder);
       }
-      return { sessions, messages, activeId, folderOf, archivedIds, manualOrder };
+      return {
+        sessions,
+        messages,
+        runs,
+        backgroundTasks,
+        activeId,
+        usage,
+        drafts,
+        folderOf,
+        archivedIds,
+        manualOrder,
+        ...projectActiveRun({ activeId, runs }),
+      };
     });
     if (get().sessions.length === 0) {
       await get().newSession();
@@ -518,6 +1012,56 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  async renameSession(id, title) {
+    // Rename is a desktop-local DB write (the `rename_session` Tauri command); the
+    // phone has no equivalent RemoteCommand, so a remote client can't rename — bail
+    // rather than desync the optimistic title against the desktop's authoritative
+    // session_list frame (the Sidebar hides the affordance in remote mode anyway).
+    if (get().remoteConnected) return;
+    // Mirror the sibling session actions (newSession/selectSession/deleteSession):
+    // never mutate a session mid-turn. The Sidebar already hides the affordance
+    // while streaming, but the store action is the authoritative guard.
+    if (get().streaming) return;
+    const trimmed = title.trim();
+    const session = get().sessions.find((s) => s.id === id);
+    if (!session) return;
+    // Ignore a no-op / empty rename (an empty title would render a blank row).
+    if (trimmed === "" || trimmed === session.title) return;
+    const previous = session.title;
+    // Optimistically apply so the row updates immediately.
+    set((st) => ({
+      sessions: st.sessions.map((s) => (s.id === id ? { ...s, title: trimmed } : s)),
+    }));
+    try {
+      await ipc.renameSession(id, trimmed);
+    } catch {
+      // Revert on a failed write (locked DB / core not ready) — the title snapping
+      // back IS the user-visible signal. Two deliberate choices: (1) revert ONLY
+      // if the title is still our optimistic value, so a newer rename or a
+      // send()-derived title that landed during the in-flight write isn't
+      // clobbered; (2) do NOT route this through `initError` — that's the
+      // full-screen "Couldn't start Portcode" panel, which would wipe a populated
+      // conversation for a transient per-row failure.
+      set((st) => ({
+        sessions: st.sessions.map((s) =>
+          s.id === id && s.title === trimmed ? { ...s, title: previous } : s,
+        ),
+      }));
+    }
+  },
+
+  async setSessionModel(model) {
+    // Point the active session at the chosen model, then mirror it into
+    // settings.model so it becomes the "last used / default for new sessions".
+    const activeId = get().activeId;
+    if (activeId) {
+      set((st) => ({
+        sessions: st.sessions.map((s) => (s.id === activeId ? { ...s, model } : s)),
+      }));
+    }
+    await get().updateSettings({ model });
+  },
+
   async send(text) {
     const { activeId, streaming } = get();
     if (!activeId || streaming || !text.trim()) return;
@@ -525,6 +1069,25 @@ export const useStore = create<AppState>((set, get) => ({
     // Trim once so the stored user bubble and the forwarded command match the
     // derived (trimmed) title — a padded draft otherwise renders odd blank lines.
     const body = text.trim();
+
+    // Close the open loop: the message is on its way, so clear this session's draft
+    // everywhere — the in-memory map, the optimistic mirror, and (immediately,
+    // cancelling any pending debounce) the durable backend — so a fast restart can't
+    // restore a just-sent draft.
+    set((st) => {
+      if (!(activeId in st.drafts)) return {};
+      const drafts = { ...st.drafts };
+      delete drafts[activeId];
+      writeJSON("pc.drafts", drafts);
+      return { drafts };
+    });
+    persistDraft(activeId, "", true);
+
+    // Turn-taking receipt (Doherty <400ms): acknowledge the send instantly ("got it
+    // — reading…"); the first REAL stream event settles it to "thinking…", with a
+    // 900ms fallback for a slow first byte. Honest — never padded latency.
+    set({ composerPhase: "received" });
+    armSettleTimer();
 
     // Remote mode: this device is the phone driving a paired desktop. Forward the
     // turn as a `run` command instead of running the local agent — the desktop is
@@ -537,7 +1100,7 @@ export const useStore = create<AppState>((set, get) => ({
     // path (turn_end/error, the drop listener, the send catch, disconnectRemote)
     // already clears streaming:false, so the composer can't get stranded.
     if (get().remoteConnected) {
-      set({ streaming: true });
+      setRun(set, activeId, { streaming: true });
       // Remote idle watchdog (symmetric with the local one below). The desktop is
       // authoritative, but if its agent dies/hangs without ever emitting
       // turn_end/error AND the channel stays up (no drop fires), nothing would clear
@@ -549,7 +1112,9 @@ export const useStore = create<AppState>((set, get) => ({
       clearRemoteWatchdog();
       remoteLastActivity = now();
       remoteWatchdog = setInterval(() => {
-        // The turn already ended or was stopped elsewhere — just clean up.
+        // The turn already ended or was stopped elsewhere — just clean up. The
+        // remote turn runs on the active session, so the active-run mirror is the
+        // right "still streaming?" signal here.
         if (!get().streaming) {
           clearRemoteWatchdog();
           return;
@@ -558,10 +1123,13 @@ export const useStore = create<AppState>((set, get) => ({
         // No live frame for the whole idle window → treat the desktop as hung and
         // recover, so the composer can't stay disabled forever.
         clearRemoteWatchdog();
+        clearSettleTimer();
         const sid = get().activeId;
         set((st) => ({
-          streaming: false,
-          pendingPermission: null,
+          ...(sid !== null
+            ? runPatch(st, sid, { streaming: false, pendingPermission: null })
+            : projectActiveRun(st)),
+          composerPhase: "idle",
           messages:
             sid !== null
               ? patchLast(st.messages, sid, (b) =>
@@ -600,11 +1168,13 @@ export const useStore = create<AppState>((set, get) => ({
       );
       return {
         sessions,
-        streaming: true,
+        ...runPatch(st, activeId, { streaming: true }),
         messages: {
           ...st.messages,
           [activeId]: [...msgs, userMsg, assistant],
         },
+        // Each turn's agents panel starts empty; this turn's subagents repopulate it.
+        agents: { ...st.agents, [activeId]: [] },
       };
     });
 
@@ -623,6 +1193,12 @@ export const useStore = create<AppState>((set, get) => ({
     // So we (a) tear the per-turn event listener down the instant a turn ends — a
     // leaked listener folds the NEXT turn's deltas into this message — and (b) run a
     // client-side watchdog that force-ends a silent turn so the app always recovers.
+    // The run-map key for this turn's session, captured up front so the watchdog
+    // and the post-await Stop check read THIS run's streaming flag (the
+    // authoritative source) rather than the active-session mirror — correct even
+    // if the active session were to change out from under a long-running turn.
+    const myKey = runKey(activeId);
+    const isStreaming = () => get().runs[myKey]?.streaming ?? false;
     let run: Awaited<ReturnType<typeof ipc.runAgent>> | null = null;
     let settled = false;
     let lastActivity = now();
@@ -646,9 +1222,20 @@ export const useStore = create<AppState>((set, get) => ({
       lastActivity = now();
       switch (e.type) {
         case "text_delta":
+          // First real byte settles the receipt into "thinking with you…" (and
+          // cancels the fallback timer). Only advance from "received" so a Stop
+          // in flight ("stopping…") isn't overwritten by a late delta.
+          if (get().composerPhase === "received") {
+            clearSettleTimer();
+            set({ composerPhase: "thinking" });
+          }
           apply((blocks) => appendText(blocks, e.text));
           break;
         case "tool_use":
+          if (get().composerPhase === "received") {
+            clearSettleTimer();
+            set({ composerPhase: "thinking" });
+          }
           apply((blocks) => [
             ...blocks,
             { kind: "tool_use", id: e.id, name: e.name, input: e.input },
@@ -666,12 +1253,13 @@ export const useStore = create<AppState>((set, get) => ({
           ]);
           break;
         case "permission_request":
-          set({
+          setRun(set, activeId, {
             pendingPermission: {
               id: e.id,
               tool: e.tool,
               summary: e.summary,
               input: e.input,
+              diff: e.diff,
             },
           });
           break;
@@ -692,18 +1280,27 @@ export const useStore = create<AppState>((set, get) => ({
         case "error":
           apply((blocks) => appendText(blocks, `\n\n**Error:** ${e.message}`));
           settle(false);
-          set({ streaming: false, cancel: null, pendingPermission: null });
+          clearSettleTimer();
+          setRun(set, activeId, { streaming: false, cancel: null, pendingPermission: null });
+          set({ composerPhase: "idle" });
           break;
         case "turn_end":
           settle(false);
-          set({ streaming: false, cancel: null, pendingPermission: null });
+          clearSettleTimer();
+          setRun(set, activeId, { streaming: false, cancel: null, pendingPermission: null });
+          set({ composerPhase: "idle" });
+          break;
+        case "agent_started":
+        case "agent_progress":
+        case "agent_finished":
+          set((st) => ({ agents: applyAgentEvent(st.agents, activeId, e) }));
           break;
       }
     };
 
     watchdog = setInterval(() => {
       // The turn already ended or was stopped elsewhere (e.g. Stop) — just clean up.
-      if (settled || !get().streaming) {
+      if (settled || !isStreaming()) {
         settle(false);
         return;
       }
@@ -718,7 +1315,10 @@ export const useStore = create<AppState>((set, get) => ({
     }, 1000);
 
     try {
-      const handle = await ipc.runAgent(activeId, body, onEvent);
+      // Per-session model (PR #30): fall back to the global default for older rows.
+      const session = get().sessions.find((s) => s.id === activeId);
+      const model = session?.model ?? get().settings.model;
+      const handle = await ipc.runAgent(activeId, body, model, onEvent);
       run = handle;
       if (settled) {
         // A terminal event (or the watchdog) settled the turn before the handle
@@ -726,7 +1326,7 @@ export const useStore = create<AppState>((set, get) => ({
         // handle still needs its listener torn down. The terminal event already issued
         // any backend cancel it needed, so just dispose — no spurious cancel_agent.
         handle.dispose();
-      } else if (!get().streaming) {
+      } else if (!isStreaming()) {
         // The turn isn't settled, but streaming already flipped false — the user
         // pressed Stop DURING the await window, when the cancel handle was still null
         // so stop() couldn't abort the backend. Honor that Stop authoritatively now:
@@ -736,7 +1336,7 @@ export const useStore = create<AppState>((set, get) => ({
         settle(true);
       } else {
         // Stop aborts the run AND clears this turn's watchdog (owned by this closure).
-        set({
+        setRun(set, activeId, {
           cancel: async () => {
             settle(false);
             await handle.cancel();
@@ -749,13 +1349,18 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async stop() {
+    // Acknowledge the Stop intent in <100ms — before the backend cancel resolves —
+    // by relabeling the presence to "stopping…" and stopping the settle fallback.
+    clearSettleTimer();
+    set({ composerPhase: "stopping" });
     // Remote mode: the turn runs on the desktop, so stop it with a Cancel command
     // over the link (there is no local `cancel` handle on the phone).
     if (get().remoteConnected) {
       clearRemoteWatchdog(); // the turn is over — stop the idle watchdog
       const activeId = get().activeId;
       if (activeId) await get().sendRemoteCommand({ cmd: "cancel", session_id: activeId });
-      set({ streaming: false, pendingPermission: null });
+      patchActiveRun(set, get, { streaming: false, pendingPermission: null });
+      set({ composerPhase: "idle" });
       return;
     }
     const c = get().cancel;
@@ -764,7 +1369,24 @@ export const useStore = create<AppState>((set, get) => ({
     } catch {
       /* the cancel_agent IPC failed; recover the UI anyway so the composer isn't stuck */
     } finally {
-      set({ streaming: false, cancel: null, pendingPermission: null });
+      patchActiveRun(set, get, { streaming: false, cancel: null, pendingPermission: null });
+      set({ composerPhase: "idle" });
+    }
+  },
+
+  // Stop ONE subagent (and its descendants) from the agents panel, leaving the
+  // top-level turn running. The real status arrives back as an `agent_finished`
+  // event (status "cancelled"), which updates the panel row.
+  async cancelAgent(agentId: string) {
+    if (get().remoteConnected) {
+      // The subagent runs on the desktop; cancel it over the link.
+      await get().sendRemoteCommand({ cmd: "cancel_agent", agent_id: agentId });
+      return;
+    }
+    try {
+      await ipc.cancelAgentById(agentId);
+    } catch {
+      /* best-effort: the subagent will also stop on the session-wide Stop */
     }
   },
 
@@ -782,7 +1404,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (get().remoteConnected) {
       const current = get().pendingPermission;
       if (current && current.id !== id) return;
-      set({ pendingPermission: null });
+      patchActiveRun(set, get, { pendingPermission: null });
       await get().sendRemoteCommand({ cmd: "permission", id, decision });
       return;
     }
@@ -795,10 +1417,18 @@ export const useStore = create<AppState>((set, get) => ({
     // Answer the backend gate FIRST (and clear the banner), so a later
     // best-effort policy save can't strand the prompt or leave the gate
     // unanswered if updateSettings rejects.
-    set({ pendingPermission: null });
+    patchActiveRun(set, get, { pendingPermission: null });
     await ipc.resolvePermission(id, decision);
     if (always && decision === "allow") {
-      await get().updateSettings({ defaultPolicy: "allow" });
+      // "Always allow" adds a SCOPED allow-rule for this tool (and, for shell,
+      // this command) instead of flipping the global policy to allow-everything.
+      // Skip if an equivalent rule already exists so repeated clicks don't pile up
+      // duplicates.
+      const rule = scopedAllowRule(p);
+      const rules = get().settings.rules;
+      if (!rules.some((r) => r.tool === rule.tool && r.command === rule.command)) {
+        await get().updateSettings({ rules: [...rules, rule] });
+      }
     }
   },
 
@@ -824,6 +1454,17 @@ export const useStore = create<AppState>((set, get) => ({
     writeStr("pc.uiScale", String(n));
     applyUiScale(n);
     set({ uiScale: n });
+  },
+
+  // Persist the consent choice; the frontend SDK init/shutdown is driven by an
+  // effect in App watching `crashReporting`, so the store stays free of any
+  // telemetry-SDK import (keeps it pure + its tests lightweight). We ALSO mirror
+  // the choice to the Rust host (best-effort: swallow errors so the mobile build —
+  // where the command isn't registered — and DSN-less dev builds don't throw).
+  setCrashReporting(v) {
+    writePref("pc.crashReporting", v);
+    set({ crashReporting: v });
+    void ipc.setTelemetryConsent(v).catch(() => {});
   },
 
   toggleFiles() {
@@ -927,14 +1568,26 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   setDraft(v) {
-    set({ draft: v });
+    const id = get().activeId;
+    if (!id) return; // no active session → nowhere to key the draft
+    set((st) => {
+      const drafts = { ...st.drafts };
+      // Keep the mirror tidy: an emptied draft drops its key (matches the backend,
+      // which deletes a blank row) so a cleared draft never round-trips back.
+      if (v) drafts[id] = v;
+      else delete drafts[id];
+      writeJSON("pc.drafts", drafts); // optimistic mirror — instant restore on reload
+      return { drafts };
+    });
+    persistDraft(id, v, false); // debounced durable write
   },
 
   appendDraft(v) {
-    set((st) => {
-      const sep = st.draft && !st.draft.endsWith(" ") ? " " : "";
-      return { draft: st.draft + sep + v + " " };
-    });
+    const id = get().activeId;
+    if (!id) return;
+    const cur = get().drafts[id] ?? "";
+    const sep = cur && !cur.endsWith(" ") ? " " : "";
+    get().setDraft(cur + sep + v + " ");
   },
 
   async openWorkspace() {
@@ -964,6 +1617,17 @@ export const useStore = create<AppState>((set, get) => ({
     } catch (err) {
       set({ settingsError: errMessage(err) });
     }
+  },
+
+  async cyclePermissionMode() {
+    // Advance through the SAFE trio only (default → acceptEdits → plan). auto and
+    // bypass are deliberately excluded from the quick-cycle (Settings-only opt-in),
+    // and cycling out of one of them lands back at the start (default) rather than
+    // stepping deeper into a permissive mode.
+    const cur = get().settings.permissionMode;
+    const i = CYCLE_MODES.indexOf(cur);
+    const next: PermissionMode = CYCLE_MODES[(i + 1) % CYCLE_MODES.length] ?? "default";
+    await get().updateSettings({ permissionMode: next });
   },
 
   async refreshOAuthStatus() {
@@ -1081,8 +1745,50 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   // The user confirmed the SAS matches the desktop's — open the remote session.
+  // No-op once the pairing was rejected (by this phone or the desktop): a stale
+  // Confirm click must not re-open a session the reject already closed.
   confirmRemoteSas() {
+    if (get().remoteRejected) return;
     set({ remoteVerified: true });
+  },
+
+  // The user decided the SAS does NOT match (or chose to cancel at the safety gate):
+  // reject the pairing. When connected, send the `pairing_reject` frame to the
+  // desktop (so it learns the SAS was rejected, not just that the link dropped), then
+  // tear the session down exactly like disconnectRemote and mark the pairing rejected
+  // so the UI shows a distinct "rejected" notice rather than the generic pair screen.
+  async rejectRemoteSas() {
+    clearRemoteWatchdog(); // user-initiated teardown — the turn is over
+    const wasConnected = get().remoteConnected;
+    const unlisten = get().remoteUnlisten;
+    // Mirror disconnectRemote's teardown: flip the connection flags FIRST (before the
+    // async reject) so no command is dispatched onto the closing channel, forget the
+    // remembered pairing, and clear turn state. Then mark the pairing rejected.
+    set({
+      remoteConnected: false,
+      remoteVerified: false,
+      remoteSas: null,
+      remotePeerKey: null,
+      remoteVapidKey: null,
+      remoteDropped: false,
+      remoteRejected: true,
+      // Locally-initiated reject carries no desktop-supplied reason.
+      remoteRejectReason: null,
+      lastPairingQr: null,
+      remoteUnlisten: null,
+      // Doubles as an abort sentinel for an in-flight connectRemote dial (same as
+      // disconnectRemote): a dial resolving after this sees remoteConnecting false
+      // and bails before registering listeners.
+      remoteConnecting: false,
+      remoteChatOpen: false,
+      streaming: false,
+      pendingPermission: null,
+    });
+    writeStr("pc.lastPairingQr", null); // forget the remembered desktop too
+    if (unlisten) unlisten();
+    // Only reach for the channel if there was a live session — a reject from a
+    // not-connected state just sets the flag (mirrors the idempotent disconnect).
+    if (wasConnected) await ipc.phoneSyncReject();
   },
 
   applyFrame(frame) {
@@ -1096,16 +1802,24 @@ export const useStore = create<AppState>((set, get) => ({
             st.activeId && ids.includes(st.activeId)
               ? st.activeId
               : (frame.sessions[0]?.id ?? null);
-          return { sessions: frame.sessions, activeId };
+          return {
+            sessions: frame.sessions,
+            activeId,
+            ...projectActiveRun({ activeId, runs: st.runs }),
+          };
         });
         break;
       case "message_delta":
-        set((st) => ({
-          // Catch-up is authoritative for this session: REPLACE its message list.
-          // This is what reconciles any optimistic user message we appended.
-          messages: { ...st.messages, [frame.session_id]: frame.messages.map(rowToMessage) },
-          activeId: st.activeId ?? frame.session_id,
-        }));
+        set((st) => {
+          const activeId = st.activeId ?? frame.session_id;
+          return {
+            // Catch-up is authoritative for this session: REPLACE its message list.
+            // This is what reconciles any optimistic user message we appended.
+            messages: { ...st.messages, [frame.session_id]: frame.messages.map(rowToMessage) },
+            activeId,
+            ...projectActiveRun({ activeId, runs: st.runs }),
+          };
+        });
         break;
       case "live":
         // Keep the remote idle watchdog alive: any live frame for the active session
@@ -1113,6 +1827,34 @@ export const useStore = create<AppState>((set, get) => ({
         if (frame.session_id === get().activeId) remoteLastActivity = now();
         applyRemoteEvent(set, frame.session_id, frame.event);
         break;
+      case "pairing_reject": {
+        // The desktop declined the pairing (the REACT direction: the desktop user
+        // rejected the SAS). The phone must stop — drop the session and show the
+        // "rejected on the other device" notice. Tear down like a disconnect: clear
+        // connection/verification/SAS, stop the idle watchdog, and unsubscribe.
+        clearRemoteWatchdog();
+        const unlisten = get().remoteUnlisten;
+        if (unlisten) unlisten();
+        // Forget the remembered desktop — a rejected pairing must not offer one-tap
+        // reconnect back into the desktop that just declined.
+        writeStr("pc.lastPairingQr", null);
+        set({
+          remoteConnected: false,
+          remoteVerified: false,
+          remoteSas: null,
+          remotePeerKey: null,
+          remoteVapidKey: null,
+          remoteDropped: false,
+          remoteRejected: true,
+          remoteRejectReason: frame.reason ?? null,
+          lastPairingQr: null,
+          remoteUnlisten: null,
+          remoteChatOpen: false,
+          streaming: false,
+          pendingPermission: null,
+        });
+        break;
+      }
       // command / ack / hello are phone-originated or not actionable inbound.
       case "command":
       case "ack":
@@ -1132,6 +1874,12 @@ export const useStore = create<AppState>((set, get) => ({
     // connect can never leave two live listeners feeding the store.
     const prev = get().remoteUnlisten;
     if (prev) prev();
+    // Entering remote-client mode: drop any desktop persistent background-task
+    // listeners this device installed while driving its own local agent, so they
+    // can't fire and re-populate the `backgroundTasks` map we reset just below (the
+    // remote path tracks tasks via frames instead). A no-op on the phone, which
+    // never installs them.
+    teardownAllBackgroundListeners();
     // A fresh dial is unverified until the user compares the new SAS.
     // Reset connection AND turn state. A fresh dial / reconnect must never inherit a
     // stale `streaming`/`pendingPermission` from a turn the previous session left
@@ -1139,13 +1887,26 @@ export const useStore = create<AppState>((set, get) => ({
     // so without this a reconnect lands in a disabled composer + a dead permission
     // prompt. If the desktop turn is genuinely still live, its catch-up/live frames
     // re-establish `streaming` after the dial.
+    clearSettleTimer();
     set({
       remoteUnlisten: null,
       remoteError: null,
       remoteVerified: false,
       remoteChatOpen: false,
+      // A fresh dial clears any prior rejection so the pair UI starts clean (the
+      // "rejected on the other device" notice must not linger across a re-pair).
+      remoteRejected: false,
+      remoteRejectReason: null,
+      // A fresh dial inherits no live runs — reset the whole map and the mirror.
+      runs: {},
+      // ...and no live subagents; the desktop's live frames repopulate them.
+      agents: {},
+      // ...and no background tasks; the desktop's live frames repopulate them.
+      backgroundTasks: {},
       streaming: false,
+      cancel: null,
       pendingPermission: null,
+      composerPhase: "idle",
     });
     let unlistenFrame: (() => void) | null = null;
     let unlistenDrop: (() => void) | null = null;
@@ -1177,13 +1938,18 @@ export const useStore = create<AppState>((set, get) => ({
         // connection flags, so neither the interim nor the reconnected session is
         // stuck on a stale `streaming`/`pendingPermission`.
         clearRemoteWatchdog();
+        clearSettleTimer();
         set({
           remoteConnected: false,
           remoteVerified: false,
           remoteDropped: true,
           remoteChatOpen: false,
+          // The channel is dead — every remote-driven run is gone.
+          runs: {},
           streaming: false,
+          cancel: null,
           pendingPermission: null,
+          composerPhase: "idle",
         });
       });
       // Remember the desktop across launches (public payload — no secret).
@@ -1267,12 +2033,21 @@ export const useStore = create<AppState>((set, get) => ({
         }));
       }
       clearRemoteWatchdog(); // the turn can't proceed on a dropped link
-      set({ remoteDropped: true, streaming: false });
+      clearSettleTimer();
+      set({
+        remoteDropped: true,
+        runs: {},
+        streaming: false,
+        cancel: null,
+        pendingPermission: null,
+        composerPhase: "idle",
+      });
     }
   },
 
   async disconnectRemote() {
     clearRemoteWatchdog(); // user-initiated teardown — the turn is over
+    clearSettleTimer();
     const unlisten = get().remoteUnlisten;
     // Flip the connection flags FIRST, before the async teardown. `remoteConnected`
     // is the routing source of truth for send/stop/resolvePermission, so clearing it
@@ -1297,8 +2072,12 @@ export const useStore = create<AppState>((set, get) => ({
       // when no dial is in flight.
       remoteConnecting: false,
       remoteChatOpen: false,
-      streaming: false, // the turn is over — don't strand a stuck composer
+      // The turn is over — don't strand a stuck composer; drop every run too.
+      runs: {},
+      streaming: false,
+      cancel: null,
       pendingPermission: null,
+      composerPhase: "idle",
     });
     writeStr("pc.lastPairingQr", null); // forget the remembered desktop too
     if (unlisten) unlisten();
@@ -1337,12 +2116,18 @@ export const useStore = create<AppState>((set, get) => ({
     set({ remoteChatOpen: false });
   },
 
-  // Forget the remembered desktop and clear the dropped flag so the UI falls back
-  // to the fresh pairing screen ("Pair a different desktop" from the drop screen).
-  // The channel is already down here, so there's nothing to tear down.
+  // Forget the remembered desktop and clear the dropped/rejected flags so the UI
+  // falls back to the fresh pairing screen ("Pair a different desktop" from the drop
+  // screen, or "Pair again" from the rejected screen). The channel is already down
+  // here, so there's nothing to tear down.
   forgetRemotePairing() {
     writeStr("pc.lastPairingQr", null);
-    set({ lastPairingQr: null, remoteDropped: false });
+    set({
+      lastPairingQr: null,
+      remoteDropped: false,
+      remoteRejected: false,
+      remoteRejectReason: null,
+    });
   },
 
   // Network presence, driven by the browser's online/offline events (see App).
@@ -1412,16 +2197,25 @@ type RemoteSetter = (fn: (st: AppState) => Partial<AppState>) => void;
 // `cancel` (that handle belongs to a local desktop run).
 //
 // Per-session message patching is always applied (a background session must still
-// build its history). But the GLOBAL UI flags — `streaming` and `pendingPermission`
-// — drive the visible composer/HUD and the permission gate, so they are only
-// touched when the frame's session is the one on screen. Otherwise a background
-// session's turn would flip the visible composer or pop a permission prompt the
-// user has no context for (and would answer blind).
+// build its history). Run state (`streaming`/`pendingPermission`) is written onto
+// the FRAME'S session run via `runPatch`/`setRun`; the active-run MIRROR then
+// surfaces it on the visible composer/HUD/permission gate only when that session
+// is the one on screen. So a background session's turn updates its own run without
+// flipping the visible composer or popping a prompt the user has no context for.
 function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent): void {
+  // First real byte for the on-screen session settles the receipt into "thinking…"
+  // and cancels the fallback timer — mirrors the local onEvent. Background-session
+  // frames never touch the visible presence.
+  const settleActivePresence = (): void => {
+    const st = useStore.getState();
+    if (st.activeId === sessionId && st.composerPhase === "received") {
+      clearSettleTimer();
+      set(() => ({ composerPhase: "thinking" }));
+    }
+  };
   switch (e.type) {
     case "turn_start":
       set((st) => {
-        const isActive = st.activeId === sessionId;
         const msgs = st.messages[sessionId] ?? [];
         const assistant: Message = {
           id: e.messageId,
@@ -1430,18 +2224,28 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
           createdAt: now(),
         };
         return {
-          // Only flip the visible streaming indicator for the active session.
-          ...(isActive ? { streaming: true } : {}),
+          // Mark this session's run streaming; the mirror surfaces it only when the
+          // session is active (runPatch re-projects), so a background run is now
+          // representable without flipping the visible composer.
+          ...runPatch(st, sessionId, { streaming: true }),
           messages: { ...st.messages, [sessionId]: [...msgs, assistant] },
+          // Each turn's agents panel starts empty. The desktop clears it in send();
+          // the phone has no local send() for the turn (the desktop drives it), so
+          // turn_start — the per-turn boundary where the assistant bubble is created
+          // — is the symmetric place to reset it, else finished subagents from prior
+          // turns would accumulate in the panel for the whole connected session.
+          agents: { ...st.agents, [sessionId]: [] },
         };
       });
       break;
     case "text_delta":
+      settleActivePresence();
       set((st) => ({
         messages: patchLast(st.messages, sessionId, (b) => appendText(b, e.text)),
       }));
       break;
     case "tool_use":
+      settleActivePresence();
       set((st) => ({
         messages: patchLast(st.messages, sessionId, (b) => [
           ...b,
@@ -1458,11 +2262,18 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       }));
       break;
     case "permission_request":
-      set((st) =>
-        st.activeId === sessionId
-          ? { pendingPermission: { id: e.id, tool: e.tool, summary: e.summary, input: e.input } }
-          : {},
-      );
+      // Store the request on its session's run; the mirror only pops the prompt
+      // when that session is active, so a background permission never hijacks the
+      // visible gate (the user would otherwise answer it blind).
+      setRun(set, sessionId, {
+        pendingPermission: {
+          id: e.id,
+          tool: e.tool,
+          summary: e.summary,
+          input: e.input,
+          diff: e.diff,
+        },
+      });
       break;
     case "usage":
       set((st) => {
@@ -1482,18 +2293,40 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       // A terminal frame for the active session ends the turn — stop the remote idle
       // watchdog (it self-clears on its next tick once streaming is false, but clear
       // it eagerly so it can't fire a spurious timeout in the meantime).
-      if (useStore.getState().activeId === sessionId) clearRemoteWatchdog();
+      if (useStore.getState().activeId === sessionId) {
+        clearRemoteWatchdog();
+        clearSettleTimer();
+      }
       set((st) => ({
         messages: patchLast(st.messages, sessionId, (b) =>
           appendText(b, `\n\n**Error:** ${e.message}`),
         ),
-        // Only clear the visible turn flags when this is the active session.
-        ...(st.activeId === sessionId ? { streaming: false, pendingPermission: null } : {}),
+        // End this session's run (per-run state + the active-session mirror). Reset
+        // the composer presence only when this is the active session.
+        ...runPatch(st, sessionId, { streaming: false, pendingPermission: null }),
+        ...(st.activeId === sessionId ? { composerPhase: "idle" as const } : {}),
       }));
       break;
     case "turn_end":
-      if (useStore.getState().activeId === sessionId) clearRemoteWatchdog();
-      set((st) => (st.activeId === sessionId ? { streaming: false, pendingPermission: null } : {}));
+      if (useStore.getState().activeId === sessionId) {
+        clearRemoteWatchdog();
+        clearSettleTimer();
+      }
+      setRun(set, sessionId, { streaming: false, pendingPermission: null });
+      if (useStore.getState().activeId === sessionId) set(() => ({ composerPhase: "idle" }));
+      break;
+    case "agent_started":
+    case "agent_progress":
+    case "agent_finished":
+      set((st) => ({ agents: applyAgentEvent(st.agents, sessionId, e) }));
+      break;
+    case "background_task_started":
+    case "background_task_finished":
+      // Background tasks ride the same per-session frame path. They outlive the
+      // turn, so — unlike agents — they are never cleared on a turn boundary.
+      set((st) => ({
+        backgroundTasks: applyBackgroundEvent(st.backgroundTasks, sessionId, e),
+      }));
       break;
   }
 }

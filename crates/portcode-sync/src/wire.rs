@@ -58,7 +58,7 @@ pub struct ChatMessage {
 /// in `src/types.ts`. `Deserialize` lets Phone Sync decode it on the phone side
 /// (it is forwarded verbatim inside `protocol::SyncFrame::Live`).
 /// (Was `crate::llm::StreamEvent`.)
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[cfg_attr(target_arch = "wasm32", derive(Tsify))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
@@ -85,6 +85,11 @@ pub enum StreamEvent {
         tool: String,
         summary: String,
         input: Value,
+        /// A pre-apply unified diff for file tools (fs_write/fs_edit), shown in
+        /// the prompt before the change is written. Optional + skipped when None,
+        /// so older decoders (and the phone) tolerate its absence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<String>,
     },
     Usage {
         #[serde(rename = "inputTokens")]
@@ -98,6 +103,45 @@ pub enum StreamEvent {
     },
     Error {
         message: String,
+    },
+    /// A subagent (the `task` tool) started. Emitted on the SESSION channel so the
+    /// live agents panel sees it even though the subagent's own deltas stream on a
+    /// private `agent://{session}:{agentId}` channel. `parent_id` is the launching
+    /// subagent's id when nested (absent for a top-level launch).
+    AgentStarted {
+        #[serde(rename = "agentId")]
+        agent_id: String,
+        description: String,
+        #[serde(rename = "parentId", default, skip_serializing_if = "Option::is_none")]
+        parent_id: Option<String>,
+    },
+    /// A subagent completed a model turn — a cheap liveness signal for the panel.
+    /// `step` is its 1-based turn count.
+    AgentProgress {
+        #[serde(rename = "agentId")]
+        agent_id: String,
+        step: u32,
+    },
+    /// A subagent finished. `status` is `"ok"`, `"cancelled"`, or `"error"`.
+    AgentFinished {
+        #[serde(rename = "agentId")]
+        agent_id: String,
+        status: String,
+    },
+    /// A `shell` command was launched in the background (the `background` mode).
+    BackgroundTaskStarted {
+        id: String,
+        command: String,
+    },
+    /// A background `shell` command finished. Emitted on the SESSION channel — it
+    /// can arrive AFTER the launching turn ended, so it is delivered to a persistent
+    /// session listener rather than the per-turn one.
+    BackgroundTaskFinished {
+        id: String,
+        command: String,
+        #[serde(rename = "exitCode")]
+        exit_code: i32,
+        output: String,
     },
 }
 
@@ -113,6 +157,11 @@ pub struct SessionRow {
     #[serde(default)]
     pub branch: Option<String>,
     pub workspace: Option<String>,
+    /// The per-session model id (per-session-model feature). Optional + serde-default
+    /// so older rows / wire payloads without it still decode; the call site falls back
+    /// to the global default model when it is None.
+    #[serde(default)]
+    pub model: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }

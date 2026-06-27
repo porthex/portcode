@@ -60,6 +60,19 @@ vi.mock("./lib/installGate", () => ({
   })),
 }));
 
+vi.mock("./components/CrashConsentPrompt", () => ({
+  CrashConsentPrompt: () => <div data-testid="crash-consent-prompt" />,
+}));
+
+// App calls telemetry on mount (main.tsx-style pre-init is separate) and from the
+// crashReporting sync effect. Stub it so this suite never depends on a build-time
+// DSN (`telemetryConfigured`) or touches the real Sentry client.
+vi.mock("./lib/telemetry", () => ({
+  initTelemetry: vi.fn(),
+  shutdownTelemetry: vi.fn(),
+  telemetryConfigured: vi.fn(() => false),
+}));
+
 // `isTauri` is consumed by App's TitleBar; the rest of the surface is what the
 // store's `init()` path invokes. A single mock of this module covers both the
 // component import and the store's `import * as ipc`. The factory is hoisted, so
@@ -73,6 +86,9 @@ vi.mock("./lib/ipc", () => ({
   listSessions: vi.fn(),
   createSession: vi.fn(),
   getMessages: vi.fn(),
+  // store.init() hydrates per-session drafts + cumulative usage on mount.
+  getDrafts: vi.fn(),
+  getAllUsage: vi.fn(),
   // store.init() restores subscription sign-in via ipc.oauthStatus() on mount.
   oauthStatus: vi.fn(),
   startOauthLogin: vi.fn(),
@@ -100,6 +116,8 @@ beforeEach(() => {
   m.listSessions.mockResolvedValue([]);
   m.createSession.mockResolvedValue(undefined);
   m.getMessages.mockResolvedValue([]);
+  m.getDrafts.mockResolvedValue([]);
+  m.getAllUsage.mockResolvedValue([]);
   m.oauthStatus.mockResolvedValue({ signedIn: false, expiresAt: null, account: null, tier: null });
   m.phoneSyncStatus.mockResolvedValue({ devicePublicKey: "DEVICE==", paired: [] });
   m.phoneSyncDisconnect.mockResolvedValue(undefined);
@@ -375,6 +393,7 @@ describe("TitleBar", () => {
           id: "a",
           title: "Refactor the parser",
           workspace: null,
+          model: "claude-opus-4-8",
           createdAt: 1,
           updatedAt: 1,
         },
@@ -394,6 +413,7 @@ describe("TitleBar", () => {
           id: "a",
           title: "Refactor the parser",
           workspace: null,
+          model: "claude-opus-4-8",
           createdAt: 1,
           updatedAt: 1,
         },
