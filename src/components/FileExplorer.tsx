@@ -225,7 +225,8 @@ function TreeNode({
   // contexts). A failure is swallowed — copy-path is a convenience, never a path
   // the agent depends on, and there's no surface to show an error here.
   const copyPath = () => {
-    void navigator.clipboard?.writeText?.(entry.path).catch(() => {});
+    const op = navigator.clipboard?.writeText?.(entry.path);
+    void op?.catch(() => {});
   };
 
   const menuItems = (): ContextMenuItem[] => {

@@ -47,7 +47,7 @@ function createFakeConnector() {
   let lastConnect: { qr: string; reconnect: boolean } | null = null;
 
   const connector: WebSessionConnector = {
-    async connect(qr: string, reconnect: boolean): Promise<WebSession> {
+    async connect(qr: string, reconnect: boolean, _privateKey?: string): Promise<WebSession> {
       calls.connect += 1;
       lastConnect = { qr, reconnect };
       return {
@@ -153,12 +153,13 @@ describe("mock connector", () => {
 });
 
 describe("ipc-shaped wrappers (default mock connector)", () => {
-  it("webPhoneSyncConnect returns the mock ConnectInfo (no VAPID key)", async () => {
+  it("webPhoneSyncConnect returns the mock ConnectInfo (no VAPID key, no privateKey)", async () => {
     const info: ConnectInfo = await webPhoneSyncConnect("qr");
     expect(info).toEqual({
       sas: "MOCK-SAS-1234",
       peerPublicKey: "MOCK_DESKTOP_KEY_BASE64==",
       vapidPublicKey: undefined,
+      privateKey: undefined,
     });
   });
 
@@ -207,7 +208,12 @@ describe("connector registry", () => {
     setWebSessionConnector(fake.connector);
 
     const info = await webPhoneSyncConnect("my-qr", true);
-    expect(info).toEqual({ sas: "FAKE-SAS", peerPublicKey: "FAKE_KEY==" });
+    expect(info).toEqual({
+      sas: "FAKE-SAS",
+      peerPublicKey: "FAKE_KEY==",
+      vapidPublicKey: undefined,
+      privateKey: undefined,
+    });
     expect(fake.calls.connect).toBe(1);
     expect(fake.lastConnect).toEqual({ qr: "my-qr", reconnect: true });
 
@@ -369,8 +375,8 @@ describe("createWasmConnector (real connector, faked wasm module)", () => {
     await connector.connect("qr-2", true);
 
     expect(load).toHaveBeenCalledTimes(1); // memoized
-    expect(connect).toHaveBeenNthCalledWith(1, "qr-1", false);
-    expect(connect).toHaveBeenNthCalledWith(2, "qr-2", true);
+    expect(connect).toHaveBeenNthCalledWith(1, "qr-1", false, undefined);
+    expect(connect).toHaveBeenNthCalledWith(2, "qr-2", true, undefined);
   });
 
   it("sendCommand reaches the wasm session; onEvent frames fan out to onFrame", async () => {
@@ -550,6 +556,8 @@ describe("createWasmConnector (real connector, faked wasm module)", () => {
       sas: "WASM-SAS",
       peerPublicKey: "WASM_KEY==",
       vapidPublicKey: "WASM_VAPID==",
+      // privateKey is undefined on the fake (not added to createFakeWasmSession yet).
+      privateKey: undefined,
     });
 
     const cb = vi.fn();
@@ -559,5 +567,51 @@ describe("createWasmConnector (real connector, faked wasm module)", () => {
 
     await webPhoneSyncDisconnect();
     expect(fake.calls.disconnect).toBe(1);
+  });
+
+  it("surfaces privateKey from the wasm Session through adaptWasmSession", async () => {
+    // Simulate a wasm session that exposes a privateKey getter (newer build).
+    const fake = createFakeWasmSession();
+    Object.defineProperty(fake.session, "privateKey", {
+      value: "PRIV_KEY_BASE64==",
+      configurable: true,
+    });
+    const connect = vi.fn(async () => fake.session);
+    const connector = createWasmConnector(async () => ({ Session: { connect } }));
+
+    const session = await connector.connect("qr", false);
+    expect(session.privateKey).toBe("PRIV_KEY_BASE64==");
+  });
+
+  it("forwards private_key to Session.connect (KK same-phone resume)", async () => {
+    const fake = createFakeWasmSession();
+    const connect = vi.fn(async () => fake.session);
+    const connector = createWasmConnector(async () => ({ Session: { connect } }));
+
+    await connector.connect("qr", true, "MY_PRIV_KEY==");
+    expect(connect).toHaveBeenCalledWith("qr", true, "MY_PRIV_KEY==");
+  });
+
+  it("webPhoneSyncConnect threads privateKey to the connector and surfaces it in ConnectInfo", async () => {
+    const fake = createFakeWasmSession();
+    Object.defineProperty(fake.session, "privateKey", { value: "PRIV==", configurable: true });
+    const connect = vi.fn(async () => fake.session);
+    setWebSessionConnector(createWasmConnector(async () => ({ Session: { connect } })));
+
+    const info = await webPhoneSyncConnect("qr", true, "INPUT_PRIV==");
+    // The private key is forwarded to the wasm connect call.
+    expect(connect).toHaveBeenCalledWith("qr", true, "INPUT_PRIV==");
+    // And the session's privateKey is surfaced in the returned ConnectInfo.
+    expect(info.privateKey).toBe("PRIV==");
+  });
+
+  it("privateKey is undefined on older wasm builds (no getter)", async () => {
+    const fake = createFakeWasmSession();
+    // Older build: no privateKey on the session (the default from createFakeWasmSession).
+    const connector = createWasmConnector(async () => ({
+      Session: { connect: async () => fake.session },
+    }));
+    const session = await connector.connect("qr", false);
+    expect(session.privateKey).toBeUndefined();
   });
 });

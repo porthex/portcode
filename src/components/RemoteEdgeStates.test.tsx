@@ -56,6 +56,41 @@ describe("DisconnectedState", () => {
     fireEvent.click(screen.getByRole("button", { name: "Pair a different desktop" }));
     expect(forgetRemotePairing).toHaveBeenCalledTimes(1);
   });
+
+  it("disables 'Pair a different desktop' while a reconnect is in flight", async () => {
+    // While reconnectRemote() is awaiting, a second tap on the fallback button
+    // must be a no-op — an in-flight dial reattaching to the old desktop while
+    // the user already pivoted to pair a different one would be confusing.
+    let resolveReconnect!: () => void;
+    reconnectRemote.mockReturnValueOnce(
+      new Promise<void>((res) => {
+        resolveReconnect = res;
+      }),
+    );
+    useStore.setState({ lastPairingQr: "QR-REMEMBERED" });
+    render(<DisconnectedState />);
+
+    const pairBtn = screen.getByRole("button", { name: "Pair a different desktop" });
+    const reconnectBtn = screen.getByRole("button", { name: /Reconnect/ });
+
+    // Kick off the reconnect — it won't resolve until we let it.
+    fireEvent.click(reconnectBtn);
+
+    // While in flight: the fallback button is disabled and clicking it is a no-op.
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(pairBtn).toBeDisabled();
+    fireEvent.click(pairBtn);
+    expect(forgetRemotePairing).not.toHaveBeenCalled();
+
+    // Once the reconnect settles the button is enabled again.
+    await act(async () => {
+      resolveReconnect();
+      await Promise.resolve();
+    });
+    expect(pairBtn).not.toBeDisabled();
+  });
 });
 
 describe("OfflineState", () => {

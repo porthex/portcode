@@ -65,11 +65,20 @@ export const MessageView = memo(function MessageView({
     },
   ];
 
+  // If the user has text selected, let the native copy menu through instead of
+  // stealing it with the custom one — right-click with a live selection is
+  // almost always "copy this", not "copy the whole message".
+  const handleContextMenu = (e: React.MouseEvent) => {
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed) return;
+    onContextMenu(menuItems)(e);
+  };
+
   return (
     <div
       id={`pc-msg-${message.id}`}
       className={`mb-5 flex gap-[11px] ${isUser ? "justify-end" : "pc-msg-enter"}`}
-      onContextMenu={onContextMenu(menuItems)}
+      onContextMenu={handleContextMenu}
     >
       {!isUser && <Avatar />}
       <div className={`min-w-0 ${isUser ? "max-w-[82%]" : "flex-1"}`}>

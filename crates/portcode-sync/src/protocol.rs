@@ -56,6 +56,16 @@ pub enum RemoteCommand {
     Permission { id: String, decision: String },
     /// Open a new session — proxies to `create_session`.
     CreateSession { title: Option<String> },
+    /// Register the web client's Web Push subscription so the desktop can wake the
+    /// PWA with a push when it is backgrounded. Sent by `webClientLifecycle.ts`
+    /// (`{ cmd: "register_push", endpoint, p256dh, auth }`). `endpoint` is the push
+    /// service URL; `p256dh`/`auth` are the subscription's encryption keys. The
+    /// desktop persists/uses these to send pushes (push SEND is a separate feature).
+    RegisterPush {
+        endpoint: String,
+        p256dh: String,
+        auth: String,
+    },
 }
 
 /// Everything that crosses the encrypted channel, in both directions.
@@ -213,6 +223,9 @@ mod tests {
             RemoteCommand::Cancel {
                 session_id: "s1".into(),
             },
+            RemoteCommand::CancelAgent {
+                agent_id: "a1".into(),
+            },
             RemoteCommand::Permission {
                 id: "p1".into(),
                 decision: "allow".into(),
@@ -221,8 +234,56 @@ mod tests {
                 title: Some("New".into()),
             },
             RemoteCommand::CreateSession { title: None },
+            RemoteCommand::RegisterPush {
+                endpoint: "https://push.example/abc".into(),
+                p256dh: "BPa...key".into(),
+                auth: "authsecret".into(),
+            },
         ] {
             round_trips(&SyncFrame::Command { command });
+        }
+    }
+
+    #[test]
+    fn register_push_uses_the_snake_case_cmd_tag_the_web_client_sends() {
+        // The web client (`webClientLifecycle.ts`) emits
+        // `{ cmd: "register_push", endpoint, p256dh, auth }`; the enum's serde
+        // `tag = "cmd"` + `rename_all = "snake_case"` must produce exactly that, or
+        // it deserializes as unknown and breaks the command channel.
+        let frame = SyncFrame::Command {
+            command: RemoteCommand::RegisterPush {
+                endpoint: "https://push.example/xyz".into(),
+                p256dh: "key".into(),
+                auth: "secret".into(),
+            },
+        };
+        let json = serde_json::to_string(&frame).expect("encode");
+        assert!(json.contains("\"cmd\":\"register_push\""), "{json}");
+        assert!(
+            json.contains("\"endpoint\":\"https://push.example/xyz\""),
+            "{json}"
+        );
+        assert!(json.contains("\"p256dh\":\"key\""), "{json}");
+        assert!(json.contains("\"auth\":\"secret\""), "{json}");
+        round_trips(&frame);
+
+        // And the exact bytes the web client sends decode into the variant.
+        let from_web = r#"{"t":"command","cmd":"register_push","endpoint":"https://push.example/xyz","p256dh":"key","auth":"secret"}"#;
+        let decoded: SyncFrame = serde_json::from_str(from_web).expect("decode web payload");
+        match decoded {
+            SyncFrame::Command {
+                command:
+                    RemoteCommand::RegisterPush {
+                        endpoint,
+                        p256dh,
+                        auth,
+                    },
+            } => {
+                assert_eq!(endpoint, "https://push.example/xyz");
+                assert_eq!(p256dh, "key");
+                assert_eq!(auth, "secret");
+            }
+            other => panic!("expected a RegisterPush command, got {other:?}"),
         }
     }
 }

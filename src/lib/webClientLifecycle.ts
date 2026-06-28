@@ -204,10 +204,10 @@ export function startWebClientLifecycle(opts: WebClientLifecycleOptions = {}): (
 
     // The store forgot the remembered desktop (explicit disconnect / forget pairing):
     // clear the durable pin too so a cold start can't silently reconnect to a desktop
-    // the user unpaired.
+    // the user unpaired. Best-effort: swallow storage failures (same as persistPinnedPeer).
     if (lastQr !== null && s.lastPairingQr === null) {
       rememberedQr = null;
-      void storage.clearPinnedPeer();
+      void storage.clearPinnedPeer().catch(() => {});
     }
 
     // Mirror the pending-decision count onto the App Badge whenever it changes.
@@ -285,7 +285,14 @@ export function startWebClientLifecycle(opts: WebClientLifecycleOptions = {}): (
     },
   });
 
+  // Guard so repeated stop() calls are no-ops: unwatch/unsubscribe are not
+  // idempotent themselves (unsubscribing a removed listener or calling a torn-down
+  // watcher could silently misbehave), and the controller's stop is already
+  // idempotent but cheaper to skip.
+  let stopped = false;
   return () => {
+    if (stopped) return;
+    stopped = true;
     controller.stop();
     unwatch();
     unsubscribe();
@@ -295,24 +302,31 @@ export function startWebClientLifecycle(opts: WebClientLifecycleOptions = {}): (
 /** Write the pinned desktop identity to durable storage (and request persistence).
  *  `peerPublicKey` is the desktop's STABLE static public key (from `ConnectInfo`),
  *  the identity reconnects authenticate against — NOT the SAS verification code.
- *  `qr` is stored alongside as the re-dial source. Best-effort: never throws
- *  (webStorage swallows storage errors). */
+ *  `qr` is stored alongside as the re-dial source. Best-effort: never throws —
+ *  failures are swallowed so a transient IndexedDB error never surfaces as an
+ *  unhandled rejection from the store subscription. */
 async function persistPinnedPeer(
   storage: LifecycleStorage,
   qr: string,
   peerPublicKey: string,
 ): Promise<void> {
-  // Ask for durable storage at pair time (iOS grants it only for installed PWAs —
-  // exactly the gate we want). Fire-and-forget the grant; the pin write below is
-  // valuable even if persistence isn't granted (it just becomes eviction-eligible).
-  void storage.requestPersistentStorage();
-  const deviceId = await storage.getOrCreateDeviceId();
-  await storage.savePinnedPeer({
-    peerPublicKey,
-    deviceId,
-    qr,
-    pairedAt: Date.now(),
-  });
+  try {
+    // Ask for durable storage at pair time (iOS grants it only for installed PWAs —
+    // exactly the gate we want). Fire-and-forget the grant; the pin write below is
+    // valuable even if persistence isn't granted (it just becomes eviction-eligible).
+    void storage.requestPersistentStorage();
+    const deviceId = await storage.getOrCreateDeviceId();
+    await storage.savePinnedPeer({
+      peerPublicKey,
+      deviceId,
+      qr,
+      pairedAt: Date.now(),
+    });
+  } catch {
+    // Best-effort: a storage failure (e.g. IndexedDB unavailable / quota exceeded)
+    // must not escape as an unhandled rejection from the void fire-and-forget call
+    // in the store subscription.
+  }
 }
 
 /**

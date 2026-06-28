@@ -600,6 +600,56 @@ describe("startWebClientLifecycle — teardown", () => {
     await flush();
     expect(storage.savePinnedPeer).not.toHaveBeenCalled();
   });
+
+  it("stop() is idempotent: repeated calls do not re-run teardown", () => {
+    const { store } = makeFakeStore({ lastPairingQr: null });
+    const w = makeWatchStub();
+    const stop = startWebClientLifecycle({ store, storage: makeFakeStorage(), watch: w.watch });
+
+    stop();
+    stop(); // second call must be a no-op
+    stop(); // third call too
+
+    // unwatch and unsubscribe were each called exactly once despite 3 stop() calls.
+    expect(w.unwatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("persistPinnedPeer swallows storage errors (no unhandled rejection)", async () => {
+    const { store, set } = makeFakeStore({ lastPairingQr: null });
+    const storage = makeFakeStorage();
+    // Make getOrCreateDeviceId reject to exercise the try/catch in persistPinnedPeer.
+    vi.mocked(storage.getOrCreateDeviceId).mockRejectedValue(new Error("IDB unavailable"));
+    const w = makeWatchStub();
+    const stop = startWebClientLifecycle({ store, storage, watch: w.watch });
+
+    // A verified connection triggers persistPinnedPeer — the rejection must be swallowed.
+    set({
+      remoteConnected: true,
+      remoteVerified: true,
+      remotePeerKey: "KEY",
+      lastPairingQr: "QR",
+    });
+    // Two flushes: first settles the void persistPinnedPeer call, second the inner awaits.
+    await flush();
+    await flush();
+    // If we reach here without an unhandled rejection, the try/catch is working.
+
+    stop();
+  });
+
+  it("clearPinnedPeer failures are swallowed (no unhandled rejection)", async () => {
+    const { store, set } = makeFakeStore({ lastPairingQr: "QR-OLD" });
+    const storage = makeFakeStorage();
+    vi.mocked(storage.clearPinnedPeer).mockRejectedValue(new Error("IDB unavailable"));
+    const w = makeWatchStub();
+    const stop = startWebClientLifecycle({ store, storage, watch: w.watch });
+
+    set({ lastPairingQr: null });
+    await flush();
+    // Reaching here means the .catch(() => {}) on clearPinnedPeer swallowed the error.
+
+    stop();
+  });
 });
 
 describe("registerServiceWorker", () => {

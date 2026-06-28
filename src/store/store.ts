@@ -712,11 +712,11 @@ const writeJSON = (k: string, v: unknown): void => {
 // can never put the list into an undefined sort/group mode.
 const readSort = (): SessionSort => {
   const v = readStr("pc.sortBy");
-  return v === "name" || v === "status" ? v : "recent";
+  return v === "name" || v === "status" || v === "manual" ? v : "recent";
 };
 const readGroup = (): SessionGroup => {
   const v = readStr("pc.groupBy");
-  return v === "workspace" || v === "status" ? v : "none";
+  return v === "workspace" || v === "status" || v === "branch" ? v : "none";
 };
 
 const uid = () =>
@@ -2217,6 +2217,8 @@ export const useStore = create<AppState>((set, get) => ({
     writeStr("pc.lastPairingQr", null);
     set({
       lastPairingQr: null,
+      remotePeerKey: null,
+      remoteVapidKey: null,
       remoteDropped: false,
       remoteRejected: false,
       remoteRejectReason: null,

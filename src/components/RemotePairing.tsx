@@ -65,6 +65,18 @@ export function RemotePairing() {
 
   const scanMode = detectScanMode();
 
+  // Abort any in-flight scan when the component unmounts (e.g. the user navigates
+  // away while the camera overlay is up). Cancel/Escape already do this on a live
+  // component; this effect covers the unmount path the interactive handlers miss.
+  useEffect(() => {
+    return () => {
+      scanAbortRef.current?.abort();
+      // Native mode: cancel the plugin's scan (fire-and-forget; we can't await here).
+      if (scanMode === "native") void cancelScan();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Dial a payload. connectRemote never throws — it folds failures into
   // store.remoteError, which the pair panel surfaces inline. On success it flips
   // remoteConnected and this screen swaps to the SAFETY state.
@@ -338,31 +350,31 @@ function PairPanel({
                 : "Show the QR from your desktop"}
         </div>
 
-        {/* photo-upload fallback — for locked-down devices where the live camera is
-            denied/unavailable. A still photo of the QR is decoded the same way. */}
-        {canScan && (
-          <>
-            <input
-              ref={fileRef}
-              type="file"
-              accept="image/*"
-              capture="environment"
-              onChange={onPickPhoto}
-              disabled={connecting}
-              className="sr-only"
-              aria-hidden="true"
-              tabIndex={-1}
-            />
-            <button
-              type="button"
-              onClick={() => fileRef.current?.click()}
-              disabled={scanning || connecting}
-              className="mx-auto mt-2.5 inline-flex items-center gap-1.5 rounded-md border border-accent-2/25 bg-accent-2/[0.06] px-3 py-1.5 font-mono text-[10px] tracking-[1px] text-accent-2 transition hover:bg-accent-2/15 disabled:opacity-40"
-            >
-              <span aria-hidden="true">▣</span> Upload a photo of the QR
-            </button>
-          </>
-        )}
+        {/* photo-upload fallback — for any host where a still photo of the QR can be
+            decoded: available regardless of live-camera presence so no-camera and
+            web-camera hosts both get it. Only the live-scan viewport above is gated
+            on `canScan`; this affordance is universal. */}
+        <>
+          <input
+            ref={fileRef}
+            type="file"
+            accept="image/*"
+            capture="environment"
+            onChange={onPickPhoto}
+            disabled={connecting}
+            className="sr-only"
+            aria-hidden="true"
+            tabIndex={-1}
+          />
+          <button
+            type="button"
+            onClick={() => fileRef.current?.click()}
+            disabled={scanning || connecting}
+            className="mx-auto mt-2.5 inline-flex items-center gap-1.5 rounded-md border border-accent-2/25 bg-accent-2/[0.06] px-3 py-1.5 font-mono text-[10px] tracking-[1px] text-accent-2 transition hover:bg-accent-2/15 disabled:opacity-40"
+          >
+            <span aria-hidden="true">▣</span> Upload a photo of the QR
+          </button>
+        </>
 
         {/* divider */}
         <div className="my-4 flex items-center gap-3 font-mono text-[10px] tracking-[2px] text-faint/70">

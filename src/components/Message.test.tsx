@@ -381,6 +381,39 @@ describe("MessageView — right-click context menu", () => {
     expect(writeText).toHaveBeenCalledWith("part one part two");
   });
 
+  it("does not open the custom menu when text is selected (preserves native copy)", () => {
+    // When the user right-clicks with a live, non-collapsed selection (e.g. to
+    // copy a snippet), the custom menu must not steal the native context menu.
+    const sel = { isCollapsed: false } as Selection;
+    vi.spyOn(window, "getSelection").mockReturnValue(sel);
+    try {
+      const { container } = render(
+        <MessageView message={message("user", [{ kind: "text", text: "Hello there" }])} />,
+      );
+
+      fireEvent.contextMenu(container.firstElementChild as HTMLElement);
+      // The native menu was NOT suppressed by our handler opening a custom one.
+      expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("opens the custom menu on right-click when there is no active selection", () => {
+    const sel = { isCollapsed: true } as Selection;
+    vi.spyOn(window, "getSelection").mockReturnValue(sel);
+    try {
+      const { container } = render(
+        <MessageView message={message("user", [{ kind: "text", text: "Hello there" }])} />,
+      );
+
+      fireEvent.contextMenu(container.firstElementChild as HTMLElement);
+      expect(screen.getByRole("menu")).toBeInTheDocument();
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
   it("disables Copy message text when the message has no text", () => {
     const { container } = render(
       <MessageView

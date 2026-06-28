@@ -392,6 +392,15 @@ export interface ConnectInfo {
    * best-effort re-engagement, never core, so its absence degrades to a no-op.
    */
   vapidPublicKey?: string;
+  /**
+   * The phone's own static private key (base64url) generated for this dial by the
+   * wasm `Session`. The caller should persist this and pass it back on the next
+   * `connect` (as `private_key?`) so wasm can resume a KK same-phone handshake
+   * instead of generating a fresh identity each time. Absent on the native Tauri
+   * path (ipc.ts manages the key internally in Rust) and on older wasm builds that
+   * predate the `privateKey` getter — callers must treat it as best-effort.
+   */
+  privateKey?: string;
 }
 
 /**

@@ -110,13 +110,13 @@ describe("RemoteSessions — list", () => {
     expect(screen.getByRole("button", { name: /New session on desktop/ })).toBeDisabled();
   });
 
-  it("keeps the new-session footer enabled while merely streaming (create not in flight)", () => {
+  it("disables the new-session footer while streaming (newSession no-ops mid-turn)", () => {
     useStore.setState({ sessions: [session()], activeId: "s1", streaming: true });
     render(<RemoteSessions />);
 
-    // The create CTA is gated on creatingSession, not streaming — a streaming turn
-    // alone doesn't block creating another desktop session.
-    expect(screen.getByRole("button", { name: /New session on desktop/ })).not.toBeDisabled();
+    // newSession() explicitly no-ops while streaming to avoid stranding a live turn.
+    // The CTA is disabled so the guard is visible rather than silently ignored.
+    expect(screen.getByRole("button", { name: /New session on desktop/ })).toBeDisabled();
   });
 
   it("does not open a different session when tapped mid-stream", () => {
@@ -164,6 +164,12 @@ describe("RemoteSessions — empty", () => {
 
   it("disables the empty-state CTA while a create is in flight (creatingSession)", () => {
     useStore.setState({ sessions: [], activeId: null, creatingSession: true });
+    render(<RemoteSessions />);
+    expect(screen.getByRole("button", { name: /New session/ })).toBeDisabled();
+  });
+
+  it("disables the empty-state CTA while streaming (newSession no-ops mid-turn)", () => {
+    useStore.setState({ sessions: [], activeId: null, streaming: true });
     render(<RemoteSessions />);
     expect(screen.getByRole("button", { name: /New session/ })).toBeDisabled();
   });

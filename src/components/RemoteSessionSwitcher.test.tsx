@@ -115,4 +115,18 @@ describe("RemoteSessionSwitcher", () => {
     // With nothing focusable inside, the trap keeps focus on the container.
     expect(document.activeElement).toBe(dialog);
   });
+
+  it("steps into the first focusable item when Tab is pressed from the container", () => {
+    // On open the container itself holds focus (no item has been selected yet).
+    // A plain Tab from the container must step INTO the sheet's first item rather
+    // than escaping behind the scrim.
+    render(<RemoteSessionSwitcher onClose={onClose} />);
+    const dialog = screen.getByRole("dialog", { name: "Switch session" });
+    const rows = screen.getAllByRole("button", { name: /Alpha|Beta/ });
+
+    // Simulate the initial state: focus sits on the container, not any child.
+    dialog.focus();
+    fireEvent.keyDown(dialog, { key: "Tab" });
+    expect(document.activeElement).toBe(rows[0]);
+  });
 });

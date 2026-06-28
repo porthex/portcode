@@ -90,22 +90,27 @@ fn redactors() -> &'static [Redactor] {
     })
 }
 
-/// Run every redaction pass over a string. Caps length first (dump guard), then
-/// applies each pass in order. Safe on any string.
+/// Run every redaction pass over a string, THEN cap its length (dump guard).
+///
+/// Order matters for privacy: the redactors run over the FULL input first, so a
+/// secret that straddles the length cap is still fully matched and replaced —
+/// truncating first could leave the un-redacted prefix of a boundary-spanning
+/// secret riding out in the kept head. Only after redaction do we apply the char
+/// cap + truncation marker. Safe on any string.
 pub fn redact_secrets(value: &str) -> String {
-    // Cap by CHARS (not bytes) so we never split a UTF-8 codepoint. This mirrors the
-    // JS `slice(0, MAX_REDACT_LEN)` which is also codepoint(-ish)-aware.
-    let capped = value.chars().count() > MAX_REDACT_LEN;
-    let mut out: String = if capped {
-        value.chars().take(MAX_REDACT_LEN).collect()
-    } else {
-        value.to_string()
-    };
+    // Redact the WHOLE input first — never a pre-truncated head — so a secret that
+    // crosses the cap can't leak its prefix.
+    let mut out = value.to_string();
     for r in redactors() {
         // `replace_all` returns Cow; only allocate when something actually matched.
         out = r.re.replace_all(&out, r.repl).into_owned();
     }
-    if capped {
+    // Cap by CHARS (not bytes) so we never split a UTF-8 codepoint. This mirrors the
+    // JS `slice(0, MAX_REDACT_LEN)` which is also codepoint(-ish)-aware. Applied to
+    // the already-redacted text, so the only thing a truncation can drop is
+    // redaction markers / non-secret tail — never a partially-matched secret.
+    if out.chars().count() > MAX_REDACT_LEN {
+        out = out.chars().take(MAX_REDACT_LEN).collect();
         out.push_str("…[truncated]");
     }
     out
@@ -213,6 +218,35 @@ mod tests {
         let huge = format!("noreply@{}", "a".repeat(50_000));
         let out = redact_secrets(&huge);
         assert!(out.chars().count() < 3000);
+        assert!(out.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn a_secret_straddling_the_length_cap_is_fully_redacted() {
+        // Plant an API key so it STRADDLES the MAX_REDACT_LEN boundary: most of it
+        // sits before the cap, the rest after. If redaction ran AFTER truncation,
+        // the kept head would carry the key's un-redacted prefix. Redacting the full
+        // input first means the whole key is replaced before any truncation.
+        let key = "sk-ant-api03-STRADDLINGSECRET0123456789ABCDEF";
+        // Position the key so it begins WELL before the cap (so its redaction marker
+        // survives truncation) but the full input still overflows it — forcing the
+        // truncation path while the key straddles the original boundary. With
+        // truncate-first, the key's tail would have been the dropped part; with
+        // redact-first the whole key is gone before any cut.
+        let prefix = "x".repeat(MAX_REDACT_LEN - key.len());
+        let suffix = "y".repeat(200);
+        let input = format!("{prefix}{key}{suffix}");
+        let out = redact_secrets(&input);
+
+        // The raw key must NOT appear anywhere in the output, nor any leaked prefix
+        // of it (the boundary-straddle case CodeRabbit flagged).
+        assert!(!out.contains(key), "the full key must be redacted: {out}");
+        assert!(
+            !out.contains("sk-ant-api03-STRADDLING"),
+            "no un-redacted prefix of the key may survive: {out}"
+        );
+        // It WAS redacted (the marker is present) and the dump guard still caps length.
+        assert!(out.contains("[redacted-api-key]"));
         assert!(out.ends_with("…[truncated]"));
     }
 

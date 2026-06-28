@@ -57,6 +57,12 @@ export function RemoteSessionSwitcher({ onClose }: { onClose: () => void }) {
     } else if (!e.shiftKey && active === last) {
       e.preventDefault();
       first.focus();
+    } else if (!e.shiftKey && active === container) {
+      // Plain Tab from the container itself (initial focus state before any
+      // focusable element has been manually selected) — step into the first item
+      // rather than escaping the trap behind the scrim.
+      e.preventDefault();
+      first.focus();
     }
   };
 

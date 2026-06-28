@@ -40,7 +40,7 @@ function presenceFor(
   tool: string | null,
 ): { text: string; dot: string } {
   if (phase === "stopping") return { text: "stopping…", dot: "pc-dot pc-dot--danger" };
-  if (!streaming) return { text: "ready when you are", dot: "pc-dot--idle" };
+  if (!streaming) return { text: "ready when you are", dot: "pc-dot pc-dot--idle" };
   if (phase === "received") return { text: "got it — reading…", dot: "pc-dot pc-dot--cyan" };
   // A tool is concretely running — name it honestly (driven by real tool_use events).
   // Gated on the "thinking" phase (reliably reset to idle at every turn end) so a

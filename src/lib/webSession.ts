@@ -51,9 +51,10 @@ export type Unlisten = () => void;
  * A live browser↔desktop session. The WASM-bindgen `Session` class implements
  * this interface; {@link createMockConnector} returns an in-memory fake of it.
  *
- * `sas` / `peerPublicKey` / `vapidPublicKey` are captured at connect time (the
- * short authentication string to compare out-of-band, the pinned desktop key, and
- * the desktop's Web Push VAPID key), so they are readonly.
+ * `sas` / `peerPublicKey` / `vapidPublicKey` / `privateKey` are captured at
+ * connect time (the short authentication string to compare out-of-band, the pinned
+ * desktop key, the desktop's Web Push VAPID key, and the phone's own static private
+ * key respectively), so they are readonly.
  */
 export interface WebSession {
   readonly sas: string;
@@ -64,6 +65,15 @@ export interface WebSession {
    * it as the `applicationServerKey` when subscribing to Web Push (§5.7).
    */
   readonly vapidPublicKey?: string;
+  /**
+   * The phone's own static private key generated during this dial (base64url), or
+   * `undefined` when the wasm build predates the `privateKey` getter. Persisting
+   * this and passing it back on the next `connect` (as `private_key`) lets wasm
+   * resume a KK handshake against the same-phone identity instead of generating a
+   * fresh static key each time, which would look like a different device to the
+   * desktop. See wasm `Session.connect(qr, reconnect, private_key?)`.
+   */
+  readonly privateKey?: string;
   /** Send one command to the live desktop. */
   sendCommand(cmd: RemoteCommand): Promise<void>;
   /** Subscribe to frames forwarded from the desktop. Returns an unlisten handle. */
@@ -85,10 +95,13 @@ export interface WebSession {
  * constructor (dial + handshake over iroh-in-browser); the mock fabricates a
  * deterministic session. `reconnect` selects the handshake prologue exactly like
  * `phoneSyncConnect` in ipc.ts (false = first pairing binds the QR nonce; true =
- * remembered-desktop reconnect binds an empty prologue).
+ * remembered-desktop reconnect binds an empty prologue). `privateKey` (optional)
+ * is the phone's own static private key from a previous dial; passing it back lets
+ * the wasm resume a KK handshake with the same identity rather than generating a
+ * fresh key each time (see {@link WebSession.privateKey}).
  */
 export interface WebSessionConnector {
-  connect(qr: string, reconnect: boolean): Promise<WebSession>;
+  connect(qr: string, reconnect: boolean, privateKey?: string): Promise<WebSession>;
 }
 
 /**
@@ -112,7 +125,7 @@ export interface WebSessionConnector {
  */
 export function createMockConnector(): WebSessionConnector {
   return {
-    async connect(_qr: string, _reconnect: boolean): Promise<WebSession> {
+    async connect(_qr: string, _reconnect: boolean, _privateKey?: string): Promise<WebSession> {
       const frameCbs = new Set<(f: SyncFrame) => void>();
       const disconnectedCbs = new Set<() => void>();
 
@@ -183,6 +196,14 @@ export interface WasmSession {
   /** The desktop's Web Push VAPID PUBLIC key getter (added on the Rust `Session`
    *  alongside `peerPublicKey`); `undefined` when the desktop sent none. */
   readonly vapidPublicKey?: string;
+  /**
+   * The phone's own static private key (base64url) generated for this dial.
+   * Exposed by the Rust `Session` so the JS layer can persist it across page
+   * loads and pass it back on the next `connect` as `private_key?`, enabling
+   * KK same-phone resume. Older wasm builds that don't expose this getter
+   * return `undefined`; the adapter surfaces it as-is.
+   */
+  readonly privateKey?: string;
   sendCommand(cmd: RemoteCommand): void | Promise<void>;
   /** Register the inbound-frame callback; Rust invokes it per `SyncFrame`. */
   onEvent(cb: (f: SyncFrame) => void): void;
@@ -206,10 +227,12 @@ export interface WasmSession {
 }
 
 /** The shape of the `portcode-wasm` module: a `Session` class with a static
- *  `connect`. Only what we call is declared. */
+ *  `connect`. Only what we call is declared. `private_key?` matches the wasm
+ *  binding's snake_case param name (from wasm-bindgen's JS glue) and is optional
+ *  so callers without a persisted key omit it cleanly. */
 export interface WasmModule {
   Session: {
-    connect(qr: string, reconnect: boolean): Promise<WasmSession>;
+    connect(qr: string, reconnect: boolean, private_key?: string): Promise<WasmSession>;
   };
 }
 
@@ -301,6 +324,11 @@ function adaptWasmSession(ws: WasmSession): WebSession {
     // Carry the desktop's VAPID key through to the WebSession so the push client
     // can use it as the `applicationServerKey` (undefined when the desktop sent none).
     vapidPublicKey: ws.vapidPublicKey,
+    // Surface the phone's own static private key so callers can persist it and
+    // pass it back on the next `connect` for KK same-phone resume. Older wasm
+    // builds that don't expose `privateKey` produce `undefined` here, which is
+    // harmless — the wasm falls back to a fresh key on the next dial.
+    privateKey: ws.privateKey,
     async sendCommand(cmd: RemoteCommand): Promise<void> {
       await ws.sendCommand(cmd);
     },
@@ -396,9 +424,12 @@ export function createWasmConnector(load: WasmLoader = defaultWasmLoader): WebSe
   }
 
   return {
-    async connect(qr: string, reconnect: boolean): Promise<WebSession> {
+    async connect(qr: string, reconnect: boolean, privateKey?: string): Promise<WebSession> {
       const m = await loadModule();
-      const ws = await m.Session.connect(qr, reconnect);
+      // Pass the persisted phone private key (if any) so wasm can resume the KK
+      // handshake with the same static identity rather than generating a fresh key.
+      // Older wasm builds that don't accept the third param ignore it safely.
+      const ws = await m.Session.connect(qr, reconnect, privateKey);
       return adaptWasmSession(ws);
     },
   };
@@ -433,14 +464,20 @@ let current: WebSession | null = null;
 /**
  * Dial + pair with a desktop from its scanned QR payload via the active connector,
  * store the result as the current session, and return its {@link ConnectInfo}
- * (`{ sas, peerPublicKey, vapidPublicKey? }`). Mirrors ipc.ts `phoneSyncConnect`.
+ * (`{ sas, peerPublicKey, vapidPublicKey?, privateKey? }`). Mirrors ipc.ts
+ * `phoneSyncConnect`. `privateKey` (optional) is the phone's persisted static
+ * private key from a prior dial; pass it to resume a KK same-phone handshake.
  */
-export async function webPhoneSyncConnect(qr: string, reconnect = false): Promise<ConnectInfo> {
+export async function webPhoneSyncConnect(
+  qr: string,
+  reconnect = false,
+  privateKey?: string,
+): Promise<ConnectInfo> {
   // Capture the session being replaced so we can tear it down: overwriting
   // `current` without disconnecting the old session would leak it (its socket /
   // WASM handle would stay open) across a reconnect.
   const previous = current;
-  const next = await connector.connect(qr, reconnect);
+  const next = await connector.connect(qr, reconnect, privateKey);
   current = next;
   // Disconnect the prior session AFTER the new dial succeeds (so a failed dial
   // leaves the existing session intact). Swallow errors — a best-effort teardown
@@ -448,7 +485,12 @@ export async function webPhoneSyncConnect(qr: string, reconnect = false): Promis
   if (previous && previous !== next) {
     await previous.disconnect().catch(() => {});
   }
-  return { sas: next.sas, peerPublicKey: next.peerPublicKey, vapidPublicKey: next.vapidPublicKey };
+  return {
+    sas: next.sas,
+    peerPublicKey: next.peerPublicKey,
+    vapidPublicKey: next.vapidPublicKey,
+    privateKey: next.privateKey,
+  };
 }
 
 /** Forward one command to the current session. No-op if not connected. */

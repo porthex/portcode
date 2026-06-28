@@ -229,15 +229,34 @@ impl TurnBuilder {
     /// Finalize the turn into a [`TurnResult`].
     ///
     /// If the stream ended while a content block was still open (no
-    /// `content_block_stop`) and the turn was not cancelled, the response was
+    /// `content_block_stop`) and the turn was NOT cancelled, the response was
     /// truncated — surface it instead of silently dropping the block. A
     /// half-built tool call would otherwise just vanish and the turn would look
     /// fine.
-    fn finish(self) -> Result<TurnResult, String> {
-        if self.current.is_some() && self.stop_reason != "cancelled" {
-            return Err(
-                "The response was cut off before it finished. Please try again.".to_string(),
-            );
+    ///
+    /// On CANCEL the turn legitimately stops mid-block, so we don't error. But an
+    /// open, non-empty text block at that point is real assistant text the user
+    /// already saw streaming live — preserve it as a finished `Block::Text` so the
+    /// persisted turn matches the UI instead of dropping it. (A still-open TOOL
+    /// block on cancel is dropped: a partial tool call has no valid `input` to act
+    /// on, and emitting half a call would be worse than omitting it.)
+    fn finish(mut self) -> Result<TurnResult, String> {
+        match self.current.take() {
+            // Cancelled mid-text: keep the partial text the user already saw.
+            Some(Building::Text(text)) if self.stop_reason == "cancelled" => {
+                if !text.is_empty() {
+                    self.blocks.push(Block::Text { text });
+                }
+            }
+            // Cancelled mid-tool: drop the half-built call (no usable input).
+            Some(_) if self.stop_reason == "cancelled" => {}
+            // Not cancelled but a block was still open → a truncated response.
+            Some(_) => {
+                return Err(
+                    "The response was cut off before it finished. Please try again.".to_string(),
+                );
+            }
+            None => {}
         }
         Ok(TurnResult {
             content: self.blocks,
@@ -628,9 +647,11 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_turn_with_open_block_finishes_ok() {
-        // Cancellation legitimately stops mid-block, so finish() must not treat
-        // the still-open block as a truncation.
+    fn cancelled_turn_with_open_text_block_keeps_the_partial_text() {
+        // Cancellation legitimately stops mid-block, so finish() must not treat the
+        // still-open block as a truncation — AND an open, non-empty TEXT block is
+        // real assistant text the user already saw streaming live, so it must be
+        // preserved as a finished Block::Text rather than dropped.
         let mut b = TurnBuilder::new();
         b.process(r#"{"type":"content_block_start","content_block":{"type":"text","text":""}}"#)
             .unwrap();
@@ -641,6 +662,49 @@ mod tests {
             .finish()
             .expect("a cancelled turn is not a truncation error");
         assert_eq!(result.stop_reason, "cancelled");
+        assert_eq!(result.content.len(), 1, "the partial text must be kept");
+        match &result.content[0] {
+            Block::Text { text } => assert_eq!(text, "hi"),
+            other => panic!("expected the preserved text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancelled_turn_with_an_empty_open_text_block_keeps_nothing() {
+        // A cancel before any text arrived leaves an EMPTY open text block — there's
+        // nothing the user saw, so finish() keeps no block (and still doesn't error).
+        let mut b = TurnBuilder::new();
+        b.process(r#"{"type":"content_block_start","content_block":{"type":"text","text":""}}"#)
+            .unwrap();
+        b.mark_cancelled();
+        let result = b.finish().expect("a cancelled turn finalizes");
+        assert_eq!(result.stop_reason, "cancelled");
+        assert!(
+            result.content.is_empty(),
+            "an empty open text block contributes no content"
+        );
+    }
+
+    #[test]
+    fn cancelled_turn_with_open_tool_block_drops_the_partial_call() {
+        // A half-built tool call has no valid `input` to act on, so a cancel mid-tool
+        // drops it rather than emitting an incomplete (and unactionable) call.
+        let mut b = TurnBuilder::new();
+        b.process(
+            r#"{"type":"content_block_start","content_block":{"type":"tool_use","id":"t","name":"n"}}"#,
+        )
+        .unwrap();
+        b.process(
+            r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"pa"}}"#,
+        )
+        .unwrap();
+        b.mark_cancelled();
+        let result = b.finish().expect("a cancelled turn finalizes");
+        assert_eq!(result.stop_reason, "cancelled");
+        assert!(
+            result.content.is_empty(),
+            "a partial tool call is dropped on cancel"
+        );
     }
 
     #[test]

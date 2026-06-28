@@ -49,6 +49,7 @@ pub enum Block {
 
 /// An Anthropic-shaped chat message. (Was `crate::llm::ChatMessage`.)
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
 pub struct ChatMessage {
     pub role: String,
     pub content: Vec<Block>,

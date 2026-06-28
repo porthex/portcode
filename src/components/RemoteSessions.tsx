@@ -23,12 +23,16 @@ export function RemoteSessions() {
     void openRemoteSession(id);
   };
 
+  // newSession() no-ops while streaming (switching activeId mid-turn would strand
+  // the live run). Disable the CTAs so the guard is visible, not silent.
+  const createDisabled = creatingSession || streaming;
+
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-bg text-fg">
       <ConnectedBanner />
 
       {sessions.length === 0 ? (
-        <EmptyState onNew={() => void newSession()} creating={creatingSession} />
+        <EmptyState onNew={() => void newSession()} creating={createDisabled} />
       ) : (
         <>
           <div className="px-5 pb-2 pt-[18px]">
@@ -53,8 +57,8 @@ export function RemoteSessions() {
           <div className="border-t border-[#141a29] px-4 py-3">
             <button
               onClick={() => void newSession()}
-              disabled={creatingSession}
-              title={creatingSession ? "Creating a session…" : undefined}
+              disabled={createDisabled}
+              title={createDisabled ? "Creating a session…" : undefined}
               className="flex h-[50px] w-full items-center justify-center gap-2 rounded-[13px] border border-accent-2/30 bg-accent-2/[0.07] font-display text-[14px] font-semibold tracking-[0.4px] text-accent-2 transition hover:bg-accent-2/[0.14] hover:shadow-glow-cyan disabled:opacity-40"
             >
               <span className="-mt-0.5 text-[17px] leading-none">+</span> New session on desktop
@@ -124,7 +128,7 @@ function SessionCard({
         {running ? (
           <span className="flex shrink-0 items-center gap-1.5 font-mono text-[10px] tracking-[1px] text-success">
             <span
-              className="h-[5px] w-[5px] rounded-full bg-success shadow-[0_0_7px_#34ff9e] motion-safe:animate-[pcDot_1.4s_ease-in-out_infinite]"
+              className="h-[5px] w-[5px] rounded-full bg-success shadow-[0_0_7px_#34ff9e] motion-safe:animate-[pc-dot_1.4s_ease-in-out_infinite]"
               aria-hidden="true"
             />
             RUNNING

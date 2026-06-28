@@ -215,7 +215,7 @@ input[type="radio"]:not(:disabled) {
 /* =========================================================================
    MOTION
    ========================================================================= */
-@keyframes pcGlow {
+@keyframes pc-glow {
   0%,
   100% {
     opacity: 0.55;
@@ -224,7 +224,7 @@ input[type="radio"]:not(:disabled) {
     opacity: 1;
   }
 }
-@keyframes pcBlink {
+@keyframes pc-blink {
   0%,
   100% {
     opacity: 1;
@@ -233,7 +233,7 @@ input[type="radio"]:not(:disabled) {
     opacity: 0;
   }
 }
-@keyframes pcDot {
+@keyframes pc-dot {
   0%,
   80%,
   100% {
@@ -245,7 +245,7 @@ input[type="radio"]:not(:disabled) {
     opacity: 1;
   }
 }
-@keyframes pcRing {
+@keyframes pc-ring {
   0% {
     box-shadow: 0 0 0 0 rgba(52, 255, 158, 0.55);
   }
@@ -253,7 +253,7 @@ input[type="radio"]:not(:disabled) {
     box-shadow: 0 0 0 5px rgba(52, 255, 158, 0);
   }
 }
-@keyframes pcSweep {
+@keyframes pc-sweep {
   0% {
     transform: translateX(-130%);
   }
@@ -261,7 +261,7 @@ input[type="radio"]:not(:disabled) {
     transform: translateX(130%);
   }
 }
-@keyframes pcBorder {
+@keyframes pc-border {
   0% {
     background-position: 0% 50%;
   }
@@ -269,7 +269,7 @@ input[type="radio"]:not(:disabled) {
     background-position: 300% 50%;
   }
 }
-@keyframes pcRise {
+@keyframes pc-rise {
   0% {
     opacity: 0;
     transform: translateY(6px);
@@ -279,7 +279,7 @@ input[type="radio"]:not(:disabled) {
     transform: translateY(0);
   }
 }
-@keyframes pcGlitch {
+@keyframes pc-glitch {
   0%,
   90%,
   100% {
@@ -309,7 +309,7 @@ input[type="radio"]:not(:disabled) {
     clip-path: inset(0 0 0 0);
   }
 }
-@keyframes pcScan {
+@keyframes pc-scan {
   0% {
     transform: translateY(-12vh);
   }
@@ -335,7 +335,7 @@ input[type="radio"]:not(:disabled) {
     transform: translateY(0);
   }
 }
-@keyframes pcFlash {
+@keyframes pc-flash {
   0% {
     box-shadow: 0 0 0 0 rgba(52, 255, 158, 0);
   }
@@ -349,7 +349,7 @@ input[type="radio"]:not(:disabled) {
 /* Sort/Group popover entrance — a quick fade + tiny scale/translate from the
    anchoring toolbar. Geometry (scale/translate), so neutralized under
    prefers-reduced-motion below. */
-@keyframes pcPop {
+@keyframes pc-pop {
   from {
     opacity: 0;
     transform: scale(0.96) translateY(-3px);
@@ -361,7 +361,7 @@ input[type="radio"]:not(:disabled) {
 }
 /* Soft cross-fade for the sessions sidebar's panel↔rail swap (the width morph is
    a Tailwind transition on the wrapper; this fades the swapped content in). */
-@keyframes pcFadeIn {
+@keyframes pc-fade-in {
   from {
     opacity: 0;
   }
@@ -370,7 +370,7 @@ input[type="radio"]:not(:disabled) {
   }
 }
 .pc-fade-in {
-  animation: pcFadeIn 0.2s ease both;
+  animation: pc-fade-in 0.2s ease both;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -387,7 +387,7 @@ input[type="radio"]:not(:disabled) {
   .pc-sweep {
     animation: none !important;
   }
-  /* pcRise-based enters slide-up (geometry) — neutralize them. Base rules
+  /* pc-rise-based enters slide-up (geometry) — neutralize them. Base rules
      declare no opacity, so each element renders fully visible without motion. */
   .pc-modal,
   .pc-palette {
@@ -412,7 +412,7 @@ input[type="radio"]:not(:disabled) {
     animation: none !important;
   }
   /* The Sort/Group popover and the right-click context menu both scale+translate
-     in (pcPop geometry). Their base rules set no resting opacity/transform, so
+     in (pc-pop geometry). Their base rules set no resting opacity/transform, so
      removing the animation renders them in place, fully visible. */
   .pc-pop,
   .pc-ctx {
@@ -461,7 +461,7 @@ input[type="radio"]:not(:disabled) {
     rgba(33, 230, 255, 0.07),
     rgba(33, 230, 255, 0)
   );
-  animation: pcScan 7s linear infinite;
+  animation: pc-scan 7s linear infinite;
 }
 
 /* =========================================================================
@@ -482,7 +482,7 @@ input[type="radio"]:not(:disabled) {
 .pc-wordmark--glitch {
   display: inline-block;
   position: relative;
-  animation: pcGlitch 5s steps(1) infinite;
+  animation: pc-glitch 5s steps(1) infinite;
 }
 .pc-eyebrow-mono {
   font-family: var(--font-mono);
@@ -620,9 +620,9 @@ input[type="radio"]:not(:disabled) {
 }
 
 /* One-shot success-accent pulse for Settings Save / Copy confirmations
-   (pcFlash box-shadow; neutralized under prefers-reduced-motion). */
+   (pc-flash box-shadow; neutralized under prefers-reduced-motion). */
 .pc-flash {
-  animation: pcFlash 360ms ease-out;
+  animation: pc-flash 360ms ease-out;
 }
 
 /* =========================================================================
@@ -669,7 +669,7 @@ input[type="radio"]:not(:disabled) {
   height: 6px;
   border-radius: 50%;
   flex-shrink: 0;
-  animation: pcGlow 1.8s ease-in-out infinite;
+  animation: pc-glow 1.8s ease-in-out infinite;
 }
 .pc-dot--accent {
   background: var(--color-accent);
@@ -694,7 +694,7 @@ input[type="radio"]:not(:disabled) {
 .pc-dot--ring {
   background: var(--color-success);
   box-shadow: 0 0 8px var(--color-success);
-  animation: pcRing 2.6s ease-out infinite;
+  animation: pc-ring 2.6s ease-out infinite;
 }
 
 /* =========================================================================
@@ -920,7 +920,7 @@ input[type="radio"]:not(:disabled) {
   vertical-align: text-bottom;
   background: var(--color-accent);
   box-shadow: 0 0 8px var(--color-accent);
-  animation: pcBlink 1s step-end infinite;
+  animation: pc-blink 1s step-end infinite;
 }
 /* The still-decoding tail of a streaming word (see useScramble): the flickering
    glyphs glow in the accent until they resolve into the real characters. */
@@ -928,19 +928,19 @@ input[type="radio"]:not(:disabled) {
   color: var(--color-accent-hi);
   text-shadow: 0 0 6px var(--color-accent);
 }
-/* New message rows ease in once on mount (reused pcRise keyframe). The global
-   reduced-motion block does NOT cover pcRise, so an explicit guard above
+/* New message rows ease in once on mount (reused pc-rise keyframe). The global
+   reduced-motion block does NOT cover pc-rise, so an explicit guard above
    neutralizes this under prefers-reduced-motion. */
 .pc-msg-enter {
-  animation: pcRise 0.18s ease both;
+  animation: pc-rise 0.18s ease both;
 }
 
 /* The scroll-to-latest FAB is conditionally mounted (no prior opacity-0 state for
-   transition-opacity to interpolate from), so give it the same pcRise entrance as
+   transition-opacity to interpolate from), so give it the same pc-rise entrance as
    message rows rather than letting it snap in. Neutralized under reduced motion via
    the guard above. */
 .pc-fab-enter {
-  animation: pcRise 0.18s ease both;
+  animation: pc-rise 0.18s ease both;
 }
 
 /* =========================================================================
@@ -949,9 +949,9 @@ input[type="radio"]:not(:disabled) {
 .pc-gate {
   border-top: 1px solid rgba(255, 176, 46, 0.4);
   background: rgba(255, 176, 46, 0.07);
-  /* Eases in once when the permission banner mounts (reused pcRise keyframe;
+  /* Eases in once when the permission banner mounts (reused pc-rise keyframe;
      neutralized under prefers-reduced-motion). */
-  animation: pcRise 0.18s ease both;
+  animation: pc-rise 0.18s ease both;
 }
 .pc-gate__icon {
   display: flex;
@@ -989,7 +989,7 @@ input[type="radio"]:not(:disabled) {
   box-shadow:
     0 0 60px rgba(255, 46, 126, 0.2),
     0 0 0 1px rgba(33, 230, 255, 0.1);
-  animation: pcRise 0.18s ease both;
+  animation: pc-rise 0.18s ease both;
 }
 .pc-modal {
   width: 560px;
@@ -1001,11 +1001,11 @@ input[type="radio"]:not(:disabled) {
   box-shadow:
     0 0 60px rgba(33, 230, 255, 0.14),
     0 0 0 1px rgba(255, 46, 126, 0.08);
-  animation: pcRise 0.18s ease both;
+  animation: pc-rise 0.18s ease both;
 }
 .pc-sweep {
   height: 2px;
-  animation: pcSweep 2.2s linear infinite;
+  animation: pc-sweep 2.2s linear infinite;
 }
 .pc-sweep--cyan {
   background: linear-gradient(90deg, transparent, var(--color-accent-2), transparent);
@@ -1108,7 +1108,7 @@ input[type="radio"]:not(:disabled) {
   box-shadow:
     0 12px 30px rgba(0, 0, 0, 0.55),
     0 0 0 1px rgba(0, 0, 0, 0.35);
-  animation: pcPop 0.14s ease both;
+  animation: pc-pop 0.14s ease both;
 }
 .pc-pop__item {
   display: flex;
@@ -1144,7 +1144,7 @@ input[type="radio"]:not(:disabled) {
 
 /* =========================================================================
    CONTEXT MENU — right-click popover (sibling of .pc-pop, portaled to <body>)
-   A dark panel that fades/scales in at the cursor (reuses pcPop, neutralized
+   A dark panel that fades/scales in at the cursor (reuses pc-pop, neutralized
    under prefers-reduced-motion via the .pc-pop guard above which also lists
    .pc-ctx). Items light cyan on hover; DESTRUCTIVE items light danger; disabled
    items dim out and stop pointer events. Leading icon column + an optional
@@ -1162,7 +1162,7 @@ input[type="radio"]:not(:disabled) {
   box-shadow:
     0 12px 30px rgba(0, 0, 0, 0.55),
     0 0 0 1px rgba(0, 0, 0, 0.35);
-  animation: pcPop 0.14s ease both;
+  animation: pc-pop 0.14s ease both;
 }
 .pc-ctx__item {
   display: flex;
@@ -1428,7 +1428,7 @@ input[type="radio"]:not(:disabled) {
   box-shadow: 0 0 22px rgba(33, 230, 255, 0.1);
 }
 .pc-neon-frame[data-busy="true"] {
-  animation: pcBorder 6s linear infinite;
+  animation: pc-border 6s linear infinite;
 }
 
 .pc-send {
@@ -1498,7 +1498,7 @@ input[type="radio"]:not(:disabled) {
 
 /* Armed cue (motor anticipation): a one-shot pulse the moment Send becomes fireable
    (disabled→enabled). Geometry, so neutralized under prefers-reduced-motion. */
-@keyframes pcArm {
+@keyframes pc-arm {
   0% {
     transform: scale(1);
     box-shadow: 0 0 16px rgba(255, 46, 126, 0.45);
@@ -1513,7 +1513,7 @@ input[type="radio"]:not(:disabled) {
   }
 }
 .pc-armed {
-  animation: pcArm 0.3s ease-out;
+  animation: pc-arm 0.3s ease-out;
 }
 
 .pc-stop {
@@ -1832,9 +1832,9 @@ html.pc-scanning #root {
    rail would eat the narrow viewport). Desktop keeps the inline sidebar.
    ========================================================================= */
 .pc-drawer {
-  animation: pcDrawerIn 0.18s ease-out;
+  animation: pc-drawer-in 0.18s ease-out;
 }
-@keyframes pcDrawerIn {
+@keyframes pc-drawer-in {
   from {
     transform: translateX(-100%);
   }

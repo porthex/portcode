@@ -318,6 +318,12 @@ fn compute_edit(
     replace_all: bool,
     p: &str,
 ) -> Result<(String, usize), String> {
+    // An empty `old_string` is degenerate: `str::matches("")` yields a match at
+    // every char boundary, so with `replace_all` it would splice `new` between
+    // every character and effectively rewrite the whole file. Reject it up front.
+    if old.is_empty() {
+        return Err(format!("'old_string' must not be empty when editing {p}"));
+    }
     let count = content.matches(old).count();
     if count == 0 {
         return Err(format!("'old_string' not found in {p}"));
@@ -585,7 +591,12 @@ impl Tool for FsWrite {
         let content = str_arg(input, "content").ok()?;
         let full = resolve_for_write(&base, p).ok()?;
         let old = if full.exists() {
-            tokio::fs::read_to_string(&full).await.unwrap_or_default()
+            // If the target exists but can't be read (binary / non-UTF-8 / locked),
+            // return None rather than diffing against "" — an empty `old` would make
+            // an unreadable OVERWRITE look like a brand-new file in the prompt, hiding
+            // that real content is being destroyed. No preview ⇒ the gate falls back
+            // to the one-line summary, which is honest.
+            tokio::fs::read_to_string(&full).await.ok()?
         } else {
             String::new()
         };
@@ -1094,6 +1105,13 @@ mod tests {
         assert_eq!((out.as_str(), n), ("X X", 2));
         assert!(compute_edit("abc", "z", "X", false, "f").is_err()); // not found
         assert!(compute_edit("a a", "a", "X", false, "f").is_err()); // ambiguous
+
+        // An empty `old_string` is rejected before any matching/replacing, so
+        // `replace_all` can't splice `new` between every char and rewrite the file.
+        let err = compute_edit("abc", "", "X", true, "f").unwrap_err();
+        assert!(err.contains("must not be empty"), "got: {err}");
+        // The file content must be reported untouched (no replacement happened).
+        assert!(compute_edit("abc", "", "X", false, "f").is_err());
     }
 
     #[tokio::test]
@@ -1111,6 +1129,29 @@ mod tests {
         assert!(diff.contains("+new line"));
         // The preview must NOT touch the file.
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "old line\n");
+
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_write_preview_returns_none_for_an_unreadable_existing_file() {
+        // An EXISTING target that can't be read as UTF-8 (here: raw non-UTF-8 bytes)
+        // must NOT preview a diff against "" — that would make a destructive overwrite
+        // look like a new-file create. preview() returns None so the gate falls back
+        // to the honest one-line summary.
+        let workspace = unique_temp_dir("preview_unreadable");
+        let ctx = ToolCtx::new(workspace.clone());
+        let file = workspace.join("blob.bin");
+        // Invalid UTF-8 (a lone 0xFF byte) — read_to_string fails on this.
+        std::fs::write(&file, [0xFF, 0xFE, 0x00, 0x80]).unwrap();
+
+        let preview = FsWrite
+            .preview(&json!({ "path": "blob.bin", "content": "new text" }), &ctx)
+            .await;
+        assert!(
+            preview.is_none(),
+            "an unreadable existing file must not diff against empty: {preview:?}"
+        );
 
         std::fs::remove_dir_all(&workspace).ok();
     }

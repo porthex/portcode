@@ -264,9 +264,12 @@ impl Db {
             );",
         )?;
         // Migrate pre-existing databases: the CREATE-IF-NOT-EXISTS above won't add
-        // a column to a table that already exists, so add `model` in place. A
-        // duplicate-column error (column already present) is expected and ignored.
-        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT", []);
+        // a column to a table that already exists, so add `model` in place. Probe
+        // `PRAGMA table_info(sessions)` first and only ALTER when the column is
+        // absent — `let _ = conn.execute(...)` would have swallowed EVERY error
+        // (disk failure, corruption, a locked table) under the guise of the benign
+        // "duplicate column name", silently leaving the schema un-migrated.
+        Self::migrate_add_model(&conn)?;
         // ADDITIVE migration: a `paired_devices` table created before the
         // device-trust gate landed has no `confirmed` column. Add it without
         // dropping the table, defaulting every pre-existing row to 0 (untrusted).
@@ -280,6 +283,24 @@ impl Db {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Idempotently add the `model` column to a legacy `sessions` table. No-op when
+    /// the column already exists (fresh DBs create it inline). Probing
+    /// `PRAGMA table_info` first lets us reserve `?`-propagation for REAL failures
+    /// rather than blanket-swallowing them the way `let _ = ALTER …` did — a
+    /// disk/corruption/lock error now surfaces instead of masquerading as the
+    /// benign "duplicate column name".
+    fn migrate_add_model(conn: &Connection) -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+        let has_model = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(|c| c.ok())
+            .any(|name| name == "model");
+        if !has_model {
+            conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT", [])?;
+        }
+        Ok(())
     }
 
     /// Idempotently add the `confirmed` column to a legacy `paired_devices`
@@ -300,24 +321,38 @@ impl Db {
     }
 
     pub fn list_sessions(&self) -> rusqlite::Result<Vec<SessionRow>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, title, workspace, model, created_at, updated_at
-             FROM sessions ORDER BY updated_at DESC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            let workspace: Option<String> = r.get(2)?;
-            Ok(SessionRow {
-                id: r.get(0)?,
-                title: r.get(1)?,
-                branch: git_branch(workspace.as_deref()),
-                workspace,
-                model: r.get(3)?,
-                created_at: r.get(4)?,
-                updated_at: r.get(5)?,
+        // Collect the raw rows under the lock, then DROP it before computing
+        // `git_branch` — that does filesystem + git I/O (reading `.git/HEAD`), which
+        // must not run while the single `self.conn` mutex is held, or every other DB
+        // op blocks behind a per-session disk read. `branch` is filled in afterward.
+        let raw: Vec<SessionRow> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, title, workspace, model, created_at, updated_at
+                 FROM sessions ORDER BY updated_at DESC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(SessionRow {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    // Filled in after the lock is dropped (no I/O under the mutex).
+                    branch: None,
+                    workspace: r.get(2)?,
+                    model: r.get(3)?,
+                    created_at: r.get(4)?,
+                    updated_at: r.get(5)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        // Lock released. Now resolve each session's git branch off the workspace.
+        Ok(raw
+            .into_iter()
+            .map(|mut s| {
+                s.branch = git_branch(s.workspace.as_deref());
+                s
             })
-        })?;
-        rows.collect()
+            .collect())
     }
 
     pub fn create_session(
@@ -1270,6 +1305,44 @@ mod tests {
 
         // Idempotent: a second migration is a no-op, not a "duplicate column" error.
         Db::migrate_add_confirmed(&conn).unwrap();
+    }
+
+    #[test]
+    fn migrate_add_model_is_additive_and_idempotent_on_a_legacy_sessions_table() {
+        // Simulate a PRE-MIGRATION database: the old `sessions` schema with no
+        // `model` column, holding a row created before per-session-model landed.
+        let conn = Connection::open(Path::new(":memory:")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO sessions (id, title, workspace, created_at, updated_at)
+            VALUES ('legacy', 'Old Session', NULL, 100, 100);",
+        )
+        .unwrap();
+
+        // Migrating ADDS the column (not drops the table); the legacy row survives
+        // with a NULL model (the call site falls back to the global default).
+        Db::migrate_add_model(&conn).unwrap();
+        let model: Option<String> = conn
+            .query_row("SELECT model FROM sessions WHERE id = 'legacy'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(model, None, "legacy rows migrate with a NULL model");
+        let title: String = conn
+            .query_row("SELECT title FROM sessions WHERE id = 'legacy'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "Old Session");
+
+        // Idempotent: re-running is a no-op, not a "duplicate column" error.
+        Db::migrate_add_model(&conn).unwrap();
     }
 
     #[test]

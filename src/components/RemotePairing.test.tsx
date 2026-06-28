@@ -86,8 +86,9 @@ describe("RemotePairing — pair panel", () => {
     expect(codeBox()).toBeInTheDocument();
     // No camera scanner in the preview/desktop host — paste is the only path.
     expect(screen.queryByRole("button", { name: "Scan QR code" })).not.toBeInTheDocument();
-    // …and no upload affordance either (no camera backend at all).
-    expect(screen.queryByRole("button", { name: /Upload a photo/ })).not.toBeInTheDocument();
+    // Upload affordance IS present even with no live camera: a still photo of the
+    // QR can always be decoded regardless of camera availability (fix #1).
+    expect(uploadBtn()).toBeInTheDocument();
   });
 
   it("autofocuses the paste field on mount (no camera)", () => {
@@ -497,6 +498,51 @@ describe("RemotePairing — camera scan (web client)", () => {
   });
 });
 
+describe("RemotePairing — unmount cleanup", () => {
+  it("aborts an in-flight web scan when the component unmounts (no camera leak)", async () => {
+    // Web backend so the AbortController path is taken.
+    m.isTauri.mockReturnValue(false);
+    p.isMobilePlatform.mockReturnValue(false);
+    w.isWebCameraAvailable.mockReturnValue(true);
+
+    let capturedSignal!: AbortSignal;
+    w.scanWithCamera.mockImplementation((opts) => {
+      capturedSignal = opts.signal!;
+      return new Promise<webScanner.WebScanOutcome>(() => {}); // never resolves
+    });
+
+    const { unmount } = render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(scanBtn());
+      await Promise.resolve();
+    });
+
+    expect(capturedSignal.aborted).toBe(false);
+    unmount();
+    expect(capturedSignal.aborted).toBe(true);
+  });
+
+  it("calls cancelScan on unmount when a native scan is in flight", async () => {
+    // Native backend (Tauri + mobile).
+    m.isTauri.mockReturnValue(true);
+    p.isMobilePlatform.mockReturnValue(true);
+    s.scanQrPayload.mockReturnValue(new Promise<scanner.ScanOutcome>(() => {}));
+
+    const { unmount } = render(<RemotePairing />);
+
+    await act(async () => {
+      fireEvent.click(scanBtn());
+      await Promise.resolve();
+    });
+
+    expect(s.cancelScan).not.toHaveBeenCalled();
+    unmount();
+    // cancelScan is fire-and-forget in the cleanup; assert it was called.
+    expect(s.cancelScan).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("RemotePairing — photo-upload fallback (web client)", () => {
   beforeEach(() => {
     m.isTauri.mockReturnValue(false);
@@ -513,6 +559,15 @@ describe("RemotePairing — photo-upload fallback (web client)", () => {
     expect(input).toBeInTheDocument();
     expect(input.accept).toBe("image/*");
     expect(input.getAttribute("capture")).toBe("environment");
+  });
+
+  it("also offers the upload affordance when scanMode=none (no live camera at all)", () => {
+    // Override: no live camera backend on this host.
+    w.isWebCameraAvailable.mockReturnValue(false);
+    render(<RemotePairing />);
+    // The live-scan button is absent, but the photo-upload fallback IS present.
+    expect(screen.queryByRole("button", { name: "Scan QR code" })).not.toBeInTheDocument();
+    expect(uploadBtn()).toBeInTheDocument();
   });
 
   it("decodes an uploaded photo and dials the payload", async () => {

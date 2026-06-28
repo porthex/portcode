@@ -157,6 +157,16 @@ impl CommandHandler for DesktopCommandHandler {
                 }
                 Ok(())
             }
+            // The web client registers its Web Push subscription so the desktop can
+            // wake a backgrounded PWA. There is no push-send backend (VAPID signer /
+            // subscription store) wired yet, so accept the command — keeping the
+            // command channel from breaking on this variant — and log it. Persisting
+            // + actually sending pushes is a separate feature; wire it here when the
+            // backend lands. The keys are intentionally NOT logged (they are secrets).
+            RemoteCommand::RegisterPush { .. } => {
+                eprintln!("phone-sync: register_push received (push send not yet wired)");
+                Ok(())
+            }
         }
     }
 }

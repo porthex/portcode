@@ -478,26 +478,31 @@ fn resolve_permission(state: State<AppState>, id: String, decision: String) {
 ///
 /// The whole pipeline stays inert by default: no DSN ⇒ the SDK is never initialized
 /// on either platform, so this command is a pure flag write with no telemetry effect.
+///
+/// Returns `Err` when the on-disk flag could not be located/written, so an opt-OUT
+/// that did NOT actually take effect surfaces to the caller instead of reporting
+/// success. (The frontend swallows the rejection but keeps the host gate
+/// authoritative; the point is to never claim a write succeeded when it didn't.)
 #[tauri::command]
-fn telemetry_set_consent(app: AppHandle, enabled: bool) {
+fn telemetry_set_consent(app: AppHandle, enabled: bool) -> Result<(), String> {
     #[cfg(desktop)]
     {
         let _ = &app; // desktop resolves the path without an AppHandle
         telemetry::set_consent(enabled);
+        Ok(())
     }
     #[cfg(mobile)]
     {
         // On Android `dirs::config_dir()` does NOT reliably point at the app sandbox,
         // so resolve the app-private config dir from Tauri (it IS inside the sandbox)
-        // and write the flag there. Falls back to the temp dir if unavailable — a
-        // best-effort write whose failure mode is the privacy-safe one (flag absent ⇒
-        // Kotlin reads consent OFF ⇒ SDK never inits). See `consent.rs` /
-        // `PortcodeApplication.kt` for the exact path agreement + device-verify note.
-        let dir = app
-            .path()
-            .app_config_dir()
-            .unwrap_or_else(|_| std::env::temp_dir());
+        // and write the flag there. If that path can't be resolved we MUST NOT fall
+        // back to the temp dir: writing the flag somewhere Kotlin never reads would
+        // leave the REAL consent file unchanged, so an opt-out would silently fail to
+        // disable crash reporting while reporting success. Return Err instead. See
+        // `consent.rs` / `PortcodeApplication.kt` for the path agreement.
+        let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
         consent::set_consent_in(&dir, enabled);
+        Ok(())
     }
 }
 
