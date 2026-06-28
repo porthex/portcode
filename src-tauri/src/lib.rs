@@ -15,6 +15,10 @@ mod settings;
 mod sync;
 #[cfg(desktop)]
 mod tools;
+// Auto-updater command surface (desktop only — the phone is a remote client and
+// never self-updates). The whole module is `#![cfg(desktop)]` internally too.
+#[cfg(desktop)]
+mod update;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -94,6 +98,9 @@ fn save_settings(state: State<AppState>, settings: Value) -> Settings {
         }
         if let Some(t) = settings.get("typingAnimation").and_then(|v| v.as_bool()) {
             s.typing_animation = t;
+        }
+        if let Some(b) = settings.get("autoUpdate").and_then(|v| v.as_bool()) {
+            s.auto_update = b;
         }
         s.save(&state.config_dir);
     }
@@ -1029,7 +1036,12 @@ pub fn run() {
         phone_sync_send_command,
         phone_sync_disconnect,
         confirm_pairing,
-        reject_pairing
+        reject_pairing,
+        // Auto-updater surface (desktop-only; phone never self-updates).
+        update::update_check,
+        update::update_download_and_install,
+        update::update_relaunch,
+        update::update_channel
     ]);
 
     // MOBILE — the remote-CLIENT subset. Shared settings/secrets/sessions +

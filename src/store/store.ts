@@ -13,11 +13,31 @@ import type {
   Settings,
   StreamEvent,
   SyncFrame,
+  UpdateChannel,
+  UpdateInfo,
   Usage,
 } from "../types";
 import { DEFAULT_SETTINGS } from "../types";
 import * as ipc from "../lib/ipc";
 import { isMobilePlatform } from "../lib/platform";
+
+/**
+ * In-app auto-update state, driving the {@link UpdateBanner}.
+ * - `idle`       — no update offered (or the banner was dismissed).
+ * - `available`  — an update exists; awaiting the user's Install (autoUpdate off).
+ * - `downloading`— downloading + staging the update; `progress` is a 0–100 percent
+ *                  (null = indeterminate, the server reported no total).
+ * - `ready`      — downloaded + staged; awaiting a relaunch.
+ * - `error`      — the check/download failed; `error` carries the message.
+ */
+export interface UpdateState {
+  phase: "idle" | "available" | "downloading" | "ready" | "error";
+  info: UpdateInfo | null;
+  progress: number | null;
+  error: string | null;
+}
+
+const IDLE_UPDATE: UpdateState = { phase: "idle", info: null, progress: null, error: null };
 
 interface AppState {
   sessions: Session[];
@@ -64,6 +84,10 @@ interface AppState {
   remoteConnecting: boolean; // a connectRemote dial is in flight (private re-entry guard)
   lastPairingQr: string | null; // last successful pairing payload, kept for one-tap reconnect
 
+  // ── Auto-update (desktop only) ────────────────────────────────────────────────
+  update: UpdateState; // in-app update flow state, drives the UpdateBanner
+  updateChannel: UpdateChannel; // which release feed this build follows
+
   init: () => Promise<void>;
   retryInit: () => Promise<void>;
   retryLoad: (id: string) => Promise<void>;
@@ -101,6 +125,16 @@ interface AppState {
   sendRemoteCommand: (command: RemoteCommand) => Promise<void>;
   disconnectRemote: () => Promise<void>;
   reconnectRemote: () => Promise<void>;
+
+  // ── Auto-update ───────────────────────────────────────────────────────────────
+  checkForUpdate: () => Promise<void>;
+  startUpdateDownload: () => Promise<void>;
+  applyUpdateProgress: (downloaded: number, total: number | null) => void;
+  markUpdateReady: () => void;
+  relaunchForUpdate: () => Promise<void>;
+  setAutoUpdate: (enabled: boolean) => Promise<void>;
+  loadUpdateChannel: () => Promise<void>;
+  dismissUpdateBanner: () => void;
 }
 
 const now = () => Date.now();
@@ -222,6 +256,11 @@ export const useStore = create<AppState>((set, get) => ({
   // Remembered across launches so the phone can reconnect without re-scanning the
   // QR (Android frequently kills backgrounded apps). Public payload — no secret.
   lastPairingQr: readStr("pc.lastPairingQr"),
+
+  // Auto-update: starts idle (no banner) on the stable channel; App.tsx kicks off a
+  // check + channel load on a desktop mount.
+  update: IDLE_UPDATE,
+  updateChannel: "stable",
 
   async init() {
     // The phone/remote client has no local sessions DB or settings — its session
@@ -1082,6 +1121,90 @@ export const useStore = create<AppState>((set, get) => ({
     // re-authenticates the same static key the user already trusted at first
     // pairing, so no fresh SAS comparison is needed.
     await get().connectRemote(qr, true);
+  },
+
+  // ── Auto-update ───────────────────────────────────────────────────────────────
+  // Every action is defensive: the update commands are desktop-only, so on a
+  // phone/web client (or an older core that doesn't register them) the invoke
+  // rejects. We swallow into `error` rather than throw, so a missing command never
+  // crashes the app or surfaces an unhandled rejection (callers use `void`).
+
+  async checkForUpdate() {
+    try {
+      const info = await ipc.checkForUpdate();
+      if (!info) {
+        // Already up to date — keep (or return to) the idle, banner-less state.
+        set({ update: IDLE_UPDATE });
+        return;
+      }
+      set((st) => ({ update: { ...st.update, info, error: null } }));
+      // Auto-update on → fetch + stage immediately (the banner then narrates the
+      // download). Off → just offer it and let the user press Install.
+      if (get().settings.autoUpdate) {
+        await get().startUpdateDownload();
+      } else {
+        set((st) => ({ update: { ...st.update, phase: "available", progress: null } }));
+      }
+    } catch (err) {
+      set((st) => ({ update: { ...st.update, phase: "error", error: errMessage(err) } }));
+    }
+  },
+
+  async startUpdateDownload() {
+    set((st) => ({ update: { ...st.update, phase: "downloading", progress: 0, error: null } }));
+    try {
+      await ipc.downloadAndInstallUpdate();
+      // Resolves once downloaded AND staged. The `updater://finished` event also
+      // marks ready (whichever lands first); both converge on the same state.
+      set((st) => ({ update: { ...st.update, phase: "ready", progress: 100 } }));
+    } catch (err) {
+      set((st) => ({ update: { ...st.update, phase: "error", error: errMessage(err) } }));
+    }
+  },
+
+  // Internal setter for the `updater://progress` event: turn raw byte counts into a
+  // 0–100 percent (null when the total is unknown → indeterminate bar).
+  applyUpdateProgress(downloaded, total) {
+    const progress = total ? Math.round((downloaded / total) * 100) : null;
+    set((st) => ({ update: { ...st.update, progress } }));
+  },
+
+  // Called on the `updater://finished` event — the download is staged.
+  markUpdateReady() {
+    set((st) => ({ update: { ...st.update, phase: "ready", progress: 100 } }));
+  },
+
+  async relaunchForUpdate() {
+    try {
+      await ipc.relaunchApp();
+      // On the desktop the process restarts, so this never returns; the catch only
+      // matters on a host where the command is unavailable.
+    } catch (err) {
+      set((st) => ({ update: { ...st.update, phase: "error", error: errMessage(err) } }));
+    }
+  },
+
+  async setAutoUpdate(enabled) {
+    await get().updateSettings({ autoUpdate: enabled });
+    // Turning it on while an update is already waiting should start the download
+    // now, matching the "auto" expectation (rather than leaving it parked).
+    if (enabled && get().update.phase === "available") {
+      await get().startUpdateDownload();
+    }
+  },
+
+  async loadUpdateChannel() {
+    try {
+      set({ updateChannel: await ipc.getUpdateChannel() });
+    } catch {
+      // Command unavailable (non-desktop / older core) — keep the default channel.
+    }
+  },
+
+  // Dismiss the banner ("Later"): drop back to idle but KEEP `info` so a later
+  // re-check / relaunch still knows which version was staged.
+  dismissUpdateBanner() {
+    set((st) => ({ update: { ...IDLE_UPDATE, info: st.update.info } }));
   },
 }));
 

@@ -11,6 +11,7 @@ import {
   type Session,
   type StreamEvent,
   type SyncFrame,
+  type UpdateInfo,
 } from "../types";
 import * as ipc from "../lib/ipc";
 import { useStore } from "./store";
@@ -43,6 +44,11 @@ vi.mock("../lib/ipc", () => ({
   onPhoneSyncPairingRequest: vi.fn(),
   confirmPairing: vi.fn(),
   rejectPairing: vi.fn(),
+  checkForUpdate: vi.fn(),
+  downloadAndInstallUpdate: vi.fn(),
+  relaunchApp: vi.fn(),
+  getUpdateChannel: vi.fn(),
+  onUpdaterEvent: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -95,6 +101,11 @@ beforeEach(() => {
   m.onPhoneSyncPairingRequest.mockResolvedValue(() => {});
   m.confirmPairing.mockResolvedValue(undefined);
   m.rejectPairing.mockResolvedValue(undefined);
+  m.checkForUpdate.mockResolvedValue(null);
+  m.downloadAndInstallUpdate.mockResolvedValue(undefined);
+  m.relaunchApp.mockResolvedValue(undefined);
+  m.getUpdateChannel.mockResolvedValue("stable");
+  m.onUpdaterEvent.mockResolvedValue(() => {});
 });
 
 describe("init", () => {
@@ -2012,6 +2023,228 @@ describe("remote client", () => {
 
       expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(1);
       expect(useStore.getState().remoteConnected).toBe(false);
+    });
+  });
+});
+
+describe("auto-update", () => {
+  const info = (over: Partial<UpdateInfo> = {}): UpdateInfo => ({
+    version: "5.1.0",
+    currentVersion: "5.0.0",
+    notes: "Bug fixes.",
+    date: "2026-06-28",
+    ...over,
+  });
+
+  describe("checkForUpdate", () => {
+    it("stays idle when the core reports no update (null)", async () => {
+      m.checkForUpdate.mockResolvedValue(null);
+      // Seed a non-idle phase to prove a null check resets the banner away.
+      useStore.setState({ update: { phase: "error", info: info(), progress: 50, error: "x" } });
+
+      await useStore.getState().checkForUpdate();
+
+      expect(m.checkForUpdate).toHaveBeenCalledTimes(1);
+      expect(useStore.getState().update).toEqual({
+        phase: "idle",
+        info: null,
+        progress: null,
+        error: null,
+      });
+    });
+
+    it("auto-downloads when an update exists and autoUpdate is on → ready", async () => {
+      m.checkForUpdate.mockResolvedValue(info());
+      m.downloadAndInstallUpdate.mockResolvedValue(undefined);
+      useStore.setState({ settings: { ...DEFAULT_SETTINGS, autoUpdate: true } });
+
+      await useStore.getState().checkForUpdate();
+
+      // autoUpdate on → it kicked the download, which resolved → ready @ 100%.
+      expect(m.downloadAndInstallUpdate).toHaveBeenCalledTimes(1);
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("ready");
+      expect(st.update.progress).toBe(100);
+      expect(st.update.info).toEqual(info());
+    });
+
+    it("only offers (phase available) when autoUpdate is off", async () => {
+      m.checkForUpdate.mockResolvedValue(info());
+      useStore.setState({ settings: { ...DEFAULT_SETTINGS, autoUpdate: false } });
+
+      await useStore.getState().checkForUpdate();
+
+      expect(m.downloadAndInstallUpdate).not.toHaveBeenCalled();
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("available");
+      expect(st.update.info).toEqual(info());
+    });
+
+    it("swallows a failing check into the error phase (never throws)", async () => {
+      m.checkForUpdate.mockRejectedValue(new Error("no updater here"));
+
+      await expect(useStore.getState().checkForUpdate()).resolves.toBeUndefined();
+
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("error");
+      expect(st.update.error).toBe("no updater here");
+    });
+  });
+
+  describe("startUpdateDownload", () => {
+    it("transitions to downloading then ready on success", async () => {
+      m.downloadAndInstallUpdate.mockResolvedValue(undefined);
+      useStore.setState({
+        update: { phase: "available", info: info(), progress: null, error: null },
+      });
+
+      await useStore.getState().startUpdateDownload();
+
+      expect(m.downloadAndInstallUpdate).toHaveBeenCalledTimes(1);
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("ready");
+      expect(st.update.progress).toBe(100);
+      // info is preserved across the download.
+      expect(st.update.info).toEqual(info());
+    });
+
+    it("records an error and message when the download rejects", async () => {
+      m.downloadAndInstallUpdate.mockRejectedValue(new Error("network down"));
+      useStore.setState({
+        update: { phase: "available", info: info(), progress: null, error: null },
+      });
+
+      await useStore.getState().startUpdateDownload();
+
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("error");
+      expect(st.update.error).toBe("network down");
+    });
+  });
+
+  describe("applyUpdateProgress", () => {
+    it("computes a rounded percent from downloaded/total", () => {
+      useStore.getState().applyUpdateProgress(50, 200);
+      expect(useStore.getState().update.progress).toBe(25);
+
+      // Rounds rather than truncates.
+      useStore.getState().applyUpdateProgress(1, 3);
+      expect(useStore.getState().update.progress).toBe(33);
+    });
+
+    it("yields null (indeterminate) when the total is null or zero", () => {
+      useStore.getState().applyUpdateProgress(10, null);
+      expect(useStore.getState().update.progress).toBeNull();
+
+      useStore.getState().applyUpdateProgress(10, 0);
+      expect(useStore.getState().update.progress).toBeNull();
+    });
+  });
+
+  describe("markUpdateReady", () => {
+    it("sets phase ready at 100% (driven by the finished event)", () => {
+      useStore.setState({
+        update: { phase: "downloading", info: info(), progress: 40, error: null },
+      });
+
+      useStore.getState().markUpdateReady();
+
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("ready");
+      expect(st.update.progress).toBe(100);
+      expect(st.update.info).toEqual(info());
+    });
+  });
+
+  describe("relaunchForUpdate", () => {
+    it("calls ipc.relaunchApp", async () => {
+      m.relaunchApp.mockResolvedValue(undefined);
+
+      await useStore.getState().relaunchForUpdate();
+
+      expect(m.relaunchApp).toHaveBeenCalledTimes(1);
+    });
+
+    it("surfaces an error if relaunch is unavailable", async () => {
+      m.relaunchApp.mockRejectedValue(new Error("no relaunch"));
+      useStore.setState({ update: { phase: "ready", info: info(), progress: 100, error: null } });
+
+      await expect(useStore.getState().relaunchForUpdate()).resolves.toBeUndefined();
+
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("error");
+      expect(st.update.error).toBe("no relaunch");
+    });
+  });
+
+  describe("setAutoUpdate", () => {
+    it("persists the preference via ipc.saveSettings", async () => {
+      useStore.setState({ settings: { ...DEFAULT_SETTINGS, autoUpdate: true } });
+
+      await useStore.getState().setAutoUpdate(false);
+
+      expect(m.saveSettings).toHaveBeenCalledWith({ autoUpdate: false });
+      expect(useStore.getState().settings.autoUpdate).toBe(false);
+    });
+
+    it("starts the download when enabled while an update is already available", async () => {
+      m.downloadAndInstallUpdate.mockResolvedValue(undefined);
+      useStore.setState({
+        settings: { ...DEFAULT_SETTINGS, autoUpdate: false },
+        update: { phase: "available", info: info(), progress: null, error: null },
+      });
+
+      await useStore.getState().setAutoUpdate(true);
+
+      expect(m.saveSettings).toHaveBeenCalledWith({ autoUpdate: true });
+      expect(m.downloadAndInstallUpdate).toHaveBeenCalledTimes(1);
+      expect(useStore.getState().update.phase).toBe("ready");
+    });
+
+    it("does not start a download when enabled but no update is waiting", async () => {
+      useStore.setState({
+        settings: { ...DEFAULT_SETTINGS, autoUpdate: false },
+        update: { phase: "idle", info: null, progress: null, error: null },
+      });
+
+      await useStore.getState().setAutoUpdate(true);
+
+      expect(m.downloadAndInstallUpdate).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("loadUpdateChannel", () => {
+    it("stores the channel reported by the core", async () => {
+      m.getUpdateChannel.mockResolvedValue("staging");
+
+      await useStore.getState().loadUpdateChannel();
+
+      expect(useStore.getState().updateChannel).toBe("staging");
+    });
+
+    it("keeps the default channel when the command is unavailable", async () => {
+      m.getUpdateChannel.mockRejectedValue(new Error("unknown command"));
+
+      await expect(useStore.getState().loadUpdateChannel()).resolves.toBeUndefined();
+
+      expect(useStore.getState().updateChannel).toBe("stable");
+    });
+  });
+
+  describe("dismissUpdateBanner", () => {
+    it("returns to idle but keeps the staged info", () => {
+      useStore.setState({
+        update: { phase: "ready", info: info(), progress: 100, error: null },
+      });
+
+      useStore.getState().dismissUpdateBanner();
+
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("idle");
+      expect(st.update.progress).toBeNull();
+      expect(st.update.error).toBeNull();
+      // info is preserved so a later relaunch/re-check still knows the version.
+      expect(st.update.info).toEqual(info());
     });
   });
 });

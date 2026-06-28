@@ -279,6 +279,19 @@ textarea:focus-visible {
     box-shadow: 0 0 0 0 rgba(52, 255, 158, 0);
   }
 }
+/* Indeterminate update-download bar: a short accent block sliding across the track
+   while the total byte count is unknown. */
+@keyframes pcShimmer {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(420%);
+  }
+}
+.pc-shimmer {
+  animation: pcShimmer 1.2s ease-in-out infinite;
+}
 
 @media (prefers-reduced-motion: reduce) {
   /* Reduced-motion: gate only large/ambient MOVEMENT. The digital rain
@@ -316,6 +329,11 @@ textarea:focus-visible {
     animation: none !important;
   }
   .pc-flash {
+    animation: none !important;
+  }
+  /* The indeterminate update bar slides geometry (translateX) — neutralize it so
+     it sits as a static accent block. */
+  .pc-shimmer {
     animation: none !important;
   }
 }

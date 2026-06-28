@@ -8,7 +8,8 @@ import { CommandPalette } from "./components/CommandPalette";
 import { StatusHud } from "./components/StatusHud";
 import { NeonRain } from "./components/NeonRain";
 import { RemotePairing } from "./components/RemotePairing";
-import { isTauri } from "./lib/ipc";
+import { UpdateBanner } from "./components/UpdateBanner";
+import { isTauri, onUpdaterEvent } from "./lib/ipc";
 
 export default function App() {
   const init = useStore((s) => s.init);
@@ -30,6 +31,44 @@ export default function App() {
   useEffect(() => {
     void init();
   }, [init]);
+
+  // Auto-update (desktop only). The updater commands/events don't exist on the
+  // phone/web client, so this whole effect is gated on isTauri() — it never runs
+  // (and so never throws) in the browser test/preview env. On the desktop it:
+  //   1. subscribes to the native updater progress/finished events,
+  //   2. learns which release channel this build follows (for the Settings hint),
+  //   3. checks for an update once on launch,
+  //   4. re-checks every 6 hours while the app stays open.
+  // The store actions it calls are all defensive (swallow a missing-command), and
+  // the listener + interval are torn down on unmount.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    const s = useStore.getState();
+
+    void onUpdaterEvent((e) => {
+      const store = useStore.getState();
+      if (e.kind === "progress") store.applyUpdateProgress(e.downloaded, e.total);
+      else store.markUpdateReady();
+    }).then((off) => {
+      // If the effect already cleaned up before the async subscribe resolved, drop
+      // the listener immediately so it can't leak.
+      if (cancelled) off();
+      else unlisten = off;
+    });
+
+    void s.loadUpdateChannel();
+    void s.checkForUpdate();
+    const SIX_HOURS = 6 * 60 * 60 * 1000;
+    const interval = setInterval(() => void useStore.getState().checkForUpdate(), SIX_HOURS);
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+      clearInterval(interval);
+    };
+  }, []);
 
   // Collapsing the file rail makes it inert, which blurs any focused tree row
   // and drops focus to <body> (Ctrl+B / the toggle both fire over a focused
@@ -145,6 +184,9 @@ export default function App() {
         <RemotePairing />
       ) : (
         <>
+          {/* In-app auto-update notice (desktop only in practice; self-gates on its
+              phase and renders nothing while idle). Sits above the other banners. */}
+          <UpdateBanner />
           {remoteMode && <RemoteBanner />}
           <div className="flex min-h-0 flex-1 overflow-hidden">
             {/* Desktop: the session list is an inline rail. On the phone that rail

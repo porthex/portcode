@@ -301,6 +301,55 @@ describe("Tauri command serialization", () => {
     expect(unlisten).toHaveBeenCalledTimes(1);
     expect(invoke).not.toHaveBeenCalledWith("cancel_agent", { sessionId: "sess-2" });
   });
+
+  it("auto-update commands invoke their core counterparts", async () => {
+    const { ipc, invoke } = await load();
+
+    const info = { version: "5.1.0", currentVersion: "5.0.0", notes: "notes", date: null };
+    invoke.mockResolvedValue(info);
+    await expect(ipc.checkForUpdate()).resolves.toBe(info);
+    expect(invoke).toHaveBeenCalledWith("update_check");
+
+    invoke.mockResolvedValue(undefined);
+    await expect(ipc.downloadAndInstallUpdate()).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("update_download_and_install");
+
+    await expect(ipc.relaunchApp()).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("update_relaunch");
+
+    invoke.mockResolvedValue("staging");
+    await expect(ipc.getUpdateChannel()).resolves.toBe("staging");
+    expect(invoke).toHaveBeenCalledWith("update_channel");
+  });
+
+  it("onUpdaterEvent listens on both updater channels and unwraps payloads", async () => {
+    const { ipc, listen } = await load();
+    const offProgress = vi.fn();
+    const offFinished = vi.fn();
+    const registered: Record<string, (ev: { payload: unknown }) => void> = {};
+    listen.mockImplementation(async (channel, cb) => {
+      registered[channel] = cb as (ev: { payload: unknown }) => void;
+      return channel === "updater://progress" ? offProgress : offFinished;
+    });
+
+    const events: Array<
+      { kind: "progress"; downloaded: number; total: number | null } | { kind: "finished" }
+    > = [];
+    const off = await ipc.onUpdaterEvent((e) => events.push(e));
+    expect(listen).toHaveBeenCalledWith("updater://progress", expect.any(Function));
+    expect(listen).toHaveBeenCalledWith("updater://finished", expect.any(Function));
+
+    registered["updater://progress"]({ payload: { downloaded: 50, total: 100 } });
+    expect(events).toContainEqual({ kind: "progress", downloaded: 50, total: 100 });
+
+    registered["updater://finished"]({ payload: null });
+    expect(events).toContainEqual({ kind: "finished" });
+
+    // The composite unlisten tears down BOTH channel subscriptions.
+    off();
+    expect(offProgress).toHaveBeenCalledTimes(1);
+    expect(offFinished).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("browser fallback (no Tauri core)", () => {
@@ -315,8 +364,27 @@ describe("browser fallback (no Tauri core)", () => {
       defaultPolicy: "ask",
       workspace: null,
       typingAnimation: true,
+      autoUpdate: true,
     });
     expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("auto-update commands are inert in the browser (no update, no relaunch)", async () => {
+    const { ipc, invoke, listen } = await load();
+
+    await expect(ipc.checkForUpdate()).resolves.toBeNull();
+    await expect(ipc.downloadAndInstallUpdate()).resolves.toBeUndefined();
+    await expect(ipc.relaunchApp()).resolves.toBeUndefined();
+    await expect(ipc.getUpdateChannel()).resolves.toBe("stable");
+
+    const events: unknown[] = [];
+    const off = await ipc.onUpdaterEvent((e) => events.push(e));
+    off(); // inert unlisten — safe to call
+    expect(events).toHaveLength(0);
+
+    // Nothing crossed the (absent) native bridge.
+    expect(invoke).not.toHaveBeenCalled();
+    expect(listen).not.toHaveBeenCalled();
   });
 
   it("saveSettings merges a partial patch and echoes the merged result", async () => {
