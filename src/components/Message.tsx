@@ -67,6 +67,7 @@ export const MessageView = memo(function MessageView({
 
   return (
     <div
+      id={`pc-msg-${message.id}`}
       className={`mb-5 flex gap-[11px] ${isUser ? "justify-end" : "pc-msg-enter"}`}
       onContextMenu={onContextMenu(menuItems)}
     >

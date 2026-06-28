@@ -31,6 +31,7 @@ vi.mock("../lib/ipc", () => ({
   getDrafts: vi.fn(),
   getUsage: vi.fn(),
   getAllUsage: vi.fn(),
+  searchMessages: vi.fn(),
   saveSettings: vi.fn(),
   resolvePermission: vi.fn(),
   setTelemetryConsent: vi.fn(),
@@ -90,6 +91,7 @@ beforeEach(() => {
   m.getDrafts.mockResolvedValue([]);
   m.getUsage.mockResolvedValue({ sessionId: "s1", input: 0, output: 0 });
   m.getAllUsage.mockResolvedValue([]);
+  m.searchMessages.mockResolvedValue([]);
   m.saveSettings.mockImplementation(async (s) => ({ ...DEFAULT_SETTINGS, ...s }));
   m.resolvePermission.mockResolvedValue(undefined);
   m.setTelemetryConsent.mockResolvedValue(undefined);
@@ -1545,6 +1547,100 @@ describe("composer presence phase", () => {
     await stopping;
     expect(useStore.getState().composerPhase).toBe("idle");
     expect(useStore.getState().streaming).toBe(false);
+  });
+
+  it("names the running tool on tool_use and clears it on tool_result", async () => {
+    const emit = await startTurn();
+    emit({ type: "tool_use", id: "t1", name: "grep", input: { pattern: "x" } });
+    expect(useStore.getState().activeTool).toBe("grep");
+    // A tool is a real first event, so the phase also settles to thinking.
+    expect(useStore.getState().composerPhase).toBe("thinking");
+    emit({ type: "tool_result", id: "t1", output: "ok", isError: false });
+    expect(useStore.getState().activeTool).toBeNull();
+    emit({ type: "turn_end", stopReason: "end_turn" });
+  });
+
+  it("resets a residual tool label when the next turn starts", async () => {
+    const emit = await startTurn();
+    emit({ type: "tool_use", id: "t1", name: "shell", input: {} });
+    expect(useStore.getState().activeTool).toBe("shell");
+    // The turn ends mid-tool (no tool_result); send() must reset the label up front
+    // so it can't leak into the next turn's presence.
+    emit({ type: "turn_end", stopReason: "end_turn" });
+    const emit2 = await startTurn();
+    expect(useStore.getState().activeTool).toBeNull();
+    emit2({ type: "turn_end", stopReason: "end_turn" });
+  });
+});
+
+describe("message search + jump", () => {
+  it("returns the backend hits under Tauri (ipc path)", async () => {
+    m.searchMessages.mockResolvedValue([
+      { sessionId: "a", messageId: "m1", seq: 2, role: "user", snippet: "hello parser" },
+    ]);
+    const hits = await useStore.getState().searchMessages("parser");
+    expect(m.searchMessages).toHaveBeenCalledWith("parser");
+    expect(hits).toHaveLength(1);
+    expect(hits[0].sessionId).toBe("a");
+  });
+
+  it("falls back to an in-memory search when the backend returns nothing", async () => {
+    m.searchMessages.mockResolvedValue([]);
+    useStore.setState({
+      messages: {
+        a: [
+          {
+            id: "m1",
+            role: "user",
+            blocks: [{ kind: "text", text: "refactor the PARSER" }],
+            createdAt: 10,
+          },
+          {
+            id: "m2",
+            role: "assistant",
+            blocks: [{ kind: "text", text: "unrelated reply" }],
+            createdAt: 20,
+          },
+        ],
+      },
+    });
+    const hits = await useStore.getState().searchMessages("parser");
+    expect(hits).toHaveLength(1);
+    expect(hits[0].messageId).toBe("m1");
+    expect(hits[0].snippet.toLowerCase()).toContain("parser");
+  });
+
+  it("ignores an empty/whitespace query without hitting the backend", async () => {
+    const hits = await useStore.getState().searchMessages("   ");
+    expect(hits).toEqual([]);
+    expect(m.searchMessages).not.toHaveBeenCalled();
+  });
+
+  it("jumpToMessage does not strand a scroll target when streaming blocks navigation", async () => {
+    // selectSession no-ops mid-stream; a cross-session jump must NOT set scrollTargetId
+    // (it would ghost-scroll a later navigation to that session).
+    useStore.setState({
+      sessions: [session({ id: "b" })],
+      activeId: "a",
+      messages: { a: [] },
+      streaming: true,
+    });
+    await useStore.getState().jumpToMessage("b", "m7");
+    expect(useStore.getState().activeId).toBe("a");
+    expect(useStore.getState().scrollTargetId).toBeNull();
+  });
+
+  it("jumpToMessage selects the session and sets the scroll target", async () => {
+    useStore.setState({ sessions: [session({ id: "b" })], activeId: "a", messages: { a: [] } });
+    await useStore.getState().jumpToMessage("b", "m7");
+    expect(useStore.getState().activeId).toBe("b");
+    expect(useStore.getState().scrollTargetId).toBe("m7");
+  });
+
+  it("clearScrollTarget resets the scroll target", () => {
+    useStore.setState({ scrollTargetId: "m7" });
+    useStore.getState().clearScrollTarget();
+    expect(useStore.getState().scrollTargetId).toBeNull();
   });
 });
 

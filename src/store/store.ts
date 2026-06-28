@@ -17,6 +17,7 @@ import type {
   PhoneSyncStatus,
   RemoteCommand,
   Rule,
+  SearchHit,
   Session,
   SessionFolder,
   SessionGroup,
@@ -123,6 +124,14 @@ interface AppState {
   // The composer's live presence phase, driven by REAL turn/stream events (never
   // padded). Surfaced in the role="status" region beside the composer.
   composerPhase: ComposerPhase;
+  // The tool the active turn is currently running (the core's tool name, e.g.
+  // `fs_read`/`shell`), or null between tools. Set on a real `tool_use` and cleared
+  // on its `tool_result`; surfaced as the "running <tool>…" presence phrase. Display
+  // is streaming-gated, so a residual value can never show once a turn ends.
+  activeTool: string | null;
+  // The message a ⌘K search result asked to reveal; the Chat transcript scrolls it
+  // into view, then clears it (see jumpToMessage / clearScrollTarget). Null at rest.
+  scrollTargetId: string | null;
   crashReporting: boolean | null; // opt-in crash/error reporting; null = not yet asked (show first-run prompt)
   cancel: (() => Promise<void>) | null;
   pendingPermission: PendingPermission | null;
@@ -181,6 +190,10 @@ interface AppState {
   cancelAgent: (agentId: string) => Promise<void>;
   setShowSettings: (v: boolean) => void;
   setShowPalette: (v: boolean) => void;
+  // ── message search (⌘K jump to a past turn) ──
+  searchMessages: (query: string) => Promise<SearchHit[]>;
+  jumpToMessage: (sessionId: string, messageId: string) => Promise<void>;
+  clearScrollTarget: () => void;
   setAmbientRain: (v: boolean) => void;
   setScanlines: (v: boolean) => void;
   setUiScale: (n: number) => void;
@@ -565,6 +578,50 @@ const armSettleTimer = (): void => {
   }, COMPOSER_SETTLE_MS);
 };
 
+// ── message search (web/preview fallback) ─────────────────────────────────────
+// In Tauri the SQLite-backed `search_messages` command searches the FULL history.
+// In web/preview mode (no desktop DB) this searches the in-memory loaded messages
+// so ⌘K still finds a past turn. Mirrors the Rust search: real text blocks only,
+// case-insensitive, newest first, capped.
+const SEARCH_LIMIT = 50;
+
+const snippetAround = (text: string, needle: string): string => {
+  const norm = text.replace(/\s+/g, " ").trim();
+  const at = norm.toLowerCase().indexOf(needle);
+  if (at < 0) return norm.slice(0, 140);
+  const start = Math.max(0, at - 40);
+  const end = Math.min(norm.length, at + needle.length + 100);
+  return (start > 0 ? "…" : "") + norm.slice(start, end) + (end < norm.length ? "…" : "");
+};
+
+const searchInMemory = (messages: Record<string, Message[]>, query: string): SearchHit[] => {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return [];
+  const scored: { hit: SearchHit; at: number }[] = [];
+  for (const [sessionId, list] of Object.entries(messages)) {
+    list.forEach((msg, idx) => {
+      const text = msg.blocks
+        .filter((b): b is Extract<ContentBlock, { kind: "text" }> => b.kind === "text")
+        .map((b) => b.text)
+        .join(" ");
+      if (text.toLowerCase().includes(needle)) {
+        scored.push({
+          hit: {
+            sessionId,
+            messageId: msg.id,
+            seq: idx,
+            role: msg.role,
+            snippet: snippetAround(text, needle),
+          },
+          at: msg.createdAt,
+        });
+      }
+    });
+  }
+  scored.sort((a, b) => b.at - a.at);
+  return scored.slice(0, SEARCH_LIMIT).map((s) => s.hit);
+};
+
 // Frontend-only UI preferences (decorative overlays). Cosmetic client state,
 // not the Rust core's Settings — persisted in localStorage so they work the
 // same in preview and native without an IPC round-trip.
@@ -718,6 +775,8 @@ export const useStore = create<AppState>((set, get) => ({
   // the backend round-trip; init() then merges the authoritative backend drafts.
   drafts: readJSON<Record<string, string>>("pc.drafts", {}),
   composerPhase: "idle",
+  activeTool: null,
+  scrollTargetId: null,
   crashReporting: readTriPref("pc.crashReporting"),
   cancel: null,
   pendingPermission: null,
@@ -924,6 +983,34 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  // ── message search (⌘K jump to a past turn) ──────────────────────────────────
+
+  async searchMessages(query) {
+    const q = query.trim();
+    if (!q) return [];
+    // Tauri: full-history SQLite search. Web/preview: ipc returns [], then fall back
+    // to the in-memory loaded messages so ⌘K still works without a desktop DB.
+    const fromDb = await ipc.searchMessages(q);
+    if (fromDb.length > 0) return fromDb;
+    return searchInMemory(get().messages, q);
+  },
+
+  async jumpToMessage(sessionId, messageId) {
+    // Reuse the single source of truth for activeId + lazy message load. selectSession
+    // no-ops while a turn streams, so only reveal the turn if we actually landed on
+    // its session — otherwise scrollTargetId would strand and ghost-scroll a later
+    // navigation to that session.
+    await get().selectSession(sessionId);
+    if (get().activeId !== sessionId) return;
+    // Ask the transcript to reveal the matched turn; Chat scrolls + clears it once
+    // the (possibly just-loaded) message is in the DOM.
+    set({ scrollTargetId: messageId });
+  },
+
+  clearScrollTarget() {
+    set({ scrollTargetId: null });
+  },
+
   async deleteSession(id) {
     if (get().streaming) return;
     try {
@@ -1086,7 +1173,9 @@ export const useStore = create<AppState>((set, get) => ({
     // Turn-taking receipt (Doherty <400ms): acknowledge the send instantly ("got it
     // — reading…"); the first REAL stream event settles it to "thinking…", with a
     // 900ms fallback for a slow first byte. Honest — never padded latency.
-    set({ composerPhase: "received" });
+    // Reset the tool label up front so a new turn never briefly shows the previous
+    // turn's last tool before its first real event arrives.
+    set({ composerPhase: "received", activeTool: null });
     armSettleTimer();
 
     // Remote mode: this device is the phone driving a paired desktop. Forward the
@@ -1236,12 +1325,16 @@ export const useStore = create<AppState>((set, get) => ({
             clearSettleTimer();
             set({ composerPhase: "thinking" });
           }
+          // Surface the running tool in the presence line ("running <tool>…").
+          set({ activeTool: e.name });
           apply((blocks) => [
             ...blocks,
             { kind: "tool_use", id: e.id, name: e.name, input: e.input },
           ]);
           break;
         case "tool_result":
+          // The tool finished — fall back to the generic "thinking with you…".
+          set({ activeTool: null });
           apply((blocks) => [
             ...blocks,
             {
@@ -2246,6 +2339,9 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       break;
     case "tool_use":
       settleActivePresence();
+      // Surface the running tool on the VISIBLE composer only — a background
+      // session's tool must not show on screen (mirrors the presence settle).
+      if (useStore.getState().activeId === sessionId) set(() => ({ activeTool: e.name }));
       set((st) => ({
         messages: patchLast(st.messages, sessionId, (b) => [
           ...b,
@@ -2254,6 +2350,7 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       }));
       break;
     case "tool_result":
+      if (useStore.getState().activeId === sessionId) set(() => ({ activeTool: null }));
       set((st) => ({
         messages: patchLast(st.messages, sessionId, (b) => [
           ...b,

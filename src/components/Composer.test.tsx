@@ -453,6 +453,34 @@ describe("Composer presence region", () => {
     expect(phaseText(true, "stopping")).toContain("stopping…");
   });
 
+  it("names the running tool while a tool_use is active (running <tool>…)", () => {
+    useStore.setState({ streaming: true, composerPhase: "thinking", activeTool: "grep" });
+    render(<Composer />);
+    expect(screen.getByRole("status").textContent).toContain("searching the code…");
+  });
+
+  it("falls back to a generic 'running <name>…' for an unmapped tool", () => {
+    useStore.setState({ streaming: true, composerPhase: "thinking", activeTool: "mystery_tool" });
+    render(<Composer />);
+    expect(screen.getByRole("status").textContent).toContain("running mystery_tool…");
+  });
+
+  it("never shows a residual tool label once streaming ends (streaming-gated)", () => {
+    useStore.setState({ streaming: false, composerPhase: "idle", activeTool: "grep" });
+    render(<Composer />);
+    expect(screen.getByRole("status").textContent).toContain("ready when you are");
+  });
+
+  it("shows the generic 'thinking with you…' (not a tool) outside the thinking phase", () => {
+    // An observed turn can be streaming with a stale activeTool while the phase is
+    // still idle; the phase gate keeps the tool label from surfacing wrongly.
+    useStore.setState({ streaming: true, composerPhase: "idle", activeTool: "grep" });
+    render(<Composer />);
+    const status = screen.getByRole("status").textContent;
+    expect(status).toContain("thinking with you…");
+    expect(status).not.toContain("searching the code…");
+  });
+
   it("shows the honest Shift+Enter hint only when the draft is multi-line", () => {
     seedDraft("one line");
     const { rerender } = render(<Composer />);

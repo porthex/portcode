@@ -14,16 +14,38 @@ function useActiveModel(): string {
 // target and the CSS clip agree (otherwise the grow stops short at the smaller).
 const MAX_TEXTAREA_H = 220;
 
+// The core's tool names → honest, human presence phrases. Falls back to a generic
+// "running <name>…" for any tool not in the map, so a newly added core tool is
+// still surfaced truthfully rather than silently hidden.
+const TOOL_PHRASES: Record<string, string> = {
+  fs_read: "reading a file…",
+  fs_write: "writing a file…",
+  fs_edit: "editing a file…",
+  list: "browsing files…",
+  glob: "finding files…",
+  grep: "searching the code…",
+  shell: "running a command…",
+  task: "delegating to a subagent…",
+};
+function prettyTool(name: string): string {
+  return TOOL_PHRASES[name] ?? `running ${name}…`;
+}
+
 // The live presence phrases, derived from REAL turn/stream state (never padded
 // latency). The dot color honors the brand semantics: cyan = the agent at work,
 // danger = a Stop in flight, faint = at rest.
 function presenceFor(
   streaming: boolean,
   phase: "idle" | "received" | "thinking" | "stopping",
+  tool: string | null,
 ): { text: string; dot: string } {
   if (phase === "stopping") return { text: "stopping…", dot: "pc-dot pc-dot--danger" };
   if (!streaming) return { text: "ready when you are", dot: "pc-dot--idle" };
   if (phase === "received") return { text: "got it — reading…", dot: "pc-dot pc-dot--cyan" };
+  // A tool is concretely running — name it honestly (driven by real tool_use events).
+  // Gated on the "thinking" phase (reliably reset to idle at every turn end) so a
+  // residual tool label can never surface on a new turn before its first real event.
+  if (phase === "thinking" && tool) return { text: prettyTool(tool), dot: "pc-dot pc-dot--cyan" };
   return { text: "thinking with you…", dot: "pc-dot pc-dot--cyan" };
 }
 
@@ -35,6 +57,7 @@ export function Composer() {
   const setText = useStore((s) => s.setDraft);
   const streaming = useStore((s) => s.streaming);
   const composerPhase = useStore((s) => s.composerPhase);
+  const activeTool = useStore((s) => s.activeTool);
   const send = useStore((s) => s.send);
   const stop = useStore((s) => s.stop);
   const remoteMode = useStore((s) => s.remoteMode);
@@ -74,7 +97,7 @@ export function Composer() {
   }, [armed]);
 
   const stopping = composerPhase === "stopping";
-  const presence = presenceFor(streaming, composerPhase);
+  const presence = presenceFor(streaming, composerPhase, activeTool);
   // Honest hint (only when it applies): Shift+Enter inserts a newline, so we only
   // claim it once the draft is actually multi-line.
   const multiline = text.includes("\n");

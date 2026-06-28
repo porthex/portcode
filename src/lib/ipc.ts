@@ -11,6 +11,7 @@ import type {
   PairingRequest,
   PhoneSyncStatus,
   RemoteCommand,
+  SearchHit,
   Session,
   SessionUsage,
   Settings,
@@ -385,6 +386,19 @@ export async function getAllUsage(): Promise<SessionUsage[]> {
   if (isTauri()) {
     const { core } = await tauri();
     return core.invoke<SessionUsage[]>("get_all_usage");
+  }
+  return [];
+}
+
+// ── message search (⌘K jump to a past turn) ───────────────────────────────────
+
+/** Search message text across sessions (newest first), via the SQLite-backed
+ *  `search_messages`. Empty outside Tauri — the store falls back to an in-memory
+ *  search over loaded messages so ⌘K still works in web/preview mode. */
+export async function searchMessages(query: string): Promise<SearchHit[]> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<SearchHit[]>("search_messages", { query });
   }
   return [];
 }

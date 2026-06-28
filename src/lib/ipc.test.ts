@@ -170,6 +170,14 @@ describe("Tauri command serialization", () => {
     expect(invoke).toHaveBeenCalledWith("get_all_usage");
   });
 
+  it("search_messages invokes its core counterpart with the query", async () => {
+    const { ipc, invoke } = await load();
+    const hits = [{ sessionId: "s1", messageId: "m1", seq: 2, role: "user", snippet: "hi" }];
+    invoke.mockResolvedValue(hits);
+    await expect(ipc.searchMessages("parser")).resolves.toBe(hits);
+    expect(invoke).toHaveBeenCalledWith("search_messages", { query: "parser" });
+  });
+
   it("list_dir passes the optional sub-path through", async () => {
     const { ipc, invoke } = await load();
     invoke.mockResolvedValue([]);
@@ -427,6 +435,9 @@ describe("browser fallback (no Tauri core)", () => {
     await expect(ipc.getDrafts()).resolves.toEqual([]);
     await expect(ipc.getUsage("s1")).resolves.toEqual({ sessionId: "s1", input: 0, output: 0 });
     await expect(ipc.getAllUsage()).resolves.toEqual([]);
+    // Search has no desktop DB to hit in web mode; the store falls back to an
+    // in-memory search, so the ipc wrapper just returns [] without touching invoke.
+    await expect(ipc.searchMessages("x")).resolves.toEqual([]);
     expect(invoke).not.toHaveBeenCalled();
   });
 
