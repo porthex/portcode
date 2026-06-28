@@ -13,7 +13,7 @@ export type ReadableStreamType = "bytes";
  * / `create_session`) — the phone never runs tools or touches the workspace
  * itself.
  */
-export type RemoteCommand = { cmd: "run"; session_id: string; text: string } | { cmd: "cancel"; session_id: string } | { cmd: "cancel_agent"; agent_id: string } | { cmd: "permission"; id: string; decision: string } | { cmd: "create_session"; title: string | null };
+export type RemoteCommand = { cmd: "run"; session_id: string; text: string } | { cmd: "cancel"; session_id: string } | { cmd: "cancel_agent"; agent_id: string } | { cmd: "permission"; id: string; decision: string } | { cmd: "create_session"; title: string | null } | { cmd: "register_push"; endpoint: string; p256dh: string; auth: string };
 
 /**
  * A session header row. (Was `crate::db::SessionRow`.)
@@ -42,6 +42,14 @@ export interface SessionRow {
  * (Was `crate::llm::Block`.)
  */
 export type Block = { type: "text"; text: string } | { type: "tool_use"; id: string; name: string; input: Value } | { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean };
+
+/**
+ * An Anthropic-shaped chat message. (Was `crate::llm::ChatMessage`.)
+ */
+export interface ChatMessage {
+    role: string;
+    content: Block[];
+}
 
 /**
  * Events streamed to the frontend. Tagged + camelCased to match `StreamEvent`
