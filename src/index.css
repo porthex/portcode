@@ -372,6 +372,19 @@ input[type="radio"]:not(:disabled) {
 .pc-fade-in {
   animation: pcFadeIn 0.2s ease both;
 }
+/* Indeterminate update-download bar: a short accent block sliding across the track
+   while the total byte count is unknown. */
+@keyframes pcShimmer {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(420%);
+  }
+}
+.pc-shimmer {
+  animation: pcShimmer 1.2s ease-in-out infinite;
+}
 
 @media (prefers-reduced-motion: reduce) {
   /* Reduced-motion: gate only large/ambient MOVEMENT. The digital rain
@@ -421,6 +434,11 @@ input[type="radio"]:not(:disabled) {
   /* The sidebar panel/rail cross-fade is opacity-only, but neutralize it too so
      the swap is instant for reduced-motion users (matches the other enters). */
   .pc-fade-in {
+    animation: none !important;
+  }
+  /* The indeterminate update bar slides geometry (translateX) — neutralize it so
+     it sits as a static accent block. */
+  .pc-shimmer {
     animation: none !important;
   }
 }

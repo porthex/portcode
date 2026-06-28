@@ -196,6 +196,8 @@ export interface Settings {
   permissionMode: PermissionMode;
   /** Per-tool/command permission rules, evaluated before the mode default. */
   rules: Rule[];
+  /** Download + install new versions automatically, then prompt to relaunch. */
+  autoUpdate: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -207,6 +209,7 @@ export const DEFAULT_SETTINGS: Settings = {
   typingAnimation: true,
   permissionMode: "default",
   rules: [],
+  autoUpdate: true,
 };
 
 /**
@@ -313,6 +316,25 @@ export interface SearchHit {
  * - `stopping` — the user pressed Stop; acknowledged in <100ms before the cancel resolves.
  */
 export type ComposerPhase = "idle" | "received" | "thinking" | "stopping";
+
+// ── Auto-update ────────────────────────────────────────────────────────────────
+
+/**
+ * A pending application update, as returned by `update_check`. Mirrors the Rust
+ * core's `UpdateInfo` serde model; `update_check` resolves null when the running
+ * build is already the latest. `notes`/`date` are best-effort metadata from the
+ * release manifest (null when the feed omits them).
+ */
+export interface UpdateInfo {
+  version: string;
+  currentVersion: string;
+  notes: string | null;
+  date: string | null;
+}
+
+/** Which release feed this build follows: the public `stable` channel or the
+ *  pre-release `staging` channel testers opt into. Returned by `update_channel`. */
+export type UpdateChannel = "stable" | "staging";
 
 // ── Phone Sync ────────────────────────────────────────────────────────────────
 

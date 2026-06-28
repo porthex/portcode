@@ -316,6 +316,87 @@ points at the most recent **published, non-prerelease** release.
 
 ---
 
+## 7a. The staging update channel (`staging.yml`)
+
+Alongside the stable channel above, Portcode ships a **staging update channel**:
+a rolling pre-release feed so testers can dogfood unreleased `staging`-branch
+builds that auto-update among themselves, **without ever touching the stable
+`latest` pointer** real users follow.
+
+### How a build knows it's "staging" — `PORTCODE_CHANNEL`
+
+A staging build is compiled with the **compile-time env var
+`PORTCODE_CHANNEL=staging`**. The Rust side reads it via
+`option_env!("PORTCODE_CHANNEL")`; when it's `staging`, the app points its
+updater at a **fixed** manifest URL instead of the stable one:
+
+| Channel     | Updater manifest URL                                                    |
+| ----------- | ----------------------------------------------------------------------- |
+| **stable**  | `https://github.com/<org>/<repo>/releases/latest/download/latest.json`  |
+| **staging** | `https://github.com/<org>/<repo>/releases/download/staging/latest.json` |
+
+The stable URL resolves to the most recent **published, non-prerelease** Release.
+The staging URL is **tag-pinned** to a single Release with the fixed tag
+**`staging`**, marked **pre-release**.
+
+### `staging.yml` — what it does
+
+- **Triggers** on `push` to the **`staging` branch** (branch-based, not tag-based)
+  and on **`workflow_dispatch`** (a dry run). A concurrency group cancels older
+  staging runs when a newer push lands.
+- Runs on **`windows-latest`**, in the same protected **`release` environment**,
+  reusing the **same 8 signing secrets** as `release.yml` (no new secrets). The
+  same secret-gating discipline applies — with no secrets it's an UNSIGNED dry
+  run that still builds and checksums.
+- **Monotonic versioning.** It reads the base `version` from
+  `src-tauri/tauri.conf.json` and forms `"<base>-staging.<run_number>"` (e.g.
+  `5.0.0-staging.42`). `github.run_number` increases every run, so the version
+  **strictly increases build-over-build** — which is what the Tauri updater needs
+  to decide one staging build supersedes the installed one (semver compares the
+  numeric `-staging.N` identifier).
+- **Transient version stamp.** It rewrites that staging version into the **three
+  version files** (`package.json`, `src-tauri/Cargo.toml` `[package] version`,
+  `src-tauri/tauri.conf.json`) **in the CI checkout only — never committed** — so
+  the built binary self-reports the staging version and the manifest matches. The
+  stamp runs **after** `pnpm install --frozen-lockfile` (so the frozen install
+  still sees the in-sync committed `package.json`); the Cargo.toml bump is safe
+  because nothing in the build uses `cargo … --locked`/`--frozen` (`pnpm app:build`
+  is plain `tauri build`, which updates `Cargo.lock` in-tree as needed).
+- **Build → sign → manifest.** Same chain as `release.yml`: cargo-deny audit,
+  `pnpm app:build` (NSIS) with `PORTCODE_CHANNEL=staging` set on the build step,
+  Authenticode (Azure, gated), `tauri signer sign` after Authenticode (gated),
+  SHA-256 checksums, and a `latest.json` whose download URL points at the fixed
+  **`staging`** tag (`releases/download/staging/<setup-exe-name>`).
+- **Publish — fixed prerelease tag, clobbering assets.** It publishes to the
+  single Release tagged **`staging`**, **always marked `--prerelease`** and titled
+  "Staging (rolling)". If that Release already exists it re-asserts
+  `--prerelease` and re-uploads the assets with `--clobber`; otherwise it creates
+  it. Because the assets live at a **tag-stable URL** and are refreshed each
+  build, staging clients always fetch the current installer.
+
+### Why "pre-release" is load-bearing
+
+The stable `latest` pointer only ever resolves to a **published, non-prerelease**
+Release. Keeping the `staging` Release a **pre-release** guarantees it can
+**never become `releases/latest`**, so it never disturbs stable clients. The
+workflow never publishes a non-prerelease and never touches the `latest` pointer.
+
+### In-app behaviour
+
+Auto-update is **ON by default** (Claude Code parity) and can be toggled in
+**Settings**:
+
+- **ON** — the updater **silently downloads + installs** the newer build, then
+  **prompts to relaunch**.
+- **OFF** — the updater only **notifies** that an update is available; nothing is
+  downloaded or installed until the user acts.
+
+Stable builds update from `releases/latest`; staging builds update from this
+`staging` pre-release feed — the only difference is which manifest URL the build
+was compiled to read.
+
+---
+
 ## 8. Owner setup (one time)
 
 Do this **once**, before the first signed release. All values stay in GitHub /
@@ -443,6 +524,7 @@ rest. Afterward, sync the bump back to `main` (§1).
 | What                     | Where (relative to repo root)                                               |
 | ------------------------ | --------------------------------------------------------------------------- |
 | Signed Windows release   | `.github/workflows/release.yml` (added by PR #8)                            |
+| Staging prerelease feed  | `.github/workflows/staging.yml` (push to `staging` → rolling prerelease)    |
 | Linux release (today)    | `.github/workflows/release-linux.yml`                                       |
 | Changelog + version bump | `.github/workflows/release-please.yml` (targets the `release` branch)       |
 | Per-PR CI (no signing)   | `.github/workflows/ci.yml`                                                  |

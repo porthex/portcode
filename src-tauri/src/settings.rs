@@ -31,9 +31,19 @@ pub struct Settings {
     /// Defaults to empty (no rules) for older settings files.
     #[serde(default)]
     pub rules: Vec<Rule>,
+    /// Whether the desktop app checks for and offers updates. Defaults to true so
+    /// the safe behaviour (staying current) is opt-out, not opt-in. `default`
+    /// keeps older settings.json files (written before this field existed) loading
+    /// cleanly instead of unwrap_or_default()-wiping every setting.
+    #[serde(default = "default_auto_update")]
+    pub auto_update: bool,
 }
 
 fn default_typing_animation() -> bool {
+    true
+}
+
+fn default_auto_update() -> bool {
     true
 }
 
@@ -50,6 +60,7 @@ impl Default for Settings {
             // through to default_policy = "ask".
             permission_mode: PermissionMode::Default,
             rules: Vec::new(),
+            auto_update: default_auto_update(),
         }
     }
 }
@@ -149,5 +160,41 @@ mod tests {
 
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert!(!back.typing_animation);
+    }
+
+    #[test]
+    fn legacy_settings_without_auto_update_still_load() {
+        // A settings.json written before `autoUpdate` existed must keep its other
+        // fields and default the new one to true — not get wiped via
+        // unwrap_or_default() because one field is missing.
+        let json = r#"{
+            "provider": "anthropic",
+            "model": "claude-opus-4-8",
+            "apiKeySet": true,
+            "defaultPolicy": "allow",
+            "workspace": null,
+            "typingAnimation": false
+        }"#;
+        let s: Settings = serde_json::from_str(json).expect("legacy settings should deserialize");
+        assert_eq!(s.default_policy, "allow");
+        assert!(!s.typing_animation, "explicit typingAnimation is preserved");
+        assert!(s.auto_update, "missing autoUpdate defaults to true");
+    }
+
+    #[test]
+    fn auto_update_serializes_as_camel_case_and_round_trips() {
+        let s = Settings {
+            auto_update: false,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"autoUpdate\":false"));
+
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert!(!back.auto_update);
+
+        // And the default round-trips as true.
+        let json_true = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(json_true.contains("\"autoUpdate\":true"));
     }
 }
