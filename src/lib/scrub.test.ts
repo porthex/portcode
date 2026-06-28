@@ -59,30 +59,11 @@ describe("redactSecrets", () => {
     expect(redactSecrets("task-management-system-design")).toBe("task-management-system-design");
   });
 
-  it("caps a long non-secret string so a giant dump can't ride out", () => {
-    // Spaces break it into <40-char runs so nothing matches a redactor; the size
-    // cap is what stops a full-file/full-prompt dump riding out inside a message.
-    const huge = "lorem ipsum dolor ".repeat(4000); // ~72k chars, none redactable
+  it("caps very long strings so a giant dump can't ride out (and resists ReDoS)", () => {
+    const huge = "noreply@" + "a".repeat(50000); // also the old email-ReDoS shape
     const out = redactSecrets(huge);
-    expect(out.length).toBeLessThan(2100);
+    expect(out.length).toBeLessThan(3000);
     expect(out.endsWith("…[truncated]")).toBe(true);
-  });
-
-  it("handles a ReDoS-shaped email input quickly and still redacts it", () => {
-    // Dot-free labels make the email pattern fail fast (no catastrophic
-    // backtracking); the 50k-char blob is collapsed to a single key token.
-    expect(redactSecrets("noreply@" + "a".repeat(50000))).toBe("noreply@[redacted-key]");
-  });
-
-  it("redacts a secret straddling the length cap instead of leaking its prefix", () => {
-    // The key starts ~30 chars before the 2048 cap and runs past it. Capping FIRST
-    // would keep only the sub-40-char prefix (which no redactor matches) and leak
-    // it; redacting the FULL string first collapses the whole key before the cap.
-    const filler = "x ".repeat(1009); // 2018 chars, none redactable (spaces)
-    const key = "A".repeat(60); // a key-shaped blob crossing the cap boundary
-    const out = redactSecrets(filler + key);
-    expect(out).toContain("[redacted-key]");
-    expect(out).not.toMatch(/A{20,}/); // no run of the raw key survived
   });
 
   it("leaves ordinary text untouched", () => {

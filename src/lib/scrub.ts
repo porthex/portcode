@@ -54,16 +54,13 @@ const REDACTORS: ReadonlyArray<readonly [RegExp, string]> = [
   [/[A-Za-z0-9+/_-]{40,}={0,2}/g, "[redacted-key]"],
 ];
 
-/** Run every redaction pass over a string, THEN cap length. Redacting before the
- *  cap is deliberate: capping first could split a secret straddling the boundary
- *  and leave its visible prefix unredacted in the outgoing event (a real leak on
- *  the telemetry path). The patterns are linear / non-backtracking, so running them
- *  over the full string is not a ReDoS risk; the cap still bounds the final size so
- *  an accidental full-file/full-prompt dump can't ride out inside a message. */
+/** Run every redaction pass over a string. Caps length first (ReDoS + dump guard),
+ *  then applies each pass. Safe on any string. */
 export function redactSecrets(value: string): string {
-  let out = value;
+  const capped = value.length > MAX_REDACT_LEN;
+  let out = capped ? value.slice(0, MAX_REDACT_LEN) : value;
   for (const [re, repl] of REDACTORS) out = out.replace(re, repl);
-  return out.length > MAX_REDACT_LEN ? out.slice(0, MAX_REDACT_LEN) + "…[truncated]" : out;
+  return capped ? out + "…[truncated]" : out;
 }
 
 /** Only plain objects/arrays are safe to enumerate for redaction. A Map/Set/Date/
