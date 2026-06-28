@@ -141,13 +141,13 @@ export async function checkForUpdate(): Promise<UpdateInfo | null> {
 }
 
 /** Download AND stage the pending update for install. Emits `updater://progress`
- *  while downloading and `updater://finished` once staged; resolves once the
- *  update is downloaded and staged (awaiting a relaunch). */
-export async function downloadAndInstallUpdate(): Promise<void> {
+ *  while downloading and `updater://finished` once staged; resolves `true` when
+ *  an update was downloaded and staged (awaiting a relaunch), or `false` when
+ *  there was no update to install (already up to date). */
+export async function downloadAndInstallUpdate(): Promise<boolean> {
   if (isTauri()) {
     const { core } = await tauri();
-    await core.invoke("update_download_and_install");
-    return;
+    return core.invoke<boolean>("update_download_and_install");
   }
   return mock.downloadAndInstallUpdate();
 }
@@ -639,8 +639,9 @@ const mock = (() => {
     async checkForUpdate(): Promise<UpdateInfo | null> {
       return null;
     },
-    async downloadAndInstallUpdate() {
-      // no-op: there is no real updater behind the browser preview.
+    async downloadAndInstallUpdate(): Promise<boolean> {
+      // no update in the browser preview — return false (nothing staged).
+      return false;
     },
     async relaunchApp() {
       // no-op: the preview can't relaunch the (nonexistent) native process.

@@ -903,6 +903,24 @@ describe("SettingsPanel — appearance toggles", () => {
     renderPanel();
     expect(screen.getByText(/on the latest version/i)).toBeInTheDocument();
   });
+
+  it("hides the Automatic updates switch and Check now button in remote mode", () => {
+    useStore.setState({ remoteMode: true });
+    renderPanel();
+
+    expect(screen.queryByRole("switch", { name: "Automatic updates" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /check now/i })).not.toBeInTheDocument();
+
+    useStore.setState({ remoteMode: false }); // don't leak into other tests
+  });
+
+  it("disables 'Check now' when an update is already staged (phase ready)", () => {
+    const info = { version: "5.1.0", currentVersion: "5.0.0", notes: null, date: null };
+    useStore.setState({ update: { phase: "ready", info, progress: 100, error: null } });
+    renderPanel();
+
+    expect(screen.getByRole("button", { name: /check now/i })).toBeDisabled();
+  });
 });
 
 describe("SettingsPanel — footer environment label", () => {

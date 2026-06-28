@@ -381,8 +381,8 @@ describe("Tauri command serialization", () => {
     await expect(ipc.checkForUpdate()).resolves.toBe(info);
     expect(invoke).toHaveBeenCalledWith("update_check");
 
-    invoke.mockResolvedValue(undefined);
-    await expect(ipc.downloadAndInstallUpdate()).resolves.toBeUndefined();
+    invoke.mockResolvedValue(true);
+    await expect(ipc.downloadAndInstallUpdate()).resolves.toBe(true);
     expect(invoke).toHaveBeenCalledWith("update_download_and_install");
 
     await expect(ipc.relaunchApp()).resolves.toBeUndefined();
@@ -452,7 +452,7 @@ describe("browser fallback (no Tauri core)", () => {
     const { ipc, invoke, listen } = await load();
 
     await expect(ipc.checkForUpdate()).resolves.toBeNull();
-    await expect(ipc.downloadAndInstallUpdate()).resolves.toBeUndefined();
+    await expect(ipc.downloadAndInstallUpdate()).resolves.toBe(false);
     await expect(ipc.relaunchApp()).resolves.toBeUndefined();
     await expect(ipc.getUpdateChannel()).resolves.toBe("stable");
 

@@ -52,7 +52,7 @@ export default function App() {
   // The store actions it calls are all defensive (swallow a missing-command), and
   // the listener + interval are torn down on unmount.
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauri() || remoteMode) return;
     let cancelled = false;
     let unlisten: (() => void) | null = null;
     const s = useStore.getState();
@@ -78,7 +78,7 @@ export default function App() {
       unlisten?.();
       clearInterval(interval);
     };
-  }, []);
+  }, [remoteMode]);
 
   // Keep the store's `online` flag live. Remote mode shows the offline screen while
   // the device has no network; auto-recovers when the connection returns.

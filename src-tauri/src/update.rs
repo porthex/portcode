@@ -96,12 +96,12 @@ pub async fn update_check(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, S
 ///   - `updater://progress` → `{ downloaded: u64, total: u64 | null }` per chunk
 ///   - `updater://finished` → `()` once the download completes (before install)
 #[tauri::command]
-pub async fn update_download_and_install(app: tauri::AppHandle) -> Result<(), String> {
+pub async fn update_download_and_install(app: tauri::AppHandle) -> Result<bool, String> {
     let updater = build_updater(&app)?;
     let update = match updater.check().await.map_err(|e| e.to_string())? {
         Some(u) => u,
         // Already up to date (or the offer raced away) — nothing to install.
-        None => return Ok(()),
+        None => return Ok(false),
     };
 
     // Track cumulative bytes across chunks; the crate hands us each chunk's length
@@ -125,7 +125,7 @@ pub async fn update_download_and_install(app: tauri::AppHandle) -> Result<(), St
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(())
+    Ok(true)
 }
 
 /// Relaunch the app to apply a staged update. `AppHandle::restart` returns `!`,

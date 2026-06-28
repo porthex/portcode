@@ -2306,10 +2306,15 @@ export const useStore = create<AppState>((set, get) => ({
   async startUpdateDownload() {
     set((st) => ({ update: { ...st.update, phase: "downloading", progress: 0, error: null } }));
     try {
-      await ipc.downloadAndInstallUpdate();
-      // Resolves once downloaded AND staged. The `updater://finished` event also
-      // marks ready (whichever lands first); both converge on the same state.
-      set((st) => ({ update: { ...st.update, phase: "ready", progress: 100 } }));
+      const staged = await ipc.downloadAndInstallUpdate();
+      if (staged) {
+        // Resolves once downloaded AND staged. The `updater://finished` event also
+        // marks ready (whichever lands first); both converge on the same state.
+        set((st) => ({ update: { ...st.update, phase: "ready", progress: 100 } }));
+      } else {
+        // No update available (already up to date) — return to idle.
+        set({ update: IDLE_UPDATE });
+      }
     } catch (err) {
       set((st) => ({ update: { ...st.update, phase: "error", error: errMessage(err) } }));
     }
@@ -2339,6 +2344,9 @@ export const useStore = create<AppState>((set, get) => ({
 
   async setAutoUpdate(enabled) {
     await get().updateSettings({ autoUpdate: enabled });
+    // Guard: if the save didn't persist (updateSettings swallows into settingsError),
+    // don't proceed with auto-download on a stale preference.
+    if (get().settings.autoUpdate !== enabled) return;
     // Turning it on while an update is already waiting should start the download
     // now, matching the "auto" expectation (rather than leaving it parked).
     if (enabled && get().update.phase === "available") {

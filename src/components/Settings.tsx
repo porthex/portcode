@@ -372,48 +372,56 @@ export function SettingsPanel() {
                 on={settings.typingAnimation}
                 onToggle={() => void updateSettings({ typingAnimation: !settings.typingAnimation })}
               />
-              <ToggleRow
-                label="Automatic updates"
-                hint={
-                  updateChannel === "staging"
-                    ? "Download and install new versions automatically, then prompt to relaunch. (staging channel)"
-                    : "Download and install new versions automatically, then prompt to relaunch."
-                }
-                on={settings.autoUpdate}
-                onToggle={() => void setAutoUpdate(!settings.autoUpdate)}
-              />
-              {/* Manual check + live status. Gives auto-update-off users on-demand
-                  control (Claude Code only ever checks on its own schedule) and
-                  surfaces the current update state inline. */}
-              <div className="flex items-center justify-between gap-4 py-1.5">
-                <div>
-                  <div className="text-[12.5px] font-medium text-fg">Check for updates</div>
-                  <div className="mt-0.5 text-[11px] text-faint" aria-live="polite">
-                    {checkingForUpdate
-                      ? "Checking for updates…"
-                      : update.phase === "available"
-                        ? `Update available · v${update.info?.version ?? ""}`
-                        : update.phase === "downloading"
-                          ? "Downloading update…"
-                          : update.phase === "ready"
-                            ? "Update ready — relaunch to apply"
-                            : update.phase === "error"
-                              ? "Last check failed — try again"
-                              : "You're on the latest version."}
+              {!remoteMode && (
+                <>
+                  <ToggleRow
+                    label="Automatic updates"
+                    hint={
+                      updateChannel === "staging"
+                        ? "Download and install new versions automatically, then prompt to relaunch. (staging channel)"
+                        : "Download and install new versions automatically, then prompt to relaunch."
+                    }
+                    on={settings.autoUpdate}
+                    onToggle={() => void setAutoUpdate(!settings.autoUpdate)}
+                  />
+                  {/* Manual check + live status. Gives auto-update-off users on-demand
+                      control (Claude Code only ever checks on its own schedule) and
+                      surfaces the current update state inline. */}
+                  <div className="flex items-center justify-between gap-4 py-1.5">
+                    <div>
+                      <div className="text-[12.5px] font-medium text-fg">Check for updates</div>
+                      <div className="mt-0.5 text-[11px] text-faint" aria-live="polite">
+                        {checkingForUpdate
+                          ? "Checking for updates…"
+                          : update.phase === "available"
+                            ? `Update available · v${update.info?.version ?? ""}`
+                            : update.phase === "downloading"
+                              ? "Downloading update…"
+                              : update.phase === "ready"
+                                ? "Update ready — relaunch to apply"
+                                : update.phase === "error"
+                                  ? "Last check failed — try again"
+                                  : "You're on the latest version."}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCheckingForUpdate(true);
+                        void checkForUpdate().finally(() => setCheckingForUpdate(false));
+                      }}
+                      disabled={
+                        checkingForUpdate ||
+                        update.phase === "downloading" ||
+                        update.phase === "ready"
+                      }
+                      className="shrink-0 rounded-md border border-border-2 bg-panel-2/80 px-3 py-1 font-mono text-[11px] text-muted transition-colors hover:border-accent/50 hover:text-accent disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {checkingForUpdate ? "Checking…" : "Check now"}
+                    </button>
                   </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setCheckingForUpdate(true);
-                    void checkForUpdate().finally(() => setCheckingForUpdate(false));
-                  }}
-                  disabled={checkingForUpdate || update.phase === "downloading"}
-                  className="shrink-0 rounded-md border border-border-2 bg-panel-2/80 px-3 py-1 font-mono text-[11px] text-muted transition-colors hover:border-accent/50 hover:text-accent disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {checkingForUpdate ? "Checking…" : "Check now"}
-                </button>
-              </div>
+                </>
+              )}
               <ToggleRow
                 label="Neon rain"
                 hint="Ambient cyberpunk backdrop behind the app. Decorative only."

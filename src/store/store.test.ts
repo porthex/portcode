@@ -125,7 +125,7 @@ beforeEach(() => {
   m.confirmPairing.mockResolvedValue(undefined);
   m.rejectPairing.mockResolvedValue(undefined);
   m.checkForUpdate.mockResolvedValue(null);
-  m.downloadAndInstallUpdate.mockResolvedValue(undefined);
+  m.downloadAndInstallUpdate.mockResolvedValue(true);
   m.relaunchApp.mockResolvedValue(undefined);
   m.getUpdateChannel.mockResolvedValue("stable");
   m.onUpdaterEvent.mockResolvedValue(() => {});
@@ -3656,7 +3656,7 @@ describe("auto-update", () => {
 
     it("auto-downloads when an update exists and autoUpdate is on → ready", async () => {
       m.checkForUpdate.mockResolvedValue(info());
-      m.downloadAndInstallUpdate.mockResolvedValue(undefined);
+      m.downloadAndInstallUpdate.mockResolvedValue(true);
       useStore.setState({ settings: { ...DEFAULT_SETTINGS, autoUpdate: true } });
 
       await useStore.getState().checkForUpdate();
@@ -3693,8 +3693,8 @@ describe("auto-update", () => {
   });
 
   describe("startUpdateDownload", () => {
-    it("transitions to downloading then ready on success", async () => {
-      m.downloadAndInstallUpdate.mockResolvedValue(undefined);
+    it("transitions to downloading then ready on success (staged=true)", async () => {
+      m.downloadAndInstallUpdate.mockResolvedValue(true);
       useStore.setState({
         update: { phase: "available", info: info(), progress: null, error: null },
       });
@@ -3707,6 +3707,19 @@ describe("auto-update", () => {
       expect(st.update.progress).toBe(100);
       // info is preserved across the download.
       expect(st.update.info).toEqual(info());
+    });
+
+    it("resets to idle when ipc reports no update was staged (staged=false)", async () => {
+      m.downloadAndInstallUpdate.mockResolvedValue(false);
+      useStore.setState({
+        update: { phase: "available", info: info(), progress: null, error: null },
+      });
+
+      await useStore.getState().startUpdateDownload();
+
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("idle");
+      expect(st.update.info).toBeNull();
     });
 
     it("records an error and message when the download rejects", async () => {
@@ -3781,6 +3794,7 @@ describe("auto-update", () => {
   describe("setAutoUpdate", () => {
     it("persists the preference via ipc.saveSettings", async () => {
       useStore.setState({ settings: { ...DEFAULT_SETTINGS, autoUpdate: true } });
+      m.saveSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, autoUpdate: false });
 
       await useStore.getState().setAutoUpdate(false);
 
@@ -3789,7 +3803,8 @@ describe("auto-update", () => {
     });
 
     it("starts the download when enabled while an update is already available", async () => {
-      m.downloadAndInstallUpdate.mockResolvedValue(undefined);
+      m.downloadAndInstallUpdate.mockResolvedValue(true);
+      m.saveSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, autoUpdate: true });
       useStore.setState({
         settings: { ...DEFAULT_SETTINGS, autoUpdate: false },
         update: { phase: "available", info: info(), progress: null, error: null },
@@ -3803,6 +3818,7 @@ describe("auto-update", () => {
     });
 
     it("does not start a download when enabled but no update is waiting", async () => {
+      m.saveSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, autoUpdate: true });
       useStore.setState({
         settings: { ...DEFAULT_SETTINGS, autoUpdate: false },
         update: { phase: "idle", info: null, progress: null, error: null },
@@ -3811,6 +3827,22 @@ describe("auto-update", () => {
       await useStore.getState().setAutoUpdate(true);
 
       expect(m.downloadAndInstallUpdate).not.toHaveBeenCalled();
+    });
+
+    it("does not start a download when the save failed (guard passes on mismatch)", async () => {
+      // saveSettings rejects — updateSettings swallows into settingsError, settings unchanged.
+      m.saveSettings.mockRejectedValueOnce(new Error("disk full"));
+      useStore.setState({
+        settings: { ...DEFAULT_SETTINGS, autoUpdate: false },
+        update: { phase: "available", info: info(), progress: null, error: null },
+      });
+
+      await useStore.getState().setAutoUpdate(true);
+
+      // The guard `if (get().settings.autoUpdate !== enabled) return;` short-circuits.
+      expect(m.downloadAndInstallUpdate).not.toHaveBeenCalled();
+      // The update phase is untouched because startUpdateDownload was never called.
+      expect(useStore.getState().update.phase).toBe("available");
     });
   });
 
