@@ -33,9 +33,12 @@ pub fn channel() -> &'static str {
 }
 
 /// Update metadata handed to the frontend. camelCase to match the TS client.
+/// `pub(crate)` (not private): it's the return type of the `pub` `update_check`
+/// command, which `generate_handler!` reaches at crate visibility — a private
+/// struct there trips `-D private-interfaces` under clippy.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct UpdateInfo {
+pub(crate) struct UpdateInfo {
     /// The version offered by the remote manifest.
     version: String,
     /// The currently-running app version (so the UI can render "X → Y").
