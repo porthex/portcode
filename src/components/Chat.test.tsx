@@ -17,6 +17,7 @@ const session = (over: Partial<Session> = {}): Session => ({
   id: "s1",
   title: "Chat",
   workspace: null,
+  model: "claude-opus-4-8",
   createdAt: 1,
   updatedAt: 1,
   ...over,
@@ -163,6 +164,52 @@ describe("Chat children", () => {
     ).toBeInTheDocument();
     // PermissionPrompt returns null when nothing is pending.
     expect(screen.queryByText(/wants to run/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("Chat scroll-to-search-result", () => {
+  const origScroll = Element.prototype.scrollIntoView;
+  afterEach(() => {
+    Element.prototype.scrollIntoView = origScroll;
+  });
+
+  it("scrolls the targeted message into view and clears the request", () => {
+    const spy = vi.fn();
+    // jsdom doesn't implement scrollIntoView — install a spy so the effect's call is
+    // observable (and harmless).
+    Element.prototype.scrollIntoView = spy as unknown as () => void;
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "first"), userMessage("m2", "the target turn")] },
+      streaming: false,
+      scrollTargetId: "m2",
+    });
+
+    render(<Chat />);
+
+    expect(spy).toHaveBeenCalled();
+    // The request is consumed exactly once, so it can't re-fire on the next render.
+    expect(useStore.getState().scrollTargetId).toBeNull();
+  });
+
+  it("leaves the target set when the message isn't in the DOM yet (retries later)", () => {
+    const spy = vi.fn();
+    Element.prototype.scrollIntoView = spy as unknown as () => void;
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "only message")] },
+      streaming: false,
+      scrollTargetId: "not-rendered-yet",
+    });
+
+    render(<Chat />);
+
+    // Nothing matched, so the effect waits (the next messages update re-runs it)
+    // rather than clearing — otherwise a still-loading session would lose the scroll.
+    expect(spy).not.toHaveBeenCalled();
+    expect(useStore.getState().scrollTargetId).toBe("not-rendered-yet");
   });
 });
 

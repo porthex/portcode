@@ -15,12 +15,37 @@ import ReactDOM from "react-dom/client";
 import App from "../src/App";
 import { ErrorBoundary } from "../src/components/ErrorBoundary";
 import { setWebClientMode } from "../src/lib/ipc";
+import { useStore } from "../src/store/store";
+import { registerServiceWorker, startWebClientLifecycle } from "../src/lib/webClientLifecycle";
+import { createWasmConnector, setWebSessionConnector } from "../src/lib/webSession";
 import "../src/index.css";
 
-// Route Phone Sync client calls through the WASM transport. The real WASM
-// connector is injected (setWebSessionConnector) once the iroh-in-browser module
-// is wired in a later phase; until then the deterministic mock connector backs it.
+// Install the real WASM-backed connector. It lazily `import()`s the `portcode-wasm`
+// iroh-in-browser package on first connect and SELF-FALLS-BACK to the deterministic
+// mock when that package is absent (it is built by CI per §6 and may not be present
+// yet). This is the sole reference to the real transport; `webSession` stays free of
+// wasm-bindgen glue.
+setWebSessionConnector(createWasmConnector());
+
+// Route Phone Sync client calls through the connector installed above. The real
+// WASM connector dials iroh-in-browser; until the wasm exists it transparently
+// uses the inert browser mock.
 setWebClientMode(true);
+
+// Force the mobile/remote shell even in a desktop preview browser. The PWA is the
+// phone client, but `isMobilePlatform()` is false in a desktop Vercel preview, so
+// without this the app would boot into the desktop layout instead of the remote
+// pairing flow.
+useStore.getState().setRemoteMode(true);
+
+// Session persistence (§5.8): reconnect-on-resume + durable pinned-peer storage.
+// Wires pwaLifecycle + webStorage to the store. Started once; lives for the whole
+// document, so we never tear it down (the document dies on a real iOS suspend).
+startWebClientLifecycle();
+
+// Register the offline-shell service worker + push scaffolding (§5.7), guarded so
+// it's a no-op where unsupported. Fire-and-forget — the app runs without it online.
+void registerServiceWorker();
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

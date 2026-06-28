@@ -19,6 +19,10 @@ When you add or change **frontend** code (`src/`):
 
 For the **Rust** core (`src-tauri/`): `cargo test` runs in CI on every PR; `cargo llvm-cov` coverage is computed on `main`/`release` only. The crate is too heavy to build on low-RAM dev machines — **verify Rust tests via CI**, not locally.
 
+## Self-dev mode
+
+You can build Portcode while running it, dogfood-style. `pnpm app:dev:self` runs a separate **Portcode Dev** build (its own data dir + a "DEV" pill in the title bar) with live frontend reload; `pnpm watch:rust` (needs `cargo install --locked bacon`) gives fast Rust type/clippy feedback without a full build. See `docs/SELF_DEV.md` for the full flow and the Phase 2 roadmap. Phase 1 is **config + tooling only** (no Rust changes); run the stable and dev builds **one at a time** (login/phone-sync state is shared).
+
 ## Project memory
 
 Durable, project-scoped knowledge lives in `.claude/memory/project-memory.md`. It is auto-loaded each session by the SessionStart hook and is meant to survive across sessions/devices (it's committed).

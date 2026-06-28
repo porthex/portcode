@@ -1,0 +1,22 @@
+# Workspace Cargo config.
+#
+# Phase 1 (docs/IOS_WEB_CLIENT_PLAN.md §5.1) turned `src-tauri` into a workspace
+# member. Cargo's default for a workspace is a SHARED `target/` at the workspace
+# root — which moved the desktop binary from `src-tauri/target/debug/portcode.exe`
+# to `<root>/target/debug/portcode.exe` and broke every path that still points at
+# the old per-crate location (the WebdriverIO smoke `application` path, the
+# release-workflow bundle globs, RELEASE.md). Pin the target dir back to
+# `src-tauri/target` so all those references keep resolving unchanged. The path is
+# resolved relative to this config's parent (the workspace root).
+[build]
+target-dir = "src-tauri/target"
+
+# MANDATORY for getrandom 0.3 on wasm: a root-level `cargo build -p portcode-sync
+# --target wasm32-unknown-unknown` (which CI runs from the workspace root) resolves
+# THIS config, not the crate-local `crates/portcode-*/.cargo/config.toml` — Cargo
+# only reads the config in/above the invocation directory. Without this flag the
+# wasm build fails with "the wasm_js backend requires the getrandom_backend cfg".
+# The crate-local configs are kept (harmless) so building from inside a crate dir
+# still works. Pairs with the `getrandom features=["wasm_js"]` in the wasm deps.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", 'getrandom_backend="wasm_js"']

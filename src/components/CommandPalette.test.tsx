@@ -21,6 +21,7 @@ vi.mock("../lib/ipc", () => ({
   resolvePermission: vi.fn(),
   openFolder: vi.fn(),
   runAgent: vi.fn(),
+  searchMessages: vi.fn(),
 }));
 
 import * as ipc from "../lib/ipc";
@@ -56,6 +57,7 @@ beforeEach(() => {
   m.resolvePermission.mockResolvedValue(undefined);
   m.openFolder.mockResolvedValue(null);
   m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}), dispose: vi.fn() });
+  m.searchMessages.mockResolvedValue([]);
 });
 
 describe("visibility", () => {
@@ -367,6 +369,55 @@ describe("running commands", () => {
     fireEvent.click(screen.getByText("Open folder…"));
 
     await vi.waitFor(() => expect(m.openFolder).toHaveBeenCalledTimes(1));
+    expect(useStore.getState().showPalette).toBe(false);
+  });
+});
+
+describe("message search", () => {
+  it("does not search for a single-character query (avoids noise)", () => {
+    open();
+    render(<CommandPalette />);
+
+    fireEvent.change(input(), { target: { value: "p" } });
+
+    expect(m.searchMessages).not.toHaveBeenCalled();
+  });
+
+  it("shows search hits and jumps to the turn on click, then closes", async () => {
+    useStore.setState({
+      sessions: [
+        {
+          id: "s2",
+          title: "Old chat",
+          workspace: null,
+          model: "claude-opus-4-8",
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+    });
+    m.searchMessages.mockResolvedValue([
+      {
+        sessionId: "s2",
+        messageId: "m9",
+        seq: 3,
+        role: "assistant",
+        snippet: "the parser lives here",
+      },
+    ]);
+    open();
+    render(<CommandPalette />);
+
+    fireEvent.change(input(), { target: { value: "parser" } });
+
+    // the hit row appears after the debounce + async resolve
+    const row = await screen.findByText("the parser lives here");
+    fireEvent.click(row);
+
+    // scrollTargetId is the LAST write in jumpToMessage (after selectSession's async
+    // message load), so waiting on it guarantees the whole jump completed.
+    await vi.waitFor(() => expect(useStore.getState().scrollTargetId).toBe("m9"));
+    expect(useStore.getState().activeId).toBe("s2");
     expect(useStore.getState().showPalette).toBe(false);
   });
 });

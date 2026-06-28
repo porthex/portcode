@@ -5,16 +5,33 @@
 // are the wire types the phone must decode — so gating `llm` would break mobile.
 #[cfg(desktop)]
 mod agent;
+#[cfg(desktop)]
+mod agents;
+#[cfg(desktop)]
+mod background;
+// Cross-target crash-reporting consent flag (the on-disk opt-in). NOT cfg-gated: the
+// desktop `telemetry` module re-uses it AND the mobile `telemetry_set_consent`
+// command writes it (the Android `PortcodeApplication` reads the same flag before it
+// ever calls `SentryAndroid.init`). Compiles on every target. See `consent.rs`.
+mod consent;
 mod db;
 mod llm;
 #[cfg(desktop)]
 mod oauth;
 mod permissions;
+#[cfg(desktop)]
+mod scrub;
 mod secrets;
 mod settings;
 mod sync;
 #[cfg(desktop)]
+mod telemetry;
+#[cfg(desktop)]
 mod tools;
+// Auto-updater command surface (desktop only — the phone is a remote client and
+// never self-updates). The whole module is `#![cfg(desktop)]` internally too.
+#[cfg(desktop)]
+mod update;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,7 +47,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use tauri::{AppHandle, Manager, State};
 
-use crate::db::{Db, SessionRow, UiMessage};
+use crate::db::{Db, DraftRow, SearchHit, SessionRow, UiMessage, UsageRow};
 use crate::settings::Settings;
 
 pub struct AppState {
@@ -40,6 +57,15 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     pub pending: permissions::Pending,
+    /// Live subagents (the `task` tool), keyed by agent id, so the agents panel can
+    /// Stop one without the rest. DESKTOP-ONLY — only the desktop runs the agent
+    /// loop that spawns subagents; the phone is a pure remote client.
+    #[cfg(desktop)]
+    pub agents: agents::Agents,
+    /// Live background `shell` tasks, keyed by task id, so a session Stop can kill
+    /// the ones it launched. DESKTOP-ONLY — only the desktop runs the agent loop.
+    #[cfg(desktop)]
+    pub background: background::Background,
     /// Serializes OAuth token refreshes so concurrent agent turns don't each
     /// hit the token endpoint (single-flight). Guards no data — held only for
     /// the duration of a refresh.
@@ -80,6 +106,9 @@ fn get_settings(state: State<AppState>) -> Settings {
 fn save_settings(state: State<AppState>, settings: Value) -> Settings {
     {
         let mut s = state.settings.lock().unwrap();
+        if let Some(p) = settings.get("provider").and_then(|v| v.as_str()) {
+            s.provider = p.to_string();
+        }
         if let Some(m) = settings.get("model").and_then(|v| v.as_str()) {
             s.model = m.to_string();
         }
@@ -94,6 +123,22 @@ fn save_settings(state: State<AppState>, settings: Value) -> Settings {
         }
         if let Some(t) = settings.get("typingAnimation").and_then(|v| v.as_bool()) {
             s.typing_animation = t;
+        }
+        // Permission mode + rules. Parse defensively: an unknown mode or a
+        // malformed rule list is IGNORED (keep the prior, safer value) rather than
+        // coerced — a bad save must never silently downgrade the permission gate.
+        if let Some(v) = settings.get("permissionMode") {
+            if let Ok(mode) = serde_json::from_value::<permissions::PermissionMode>(v.clone()) {
+                s.permission_mode = mode;
+            }
+        }
+        if let Some(v) = settings.get("rules") {
+            if let Ok(rules) = serde_json::from_value::<Vec<permissions::Rule>>(v.clone()) {
+                s.rules = rules;
+            }
+        }
+        if let Some(b) = settings.get("autoUpdate").and_then(|v| v.as_bool()) {
+            s.auto_update = b;
         }
         s.save(&state.config_dir);
     }
@@ -187,6 +232,7 @@ fn create_session(
     id: String,
     title: Option<String>,
     workspace: Option<String>,
+    model: Option<String>,
 ) -> Result<(), String> {
     state
         .db
@@ -194,6 +240,7 @@ fn create_session(
             &id,
             title.as_deref().unwrap_or("New chat"),
             workspace.as_deref(),
+            model.as_deref(),
             db::now_ms(),
         )
         .map_err(|e| e.to_string())
@@ -215,6 +262,55 @@ fn delete_session(state: State<AppState>, id: String) -> Result<(), String> {
 #[tauri::command]
 fn get_messages(state: State<AppState>, session_id: String) -> Vec<UiMessage> {
     state.db.ui_messages(&session_id)
+}
+
+// ── drafts (composer open-loop persistence) ──────────────────────────────────
+
+/// Persist (or clear, when blank) one session's unsent composer draft. Debounced
+/// from the store so keystrokes don't hammer SQLite.
+#[tauri::command]
+fn save_draft(state: State<AppState>, session_id: String, text: String) -> Result<(), String> {
+    state
+        .db
+        .save_draft(&session_id, &text, db::now_ms())
+        .map_err(|e| e.to_string())
+}
+
+/// The stored draft for a session, or `null` when there is none.
+#[tauri::command]
+fn get_draft(state: State<AppState>, session_id: String) -> Option<String> {
+    state.db.get_draft(&session_id)
+}
+
+/// Every stored draft — the init-bundle hydration for the frontend's per-session
+/// draft map (authoritative over the optimistic localStorage mirror).
+#[tauri::command]
+fn get_drafts(state: State<AppState>) -> Vec<DraftRow> {
+    state.db.all_drafts()
+}
+
+// ── usage (cumulative per-session token spend) ───────────────────────────────
+
+/// Cumulative token usage for one session (zeros when none recorded).
+#[tauri::command]
+fn get_usage(state: State<AppState>, session_id: String) -> UsageRow {
+    state.db.get_usage(&session_id)
+}
+
+/// Every session's cumulative usage — restores the per-session token meters and
+/// the workspace-total spend in the status HUD across a restart.
+#[tauri::command]
+fn get_all_usage(state: State<AppState>) -> Vec<UsageRow> {
+    state.db.all_usage()
+}
+
+// ── message search (⌘K jump to a past turn) ──────────────────────────────────
+
+/// Search message text across every session, newest first. Capped server-side so
+/// a broad query can't return an unbounded result set.
+#[tauri::command]
+fn search_messages(state: State<AppState>, query: String) -> Vec<SearchHit> {
+    state.db.search_messages(&query, 50)
 }
 
 // ── workspace file tree ──────────────────────────────────────────────────────
@@ -303,12 +399,15 @@ async fn run_agent(
     state: State<'_, AppState>,
     session_id: String,
     text: String,
+    model: Option<String>,
 ) -> Result<(), String> {
     let http = state.http.clone();
     let settings = state.settings.clone();
     let db = state.db.clone();
     let cancels = state.cancels.clone();
     let pending = state.pending.clone();
+    let agents = state.agents.clone();
+    let background = state.background.clone();
     let oauth_refresh = state.oauth_refresh.clone();
 
     // Run in the background so the command returns immediately and the frontend
@@ -321,9 +420,12 @@ async fn run_agent(
             db,
             cancels,
             pending,
+            agents,
+            background,
             oauth_refresh,
             session_id,
             text,
+            model,
         )
         .await;
     });
@@ -336,7 +438,19 @@ fn cancel_agent(state: State<AppState>, session_id: String) {
     if let Some(flag) = state.cancels.lock().unwrap().get(&session_id) {
         flag.store(true, Ordering::Relaxed);
     }
+    // A session-wide Stop also cancels every subagent the run launched...
+    agents::cancel_session(&state.agents, &session_id);
+    // ...and kills its background tasks.
+    background::cancel_session(&state.background, &session_id);
     permissions::deny_all(&state.pending, &session_id);
+}
+
+/// Stop ONE subagent (and its descendants) from the agents panel, leaving the rest
+/// of the session — including the top-level turn — running.
+#[cfg(desktop)]
+#[tauri::command]
+fn cancel_agent_by_id(state: State<AppState>, agent_id: String) {
+    agents::cancel_one(&state.agents, &agent_id);
 }
 
 #[cfg(desktop)]
@@ -348,6 +462,50 @@ fn resolve_permission(state: State<AppState>, id: String, decision: String) {
         permissions::Decision::Deny
     };
     permissions::resolve(&state.pending, &id, d);
+}
+
+// ── Opt-in crash reporting (Phase 1b desktop / Phase 3 Android) ──────────────
+
+/// Mirror the frontend's crash-reporting consent into the native host, on BOTH
+/// desktop and mobile. The frontend calls `ipc.setTelemetryConsent` on every Tauri
+/// build, so this command is now registered on both targets (Phase 3).
+///
+/// It only ever WRITES the on-disk consent flag — it never inits/closes any SDK:
+///  * DESKTOP — `telemetry::set_consent` writes `<app_config_dir>/.telemetry_consent`
+///    (the flag the main process AND the re-exec'd crash-reporter child both read in
+///    `before_send`). Inert without a build-time `SENTRY_DSN`.
+///  * ANDROID — resolves the app-private config dir from the `AppHandle`
+///    (`app_config_dir()`, inside the OS sandbox — the same dir `secrets::init_dir`
+///    uses) and writes the SAME flag via `consent::set_consent_in`. The Kotlin
+///    `PortcodeApplication` reads it on next launch and refuses to init the Sentry
+///    SDK unless it is `"1"` (AND a DSN was baked in). Writing the flag NEVER arms
+///    anything by itself — the SDK is only ever initialized at process start, behind
+///    both the DSN gate and this flag, so opting in mid-session takes effect on the
+///    next launch (matching the desktop startup-bind model).
+///
+/// The whole pipeline stays inert by default: no DSN ⇒ the SDK is never initialized
+/// on either platform, so this command is a pure flag write with no telemetry effect.
+#[tauri::command]
+fn telemetry_set_consent(app: AppHandle, enabled: bool) {
+    #[cfg(desktop)]
+    {
+        let _ = &app; // desktop resolves the path without an AppHandle
+        telemetry::set_consent(enabled);
+    }
+    #[cfg(mobile)]
+    {
+        // On Android `dirs::config_dir()` does NOT reliably point at the app sandbox,
+        // so resolve the app-private config dir from Tauri (it IS inside the sandbox)
+        // and write the flag there. Falls back to the temp dir if unavailable — a
+        // best-effort write whose failure mode is the privacy-safe one (flag absent ⇒
+        // Kotlin reads consent OFF ⇒ SDK never inits). See `consent.rs` /
+        // `PortcodeApplication.kt` for the exact path agreement + device-verify note.
+        let dir = app
+            .path()
+            .app_config_dir()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        consent::set_consent_in(&dir, enabled);
+    }
 }
 
 // ── Phone Sync (Phase 1b: identity + pairing surface) ────────────────────────
@@ -511,6 +669,8 @@ fn phone_sync_listen(app: AppHandle, state: State<AppState>) -> Result<(), Strin
         state.db.clone(),
         state.cancels.clone(),
         state.pending.clone(),
+        state.agents.clone(),
+        state.background.clone(),
         state.oauth_refresh.clone(),
         state.listen_endpoint.clone(),
         state.pairing_gate.clone(),
@@ -532,7 +692,16 @@ async fn serve_connection(
 ) {
     use base64::Engine as _;
     use sync::pairing_gate::ServeDecision;
+    use sync::protocol::{Cursor, SyncFrame};
     use tauri::Emitter as _;
+
+    // On the first-pairing (`Prompt`) path the desktop reads the phone's early
+    // `Hello` itself while watching for a `PairingReject` (see below), so by the
+    // time catch-up runs the `Hello` is already consumed. Stash its cursors here so
+    // catch-up answers them via `serve_catch_up_with_cursors` instead of re-reading
+    // a `Hello` that will never come again. `None` on the already-trusted `Serve`
+    // path, where `serve_catch_up` reads the `Hello` normally.
+    let mut prefetched_cursors: Option<Vec<Cursor>> = None;
 
     // ── DEVICE-TRUST GATE ────────────────────────────────────────────────────
     // Completing the keyless XX handshake does NOT authorize a peer. Identify the
@@ -580,20 +749,90 @@ async fn serve_connection(
                 }),
             );
 
-            let confirmed =
-                match tokio::time::timeout(sync::pairing_gate::PAIRING_CONFIRM_TIMEOUT, rx).await {
-                    // The user confirmed: `confirm_pairing` already persisted the key
-                    // as confirmed before resolving this oneshot.
-                    Ok(Ok(true)) => true,
-                    // Rejected, or the sender was dropped (forgotten) — do not serve.
-                    Ok(Ok(false)) | Ok(Err(_)) => false,
-                    // Timed out — clean up the pending entry and do not serve.
-                    Err(_) => {
-                        pairing_gate.forget_pending(&request_id);
-                        false
-                    }
-                };
+            // Await the desktop user's decision, but ALSO watch the channel: the
+            // phone sends its catch-up `Hello` as soon as the handshake completes
+            // (before either side confirms the SAS), and the phone user can decline
+            // — sending a `PairingReject` — while we're parked on this prompt. So we
+            // loop, selecting the decision against an inbound frame:
+            //   * `Hello`         → stash its cursors and keep waiting (this is the
+            //                       catch-up kickoff, consumed here so catch-up uses
+            //                       `serve_catch_up_with_cursors` afterward);
+            //   * `PairingReject` → the phone declined: stop waiting, drop promptly
+            //                       (no 60s park), no outbound reject (phone knows);
+            //   * any other frame / error / close → protocol violation or a dead
+            //                       connection: stop waiting and drop.
+            // `desktop_rejected` records whether WE (the desktop user) declined, so
+            // we can tell the phone afterward.
+            let decision_fut =
+                tokio::time::timeout(sync::pairing_gate::PAIRING_CONFIRM_TIMEOUT, rx);
+            tokio::pin!(decision_fut);
+            let mut desktop_rejected = false;
+            let confirmed = loop {
+                tokio::select! {
+                    decision = &mut decision_fut => break match decision {
+                        // The user confirmed: `confirm_pairing` already persisted the
+                        // key as confirmed before resolving this oneshot.
+                        Ok(Ok(true)) => true,
+                        // The user rejected — note it so we send the phone a reject.
+                        Ok(Ok(false)) => {
+                            desktop_rejected = true;
+                            false
+                        }
+                        // The sender was dropped (forgotten) — do not serve.
+                        Ok(Err(_)) => false,
+                        // Timed out — clean up the pending entry and do not serve.
+                        Err(_) => {
+                            pairing_gate.forget_pending(&request_id);
+                            false
+                        }
+                    },
+                    inbound = paired.channel.recv_frame() => match inbound {
+                        // The phone's early catch-up kickoff: keep its cursors and
+                        // keep waiting for the desktop user's decision.
+                        Ok(SyncFrame::Hello { cursors, .. }) => {
+                            prefetched_cursors = Some(cursors);
+                        }
+                        // The phone declined: drop now instead of parking 60s. No
+                        // outbound reject — the phone already knows + is tearing down.
+                        Ok(SyncFrame::PairingReject { .. }) => {
+                            eprintln!("phone-sync: phone rejected pairing — dropping connection");
+                            pairing_gate.forget_pending(&request_id);
+                            break false;
+                        }
+                        Ok(other) => {
+                            eprintln!(
+                                "phone-sync: unexpected frame before pairing confirmed: \
+                                 {other:?} — dropping connection"
+                            );
+                            pairing_gate.forget_pending(&request_id);
+                            break false;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "phone-sync: connection ended while awaiting pairing: {e} \
+                                 — dropping connection"
+                            );
+                            pairing_gate.forget_pending(&request_id);
+                            break false;
+                        }
+                    },
+                }
+            };
             if !confirmed {
+                // If WE declined, tell the phone before dropping so it surfaces the
+                // decline instead of a bare disconnect. Best-effort: a send failure
+                // (channel already gone) is logged, not fatal — we drop either way.
+                if desktop_rejected {
+                    if let Err(e) = paired
+                        .channel
+                        .send_frame(&SyncFrame::PairingReject {
+                            reason: Some("declined".into()),
+                        })
+                        .await
+                    {
+                        eprintln!("phone-sync: failed to send reject to phone: {e}");
+                    }
+                }
                 eprintln!("phone-sync: pairing not confirmed — dropping connection");
                 return;
             }
@@ -614,8 +853,17 @@ async fn serve_connection(
         }
     };
 
-    // Catch-up runs on the full-duplex channel (SecureChannel: FrameChannel).
-    if let Err(e) = sync::session::serve_catch_up(&mut paired.channel, &db).await {
+    // Catch-up runs on the full-duplex channel (SecureChannel: FrameChannel). If the
+    // first-pairing path already consumed the phone's `Hello` (while watching for a
+    // reject), answer the stashed cursors directly; otherwise read the `Hello` here
+    // (the already-trusted reconnect path).
+    let catch_up = match prefetched_cursors {
+        Some(cursors) => {
+            sync::session::serve_catch_up_with_cursors(&mut paired.channel, &db, cursors).await
+        }
+        None => sync::session::serve_catch_up(&mut paired.channel, &db).await,
+    };
+    if let Err(e) = catch_up {
         eprintln!("phone-sync: catch-up failed: {e}");
         return;
     }
@@ -663,6 +911,8 @@ fn start_listener(
     db: Arc<Db>,
     cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     pending: permissions::Pending,
+    agents: agents::Agents,
+    background: background::Background,
     oauth_refresh: Arc<tokio::sync::Mutex<()>>,
     listen_endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
     pairing_gate: Arc<sync::pairing_gate::PairingGate>,
@@ -679,11 +929,18 @@ fn start_listener(
         db: db.clone(),
         cancels,
         pending,
+        agents,
+        background,
         oauth_refresh,
     };
-    let device_private = device.private.clone();
     let app_for_loop = app.clone();
 
+    // `device` (the long-term Noise identity) is MOVED into the task below (by the
+    // `async move`) and its private key is BORROWED at each `accept_and_pair` call —
+    // we never take a `.to_vec()` heap copy of the secret (which would linger
+    // un-zeroized in freed heap until reuse). `StaticKeypair` zeroizes its private
+    // half on drop, so the only copy lives for the task's lifetime and is wiped on
+    // exit.
     tauri::async_runtime::spawn(async move {
         // Build the endpoint INSIDE the task so it is owned here and outlives every
         // `accept_and_pair(&endpoint, …)` borrow below. RelayMode::Default = relay +
@@ -722,20 +979,21 @@ fn start_listener(
             // `accept_and_pair`, post-`accept`), so it captures the window open at
             // connect time — not a stale snapshot from while the loop was parked idle.
             let gate_for_nonce = pairing_gate.clone();
-            let paired = match sync::transport::accept_and_pair(&endpoint, &device_private, || {
-                gate_for_nonce.active_nonce().unwrap_or_default()
-            })
-            .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    if e == "endpoint closed" {
-                        return; // socket gone → stop listening
+            let paired =
+                match sync::transport::accept_and_pair(&endpoint, device.private_key(), || {
+                    gate_for_nonce.active_nonce().unwrap_or_default()
+                })
+                .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if e == "endpoint closed" {
+                            return; // socket gone → stop listening
+                        }
+                        eprintln!("phone-sync: pairing failed: {e}");
+                        continue; // a transient/rejected pairing must not kill the loop
                     }
-                    eprintln!("phone-sync: pairing failed: {e}");
-                    continue; // a transient/rejected pairing must not kill the loop
-                }
-            };
+                };
 
             // Hand off to a per-connection task so the accept loop is free to take
             // the next phone. `handler.clone()` is cheap (all Arc/AppHandle).
@@ -816,7 +1074,7 @@ async fn phone_sync_connect(
     let paired = sync::transport::connect_and_pair(
         &endpoint,
         payload.node_addr.clone(),
-        &identity.private,
+        identity.private_key(),
         &prologue,
     )
     .await?;
@@ -918,6 +1176,16 @@ fn phone_sync_disconnect(state: State<AppState>) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Phase 2 — arm desktop crash reporting FIRST: the out-of-process minidump monitor
+    // + the Rust Sentry client whose `before_send` scrubs and consent-gates every event.
+    // This MUST be the first statement in run(): it executes in BOTH this process and
+    // the re-exec'd crash-reporter child (everything before `minidump::init` runs in
+    // both), and the monitor must be live before any crash. Inert (returns None) when no
+    // `SENTRY_DSN` was baked in — dev/contributor/fork builds never report. The returned
+    // guard is held for the whole process lifetime; dropping it stops the reporter child.
+    #[cfg(desktop)]
+    let _sentry_guard = telemetry::init_desktop_with_minidump();
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -956,6 +1224,10 @@ pub fn run() {
                 db: Arc::new(db),
                 cancels: Arc::new(Mutex::new(HashMap::new())),
                 pending: Arc::new(Mutex::new(HashMap::new())),
+                #[cfg(desktop)]
+                agents: agents::new(),
+                #[cfg(desktop)]
+                background: background::new(),
                 oauth_refresh: Arc::new(tokio::sync::Mutex::new(())),
                 phone_client: Arc::new(Mutex::new(None)),
                 listen_endpoint: Arc::new(Mutex::new(None)),
@@ -982,6 +1254,8 @@ pub fn run() {
                     state.db.clone(),
                     state.cancels.clone(),
                     state.pending.clone(),
+                    state.agents.clone(),
+                    state.background.clone(),
                     state.oauth_refresh.clone(),
                     state.listen_endpoint.clone(),
                     state.pairing_gate.clone(),
@@ -1017,10 +1291,18 @@ pub fn run() {
         rename_session,
         delete_session,
         get_messages,
+        save_draft,
+        get_draft,
+        get_drafts,
+        get_usage,
+        get_all_usage,
+        search_messages,
         list_dir,
         run_agent,
         cancel_agent,
+        cancel_agent_by_id,
         resolve_permission,
+        telemetry_set_consent,
         phone_sync_status,
         phone_sync_begin_pairing,
         phone_sync_unpair,
@@ -1029,7 +1311,12 @@ pub fn run() {
         phone_sync_send_command,
         phone_sync_disconnect,
         confirm_pairing,
-        reject_pairing
+        reject_pairing,
+        // Auto-updater surface (desktop-only; phone never self-updates).
+        update::update_check,
+        update::update_download_and_install,
+        update::update_relaunch,
+        update::update_channel
     ]);
 
     // MOBILE — the remote-CLIENT subset. Shared settings/secrets/sessions +
@@ -1049,6 +1336,13 @@ pub fn run() {
         rename_session,
         delete_session,
         get_messages,
+        save_draft,
+        get_draft,
+        get_drafts,
+        get_usage,
+        get_all_usage,
+        search_messages,
+        telemetry_set_consent,
         phone_sync_status,
         phone_sync_unpair,
         phone_sync_connect,

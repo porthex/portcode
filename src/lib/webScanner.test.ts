@@ -1,10 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  createZxingDecoder,
   isWebCameraAvailable,
   scanFromFile,
   scanWithCamera,
   type ScannerDeps,
   type QrDecoder,
+  type ZxingReaderModule,
 } from "./webScanner";
 
 // A throwaway ImageData stand-in: jsdom has no real canvas, so we never construct
@@ -91,6 +93,14 @@ function fakeStream(tracks: ReturnType<typeof fakeTrack>[]) {
   return { getTracks: () => tracks } as unknown as MediaStream;
 }
 
+// A pass-through `makeVideo` for the injected-deps tests: they supply their own
+// `captureFrame` and don't need a real `<video>`, so the "video" is just the
+// stream itself. Spread into deps so the default DOM-backed makeVideo (which
+// jsdom can't run) is never reached in these unit tests.
+const passThroughVideo = {
+  makeVideo: async (s: MediaStream) => s,
+} satisfies Partial<ScannerDeps>;
+
 // A `setTimeout` shim that fires immediately so the polling loop doesn't actually
 // wait. Returns a dummy handle (clearTimeout no-ops on it harmlessly).
 const immediateTimeout = ((fn: () => void) => {
@@ -117,7 +127,7 @@ describe("scanWithCamera", () => {
 
     const out = await scanWithCamera({
       decode,
-      deps: { getUserMedia, captureFrame, setTimeoutFn: immediateTimeout },
+      deps: { getUserMedia, captureFrame, setTimeoutFn: immediateTimeout, ...passThroughVideo },
     });
 
     expect(out).toEqual({ ok: true, value: "the-payload" });
@@ -140,6 +150,7 @@ describe("scanWithCamera", () => {
         getUserMedia: vi.fn().mockResolvedValue(stream),
         captureFrame: vi.fn().mockReturnValue(fakeImage),
         setTimeoutFn: immediateTimeout,
+        ...passThroughVideo,
       },
     });
     expect(out).toEqual({ ok: true, value: "v" });
@@ -159,11 +170,80 @@ describe("scanWithCamera", () => {
         getUserMedia: vi.fn().mockResolvedValue(fakeStream([track])),
         captureFrame,
         setTimeoutFn: immediateTimeout,
+        ...passThroughVideo,
       },
     });
     expect(out).toEqual({ ok: true, value: "ok-after-null-frame" });
     expect(decode).toHaveBeenCalledTimes(1);
     expect(track.stop).toHaveBeenCalled();
+  });
+
+  it("wraps the stream in a <video> and feeds THAT (not the raw stream) to captureFrame", async () => {
+    // Regression: the live-camera loop used to pass the raw MediaStream to
+    // captureFrame, but the default captureFrame needs an HTMLVideoElement, so it
+    // always returned null and the camera never decoded. Verify makeVideo is called
+    // with the stream and its output is what captureFrame receives.
+    const track = fakeTrack();
+    const stream = fakeStream([track]);
+    const fakeVideo = { tag: "video" } as unknown as HTMLVideoElement;
+    const makeVideo = vi.fn().mockResolvedValue(fakeVideo);
+    const captureFrame = vi.fn().mockReturnValue(fakeImage);
+    const decode = vi.fn().mockResolvedValue("decoded");
+
+    const out = await scanWithCamera({
+      decode,
+      deps: {
+        getUserMedia: vi.fn().mockResolvedValue(stream),
+        makeVideo,
+        captureFrame,
+        setTimeoutFn: immediateTimeout,
+      },
+    });
+
+    expect(out).toEqual({ ok: true, value: "decoded" });
+    expect(makeVideo).toHaveBeenCalledWith(stream);
+    // captureFrame must see the <video>, never the raw MediaStream.
+    expect(captureFrame).toHaveBeenCalledWith(fakeVideo);
+    expect(captureFrame).not.toHaveBeenCalledWith(stream);
+    expect(track.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the real default makeVideo (no <video>) under a DOM-less host without throwing", async () => {
+    // With no makeVideo injected, the default is used. Under jsdom we still go
+    // through resolveDeps's defaults; assert the call completes and releases the
+    // camera. (The default captureFrame yields null for the non-video source here,
+    // so we abort via signal to terminate the loop deterministically.)
+    const track = fakeTrack();
+    const controller = new AbortController();
+    const out = await scanWithCamera({
+      decode: vi.fn().mockResolvedValue(null),
+      signal: controller.signal,
+      deps: {
+        getUserMedia: vi.fn().mockResolvedValue(fakeStream([track])),
+        // No makeVideo / captureFrame injected → exercises resolveDeps defaults.
+        setTimeoutFn: ((fn: () => void) => {
+          controller.abort();
+          fn();
+          return 0 as unknown as ReturnType<typeof setTimeout>;
+        }) as unknown as typeof setTimeout,
+      },
+    });
+    expect(out).toEqual({ ok: false, reason: "cancelled" });
+    expect(track.stop).toHaveBeenCalled();
+  });
+
+  it("returns unavailable when no camera API exists and no getUserMedia is injected", async () => {
+    // Regression: a missing navigator.mediaDevices.getUserMedia used to surface as
+    // reason:"error" (the default getUserMedia throws a TypeError), but callers need
+    // "unavailable" to fall back to the file/manual path.
+    const orig = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { value: {}, configurable: true });
+    try {
+      const out = await scanWithCamera({ decode: vi.fn() });
+      expect(out).toEqual({ ok: false, reason: "unavailable" });
+    } finally {
+      Object.defineProperty(globalThis, "navigator", { value: orig, configurable: true });
+    }
   });
 
   it("maps NotAllowedError to denied", async () => {
@@ -221,7 +301,7 @@ describe("scanWithCamera", () => {
     const out = await scanWithCamera({
       decode,
       signal: controller.signal,
-      deps: { getUserMedia, captureFrame, setTimeoutFn: abortingTimeout },
+      deps: { getUserMedia, captureFrame, setTimeoutFn: abortingTimeout, ...passThroughVideo },
     });
 
     expect(out).toEqual({ ok: false, reason: "cancelled" });
@@ -245,6 +325,7 @@ describe("scanWithCamera", () => {
         getUserMedia: vi.fn().mockResolvedValue(fakeStream([track])),
         captureFrame,
         setTimeoutFn: immediateTimeout,
+        ...passThroughVideo,
       },
     });
     expect(out).toEqual({ ok: false, reason: "cancelled" });
@@ -261,9 +342,87 @@ describe("scanWithCamera", () => {
           throw new Error("draw failed");
         }),
         setTimeoutFn: immediateTimeout,
+        ...passThroughVideo,
       },
     });
     expect(out).toEqual({ ok: false, reason: "error", message: "draw failed" });
     expect(track.stop).toHaveBeenCalled();
+  });
+});
+
+// ── createZxingDecoder ───────────────────────────────────────────────────────
+//
+// The real default decoder is backed by `zxing-wasm`. We NEVER load real wasm in
+// vitest: every test injects a fake loader that returns a stub `readBarcodes`.
+
+describe("createZxingDecoder", () => {
+  it("returns the first VALID barcode's text", async () => {
+    const readBarcodes = vi.fn().mockResolvedValue([
+      { isValid: false, text: "garbage" },
+      { isValid: true, text: "payload-json" },
+    ]);
+    const load = vi.fn(async (): Promise<ZxingReaderModule> => ({ readBarcodes }));
+    const decode = createZxingDecoder(load);
+
+    const out = await decode(fakeImage);
+    expect(out).toBe("payload-json");
+    expect(readBarcodes).toHaveBeenCalledWith(fakeImage);
+  });
+
+  it("returns null when no barcode is found (empty results)", async () => {
+    const load = async (): Promise<ZxingReaderModule> => ({
+      readBarcodes: vi.fn().mockResolvedValue([]),
+    });
+    const decode = createZxingDecoder(load);
+    expect(await decode(fakeImage)).toBeNull();
+  });
+
+  it("returns null when results are present but none are valid (or are empty text)", async () => {
+    const load = async (): Promise<ZxingReaderModule> => ({
+      readBarcodes: vi.fn().mockResolvedValue([
+        { isValid: false, text: "nope" },
+        { isValid: true, text: "" }, // valid but empty → not a usable QR
+      ]),
+    });
+    const decode = createZxingDecoder(load);
+    expect(await decode(fakeImage)).toBeNull();
+  });
+
+  it("loads the wasm module only once across repeated decodes (memoized)", async () => {
+    const readBarcodes = vi.fn().mockResolvedValue([{ isValid: true, text: "x" }]);
+    const load = vi.fn(async (): Promise<ZxingReaderModule> => ({ readBarcodes }));
+    const decode = createZxingDecoder(load);
+
+    await decode(fakeImage);
+    await decode(fakeImage);
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(readBarcodes).toHaveBeenCalledTimes(2);
+  });
+
+  it("plugs into scanFromFile as a real QrDecoder", async () => {
+    const load = async (): Promise<ZxingReaderModule> => ({
+      readBarcodes: vi.fn().mockResolvedValue([{ isValid: true, text: "from-file" }]),
+    });
+    const decode: QrDecoder = createZxingDecoder(load);
+    const deps: ScannerDeps = { decodeFile: vi.fn().mockResolvedValue(fakeImage) };
+    const out = await scanFromFile(fakeFile, decode, deps);
+    expect(out).toEqual({ ok: true, value: "from-file" });
+  });
+
+  it("retries the load after a rejection (does not cache the rejected promise)", async () => {
+    const readBarcodes = vi.fn().mockResolvedValue([{ isValid: true, text: "recovered" }]);
+    // First load() rejects (transient wasm-chunk fetch failure); the second succeeds.
+    const load = vi
+      .fn<() => Promise<ZxingReaderModule>>()
+      .mockRejectedValueOnce(new Error("network down"))
+      .mockResolvedValue({ readBarcodes });
+    const decode = createZxingDecoder(load);
+
+    // First decode propagates the load rejection…
+    await expect(decode(fakeImage)).rejects.toThrow("network down");
+    // …and a later scan RETRIES the load instead of being stuck on the rejected
+    // promise, so it recovers.
+    expect(await decode(fakeImage)).toBe("recovered");
+    expect(load).toHaveBeenCalledTimes(2);
   });
 });

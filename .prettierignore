@@ -8,6 +8,12 @@ coverage/
 src-tauri/target/
 src-tauri/gen/
 
+# Committed but machine-generated wasm-bindgen artifact (wasm-pack --target web).
+# The glue .js / .d.ts are emitted by the toolchain and must not churn the format
+# baseline; the README is hand-written but kept alongside the artifact, so the
+# whole dir is excluded for simplicity.
+web/wasm/
+
 # Dependencies
 node_modules/
 

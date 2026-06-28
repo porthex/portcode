@@ -13,14 +13,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use crate::agent;
+use crate::agents;
+use crate::background;
 use crate::db::{self, Db};
 use crate::permissions::{self, Decision, Pending};
 use crate::settings::Settings;
-use crate::sync::protocol::RemoteCommand;
+use crate::sync::protocol::{RemoteCommand, SyncFrame};
 use crate::sync::session::CommandHandler;
+use crate::sync::SyncHub;
 
 /// Owned, `Send + 'static` capture of the `AppState` pieces a phone's remote
 /// commands drive. Cloned from `AppState` when the listener starts; the inner
@@ -34,6 +37,8 @@ pub struct DesktopCommandHandler {
     pub db: Arc<Db>,
     pub cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     pub pending: Pending,
+    pub agents: agents::Agents,
+    pub background: background::Background,
     pub oauth_refresh: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -66,6 +71,8 @@ impl CommandHandler for DesktopCommandHandler {
                 let db = self.db.clone();
                 let cancels = self.cancels.clone();
                 let pending = self.pending.clone();
+                let agents = self.agents.clone();
+                let background = self.background.clone();
                 let oauth_refresh = self.oauth_refresh.clone();
                 tauri::async_runtime::spawn(async move {
                     agent::run(
@@ -75,21 +82,36 @@ impl CommandHandler for DesktopCommandHandler {
                         db,
                         cancels,
                         pending,
+                        agents,
+                        background,
                         oauth_refresh,
                         session_id,
                         text,
+                        // The phone's Run command carries no per-session model override,
+                        // so use the desktop default — `agent::run` falls back to
+                        // settings.model on None, matching the pre-per-session behavior.
+                        None,
                     )
                     .await;
                 });
                 Ok(())
             }
-            // Mirror `cancel_agent`: set an EXISTING flag (agent::run inserts it)
-            // + deny pending gates. Guard dropped at the `if let` end; no await.
+            // Mirror `cancel_agent`: set an EXISTING flag (agent::run inserts it),
+            // cascade to the session's subagents, and deny pending gates. Guard
+            // dropped at the `if let` end; no await.
             RemoteCommand::Cancel { session_id } => {
                 if let Some(flag) = self.cancels.lock().unwrap().get(&session_id) {
                     flag.store(true, Ordering::Relaxed);
                 }
+                agents::cancel_session(&self.agents, &session_id);
+                background::cancel_session(&self.background, &session_id);
                 permissions::deny_all(&self.pending, &session_id);
+                Ok(())
+            }
+            // Mirror `cancel_agent_by_id`: stop ONE subagent (and its descendants),
+            // leaving the rest of the session running.
+            RemoteCommand::CancelAgent { agent_id } => {
+                agents::cancel_one(&self.agents, &agent_id);
                 Ok(())
             }
             // Mirror `resolve_permission`, but validate the decision string against
@@ -104,17 +126,36 @@ impl CommandHandler for DesktopCommandHandler {
                 Ok(())
             }
             // Mirror `create_session`. The phone supplies only a title; the desktop
-            // mints the id (the phone learns it from the next catch-up SessionList).
+            // mints the id. AFTER creating, re-push a fresh `SessionList` onto the
+            // SyncHub so the new session appears on the phone immediately — without
+            // it the created session would be invisible until the next
+            // reconnect/catch-up (the catch-up `SessionList` is sent once, on Hello,
+            // and `forward_live` only ever carried `Live` frames before this).
             RemoteCommand::CreateSession { title } => {
                 let id = uuid::Uuid::new_v4().to_string();
                 self.db
                     .create_session(
                         &id,
                         title.as_deref().unwrap_or("New chat"),
-                        None,
+                        None, // workspace
+                        None, // model — phone-created sessions use the desktop default
                         db::now_ms(),
                     )
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string())?;
+                // Best-effort fan-out of the updated list. A `list_sessions` read
+                // error here must not fail the (already-committed) create, so log +
+                // continue; the phone still picks the session up on next catch-up.
+                if let Some(hub) = self.app.try_state::<SyncHub>() {
+                    match self.db.list_sessions() {
+                        Ok(sessions) => {
+                            hub.publish_frame(SyncFrame::SessionList { sessions });
+                        }
+                        Err(e) => {
+                            eprintln!("phone-sync: list_sessions after create failed: {e}");
+                        }
+                    }
+                }
+                Ok(())
             }
         }
     }

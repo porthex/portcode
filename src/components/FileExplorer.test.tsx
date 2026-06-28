@@ -14,6 +14,9 @@ vi.mock("../lib/ipc", () => ({
   listDir: vi.fn(),
   openFolder: vi.fn(),
   saveSettings: vi.fn(),
+  // appendDraft → setDraft debounces a durable saveDraft; mock it so the timer
+  // never reaches a real backend.
+  saveDraft: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -27,7 +30,13 @@ const entry = (over: Partial<DirEntry> = {}): DirEntry => ({
 });
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  // resetAllMocks (not clearAllMocks) so any queued `mockResolvedValueOnce` values
+  // are DRAINED between tests. clearAllMocks only wipes call history, leaving a
+  // prior test's unconsumed `listDir` Once at the head of the queue — which the
+  // next test's mount would then consume, rendering a stale tree. That cross-test
+  // leak is timing-dependent (whether every Once is consumed before a test ends),
+  // so it surfaced as a flaky FileExplorer failure under CI load.
+  vi.resetAllMocks();
   // Restore a pristine store between tests (zustand has no built-in reset).
   useStore.setState(initialState, true);
 
@@ -134,6 +143,15 @@ describe("FileExplorer empty state", () => {
     fireEvent.click(headerBtn);
 
     await waitFor(() => expect(m.openFolder).toHaveBeenCalledTimes(1));
+  });
+
+  it("closes the explorer from its own × button (toggles filesOpen off)", () => {
+    useStore.setState({ showFiles: true });
+    render(<FileExplorer />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Close file explorer" }));
+
+    expect(useStore.getState().showFiles).toBe(false);
   });
 });
 
@@ -277,6 +295,8 @@ describe("FileExplorer tree", () => {
   });
 
   it("clicking a file appends its path to the composer draft instead of fetching", async () => {
+    // appendDraft now keys the draft by the active session, so one must be active.
+    useStore.setState({ activeId: "s1" });
     m.listDir.mockResolvedValueOnce([
       entry({ name: "notes.md", path: "docs/notes.md", isDir: false }),
     ]);
@@ -286,8 +306,8 @@ describe("FileExplorer tree", () => {
 
     fireEvent.click(fileBtn);
 
-    // appendDraft folded the path into the real store; no second listDir.
-    await waitFor(() => expect(useStore.getState().draft).toBe("docs/notes.md "));
+    // appendDraft folded the path into the active session's draft; no second listDir.
+    await waitFor(() => expect(useStore.getState().drafts.s1).toBe("docs/notes.md "));
     expect(m.listDir).toHaveBeenCalledTimes(1);
   });
 });
@@ -432,8 +452,12 @@ describe("FileExplorer accessibility", () => {
     ]);
 
     render(<FileExplorer />);
-    const tree = await screen.findByRole("tree");
-    const a = screen.getByRole("treeitem", { name: "a.ts" });
+    // The tree container renders immediately (even while empty), so awaiting it
+    // does NOT wait for the async listDir that mounts the rows. Await an actual
+    // row first; a/b/c arrive together in one setRoots, so once "a.ts" exists the
+    // synchronous lookups for "b.ts"/"c.ts" can't race the pending fetch.
+    const a = await screen.findByRole("treeitem", { name: "a.ts" });
+    const tree = screen.getByRole("tree");
     const b = screen.getByRole("treeitem", { name: "b.ts" });
     const c = screen.getByRole("treeitem", { name: "c.ts" });
 
@@ -464,8 +488,10 @@ describe("FileExplorer accessibility", () => {
       .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx", isDir: false })]);
 
     render(<FileExplorer />);
-    const tree = await screen.findByRole("tree");
-    const dir = screen.getByRole("treeitem", { name: "src folder" });
+    // Await the row, not the always-present tree container, so this lookup can't
+    // race the async listDir that mounts the rows.
+    const dir = await screen.findByRole("treeitem", { name: "src folder" });
+    const tree = screen.getByRole("tree");
 
     dir.focus();
     // ArrowRight on a collapsed dir expands it (fetching children).
@@ -494,8 +520,10 @@ describe("FileExplorer accessibility", () => {
       .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx", isDir: false })]);
 
     render(<FileExplorer />);
-    const tree = await screen.findByRole("tree");
-    const dir = screen.getByRole("treeitem", { name: "src folder" });
+    // Await the row, not the always-present tree container, so this lookup can't
+    // race the async listDir that mounts the rows.
+    const dir = await screen.findByRole("treeitem", { name: "src folder" });
+    const tree = screen.getByRole("tree");
 
     // Expand (mounts the child), then collapse (child stays mounted, aria-hidden).
     dir.focus();
@@ -548,6 +576,87 @@ describe("FileExplorer workspace switch", () => {
     await waitFor(() => expect(m.listDir).toHaveBeenCalledTimes(4));
     expect(await screen.findByText("B.tsx")).toBeInTheDocument();
     expect(screen.queryByText("A.tsx")).not.toBeInTheDocument();
+  });
+});
+
+describe("FileExplorer right-click context menu", () => {
+  // Stub the clipboard so "Copy path" can be asserted without a real one.
+  let writeText: ReturnType<typeof vi.fn>;
+  beforeEach(() => {
+    writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+  });
+
+  it("opens a file menu with Insert into composer + Copy path (no Expand/Collapse)", async () => {
+    m.listDir.mockResolvedValueOnce([entry({ name: "notes.md", path: "docs/notes.md" })]);
+    render(<FileExplorer />);
+
+    const fileRow = await screen.findByRole("treeitem", { name: /notes\.md/ });
+    fireEvent.contextMenu(fileRow);
+
+    const menu = screen.getByRole("menu");
+    expect(
+      within(menu).getByRole("menuitem", { name: "Insert into composer" }),
+    ).toBeInTheDocument();
+    expect(within(menu).getByRole("menuitem", { name: "Copy path" })).toBeInTheDocument();
+    // Files have no expand/collapse action.
+    expect(within(menu).queryByRole("menuitem", { name: "Expand" })).not.toBeInTheDocument();
+  });
+
+  it("inserts the file path into the composer from the menu", async () => {
+    // appendDraft now keys the draft by the active session, so one must be active.
+    useStore.setState({ activeId: "s1" });
+    m.listDir.mockResolvedValueOnce([entry({ name: "notes.md", path: "docs/notes.md" })]);
+    render(<FileExplorer />);
+
+    const fileRow = await screen.findByRole("treeitem", { name: /notes\.md/ });
+    fireEvent.contextMenu(fileRow);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Insert into composer" }));
+
+    expect(useStore.getState().drafts.s1).toBe("docs/notes.md ");
+  });
+
+  it("copies the file path to the clipboard from the menu", async () => {
+    m.listDir.mockResolvedValueOnce([entry({ name: "notes.md", path: "docs/notes.md" })]);
+    render(<FileExplorer />);
+
+    const fileRow = await screen.findByRole("treeitem", { name: /notes\.md/ });
+    fireEvent.contextMenu(fileRow);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy path" }));
+
+    expect(writeText).toHaveBeenCalledWith("docs/notes.md");
+  });
+
+  it("offers Expand on a closed directory and toggles it open", async () => {
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })])
+      .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx" })]);
+    render(<FileExplorer />);
+
+    const dir = await screen.findByRole("treeitem", { name: "src folder" });
+    fireEvent.contextMenu(dir);
+    // Closed dir → "Expand".
+    fireEvent.click(screen.getByRole("menuitem", { name: "Expand" }));
+
+    await waitFor(() => expect(dir).toHaveAttribute("aria-expanded", "true"));
+    expect(await screen.findByText("App.tsx")).toBeInTheDocument();
+  });
+
+  it("offers Collapse on an open directory", async () => {
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src", path: "src", isDir: true })])
+      .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx" })]);
+    render(<FileExplorer />);
+
+    const dir = await screen.findByRole("treeitem", { name: "src folder" });
+    fireEvent.click(dir); // expand first
+    await waitFor(() => expect(dir).toHaveAttribute("aria-expanded", "true"));
+
+    fireEvent.contextMenu(dir);
+    expect(screen.getByRole("menuitem", { name: "Collapse" })).toBeInTheDocument();
   });
 });
 

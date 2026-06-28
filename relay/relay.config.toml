@@ -1,0 +1,60 @@
+# iroh-relay configuration for Portcode Phone Sync.
+#
+# This is the config consumed by `iroh-relay --config-path` (see Dockerfile CMD).
+# The relay is BLIND — it forwards ciphertext only (docs/IOS_WEB_CLIENT_PLAN.md
+# §5.5/§5.10), so there are NO secrets here and nothing to protect beyond keeping
+# the service available and version-pinned.
+#
+# Field names follow the `iroh-relay` Config schema. If your pinned `iroh-relay`
+# release renames a field, prefer the binary's own help/defaults over this file:
+#   iroh-relay --help
+# and adjust here. Treat unknown-field errors at startup as a version drift signal
+# (see relay/README.md "Upgrading in lock-step").
+
+# Public host clients connect to. This is what ends up in the relay URL and the
+# `relay_url` carried in the PairingPayload. Set it to YOUR domain.
+# (Override at deploy time; placeholder shown.)
+# host = "relay.example.com"
+
+# --- HTTP / WebSocket listener -----------------------------------------------
+# The relay serves its WebSocket upgrade + HTTP probe endpoints here.
+#
+# TWO DEPLOYMENT SHAPES (pick one; see relay/README.md):
+#
+#   A) Relay terminates TLS itself (VPS / docker run with a real cert):
+#      serve HTTPS/WSS on 443 and point `tls` at your cert+key. Clients use
+#      wss://relay.example.com (implicit :443).
+#
+#   B) Platform terminates TLS at its edge (Fly.io / Render):
+#      the platform handles the public cert on 443 and forwards plaintext HTTP to
+#      the container. Serve plain HTTP on the internal port and LEAVE TLS OFF
+#      here. fly.toml / render.yaml below are wired for this shape (internal
+#      HTTP, edge TLS), which is the simplest path to a stable wss:// URL.
+#
+# `http_bind_addr` is a SCALAR socket-address string (NOT a table). We bind the
+# UNPRIVILEGED internal port 8443 — the container runs as non-root `relay`, which
+# cannot bind <1024 (see Dockerfile). Fly/Render/compose map public :443 -> :8443.
+http_bind_addr = "0.0.0.0:8443"
+
+# Shape A (relay-terminated TLS): uncomment to have iroh-relay hold the cert. TLS
+# config stays under the `[tls]` table.
+# [tls]
+# cert_mode = "manual"        # or "lets_encrypt" for ACME
+# cert_path = "/etc/iroh-relay/cert.pem"
+# key_path  = "/etc/iroh-relay/key.pem"
+# https_bind_addr = "0.0.0.0:8443"
+
+# --- QUIC address discovery (the native desktop relay leg) -------------------
+# Lets native iroh nodes (the desktop) discover their reflexive address through
+# the relay. Browser clients don't use this (no UDP in the browser); the desktop
+# does. This is a SCALAR boolean toggle (NOT a `[quic]` table); the discovery
+# listener uses the relay's QUIC port (the UDP port the Dockerfile exposes).
+enable_quic_addr_discovery = true
+
+# --- Limits ------------------------------------------------------------------
+# The relay carries a small CONTROL/MIRROR plane (command + frame traffic), not
+# bulk transfer (§9 risk #2). Conservative caps keep one runaway client from
+# starving others; tune to your host's bandwidth.
+# [limits]
+# accept_conn_limit = 1024        # max concurrent relay connections
+# accept_conn_burst = 64

@@ -1,7 +1,15 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { useStore } from "../store/store";
-import { MODELS, type PairingPayload, type PairingRequest, type ToolPolicy } from "../types";
+import {
+  DANGER_MODES,
+  MODELS,
+  type PairingPayload,
+  type PairingRequest,
+  type PermissionMode,
+  type Rule,
+  type ToolPolicy,
+} from "../types";
 import * as ipc from "../lib/ipc";
 
 export function SettingsPanel() {
@@ -17,8 +25,18 @@ export function SettingsPanel() {
 
   const ambientRain = useStore((s) => s.ambientRain);
   const scanlines = useStore((s) => s.scanlines);
+  const uiScale = useStore((s) => s.uiScale);
   const setAmbientRain = useStore((s) => s.setAmbientRain);
   const setScanlines = useStore((s) => s.setScanlines);
+  const setUiScale = useStore((s) => s.setUiScale);
+  const crashReporting = useStore((s) => s.crashReporting);
+  const setCrashReporting = useStore((s) => s.setCrashReporting);
+
+  const setAutoUpdate = useStore((s) => s.setAutoUpdate);
+  const updateChannel = useStore((s) => s.updateChannel);
+  const update = useStore((s) => s.update);
+  const checkForUpdate = useStore((s) => s.checkForUpdate);
+  const [checkingForUpdate, setCheckingForUpdate] = useState(false);
 
   const phoneSync = useStore((s) => s.phoneSync);
   const pairingPayload = useStore((s) => s.pairingPayload);
@@ -212,7 +230,7 @@ export function SettingsPanel() {
                   htmlFor="pc-settings-model"
                   className="mb-1.5 block text-[12.5px] font-medium text-fg"
                 >
-                  Model
+                  Default model (new sessions)
                 </label>
                 <select
                   id="pc-settings-model"
@@ -226,6 +244,10 @@ export function SettingsPanel() {
                     </option>
                   ))}
                 </select>
+                <p className="mt-1.5 text-[11px] text-faint">
+                  Used as the starting model for new chats. Change a chat&apos;s model from its
+                  composer.
+                </p>
                 {/* settingsError is shared by the model select and the permission
                     policy buttons; surface it next to its higher control here. */}
                 {settingsError && (
@@ -338,27 +360,7 @@ export function SettingsPanel() {
           </section>
 
           {/* PERMISSIONS */}
-          <section className={remoteMode ? "hidden" : undefined}>
-            <div className="pc-eyebrow pc-eyebrow--amber">PERMISSIONS</div>
-            <div className="flex gap-2">
-              {(["allow", "ask", "deny"] as ToolPolicy[]).map((p) => (
-                <button
-                  key={p}
-                  onClick={() => void updateSettings({ defaultPolicy: p })}
-                  className={`flex-1 rounded-lg border px-3 py-2.5 text-[12.5px] capitalize transition-colors ${
-                    settings.defaultPolicy === p
-                      ? "border-accent-2/50 bg-accent-2/10 text-accent-2"
-                      : "border-border bg-panel-2 text-muted hover:border-accent-2/40"
-                  }`}
-                >
-                  {p}
-                </button>
-              ))}
-            </div>
-            <p className="mt-1.5 text-[11px] text-faint">
-              Controls write / edit / shell tools. Read-only tools always run.
-            </p>
-          </section>
+          <PermissionSettings />
 
           {/* APPEARANCE */}
           <section>
@@ -370,6 +372,56 @@ export function SettingsPanel() {
                 on={settings.typingAnimation}
                 onToggle={() => void updateSettings({ typingAnimation: !settings.typingAnimation })}
               />
+              {!remoteMode && (
+                <>
+                  <ToggleRow
+                    label="Automatic updates"
+                    hint={
+                      updateChannel === "staging"
+                        ? "Download and install new versions automatically, then prompt to relaunch. (staging channel)"
+                        : "Download and install new versions automatically, then prompt to relaunch."
+                    }
+                    on={settings.autoUpdate}
+                    onToggle={() => void setAutoUpdate(!settings.autoUpdate)}
+                  />
+                  {/* Manual check + live status. Gives auto-update-off users on-demand
+                      control (Claude Code only ever checks on its own schedule) and
+                      surfaces the current update state inline. */}
+                  <div className="flex items-center justify-between gap-4 py-1.5">
+                    <div>
+                      <div className="text-[12.5px] font-medium text-fg">Check for updates</div>
+                      <div className="mt-0.5 text-[11px] text-faint" aria-live="polite">
+                        {checkingForUpdate
+                          ? "Checking for updates…"
+                          : update.phase === "available"
+                            ? `Update available · v${update.info?.version ?? ""}`
+                            : update.phase === "downloading"
+                              ? "Downloading update…"
+                              : update.phase === "ready"
+                                ? "Update ready — relaunch to apply"
+                                : update.phase === "error"
+                                  ? "Last check failed — try again"
+                                  : "You're on the latest version."}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCheckingForUpdate(true);
+                        void checkForUpdate().finally(() => setCheckingForUpdate(false));
+                      }}
+                      disabled={
+                        checkingForUpdate ||
+                        update.phase === "downloading" ||
+                        update.phase === "ready"
+                      }
+                      className="shrink-0 rounded-md border border-border-2 bg-panel-2/80 px-3 py-1 font-mono text-[11px] text-muted transition-colors hover:border-accent/50 hover:text-accent disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {checkingForUpdate ? "Checking…" : "Check now"}
+                    </button>
+                  </div>
+                </>
+              )}
               <ToggleRow
                 label="Neon rain"
                 hint="Ambient cyberpunk backdrop behind the app. Decorative only."
@@ -381,6 +433,20 @@ export function SettingsPanel() {
                 hint="CRT-style scanline overlay and vignette."
                 on={scanlines}
                 onToggle={() => setScanlines(!scanlines)}
+              />
+              <ScaleRow value={uiScale} onSelect={setUiScale} />
+            </div>
+          </section>
+
+          {/* PRIVACY */}
+          <section>
+            <div className="pc-eyebrow pc-eyebrow--violet">PRIVACY</div>
+            <div>
+              <ToggleRow
+                label="Crash & performance reports"
+                hint="Send anonymous, scrubbed crash + basic performance reports — never your prompts, code, files, or keys. Off by default."
+                on={crashReporting === true}
+                onToggle={() => setCrashReporting(crashReporting !== true)}
               />
             </div>
           </section>
@@ -657,6 +723,307 @@ function PairingCode({ payload, onDone }: { payload: PairingPayload; onDone: () 
         )}
       </div>
     </div>
+  );
+}
+
+/** The selectable interface-scale presets (a frontend-only `document.zoom`).
+ *  Kept small + named so the picker reads as discrete steps, not a free slider. */
+const UI_SCALES: { value: number; label: string }[] = [
+  { value: 0.9, label: "Compact" },
+  { value: 1, label: "Default" },
+  { value: 1.1, label: "Comfortable" },
+  { value: 1.25, label: "Large" },
+];
+
+/** Interface-scale row: a segmented set of preset buttons wired to the store's
+ *  uiScale/setUiScale. The active option is indicated with aria-pressed (not by
+ *  colour alone) so it's conveyed to assistive tech and high-contrast users. */
+function ScaleRow({ value, onSelect }: { value: number; onSelect: (n: number) => void }) {
+  return (
+    <div className="flex flex-col gap-2 py-1.5">
+      <div>
+        <div className="text-[12.5px] font-medium text-fg">Interface scale</div>
+        <div className="text-[11px] text-faint mt-0.5">
+          Resize the whole interface for comfort or density.
+        </div>
+      </div>
+      <div role="group" aria-label="Interface scale" className="flex gap-2">
+        {UI_SCALES.map((s) => {
+          const active = value === s.value;
+          return (
+            <button
+              key={s.value}
+              type="button"
+              aria-pressed={active}
+              onClick={() => onSelect(s.value)}
+              className={`flex-1 rounded-lg border px-2 py-2 text-[12px] transition-colors ${
+                active
+                  ? "border-accent-2/50 bg-accent-2/10 text-accent-2"
+                  : "border-border bg-panel-2 text-muted hover:border-accent-2/40"
+              }`}
+            >
+              {s.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+const PERM_TOOLS = ["fs_read", "list", "glob", "grep", "fs_write", "fs_edit", "shell", "*"];
+
+const MODE_INFO: Record<PermissionMode, { label: string; hint: string }> = {
+  default: { label: "Default", hint: "Use the policy below (ask / allow / deny)." },
+  acceptEdits: {
+    label: "Accept edits",
+    hint: "Auto-allow file writes & edits; still ask for shell.",
+  },
+  plan: { label: "Plan", hint: "Read-only — deny every mutating tool." },
+  auto: { label: "Auto", hint: "Auto-allow EVERY mutating tool, including shell." },
+  bypass: { label: "Bypass", hint: "Skip the permission gate entirely." },
+};
+const MODE_ORDER: PermissionMode[] = ["default", "acceptEdits", "plan", "auto", "bypass"];
+
+/**
+ * The permission mode + per-tool/command rule editor. auto/bypass require an
+ * explicit danger acknowledgment to engage, and an over-broad allow rule (any
+ * tool, or shell with no command prefix) is flagged loudly — the UI guardrails
+ * the security review of the gate flagged as the layer that must enforce them.
+ */
+function PermissionSettings() {
+  const settings = useStore((s) => s.settings);
+  const updateSettings = useStore((s) => s.updateSettings);
+  // Permission config is a desktop-side setting; on the phone the section is
+  // hidden (the phone observes the active mode via the HUD but doesn't edit it).
+  const remoteMode = useStore((s) => s.remoteMode);
+  const mode = settings.permissionMode;
+  const rules = settings.rules;
+
+  const [confirmMode, setConfirmMode] = useState<PermissionMode | null>(null);
+  const [ruleTool, setRuleTool] = useState("shell");
+  const [ruleCommand, setRuleCommand] = useState("");
+  const [ruleDecision, setRuleDecision] = useState<ToolPolicy>("ask");
+
+  const pickMode = (m: PermissionMode) => {
+    if (DANGER_MODES.includes(m)) {
+      setConfirmMode(m); // require an explicit acknowledgment before engaging
+    } else {
+      setConfirmMode(null);
+      void updateSettings({ permissionMode: m });
+    }
+  };
+
+  // An allow rule that matches everything (any tool, or shell with no command
+  // prefix) is the footgun the gate security review flagged — warn loudly.
+  const overBroadAllow =
+    ruleDecision === "allow" &&
+    (ruleTool === "*" || (ruleTool === "shell" && ruleCommand.trim() === ""));
+
+  const addRule = () => {
+    const command = ruleTool === "shell" && ruleCommand.trim() ? ruleCommand : undefined;
+    const rule: Rule = command
+      ? { tool: ruleTool, command, decision: ruleDecision }
+      : { tool: ruleTool, decision: ruleDecision };
+    if (
+      rules.some(
+        (r) => r.tool === rule.tool && r.command === rule.command && r.decision === rule.decision,
+      )
+    ) {
+      return; // exact duplicate — no-op
+    }
+    void updateSettings({ rules: [...rules, rule] });
+    setRuleCommand("");
+  };
+
+  const removeRule = (i: number) =>
+    void updateSettings({ rules: rules.filter((_, idx) => idx !== i) });
+
+  return (
+    <section className={remoteMode ? "hidden" : undefined}>
+      <div className="pc-eyebrow pc-eyebrow--amber">PERMISSIONS</div>
+
+      <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
+        {MODE_ORDER.map((m) => {
+          const danger = DANGER_MODES.includes(m);
+          const active = mode === m;
+          return (
+            <button
+              key={m}
+              type="button"
+              onClick={() => pickMode(m)}
+              title={MODE_INFO[m].hint}
+              aria-pressed={active}
+              className={`rounded-lg border px-2 py-2 text-[11.5px] capitalize transition-colors ${
+                active
+                  ? danger
+                    ? "border-danger/60 bg-danger/10 text-danger"
+                    : "border-accent-2/50 bg-accent-2/10 text-accent-2"
+                  : `border-border bg-panel-2 hover:border-accent-2/40 ${
+                      danger ? "text-danger/80" : "text-muted"
+                    }`
+              }`}
+            >
+              {danger ? "⚠ " : ""}
+              {MODE_INFO[m].label}
+            </button>
+          );
+        })}
+      </div>
+      <p className="mt-1.5 text-[11px] text-faint">{MODE_INFO[mode].hint}</p>
+
+      {confirmMode && (
+        <div
+          role="alert"
+          className="mt-2 rounded-lg border border-danger/50 bg-danger/10 p-2.5 text-[11.5px] text-danger"
+        >
+          <p>
+            ⚠ <strong className="capitalize">{MODE_INFO[confirmMode].label}</strong> lets the agent
+            run mutating tools — including shell commands — without asking. Only enable it if you
+            trust the task.
+          </p>
+          <div className="mt-2 flex gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                void updateSettings({ permissionMode: confirmMode });
+                setConfirmMode(null);
+              }}
+              className="rounded border border-danger/60 bg-danger/15 px-2.5 py-1 capitalize text-danger"
+            >
+              Enable {MODE_INFO[confirmMode].label}
+            </button>
+            <button
+              type="button"
+              onClick={() => setConfirmMode(null)}
+              className="rounded border border-border bg-panel-2 px-2.5 py-1 text-muted"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-3">
+        <div className="mb-1 text-[11px] text-faint">
+          Default-mode policy (used when the mode is Default)
+        </div>
+        <div className="flex gap-2">
+          {(["allow", "ask", "deny"] as ToolPolicy[]).map((p) => (
+            <button
+              key={p}
+              type="button"
+              onClick={() => void updateSettings({ defaultPolicy: p })}
+              className={`flex-1 rounded-lg border px-3 py-2 text-[12.5px] capitalize transition-colors ${
+                settings.defaultPolicy === p
+                  ? "border-accent-2/50 bg-accent-2/10 text-accent-2"
+                  : "border-border bg-panel-2 text-muted hover:border-accent-2/40"
+              }`}
+            >
+              {p}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="mt-3">
+        <div className="mb-1 text-[11px] text-faint">
+          Rules — first match wins, evaluated before the mode default
+        </div>
+        {rules.length === 0 ? (
+          <p className="text-[11px] text-faint">
+            No rules yet. The mode above applies to every tool.
+          </p>
+        ) : (
+          <ul className="flex flex-col gap-1">
+            {rules.map((r, i) => (
+              <li
+                key={`${r.tool}|${r.command ?? ""}|${r.decision}`}
+                className="flex items-center justify-between gap-2 rounded border border-border bg-panel-2 px-2 py-1 text-[11.5px]"
+              >
+                <span className="min-w-0 truncate font-mono">
+                  <span className="text-fg">{r.tool}</span>
+                  {r.command ? <span className="text-muted"> “{r.command}”</span> : null}{" "}
+                  <span
+                    className={
+                      r.decision === "allow"
+                        ? "text-accent-2"
+                        : r.decision === "deny"
+                          ? "text-danger"
+                          : "text-warn"
+                    }
+                  >
+                    → {r.decision}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => removeRule(i)}
+                  aria-label={`Remove rule ${i + 1}`}
+                  className="shrink-0 px-1 text-muted hover:text-danger"
+                >
+                  ×
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <select
+            aria-label="Rule tool"
+            value={ruleTool}
+            onChange={(e) => setRuleTool(e.target.value)}
+            className="rounded border border-border bg-panel-2 px-2 py-1 text-[11.5px] text-fg"
+          >
+            {PERM_TOOLS.map((t) => (
+              <option key={t} value={t}>
+                {t === "*" ? "any tool (*)" : t}
+              </option>
+            ))}
+          </select>
+          {ruleTool === "shell" && (
+            <input
+              aria-label="Command prefix"
+              value={ruleCommand}
+              onChange={(e) => setRuleCommand(e.target.value)}
+              placeholder="command prefix (e.g. git )"
+              className="min-w-0 flex-1 rounded border border-border bg-panel-2 px-2 py-1 text-[11.5px] text-fg"
+            />
+          )}
+          <select
+            aria-label="Rule decision"
+            value={ruleDecision}
+            onChange={(e) => setRuleDecision(e.target.value as ToolPolicy)}
+            className="rounded border border-border bg-panel-2 px-2 py-1 text-[11.5px] text-fg"
+          >
+            {(["allow", "ask", "deny"] as ToolPolicy[]).map((d) => (
+              <option key={d} value={d}>
+                {d}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            onClick={addRule}
+            className="rounded border border-accent-2/50 bg-accent-2/10 px-2.5 py-1 text-[11.5px] text-accent-2"
+          >
+            Add rule
+          </button>
+        </div>
+        {overBroadAllow && (
+          <p role="alert" className="mt-1.5 text-[11px] text-danger">
+            ⚠ This allow rule matches {ruleTool === "*" ? "every tool" : "every shell command"} —
+            anything chained after a trusted prefix runs without asking. Prefer a specific tool and
+            command prefix.
+          </p>
+        )}
+        <p className="mt-1.5 text-[11px] text-faint">
+          A command prefix is a literal match — “git ” also matches “git x; rm -rf y”. It’s a
+          convenience, not a guarantee.
+        </p>
+      </div>
+    </section>
   );
 }
 

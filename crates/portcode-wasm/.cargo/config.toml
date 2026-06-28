@@ -1,0 +1,18 @@
+# getrandom 0.3 needs BOTH the `wasm_js` cargo feature (set transitively via
+# portcode-sync's wasm target table) AND this cfg flag to select the JS-backed
+# CSPRNG on wasm32-unknown-unknown — without it the build fails with
+# "the wasm*-unknown-unknown targets are not supported by default" (§5.3).
+#
+# This is the wasm-bindgen `Session` cdylib that `wasm-pack build --target web`
+# actually compiles, so the flag MUST live here too (a `.cargo/config.toml` only
+# applies when cargo is invoked at/under its directory; the copy in
+# `crates/portcode-sync` covers `cargo build -p portcode-sync`, this copy covers
+# `cargo build -p portcode-wasm` / `wasm-pack build crates/portcode-wasm`).
+# Verify the resolved getrandom version stays 0.3 in Cargo.lock.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", 'getrandom_backend="wasm_js"']
+
+# This crate only ever targets the browser; default the build target so a bare
+# `cargo build`/`cargo clippy` in this directory picks wasm32 without `--target`.
+[build]
+target = "wasm32-unknown-unknown"

@@ -152,15 +152,23 @@ pnpm typecheck       # tsc --noEmit
 pnpm test            # Vitest
 ```
 
-### Rust (Tauri backend)
+### Rust (workspace)
 
-Portcode is a single Rust crate today, so target it with `--manifest-path`:
+Portcode is a Cargo workspace — the `src-tauri` desktop crate plus the shared
+`crates/portcode-sync` and `crates/portcode-wasm` crates. Run the gate from the
+repo root so it covers every member:
 
 ```powershell
-cargo fmt --manifest-path src-tauri/Cargo.toml --check
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
+
+> `portcode-sync` and `portcode-wasm` also compile to `wasm32-unknown-unknown`
+> (the browser client) under a separate **WASM** CI job — the `--workspace`
+> clippy above only sees their native build. If you change either crate, check
+> the `wasm32` build/clippy commands in
+> [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ### Testing notes
 
@@ -289,10 +297,13 @@ invest time, here is what does and does not belong in this repository. See
 - A managed BYOK gateway or centralized inference service.
 - Audit-log retention services and enterprise distribution artifacts.
 
-**Telemetry:** Portcode ships with **no telemetry** and no phone-home today. Any
-future signal would be **strictly opt-in, off by default, and documented**. PRs
-that add telemetry or phone-home behavior outside that agreed design will be
-declined.
+**Telemetry:** Portcode sends **no telemetry by default** and has no phone-home.
+There is one sanctioned, **opt-in, off-by-default** crash/error reporting path
+(scrubbed, EU-region Sentry, and armed only in official release builds — the DSN
+is never in source, so contributor and fork builds cannot report); see
+[SECURITY.md](SECURITY.md) for exactly what it sends. PRs that add any _other_
+telemetry or phone-home behavior, that weaken the off-by-default / consent /
+scrubbing guarantees, or that bake a reporting DSN into source will be declined.
 
 ---
 

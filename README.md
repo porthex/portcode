@@ -41,9 +41,12 @@ say so than oversell it.
 > [!WARNING]
 > **Early alpha — experimental.** Portcode works today with **Claude (Anthropic) only**, runs on
 > **Windows only**, and is **desktop only**. You describe a task and the model makes the changes
-> as reviewable diffs you approve at a permission gate. Multi-provider support, Linux, and
-> **Phone Sync** are the mission and the roadmap — **not** shipped yet. Rough edges and breaking
-> changes ahead. If that's exciting rather than disqualifying, welcome aboard.
+> as reviewable diffs you approve at a permission gate. Multi-provider support and Linux are the
+> mission and the roadmap — **not** shipped yet. **Phone Sync** (drive a desktop session from your
+> phone) is **in-progress alpha**: the browser/iOS web-client foundation has landed, but it is
+> **not usable end-to-end yet** — the on-device iOS go/no-go spike is still pending. See the
+> [iOS web client plan](docs/IOS_WEB_CLIENT_PLAN.md). Rough edges and breaking changes ahead. If
+> that's exciting rather than disqualifying, welcome aboard.
 
 <div align="center"><sub>▶︎ Demo GIF coming soon — see "Roadmap".</sub></div>
 
@@ -61,13 +64,16 @@ say so than oversell it.
   binary is ~6 MB and idles around ~32 MB of RAM, reusing the WebView2 runtime already on
   Windows rather than shipping its own browser engine.
 - **🛡️ Private & local by design.** Your key lives in **Windows Credential Manager**, file tools
-  are sandboxed to your workspace, every mutating action is gated, and there is **zero
-  telemetry** — nothing leaves your machine except the calls to the model you chose.
+  are sandboxed to your workspace, every mutating action is gated, and there is **no telemetry by
+  default** — nothing leaves your machine except the calls to the model you chose. (Crash reporting
+  is strictly opt-in and stays off until you turn it on — see [Privacy & security](#privacy--security).)
 - **🧠 Codebase knowledge-graph aware.** An optional [graphify](GRAPHIFY.md) integration lets you
   (and your model) _query_ a knowledge graph of your repo instead of blindly grepping.
-- **📱 Phone Sync — on the roadmap.** A fast engine to drive and continue your coding sessions
-  from your phone. Vision-stage today, and a big reason Portcode is built on a lean, portable
-  core.
+- **📱 Phone Sync — in-progress alpha.** A fast engine to drive and continue your coding sessions
+  from your phone. The browser/iOS web-client foundation has landed (see the
+  [iOS web client plan](docs/IOS_WEB_CLIENT_PLAN.md)); it is **not usable end-to-end yet** — the
+  on-device iOS go/no-go spike is still pending. A big reason Portcode is built on a lean,
+  portable core.
 - **🔑 Use any model, with your own keys.** Bring your own API key — Claude today, more providers
   planned. You pay the provider directly, at cost; Portcode takes no cut and adds no markup.
 
@@ -82,11 +88,13 @@ We think the fastest way to lose your trust is to blur what's real. So:
 | **Models**      | Claude (Anthropic)                                                                        | OpenAI, Gemini, local models — _the mission: every LLM_                              |
 | **Auth**        | Anthropic **API key** (BYOK), or **Claude Pro/Max** subscription sign-in _(experimental)_ | Subscription/account sign-in for other providers                                     |
 | **OS**          | Windows 10/11                                                                             | Linux                                                                                |
-| **Form factor** | Desktop                                                                                   | **📱 Phone Sync** — start a task at your desk, drive and continue it from your phone |
+| **Form factor** | Desktop (Phone Sync web client: **in-progress alpha**, not usable end-to-end yet)         | **📱 Phone Sync** — start a task at your desk, drive and continue it from your phone |
 
 **Phone Sync** is the headline of where we're going: a fast, efficient engine to continue
-your coding sessions from iOS/Android. It's vision-stage today (not built) — but it's the
-reason Portcode is built on a lean, portable core from day one.
+your coding sessions from iOS/Android. The browser/iOS web-client foundation has landed
+([iOS web client plan](docs/IOS_WEB_CLIENT_PLAN.md)) — **in-progress alpha**, not yet usable
+end-to-end (the on-device iOS spike is the next gate). It's the reason Portcode is built on a
+lean, portable core from day one.
 
 ---
 
@@ -194,8 +202,15 @@ Portcode keeps your work on your machine:
 - **Workspace sandbox** — file tools cannot read or write outside the folder you open.
 - **Everything destructive is gated** — `fs_write`, `fs_edit`, and `shell` pass through the
   permission gate every time (until you choose "always allow").
-- **Zero telemetry, no phone-home** — Portcode makes no network calls except to the LLM
-  provider you configured.
+- **No telemetry by default** — out of the box Portcode makes no network calls except to the LLM
+  provider you configured. No analytics, no tracking, no phone-home.
+- **Opt-in crash reporting (off by default)** — you can _optionally_ turn on scrubbed crash/error
+  reporting in **Settings → Privacy** to help fix bugs. It stays off until you enable it; only
+  official signed release builds can use it (the reporting key is never in the source, so dev,
+  contributor, and fork builds physically cannot report); reports are aggressively redacted (API
+  keys, tokens, paths, prompts, and code are stripped) and go to an EU-region Sentry project.
+  Desktop native-crash reports additionally include an **unscrubbable memory snapshot** — see
+  [SECURITY.md](SECURITY.md) for exactly what is and isn't sent. Turn it back off anytime.
 
 Found a vulnerability? Portcode runs `shell` and holds API keys — please disclose privately
 via [GitHub Private Vulnerability Reporting](https://github.com/porthex/portcode/security/advisories/new),
@@ -223,7 +238,10 @@ The near-term engineering plan lives in [docs/ROADMAP.md](docs/ROADMAP.md). The 
    provider/account sign-in to follow.
 3. **Linux** — Windows-first today; Linux is next.
 4. **📱 Phone Sync** _(marquee)_ — a fast engine to drive and continue your coding sessions
-   from your phone.
+   from your phone. **In-progress alpha:** the browser/iOS web-client foundation has landed
+   (see the [iOS web client plan](docs/IOS_WEB_CLIENT_PLAN.md)), with a self-hosted, version-pinned
+   [`iroh-relay`](relay/) for the always-on relay leg; the on-device iOS go/no-go spike is the
+   next gate before it's usable end-to-end.
 5. **Signed installers + auto-update** — so you don't have to build from source.
 
 ---

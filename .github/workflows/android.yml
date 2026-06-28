@@ -54,6 +54,19 @@ jobs:
       # Match the NDK the dev box uses; Tauri's Gradle plugin resolves the NDK
       # from NDK_HOME/ANDROID_NDK_ROOT (the app module pins no ndkVersion).
       NDK_VERSION: "27.0.12077973"
+      # Sentry build-time env vars. The Gradle plugin reads these automatically:
+      #   SENTRY_DSN          — injected into BuildConfig.SENTRY_DSN at compile time.
+      #   SENTRY_AUTH_TOKEN   — when absent (contributor/fork builds without the
+      #                         secret), the sentry{} block skips symbol upload so the
+      #                         probe stays green without a Sentry account.
+      #   SENTRY_ORG / SENTRY_PROJECT / SENTRY_URL — identify the upload destination.
+      #   SENTRY_ENVIRONMENT  — defaults to "debug" for this non-publishing probe.
+      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+      SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+      SENTRY_URL: ${{ secrets.SENTRY_URL }}
+      SENTRY_ENVIRONMENT: debug
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -73,13 +86,13 @@ jobs:
       # AGP 8 / the Tauri Gradle plugin need JDK 17 to run (the app targets Java 8
       # bytecode, but the toolchain itself is 17).
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       # compileSdk/targetSdk = 36 (src-tauri/gen/android/app/build.gradle.kts) and
       # the NDK the Rust cross-compile links against.

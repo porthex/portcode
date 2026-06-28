@@ -35,6 +35,72 @@
  */
 export type QrDecoder = (image: ImageData) => string | null | Promise<string | null>;
 
+// ── Default zxing-wasm decoder ───────────────────────────────────────────────
+//
+// The production {@link QrDecoder} is backed by `zxing-wasm` (ZXing-C++ compiled
+// to WebAssembly — iOS Safari ships no `BarcodeDetector`, see the file header).
+// Its `readBarcodes(ImageData)` returns the decoded barcodes; we keep the first
+// VALID result's text. The wasm chunk is hundreds of KB, so it is LAZILY loaded
+// via a dynamic `import()` on the first decode (the PWA shell paints first).
+//
+// The loader is injectable so vitest never resolves/instantiates the real wasm
+// (it would try to fetch the `.wasm` binary, which jsdom can't do). The default
+// loader imports `zxing-wasm/reader` — the reader-only entry, the smallest build.
+
+/** The subset of the `zxing-wasm` reader module {@link defaultQrDecoder} uses. */
+export interface ZxingReaderModule {
+  readBarcodes(input: ImageData): Promise<ReadonlyArray<{ isValid: boolean; text: string }>>;
+}
+
+/** Loads the `zxing-wasm` reader module. Injectable so tests mock it instead of
+ *  loading real wasm. */
+export type ZxingLoader = () => Promise<ZxingReaderModule>;
+
+/** Default loader: lazy dynamic `import()` of the reader-only `zxing-wasm` entry.
+ *  Untestable under jsdom (it would fetch the real `.wasm` binary), so tests inject
+ *  a fake loader via {@link createZxingDecoder} and this body is c8-ignored. */
+/* c8 ignore start */
+export const defaultZxingLoader: ZxingLoader = () =>
+  import("zxing-wasm/reader") as Promise<ZxingReaderModule>;
+/* c8 ignore stop */
+
+/**
+ * Build a {@link QrDecoder} backed by `zxing-wasm`. The wasm module is loaded once
+ * (memoized) on the first call and reused. Returns the first VALID decoded text,
+ * or `null` when no barcode is found — matching the {@link QrDecoder} contract
+ * (`scanFromFile`/`scanWithCamera` treat `null` as "no QR yet", never an error).
+ *
+ * @param load injectable module loader (defaults to {@link defaultZxingLoader}).
+ */
+export function createZxingDecoder(load: ZxingLoader = defaultZxingLoader): QrDecoder {
+  let modPromise: Promise<ZxingReaderModule> | null = null;
+  return async (image: ImageData): Promise<string | null> => {
+    if (modPromise === null) {
+      // Memoize the load — but if it REJECTS (transient network failure fetching
+      // the wasm chunk), clear the cache so the NEXT scan retries instead of being
+      // stuck on a permanently-rejected promise. Without this reset a single failed
+      // load would break scanning for the life of the decoder.
+      const pending = load();
+      pending.catch(() => {
+        if (modPromise === pending) modPromise = null;
+      });
+      modPromise = pending;
+    }
+    const mod = await modPromise;
+    const results = await mod.readBarcodes(image);
+    const hit = results.find((r) => r.isValid && r.text.length > 0);
+    return hit ? hit.text : null;
+  };
+}
+
+/**
+ * The DEFAULT QR decoder used when a caller does not inject one: a lazily-loaded
+ * `zxing-wasm` decoder. A single shared instance so the wasm module is loaded at
+ * most once across the app. Tests inject their own decoder (or a fake loader via
+ * {@link createZxingDecoder}) so real wasm never loads under vitest.
+ */
+export const defaultQrDecoder: QrDecoder = createZxingDecoder();
+
 /**
  * The result of a web scan attempt. Like the native `ScanOutcome`, the scan
  * functions never throw — they fold every failure into one of these reasons:
@@ -61,6 +127,9 @@ export interface ScannerDeps {
   getUserMedia?: (c: MediaStreamConstraints) => Promise<MediaStream>;
   /** Grab one frame's `ImageData` from a source (a `<video>` or image element). */
   captureFrame?: (source: unknown) => ImageData | null;
+  /** Wrap a camera `MediaStream` in a frame source (a `<video>`) for `captureFrame`.
+   *  Defaults to creating a hidden, muted, playing `<video>`; tests inject a fake. */
+  makeVideo?: (stream: MediaStream) => Promise<HTMLVideoElement | MediaStream>;
   /** Decode a still-image `File` to `ImageData` via a canvas. */
   decodeFile?: (file: File) => Promise<ImageData | null>;
   /** Monotonic-ish clock; defaults to `Date.now`. */
@@ -125,12 +194,49 @@ async function defaultDecodeFile(file: File): Promise<ImageData | null> {
     bitmap.close();
   }
 }
+
+/**
+ * Wrap a live `MediaStream` in a hidden, muted, autoplaying `<video>` so the
+ * default `captureFrame` (which reads `videoWidth`/`videoHeight`) has a real
+ * frame source. Muted + `playsInline` is required for iOS Safari to autoplay
+ * without a user gesture. Returns the stream itself (no video) when there is no
+ * `document` (non-browser host) — that path is only reachable with the real
+ * default capture, which also needs a real DOM, so it degrades to a null frame
+ * rather than crashing.
+ */
+async function defaultMakeVideo(stream: MediaStream): Promise<HTMLVideoElement | MediaStream> {
+  if (typeof document === "undefined") return stream;
+  const video = document.createElement("video");
+  video.playsInline = true;
+  video.muted = true;
+  video.srcObject = stream;
+  try {
+    await video.play();
+  } catch {
+    // Autoplay can reject in some browsers; we still try to capture frames — a
+    // not-yet-playing video simply yields null frames until it produces one.
+  }
+  return video;
+}
+
+/** Best-effort teardown of a `<video>` we created to host the camera stream:
+ *  pause it and detach the stream so it stops holding the source. */
+function teardownVideo(source: unknown): void {
+  if (typeof HTMLVideoElement === "undefined" || !(source instanceof HTMLVideoElement)) return;
+  try {
+    source.pause();
+    source.srcObject = null;
+  } catch {
+    // best-effort — tearing the video down must never throw
+  }
+}
 /* c8 ignore stop */
 
 function resolveDeps(deps?: ScannerDeps): Required<ScannerDeps> {
   return {
     getUserMedia: deps?.getUserMedia ?? defaultGetUserMedia,
     captureFrame: deps?.captureFrame ?? defaultCaptureFrame,
+    makeVideo: deps?.makeVideo ?? defaultMakeVideo,
     decodeFile: deps?.decodeFile ?? defaultDecodeFile,
     now: deps?.now ?? Date.now,
     setTimeoutFn: deps?.setTimeoutFn ?? setTimeout,
@@ -199,15 +305,30 @@ function stopStream(stream: MediaStream | null): void {
  * camera light otherwise stays on).
  */
 export async function scanWithCamera(opts: CameraScanOptions): Promise<WebScanOutcome> {
-  const { getUserMedia, captureFrame, setTimeoutFn } = resolveDeps(opts.deps);
+  const { getUserMedia, captureFrame, makeVideo, setTimeoutFn } = resolveDeps(opts.deps);
   const intervalMs = opts.intervalMs ?? 250;
   const signal = opts.signal;
+  // Whether we fell back to the real `navigator`-backed default (no fake injected).
+  // Only then do we gate on `isWebCameraAvailable()` for the "API missing" case;
+  // an injected `getUserMedia` is always considered present.
+  const usesDefaultGetUserMedia = opts.deps?.getUserMedia === undefined;
 
   // Fast path: nothing to open if the user already aborted.
   if (signal?.aborted) return { ok: false, reason: "cancelled" };
 
   let stream: MediaStream | null = null;
+  let source: unknown = null;
   try {
+    // No camera API in this environment at all → `unavailable` so callers fall
+    // back to the file/manual path. This is distinct from a *runtime* failure
+    // (hardware fault, etc.) below, which maps to `error`. We check BEFORE the
+    // call because the default `getUserMedia` would otherwise throw a TypeError
+    // when `navigator.mediaDevices` is absent, which would be mis-mapped to
+    // `error`. Callers that inject a custom `getUserMedia` opt out of this gate.
+    if (usesDefaultGetUserMedia && !isWebCameraAvailable()) {
+      return { ok: false, reason: "unavailable" };
+    }
+
     try {
       stream = await getUserMedia({ video: { facingMode: "environment" } });
     } catch (e) {
@@ -220,11 +341,18 @@ export async function scanWithCamera(opts: CameraScanOptions): Promise<WebScanOu
 
     if (!stream) return { ok: false, reason: "unavailable" };
 
+    // The default `captureFrame` reads pixels off an `HTMLVideoElement` (needs
+    // `videoWidth`/`videoHeight`), so a raw `MediaStream` would always yield a
+    // null frame. Wrap the stream in a hidden, muted, autoplaying `<video>` and
+    // pass THAT to `captureFrame`. Tests inject a fake `makeVideo`/`captureFrame`
+    // so this stays unit-testable under jsdom (no real `<video>`).
+    source = await makeVideo(stream);
+
     // Poll frames on an interval until a QR decodes or we're aborted.
     for (;;) {
       if (signal?.aborted) return { ok: false, reason: "cancelled" };
 
-      const frame = captureFrame(stream);
+      const frame = captureFrame(source);
       if (frame) {
         const value = await opts.decode(frame);
         if (value != null) return { ok: true, value };
@@ -256,7 +384,9 @@ export async function scanWithCamera(opts: CameraScanOptions): Promise<WebScanOu
   } catch (e) {
     return { ok: false, reason: "error", message: errMessage(e) };
   } finally {
-    // The camera is released on EVERY exit path.
+    // The camera is released on EVERY exit path: detach the `<video>` we created
+    // (if any) and stop every track so the hardware/indicator is freed.
+    teardownVideo(source);
     stopStream(stream);
   }
 }

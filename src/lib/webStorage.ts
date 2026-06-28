@@ -150,19 +150,43 @@ export async function savePinnedPeer(peer: PinnedPeer): Promise<void> {
 }
 
 /**
+ * Validate that a parsed value is a well-formed {@link PinnedPeer}. Guards against
+ * a corrupt write OR an OLD-SCHEMA record from a previous app version (e.g. a pin
+ * missing `deviceId`, or with a non-string key): an old/partial record would
+ * otherwise be handed to the reconnect path and either crash on a missing field or
+ * dial with garbage. We require the three mandatory string/number fields and accept
+ * `qr` only when absent or a string.
+ */
+function isPinnedPeer(value: unknown): value is PinnedPeer {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.peerPublicKey === "string" &&
+    typeof v.deviceId === "string" &&
+    typeof v.pairedAt === "number" &&
+    (v.qr === undefined || typeof v.qr === "string")
+  );
+}
+
+/**
  * Load the pinned desktop identity, or `null` if the phone has never paired (or
- * the pin was evicted / storage is unavailable). Returns `null` rather than
- * throwing on any read failure so the UI defaults cleanly to the pairing screen.
+ * the pin was evicted / storage is unavailable / the stored record is malformed or
+ * from an older schema). Returns `null` rather than throwing on any read failure so
+ * the UI defaults cleanly to the pairing screen.
  */
 export async function loadPinnedPeer(): Promise<PinnedPeer | null> {
   const raw = await idbGet<string>(PINNED_PEER_KEY);
   if (raw === null) return null;
+  let parsed: unknown;
   try {
-    return JSON.parse(raw) as PinnedPeer;
+    parsed = JSON.parse(raw);
   } catch {
-    // Corrupt/partial value — treat as unpaired rather than crashing.
+    // Corrupt/partial JSON — treat as unpaired rather than crashing.
     return null;
   }
+  // Reject malformed / old-schema records so the reconnect path never sees a
+  // PinnedPeer missing required fields.
+  return isPinnedPeer(parsed) ? parsed : null;
 }
 
 /**
@@ -179,16 +203,41 @@ export async function clearPinnedPeer(): Promise<void> {
  * must be the *same* value on every call once minted — hence we read-through
  * IndexedDB and only mint when nothing is stored.
  *
- * When storage is unavailable the write silently no-ops, so we still return a
- * freshly generated id (correct for this session) even though it won't survive a
- * reload — that degrades to "looks like a new device each launch", not a crash.
+ * When storage is unavailable the write silently no-ops. To keep the id STABLE
+ * within a session regardless — and to make concurrent first calls race-free — we
+ * memoize the in-flight resolution in a module-level promise: the first call mints
+ * (or reads) once, and every later call awaits the same promise, so all callers
+ * see one id even when IndexedDB can't persist it across a reload.
  */
-export async function getOrCreateDeviceId(): Promise<string> {
-  const existing = await idbGet<string>(DEVICE_ID_KEY);
-  if (existing !== null) return existing;
-  const id = crypto.randomUUID();
-  await idbPut(DEVICE_ID_KEY, id);
-  return id;
+let deviceIdPromise: Promise<string> | null = null;
+
+export function getOrCreateDeviceId(): Promise<string> {
+  if (deviceIdPromise === null) {
+    deviceIdPromise = (async () => {
+      const existing = await idbGet<string>(DEVICE_ID_KEY);
+      if (existing !== null) return existing;
+      const id = crypto.randomUUID();
+      await idbPut(DEVICE_ID_KEY, id);
+      return id;
+    })().catch((err) => {
+      // A transient failure (e.g. crypto.randomUUID throwing, or an IDB read that
+      // rejects) must NOT poison the cache: a memoized rejected promise would make
+      // every later call fail forever. Clear the cache so the next call retries,
+      // then rethrow so this caller still sees the failure.
+      deviceIdPromise = null;
+      throw err;
+    });
+  }
+  return deviceIdPromise;
+}
+
+/**
+ * Reset the memoized device id (test-only seam). Production never needs this — the
+ * id is meant to live for the whole session — but tests that swap IndexedDB in/out
+ * must clear the cache so each scenario mints fresh.
+ */
+export function resetDeviceIdCacheForTest(): void {
+  deviceIdPromise = null;
 }
 
 /**

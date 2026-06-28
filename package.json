@@ -10,10 +10,15 @@
     "build": "tsc --noEmit && vite build",
     "build:web": "vite build --config vite.web.config.ts",
     "dev:web": "vite --config vite.web.config.ts",
+    "dev:self": "vite --mode selfdev",
+    "build:self": "tsc --noEmit && vite build --mode selfdev",
     "preview": "vite preview",
     "tauri": "tauri",
     "app:dev": "tauri dev",
     "app:build": "tauri build",
+    "app:dev:self": "tauri dev --config src-tauri/tauri.dev.conf.json",
+    "app:build:self": "tauri build --config src-tauri/tauri.dev.conf.json",
+    "watch:rust": "cd src-tauri && bacon",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -26,6 +31,7 @@
     "prepare": "husky"
   },
   "dependencies": {
+    "@sentry/react": "^10.59.0",
     "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/plugin-barcode-scanner": "^2.4.5",
     "@tauri-apps/plugin-dialog": "^2.2.0",
@@ -36,7 +42,8 @@
     "react-markdown": "^10.1.0",
     "rehype-highlight": "^7.0.2",
     "remark-gfm": "^4.0.0",
-    "zustand": "^5.0.2"
+    "zustand": "^5.0.2",
+    "zxing-wasm": "^3.1.0"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
@@ -75,6 +82,7 @@
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.0.0",
     "vite": "^8.0.16",
+    "vite-plugin-wasm": "^3.6.0",
     "vitest": "^4.1.9",
     "webdriverio": "^9.29.0"
   },

@@ -1,0 +1,5 @@
+# Throwaway spike build artifacts — do not commit.
+echo-web/target/
+echo-desktop/target/
+web/pkg/
+**/Cargo.lock

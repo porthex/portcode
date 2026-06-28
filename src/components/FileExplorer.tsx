@@ -1,4 +1,5 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { useContextMenu, type ContextMenuItem } from "./ContextMenu";
 import { useStore } from "../store/store";
 import * as ipc from "../lib/ipc";
 import type { DirEntry } from "../types";
@@ -7,6 +8,7 @@ export function FileExplorer() {
   const workspace = useStore((s) => s.settings.workspace);
   const openWorkspace = useStore((s) => s.openWorkspace);
   const workspaceError = useStore((s) => s.workspaceError);
+  const toggleFiles = useStore((s) => s.toggleFiles);
   const [roots, setRoots] = useState<DirEntry[]>([]);
   // Roving-tabindex active row: the path of the single treeitem that holds
   // tabIndex 0. Null until the user focuses a row, so the first root keeps the
@@ -100,7 +102,7 @@ export function FileExplorer() {
     >
       <div className="flex items-center gap-2 border-b border-border px-3.5 py-[11px]">
         <span
-          className="pc-eyebrow-mono text-[9.5px] tracking-[2px] text-accent-2"
+          className="pc-eyebrow-mono text-[10.5px] tracking-[2px] text-accent-2"
           style={{ filter: "drop-shadow(0 0 6px rgba(33, 230, 255, 0.55))" }}
         >
           ◧ PORTCODE
@@ -112,6 +114,16 @@ export function FileExplorer() {
           aria-label="Open folder"
         >
           OPEN…
+        </button>
+        {/* The explorer can now be dismissed from its own header, not just the
+            main-header folder toggle — both flip the same `filesOpen` flag. */}
+        <button
+          onClick={toggleFiles}
+          className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-faint transition-colors hover:bg-danger/10 hover:text-danger motion-reduce:transition-none"
+          title="Close file explorer"
+          aria-label="Close file explorer"
+        >
+          ✕
         </button>
       </div>
       {workspaceError && (
@@ -184,6 +196,7 @@ function TreeNode({
   // the first is still pending.
   const loading = useRef(false);
   const appendDraft = useStore((s) => s.appendDraft);
+  const { onContextMenu, menu } = useContextMenu();
 
   const toggle = async () => {
     if (entry.isDir) {
@@ -208,6 +221,33 @@ function TreeNode({
     }
   };
 
+  // Best-effort clipboard copy (the API is missing in some webviews / blocked
+  // contexts). A failure is swallowed — copy-path is a convenience, never a path
+  // the agent depends on, and there's no surface to show an error here.
+  const copyPath = () => {
+    void navigator.clipboard?.writeText?.(entry.path).catch(() => {});
+  };
+
+  const menuItems = (): ContextMenuItem[] => {
+    const items: ContextMenuItem[] = [
+      {
+        label: "Insert into composer",
+        icon: <InsertGlyph />,
+        onSelect: () => appendDraft(entry.path),
+      },
+      { label: "Copy path", icon: <CopyGlyph />, onSelect: copyPath },
+    ];
+    if (entry.isDir) {
+      items.push({
+        label: open ? "Collapse" : "Expand",
+        icon: <CaretGlyph open={open} />,
+        separatorBefore: true,
+        onSelect: () => void toggle(),
+      });
+    }
+    return items;
+  };
+
   const glyph = entry.isDir ? null : fileGlyph(entry.name);
   const rowColor = entry.isDir ? "text-fg" : (glyph!.rowClass ?? "text-muted");
 
@@ -215,6 +255,7 @@ function TreeNode({
     <div>
       <button
         onClick={() => void toggle()}
+        onContextMenu={onContextMenu(menuItems())}
         onFocus={() => onActivate(entry.path)}
         role="treeitem"
         data-path={entry.path}
@@ -277,7 +318,53 @@ function TreeNode({
           )}
         </div>
       </div>
+      {menu}
     </div>
+  );
+}
+
+// ── Context-menu glyphs ──────────────────────────────────────────────────────
+function InsertGlyph() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M12 5v9" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+      <path
+        d="M8 11l4 4 4-4"
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path d="M5 19h14" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function CopyGlyph() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" strokeWidth="1.6" />
+      <path
+        d="M5 15V6a1 1 0 0 1 1-1h9"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function CaretGlyph({ open }: { open: boolean }) {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d={open ? "M6 9l6 6 6-6" : "M9 6l6 6-6 6"}
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
   );
 }
 

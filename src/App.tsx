@@ -8,19 +8,30 @@ import { CommandPalette } from "./components/CommandPalette";
 import { StatusHud } from "./components/StatusHud";
 import { NeonRain } from "./components/NeonRain";
 import { RemotePairing } from "./components/RemotePairing";
-import { isTauri } from "./lib/ipc";
+import { RemoteSessions } from "./components/RemoteSessions";
+import { RemoteChatHeader } from "./components/RemoteChatHeader";
+import { DisconnectedState, OfflineState } from "./components/RemoteEdgeStates";
+import { InstallGate } from "./components/InstallGate";
+import { CrashConsentPrompt } from "./components/CrashConsentPrompt";
+import { UpdateBanner } from "./components/UpdateBanner";
+import { ChannelBadge } from "./components/ChannelBadge";
+import { isTauri, isWebClientMode, onUpdaterEvent } from "./lib/ipc";
+import { getInstallState } from "./lib/installGate";
+import { initTelemetry, shutdownTelemetry, telemetryConfigured } from "./lib/telemetry";
 
 export default function App() {
   const init = useStore((s) => s.init);
   const showSettings = useStore((s) => s.showSettings);
   const showFiles = useStore((s) => s.showFiles);
-  const showSidebar = useStore((s) => s.showSidebar);
   const ambientRain = useStore((s) => s.ambientRain);
   const scanlines = useStore((s) => s.scanlines);
   const remoteMode = useStore((s) => s.remoteMode);
   const remoteConnected = useStore((s) => s.remoteConnected);
   const remoteVerified = useStore((s) => s.remoteVerified);
   const remoteDropped = useStore((s) => s.remoteDropped);
+  const remoteChatOpen = useStore((s) => s.remoteChatOpen);
+  const online = useStore((s) => s.online);
+  const crashReporting = useStore((s) => s.crashReporting);
 
   // A stable target for keyboard focus after the file rail collapses: the
   // TitleBar file-toggle button stays visible and tabbable, so it's where a
@@ -30,6 +41,56 @@ export default function App() {
   useEffect(() => {
     void init();
   }, [init]);
+
+  // Auto-update (desktop only). The updater commands/events don't exist on the
+  // phone/web client, so this whole effect is gated on isTauri() — it never runs
+  // (and so never throws) in the browser test/preview env. On the desktop it:
+  //   1. subscribes to the native updater progress/finished events,
+  //   2. learns which release channel this build follows (for the Settings hint),
+  //   3. checks for an update once on launch,
+  //   4. re-checks every 6 hours while the app stays open.
+  // The store actions it calls are all defensive (swallow a missing-command), and
+  // the listener + interval are torn down on unmount.
+  useEffect(() => {
+    if (!isTauri() || remoteMode) return;
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    const s = useStore.getState();
+
+    void onUpdaterEvent((e) => {
+      const store = useStore.getState();
+      if (e.kind === "progress") store.applyUpdateProgress(e.downloaded, e.total);
+      else store.markUpdateReady();
+    }).then((off) => {
+      // If the effect already cleaned up before the async subscribe resolved, drop
+      // the listener immediately so it can't leak.
+      if (cancelled) off();
+      else unlisten = off;
+    });
+
+    void s.loadUpdateChannel();
+    void s.checkForUpdate();
+    const SIX_HOURS = 6 * 60 * 60 * 1000;
+    const interval = setInterval(() => void useStore.getState().checkForUpdate(), SIX_HOURS);
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+      clearInterval(interval);
+    };
+  }, [remoteMode]);
+
+  // Keep the store's `online` flag live. Remote mode shows the offline screen while
+  // the device has no network; auto-recovers when the connection returns.
+  useEffect(() => {
+    const update = () => useStore.getState().setOnline(navigator.onLine);
+    window.addEventListener("online", update);
+    window.addEventListener("offline", update);
+    return () => {
+      window.removeEventListener("online", update);
+      window.removeEventListener("offline", update);
+    };
+  }, []);
 
   // Collapsing the file rail makes it inert, which blurs any focused tree row
   // and drops focus to <body> (Ctrl+B / the toggle both fire over a focused
@@ -47,7 +108,7 @@ export default function App() {
   }, [showFiles]);
 
   // Announce a successful remote pairing, mirroring the remoteDropped case. The
-  // confirm-SAS path flips remoteGate false and unmounts the pairing screen with
+  // confirm-SAS path flips remoteVerified true and unmounts the pairing screen with
   // no spoken feedback; track the prior connected+verified value and, on the
   // false->true edge, set a transient message so the empty->message change is
   // announced by AT, then clear it. No animation, so no reduced-motion concern.
@@ -63,6 +124,14 @@ export default function App() {
     }
     prevRemoteLive.current = remoteLive;
   }, [remoteLive]);
+
+  // Keep the crash-reporting SDK in sync with the consent toggle. `initTelemetry`
+  // is idempotent and a no-op without consent+DSN, so this safely covers opting in
+  // (start) and opting out (flush + disable).
+  useEffect(() => {
+    if (crashReporting === true) initTelemetry(true);
+    else shutdownTelemetry();
+  }, [crashReporting]);
 
   // Release the live remote frame subscription if the app tree unmounts (HMR, a
   // root remount) so a stale native listener can't survive into a new store
@@ -120,12 +189,8 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // Remote mode (the phone, or any client that opted in): until a desktop session
-  // is connected AND its SAS verified, the pairing screen takes over the shell.
-  const remoteGate = remoteMode && !(remoteConnected && remoteVerified);
-
   return (
-    <div className="relative flex h-full w-full flex-col overflow-hidden bg-bg text-fg">
+    <div className="pc-safe-area relative flex h-full w-full flex-col overflow-hidden bg-bg text-fg">
       {/* Ambient layers — vignette always on; rain/scanlines are user-opt-in. */}
       {ambientRain && <NeonRain />}
       {scanlines && <div className="pc-scanlines" aria-hidden="true" />}
@@ -141,42 +206,43 @@ export default function App() {
         </span>
       )}
 
-      {remoteGate ? (
-        <RemotePairing />
+      {remoteMode ? (
+        <RemoteShell
+          online={online}
+          remoteDropped={remoteDropped}
+          remoteConnected={remoteConnected}
+          remoteVerified={remoteVerified}
+          remoteChatOpen={remoteChatOpen}
+        />
       ) : (
         <>
-          {remoteMode && <RemoteBanner />}
+          {/* In-app auto-update notice (desktop only in practice; self-gates on its
+              phase and renders nothing while idle). Sits above the other banners. */}
+          <UpdateBanner />
           <div className="flex min-h-0 flex-1 overflow-hidden">
-            {/* Desktop: the session list is an inline rail. On the phone that rail
-                would eat the narrow viewport, so there it becomes a drawer (below)
-                and the chat takes the full width. */}
-            {!remoteMode && <Sidebar />}
+            <Sidebar />
             {/* The file rail stays mounted and animates its inline width (0fr<->1fr
                 grid accordion, the same pattern ToolCall uses on rows) so toggling
                 it slides instead of jumping the main column sideways. The inner
                 overflow-hidden clips the 236px-wide content to zero; reduced-motion
                 users get the instant swap they had before. Collapsed, the rail is
                 inert + aria-hidden so its tree stays out of the tab order and AT. */}
-            {!remoteMode && (
-              <div
-                data-testid="file-rail"
-                className="grid shrink-0 transition-[grid-template-columns] duration-200 ease-out motion-reduce:transition-none"
-                style={{ gridTemplateColumns: showFiles ? "1fr" : "0fr" }}
-                aria-hidden={!showFiles || undefined}
-                inert={!showFiles}
-              >
-                <div className="overflow-hidden">
-                  <FileExplorer />
-                </div>
+            <div
+              data-testid="file-rail"
+              className="grid shrink-0 transition-[grid-template-columns] duration-200 ease-out motion-reduce:transition-none"
+              style={{ gridTemplateColumns: showFiles ? "1fr" : "0fr" }}
+              aria-hidden={!showFiles || undefined}
+              inert={!showFiles}
+            >
+              <div className="overflow-hidden">
+                <FileExplorer />
               </div>
-            )}
+            </div>
             <main className="flex min-w-0 flex-1 flex-col">
               <TitleBar fileToggleRef={fileToggleRef} />
               <Chat />
             </main>
           </div>
-
-          {remoteMode && showSidebar && <SidebarDrawer />}
 
           <StatusHud />
 
@@ -184,108 +250,48 @@ export default function App() {
           <CommandPalette />
         </>
       )}
+
+      {/* First-run crash-reporting consent — only when the choice is unmade AND
+          this build can actually report (a DSN was baked in). Off-by-default: no
+          choice means nothing is ever sent. */}
+      {crashReporting === null && telemetryConfigured() && <CrashConsentPrompt />}
     </div>
   );
 }
 
-const FOCUSABLE =
-  'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
-
-/** The session list as a slide-in overlay — the phone's equivalent of the
- *  desktop's inline sidebar rail. Tapping the backdrop closes it; selecting or
- *  creating a session closes it too (handled in the store). Behaves as a modal
- *  dialog: focus moves in on open, Tab is trapped, and focus returns to the
- *  opener on close. */
-function SidebarDrawer() {
-  const setShowSidebar = useStore((s) => s.setShowSidebar);
-  const drawerRef = useRef<HTMLDivElement>(null);
-  // Escape closes the drawer (the App keydown effect only handles modified keys,
-  // so plain Escape would otherwise strand focus inside the overlay). Bail while
-  // Settings (z-58) or the command palette (z-60) is open: both stack on top of
-  // the drawer (z-50), so the first Escape must dismiss only the topmost layer.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      const s = useStore.getState();
-      if (!s.showSettings && !s.showPalette) setShowSidebar(false);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [setShowSidebar]);
-  // Treat the drawer as a modal dialog: move focus into it on open (onto the
-  // container, a non-input element, so the phone soft keyboard doesn't pop) and
-  // restore focus to the opener (the TitleBar hamburger) on close.
-  useEffect(() => {
-    const opener = document.activeElement as HTMLElement | null;
-    drawerRef.current?.focus();
-    return () => {
-      if (opener && opener.isConnected) opener.focus();
-    };
-  }, []);
-  // Trap Tab within the drawer so it can't walk into the chat behind the backdrop.
-  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    if (e.key !== "Tab") return;
-    const container = drawerRef.current;
-    if (!container) return;
-    const focusable = [...container.querySelectorAll<HTMLElement>(FOCUSABLE)];
-    if (focusable.length === 0) {
-      // Nothing tabbable inside — keep focus pinned to the container.
-      e.preventDefault();
-      container.focus();
-      return;
-    }
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    const active = document.activeElement;
-    if (e.shiftKey && (active === first || active === container)) {
-      e.preventDefault();
-      last.focus();
-    } else if (!e.shiftKey && active === last) {
-      e.preventDefault();
-      first.focus();
-    }
-  };
+/** The remote (phone) shell. Walks the design flow: offline → disconnected →
+ *  pair/safety → sessions list → open session (chat). The connection-state gates
+ *  come from the store; pairing+safety both live inside RemotePairing. */
+function RemoteShell({
+  online,
+  remoteDropped,
+  remoteConnected,
+  remoteVerified,
+  remoteChatOpen,
+}: {
+  online: boolean;
+  remoteDropped: boolean;
+  remoteConnected: boolean;
+  remoteVerified: boolean;
+  remoteChatOpen: boolean;
+}) {
+  if (!online) return <OfflineState />;
+  if (remoteDropped) return <DisconnectedState />;
+  // Web-client (iOS PWA) install gate (§5.7): block pairing until the app is
+  // installed to the Home Screen on iOS, since install is what grants push, durable
+  // storage, and the correct storage partition. Only gates in web-client mode and
+  // only when the reason is "needs-install" (iOS in a Safari tab); desktop/Android
+  // browsers ("not-ios-ok") and an already-installed iOS PWA ("ok") fall through to
+  // pairing. The Tauri/native path never enters this branch (isWebClientMode is off).
+  if (isWebClientMode() && getInstallState().reason === "needs-install") return <InstallGate />;
+  if (!(remoteConnected && remoteVerified)) return <RemotePairing />;
+  if (!remoteChatOpen) return <RemoteSessions />;
+  // Open session — the chat view. `relative` so the session switcher's scrim/sheet
+  // (raised from the header) position against this view.
   return (
-    <div
-      ref={drawerRef}
-      role="dialog"
-      aria-modal="true"
-      aria-label="Sessions"
-      tabIndex={-1}
-      onKeyDown={onKeyDown}
-      className="fixed inset-0 z-50 flex outline-none"
-    >
-      <div className="pc-drawer h-full shrink-0">
-        <Sidebar />
-      </div>
-      <button
-        type="button"
-        aria-label="Close sessions"
-        onClick={() => setShowSidebar(false)}
-        className="h-full flex-1 bg-black/60 backdrop-blur-[1px]"
-      />
-    </div>
-  );
-}
-
-/** A slim banner atop the remote session: shows the live link and lets the user
- *  drop it. Only rendered in remote mode once connected + verified. */
-function RemoteBanner() {
-  const disconnectRemote = useStore((s) => s.disconnectRemote);
-  return (
-    <div className="flex shrink-0 items-center justify-between gap-3 border-b border-accent-2/25 bg-accent-2/5 px-4 py-2">
-      <span className="flex items-center gap-2 font-mono text-[10.5px] uppercase tracking-[1.5px] text-accent-2">
-        <span className="pc-dot pc-dot--cyan" />
-        Remote · connected
-      </span>
-      <button
-        onClick={() => void disconnectRemote()}
-        className="rounded-md border border-border-2 bg-panel-2/80 px-2.5 py-1 font-mono text-[11px] text-muted transition-colors hover:border-danger/50 hover:text-danger"
-        aria-label="Disconnect from desktop"
-        title="Disconnect from desktop"
-      >
-        Disconnect
-      </button>
+    <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+      <RemoteChatHeader />
+      <Chat />
     </div>
   );
 }
@@ -294,41 +300,20 @@ function TitleBar({ fileToggleRef }: { fileToggleRef?: React.Ref<HTMLButtonEleme
   const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
   const showFiles = useStore((s) => s.showFiles);
   const toggleFiles = useStore((s) => s.toggleFiles);
-  const toggleSidebar = useStore((s) => s.toggleSidebar);
   const setShowPalette = useStore((s) => s.setShowPalette);
-  // The file explorer browses the desktop's workspace (`list_dir` is desktop-only),
-  // so the phone hides the toggle.
-  const remoteMode = useStore((s) => s.remoteMode);
   return (
     <header className="flex h-[46px] shrink-0 items-center justify-between border-b border-border bg-panel/70 px-3.5 backdrop-blur-sm">
       <div className="flex min-w-0 items-center gap-2.5">
-        {remoteMode && (
-          <button
-            onClick={toggleSidebar}
-            aria-label="Toggle sessions"
-            title="Sessions"
-            className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[7px] border border-transparent text-muted transition-colors hover:text-accent-2"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-              <path
-                d="M4 6h16M4 12h16M4 18h16"
-                stroke="currentColor"
-                strokeWidth="1.7"
-                strokeLinecap="round"
-              />
-            </svg>
-          </button>
-        )}
         <button
           ref={fileToggleRef}
           onClick={toggleFiles}
           aria-label="Toggle file explorer (Ctrl+B)"
           aria-pressed={showFiles}
           title="Toggle file explorer (Ctrl+B)"
-          className={`${remoteMode ? "hidden " : ""}flex h-[30px] w-[30px] items-center justify-center rounded-[7px] border transition-colors ${
+          className={`flex h-[30px] w-[30px] items-center justify-center rounded-[7px] border transition-[background-color,border-color,box-shadow,color] duration-150 motion-reduce:transition-none ${
             showFiles
-              ? "border-accent-2/30 bg-accent-2/10 text-accent-2"
-              : "border-transparent text-muted hover:text-accent-2"
+              ? "border-accent-2/50 bg-accent-2/12 text-accent-2 shadow-[0_0_14px_rgba(33,230,255,0.25)]"
+              : "border-border-2 bg-panel-2/60 text-muted hover:border-accent-2/30 hover:text-accent-2"
           }`}
         >
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
@@ -346,22 +331,21 @@ function TitleBar({ fileToggleRef }: { fileToggleRef?: React.Ref<HTMLButtonEleme
         </span>
       </div>
       <div className="flex shrink-0 items-center gap-2.5">
+        <ChannelBadge />
         {!isTauri() && (
           <span className="pc-pill pc-pill--warn">
             <span className="pc-dot pc-dot--warn" />
             PREVIEW MODE
           </span>
         )}
-        {!remoteMode && (
-          <button
-            onClick={() => setShowPalette(true)}
-            aria-label="Open command palette (Ctrl+K)"
-            title="Command palette (Ctrl+K)"
-            className="flex items-center gap-1.5 rounded-md border border-border-2 bg-panel-2/80 px-2.5 py-1 font-mono text-[11px] text-muted transition-colors hover:border-accent/50 hover:text-accent"
-          >
-            ⌘K <span className="text-faint">palette</span>
-          </button>
-        )}
+        <button
+          onClick={() => setShowPalette(true)}
+          aria-label="Open command palette (Ctrl+K)"
+          title="Command palette (Ctrl+K)"
+          className="flex items-center gap-1.5 rounded-md border border-border-2 bg-panel-2/80 px-2.5 py-1 font-mono text-[11px] text-muted transition-colors hover:border-accent/50 hover:text-accent"
+        >
+          ⌘K <span className="text-faint">palette</span>
+        </button>
       </div>
     </header>
   );

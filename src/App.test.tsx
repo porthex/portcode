@@ -5,6 +5,7 @@ import App from "./App";
 import { useStore } from "./store/store";
 import { DEFAULT_SETTINGS } from "./types";
 import * as ipc from "./lib/ipc";
+import { getInstallState } from "./lib/installGate";
 
 // App's own logic is the mount-time `init()` effect, the global keyboard
 // shortcut effect, and the conditional rendering of panels by store flags
@@ -31,6 +32,46 @@ vi.mock("./components/CommandPalette", () => ({
 vi.mock("./components/RemotePairing", () => ({
   RemotePairing: () => <div data-testid="remote-pairing" />,
 }));
+vi.mock("./components/RemoteSessions", () => ({
+  RemoteSessions: () => <div data-testid="remote-sessions" />,
+}));
+vi.mock("./components/RemoteChatHeader", () => ({
+  RemoteChatHeader: () => <div data-testid="remote-chat-header" />,
+}));
+vi.mock("./components/RemoteEdgeStates", () => ({
+  DisconnectedState: () => <div data-testid="disconnected-state" />,
+  OfflineState: () => <div data-testid="offline-state" />,
+}));
+vi.mock("./components/InstallGate", () => ({
+  InstallGate: () => <div data-testid="install-gate" />,
+}));
+
+// The install gate is gated on the web-client flag (ipc.isWebClientMode) AND the
+// iOS install state (installGate.getInstallState). Stub the install state module so
+// these App tests can drive the gate branch; default to "not-ios-ok" (a desktop
+// browser) so the existing tests fall through to pairing exactly as before.
+vi.mock("./lib/installGate", () => ({
+  getInstallState: vi.fn(() => ({
+    installed: false,
+    ios: false,
+    canPair: true,
+    reason: "not-ios-ok",
+    guidance: "",
+  })),
+}));
+
+vi.mock("./components/CrashConsentPrompt", () => ({
+  CrashConsentPrompt: () => <div data-testid="crash-consent-prompt" />,
+}));
+
+// App calls telemetry on mount (main.tsx-style pre-init is separate) and from the
+// crashReporting sync effect. Stub it so this suite never depends on a build-time
+// DSN (`telemetryConfigured`) or touches the real Sentry client.
+vi.mock("./lib/telemetry", () => ({
+  initTelemetry: vi.fn(),
+  shutdownTelemetry: vi.fn(),
+  telemetryConfigured: vi.fn(() => false),
+}));
 
 // `isTauri` is consumed by App's TitleBar; the rest of the surface is what the
 // store's `init()` path invokes. A single mock of this module covers both the
@@ -39,10 +80,15 @@ vi.mock("./components/RemotePairing", () => ({
 // them later through the imported (now-mocked) module.
 vi.mock("./lib/ipc", () => ({
   isTauri: vi.fn(),
+  // App uses this to gate the iOS install screen to the web-client path only.
+  isWebClientMode: vi.fn(),
   getSettings: vi.fn(),
   listSessions: vi.fn(),
   createSession: vi.fn(),
   getMessages: vi.fn(),
+  // store.init() hydrates per-session drafts + cumulative usage on mount.
+  getDrafts: vi.fn(),
+  getAllUsage: vi.fn(),
   // store.init() restores subscription sign-in via ipc.oauthStatus() on mount.
   oauthStatus: vi.fn(),
   startOauthLogin: vi.fn(),
@@ -55,6 +101,11 @@ vi.mock("./lib/ipc", () => ({
   phoneSyncDisconnect: vi.fn(),
   // store.init() (desktop) subscribes to inbound pairing-confirm requests.
   onPhoneSyncPairingRequest: vi.fn(),
+  // Auto-update: App's desktop-only mount effect subscribes to updater events and
+  // kicks off a channel load + check. Only reached when isTauri() is true.
+  onUpdaterEvent: vi.fn(),
+  getUpdateChannel: vi.fn(),
+  checkForUpdate: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -70,10 +121,27 @@ beforeEach(() => {
   m.listSessions.mockResolvedValue([]);
   m.createSession.mockResolvedValue(undefined);
   m.getMessages.mockResolvedValue([]);
+  m.getDrafts.mockResolvedValue([]);
+  m.getAllUsage.mockResolvedValue([]);
   m.oauthStatus.mockResolvedValue({ signedIn: false, expiresAt: null, account: null, tier: null });
   m.phoneSyncStatus.mockResolvedValue({ devicePublicKey: "DEVICE==", paired: [] });
   m.phoneSyncDisconnect.mockResolvedValue(undefined);
   m.onPhoneSyncPairingRequest.mockResolvedValue(() => {});
+  // Default: NOT the web client (desktop preview / native), so the install gate
+  // never intercepts. The install-gate tests below flip these per-test.
+  m.isWebClientMode.mockReturnValue(false);
+  vi.mocked(getInstallState).mockReturnValue({
+    installed: false,
+    ios: false,
+    canPair: true,
+    reason: "not-ios-ok",
+    guidance: "",
+  });
+  // Auto-update mocks: harmless resolved values so the desktop mount effect (when
+  // isTauri() is true) settles without touching a real updater.
+  m.onUpdaterEvent.mockResolvedValue(() => {});
+  m.getUpdateChannel.mockResolvedValue("stable");
+  m.checkForUpdate.mockResolvedValue(null);
 });
 
 describe("App layout", () => {
@@ -146,17 +214,17 @@ describe("App layout", () => {
 });
 
 describe("remote mode shell", () => {
-  it("renders the desktop layout (no pairing screen) when remoteMode is off", () => {
+  it("renders the desktop layout (no remote screens) when remoteMode is off", () => {
     useStore.setState({ remoteMode: false });
 
     render(<App />);
 
-    expect(screen.queryByTestId("remote-pairing")).not.toBeInTheDocument();
     expect(screen.getByTestId("sidebar")).toBeInTheDocument();
-    expect(screen.queryByText("Remote · connected")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("remote-pairing")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("remote-sessions")).not.toBeInTheDocument();
   });
 
-  it("shows the pairing screen (and hides the session) when in remote mode but not connected", () => {
+  it("shows the pairing screen (and hides the desktop layout) when not connected", () => {
     useStore.setState({ remoteMode: true, remoteConnected: false, remoteVerified: false });
 
     render(<App />);
@@ -167,186 +235,153 @@ describe("remote mode shell", () => {
   });
 
   it("keeps showing the pairing screen while connected but not yet SAS-verified", () => {
-    // The SAS gate: a live connection alone isn't enough to reveal the session.
+    // The SAS gate: a live connection alone isn't enough to reveal the sessions.
     useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: false });
 
     render(<App />);
 
     expect(screen.getByTestId("remote-pairing")).toBeInTheDocument();
-    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("remote-sessions")).not.toBeInTheDocument();
   });
 
-  it("renders the remote session with a connected banner once verified", () => {
-    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+  it("shows the sessions list once verified, before a session is opened", () => {
+    useStore.setState({
+      remoteMode: true,
+      remoteConnected: true,
+      remoteVerified: true,
+      remoteChatOpen: false,
+    });
 
     render(<App />);
 
+    expect(screen.getByTestId("remote-sessions")).toBeInTheDocument();
     expect(screen.queryByTestId("remote-pairing")).not.toBeInTheDocument();
-    // On the phone the session list is a drawer, not an inline rail — reached via
-    // the TitleBar "Sessions" menu button.
+    expect(screen.queryByTestId("remote-chat-header")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("chat")).not.toBeInTheDocument();
+    // No desktop chrome on the phone (the inline session rail is desktop-only).
     expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Toggle sessions" })).toBeInTheDocument();
+  });
+
+  it("opens the chat view (header + chat) when a session is open", () => {
+    useStore.setState({
+      remoteMode: true,
+      remoteConnected: true,
+      remoteVerified: true,
+      remoteChatOpen: true,
+    });
+
+    render(<App />);
+
+    expect(screen.getByTestId("remote-chat-header")).toBeInTheDocument();
     expect(screen.getByTestId("chat")).toBeInTheDocument();
-    expect(screen.getByText("Remote · connected")).toBeInTheDocument();
-  });
-
-  it("opens the session drawer from the menu button and closes it on the backdrop", () => {
-    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
-
-    render(<App />);
-    // Drawer closed initially: the sidebar isn't mounted.
-    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Toggle sessions" }));
-    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
-    expect(useStore.getState().showSidebar).toBe(true);
-
-    fireEvent.click(screen.getByRole("button", { name: "Close sessions" }));
-    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
-    expect(useStore.getState().showSidebar).toBe(false);
-  });
-
-  it("closes the session drawer with Escape", () => {
-    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
-
-    render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "Toggle sessions" }));
-    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
-
-    // Plain Escape isn't caught by App's modified-key shortcut effect; the drawer
-    // installs its own handler so focus isn't stranded inside the overlay.
-    fireEvent.keyDown(window, { key: "Escape" });
-
-    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
-    expect(useStore.getState().showSidebar).toBe(false);
-  });
-
-  it("Escape closes only the topmost layer when Settings stacks over the drawer", () => {
-    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
-
-    render(<App />);
-    const opener = screen.getByRole("button", { name: "Toggle sessions" });
-    opener.focus();
-    fireEvent.click(opener);
-    // Both overlays are open: the drawer renders <Sidebar/>, whose footer Settings
-    // button opens Settings without closing the drawer (it stacks on top, z-58 > z-50).
-    // SettingsPanel is stubbed here, so its own unconditional Escape handler isn't
-    // present — this case targets the drawer's new bail branch, leaving the topmost
-    // layer (Settings) to dismiss itself (covered in Settings.test).
-    act(() => useStore.setState({ showSettings: true }));
-    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
-    expect(screen.getByTestId("settings-panel")).toBeInTheDocument();
-
-    // First Escape: the drawer's handler bails while Settings is open, so the drawer
-    // stays mounted instead of collapsing both layers at once.
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(useStore.getState().showSidebar).toBe(true);
-    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
-
-    // Once the top layer (Settings) is gone, focus returns to the drawer and a
-    // second Escape closes it, restoring focus to the hamburger.
-    act(() => useStore.setState({ showSettings: false }));
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(useStore.getState().showSidebar).toBe(false);
-    expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
-    expect(document.activeElement).toBe(opener);
-  });
-
-  it("Escape closes only the topmost layer when the command palette stacks over the drawer", () => {
-    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
-
-    render(<App />);
-    const opener = screen.getByRole("button", { name: "Toggle sessions" });
-    opener.focus();
-    fireEvent.click(opener);
-    // The palette (z-60) stacks above the drawer (z-50) and is reachable in remote
-    // mode via Ctrl+K. With both open, the drawer's Escape handler must bail so a
-    // single Escape dismisses only the palette layer, not the drawer underneath.
-    act(() => useStore.setState({ showPalette: true }));
-    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
-
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(useStore.getState().showSidebar).toBe(true);
-    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
-
-    // Once the palette layer is gone, a second Escape collapses the drawer.
-    act(() => useStore.setState({ showPalette: false }));
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(useStore.getState().showSidebar).toBe(false);
-  });
-
-  it("moves focus into the drawer on open and restores it to the opener on close", () => {
-    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
-
-    render(<App />);
-    const opener = screen.getByRole("button", { name: "Toggle sessions" });
-    // The opener is the focused trigger when the drawer opens.
-    opener.focus();
-    expect(document.activeElement).toBe(opener);
-
-    fireEvent.click(opener);
-
-    // Focus moves onto the dialog container (a non-input element, so the phone
-    // soft keyboard doesn't pop), not left on the now-occluded hamburger.
-    const dialog = screen.getByRole("dialog", { name: "Sessions" });
-    expect(dialog).toHaveAttribute("aria-modal", "true");
-    expect(document.activeElement).toBe(dialog);
-
-    // Closing restores focus to the opener that launched the drawer.
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(document.activeElement).toBe(opener);
-  });
-
-  it("traps Tab within the drawer (wraps from the last focusable back to the first)", () => {
-    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
-
-    render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "Toggle sessions" }));
-
-    const dialog = screen.getByRole("dialog", { name: "Sessions" });
-    // With the Sidebar stubbed, the only tabbable descendant is the backdrop
-    // Close button — it's both the first and last focusable in the trap.
-    const close = screen.getByRole("button", { name: "Close sessions" });
-    close.focus();
-    expect(document.activeElement).toBe(close);
-
-    // Tab from the last focusable wraps to the first (still the Close button),
-    // so focus never escapes the modal into the chat behind the backdrop.
-    fireEvent.keyDown(dialog, { key: "Tab" });
-    expect(document.activeElement).toBe(close);
-
-    // Shift+Tab from the first focusable wraps back to the last (also Close).
-    fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
-    expect(document.activeElement).toBe(close);
-  });
-
-  it("hides the desktop command-palette button on the phone", () => {
-    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
-
-    render(<App />);
-
-    // ⌘K is a desktop keyboard affordance — gone on the phone.
+    expect(screen.queryByTestId("remote-sessions")).not.toBeInTheDocument();
+    // The desktop command-palette button is a keyboard affordance — gone on the phone.
     expect(
       screen.queryByRole("button", { name: "Open command palette (Ctrl+K)" }),
     ).not.toBeInTheDocument();
   });
 
-  it("disconnects from the desktop via the banner button", async () => {
-    useStore.setState({ remoteMode: true, remoteConnected: true, remoteVerified: true });
+  it("shows the disconnected screen when the link dropped", () => {
+    useStore.setState({ remoteMode: true, remoteDropped: true });
 
     render(<App />);
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Disconnect from desktop" }));
-      await Promise.resolve();
-      await Promise.resolve();
+    expect(screen.getByTestId("disconnected-state")).toBeInTheDocument();
+    expect(screen.queryByTestId("remote-pairing")).not.toBeInTheDocument();
+  });
+
+  it("shows the offline screen, taking precedence over a drop, when the device is offline", () => {
+    useStore.setState({ remoteMode: true, remoteDropped: true, online: false });
+
+    render(<App />);
+
+    expect(screen.getByTestId("offline-state")).toBeInTheDocument();
+    expect(screen.queryByTestId("disconnected-state")).not.toBeInTheDocument();
+  });
+
+  it("gates pairing behind the install screen in web-client mode on uninstalled iOS", () => {
+    m.isWebClientMode.mockReturnValue(true);
+    vi.mocked(getInstallState).mockReturnValue({
+      installed: false,
+      ios: true,
+      canPair: false,
+      reason: "needs-install",
+      guidance: "install me",
+    });
+    useStore.setState({ remoteMode: true, remoteConnected: false, remoteVerified: false });
+
+    render(<App />);
+
+    expect(screen.getByTestId("install-gate")).toBeInTheDocument();
+    expect(screen.queryByTestId("remote-pairing")).not.toBeInTheDocument();
+  });
+
+  it("does NOT gate when not in web-client mode (native path), even on iOS", () => {
+    // Native/Tauri path: the install gate must never intercept the desktop/mobile
+    // app, no matter what the install sniff would say.
+    m.isWebClientMode.mockReturnValue(false);
+    vi.mocked(getInstallState).mockReturnValue({
+      installed: false,
+      ios: true,
+      canPair: false,
+      reason: "needs-install",
+      guidance: "install me",
+    });
+    useStore.setState({ remoteMode: true, remoteConnected: false, remoteVerified: false });
+
+    render(<App />);
+
+    expect(screen.queryByTestId("install-gate")).not.toBeInTheDocument();
+    expect(screen.getByTestId("remote-pairing")).toBeInTheDocument();
+  });
+
+  it("proceeds to pairing in web-client mode when install state is ok (installed iOS)", () => {
+    m.isWebClientMode.mockReturnValue(true);
+    vi.mocked(getInstallState).mockReturnValue({
+      installed: true,
+      ios: true,
+      canPair: true,
+      reason: "ok",
+      guidance: "",
+    });
+    useStore.setState({ remoteMode: true, remoteConnected: false, remoteVerified: false });
+
+    render(<App />);
+
+    expect(screen.queryByTestId("install-gate")).not.toBeInTheDocument();
+    expect(screen.getByTestId("remote-pairing")).toBeInTheDocument();
+  });
+
+  it("proceeds to pairing in web-client mode on a non-iOS browser (not-ios-ok)", () => {
+    m.isWebClientMode.mockReturnValue(true); // reason defaults to "not-ios-ok"
+    useStore.setState({ remoteMode: true, remoteConnected: false, remoteVerified: false });
+
+    render(<App />);
+
+    expect(screen.queryByTestId("install-gate")).not.toBeInTheDocument();
+    expect(screen.getByTestId("remote-pairing")).toBeInTheDocument();
+  });
+
+  it("recovers from the offline screen when the network returns", () => {
+    useStore.setState({
+      remoteMode: true,
+      remoteConnected: true,
+      remoteVerified: true,
+      remoteChatOpen: true,
+      online: false,
     });
 
-    expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(1);
-    const st = useStore.getState();
-    expect(st.remoteConnected).toBe(false);
-    expect(st.remoteVerified).toBe(false);
+    render(<App />);
+    expect(screen.getByTestId("offline-state")).toBeInTheDocument();
+
+    // App's online/offline listener re-reads navigator.onLine (true in jsdom) on the
+    // browser 'online' event, flipping the store flag and revealing the chat again.
+    act(() => {
+      window.dispatchEvent(new Event("online"));
+    });
+
+    expect(screen.queryByTestId("offline-state")).not.toBeInTheDocument();
+    expect(screen.getByTestId("remote-chat-header")).toBeInTheDocument();
   });
 });
 
@@ -368,6 +403,7 @@ describe("TitleBar", () => {
           id: "a",
           title: "Refactor the parser",
           workspace: null,
+          model: "claude-opus-4-8",
           createdAt: 1,
           updatedAt: 1,
         },
@@ -387,6 +423,7 @@ describe("TitleBar", () => {
           id: "a",
           title: "Refactor the parser",
           workspace: null,
+          model: "claude-opus-4-8",
           createdAt: 1,
           updatedAt: 1,
         },

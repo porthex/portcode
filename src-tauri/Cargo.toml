@@ -27,6 +27,15 @@ tauri-plugin-opener = "2"
 # the release workflow's secret-gated `tauri signer sign` step.
 tauri-plugin-updater = "2"
 
+# Phone Sync shared crate (Phase 1 of docs/IOS_WEB_CLIENT_PLAN.md): the protocol,
+# Noise crypto, session loops, and the native iroh transport now live here so the
+# same code compiles for the future wasm browser client. With default features
+# this resolves the crate's NATIVE target table (tokio + `iroh = "1"`); the wasm
+# path is selected only when something is built for wasm32. The desktop re-exports
+# these types through `src/sync/*.rs`, `src/llm.rs`, and `src/db.rs`, so the rest
+# of the crate stays source-compatible.
+portcode-sync = { path = "../crates/portcode-sync" }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -83,12 +92,36 @@ keyring = { version = "3", features = ["windows-native"] }
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "2"
 
-[profile.release]
-opt-level = "s"
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true
+# NOTE: `[profile.release]` moved to the workspace ROOT `Cargo.toml` — Cargo only
+# honors profiles at the workspace root and ignores (with a warning) a profile
+# defined in a member manifest. The exact same flags now live there (incl. the
+# Sentry symbolication `debug = true`).
+
+# Opt-in crash/perf reporting (Phase 1b — Rust host). Gated to DESKTOP targets so
+# the crate is NEVER compiled for the Android/iOS cross-compile probe (the phone is
+# a pure remote client and ships no host crash reporter — `src/telemetry.rs` is
+# `#[cfg(desktop)]`). Mirrors the `keyring`/`tauri-plugin-barcode-scanner` target
+# tables above. `default-features = false` + `reqwest` + `rustls` keeps the
+# transport on rustls (matching this crate's `reqwest`) and avoids pulling
+# openssl/native-tls; `backtrace`/`contexts`/`panic` give the panic integration +
+# stack/OS contexts. The whole pipeline is compile-time-inert without a build-time
+# `SENTRY_DSN` (see `telemetry::dsn`), preserving "zero telemetry by default".
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+sentry = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+# Phase 2 — desktop minidump capture + the webview→Rust envelope bridge. The plugin
+# RE-EXPORTS `sentry` + `sentry-rust-minidump` and pins `sentry ^0.34`, so it aligns
+# with the `sentry` dep above WITHOUT forcing a version bump (verified against the
+# published `tauri-plugin-sentry` 0.2.0 Cargo.toml). Exact-pinned because 0.3.x bumps
+# `sentry` to 0.35. The plugin's `sentry-rust-minidump` (also 0.34-aligned) re-execs
+# the binary as an OUT-OF-PROCESS crash monitor (EmbarkStudios crash-handler), so
+# native segfaults AND `panic = "abort"` aborts are captured even though they can't
+# unwind in-process. Gated to DESKTOP (mirrors `sentry`): the phone is a remote client.
+tauri-plugin-sentry = "=0.2.0"
+# Resolves `<app_config_dir>` WITHOUT a Tauri app handle — the consent file is read in
+# the re-exec'd crash-reporter process, which has no `AppHandle`. Tauri's own
+# `app_config_dir()` is `dirs::config_dir().join(<identifier>)`, so this reproduces the
+# exact path. `dirs = "6"` matches the version Tauri 2 already resolves (no dup in lock).
+dirs = "6"
 
 # Lint policy. CI runs `cargo clippy --all-targets -- -D warnings`; these make
 # the same baseline reproducible for local `cargo clippy`. `unsafe_code = "deny"`

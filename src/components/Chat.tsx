@@ -3,6 +3,8 @@ import { useStore } from "../store/store";
 import { MessageView } from "./Message";
 import { Composer } from "./Composer";
 import { PermissionPrompt } from "./PermissionPrompt";
+import { AgentsPanel } from "./AgentsPanel";
+import { BackgroundTasksPanel } from "./BackgroundTasksPanel";
 import type { Message } from "../types";
 
 // Stable reference so the selector never returns a fresh array (which would
@@ -17,6 +19,8 @@ export function Chat() {
   const loadError = useStore((s) => (activeId ? s.loadErrors[activeId] : false));
   const retryInit = useStore((s) => s.retryInit);
   const retryLoad = useStore((s) => s.retryLoad);
+  const scrollTargetId = useStore((s) => s.scrollTargetId);
+  const clearScrollTarget = useStore((s) => s.clearScrollTarget);
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   // Whether the viewport is pinned to the bottom. We only auto-follow new content
@@ -53,6 +57,19 @@ export function Chat() {
     const el = scrollRef.current;
     if (el && stuckToBottom.current) el.scrollTop = el.scrollHeight;
   }, [messages, streaming]);
+
+  // A ⌘K search result asked to reveal a specific past message: scroll it into view
+  // once it's in the DOM (it can arrive a tick later when the session was just
+  // loaded), then clear the request. Declared after the bottom-followers above so it
+  // wins on a jump. Leaves the target set until the element exists, so a still-loading
+  // session retries on the next messages update instead of losing the scroll.
+  useEffect(() => {
+    if (!scrollTargetId) return;
+    const el = document.getElementById(`pc-msg-${scrollTargetId}`);
+    if (!el) return;
+    el.scrollIntoView?.({ block: "center" });
+    clearScrollTarget();
+  }, [scrollTargetId, messages, clearScrollTarget]);
 
   // The decode reveal grows the transcript height between store updates, so follow
   // it to the bottom while a turn streams — but only while the user is still pinned
@@ -135,6 +152,8 @@ export function Chat() {
           </button>
         )}
       </div>
+      <AgentsPanel />
+      <BackgroundTasksPanel />
       <PermissionPrompt />
       <Composer />
     </div>

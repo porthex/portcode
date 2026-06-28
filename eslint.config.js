@@ -15,6 +15,14 @@ export default tseslint.config(
       "src-tauri/**",
       // graphify knowledge-graph output is machine-generated, not source.
       "graphify-out/**",
+      // Transient Claude Code agent git worktrees (gitignored): full repo copies
+      // with their own tsconfigs that otherwise break the TS parser's project-root
+      // detection. Not first-party source.
+      ".claude/worktrees/**",
+      // Committed but machine-generated wasm-bindgen output (wasm-pack --target web).
+      // Linting the glue is meaningless and would flag its generated patterns; the
+      // hand-written wiring lives in src/lib/webSession.ts, which IS linted.
+      "web/wasm/**",
     ],
   },
   {

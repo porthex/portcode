@@ -2,6 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Required by the Sentry Android SDK to check connectivity before
+         attempting to send crash/error events. Without this the SDK silently
+         queues events but cannot determine when to flush them. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
     <!-- Camera: scan the desktop's pairing QR (Phone Sync). Declared not-required
          as a hardware feature so the app still installs on camera-less devices —
          the pairing screen falls back to pasting the code. -->
@@ -12,10 +17,18 @@
     <uses-feature android:name="android.software.leanback" android:required="false" />
 
     <application
+        android:name=".PortcodeApplication"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:theme="@style/Theme.portcode"
         android:usesCleartextTraffic="${usesCleartextTraffic}">
+        <!-- Disable Sentry's ContentProvider (SentryInitProvider) auto-init. The SDK
+             must be initialized ONLY from PortcodeApplication.onCreate(), AFTER the
+             on-disk consent check — otherwise it could init at process start and
+             bypass consent. Manual SentryAndroid.init() still works with this false.
+             Set unconditionally (belt-and-suspenders) since the merged manifest can't
+             be inspected on the dev box; harmless if the plugin wouldn't auto-init. -->
+        <meta-data android:name="io.sentry.auto-init" android:value="false" />
         <activity
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
             android:launchMode="singleTask"

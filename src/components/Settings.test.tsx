@@ -21,6 +21,8 @@ import {
 vi.mock("../lib/ipc", () => ({
   // Reached by the store's updateSettings; echoes a merged settings object.
   saveSettings: vi.fn(async (s: Partial<Settings>) => ({ ...DEFAULT_SETTINGS, ...s })),
+  // Reached by the store's checkForUpdate (manual "Check now" button); no update.
+  checkForUpdate: vi.fn(async () => null),
   // Called directly by the component when saving the API key.
   setApiKey: vi.fn(async (_key: string) => {}),
   // Resolves a folder path; present for completeness of the store's surface.
@@ -93,9 +95,9 @@ describe("SettingsPanel — structure", () => {
     expect(screen.getByText("Anthropic (Claude)")).toBeInTheDocument();
 
     // Model select reflects the store's current model. Query by its accessible
-    // name (the visible "Model" label is associated via htmlFor/id), which both
+    // name (the visible "Default model" label is associated via htmlFor/id), which both
     // locks in the accessible-name wiring and finds the same <select>.
-    const select = screen.getByLabelText("Model") as HTMLSelectElement;
+    const select = screen.getByLabelText("Default model (new sessions)") as HTMLSelectElement;
     expect(select.value).toBe(DEFAULT_SETTINGS.model);
     // Every model from the catalogue is offered as an option.
     for (const model of MODELS) {
@@ -310,7 +312,7 @@ describe("SettingsPanel — model picker", () => {
   it("persists a model change through ipc.saveSettings and updates the store", async () => {
     renderPanel();
 
-    const select = screen.getByLabelText("Model");
+    const select = screen.getByLabelText("Default model (new sessions)");
     fireEvent.change(select, { target: { value: "claude-haiku-4-5-20251001" } });
 
     // updateSettings -> ipc.saveSettings; flush the microtask the action awaits.
@@ -324,7 +326,7 @@ describe("SettingsPanel — model picker", () => {
     m.saveSettings.mockRejectedValueOnce(new Error("disk full"));
     renderPanel({ model: MODELS[0].id });
 
-    const select = screen.getByLabelText("Model") as HTMLSelectElement;
+    const select = screen.getByLabelText("Default model (new sessions)") as HTMLSelectElement;
     await act(async () => {
       fireEvent.change(select, { target: { value: "claude-haiku-4-5-20251001" } });
       await Promise.resolve();
@@ -621,6 +623,86 @@ describe("SettingsPanel — default tool permission", () => {
   });
 });
 
+describe("SettingsPanel — permission modes & rules", () => {
+  it("switches to a safe mode through ipc.saveSettings", async () => {
+    renderPanel({ permissionMode: "default" });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept edits" }));
+    });
+
+    expect(m.saveSettings).toHaveBeenCalledWith({ permissionMode: "acceptEdits" });
+  });
+
+  it("requires an explicit acknowledgment before enabling a danger mode (auto)", async () => {
+    renderPanel({ permissionMode: "default" });
+
+    // Clicking Auto does NOT switch immediately — it asks for confirmation first.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Auto/i }));
+    });
+    expect(m.saveSettings).not.toHaveBeenCalled();
+    const confirm = screen.getByRole("button", { name: /Enable Auto/i });
+
+    // Confirming engages the mode.
+    await act(async () => {
+      fireEvent.click(confirm);
+    });
+    expect(m.saveSettings).toHaveBeenCalledWith({ permissionMode: "auto" });
+  });
+
+  it("cancelling the danger acknowledgment does not switch the mode", async () => {
+    renderPanel({ permissionMode: "default" });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Bypass/i }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    });
+
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("adds a per-tool rule through ipc.saveSettings", async () => {
+    renderPanel(); // form defaults: shell + ask
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    });
+
+    expect(m.saveSettings).toHaveBeenCalledWith({ rules: [{ tool: "shell", decision: "ask" }] });
+  });
+
+  it("warns when an allow rule would match every shell command (over-broad)", () => {
+    renderPanel(); // tool=shell, command empty
+    fireEvent.change(screen.getByLabelText("Rule decision"), { target: { value: "allow" } });
+
+    expect(screen.getByText(/matches every shell command/i)).toBeInTheDocument();
+  });
+
+  it("removes an existing rule through ipc.saveSettings", async () => {
+    renderPanel({ rules: [{ tool: "fs_edit", decision: "allow" }] });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove rule 1" }));
+    });
+
+    expect(m.saveSettings).toHaveBeenCalledWith({ rules: [] });
+  });
+
+  it("does not add a duplicate rule", async () => {
+    // The default form (shell + ask) matches the seeded rule, so adding is a no-op.
+    renderPanel({ rules: [{ tool: "shell", decision: "ask" }] });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    });
+
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+});
+
 describe("SettingsPanel — appearance toggles", () => {
   // APPEARANCE now renders three role="switch" buttons, so each must be queried
   // by its accessible name rather than the bare switch role.
@@ -673,6 +755,171 @@ describe("SettingsPanel — appearance toggles", () => {
     expect(useStore.getState().scanlines).toBe(false);
     expect(m.saveSettings).not.toHaveBeenCalled();
     expect(sw).toHaveAttribute("aria-checked", "false");
+  });
+
+  // ── Interface scale: a frontend-only document-zoom preset picker ─────────────
+  it("offers the interface-scale presets in an accessible group", () => {
+    renderPanel();
+
+    const group = screen.getByRole("group", { name: "Interface scale" });
+    expect(group).toBeInTheDocument();
+    for (const label of ["Compact", "Default", "Comfortable", "Large"]) {
+      expect(within(group).getByRole("button", { name: label })).toBeInTheDocument();
+    }
+  });
+
+  it("marks the active scale with aria-pressed (not colour alone)", () => {
+    useStore.setState({ uiScale: 1 });
+    renderPanel();
+
+    const group = screen.getByRole("group", { name: "Interface scale" });
+    // The active preset is conveyed via aria-pressed so it's not colour-only.
+    expect(within(group).getByRole("button", { name: "Default" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(within(group).getByRole("button", { name: "Large" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
+  it("selecting a preset drives the store's setUiScale (client-only, no ipc.saveSettings)", () => {
+    useStore.setState({ uiScale: 1 });
+    renderPanel();
+
+    const group = screen.getByRole("group", { name: "Interface scale" });
+    fireEvent.click(within(group).getByRole("button", { name: "Large" }));
+
+    expect(useStore.getState().uiScale).toBe(1.25);
+    expect(document.documentElement.style.zoom).toBe("1.25");
+    expect(m.saveSettings).not.toHaveBeenCalled();
+    // The newly active preset now reports pressed; the prior one is released.
+    expect(within(group).getByRole("button", { name: "Large" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(within(group).getByRole("button", { name: "Default" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
+  it("reflects the stored auto-update value and persists a toggle via ipc.saveSettings", async () => {
+    renderPanel({ autoUpdate: true });
+
+    const sw = screen.getByRole("switch", { name: "Automatic updates" });
+    expect(sw).toHaveAttribute("aria-checked", "true");
+
+    // The toggle routes through the store's setAutoUpdate -> updateSettings ->
+    // ipc.saveSettings with the negated value.
+    fireEvent.click(sw);
+    expect(m.saveSettings).toHaveBeenCalledWith({ autoUpdate: false });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(useStore.getState().settings.autoUpdate).toBe(false);
+  });
+
+  it("shows the auto-update switch as off when the preference is disabled", () => {
+    renderPanel({ autoUpdate: false });
+    expect(screen.getByRole("switch", { name: "Automatic updates" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+  });
+
+  it("annotates the auto-update hint with the staging channel when on staging", () => {
+    useStore.setState({ updateChannel: "staging" });
+    renderPanel({ autoUpdate: true });
+    expect(screen.getByText(/\(staging channel\)/)).toBeInTheDocument();
+  });
+
+  it("omits the staging annotation on the stable channel", () => {
+    useStore.setState({ updateChannel: "stable" });
+    renderPanel({ autoUpdate: true });
+    expect(screen.queryByText(/\(staging channel\)/)).not.toBeInTheDocument();
+  });
+
+  it("runs a manual update check when 'Check now' is clicked", async () => {
+    renderPanel({ autoUpdate: false });
+    fireEvent.click(screen.getByRole("button", { name: /check now/i }));
+    // The button routes through the store's checkForUpdate -> ipc.checkForUpdate.
+    expect(m.checkForUpdate).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await Promise.resolve();
+    });
+  });
+
+  it("shows a busy state while a manual check is in flight, then settles", async () => {
+    let finish!: () => void;
+    m.checkForUpdate.mockReturnValue(
+      new Promise<null>((resolve) => {
+        finish = () => resolve(null);
+      }),
+    );
+    renderPanel({ autoUpdate: false });
+
+    fireEvent.click(screen.getByRole("button", { name: /check now/i }));
+    // Mid-flight: the button is disabled and both it and the status read "checking".
+    const busyBtn = screen.getByRole("button", { name: /checking/i });
+    expect(busyBtn).toBeDisabled();
+    expect(screen.getByText(/checking for updates/i)).toBeInTheDocument();
+
+    await act(async () => {
+      finish();
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("button", { name: /check now/i })).toBeEnabled();
+  });
+
+  it("surfaces each update phase inline as a status line", () => {
+    const info = { version: "5.1.0", currentVersion: "5.0.0", notes: null, date: null };
+
+    useStore.setState({ update: { phase: "available", info, progress: null, error: null } });
+    const { unmount: u1 } = renderPanel();
+    expect(screen.getByText(/Update available · v5\.1\.0/)).toBeInTheDocument();
+    u1();
+
+    useStore.setState({ update: { phase: "ready", info, progress: 100, error: null } });
+    const { unmount: u2 } = renderPanel();
+    expect(screen.getByText(/relaunch to apply/i)).toBeInTheDocument();
+    u2();
+
+    useStore.setState({ update: { phase: "error", info: null, progress: null, error: "x" } });
+    renderPanel();
+    expect(screen.getByText(/last check failed/i)).toBeInTheDocument();
+  });
+
+  it("disables 'Check now' and shows progress while an update is downloading", () => {
+    useStore.setState({
+      update: { phase: "downloading", info: null, progress: 40, error: null },
+    });
+    renderPanel();
+    expect(screen.getByRole("button", { name: /check now/i })).toBeDisabled();
+    expect(screen.getByText(/downloading update/i)).toBeInTheDocument();
+  });
+
+  it("reads as up to date when idle (no update offered)", () => {
+    renderPanel();
+    expect(screen.getByText(/on the latest version/i)).toBeInTheDocument();
+  });
+
+  it("hides the Automatic updates switch and Check now button in remote mode", () => {
+    useStore.setState({ remoteMode: true });
+    renderPanel();
+
+    expect(screen.queryByRole("switch", { name: "Automatic updates" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /check now/i })).not.toBeInTheDocument();
+
+    useStore.setState({ remoteMode: false }); // don't leak into other tests
+  });
+
+  it("disables 'Check now' when an update is already staged (phase ready)", () => {
+    const info = { version: "5.1.0", currentVersion: "5.0.0", notes: null, date: null };
+    useStore.setState({ update: { phase: "ready", info, progress: 100, error: null } });
+    renderPanel();
+
+    expect(screen.getByRole("button", { name: /check now/i })).toBeDisabled();
   });
 });
 

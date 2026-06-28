@@ -146,7 +146,7 @@ describe("PermissionPrompt", () => {
     expect(useStore.getState().pendingPermission).toBeNull();
   });
 
-  it("Always allow persists the allow-always policy as well", async () => {
+  it("Always allow adds a scoped allow-rule for the tool (not a global policy flip)", async () => {
     useStore.setState({ pendingPermission: pending() });
 
     render(<PermissionPrompt />);
@@ -154,7 +154,9 @@ describe("PermissionPrompt", () => {
 
     await flush();
 
-    expect(m.saveSettings).toHaveBeenCalledWith({ defaultPolicy: "allow" });
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      rules: [{ tool: "fs_edit", decision: "allow" }],
+    });
     expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
     expect(useStore.getState().pendingPermission).toBeNull();
   });
@@ -170,6 +172,26 @@ describe("PermissionPrompt", () => {
     expect(m.resolvePermission).toHaveBeenCalledWith("p9", "deny");
     expect(m.saveSettings).not.toHaveBeenCalled();
     expect(useStore.getState().pendingPermission).toBeNull();
+  });
+
+  it("renders the pre-apply diff when one is attached to the request", () => {
+    useStore.setState({
+      pendingPermission: pending({ diff: "--- a\n+++ b\n-old line\n+new line\n" }),
+    });
+
+    render(<PermissionPrompt />);
+
+    expect(screen.getByLabelText("Proposed change")).toBeInTheDocument();
+    expect(screen.getByText("-old line")).toBeInTheDocument();
+    expect(screen.getByText("+new line")).toBeInTheDocument();
+  });
+
+  it("shows no diff block when the request has no diff (e.g. a shell command)", () => {
+    useStore.setState({ pendingPermission: pending() });
+
+    render(<PermissionPrompt />);
+
+    expect(screen.queryByLabelText("Proposed change")).not.toBeInTheDocument();
   });
 
   it("restores focus to the Chat log region when the prompt clears mid-turn", () => {

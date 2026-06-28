@@ -11,9 +11,10 @@ import {
   type Session,
   type StreamEvent,
   type SyncFrame,
+  type UpdateInfo,
 } from "../types";
 import * as ipc from "../lib/ipc";
-import { useStore } from "./store";
+import { teardownAllBackgroundListeners, useStore } from "./store";
 
 // The store is the app's brain: it orchestrates the IPC bridge and folds the
 // agent's streamed events into renderable message blocks. We mock the IPC layer
@@ -25,10 +26,20 @@ vi.mock("../lib/ipc", () => ({
   createSession: vi.fn(),
   getMessages: vi.fn(),
   deleteSession: vi.fn(),
+  renameSession: vi.fn(),
+  saveDraft: vi.fn(),
+  getDraft: vi.fn(),
+  getDrafts: vi.fn(),
+  getUsage: vi.fn(),
+  getAllUsage: vi.fn(),
+  searchMessages: vi.fn(),
   saveSettings: vi.fn(),
   resolvePermission: vi.fn(),
+  setTelemetryConsent: vi.fn(),
   openFolder: vi.fn(),
   runAgent: vi.fn(),
+  subscribeSessionEvents: vi.fn(),
+  cancelAgentById: vi.fn(),
   oauthStatus: vi.fn(),
   startOauthLogin: vi.fn(),
   oauthLogout: vi.fn(),
@@ -38,11 +49,17 @@ vi.mock("../lib/ipc", () => ({
   phoneSyncConnect: vi.fn(),
   phoneSyncSendCommand: vi.fn(),
   phoneSyncDisconnect: vi.fn(),
+  phoneSyncReject: vi.fn(),
   onPhoneSyncFrame: vi.fn(),
   onPhoneSyncDisconnected: vi.fn(),
   onPhoneSyncPairingRequest: vi.fn(),
   confirmPairing: vi.fn(),
   rejectPairing: vi.fn(),
+  checkForUpdate: vi.fn(),
+  downloadAndInstallUpdate: vi.fn(),
+  relaunchApp: vi.fn(),
+  getUpdateChannel: vi.fn(),
+  onUpdaterEvent: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -58,6 +75,7 @@ const session = (over: Partial<Session> = {}): Session => ({
   id: "s1",
   title: "Chat",
   workspace: null,
+  model: "claude-opus-4-8",
   createdAt: 1,
   updatedAt: 1,
   ...over,
@@ -73,10 +91,20 @@ beforeEach(() => {
   m.getMessages.mockResolvedValue([]);
   m.createSession.mockResolvedValue(undefined);
   m.deleteSession.mockResolvedValue(undefined);
+  m.renameSession.mockResolvedValue(undefined);
+  m.saveDraft.mockResolvedValue(undefined);
+  m.getDraft.mockResolvedValue(null);
+  m.getDrafts.mockResolvedValue([]);
+  m.getUsage.mockResolvedValue({ sessionId: "s1", input: 0, output: 0 });
+  m.getAllUsage.mockResolvedValue([]);
+  m.searchMessages.mockResolvedValue([]);
   m.saveSettings.mockImplementation(async (s) => ({ ...DEFAULT_SETTINGS, ...s }));
   m.resolvePermission.mockResolvedValue(undefined);
+  m.setTelemetryConsent.mockResolvedValue(undefined);
   m.openFolder.mockResolvedValue(null);
   m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}), dispose: vi.fn() });
+  m.subscribeSessionEvents.mockResolvedValue(() => {});
+  m.cancelAgentById.mockResolvedValue(undefined);
   m.oauthStatus.mockResolvedValue(signedOut);
   m.startOauthLogin.mockResolvedValue(signedOut);
   m.oauthLogout.mockResolvedValue(undefined);
@@ -90,11 +118,17 @@ beforeEach(() => {
   m.phoneSyncConnect.mockResolvedValue({ sas: "SAS-1", peerPublicKey: "PEER==" });
   m.phoneSyncSendCommand.mockResolvedValue(undefined);
   m.phoneSyncDisconnect.mockResolvedValue(undefined);
+  m.phoneSyncReject.mockResolvedValue(undefined);
   m.onPhoneSyncFrame.mockResolvedValue(() => {});
   m.onPhoneSyncDisconnected.mockResolvedValue(() => {});
   m.onPhoneSyncPairingRequest.mockResolvedValue(() => {});
   m.confirmPairing.mockResolvedValue(undefined);
   m.rejectPairing.mockResolvedValue(undefined);
+  m.checkForUpdate.mockResolvedValue(null);
+  m.downloadAndInstallUpdate.mockResolvedValue(true);
+  m.relaunchApp.mockResolvedValue(undefined);
+  m.getUpdateChannel.mockResolvedValue("stable");
+  m.onUpdaterEvent.mockResolvedValue(() => {});
 });
 
 describe("init", () => {
@@ -127,6 +161,19 @@ describe("init", () => {
     expect(st.activeId).toBe("a");
     expect(st.sessions).toEqual([s1, s2]);
     expect(st.messages["a"]).toEqual([msg]);
+  });
+
+  it("coerces a loaded session with no model to the last-used default", async () => {
+    // Old DB rows predate per-session model: listSessions yields a session whose
+    // model is absent. The store must coalesce it to settings.model so
+    // Session.model stays a non-null string.
+    m.getSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, model: "claude-sonnet-4-6" });
+    const legacy = { ...session({ id: "a" }), model: undefined } as unknown as Session;
+    m.listSessions.mockResolvedValue([legacy]);
+
+    await useStore.getState().init();
+
+    expect(useStore.getState().sessions[0].model).toBe("claude-sonnet-4-6");
   });
 
   it("records initError when a load-bearing startup call rejects", async () => {
@@ -190,6 +237,25 @@ describe("newSession", () => {
     expect(st.sessions).toHaveLength(2);
     expect(st.sessions[0].id).toBe(st.activeId);
     expect(st.messages[st.activeId!]).toEqual([]);
+  });
+
+  it("initializes the new session's model from the last-used settings.model", async () => {
+    useStore.setState({
+      sessions: [session({ id: "old" })],
+      settings: { ...DEFAULT_SETTINGS, model: "claude-haiku-4-5-20251001" },
+    });
+
+    await useStore.getState().newSession();
+
+    const st = useStore.getState();
+    expect(st.sessions[0].model).toBe("claude-haiku-4-5-20251001");
+    // The chosen model is persisted with the new session row.
+    expect(m.createSession).toHaveBeenCalledWith(
+      st.sessions[0].id,
+      "New chat",
+      null,
+      "claude-haiku-4-5-20251001",
+    );
   });
 
   it("closes the mobile session drawer", async () => {
@@ -266,6 +332,32 @@ describe("newSession", () => {
     expect(st.initError).toBe("db locked");
     expect(st.sessions).toHaveLength(1); // no phantom session on failure
     expect(st.creatingSession).toBe(false); // lock released
+  });
+});
+
+describe("setSessionModel", () => {
+  it("updates the active session's model and tracks it as the last-used default", async () => {
+    useStore.setState({
+      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      activeId: "a",
+    });
+
+    await useStore.getState().setSessionModel("claude-sonnet-4-6");
+
+    const st = useStore.getState();
+    expect(st.sessions[0].model).toBe("claude-sonnet-4-6");
+    // Last-used sync: settings.model is updated through ipc.saveSettings.
+    expect(m.saveSettings).toHaveBeenCalledWith({ model: "claude-sonnet-4-6" });
+    expect(st.settings.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("still updates the last-used default when no session is active (palette safety)", async () => {
+    useStore.setState({ sessions: [], activeId: null });
+
+    await useStore.getState().setSessionModel("claude-haiku-4-5-20251001");
+
+    expect(m.saveSettings).toHaveBeenCalledWith({ model: "claude-haiku-4-5-20251001" });
+    expect(useStore.getState().settings.model).toBe("claude-haiku-4-5-20251001");
   });
 });
 
@@ -350,6 +442,31 @@ describe("deleteSession", () => {
     expect(st.messages.a).toBeUndefined();
   });
 
+  it("prunes the gone session's usage + draft to stay in lockstep with the backend", () => {
+    // The backend (db.rs) deletes the drafts + usage rows on delete_session; the
+    // frontend must mirror that, or the deleted session's tokens keep inflating the
+    // HUD workspace-total spend (and a dead draft lingers) until a restart.
+    localStorage.setItem("pc.drafts", JSON.stringify({ a: "unsent a", b: "unsent b" }));
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      messages: { a: [], b: [] },
+      drafts: { a: "unsent a", b: "unsent b" },
+      usage: { a: { input: 1000, output: 200 }, b: { input: 50, output: 5 } },
+    });
+
+    return useStore
+      .getState()
+      .deleteSession("a")
+      .then(() => {
+        const st = useStore.getState();
+        expect(st.usage).toEqual({ b: { input: 50, output: 5 } });
+        expect(st.drafts).toEqual({ b: "unsent b" });
+        // The localStorage mirror is pruned too, so mergeDrafts won't resurrect it.
+        expect(JSON.parse(localStorage.getItem("pc.drafts")!)).toEqual({ b: "unsent b" });
+      });
+  });
+
   it("spawns a fresh session when the last one is deleted", async () => {
     useStore.setState({ sessions: [session({ id: "a" })], activeId: "a", messages: { a: [] } });
 
@@ -427,6 +544,105 @@ describe("deleteSession", () => {
     expect(st.activeId).toBe("a"); // unchanged
     expect(st.messages.a).toEqual([]); // not removed
   });
+
+  it("drops the deleted session's run from the run map (no leak)", async () => {
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      messages: { a: [], b: [] },
+      // Both sessions are idle but each has an entry in the run map.
+      runs: {
+        a: { streaming: false, cancel: null, pendingPermission: null },
+        b: { streaming: false, cancel: null, pendingPermission: null },
+      },
+    });
+
+    await useStore.getState().deleteSession("b");
+
+    const st = useStore.getState();
+    expect(st.runs.b).toBeUndefined(); // the deleted session's run is gone
+    expect(Object.keys(st.runs)).toEqual(["a"]); // only the surviving run remains
+    expect(st.activeId).toBe("a"); // active unchanged (we deleted the other one)
+  });
+});
+
+describe("renameSession", () => {
+  it("optimistically applies the trimmed title and persists it via IPC", async () => {
+    useStore.setState({ sessions: [session({ id: "a", title: "Old" })], activeId: "a" });
+    await useStore.getState().renameSession("a", "  Fresh title  ");
+    expect(useStore.getState().sessions[0].title).toBe("Fresh title");
+    expect(m.renameSession).toHaveBeenCalledWith("a", "Fresh title");
+  });
+
+  it("ignores an empty / whitespace-only rename", async () => {
+    useStore.setState({ sessions: [session({ id: "a", title: "Keep" })], activeId: "a" });
+    await useStore.getState().renameSession("a", "   ");
+    expect(useStore.getState().sessions[0].title).toBe("Keep");
+    expect(m.renameSession).not.toHaveBeenCalled();
+  });
+
+  it("ignores a no-op rename to the same title", async () => {
+    useStore.setState({ sessions: [session({ id: "a", title: "Same" })], activeId: "a" });
+    await useStore.getState().renameSession("a", "Same");
+    expect(m.renameSession).not.toHaveBeenCalled();
+  });
+
+  it("ignores a rename for an unknown session id", async () => {
+    useStore.setState({ sessions: [session({ id: "a", title: "A" })], activeId: "a" });
+    await useStore.getState().renameSession("ghost", "X");
+    expect(m.renameSession).not.toHaveBeenCalled();
+    expect(useStore.getState().sessions[0].title).toBe("A");
+  });
+
+  it("reverts the optimistic title on a failed write WITHOUT hijacking the init panel", async () => {
+    m.renameSession.mockRejectedValueOnce(new Error("locked db"));
+    useStore.setState({ sessions: [session({ id: "a", title: "Original" })], activeId: "a" });
+    await useStore.getState().renameSession("a", "Doomed");
+    const st = useStore.getState();
+    expect(st.sessions[0].title).toBe("Original"); // reverted — the visible signal
+    // A per-row rename failure must NOT route through initError (the full-screen
+    // "Couldn't start Portcode" panel, which would wipe a populated conversation).
+    expect(st.initError).toBeNull();
+  });
+
+  it("a failing revert does not clobber a title changed during the in-flight write", async () => {
+    // The write is pending; meanwhile a newer title lands (a second rename / a
+    // send()-derived title). When the write then fails, the revert must be a no-op.
+    let reject!: (e: unknown) => void;
+    m.renameSession.mockImplementationOnce(() => new Promise((_, rej) => (reject = rej)));
+    useStore.setState({ sessions: [session({ id: "a", title: "Original" })], activeId: "a" });
+    const pending = useStore.getState().renameSession("a", "Optimistic");
+    // A newer write supersedes the optimistic title before the IPC settles.
+    useStore.setState((st) => ({
+      sessions: st.sessions.map((s) => (s.id === "a" ? { ...s, title: "Newer" } : s)),
+    }));
+    reject(new Error("boom"));
+    await pending;
+    // The revert saw the title was no longer "Optimistic", so "Newer" survives.
+    expect(useStore.getState().sessions[0].title).toBe("Newer");
+  });
+
+  it("does not rename mid-stream (a turn is in flight)", async () => {
+    useStore.setState({
+      sessions: [session({ id: "a", title: "Busy" })],
+      activeId: "a",
+      streaming: true,
+    });
+    await useStore.getState().renameSession("a", "Nope");
+    expect(m.renameSession).not.toHaveBeenCalled();
+    expect(useStore.getState().sessions[0].title).toBe("Busy");
+  });
+
+  it("does not rename in remote mode (the phone has no rename command)", async () => {
+    useStore.setState({
+      sessions: [session({ id: "a", title: "Phone" })],
+      activeId: "a",
+      remoteConnected: true,
+    });
+    await useStore.getState().renameSession("a", "Nope");
+    expect(m.renameSession).not.toHaveBeenCalled();
+    expect(useStore.getState().sessions[0].title).toBe("Phone");
+  });
 });
 
 describe("send", () => {
@@ -445,7 +661,7 @@ describe("send", () => {
 
   it("appends user+assistant turns, titles the first turn, and folds streamed events", async () => {
     let emit!: (e: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
       emit = onEvent;
       return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
     });
@@ -462,7 +678,12 @@ describe("send", () => {
     expect(st.messages.a).toHaveLength(2);
     expect(st.messages.a[0].role).toBe("user");
     expect(st.sessions[0].title).toBe("Refactor the parser"); // derived from first message
-    expect(m.runAgent).toHaveBeenCalledWith("a", "Refactor the parser", expect.any(Function));
+    expect(m.runAgent).toHaveBeenCalledWith(
+      "a",
+      "Refactor the parser",
+      "claude-opus-4-8",
+      expect.any(Function),
+    );
 
     const assistant = () => useStore.getState().messages.a[1];
 
@@ -481,9 +702,17 @@ describe("send", () => {
     emit({ type: "usage", inputTokens: 10, outputTokens: 5 });
     expect(useStore.getState().usage.a).toEqual({ input: 110, output: 45 });
 
-    // a permission request surfaces as a pending prompt
-    emit({ type: "permission_request", id: "p1", tool: "fs_edit", summary: "x", input: {} });
+    // a permission request surfaces as a pending prompt, carrying its diff
+    emit({
+      type: "permission_request",
+      id: "p1",
+      tool: "fs_edit",
+      summary: "x",
+      input: {},
+      diff: "-a\n+b\n",
+    });
     expect(useStore.getState().pendingPermission?.id).toBe("p1");
+    expect(useStore.getState().pendingPermission?.diff).toBe("-a\n+b\n");
 
     // turn_end clears streaming + any pending prompt
     emit({ type: "turn_end", stopReason: "end_turn" });
@@ -494,7 +723,7 @@ describe("send", () => {
 
   it("trims surrounding whitespace from the stored user bubble and derived title", async () => {
     let emit!: (e: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
       emit = onEvent;
       return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
     });
@@ -512,7 +741,7 @@ describe("send", () => {
     expect(st.sessions[0].title).toBe("hi");
     // The local agent is also prompted with the trimmed body (not the raw padded
     // draft), so what the user sees and what the model receives stay consistent.
-    expect(m.runAgent).toHaveBeenCalledWith("a", "hi", expect.any(Function));
+    expect(m.runAgent).toHaveBeenCalledWith("a", "hi", "claude-opus-4-8", expect.any(Function));
   });
 
   it("trims the forwarded run text in remote mode", async () => {
@@ -535,7 +764,7 @@ describe("send", () => {
 
   it("keeps the existing title once a session already has messages", async () => {
     let emit!: (e: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
       emit = onEvent;
       return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
     });
@@ -625,7 +854,7 @@ describe("send", () => {
   it("tears down the turn's listener on turn_end so a later turn can't edit this message", async () => {
     const handles: { cancel: ReturnType<typeof vi.fn>; dispose: ReturnType<typeof vi.fn> }[] = [];
     const emits: ((e: StreamEvent) => void)[] = [];
-    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
       emits.push(onEvent);
       const handle = { cancel: vi.fn(async () => {}), dispose: vi.fn() };
       handles.push(handle);
@@ -654,7 +883,7 @@ describe("send", () => {
   it("disposes the listener when a turn ends in an error event", async () => {
     const dispose = vi.fn();
     let emit!: (e: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
       emit = onEvent;
       return { cancel: vi.fn(async () => {}), dispose };
     });
@@ -671,7 +900,7 @@ describe("send", () => {
     vi.useFakeTimers();
     try {
       const cancel = vi.fn(async () => {});
-      m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
         // The turn starts streaming, then the backend goes silent — no turn_end/error.
         onEvent({ type: "text_delta", text: "thinking" });
         return { cancel, dispose: vi.fn() };
@@ -917,15 +1146,48 @@ describe("resolvePermission", () => {
     expect(useStore.getState().pendingPermission).toBeNull();
   });
 
-  it("persists allow-always as the new default policy", async () => {
+  it("allow-always adds a SCOPED allow-rule for the tool (not a global policy flip)", async () => {
     useStore.setState({
       pendingPermission: { id: "p1", tool: "fs_edit", summary: "x", input: {} },
     });
 
     await useStore.getState().resolvePermission("allow", true);
 
-    expect(m.saveSettings).toHaveBeenCalledWith({ defaultPolicy: "allow" });
+    // A non-shell tool scopes to the tool itself, not allow-everything.
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      rules: [{ tool: "fs_edit", decision: "allow" }],
+    });
     expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
+  });
+
+  it("allow-always for a shell call scopes the rule to that command", async () => {
+    useStore.setState({
+      pendingPermission: {
+        id: "p2",
+        tool: "shell",
+        summary: "git status",
+        input: { command: "git status" },
+      },
+    });
+
+    await useStore.getState().resolvePermission("allow", true);
+
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      rules: [{ tool: "shell", command: "git status", decision: "allow" }],
+    });
+  });
+
+  it("allow-always does not add a duplicate rule if an equivalent one exists", async () => {
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS, rules: [{ tool: "fs_edit", decision: "allow" }] },
+      pendingPermission: { id: "p3", tool: "fs_edit", summary: "x", input: {} },
+    });
+
+    await useStore.getState().resolvePermission("allow", true);
+
+    // The gate is still answered, but no redundant settings save is made.
+    expect(m.resolvePermission).toHaveBeenCalledWith("p3", "allow");
+    expect(m.saveSettings).not.toHaveBeenCalled();
   });
 
   it("answers the gate FIRST and persists allow-always after (ordered)", async () => {
@@ -1005,23 +1267,428 @@ describe("resolvePermission", () => {
   });
 });
 
-describe("draft + UI setters", () => {
-  it("appendDraft inserts a single separating space only when needed", () => {
-    const { setDraft, appendDraft } = useStore.getState();
+describe("multi-run model (runs collection)", () => {
+  // Fold a live frame for an arbitrary session into the run map (the path the
+  // phone uses for a desktop turn). turn_start/turn_end drive the per-run state.
+  const live = (sessionId: string, event: StreamEvent) =>
+    useStore.getState().applyFrame({ t: "live", session_id: sessionId, event });
 
-    setDraft("");
-    appendDraft("@a.ts"); // empty draft -> no leading space
-    expect(useStore.getState().draft).toBe("@a.ts ");
+  it("represents two sessions streaming concurrently, with the mirror tracking only the active one", () => {
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      runs: {},
+    });
 
-    setDraft("foo"); // no trailing space -> separator added
-    appendDraft("bar");
-    expect(useStore.getState().draft).toBe("foo bar ");
+    live("a", { type: "turn_start", messageId: "ma" });
+    live("b", { type: "turn_start", messageId: "mb" });
 
-    setDraft("foo "); // already trailing space -> no double space
-    appendDraft("bar");
-    expect(useStore.getState().draft).toBe("foo bar ");
+    const st = useStore.getState();
+    // BOTH runs stream in the map — the capability a single global flag could
+    // never represent (the foundation for a parallel-agents UI).
+    expect(st.runs.a.streaming).toBe(true);
+    expect(st.runs.b.streaming).toBe(true);
+    // The visible mirror reflects only the active session ("a").
+    expect(st.streaming).toBe(true);
   });
 
+  it("the active-run mirror re-projects when the active session changes", async () => {
+    // "a" is idle, "b" has a live background run.
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      runs: {
+        a: { streaming: false, cancel: null, pendingPermission: null },
+        b: { streaming: true, cancel: null, pendingPermission: null },
+      },
+      streaming: false,
+    });
+    // selectSession is blocked only while the ACTIVE session streams; "a" is idle,
+    // so the switch goes through and the mirror must follow "b"'s run.
+    await useStore.getState().selectSession("b");
+    expect(useStore.getState().streaming).toBe(true);
+  });
+
+  it("clearing one session's run leaves another's untouched", () => {
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      runs: {},
+    });
+    live("a", { type: "turn_start", messageId: "ma" });
+    live("b", { type: "turn_start", messageId: "mb" });
+
+    live("b", { type: "turn_end", stopReason: "end_turn" }); // end only "b"
+
+    const st = useStore.getState();
+    expect(st.runs.a.streaming).toBe(true); // "a" still streaming
+    expect(st.runs.b.streaming).toBe(false); // "b" done
+    expect(st.streaming).toBe(true); // mirror still reflects active "a"
+  });
+
+  it("stop() clears the ACTIVE run (and its mirror) while leaving a concurrent run untouched", async () => {
+    // Both the active "a" and a background "b" are streaming in the map; stop()
+    // must clear only "a" (the run on screen) and re-project, not touch "b". This
+    // exercises patchActiveRun's activeId-present branch (the production path).
+    const cancel = vi.fn(async () => {});
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      runs: {
+        a: { streaming: true, cancel, pendingPermission: null },
+        b: { streaming: true, cancel: null, pendingPermission: null },
+      },
+      streaming: true,
+      cancel,
+    });
+
+    await useStore.getState().stop();
+
+    const st = useStore.getState();
+    expect(cancel).toHaveBeenCalledOnce(); // the active run's handle was aborted
+    expect(st.runs.a).toEqual({ streaming: false, cancel: null, pendingPermission: null });
+    expect(st.streaming).toBe(false); // mirror re-projected from "a"
+    expect(st.cancel).toBeNull();
+    // The concurrent background run is undisturbed.
+    expect(st.runs.b).toEqual({ streaming: true, cancel: null, pendingPermission: null });
+  });
+});
+
+describe("cyclePermissionMode", () => {
+  it("advances through the safe trio default → acceptEdits → plan → default", async () => {
+    const seed = (permissionMode: "default" | "acceptEdits" | "plan") =>
+      useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode } });
+
+    seed("default");
+    await useStore.getState().cyclePermissionMode();
+    expect(m.saveSettings).toHaveBeenLastCalledWith({ permissionMode: "acceptEdits" });
+
+    seed("acceptEdits");
+    await useStore.getState().cyclePermissionMode();
+    expect(m.saveSettings).toHaveBeenLastCalledWith({ permissionMode: "plan" });
+
+    seed("plan");
+    await useStore.getState().cyclePermissionMode();
+    expect(m.saveSettings).toHaveBeenLastCalledWith({ permissionMode: "default" });
+  });
+
+  it("never cycles INTO auto/bypass, and cycling out of one lands on default", async () => {
+    // auto/bypass are Settings-only opt-in; the quick-cycle must not reach them,
+    // and stepping the cycle while in one returns to the safe start.
+    for (const danger of ["auto", "bypass"] as const) {
+      useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: danger } });
+      await useStore.getState().cyclePermissionMode();
+      expect(m.saveSettings).toHaveBeenLastCalledWith({ permissionMode: "default" });
+    }
+  });
+});
+
+describe("draft + UI setters", () => {
+  const draftOf = (id: string) => useStore.getState().drafts[id];
+
+  // setDraft schedules a ~400ms debounced backend write; fake timers keep that
+  // pending timer from firing into a later test's saveDraft assertions.
+  it("appendDraft inserts a single separating space only when needed", () => {
+    vi.useFakeTimers();
+    try {
+      useStore.setState({ activeId: "s1" });
+      const { setDraft, appendDraft } = useStore.getState();
+
+      setDraft("");
+      appendDraft("@a.ts"); // empty draft -> no leading space
+      expect(draftOf("s1")).toBe("@a.ts ");
+
+      setDraft("foo"); // no trailing space -> separator added
+      appendDraft("bar");
+      expect(draftOf("s1")).toBe("foo bar ");
+
+      setDraft("foo "); // already trailing space -> no double space
+      appendDraft("bar");
+      expect(draftOf("s1")).toBe("foo bar ");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps drafts isolated per session and mirrors them to localStorage", () => {
+    vi.useFakeTimers();
+    try {
+      useStore.setState({ activeId: "a" });
+      useStore.getState().setDraft("draft for a");
+      useStore.setState({ activeId: "b" });
+      useStore.getState().setDraft("draft for b");
+
+      // A draft typed in one session never bleeds into another (the bug per-session
+      // drafts fix). Each is keyed by its own session id.
+      expect(useStore.getState().drafts).toEqual({ a: "draft for a", b: "draft for b" });
+      // Optimistic localStorage mirror is written synchronously for instant restore.
+      expect(JSON.parse(localStorage.getItem("pc.drafts")!)).toEqual({
+        a: "draft for a",
+        b: "draft for b",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clearing a draft drops its key from the map and the mirror", () => {
+    vi.useFakeTimers();
+    try {
+      useStore.setState({ activeId: "a" });
+      useStore.getState().setDraft("something");
+      useStore.getState().setDraft("");
+      expect(useStore.getState().drafts).toEqual({});
+      expect(JSON.parse(localStorage.getItem("pc.drafts")!)).toEqual({});
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("debounces the durable draft save (~400ms), coalescing keystrokes", () => {
+    vi.useFakeTimers();
+    try {
+      useStore.setState({ activeId: "a" });
+      useStore.getState().setDraft("h");
+      useStore.getState().setDraft("he");
+      useStore.getState().setDraft("hel");
+      // No backend write yet — the debounce coalesces the burst.
+      expect(m.saveDraft).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(400);
+      // Exactly one durable write, carrying the latest value.
+      expect(m.saveDraft).toHaveBeenCalledTimes(1);
+      expect(m.saveDraft).toHaveBeenCalledWith("a", "hel");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("composer drafts on send", () => {
+  beforeEach(() => {
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: { a: [] },
+    });
+  });
+
+  it("clears the sent session's draft everywhere, flushing the backend immediately", async () => {
+    vi.useFakeTimers();
+    try {
+      useStore.getState().setDraft("a half-written thought");
+      expect(useStore.getState().drafts.a).toBe("a half-written thought");
+
+      await useStore.getState().send("ship it");
+
+      // The open loop is closed: in-memory map + localStorage mirror cleared, and the
+      // durable backend cleared IMMEDIATELY (not waiting on the debounce) so a fast
+      // restart can't restore a just-sent draft.
+      expect(useStore.getState().drafts.a).toBeUndefined();
+      expect(JSON.parse(localStorage.getItem("pc.drafts")!)).toEqual({});
+      expect(m.saveDraft).toHaveBeenLastCalledWith("a", "");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("composer presence phase", () => {
+  // Start a real local turn and hand back the captured stream-event emitter so each
+  // test can drive presence transitions from real events.
+  const startTurn = async (): Promise<(e: StreamEvent) => void> => {
+    let emit!: (e: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
+    useStore.setState({ sessions: [session({ id: "a" })], activeId: "a", messages: { a: [] } });
+    await useStore.getState().send("do a thing");
+    return emit;
+  };
+
+  it("acknowledges the send instantly with the received phase", async () => {
+    const emit = await startTurn();
+    // Turn-taking receipt: the phase flips to "received" the moment the turn is sent.
+    expect(useStore.getState().composerPhase).toBe("received");
+    emit({ type: "turn_end", stopReason: "end_turn" });
+  });
+
+  it("settles received → thinking on the first real stream event", async () => {
+    const emit = await startTurn();
+    expect(useStore.getState().composerPhase).toBe("received");
+    emit({ type: "text_delta", text: "Hi" });
+    expect(useStore.getState().composerPhase).toBe("thinking");
+    emit({ type: "turn_end", stopReason: "end_turn" });
+  });
+
+  it("falls back to thinking after ~900ms when the first byte is slow", async () => {
+    vi.useFakeTimers();
+    try {
+      const emit = await startTurn();
+      expect(useStore.getState().composerPhase).toBe("received");
+      // No real event yet — the fallback timer (NOT padded latency) advances the
+      // phase so the presence doesn't sit on "reading…" forever.
+      vi.advanceTimersByTime(900);
+      expect(useStore.getState().composerPhase).toBe("thinking");
+      emit({ type: "turn_end", stopReason: "end_turn" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns to idle on turn_end and on a turn error", async () => {
+    const emit = await startTurn();
+    emit({ type: "text_delta", text: "x" });
+    emit({ type: "turn_end", stopReason: "end_turn" });
+    expect(useStore.getState().composerPhase).toBe("idle");
+
+    const emit2 = await startTurn();
+    emit2({ type: "error", message: "boom" });
+    expect(useStore.getState().composerPhase).toBe("idle");
+  });
+
+  it("relabels to stopping the instant Stop is pressed, then idle once it resolves", async () => {
+    const emit = await startTurn();
+    emit({ type: "text_delta", text: "x" });
+    expect(useStore.getState().composerPhase).toBe("thinking");
+    // stop() sets "stopping" synchronously, before awaiting the backend cancel — so
+    // the intent is acknowledged immediately (the <100ms relabel).
+    const stopping = useStore.getState().stop();
+    expect(useStore.getState().composerPhase).toBe("stopping");
+    await stopping;
+    expect(useStore.getState().composerPhase).toBe("idle");
+    expect(useStore.getState().streaming).toBe(false);
+  });
+
+  it("names the running tool on tool_use and clears it on tool_result", async () => {
+    const emit = await startTurn();
+    emit({ type: "tool_use", id: "t1", name: "grep", input: { pattern: "x" } });
+    expect(useStore.getState().activeTool).toBe("grep");
+    // A tool is a real first event, so the phase also settles to thinking.
+    expect(useStore.getState().composerPhase).toBe("thinking");
+    emit({ type: "tool_result", id: "t1", output: "ok", isError: false });
+    expect(useStore.getState().activeTool).toBeNull();
+    emit({ type: "turn_end", stopReason: "end_turn" });
+  });
+
+  it("resets a residual tool label when the next turn starts", async () => {
+    const emit = await startTurn();
+    emit({ type: "tool_use", id: "t1", name: "shell", input: {} });
+    expect(useStore.getState().activeTool).toBe("shell");
+    // The turn ends mid-tool (no tool_result); send() must reset the label up front
+    // so it can't leak into the next turn's presence.
+    emit({ type: "turn_end", stopReason: "end_turn" });
+    const emit2 = await startTurn();
+    expect(useStore.getState().activeTool).toBeNull();
+    emit2({ type: "turn_end", stopReason: "end_turn" });
+  });
+});
+
+describe("message search + jump", () => {
+  it("returns the backend hits under Tauri (ipc path)", async () => {
+    m.searchMessages.mockResolvedValue([
+      { sessionId: "a", messageId: "m1", seq: 2, role: "user", snippet: "hello parser" },
+    ]);
+    const hits = await useStore.getState().searchMessages("parser");
+    expect(m.searchMessages).toHaveBeenCalledWith("parser");
+    expect(hits).toHaveLength(1);
+    expect(hits[0].sessionId).toBe("a");
+  });
+
+  it("falls back to an in-memory search when the backend returns nothing", async () => {
+    m.searchMessages.mockResolvedValue([]);
+    useStore.setState({
+      messages: {
+        a: [
+          {
+            id: "m1",
+            role: "user",
+            blocks: [{ kind: "text", text: "refactor the PARSER" }],
+            createdAt: 10,
+          },
+          {
+            id: "m2",
+            role: "assistant",
+            blocks: [{ kind: "text", text: "unrelated reply" }],
+            createdAt: 20,
+          },
+        ],
+      },
+    });
+    const hits = await useStore.getState().searchMessages("parser");
+    expect(hits).toHaveLength(1);
+    expect(hits[0].messageId).toBe("m1");
+    expect(hits[0].snippet.toLowerCase()).toContain("parser");
+  });
+
+  it("ignores an empty/whitespace query without hitting the backend", async () => {
+    const hits = await useStore.getState().searchMessages("   ");
+    expect(hits).toEqual([]);
+    expect(m.searchMessages).not.toHaveBeenCalled();
+  });
+
+  it("jumpToMessage does not strand a scroll target when streaming blocks navigation", async () => {
+    // selectSession no-ops mid-stream; a cross-session jump must NOT set scrollTargetId
+    // (it would ghost-scroll a later navigation to that session).
+    useStore.setState({
+      sessions: [session({ id: "b" })],
+      activeId: "a",
+      messages: { a: [] },
+      streaming: true,
+    });
+    await useStore.getState().jumpToMessage("b", "m7");
+    expect(useStore.getState().activeId).toBe("a");
+    expect(useStore.getState().scrollTargetId).toBeNull();
+  });
+
+  it("jumpToMessage selects the session and sets the scroll target", async () => {
+    useStore.setState({ sessions: [session({ id: "b" })], activeId: "a", messages: { a: [] } });
+    await useStore.getState().jumpToMessage("b", "m7");
+    expect(useStore.getState().activeId).toBe("b");
+    expect(useStore.getState().scrollTargetId).toBe("m7");
+  });
+
+  it("clearScrollTarget resets the scroll target", () => {
+    useStore.setState({ scrollTargetId: "m7" });
+    useStore.getState().clearScrollTarget();
+    expect(useStore.getState().scrollTargetId).toBeNull();
+  });
+});
+
+describe("init draft + usage hydration", () => {
+  it("merges backend drafts under the localStorage mirror and restores usage", async () => {
+    // The optimistic mirror (already in state from the synchronous load) holds a
+    // FRESHER draft for `a`; the backend has a stale `a` plus `b` the mirror lacks.
+    useStore.setState({ drafts: { a: "fresh local a" } });
+    m.listSessions.mockResolvedValue([session({ id: "a" }), session({ id: "b" })]);
+    m.getDrafts.mockResolvedValue([
+      { sessionId: "a", text: "stale backend a" },
+      { sessionId: "b", text: "backend b" },
+    ]);
+    m.getAllUsage.mockResolvedValue([{ sessionId: "a", input: 1000, output: 200 }]);
+
+    await useStore.getState().init();
+
+    const st = useStore.getState();
+    // Mirror wins for `a` (never staler than the debounced backend); backend fills `b`.
+    expect(st.drafts).toEqual({ a: "fresh local a", b: "backend b" });
+    // Cumulative usage restored so the per-session meter + HUD spend survive restart.
+    expect(st.usage).toEqual({ a: { input: 1000, output: 200 } });
+  });
+
+  it("survives a core that predates the draft/usage commands (no init error)", async () => {
+    m.getDrafts.mockRejectedValue(new Error("unknown command"));
+    m.getAllUsage.mockRejectedValue(new Error("unknown command"));
+    m.listSessions.mockResolvedValue([session({ id: "a" })]);
+
+    await useStore.getState().init();
+
+    // The resilient .catch(() => []) keeps startup green; no spurious init error panel.
+    expect(useStore.getState().initError).toBeNull();
+  });
+});
+
+describe("UI setters", () => {
   it("toggleFiles flips and the show* setters take explicit values", () => {
     const before = useStore.getState().showFiles;
     useStore.getState().toggleFiles();
@@ -1042,6 +1709,103 @@ describe("draft + UI setters", () => {
 
     useStore.getState().setShowSidebar(true);
     expect(useStore.getState().showSidebar).toBe(true);
+  });
+
+  it("setAmbientRain / setScanlines flip the decorative flags and persist them", () => {
+    localStorage.clear();
+
+    useStore.getState().setAmbientRain(true);
+    expect(useStore.getState().ambientRain).toBe(true);
+    expect(localStorage.getItem("pc.ambientRain")).toBe("1");
+
+    useStore.getState().setScanlines(true);
+    expect(useStore.getState().scanlines).toBe(true);
+    expect(localStorage.getItem("pc.scanlines")).toBe("1");
+  });
+});
+
+describe("uiScale (interface scale)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    // Reset the document zoom that prior tests / the module init may have set.
+    document.documentElement.style.zoom = "";
+  });
+
+  it("defaults to 1 (no zoom applied) until set", () => {
+    expect(useStore.getState().uiScale).toBe(1);
+  });
+
+  it("setUiScale updates state, persists a string number, and applies document zoom", () => {
+    useStore.getState().setUiScale(1.25);
+
+    expect(useStore.getState().uiScale).toBe(1.25);
+    // Persisted as a plain string number under the documented key.
+    expect(localStorage.getItem("pc.uiScale")).toBe("1.25");
+    // Applied to the whole document via the `zoom` property (Chromium/WebView2).
+    expect(document.documentElement.style.zoom).toBe("1.25");
+  });
+
+  it("stays resilient when localStorage throws", () => {
+    const spy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota");
+    });
+
+    expect(() => useStore.getState().setUiScale(0.9)).not.toThrow();
+    // In-memory state + the applied zoom still update even if persistence fails.
+    expect(useStore.getState().uiScale).toBe(0.9);
+    expect(document.documentElement.style.zoom).toBe("0.9");
+
+    spy.mockRestore();
+  });
+
+  it("hydrates the persisted scale on init and applies it to the document", async () => {
+    localStorage.setItem("pc.uiScale", "1.1");
+    document.documentElement.style.zoom = "";
+
+    vi.resetModules();
+    const fresh = await import("./store");
+
+    expect(fresh.useStore.getState().uiScale).toBe(1.1);
+    // The module applies the restored scale once at creation.
+    expect(document.documentElement.style.zoom).toBe("1.1");
+  });
+
+  it("falls back to 1 for a missing or garbage persisted value", async () => {
+    localStorage.setItem("pc.uiScale", "not-a-number");
+
+    vi.resetModules();
+    const fresh = await import("./store");
+
+    expect(fresh.useStore.getState().uiScale).toBe(1);
+  });
+});
+
+describe("crashReporting (telemetry consent)", () => {
+  it("setCrashReporting persists the consent choice as a tri-state pref", () => {
+    useStore.getState().setCrashReporting(true);
+    expect(useStore.getState().crashReporting).toBe(true);
+    expect(localStorage.getItem("pc.crashReporting")).toBe("1");
+
+    useStore.getState().setCrashReporting(false);
+    expect(useStore.getState().crashReporting).toBe(false);
+    expect(localStorage.getItem("pc.crashReporting")).toBe("0");
+  });
+
+  it("setCrashReporting mirrors the consent choice to the Rust host (both ways)", () => {
+    useStore.getState().setCrashReporting(true);
+    expect(m.setTelemetryConsent).toHaveBeenCalledWith(true);
+
+    useStore.getState().setCrashReporting(false);
+    expect(m.setTelemetryConsent).toHaveBeenCalledWith(false);
+  });
+
+  it("setCrashReporting still applies the choice when the host mirror rejects", () => {
+    // DSN-less dev builds / the mobile build (command unregistered) reject the
+    // invoke; the consent choice must still persist (the host gate is authoritative).
+    m.setTelemetryConsent.mockRejectedValueOnce(new Error("command not found"));
+    expect(() => useStore.getState().setCrashReporting(true)).not.toThrow();
+    expect(useStore.getState().crashReporting).toBe(true);
+    expect(localStorage.getItem("pc.crashReporting")).toBe("1");
   });
 });
 
@@ -1451,6 +2215,45 @@ describe("remote client", () => {
       expect(after.messages).toBe(before.messages);
       expect(after.activeId).toBe(before.activeId);
     });
+
+    it("pairing_reject drops the session and marks it rejected (REACT: desktop declined)", () => {
+      const unlisten = vi.fn();
+      useStore.setState({
+        remoteConnected: true,
+        remoteVerified: true,
+        remoteSas: "SAS-1",
+        remotePeerKey: "PEER==",
+        remoteChatOpen: true,
+        lastPairingQr: "QR",
+        remoteUnlisten: unlisten,
+        streaming: true,
+      });
+
+      useStore.getState().applyFrame({ t: "pairing_reject", reason: "Codes didn't match" });
+
+      // The frame subscription is torn down (the desktop closed the door).
+      expect(unlisten).toHaveBeenCalledTimes(1);
+      const st = useStore.getState();
+      expect(st.remoteRejected).toBe(true);
+      expect(st.remoteRejectReason).toBe("Codes didn't match");
+      expect(st.remoteConnected).toBe(false);
+      expect(st.remoteVerified).toBe(false);
+      expect(st.remoteSas).toBeNull();
+      expect(st.remoteChatOpen).toBe(false);
+      expect(st.streaming).toBe(false);
+      // A rejected desktop is forgotten (no one-tap reconnect into it).
+      expect(st.lastPairingQr).toBeNull();
+    });
+
+    it("pairing_reject with no reason sets a null reason", () => {
+      useStore.setState({ remoteConnected: true, remoteSas: "SAS-1" });
+
+      useStore.getState().applyFrame({ t: "pairing_reject" });
+
+      const st = useStore.getState();
+      expect(st.remoteRejected).toBe(true);
+      expect(st.remoteRejectReason).toBeNull();
+    });
   });
 
   describe("live stream reducer", () => {
@@ -1493,13 +2296,20 @@ describe("remote client", () => {
       expect(useStore.getState().messages.s1).toBeUndefined();
     });
 
-    it("permission_request surfaces a pending prompt for the active session", () => {
+    it("permission_request surfaces a pending prompt (with its diff) for the active session", () => {
       useStore.setState({ activeId: "s1" });
 
       useStore.getState().applyFrame({
         t: "live",
         session_id: "s1",
-        event: { type: "permission_request", id: "p1", tool: "fs_edit", summary: "x", input: {} },
+        event: {
+          type: "permission_request",
+          id: "p1",
+          tool: "fs_edit",
+          summary: "x",
+          input: {},
+          diff: "-a\n+b\n",
+        },
       });
 
       expect(useStore.getState().pendingPermission).toEqual({
@@ -1507,6 +2317,7 @@ describe("remote client", () => {
         tool: "fs_edit",
         summary: "x",
         input: {},
+        diff: "-a\n+b\n",
       });
     });
 
@@ -1562,28 +2373,33 @@ describe("remote client", () => {
       const bgLive = (event: StreamEvent) =>
         useStore.getState().applyFrame({ t: "live", session_id: "bg", event });
 
-      it("turn_start for a background session appends its message but doesn't flip streaming", () => {
-        useStore.setState({ activeId: "active", streaming: false });
+      it("turn_start for a background session appends its message and tracks its own run, without flipping the visible composer", () => {
+        useStore.setState({ activeId: "active", runs: {}, streaming: false });
 
         bgLive({ type: "turn_start", messageId: "b1" });
 
         const st = useStore.getState();
-        expect(st.streaming).toBe(false); // visible composer untouched
+        expect(st.streaming).toBe(false); // visible composer (mirror = active run) untouched
+        // ...but the background run IS now streaming in the run map — the whole
+        // point of the multi-run model: N runs are independently representable.
+        expect(st.runs.bg.streaming).toBe(true);
         expect(st.messages.bg).toEqual([
           { id: "b1", role: "assistant", blocks: [], createdAt: expect.any(Number) },
         ]);
       });
 
-      it("permission_request for a background session does NOT pop a prompt", () => {
-        useStore.setState({ activeId: "active", pendingPermission: null });
+      it("permission_request for a background session is recorded on its run but does NOT pop the visible prompt", () => {
+        useStore.setState({ activeId: "active", runs: {}, pendingPermission: null });
 
         bgLive({ type: "permission_request", id: "p9", tool: "fs_edit", summary: "x", input: {} });
 
-        expect(useStore.getState().pendingPermission).toBeNull();
+        const st = useStore.getState();
+        expect(st.pendingPermission).toBeNull(); // the visible gate stays closed
+        expect(st.runs.bg.pendingPermission?.id).toBe("p9"); // but the bg run holds it
       });
 
       it("text_delta still folds into the background session's message", () => {
-        useStore.setState({ activeId: "active" });
+        useStore.setState({ activeId: "active", runs: {} });
         bgLive({ type: "turn_start", messageId: "b1" });
 
         bgLive({ type: "text_delta", text: "hi" });
@@ -1591,9 +2407,18 @@ describe("remote client", () => {
         expect(useStore.getState().messages.bg[0].blocks).toEqual([{ kind: "text", text: "hi" }]);
       });
 
-      it("turn_end / error for a background session leave the visible turn flags alone", () => {
+      it("turn_end / error for a background session leave the ACTIVE session's visible flags alone but end the bg run", () => {
+        // Seed the ACTIVE session as a live turn IN THE RUN MAP — the visible
+        // mirror derives from it, so a background turn ending must not disturb it.
         useStore.setState({
           activeId: "active",
+          runs: {
+            active: {
+              streaming: true,
+              cancel: null,
+              pendingPermission: { id: "p", tool: "t", summary: "s", input: {} },
+            },
+          },
           streaming: true,
           pendingPermission: { id: "p", tool: "t", summary: "s", input: {} },
         });
@@ -1604,7 +2429,8 @@ describe("remote client", () => {
         // The visible turn flags belong to the active session, not the background one.
         expect(st.streaming).toBe(true);
         expect(st.pendingPermission).not.toBeNull();
-        // ...but the background message still got the inline error.
+        // ...the background run has ended, and its message got the inline error.
+        expect(st.runs.bg.streaming).toBe(false);
         const text = st.messages.bg[0].blocks
           .map((b) => (b.kind === "text" ? b.text : ""))
           .join("");
@@ -1634,6 +2460,57 @@ describe("remote client", () => {
 
       expect(useStore.getState().remoteVerified).toBe(true);
     });
+
+    it("confirmRemoteSas is a no-op once the pairing was rejected", () => {
+      // A stale Confirm click (e.g. an inbound desktop reject landed first) must not
+      // re-open a session the reject already closed.
+      useStore.setState({ remoteRejected: true, remoteVerified: false });
+
+      useStore.getState().confirmRemoteSas();
+
+      expect(useStore.getState().remoteVerified).toBe(false);
+    });
+  });
+
+  describe("rejectRemoteSas", () => {
+    it("rejects a live connection: sends the reject, tears down, and marks rejected", async () => {
+      const unlisten = vi.fn();
+      useStore.setState({
+        remoteConnected: true,
+        remoteVerified: true,
+        remoteSas: "SAS-1",
+        remotePeerKey: "PEER==",
+        remoteChatOpen: true,
+        lastPairingQr: "QR",
+        remoteUnlisten: unlisten,
+      });
+
+      await useStore.getState().rejectRemoteSas();
+
+      // The reject frame goes out over the link (not a bare disconnect).
+      expect(m.phoneSyncReject).toHaveBeenCalledTimes(1);
+      expect(m.phoneSyncDisconnect).not.toHaveBeenCalled();
+      // The frame subscription was torn down.
+      expect(unlisten).toHaveBeenCalledTimes(1);
+      const st = useStore.getState();
+      expect(st.remoteRejected).toBe(true);
+      expect(st.remoteConnected).toBe(false);
+      expect(st.remoteVerified).toBe(false);
+      expect(st.remoteSas).toBeNull();
+      expect(st.remotePeerKey).toBeNull();
+      expect(st.remoteChatOpen).toBe(false);
+      // The remembered pairing is forgotten — a rejected desktop isn't offered reconnect.
+      expect(st.lastPairingQr).toBeNull();
+    });
+
+    it("from a not-connected state, just sets rejected without reaching the channel", async () => {
+      useStore.setState({ remoteConnected: false });
+
+      await useStore.getState().rejectRemoteSas();
+
+      expect(m.phoneSyncReject).not.toHaveBeenCalled();
+      expect(useStore.getState().remoteRejected).toBe(true);
+    });
   });
 
   describe("connectRemote", () => {
@@ -1651,6 +2528,8 @@ describe("remote client", () => {
       expect(m.phoneSyncConnect).toHaveBeenCalledWith("QR-PAYLOAD", false);
       expect(st.remoteConnected).toBe(true);
       expect(st.remoteSas).toBe("SAS-1");
+      // The STABLE pinned desktop key is captured separately from the SAS.
+      expect(st.remotePeerKey).toBe("PEER==");
       expect(st.remoteError).toBeNull();
 
       // The captured callback must drive applyFrame.
@@ -1676,6 +2555,19 @@ describe("remote client", () => {
       await useStore.getState().connectRemote("QR");
 
       expect(useStore.getState().remoteVerified).toBe(false);
+    });
+
+    it("clears a prior rejection on a fresh dial", async () => {
+      // A re-pair must start clean — a lingering "rejected" notice can't carry over
+      // into a new connection attempt.
+      useStore.setState({ remoteRejected: true, remoteRejectReason: "old reason" });
+
+      await useStore.getState().connectRemote("QR");
+
+      const st = useStore.getState();
+      expect(st.remoteRejected).toBe(false);
+      expect(st.remoteRejectReason).toBeNull();
+      expect(st.remoteConnected).toBe(true);
     });
 
     it("records the error and stays disconnected when the dial fails", async () => {
@@ -1828,6 +2720,20 @@ describe("remote client", () => {
       const st = useStore.getState();
       expect(st.remoteDropped).toBe(false);
       expect(st.lastPairingQr).toBeNull();
+      // The pinned peer key is cleared too — no stale identity left behind.
+      expect(st.remotePeerKey).toBeNull();
+    });
+
+    it("hydrateRememberedQr fills an empty lastPairingQr but never clobbers an existing one", async () => {
+      // Cold launch: nothing remembered yet → the durable QR hydrates the slot so
+      // reconnectRemote (which reads lastPairingQr) can dial.
+      expect(useStore.getState().lastPairingQr).toBeNull();
+      useStore.getState().hydrateRememberedQr("QR-FROM-IDB");
+      expect(useStore.getState().lastPairingQr).toBe("QR-FROM-IDB");
+
+      // A QR already in the store (the localStorage mirror) wins — hydration is a no-op.
+      useStore.getState().hydrateRememberedQr("QR-STALE");
+      expect(useStore.getState().lastPairingQr).toBe("QR-FROM-IDB");
     });
 
     it("tears down a partial subscription if the disconnect listener fails to register", async () => {
@@ -2012,6 +2918,966 @@ describe("remote client", () => {
 
       expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(1);
       expect(useStore.getState().remoteConnected).toBe(false);
+    });
+  });
+
+  describe("remote navigation + presence", () => {
+    it("openRemoteSession switches to the session and opens the chat view", async () => {
+      const msg: Message = { id: "m", role: "assistant", blocks: [], createdAt: 1 };
+      m.getMessages.mockResolvedValue([msg]);
+
+      await useStore.getState().openRemoteSession("z");
+
+      const st = useStore.getState();
+      expect(st.activeId).toBe("z");
+      expect(st.remoteChatOpen).toBe(true);
+      expect(st.messages.z).toEqual([msg]);
+    });
+
+    it("openRemoteSession is blocked for a different session while streaming", async () => {
+      // Mid-stream, tapping a DIFFERENT session must not open the chat (selectSession
+      // is a no-op, so opening would reveal the wrong session).
+      useStore.setState({ activeId: "a", streaming: true, remoteChatOpen: false });
+
+      await useStore.getState().openRemoteSession("b");
+
+      const st = useStore.getState();
+      expect(st.activeId).toBe("a"); // unchanged
+      expect(st.remoteChatOpen).toBe(false); // chat did NOT open
+    });
+
+    it("openRemoteSession still enters the already-active session while streaming", async () => {
+      const msg: Message = { id: "m", role: "assistant", blocks: [], createdAt: 1 };
+      useStore.setState({
+        activeId: "a",
+        streaming: true,
+        remoteChatOpen: false,
+        messages: { a: [msg] },
+      });
+
+      await useStore.getState().openRemoteSession("a");
+
+      const st = useStore.getState();
+      expect(st.activeId).toBe("a");
+      expect(st.remoteChatOpen).toBe(true); // tapping the active running session enters it
+    });
+
+    it("closeRemoteSession returns to the sessions list without disconnecting", () => {
+      useStore.setState({ remoteChatOpen: true, remoteConnected: true });
+
+      useStore.getState().closeRemoteSession();
+
+      const st = useStore.getState();
+      expect(st.remoteChatOpen).toBe(false);
+      expect(st.remoteConnected).toBe(true); // the link stays live
+    });
+
+    it("forgetRemotePairing clears the remembered desktop and the dropped flag", () => {
+      useStore.setState({ lastPairingQr: "QR", remoteDropped: true });
+      localStorage.setItem("pc.lastPairingQr", "QR");
+
+      useStore.getState().forgetRemotePairing();
+
+      const st = useStore.getState();
+      expect(st.lastPairingQr).toBeNull();
+      expect(st.remoteDropped).toBe(false);
+      expect(localStorage.getItem("pc.lastPairingQr")).toBeNull();
+    });
+
+    it("setOnline reflects network presence", () => {
+      useStore.getState().setOnline(false);
+      expect(useStore.getState().online).toBe(false);
+
+      useStore.getState().setOnline(true);
+      expect(useStore.getState().online).toBe(true);
+    });
+
+    it("a fresh dial resets the chat view to the sessions list", async () => {
+      useStore.setState({ remoteChatOpen: true });
+
+      await useStore.getState().connectRemote("QR");
+
+      expect(useStore.getState().remoteChatOpen).toBe(false);
+    });
+
+    it("disconnect closes the chat view", async () => {
+      useStore.setState({ remoteConnected: true, remoteChatOpen: true });
+
+      await useStore.getState().disconnectRemote();
+
+      expect(useStore.getState().remoteChatOpen).toBe(false);
+    });
+
+    it("an unexpected drop closes the chat view", async () => {
+      let dropCb!: () => void;
+      m.onPhoneSyncDisconnected.mockImplementation(async (cb) => {
+        dropCb = cb;
+        return () => {};
+      });
+      await useStore.getState().connectRemote("QR");
+      useStore.setState({ remoteChatOpen: true });
+
+      dropCb();
+
+      expect(useStore.getState().remoteChatOpen).toBe(false);
+    });
+  });
+
+  // ── Sessions sidebar organization (frontend-only overlay) ───────────────────
+  describe("sidebar organization", () => {
+    beforeEach(() => {
+      // These assert on the persisted slice, so isolate localStorage per test.
+      localStorage.clear();
+    });
+
+    it("setSortBy / setGroupBy update state and persist the choice", () => {
+      useStore.getState().setSortBy("name");
+      useStore.getState().setGroupBy("status");
+
+      expect(useStore.getState().sortBy).toBe("name");
+      expect(useStore.getState().groupBy).toBe("status");
+      expect(localStorage.getItem("pc.sortBy")).toBe("name");
+      expect(localStorage.getItem("pc.groupBy")).toBe("status");
+    });
+
+    it("addFolder appends an expanded 'New folder' and persists it", () => {
+      useStore.getState().addFolder();
+
+      const { folders } = useStore.getState();
+      expect(folders).toHaveLength(1);
+      expect(folders[0]).toMatchObject({ name: "New folder", open: true });
+      expect(typeof folders[0].id).toBe("string");
+      expect(JSON.parse(localStorage.getItem("pc.folders")!)).toHaveLength(1);
+    });
+
+    it("toggleFolder flips a folder's open flag", () => {
+      useStore.setState({ folders: [{ id: "f1", name: "Work", open: true }] });
+
+      useStore.getState().toggleFolder("f1");
+      expect(useStore.getState().folders[0].open).toBe(false);
+
+      useStore.getState().toggleFolder("f1");
+      expect(useStore.getState().folders[0].open).toBe(true);
+      // Untouched ids are left alone.
+      useStore.getState().toggleFolder("nope");
+      expect(useStore.getState().folders[0].open).toBe(true);
+    });
+
+    it("renameFolder trims a new name but ignores an empty/whitespace one", () => {
+      useStore.setState({ folders: [{ id: "f1", name: "Work", open: true }] });
+
+      useStore.getState().renameFolder("f1", "  Research  ");
+      expect(useStore.getState().folders[0].name).toBe("Research");
+
+      // A blank rename is a no-op so a folder can never lose its label.
+      useStore.getState().renameFolder("f1", "   ");
+      expect(useStore.getState().folders[0].name).toBe("Research");
+    });
+
+    it("deleteFolder removes the folder and orphans its members back to loose", () => {
+      useStore.setState({
+        folders: [
+          { id: "f1", name: "Work", open: true },
+          { id: "f2", name: "Personal", open: true },
+        ],
+        folderOf: { a: "f1", b: "f1", c: "f2" },
+      });
+
+      useStore.getState().deleteFolder("f1");
+
+      const st = useStore.getState();
+      expect(st.folders.map((f) => f.id)).toEqual(["f2"]);
+      // a + b drop their membership (back to loose); c (in f2) is untouched.
+      expect(st.folderOf).toEqual({ c: "f2" });
+      expect(JSON.parse(localStorage.getItem("pc.folderOf")!)).toEqual({ c: "f2" });
+    });
+
+    it("moveSessionToFolder sets membership, and null moves a chat back to loose", () => {
+      useStore.getState().moveSessionToFolder("a", "f1");
+      expect(useStore.getState().folderOf).toEqual({ a: "f1" });
+
+      useStore.getState().moveSessionToFolder("a", null);
+      expect(useStore.getState().folderOf).toEqual({});
+      expect(JSON.parse(localStorage.getItem("pc.folderOf")!)).toEqual({});
+    });
+
+    it("toggleArchived adds then removes a session id, persisting each time", () => {
+      useStore.getState().toggleArchived("a");
+      expect(useStore.getState().archivedIds).toEqual(["a"]);
+      expect(JSON.parse(localStorage.getItem("pc.archivedIds")!)).toEqual(["a"]);
+
+      useStore.getState().toggleArchived("a");
+      expect(useStore.getState().archivedIds).toEqual([]);
+    });
+
+    it("setSidebarCollapsed toggles the rail flag and persists it", () => {
+      useStore.getState().setSidebarCollapsed(true);
+      expect(useStore.getState().sidebarCollapsed).toBe(true);
+      expect(localStorage.getItem("pc.sidebarCollapsed")).toBe("1");
+
+      useStore.getState().setSidebarCollapsed(false);
+      expect(useStore.getState().sidebarCollapsed).toBe(false);
+      expect(localStorage.getItem("pc.sidebarCollapsed")).toBe("0");
+    });
+
+    it("setManualOrder records the order and flips sortBy to manual (sort off)", () => {
+      expect(useStore.getState().sortBy).toBe("recent");
+
+      useStore.getState().setManualOrder(["c", "a", "b"]);
+
+      const st = useStore.getState();
+      expect(st.manualOrder).toEqual(["c", "a", "b"]);
+      expect(st.sortBy).toBe("manual");
+      expect(JSON.parse(localStorage.getItem("pc.manualOrder")!)).toEqual(["c", "a", "b"]);
+      expect(localStorage.getItem("pc.sortBy")).toBe("manual");
+    });
+
+    it("deleteSession prunes the gone session's folder, archived, and manual-order entries", async () => {
+      useStore.setState({
+        sessions: [session({ id: "a" }), session({ id: "b" })],
+        activeId: "a",
+        messages: { a: [] },
+        folders: [{ id: "f1", name: "Work", open: true }],
+        folderOf: { b: "f1" },
+        archivedIds: ["b"],
+        manualOrder: ["a", "b"],
+      });
+
+      await useStore.getState().deleteSession("b");
+
+      const st = useStore.getState();
+      expect(st.sessions.map((s) => s.id)).toEqual(["a"]);
+      expect(st.folderOf).toEqual({});
+      expect(st.archivedIds).toEqual([]);
+      expect(st.manualOrder).toEqual(["a"]);
+      expect(JSON.parse(localStorage.getItem("pc.folderOf")!)).toEqual({});
+      expect(JSON.parse(localStorage.getItem("pc.archivedIds")!)).toEqual([]);
+      expect(JSON.parse(localStorage.getItem("pc.manualOrder")!)).toEqual(["a"]);
+    });
+
+    it("write actions stay resilient when localStorage throws", () => {
+      const spy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+        throw new Error("quota");
+      });
+
+      // The action must still update in-memory state even if persistence fails.
+      expect(() => useStore.getState().addFolder()).not.toThrow();
+      expect(useStore.getState().folders).toHaveLength(1);
+
+      spy.mockRestore();
+    });
+
+    it("hydrates the sidebar prefs from localStorage on init", async () => {
+      localStorage.setItem("pc.sortBy", "name");
+      localStorage.setItem("pc.groupBy", "status");
+      localStorage.setItem("pc.folders", JSON.stringify([{ id: "f1", name: "Work", open: false }]));
+      localStorage.setItem("pc.folderOf", JSON.stringify({ s1: "f1" }));
+      localStorage.setItem("pc.archivedIds", JSON.stringify(["s2"]));
+      localStorage.setItem("pc.manualOrder", JSON.stringify(["s3", "s1"]));
+      localStorage.setItem("pc.sidebarCollapsed", "1");
+
+      vi.resetModules();
+      const fresh = await import("./store");
+      const st = fresh.useStore.getState();
+
+      expect(st.sortBy).toBe("name");
+      expect(st.groupBy).toBe("status");
+      expect(st.folders).toEqual([{ id: "f1", name: "Work", open: false }]);
+      expect(st.folderOf).toEqual({ s1: "f1" });
+      expect(st.archivedIds).toEqual(["s2"]);
+      expect(st.manualOrder).toEqual(["s3", "s1"]);
+      expect(st.sidebarCollapsed).toBe(true);
+    });
+
+    it("falls back to defaults when localStorage throws on init read", async () => {
+      const spy = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+        throw new Error("blocked");
+      });
+
+      vi.resetModules();
+      const fresh = await import("./store");
+      const st = fresh.useStore.getState();
+
+      expect(st.sortBy).toBe("recent");
+      expect(st.groupBy).toBe("none");
+      expect(st.folders).toEqual([]);
+      expect(st.folderOf).toEqual({});
+      expect(st.archivedIds).toEqual([]);
+      expect(st.manualOrder).toEqual([]);
+      expect(st.sidebarCollapsed).toBe(false);
+
+      spy.mockRestore();
+    });
+  });
+});
+
+describe("live subagents (agents panel)", () => {
+  // Drive the desktop event path: send() wires onEvent, which we capture and feed
+  // the agent lifecycle events the Rust spawner emits on the session channel.
+  const startTurn = async (id = "a") => {
+    let emit!: (e: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
+    useStore.setState({
+      sessions: [session({ id, title: "New chat" })],
+      activeId: id,
+      messages: { [id]: [] },
+    });
+    await useStore.getState().send("go");
+    return emit;
+  };
+
+  it("tracks a subagent's lifecycle: started → progress → finished", async () => {
+    const emit = await startTurn();
+
+    emit({ type: "agent_started", agentId: "g1", description: "audit deps" });
+    let a = useStore.getState().agents.a;
+    expect(a).toHaveLength(1);
+    expect(a[0]).toMatchObject({ id: "g1", description: "audit deps", status: "running", step: 0 });
+
+    emit({ type: "agent_progress", agentId: "g1", step: 3 });
+    expect(useStore.getState().agents.a[0].step).toBe(3);
+
+    emit({ type: "agent_finished", agentId: "g1", status: "ok" });
+    a = useStore.getState().agents.a;
+    expect(a[0].status).toBe("ok");
+    expect(a[0].step).toBe(3); // progress preserved
+  });
+
+  it("keeps multiple subagents in start order and records parentage", async () => {
+    const emit = await startTurn();
+
+    emit({ type: "agent_started", agentId: "g1", description: "first" });
+    emit({ type: "agent_started", agentId: "g2", description: "second", parentId: "g1" });
+
+    const a = useStore.getState().agents.a;
+    expect(a.map((x) => x.id)).toEqual(["g1", "g2"]);
+    expect(a[1].parentId).toBe("g1");
+  });
+
+  it("maps the finish status string, defaulting an unknown value to ok", async () => {
+    const emit = await startTurn();
+    emit({ type: "agent_started", agentId: "c", description: "x" });
+    emit({ type: "agent_finished", agentId: "c", status: "cancelled" });
+    expect(useStore.getState().agents.a[0].status).toBe("cancelled");
+
+    emit({ type: "agent_started", agentId: "e", description: "y" });
+    emit({ type: "agent_finished", agentId: "e", status: "kaboom" });
+    expect(useStore.getState().agents.a.find((x) => x.id === "e")?.status).toBe("ok");
+  });
+
+  it("clears the previous turn's subagents when a new turn starts", async () => {
+    const emit = await startTurn();
+    emit({ type: "agent_started", agentId: "g1", description: "old" });
+    expect(useStore.getState().agents.a).toHaveLength(1);
+    emit({ type: "turn_end", stopReason: "end_turn" });
+
+    // The next turn on the same session starts with an empty panel.
+    await useStore.getState().send("again");
+    expect(useStore.getState().agents.a).toEqual([]);
+  });
+
+  it("ignores a progress/finished event for an agent it never saw start", async () => {
+    const emit = await startTurn();
+    emit({ type: "agent_progress", agentId: "ghost", step: 2 });
+    emit({ type: "agent_finished", agentId: "ghost", status: "ok" });
+    expect(useStore.getState().agents.a).toEqual([]);
+  });
+
+  it("folds agent events from a phone live frame onto their session", () => {
+    useStore.setState({ activeId: "a", agents: {} });
+    const frame = (event: StreamEvent): SyncFrame => ({ t: "live", session_id: "a", event });
+
+    useStore
+      .getState()
+      .applyFrame(frame({ type: "agent_started", agentId: "g1", description: "remote" }));
+    useStore.getState().applyFrame(frame({ type: "agent_progress", agentId: "g1", step: 2 }));
+    expect(useStore.getState().agents.a[0]).toMatchObject({ description: "remote", step: 2 });
+  });
+
+  it("clears the prior turn's subagents at the start of a new remote turn (phone path)", () => {
+    // The phone has no local send() for the turn — the desktop drives it — so the
+    // per-turn reset must happen on the turn_start frame, symmetric to the desktop.
+    useStore.setState({
+      activeId: "a",
+      agents: { a: [{ id: "old", description: "prior turn", status: "ok", step: 4 }] },
+    });
+    const frame = (event: StreamEvent): SyncFrame => ({ t: "live", session_id: "a", event });
+
+    useStore.getState().applyFrame(frame({ type: "turn_start", messageId: "m2" }));
+    // The stale finished subagent from the previous turn is gone.
+    expect(useStore.getState().agents.a).toEqual([]);
+
+    // This turn's subagents repopulate the now-empty panel (no accumulation).
+    useStore
+      .getState()
+      .applyFrame(frame({ type: "agent_started", agentId: "new", description: "fresh" }));
+    expect(useStore.getState().agents.a.map((x) => x.id)).toEqual(["new"]);
+  });
+
+  it("cancelAgent calls the per-agent IPC on the desktop", async () => {
+    await useStore.getState().cancelAgent("g1");
+    expect(m.cancelAgentById).toHaveBeenCalledWith("g1");
+    expect(m.phoneSyncSendCommand).not.toHaveBeenCalled();
+  });
+
+  it("cancelAgent sends a cancel_agent command in remote mode", async () => {
+    useStore.setState({ remoteConnected: true });
+    await useStore.getState().cancelAgent("g1");
+    expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({ cmd: "cancel_agent", agent_id: "g1" });
+    expect(m.cancelAgentById).not.toHaveBeenCalled();
+  });
+
+  it("cancelAgent swallows an IPC failure so the panel never throws", async () => {
+    m.cancelAgentById.mockRejectedValueOnce(new Error("ipc boom"));
+    await expect(useStore.getState().cancelAgent("g1")).resolves.toBeUndefined();
+  });
+});
+
+describe("background shell tasks (background-tasks panel)", () => {
+  // Drain microtasks AND macrotasks so a `void`-ed (fire-and-forget) background
+  // subscription has finished installing its unlisten before we assert on it.
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  // Background events ride a per-session frame on the phone and a persistent
+  // session listener on the desktop, both folding through the same reducer. The
+  // phone `applyFrame` path is the cleanest way to exercise that reducer — it
+  // never touches the module-scoped desktop listener registry.
+  const bgFrame = (session_id: string, event: StreamEvent): SyncFrame => ({
+    t: "live",
+    session_id,
+    event,
+  });
+
+  // The desktop listener registry (`bgListeners`) is module-scoped, so it leaks
+  // across tests; clear it before each so subscribe/idempotency assertions start
+  // from a clean slate (mirrors the store reset in the global beforeEach).
+  beforeEach(() => teardownAllBackgroundListeners());
+
+  it("tracks a background task's lifecycle: started → finished (ok)", () => {
+    useStore.setState({ activeId: "a", backgroundTasks: {} });
+    const f = useStore.getState().applyFrame;
+    f(bgFrame("a", { type: "background_task_started", id: "t1", command: "npm run dev" }));
+    let t = useStore.getState().backgroundTasks.a;
+    expect(t).toHaveLength(1);
+    expect(t[0]).toMatchObject({ id: "t1", command: "npm run dev", status: "running" });
+    expect(t[0].exitCode).toBeUndefined();
+
+    f(
+      bgFrame("a", {
+        type: "background_task_finished",
+        id: "t1",
+        command: "npm run dev",
+        exitCode: 0,
+        output: "served",
+      }),
+    );
+    t = useStore.getState().backgroundTasks.a;
+    expect(t[0]).toMatchObject({ status: "ok", exitCode: 0, output: "served" });
+  });
+
+  it("maps a non-zero exit code to an error status", () => {
+    useStore.setState({ activeId: "a", backgroundTasks: {} });
+    const f = useStore.getState().applyFrame;
+    f(bgFrame("a", { type: "background_task_started", id: "t1", command: "make" }));
+    f(
+      bgFrame("a", {
+        type: "background_task_finished",
+        id: "t1",
+        command: "make",
+        exitCode: 2,
+        output: "boom",
+      }),
+    );
+    expect(useStore.getState().backgroundTasks.a[0]).toMatchObject({
+      status: "error",
+      exitCode: 2,
+    });
+  });
+
+  it("keeps multiple tasks in launch order and replaces a duplicate start", () => {
+    useStore.setState({ activeId: "a", backgroundTasks: {} });
+    const f = useStore.getState().applyFrame;
+    f(bgFrame("a", { type: "background_task_started", id: "t1", command: "first" }));
+    f(bgFrame("a", { type: "background_task_started", id: "t2", command: "second" }));
+    f(bgFrame("a", { type: "background_task_started", id: "t1", command: "first-again" }));
+    const t = useStore.getState().backgroundTasks.a;
+    expect(t.map((x) => x.id)).toEqual(["t1", "t2"]);
+    expect(t[0].command).toBe("first-again");
+  });
+
+  it("upserts a finished event whose start it never saw", () => {
+    useStore.setState({ activeId: "a", backgroundTasks: {} });
+    useStore.getState().applyFrame(
+      bgFrame("a", {
+        type: "background_task_finished",
+        id: "orphan",
+        command: "probe",
+        exitCode: 0,
+        output: "ok",
+      }),
+    );
+    const t = useStore.getState().backgroundTasks.a;
+    expect(t).toHaveLength(1);
+    expect(t[0]).toMatchObject({ id: "orphan", command: "probe", status: "ok" });
+  });
+
+  it("keeps background tasks across a turn boundary (they outlive the turn)", () => {
+    // Unlike subagents (cleared on turn_start), a background task must survive into
+    // the next turn — its finish can land turns after it was launched.
+    useStore.setState({
+      activeId: "a",
+      backgroundTasks: { a: [{ id: "t1", command: "npm run dev", status: "running" }] },
+      agents: { a: [{ id: "g", description: "x", status: "running", step: 1 }] },
+    });
+    useStore.getState().applyFrame(bgFrame("a", { type: "turn_start", messageId: "m2" }));
+    // The subagent panel resets...
+    expect(useStore.getState().agents.a).toEqual([]);
+    // ...but the running background task is untouched.
+    expect(useStore.getState().backgroundTasks.a).toHaveLength(1);
+    expect(useStore.getState().backgroundTasks.a[0].id).toBe("t1");
+  });
+
+  it("records a background task on its OWN session even when another is active", () => {
+    useStore.setState({ activeId: "active", backgroundTasks: {} });
+    useStore
+      .getState()
+      .applyFrame(bgFrame("other", { type: "background_task_started", id: "t1", command: "bg" }));
+    expect(useStore.getState().backgroundTasks.other).toHaveLength(1);
+    expect(useStore.getState().backgroundTasks.active).toBeUndefined();
+  });
+
+  // ── desktop persistent-listener wiring ──────────────────────────────────────
+  it("subscribes a persistent session listener and folds its background events", async () => {
+    let emit!: (e: StreamEvent) => void;
+    m.subscribeSessionEvents.mockImplementation(async (_sid, onEvent) => {
+      emit = onEvent;
+      return () => {};
+    });
+    useStore.setState({
+      sessions: [session({ id: "bgt-desk" })],
+      activeId: "bgt-desk",
+      messages: { "bgt-desk": [] },
+    });
+    await useStore.getState().selectSession("bgt-desk");
+    expect(m.subscribeSessionEvents).toHaveBeenCalledWith("bgt-desk", expect.any(Function));
+
+    emit({ type: "background_task_started", id: "t1", command: "serve" });
+    expect(useStore.getState().backgroundTasks["bgt-desk"]).toHaveLength(1);
+    emit({ type: "background_task_finished", id: "t1", command: "serve", exitCode: 0, output: "" });
+    expect(useStore.getState().backgroundTasks["bgt-desk"][0].status).toBe("ok");
+  });
+
+  it("subscribes a background listener for every session on init", async () => {
+    m.listSessions.mockResolvedValue([
+      session({ id: "bgt-init-1" }),
+      session({ id: "bgt-init-2" }),
+    ]);
+    m.getMessages.mockResolvedValue([]);
+    await useStore.getState().init();
+    expect(m.subscribeSessionEvents).toHaveBeenCalledWith("bgt-init-1", expect.any(Function));
+    expect(m.subscribeSessionEvents).toHaveBeenCalledWith("bgt-init-2", expect.any(Function));
+  });
+
+  it("subscribes a background listener for a newly created session", async () => {
+    useStore.setState({ sessions: [], activeId: null, messages: {} });
+    await useStore.getState().newSession();
+    const newId = useStore.getState().activeId;
+    expect(newId).toBeTruthy();
+    expect(m.subscribeSessionEvents).toHaveBeenCalledWith(newId, expect.any(Function));
+  });
+
+  it("tears the listener down and drops the tasks when a session is deleted", async () => {
+    const unlisten = vi.fn();
+    m.subscribeSessionEvents.mockResolvedValue(unlisten);
+    useStore.setState({
+      sessions: [session({ id: "bgt-del" }), session({ id: "bgt-keep" })],
+      activeId: "bgt-del",
+      messages: { "bgt-del": [], "bgt-keep": [] },
+      backgroundTasks: { "bgt-del": [{ id: "t1", command: "x", status: "running" }] },
+    });
+    await useStore.getState().selectSession("bgt-del"); // installs the listener
+    await flush(); // let the fire-and-forget subscription finish installing
+    await useStore.getState().deleteSession("bgt-del");
+    expect(unlisten).toHaveBeenCalled();
+    expect(useStore.getState().backgroundTasks["bgt-del"]).toBeUndefined();
+  });
+
+  it("resets background tasks on a fresh remote dial", async () => {
+    useStore.setState({
+      backgroundTasks: { a: [{ id: "t", command: "x", status: "running" }] },
+    });
+    await useStore.getState().connectRemote("qr");
+    expect(useStore.getState().backgroundTasks).toEqual({});
+  });
+
+  it("survives a failed background subscription and can retry it later", async () => {
+    m.subscribeSessionEvents.mockRejectedValueOnce(new Error("listen boom"));
+    useStore.setState({
+      sessions: [session({ id: "bgt-fail" })],
+      activeId: "bgt-fail",
+      messages: { "bgt-fail": [] },
+    });
+    // The subscribe is fire-and-forget; a rejected one must be swallowed (no
+    // unhandled rejection) and must not break selecting the session.
+    await expect(useStore.getState().selectSession("bgt-fail")).resolves.toBeUndefined();
+    await flush(); // let the rejected subscribe settle (the reservation is dropped)
+
+    // Because the failed reservation was released, a later select retries the
+    // subscribe rather than treating the session as already-listening.
+    m.subscribeSessionEvents.mockResolvedValueOnce(() => {});
+    await useStore.getState().selectSession("bgt-fail");
+    await flush();
+    const calls = m.subscribeSessionEvents.mock.calls.filter((c) => c[0] === "bgt-fail");
+    expect(calls).toHaveLength(2);
+  });
+
+  it("installs at most one persistent listener per session (idempotent)", async () => {
+    m.subscribeSessionEvents.mockResolvedValue(() => {});
+    useStore.setState({
+      sessions: [session({ id: "bgt-idem" })],
+      activeId: "bgt-idem",
+      messages: { "bgt-idem": [] },
+    });
+    await useStore.getState().selectSession("bgt-idem");
+    await flush();
+    await useStore.getState().selectSession("bgt-idem");
+    await flush();
+    const calls = m.subscribeSessionEvents.mock.calls.filter((c) => c[0] === "bgt-idem");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("never installs a desktop listener in remote mode (the phone uses frames)", async () => {
+    useStore.setState({
+      remoteMode: true,
+      sessions: [session({ id: "bgt-remote" })],
+      activeId: "bgt-remote",
+      messages: { "bgt-remote": [] },
+    });
+    await useStore.getState().selectSession("bgt-remote");
+    await flush();
+    const calls = m.subscribeSessionEvents.mock.calls.filter((c) => c[0] === "bgt-remote");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("honours a teardown that lands while the subscribe is still in flight", async () => {
+    // The subscribe stays pending until we resolve it by hand, so we can interleave
+    // a teardown (deleteSession) in the gap — the documented race. The just-resolved
+    // listener must tear itself down (its reservation is gone), not leak.
+    let resolveSub!: (un: () => void) => void;
+    m.subscribeSessionEvents.mockImplementation(
+      () => new Promise<() => void>((r) => (resolveSub = r)),
+    );
+    useStore.setState({
+      sessions: [session({ id: "bgt-race" }), session({ id: "bgt-keep" })],
+      activeId: "bgt-race",
+      messages: { "bgt-race": [], "bgt-keep": [] },
+    });
+    void useStore.getState().selectSession("bgt-race"); // starts the (pending) subscribe
+    await flush();
+    await useStore.getState().deleteSession("bgt-race"); // teardown before it resolves
+
+    const unlisten = vi.fn();
+    resolveSub(unlisten); // the subscribe finally resolves...
+    await flush();
+    expect(unlisten).toHaveBeenCalled(); // ...and the orphaned listener tore itself down
+  });
+
+  it("tears down desktop listeners when the device dials into remote mode", async () => {
+    const unlisten = vi.fn();
+    m.subscribeSessionEvents.mockResolvedValue(unlisten);
+    useStore.setState({
+      sessions: [session({ id: "bgt-conn" })],
+      activeId: "bgt-conn",
+      messages: { "bgt-conn": [] },
+    });
+    await useStore.getState().selectSession("bgt-conn"); // desktop installs the listener
+    await flush();
+    await useStore.getState().connectRemote("qr");
+    expect(unlisten).toHaveBeenCalled(); // the persistent path is dropped on going remote
+  });
+
+  it("the per-turn listener ignores background events (the persistent listener owns them)", async () => {
+    // During a turn BOTH listeners receive every `agent://{session}` event; only the
+    // persistent one must act on background events. Drive a background event through
+    // the per-turn onEvent and assert it changes nothing — no double-count.
+    let perTurn!: (e: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+      perTurn = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
+    useStore.setState({
+      sessions: [session({ id: "bgt-turn" })],
+      activeId: "bgt-turn",
+      messages: { "bgt-turn": [] },
+    });
+    await useStore.getState().send("go");
+
+    perTurn({ type: "background_task_started", id: "t1", command: "serve" });
+    perTurn({
+      type: "background_task_finished",
+      id: "t1",
+      command: "serve",
+      exitCode: 0,
+      output: "",
+    });
+    // The per-turn listener has no background case → background state is untouched.
+    expect(useStore.getState().backgroundTasks["bgt-turn"]).toBeUndefined();
+  });
+});
+
+describe("auto-update", () => {
+  const info = (over: Partial<UpdateInfo> = {}): UpdateInfo => ({
+    version: "5.1.0",
+    currentVersion: "5.0.0",
+    notes: "Bug fixes.",
+    date: "2026-06-28",
+    ...over,
+  });
+
+  describe("checkForUpdate", () => {
+    it("stays idle when the core reports no update (null)", async () => {
+      m.checkForUpdate.mockResolvedValue(null);
+      // Seed a non-idle phase to prove a null check resets the banner away.
+      useStore.setState({ update: { phase: "error", info: info(), progress: 50, error: "x" } });
+
+      await useStore.getState().checkForUpdate();
+
+      expect(m.checkForUpdate).toHaveBeenCalledTimes(1);
+      expect(useStore.getState().update).toEqual({
+        phase: "idle",
+        info: null,
+        progress: null,
+        error: null,
+      });
+    });
+
+    it("auto-downloads when an update exists and autoUpdate is on → ready", async () => {
+      m.checkForUpdate.mockResolvedValue(info());
+      m.downloadAndInstallUpdate.mockResolvedValue(true);
+      useStore.setState({ settings: { ...DEFAULT_SETTINGS, autoUpdate: true } });
+
+      await useStore.getState().checkForUpdate();
+
+      // autoUpdate on → it kicked the download, which resolved → ready @ 100%.
+      expect(m.downloadAndInstallUpdate).toHaveBeenCalledTimes(1);
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("ready");
+      expect(st.update.progress).toBe(100);
+      expect(st.update.info).toEqual(info());
+    });
+
+    it("only offers (phase available) when autoUpdate is off", async () => {
+      m.checkForUpdate.mockResolvedValue(info());
+      useStore.setState({ settings: { ...DEFAULT_SETTINGS, autoUpdate: false } });
+
+      await useStore.getState().checkForUpdate();
+
+      expect(m.downloadAndInstallUpdate).not.toHaveBeenCalled();
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("available");
+      expect(st.update.info).toEqual(info());
+    });
+
+    it("swallows a failing check into the error phase (never throws)", async () => {
+      m.checkForUpdate.mockRejectedValue(new Error("no updater here"));
+
+      await expect(useStore.getState().checkForUpdate()).resolves.toBeUndefined();
+
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("error");
+      expect(st.update.error).toBe("no updater here");
+    });
+  });
+
+  describe("startUpdateDownload", () => {
+    it("transitions to downloading then ready on success (staged=true)", async () => {
+      m.downloadAndInstallUpdate.mockResolvedValue(true);
+      useStore.setState({
+        update: { phase: "available", info: info(), progress: null, error: null },
+      });
+
+      await useStore.getState().startUpdateDownload();
+
+      expect(m.downloadAndInstallUpdate).toHaveBeenCalledTimes(1);
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("ready");
+      expect(st.update.progress).toBe(100);
+      // info is preserved across the download.
+      expect(st.update.info).toEqual(info());
+    });
+
+    it("resets to idle when ipc reports no update was staged (staged=false)", async () => {
+      m.downloadAndInstallUpdate.mockResolvedValue(false);
+      useStore.setState({
+        update: { phase: "available", info: info(), progress: null, error: null },
+      });
+
+      await useStore.getState().startUpdateDownload();
+
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("idle");
+      expect(st.update.info).toBeNull();
+    });
+
+    it("records an error and message when the download rejects", async () => {
+      m.downloadAndInstallUpdate.mockRejectedValue(new Error("network down"));
+      useStore.setState({
+        update: { phase: "available", info: info(), progress: null, error: null },
+      });
+
+      await useStore.getState().startUpdateDownload();
+
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("error");
+      expect(st.update.error).toBe("network down");
+    });
+  });
+
+  describe("applyUpdateProgress", () => {
+    it("computes a rounded percent from downloaded/total", () => {
+      useStore.getState().applyUpdateProgress(50, 200);
+      expect(useStore.getState().update.progress).toBe(25);
+
+      // Rounds rather than truncates.
+      useStore.getState().applyUpdateProgress(1, 3);
+      expect(useStore.getState().update.progress).toBe(33);
+    });
+
+    it("yields null (indeterminate) when the total is null or zero", () => {
+      useStore.getState().applyUpdateProgress(10, null);
+      expect(useStore.getState().update.progress).toBeNull();
+
+      useStore.getState().applyUpdateProgress(10, 0);
+      expect(useStore.getState().update.progress).toBeNull();
+    });
+  });
+
+  describe("markUpdateReady", () => {
+    it("sets phase ready at 100% (driven by the finished event)", () => {
+      useStore.setState({
+        update: { phase: "downloading", info: info(), progress: 40, error: null },
+      });
+
+      useStore.getState().markUpdateReady();
+
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("ready");
+      expect(st.update.progress).toBe(100);
+      expect(st.update.info).toEqual(info());
+    });
+  });
+
+  describe("relaunchForUpdate", () => {
+    it("calls ipc.relaunchApp", async () => {
+      m.relaunchApp.mockResolvedValue(undefined);
+
+      await useStore.getState().relaunchForUpdate();
+
+      expect(m.relaunchApp).toHaveBeenCalledTimes(1);
+    });
+
+    it("surfaces an error if relaunch is unavailable", async () => {
+      m.relaunchApp.mockRejectedValue(new Error("no relaunch"));
+      useStore.setState({ update: { phase: "ready", info: info(), progress: 100, error: null } });
+
+      await expect(useStore.getState().relaunchForUpdate()).resolves.toBeUndefined();
+
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("error");
+      expect(st.update.error).toBe("no relaunch");
+    });
+  });
+
+  describe("setAutoUpdate", () => {
+    it("persists the preference via ipc.saveSettings", async () => {
+      useStore.setState({ settings: { ...DEFAULT_SETTINGS, autoUpdate: true } });
+      m.saveSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, autoUpdate: false });
+
+      await useStore.getState().setAutoUpdate(false);
+
+      expect(m.saveSettings).toHaveBeenCalledWith({ autoUpdate: false });
+      expect(useStore.getState().settings.autoUpdate).toBe(false);
+    });
+
+    it("starts the download when enabled while an update is already available", async () => {
+      m.downloadAndInstallUpdate.mockResolvedValue(true);
+      m.saveSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, autoUpdate: true });
+      useStore.setState({
+        settings: { ...DEFAULT_SETTINGS, autoUpdate: false },
+        update: { phase: "available", info: info(), progress: null, error: null },
+      });
+
+      await useStore.getState().setAutoUpdate(true);
+
+      expect(m.saveSettings).toHaveBeenCalledWith({ autoUpdate: true });
+      expect(m.downloadAndInstallUpdate).toHaveBeenCalledTimes(1);
+      expect(useStore.getState().update.phase).toBe("ready");
+    });
+
+    it("does not start a download when enabled but no update is waiting", async () => {
+      m.saveSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, autoUpdate: true });
+      useStore.setState({
+        settings: { ...DEFAULT_SETTINGS, autoUpdate: false },
+        update: { phase: "idle", info: null, progress: null, error: null },
+      });
+
+      await useStore.getState().setAutoUpdate(true);
+
+      expect(m.downloadAndInstallUpdate).not.toHaveBeenCalled();
+    });
+
+    it("does not start a download when the save failed (guard passes on mismatch)", async () => {
+      // saveSettings rejects — updateSettings swallows into settingsError, settings unchanged.
+      m.saveSettings.mockRejectedValueOnce(new Error("disk full"));
+      useStore.setState({
+        settings: { ...DEFAULT_SETTINGS, autoUpdate: false },
+        update: { phase: "available", info: info(), progress: null, error: null },
+      });
+
+      await useStore.getState().setAutoUpdate(true);
+
+      // The guard `if (get().settings.autoUpdate !== enabled) return;` short-circuits.
+      expect(m.downloadAndInstallUpdate).not.toHaveBeenCalled();
+      // The update phase is untouched because startUpdateDownload was never called.
+      expect(useStore.getState().update.phase).toBe("available");
+    });
+  });
+
+  describe("loadUpdateChannel", () => {
+    it("stores the channel reported by the core", async () => {
+      m.getUpdateChannel.mockResolvedValue("staging");
+
+      await useStore.getState().loadUpdateChannel();
+
+      expect(useStore.getState().updateChannel).toBe("staging");
+    });
+
+    it("keeps the default channel when the command is unavailable", async () => {
+      m.getUpdateChannel.mockRejectedValue(new Error("unknown command"));
+
+      await expect(useStore.getState().loadUpdateChannel()).resolves.toBeUndefined();
+
+      expect(useStore.getState().updateChannel).toBe("stable");
+    });
+  });
+
+  describe("dismissUpdateBanner", () => {
+    it("returns to idle but keeps the staged info", () => {
+      useStore.setState({
+        update: { phase: "ready", info: info(), progress: 100, error: null },
+      });
+
+      useStore.getState().dismissUpdateBanner();
+
+      const st = useStore.getState();
+      expect(st.update.phase).toBe("idle");
+      expect(st.update.progress).toBeNull();
+      expect(st.update.error).toBeNull();
+      // info is preserved so a later relaunch/re-check still knows the version.
+      expect(st.update.info).toEqual(info());
     });
   });
 });
