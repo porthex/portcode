@@ -14,6 +14,13 @@ use serde_json::Value;
 
 use crate::llm::{Block, ChatMessage};
 
+/// How many of the most-recent messages per session the desktop ships in a single
+/// catch-up [`SyncFrame::MessageDelta`](crate::sync::protocol::SyncFrame). Bounds
+/// the serialized delta so it fits the Noise transport's ~65 KB frame cap; anything
+/// older is fetched on demand by scroll-up pagination (`messages_page` +
+/// `RemoteCommand::FetchMessages`). See `Db::messages_tail`.
+pub const SYNC_CACHE_WINDOW: i64 = 200;
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -204,6 +211,23 @@ fn search_snippet(text: &str, needle: &str) -> Option<String> {
         out.push('…');
     }
     Some(out)
+}
+
+/// Map one `messages` row to a [`MessageRow`]. Shared by every catch-up/pagination
+/// query (`messages_since` / `messages_tail` / `messages_page`) so they decode the
+/// six columns identically. `content` is parsed leniently: corrupt JSON degrades to
+/// an empty block list rather than failing the row (same policy as
+/// `load_chat_messages`/`ui_messages`).
+fn row_to_message(r: &rusqlite::Row) -> rusqlite::Result<MessageRow> {
+    let content: String = r.get(4)?;
+    Ok(MessageRow {
+        id: r.get(0)?,
+        session_id: r.get(1)?,
+        seq: r.get(2)?,
+        role: r.get(3)?,
+        content: serde_json::from_str(&content).unwrap_or_default(),
+        created_at: r.get(5)?,
+    })
 }
 
 pub struct Db {
@@ -561,32 +585,91 @@ impl Db {
         ) else {
             return Vec::new();
         };
-        let rows = stmt.query_map(params![session_id, after_seq], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, i64>(5)?,
-            ))
-        });
+        let rows = stmt.query_map(params![session_id, after_seq], row_to_message);
         let Ok(rows) = rows else { return Vec::new() };
-        rows.filter_map(|res| res.ok())
-            .map(
-                |(id, session_id, seq, role, content, created_at)| MessageRow {
-                    id,
-                    session_id,
-                    seq,
-                    role,
-                    // Same lenient parse as load_chat_messages/ui_messages: corrupt
-                    // content degrades to an empty block list rather than dropping the
-                    // row. TODO(phase-2): surface a warning instead of swallowing it.
-                    content: serde_json::from_str(&content).unwrap_or_default(),
-                    created_at,
-                },
-            )
-            .collect()
+        rows.filter_map(|res| res.ok()).collect()
+    }
+
+    /// Append-only catch-up delta, BOUNDED to at most the last `limit` rows: every
+    /// message in `session_id` whose `seq` is **strictly greater** than `after_seq`,
+    /// keeping only the most-recent `limit` of them, returned in ascending `seq`
+    /// order. Pass `after_seq = -1` for the tail of the whole session.
+    ///
+    /// This is the bounded counterpart of [`messages_since`](Self::messages_since):
+    /// a long session would otherwise serialize its entire history into one frame,
+    /// and the Noise transport caps a frame at ~65 KB, so an unbounded delta can
+    /// fail to send. The catch-up serve path (`sync::session`) uses this with
+    /// [`SYNC_CACHE_WINDOW`] so a client always gets a recent, send-safe window;
+    /// older history is then fetched on demand via pagination ([`messages_page`]).
+    ///
+    /// SQL fetches the newest `limit` rows (`seq DESC LIMIT limit`) then reverses to
+    /// ascending in Rust, so the result is the LAST `limit` rows, not the first.
+    /// Backed by the `idx_messages_session(session_id, seq)` index. A non-positive
+    /// `limit` or an unknown session yields an empty vec (not an error).
+    pub fn messages_tail(&self, session_id: &str, after_seq: i64, limit: i64) -> Vec<MessageRow> {
+        if limit <= 0 {
+            return Vec::new();
+        }
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, session_id, seq, role, content, created_at
+             FROM messages WHERE session_id = ?1 AND seq > ?2 ORDER BY seq DESC LIMIT ?3",
+        ) else {
+            return Vec::new();
+        };
+        let rows = stmt.query_map(params![session_id, after_seq, limit], row_to_message);
+        let Ok(rows) = rows else { return Vec::new() };
+        let mut out: Vec<MessageRow> = rows.filter_map(|res| res.ok()).collect();
+        // The query returned newest-first (so LIMIT keeps the tail); reverse to the
+        // ascending seq order the wire frame expects.
+        out.reverse();
+        out
+    }
+
+    /// One page of OLDER history for scroll-up pagination: up to `limit` messages in
+    /// `session_id` whose `seq` is **strictly less** than `before_seq`, in ascending
+    /// `seq` order, plus a `has_more` flag that is true when at least one row exists
+    /// older than the returned page's oldest seq (so the client knows to offer
+    /// "load more"). Pass a `before_seq` larger than any held seq to page from the
+    /// newest end.
+    ///
+    /// Implemented by fetching `limit + 1` newest-first rows below the cursor: if
+    /// `limit + 1` came back there is an older row beyond this page (`has_more`), so
+    /// we drop the extra and report true; otherwise this is the last page. The kept
+    /// rows are reversed to ascending. A non-positive `limit` or an unknown session
+    /// yields `(empty, false)`.
+    pub fn messages_page(
+        &self,
+        session_id: &str,
+        before_seq: i64,
+        limit: i64,
+    ) -> (Vec<MessageRow>, bool) {
+        if limit <= 0 {
+            return (Vec::new(), false);
+        }
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, session_id, seq, role, content, created_at
+             FROM messages WHERE session_id = ?1 AND seq < ?2 ORDER BY seq DESC LIMIT ?3",
+        ) else {
+            return (Vec::new(), false);
+        };
+        // Fetch one extra row to detect whether older history remains beyond this page.
+        let probe = limit.saturating_add(1);
+        let rows = stmt.query_map(params![session_id, before_seq, probe], row_to_message);
+        let Ok(rows) = rows else {
+            return (Vec::new(), false);
+        };
+        let mut out: Vec<MessageRow> = rows.filter_map(|res| res.ok()).collect();
+        let has_more = out.len() as i64 > limit;
+        if has_more {
+            // Drop the probe row (the oldest of the newest-first batch) so the page is
+            // exactly `limit` rows; its existence is what `has_more` records.
+            out.truncate(limit as usize);
+        }
+        // Newest-first → ascending for the wire frame.
+        out.reverse();
+        (out, has_more)
     }
 
     /// Search message TEXT (user + assistant) for `query`, newest first, capped at
@@ -1153,6 +1236,144 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].role, "assistant");
         assert!(matches!(&rows[0].content[0], Block::Text { text } if text == "hello phone"));
+    }
+
+    // ── messages_tail: the BOUNDED catch-up window (7a) ──────────────────────
+    // Invariants: at most N rows, the MOST RECENT N (not the oldest), ascending
+    // order, per-session isolation, and unknown session → empty.
+
+    #[test]
+    fn messages_tail_caps_at_the_limit_and_keeps_the_most_recent_rows() {
+        let db = mem_db();
+        db.create_session("s", "S", None, None, 1).unwrap();
+        for i in 0..10 {
+            db.append_message("s", &text(&format!("m{i}")), 100 + i); // seq 0..9
+        }
+        // Full tail from -1, capped to the last 3 rows (seq 7, 8, 9), ascending.
+        let rows = db.messages_tail("s", -1, 3);
+        let seqs: Vec<i64> = rows.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, [7, 8, 9]);
+    }
+
+    #[test]
+    fn messages_tail_returns_all_rows_when_under_the_limit() {
+        let db = mem_db();
+        db.create_session("s", "S", None, None, 1).unwrap();
+        db.append_message("s", &text("a"), 100); // seq 0
+        db.append_message("s", &assistant("b"), 101); // seq 1
+
+        let seqs: Vec<i64> = db
+            .messages_tail("s", -1, 50)
+            .iter()
+            .map(|r| r.seq)
+            .collect();
+        assert_eq!(seqs, [0, 1]); // fewer than the limit → all, still ascending
+    }
+
+    #[test]
+    fn messages_tail_honors_the_after_seq_cursor() {
+        let db = mem_db();
+        db.create_session("s", "S", None, None, 1).unwrap();
+        for i in 0..6 {
+            db.append_message("s", &text(&format!("m{i}")), 100 + i); // seq 0..5
+        }
+        // Only rows strictly after seq 2 (3,4,5), capped to the last 2 (4,5).
+        let seqs: Vec<i64> = db.messages_tail("s", 2, 2).iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, [4, 5]);
+    }
+
+    #[test]
+    fn messages_tail_is_isolated_per_session_and_empty_for_unknown_or_nonpositive_limit() {
+        let db = mem_db();
+        db.create_session("a", "A", None, None, 1).unwrap();
+        db.create_session("b", "B", None, None, 1).unwrap();
+        db.append_message("a", &text("in a"), 2);
+        db.append_message("b", &text("in b"), 3);
+
+        assert_eq!(db.messages_tail("a", -1, 10).len(), 1);
+        assert_eq!(db.messages_tail("a", -1, 10)[0].session_id, "a");
+        // Unknown session → empty (a reconnecting client may ask about an unknown id).
+        assert!(db.messages_tail("no-such", -1, 10).is_empty());
+        // A non-positive limit yields nothing rather than an error or all rows.
+        assert!(db.messages_tail("a", -1, 0).is_empty());
+        assert!(db.messages_tail("a", -1, -5).is_empty());
+    }
+
+    // ── messages_page: scroll-up pagination (7b) ─────────────────────────────
+    // Invariants: rows strictly BEFORE the cursor, the most-recent page first call,
+    // has_more true/false at the boundaries, ascending order, unknown → empty.
+
+    #[test]
+    fn messages_page_returns_the_most_recent_page_below_the_cursor_ascending() {
+        let db = mem_db();
+        db.create_session("s", "S", None, None, 1).unwrap();
+        for i in 0..10 {
+            db.append_message("s", &text(&format!("m{i}")), 100 + i); // seq 0..9
+        }
+        // Page from above the newest seq: the last 3 rows (7,8,9) ascending, and
+        // there is older history → has_more.
+        let (rows, has_more) = db.messages_page("s", 1_000, 3);
+        let seqs: Vec<i64> = rows.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, [7, 8, 9]);
+        assert!(has_more);
+    }
+
+    #[test]
+    fn messages_page_walks_older_pages_via_the_returned_cursor() {
+        let db = mem_db();
+        db.create_session("s", "S", None, None, 1).unwrap();
+        for i in 0..5 {
+            db.append_message("s", &text(&format!("m{i}")), 100 + i); // seq 0..4
+        }
+        // First (newest) page below seq 5 → 3,4 with more behind.
+        let (p1, more1) = db.messages_page("s", 5, 2);
+        assert_eq!(p1.iter().map(|r| r.seq).collect::<Vec<_>>(), [3, 4]);
+        assert!(more1);
+        // Next page, before the oldest held seq (3) → 1,2 with more behind.
+        let (p2, more2) = db.messages_page("s", p1[0].seq, 2);
+        assert_eq!(p2.iter().map(|r| r.seq).collect::<Vec<_>>(), [1, 2]);
+        assert!(more2);
+        // Final page → just seq 0, nothing older.
+        let (p3, more3) = db.messages_page("s", p2[0].seq, 2);
+        assert_eq!(p3.iter().map(|r| r.seq).collect::<Vec<_>>(), [0]);
+        assert!(!more3);
+    }
+
+    #[test]
+    fn messages_page_has_more_is_false_when_the_page_exactly_drains_the_history() {
+        let db = mem_db();
+        db.create_session("s", "S", None, None, 1).unwrap();
+        for i in 0..3 {
+            db.append_message("s", &text(&format!("m{i}")), 100 + i); // seq 0..2
+        }
+        // A page sized exactly to the remaining rows: all of them, no more behind.
+        let (rows, has_more) = db.messages_page("s", 1_000, 3);
+        assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [0, 1, 2]);
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn messages_page_excludes_the_cursor_row_and_handles_edges() {
+        let db = mem_db();
+        db.create_session("s", "S", None, None, 1).unwrap();
+        for i in 0..4 {
+            db.append_message("s", &text(&format!("m{i}")), 100 + i); // seq 0..3
+        }
+        // before_seq is EXCLUSIVE: paging before seq 2 returns 0,1 (not 2).
+        let (rows, _) = db.messages_page("s", 2, 10);
+        assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [0, 1]);
+        // Paging before the very first seq returns nothing, no more.
+        let (none, more) = db.messages_page("s", 0, 10);
+        assert!(none.is_empty());
+        assert!(!more);
+        // Unknown session and non-positive limit both yield (empty, false).
+        // (MessageRow has no PartialEq, so assert the two fields, not the whole tuple.)
+        let (unknown_rows, unknown_more) = db.messages_page("no-such", 1_000, 10);
+        assert!(unknown_rows.is_empty());
+        assert!(!unknown_more);
+        let (zero_rows, zero_more) = db.messages_page("s", 1_000, 0);
+        assert!(zero_rows.is_empty());
+        assert!(!zero_more);
     }
 
     // ── paired_devices (Phone Sync registry) ─────────────────────────────────

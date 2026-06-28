@@ -428,6 +428,15 @@ export type RemoteCommand =
   | { cmd: "permission"; id: string; decision: string }
   | { cmd: "create_session"; title?: string | null }
   /**
+   * Request an OLDER page of a session's history for scroll-up pagination. The
+   * initial catch-up ships only the most-recent window; scrolling up past it asks
+   * the desktop for the rows STRICTLY BEFORE `before_seq` (up to `limit`). The
+   * desktop answers with a `message_page` {@link SyncFrame}. `before_seq` is the
+   * smallest `seq` the client currently holds for the session. Mirrors the Rust
+   * `RemoteCommand::FetchMessages` (snake_case fields).
+   */
+  | { cmd: "fetch_messages"; session_id: string; before_seq: number; limit: number }
+  /**
    * Register an installed-PWA Web Push subscription with the desktop (the push
    * SENDER) so it can deliver "permission needed" / "turn finished" notifications
    * (§5.7). `endpoint` is the push service URL; `p256dh`/`auth` are the
@@ -458,6 +467,12 @@ export interface MessageRow {
 export type SyncFrame =
   | { t: "session_list"; sessions: Session[] }
   | { t: "message_delta"; session_id: string; messages: MessageRow[] }
+  // An OLDER page of one session's history (scroll-up pagination), answering a
+  // `fetch_messages` command. `messages` are the rows before the requested cursor,
+  // ascending; `has_more` is true when still older history exists. PREPENDED to the
+  // held list (vs message_delta, which replaces/appends recent rows). Mirrors the
+  // Rust `SyncFrame::MessagePage` (frame fields snake_case; rows camelCase).
+  | { t: "message_page"; session_id: string; messages: MessageRow[]; has_more: boolean }
   | { t: "live"; session_id: string; event: StreamEvent }
   | { t: "command"; command: RemoteCommand }
   | { t: "ack"; session_id: string; seq: number }
