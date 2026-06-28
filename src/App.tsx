@@ -14,6 +14,7 @@ import { DisconnectedState, OfflineState } from "./components/RemoteEdgeStates";
 import { InstallGate } from "./components/InstallGate";
 import { CrashConsentPrompt } from "./components/CrashConsentPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { ChannelBadge } from "./components/ChannelBadge";
 import { isTauri, isWebClientMode, onUpdaterEvent } from "./lib/ipc";
 import { getInstallState } from "./lib/installGate";
 import { initTelemetry, shutdownTelemetry, telemetryConfigured } from "./lib/telemetry";
@@ -330,6 +331,7 @@ function TitleBar({ fileToggleRef }: { fileToggleRef?: React.Ref<HTMLButtonEleme
         </span>
       </div>
       <div className="flex shrink-0 items-center gap-2.5">
+        <ChannelBadge />
         {!isTauri() && (
           <span className="pc-pill pc-pill--warn">
             <span className="pc-dot pc-dot--warn" />
