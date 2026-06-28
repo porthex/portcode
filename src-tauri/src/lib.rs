@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use tauri::{AppHandle, Manager, State};
 
-use crate::db::{Db, DraftRow, SessionRow, UiMessage, UsageRow};
+use crate::db::{Db, DraftRow, SearchHit, SessionRow, UiMessage, UsageRow};
 use crate::settings::Settings;
 
 pub struct AppState {
@@ -295,6 +295,15 @@ fn get_usage(state: State<AppState>, session_id: String) -> UsageRow {
 #[tauri::command]
 fn get_all_usage(state: State<AppState>) -> Vec<UsageRow> {
     state.db.all_usage()
+}
+
+// ── message search (⌘K jump to a past turn) ──────────────────────────────────
+
+/// Search message text across every session, newest first. Capped server-side so
+/// a broad query can't return an unbounded result set.
+#[tauri::command]
+fn search_messages(state: State<AppState>, query: String) -> Vec<SearchHit> {
+    state.db.search_messages(&query, 50)
 }
 
 // ── workspace file tree ──────────────────────────────────────────────────────
@@ -1280,6 +1289,7 @@ pub fn run() {
         get_drafts,
         get_usage,
         get_all_usage,
+        search_messages,
         list_dir,
         run_agent,
         cancel_agent,
@@ -1319,6 +1329,7 @@ pub fn run() {
         get_drafts,
         get_usage,
         get_all_usage,
+        search_messages,
         telemetry_set_consent,
         phone_sync_status,
         phone_sync_unpair,

@@ -1,11 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "../store/store";
 import { MODELS } from "../types";
+import type { SearchHit } from "../types";
 
 interface Command {
   id: string;
   label: string;
   glyph: string;
+  /** Tailwind colour class for the glyph (brand semantics: magenta = you, cyan =
+   *  the agent). Defaults to cyan when unset. */
+  glyphClass?: string;
   hint?: string;
   run: () => void;
 }
@@ -18,9 +22,13 @@ export function CommandPalette() {
   const setShowSettings = useStore((s) => s.setShowSettings);
   const openWorkspace = useStore((s) => s.openWorkspace);
   const setSessionModel = useStore((s) => s.setSessionModel);
+  const searchMessages = useStore((s) => s.searchMessages);
+  const jumpToMessage = useStore((s) => s.jumpToMessage);
+  const sessions = useStore((s) => s.sessions);
 
   const [query, setQuery] = useState("");
   const [sel, setSel] = useState(0);
+  const [hits, setHits] = useState<SearchHit[]>([]);
 
   const commands = useMemo<Command[]>(
     () => [
@@ -49,6 +57,45 @@ export function CommandPalette() {
     if (!q) return commands;
     return commands.filter((c) => c.label.toLowerCase().includes(q));
   }, [commands, query]);
+
+  // Debounced message search: a query of 2+ chars also searches past turns. The
+  // store routes to the SQLite-backed command under Tauri and an in-memory fallback
+  // in web/preview mode, so results show in both runtimes.
+  useEffect(() => {
+    const q = query.trim();
+    if (q.length < 2) {
+      setHits([]);
+      return;
+    }
+    let cancelled = false;
+    const t = setTimeout(() => {
+      void searchMessages(q).then((res) => {
+        if (!cancelled) setHits(res);
+      });
+    }, 150);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [query, searchMessages]);
+
+  // Search hits become navigable rows below the command matches. Glyph colour honors
+  // the brand semantics — magenta = you, cyan = the agent — and the hint names the
+  // conversation the turn lives in.
+  const searchItems = useMemo<Command[]>(
+    () =>
+      hits.map((h) => ({
+        id: `hit-${h.sessionId}-${h.messageId}`,
+        label: h.snippet,
+        glyph: h.role === "user" ? "›" : "◇",
+        glyphClass: h.role === "user" ? "text-accent" : "text-accent-2",
+        hint: sessions.find((s) => s.id === h.sessionId)?.title ?? "chat",
+        run: () => void jumpToMessage(h.sessionId, h.messageId),
+      })),
+    [hits, sessions, jumpToMessage],
+  );
+  // The unified, navigable list: command matches first, then jump-to-turn results.
+  const items = useMemo(() => [...filtered, ...searchItems], [filtered, searchItems]);
 
   const selRef = useRef<HTMLButtonElement>(null);
 
@@ -104,7 +151,7 @@ export function CommandPalette() {
   };
 
   const choose = (i: number) => {
-    const cmd = filtered[i];
+    const cmd = items[i];
     if (cmd) {
       cmd.run();
       close();
@@ -114,11 +161,11 @@ export function CommandPalette() {
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      const n = filtered.length;
+      const n = items.length;
       setSel((s) => (n === 0 ? 0 : (s + 1) % n));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      const n = filtered.length;
+      const n = items.length;
       setSel((s) => (n === 0 ? 0 : (s - 1 + n) % n));
     } else if (e.key === "Enter") {
       e.preventDefault();
@@ -151,7 +198,7 @@ export function CommandPalette() {
             aria-expanded={true}
             aria-controls="pc-palette-list"
             aria-haspopup="listbox"
-            aria-activedescendant={filtered[sel] ? `pc-cmd-${filtered[sel].id}` : undefined}
+            aria-activedescendant={items[sel] ? `pc-cmd-${items[sel].id}` : undefined}
             value={query}
             onChange={(e) => {
               setQuery(e.target.value);
@@ -169,7 +216,7 @@ export function CommandPalette() {
             results vanish. Always mounted so the live region exists before its text
             changes, which AT announces more reliably than a region that appears. */}
         <span role="status" aria-live="polite" className="sr-only">
-          {filtered.length === 0 ? "No matching commands" : ""}
+          {items.length === 0 ? "No matching commands" : ""}
         </span>
         <div
           className="max-h-[min(340px,60vh)] overflow-y-auto p-1.5"
@@ -177,10 +224,10 @@ export function CommandPalette() {
           id="pc-palette-list"
           aria-label="Commands"
         >
-          {filtered.length === 0 ? (
+          {items.length === 0 ? (
             <div className="px-5 py-5 text-center text-[13px] text-faint">No matching commands</div>
           ) : (
-            filtered.map((c, i) => (
+            items.map((c, i) => (
               <button
                 key={c.id}
                 ref={i === sel ? selRef : null}
@@ -193,11 +240,13 @@ export function CommandPalette() {
                 onClick={() => choose(i)}
                 className="pc-palette-row flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-[13px] text-fg"
               >
-                <span className="flex gap-2.5">
-                  <span className="inline-flex w-5 shrink-0 justify-center font-mono text-accent-2">
+                <span className="flex min-w-0 gap-2.5">
+                  <span
+                    className={`inline-flex w-5 shrink-0 justify-center font-mono ${c.glyphClass ?? "text-accent-2"}`}
+                  >
                     {c.glyph}
                   </span>
-                  {c.label}
+                  <span className="truncate">{c.label}</span>
                 </span>
                 {c.hint && <span className="font-mono text-[10.5px] text-faint">{c.hint}</span>}
               </button>

@@ -291,6 +291,19 @@ export interface DraftEntry {
 }
 
 /**
+ * One message-search hit from `search_messages` (mirrors the Rust `SearchHit`,
+ * camelCase). Newest-first; the command palette jumps to `sessionId` and scrolls
+ * to `messageId`. `snippet` is a one-line excerpt around the match.
+ */
+export interface SearchHit {
+  sessionId: string;
+  messageId: string;
+  seq: number;
+  role: Role;
+  snippet: string;
+}
+
+/**
  * The composer's live presence phase, driven by REAL turn/stream events (never
  * padded latency). Surfaced in the `role="status"` region beside the composer:
  * - `idle`     — at rest ("ready when you are").
