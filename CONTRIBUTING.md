@@ -152,15 +152,23 @@ pnpm typecheck       # tsc --noEmit
 pnpm test            # Vitest
 ```
 
-### Rust (Tauri backend)
+### Rust (workspace)
 
-Portcode is a single Rust crate today, so target it with `--manifest-path`:
+Portcode is a Cargo workspace — the `src-tauri` desktop crate plus the shared
+`crates/portcode-sync` and `crates/portcode-wasm` crates. Run the gate from the
+repo root so it covers every member:
 
 ```powershell
-cargo fmt --manifest-path src-tauri/Cargo.toml --check
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
+
+> `portcode-sync` and `portcode-wasm` also compile to `wasm32-unknown-unknown`
+> (the browser client) under a separate **WASM** CI job — the `--workspace`
+> clippy above only sees their native build. If you change either crate, check
+> the `wasm32` build/clippy commands in
+> [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ### Testing notes
 

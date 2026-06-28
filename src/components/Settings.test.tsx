@@ -21,6 +21,8 @@ import {
 vi.mock("../lib/ipc", () => ({
   // Reached by the store's updateSettings; echoes a merged settings object.
   saveSettings: vi.fn(async (s: Partial<Settings>) => ({ ...DEFAULT_SETTINGS, ...s })),
+  // Reached by the store's checkForUpdate (manual "Check now" button); no update.
+  checkForUpdate: vi.fn(async () => null),
   // Called directly by the component when saving the API key.
   setApiKey: vi.fn(async (_key: string) => {}),
   // Resolves a folder path; present for completeness of the store's surface.
@@ -801,6 +803,123 @@ describe("SettingsPanel — appearance toggles", () => {
       "aria-pressed",
       "false",
     );
+  });
+
+  it("reflects the stored auto-update value and persists a toggle via ipc.saveSettings", async () => {
+    renderPanel({ autoUpdate: true });
+
+    const sw = screen.getByRole("switch", { name: "Automatic updates" });
+    expect(sw).toHaveAttribute("aria-checked", "true");
+
+    // The toggle routes through the store's setAutoUpdate -> updateSettings ->
+    // ipc.saveSettings with the negated value.
+    fireEvent.click(sw);
+    expect(m.saveSettings).toHaveBeenCalledWith({ autoUpdate: false });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(useStore.getState().settings.autoUpdate).toBe(false);
+  });
+
+  it("shows the auto-update switch as off when the preference is disabled", () => {
+    renderPanel({ autoUpdate: false });
+    expect(screen.getByRole("switch", { name: "Automatic updates" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+  });
+
+  it("annotates the auto-update hint with the staging channel when on staging", () => {
+    useStore.setState({ updateChannel: "staging" });
+    renderPanel({ autoUpdate: true });
+    expect(screen.getByText(/\(staging channel\)/)).toBeInTheDocument();
+  });
+
+  it("omits the staging annotation on the stable channel", () => {
+    useStore.setState({ updateChannel: "stable" });
+    renderPanel({ autoUpdate: true });
+    expect(screen.queryByText(/\(staging channel\)/)).not.toBeInTheDocument();
+  });
+
+  it("runs a manual update check when 'Check now' is clicked", async () => {
+    renderPanel({ autoUpdate: false });
+    fireEvent.click(screen.getByRole("button", { name: /check now/i }));
+    // The button routes through the store's checkForUpdate -> ipc.checkForUpdate.
+    expect(m.checkForUpdate).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await Promise.resolve();
+    });
+  });
+
+  it("shows a busy state while a manual check is in flight, then settles", async () => {
+    let finish!: () => void;
+    m.checkForUpdate.mockReturnValue(
+      new Promise<null>((resolve) => {
+        finish = () => resolve(null);
+      }),
+    );
+    renderPanel({ autoUpdate: false });
+
+    fireEvent.click(screen.getByRole("button", { name: /check now/i }));
+    // Mid-flight: the button is disabled and both it and the status read "checking".
+    const busyBtn = screen.getByRole("button", { name: /checking/i });
+    expect(busyBtn).toBeDisabled();
+    expect(screen.getByText(/checking for updates/i)).toBeInTheDocument();
+
+    await act(async () => {
+      finish();
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("button", { name: /check now/i })).toBeEnabled();
+  });
+
+  it("surfaces each update phase inline as a status line", () => {
+    const info = { version: "5.1.0", currentVersion: "5.0.0", notes: null, date: null };
+
+    useStore.setState({ update: { phase: "available", info, progress: null, error: null } });
+    const { unmount: u1 } = renderPanel();
+    expect(screen.getByText(/Update available · v5\.1\.0/)).toBeInTheDocument();
+    u1();
+
+    useStore.setState({ update: { phase: "ready", info, progress: 100, error: null } });
+    const { unmount: u2 } = renderPanel();
+    expect(screen.getByText(/relaunch to apply/i)).toBeInTheDocument();
+    u2();
+
+    useStore.setState({ update: { phase: "error", info: null, progress: null, error: "x" } });
+    renderPanel();
+    expect(screen.getByText(/last check failed/i)).toBeInTheDocument();
+  });
+
+  it("disables 'Check now' and shows progress while an update is downloading", () => {
+    useStore.setState({
+      update: { phase: "downloading", info: null, progress: 40, error: null },
+    });
+    renderPanel();
+    expect(screen.getByRole("button", { name: /check now/i })).toBeDisabled();
+    expect(screen.getByText(/downloading update/i)).toBeInTheDocument();
+  });
+
+  it("reads as up to date when idle (no update offered)", () => {
+    renderPanel();
+    expect(screen.getByText(/on the latest version/i)).toBeInTheDocument();
+  });
+
+  it("hides the Automatic updates switch and Check now button in remote mode", () => {
+    useStore.setState({ remoteMode: true });
+    renderPanel();
+
+    expect(screen.queryByRole("switch", { name: "Automatic updates" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /check now/i })).not.toBeInTheDocument();
+
+    useStore.setState({ remoteMode: false }); // don't leak into other tests
+  });
+
+  it("disables 'Check now' when an update is already staged (phase ready)", () => {
+    const info = { version: "5.1.0", currentVersion: "5.0.0", notes: null, date: null };
+    useStore.setState({ update: { phase: "ready", info, progress: 100, error: null } });
+    renderPanel();
+
+    expect(screen.getByRole("button", { name: /check now/i })).toBeDisabled();
   });
 });
 

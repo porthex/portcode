@@ -86,13 +86,13 @@ jobs:
       # AGP 8 / the Tauri Gradle plugin need JDK 17 to run (the app targets Java 8
       # bytecode, but the toolchain itself is 17).
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       # compileSdk/targetSdk = 36 (src-tauri/gen/android/app/build.gradle.kts) and
       # the NDK the Rust cross-compile links against.

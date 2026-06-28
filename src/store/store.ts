@@ -26,6 +26,8 @@ import type {
   Settings,
   StreamEvent,
   SyncFrame,
+  UpdateChannel,
+  UpdateInfo,
   Usage,
 } from "../types";
 import { CYCLE_MODES, DEFAULT_SETTINGS } from "../types";
@@ -71,6 +73,24 @@ const scopedAllowRule = (p: PendingPermission): Rule => {
   }
   return { tool: p.tool, decision: "allow" };
 };
+
+/**
+ * In-app auto-update state, driving the {@link UpdateBanner}.
+ * - `idle`       — no update offered (or the banner was dismissed).
+ * - `available`  — an update exists; awaiting the user's Install (autoUpdate off).
+ * - `downloading`— downloading + staging the update; `progress` is a 0–100 percent
+ *                  (null = indeterminate, the server reported no total).
+ * - `ready`      — downloaded + staged; awaiting a relaunch.
+ * - `error`      — the check/download failed; `error` carries the message.
+ */
+export interface UpdateState {
+  phase: "idle" | "available" | "downloading" | "ready" | "error";
+  info: UpdateInfo | null;
+  progress: number | null;
+  error: string | null;
+}
+
+const IDLE_UPDATE: UpdateState = { phase: "idle", info: null, progress: null, error: null };
 
 interface AppState {
   sessions: Session[];
@@ -159,6 +179,10 @@ interface AppState {
   remoteChatOpen: boolean; // remote: a session is open (chat view) vs. the sessions list
   online: boolean; // the device has network — remote needs it to reach the desktop
 
+  // ── Auto-update (desktop only) ────────────────────────────────────────────────
+  update: UpdateState; // in-app update flow state, drives the UpdateBanner
+  updateChannel: UpdateChannel; // which release feed this build follows
+
   init: () => Promise<void>;
   retryInit: () => Promise<void>;
   retryLoad: (id: string) => Promise<void>;
@@ -224,6 +248,16 @@ interface AppState {
   forgetRemotePairing: () => void;
   setOnline: (v: boolean) => void;
   hydrateRememberedQr: (qr: string) => void;
+
+  // ── Auto-update ───────────────────────────────────────────────────────────────
+  checkForUpdate: () => Promise<void>;
+  startUpdateDownload: () => Promise<void>;
+  applyUpdateProgress: (downloaded: number, total: number | null) => void;
+  markUpdateReady: () => void;
+  relaunchForUpdate: () => Promise<void>;
+  setAutoUpdate: (enabled: boolean) => Promise<void>;
+  loadUpdateChannel: () => Promise<void>;
+  dismissUpdateBanner: () => void;
 }
 
 // Project the active session's run onto the three mirror fields. Called in every
@@ -807,6 +841,11 @@ export const useStore = create<AppState>((set, get) => ({
   // Network presence. Seeded from the browser; App keeps it live via online/offline
   // events. Remote mode shows the offline screen when this is false.
   online: typeof navigator !== "undefined" && "onLine" in navigator ? navigator.onLine : true,
+
+  // Auto-update: starts idle (no banner) on the stable channel; App.tsx kicks off a
+  // check + channel load on a desktop mount.
+  update: IDLE_UPDATE,
+  updateChannel: "stable",
 
   async init() {
     // The phone/remote client has no local sessions DB or settings — its session
@@ -2235,6 +2274,98 @@ export const useStore = create<AppState>((set, get) => ({
   // clobbers a QR the store already has (the live/localStorage value wins).
   hydrateRememberedQr(qr) {
     if (!get().lastPairingQr) set({ lastPairingQr: qr });
+  },
+
+  // ── Auto-update ───────────────────────────────────────────────────────────────
+  // Every action is defensive: the update commands are desktop-only, so on a
+  // phone/web client (or an older core that doesn't register them) the invoke
+  // rejects. We swallow into `error` rather than throw, so a missing command never
+  // crashes the app or surfaces an unhandled rejection (callers use `void`).
+
+  async checkForUpdate() {
+    try {
+      const info = await ipc.checkForUpdate();
+      if (!info) {
+        // Already up to date — keep (or return to) the idle, banner-less state.
+        set({ update: IDLE_UPDATE });
+        return;
+      }
+      set((st) => ({ update: { ...st.update, info, error: null } }));
+      // Auto-update on → fetch + stage immediately (the banner then narrates the
+      // download). Off → just offer it and let the user press Install.
+      if (get().settings.autoUpdate) {
+        await get().startUpdateDownload();
+      } else {
+        set((st) => ({ update: { ...st.update, phase: "available", progress: null } }));
+      }
+    } catch (err) {
+      set((st) => ({ update: { ...st.update, phase: "error", error: errMessage(err) } }));
+    }
+  },
+
+  async startUpdateDownload() {
+    set((st) => ({ update: { ...st.update, phase: "downloading", progress: 0, error: null } }));
+    try {
+      const staged = await ipc.downloadAndInstallUpdate();
+      if (staged) {
+        // Resolves once downloaded AND staged. The `updater://finished` event also
+        // marks ready (whichever lands first); both converge on the same state.
+        set((st) => ({ update: { ...st.update, phase: "ready", progress: 100 } }));
+      } else {
+        // No update available (already up to date) — return to idle.
+        set({ update: IDLE_UPDATE });
+      }
+    } catch (err) {
+      set((st) => ({ update: { ...st.update, phase: "error", error: errMessage(err) } }));
+    }
+  },
+
+  // Internal setter for the `updater://progress` event: turn raw byte counts into a
+  // 0–100 percent (null when the total is unknown → indeterminate bar).
+  applyUpdateProgress(downloaded, total) {
+    const progress = total ? Math.round((downloaded / total) * 100) : null;
+    set((st) => ({ update: { ...st.update, progress } }));
+  },
+
+  // Called on the `updater://finished` event — the download is staged.
+  markUpdateReady() {
+    set((st) => ({ update: { ...st.update, phase: "ready", progress: 100 } }));
+  },
+
+  async relaunchForUpdate() {
+    try {
+      await ipc.relaunchApp();
+      // On the desktop the process restarts, so this never returns; the catch only
+      // matters on a host where the command is unavailable.
+    } catch (err) {
+      set((st) => ({ update: { ...st.update, phase: "error", error: errMessage(err) } }));
+    }
+  },
+
+  async setAutoUpdate(enabled) {
+    await get().updateSettings({ autoUpdate: enabled });
+    // Guard: if the save didn't persist (updateSettings swallows into settingsError),
+    // don't proceed with auto-download on a stale preference.
+    if (get().settings.autoUpdate !== enabled) return;
+    // Turning it on while an update is already waiting should start the download
+    // now, matching the "auto" expectation (rather than leaving it parked).
+    if (enabled && get().update.phase === "available") {
+      await get().startUpdateDownload();
+    }
+  },
+
+  async loadUpdateChannel() {
+    try {
+      set({ updateChannel: await ipc.getUpdateChannel() });
+    } catch {
+      // Command unavailable (non-desktop / older core) — keep the default channel.
+    }
+  },
+
+  // Dismiss the banner ("Later"): drop back to idle but KEEP `info` so a later
+  // re-check / relaunch still knows which version was staged.
+  dismissUpdateBanner() {
+    set((st) => ({ update: { ...IDLE_UPDATE, info: st.update.info } }));
   },
 }));
 

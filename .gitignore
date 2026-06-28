@@ -82,3 +82,8 @@ graphify-out/
 .claude-flow/
 ruvector.db
 ruvector.db-*
+# `memory init` also syncs a copy of the shared memory DB into the committed .claude/
+# dir — NEVER commit it (this repo is public). Ignore only the db files; the rest of
+# .claude/ (CLAUDE.md, skills, settings, memory/) stays committed.
+.claude/**/*.db
+.claude/**/*.db-*

@@ -17,6 +17,8 @@ import type {
   Settings,
   StreamEvent,
   SyncFrame,
+  UpdateChannel,
+  UpdateInfo,
 } from "../types";
 import {
   webOnPhoneSyncDisconnected,
@@ -121,6 +123,85 @@ export async function oauthLogout(): Promise<void> {
     return;
   }
   return mock.oauthLogout();
+}
+
+// ── Auto-update (desktop only) ─────────────────────────────────────────────────
+// All four commands are desktop-only — they don't exist on the phone/web client.
+// The mock keeps them inert (no update offered) so the browser preview never pops a
+// spurious banner, and a missing command on a non-desktop host is a harmless no-op.
+
+/** Check the release feed for a newer build. Resolves the {@link UpdateInfo} when
+ *  one is available, or null when the running build is already the latest. */
+export async function checkForUpdate(): Promise<UpdateInfo | null> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<UpdateInfo | null>("update_check");
+  }
+  return mock.checkForUpdate();
+}
+
+/** Download AND stage the pending update for install. Emits `updater://progress`
+ *  while downloading and `updater://finished` once staged; resolves `true` when
+ *  an update was downloaded and staged (awaiting a relaunch), or `false` when
+ *  there was no update to install (already up to date). */
+export async function downloadAndInstallUpdate(): Promise<boolean> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<boolean>("update_download_and_install");
+  }
+  return mock.downloadAndInstallUpdate();
+}
+
+/** Relaunch the process to apply a staged update. The process restarts, so this
+ *  promise effectively never resolves on the desktop. */
+export async function relaunchApp(): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("update_relaunch");
+    return;
+  }
+  return mock.relaunchApp();
+}
+
+/** Which release feed this build follows (`stable` / `staging`). */
+export async function getUpdateChannel(): Promise<UpdateChannel> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<UpdateChannel>("update_channel");
+  }
+  return mock.getUpdateChannel();
+}
+
+/** Payload of the `updater://progress` event: bytes downloaded so far and the
+ *  total (null while the server hasn't reported a content length). */
+export interface UpdaterProgress {
+  downloaded: number;
+  total: number | null;
+}
+
+/** Subscribe to the updater's progress + finished events (desktop only). The
+ *  handler is called with `{ kind: "progress", ... }` for each chunk and once with
+ *  `{ kind: "finished" }` when the download is staged. Returns an unlisten cleanup
+ *  fn; in the browser/non-Tauri host it's an inert no-op. */
+export async function onUpdaterEvent(
+  handler: (
+    e: { kind: "progress"; downloaded: number; total: number | null } | { kind: "finished" },
+  ) => void,
+): Promise<Unlisten> {
+  if (isTauri()) {
+    const { event } = await tauri();
+    const offProgress = await event.listen<UpdaterProgress>("updater://progress", (ev) =>
+      handler({ kind: "progress", downloaded: ev.payload.downloaded, total: ev.payload.total }),
+    );
+    const offFinished = await event.listen<null>("updater://finished", () =>
+      handler({ kind: "finished" }),
+    );
+    return () => {
+      offProgress();
+      offFinished();
+    };
+  }
+  return mock.onUpdaterEvent(handler);
 }
 
 // ── Phone Sync ────────────────────────────────────────────────────────────────
@@ -511,6 +592,7 @@ const mock = (() => {
     typingAnimation: true,
     permissionMode: "default",
     rules: [],
+    autoUpdate: true,
   };
 
   // Fake subscription-auth state so the sign-in UX is testable without Tauri.
@@ -551,6 +633,28 @@ const mock = (() => {
     },
     async oauthLogout() {
       oauth = { signedIn: false, expiresAt: null, account: null, tier: null };
+    },
+    // Auto-update — inert in the preview: never offer an update, never relaunch,
+    // never emit progress/finished. The desktop preview shows no update banner.
+    async checkForUpdate(): Promise<UpdateInfo | null> {
+      return null;
+    },
+    async downloadAndInstallUpdate(): Promise<boolean> {
+      // no update in the browser preview — return false (nothing staged).
+      return false;
+    },
+    async relaunchApp() {
+      // no-op: the preview can't relaunch the (nonexistent) native process.
+    },
+    async getUpdateChannel(): Promise<UpdateChannel> {
+      return "stable";
+    },
+    async onUpdaterEvent(
+      _handler: (
+        e: { kind: "progress"; downloaded: number; total: number | null } | { kind: "finished" },
+      ) => void,
+    ): Promise<Unlisten> {
+      return () => {}; // inert: the preview never downloads an update.
     },
     async phoneSyncStatus() {
       return { ...phoneSyncState, paired: [...phoneSyncState.paired] };

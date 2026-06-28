@@ -101,6 +101,11 @@ vi.mock("./lib/ipc", () => ({
   phoneSyncDisconnect: vi.fn(),
   // store.init() (desktop) subscribes to inbound pairing-confirm requests.
   onPhoneSyncPairingRequest: vi.fn(),
+  // Auto-update: App's desktop-only mount effect subscribes to updater events and
+  // kicks off a channel load + check. Only reached when isTauri() is true.
+  onUpdaterEvent: vi.fn(),
+  getUpdateChannel: vi.fn(),
+  checkForUpdate: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -132,6 +137,11 @@ beforeEach(() => {
     reason: "not-ios-ok",
     guidance: "",
   });
+  // Auto-update mocks: harmless resolved values so the desktop mount effect (when
+  // isTauri() is true) settles without touching a real updater.
+  m.onUpdaterEvent.mockResolvedValue(() => {});
+  m.getUpdateChannel.mockResolvedValue("stable");
+  m.checkForUpdate.mockResolvedValue(null);
 });
 
 describe("App layout", () => {
