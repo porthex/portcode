@@ -51,7 +51,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Subscription OAuth (PKCE S256). All safe Rust. The OAuth constants and flow in
 # `src/oauth.rs` are credited to opencode (MIT) and the official Claude Code CLI.
-sha2 = "0.10"
+sha2 = "0.11"
 base64 = "0.22"
 rand = "0.8"
 
