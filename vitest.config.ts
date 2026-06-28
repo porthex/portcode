@@ -9,6 +9,12 @@ export default defineConfig({
     setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
     css: false,
+    // Headroom over the default 5000ms so the 5000ms async-utils timeout
+    // (see src/test/setup.ts) surfaces a clean Testing Library "Unable to find …"
+    // error instead of colliding with the per-test timeout under heavy
+    // windows-latest CI load. Passing tests never approach this; it only governs
+    // how long a failing/slow test waits before giving up.
+    testTimeout: 15000,
     coverage: {
       provider: "v8",
       // Instrument every source file, not just the ones a test imports, so

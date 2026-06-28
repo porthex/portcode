@@ -452,8 +452,12 @@ describe("FileExplorer accessibility", () => {
     ]);
 
     render(<FileExplorer />);
-    const tree = await screen.findByRole("tree");
-    const a = screen.getByRole("treeitem", { name: "a.ts" });
+    // The tree container renders immediately (even while empty), so awaiting it
+    // does NOT wait for the async listDir that mounts the rows. Await an actual
+    // row first; a/b/c arrive together in one setRoots, so once "a.ts" exists the
+    // synchronous lookups for "b.ts"/"c.ts" can't race the pending fetch.
+    const a = await screen.findByRole("treeitem", { name: "a.ts" });
+    const tree = screen.getByRole("tree");
     const b = screen.getByRole("treeitem", { name: "b.ts" });
     const c = screen.getByRole("treeitem", { name: "c.ts" });
 
@@ -484,8 +488,10 @@ describe("FileExplorer accessibility", () => {
       .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx", isDir: false })]);
 
     render(<FileExplorer />);
-    const tree = await screen.findByRole("tree");
-    const dir = screen.getByRole("treeitem", { name: "src folder" });
+    // Await the row, not the always-present tree container, so this lookup can't
+    // race the async listDir that mounts the rows.
+    const dir = await screen.findByRole("treeitem", { name: "src folder" });
+    const tree = screen.getByRole("tree");
 
     dir.focus();
     // ArrowRight on a collapsed dir expands it (fetching children).
@@ -514,8 +520,10 @@ describe("FileExplorer accessibility", () => {
       .mockResolvedValueOnce([entry({ name: "App.tsx", path: "src/App.tsx", isDir: false })]);
 
     render(<FileExplorer />);
-    const tree = await screen.findByRole("tree");
-    const dir = screen.getByRole("treeitem", { name: "src folder" });
+    // Await the row, not the always-present tree container, so this lookup can't
+    // race the async listDir that mounts the rows.
+    const dir = await screen.findByRole("treeitem", { name: "src folder" });
+    const tree = screen.getByRole("tree");
 
     // Expand (mounts the child), then collapse (child stays mounted, aria-hidden).
     dir.focus();
