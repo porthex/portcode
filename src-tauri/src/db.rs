@@ -100,6 +100,19 @@ pub struct UsageRow {
     pub output: i64,
 }
 
+/// One message-search hit (newest-first). camelCase to match the frontend
+/// `SearchHit`. `seq` is the message's monotonic position in its session; the UI
+/// jumps to `session_id` and scrolls to `message_id`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub session_id: String,
+    pub message_id: String,
+    pub seq: i64,
+    pub role: String,
+    pub snippet: String,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum UiBlock {
@@ -147,6 +160,50 @@ fn to_ui_block(b: &Block) -> UiBlock {
             is_error: *is_error,
         },
     }
+}
+
+/// Escape LIKE wildcards so a literal query matches literally under
+/// `... LIKE ? ESCAPE '\'` (otherwise a `%` or `_` in the query would widen it).
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for ch in s.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// A one-line excerpt of `text` around the first ASCII-case-insensitive match of
+/// `needle` (which the caller has already ASCII-lowercased). Returns `None` when
+/// `text` doesn't actually contain the needle — this is what drops LIKE matches
+/// that only hit serialized JSON structure rather than real conversation text.
+fn search_snippet(text: &str, needle: &str) -> Option<String> {
+    // Collapse whitespace so a multi-line message reads as a single preview line.
+    let normalized: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // ASCII-lowercase preserves the byte layout, so an offset found in `hay` is a
+    // valid index into `normalized` too (no multibyte-slice panic risk).
+    let hay = normalized.to_ascii_lowercase();
+    let pos = hay.find(needle)?;
+    let match_end = pos + needle.len();
+    let mut start = pos.saturating_sub(40);
+    while start > 0 && !normalized.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (match_end + 100).min(normalized.len());
+    while end < normalized.len() && !normalized.is_char_boundary(end) {
+        end += 1;
+    }
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.push_str(&normalized[start..end]);
+    if end < normalized.len() {
+        out.push('…');
+    }
+    Some(out)
 }
 
 pub struct Db {
@@ -532,6 +589,65 @@ impl Db {
             .collect()
     }
 
+    /// Search message TEXT (user + assistant) for `query`, newest first, capped at
+    /// `limit` hits. A LIKE pre-filter bounds the scan; each candidate's real block
+    /// text is then extracted and re-checked so structural JSON matches (field names,
+    /// tool I/O) never surface. ASCII-case-insensitive. A DB error degrades to an
+    /// empty list rather than an error — search is best-effort, never a hard failure.
+    pub fn search_messages(&self, query: &str, limit: usize) -> Vec<SearchHit> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let needle = trimmed.to_ascii_lowercase();
+        let like = format!("%{}%", escape_like(trimmed));
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, session_id, seq, role, content FROM messages
+             WHERE content LIKE ?1 ESCAPE '\\'
+             ORDER BY created_at DESC, seq DESC",
+        ) else {
+            return Vec::new();
+        };
+        let rows = stmt.query_map(params![like], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        });
+        let Ok(rows) = rows else { return Vec::new() };
+        let mut hits = Vec::new();
+        for (id, session_id, seq, role, content) in rows.filter_map(|r| r.ok()) {
+            // Only real conversation text is searchable — tool I/O is excluded so a
+            // file dump or command output can't drown the results in noise.
+            let blocks: Vec<Block> = serde_json::from_str(&content).unwrap_or_default();
+            let text = blocks
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if let Some(snippet) = search_snippet(&text, &needle) {
+                hits.push(SearchHit {
+                    session_id,
+                    message_id: id,
+                    seq,
+                    role,
+                    snippet,
+                });
+                if hits.len() >= limit {
+                    break;
+                }
+            }
+        }
+        hits
+    }
+
     // ── paired devices (Phone Sync) ──────────────────────────────────────────
 
     /// Record a paired device (or refresh an existing one's name/last_seen). The
@@ -812,6 +928,81 @@ mod tests {
         db.delete_session("a").unwrap();
         assert!(db.list_sessions().unwrap().is_empty());
         assert!(db.load_chat_messages("a").is_empty());
+    }
+
+    #[test]
+    fn search_messages_finds_text_newest_first_with_snippets() {
+        let db = mem_db();
+        db.create_session("a", "A", None, None, 1).unwrap();
+        db.create_session("b", "B", None, None, 1).unwrap();
+        db.append_message("a", &text("let's refactor the parser today"), 10);
+        db.append_message("b", &assistant("the PARSER lives in llm.rs"), 20);
+
+        let hits = db.search_messages("parser", 50);
+        assert_eq!(hits.len(), 2);
+        // created_at DESC: "b" (ts 20) precedes "a" (ts 10).
+        assert_eq!(hits[0].session_id, "b");
+        assert_eq!(hits[0].role, "assistant");
+        assert_eq!(hits[1].session_id, "a");
+        // ASCII-case-insensitive, and the snippet carries the matched text.
+        assert!(hits[0].snippet.to_lowercase().contains("parser"));
+    }
+
+    #[test]
+    fn search_messages_ignores_tool_io_and_structural_json() {
+        let db = mem_db();
+        db.create_session("a", "A", None, None, 1).unwrap();
+        // Only real conversation TEXT is searchable: a tool call's name, its input,
+        // and its output must NOT match, and the serialized block tag ("tool_use")
+        // must not register as a hit even though it's present in the stored JSON.
+        db.append_message(
+            "a",
+            &ChatMessage {
+                role: "assistant".into(),
+                content: vec![
+                    Block::ToolUse {
+                        id: "t1".into(),
+                        name: "grep".into(),
+                        input: json!({ "pattern": "needle_in_tool" }),
+                    },
+                    Block::ToolResult {
+                        tool_use_id: "t1".into(),
+                        content: "secret_output_token".into(),
+                        is_error: false,
+                    },
+                ],
+            },
+            5,
+        );
+        assert!(db.search_messages("needle_in_tool", 50).is_empty());
+        assert!(db.search_messages("secret_output_token", 50).is_empty());
+        assert!(db.search_messages("tool_use", 50).is_empty());
+    }
+
+    #[test]
+    fn search_messages_respects_limit_and_empty_query() {
+        let db = mem_db();
+        db.create_session("a", "A", None, None, 1).unwrap();
+        for i in 0..5_i64 {
+            db.append_message("a", &text(&format!("match number {i}")), 10 + i);
+        }
+        assert_eq!(db.search_messages("match", 3).len(), 3);
+        assert!(db.search_messages("   ", 50).is_empty());
+        assert!(db.search_messages("match", 0).is_empty());
+        assert!(db.search_messages("no_such_term", 50).is_empty());
+    }
+
+    #[test]
+    fn search_messages_treats_like_wildcards_literally() {
+        let db = mem_db();
+        db.create_session("a", "A", None, None, 1).unwrap();
+        db.append_message("a", &text("progress is 50% done"), 10);
+        db.append_message("a", &text("a plain sentence"), 11);
+        // The "%" is a literal here, not a LIKE wildcard — only the first message hits.
+        let hits = db.search_messages("50%", 50);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].seq, 0);
+        assert!(hits[0].snippet.contains("50%"));
     }
 
     #[test]
