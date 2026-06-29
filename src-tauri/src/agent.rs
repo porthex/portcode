@@ -973,9 +973,7 @@ fn subagent_label(description: &str, prompt: &str) -> String {
     }
 
     // Strip a leading Markdown bullet or heading marker (e.g. "- ", "# ", "## ").
-    let stripped = first
-        .trim_start_matches(|c: char| c == '#' || c == '-' || c == '*' || c == '>')
-        .trim_start();
+    let stripped = first.trim_start_matches(['#', '-', '*', '>']).trim_start();
     let text = if stripped.is_empty() { first } else { stripped };
 
     // Collapse internal whitespace into single spaces.
