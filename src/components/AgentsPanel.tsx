@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { useStore } from "../store/store";
 import type { AgentInfo, AgentStatus } from "../types";
 
@@ -10,34 +11,63 @@ import type { AgentInfo, AgentStatus } from "../types";
  * running — a Stop button that cancels just that subagent (and its descendants),
  * leaving the rest of the turn alone. Renders nothing when the active session has
  * no subagents, so it costs nothing on an ordinary turn.
+ *
+ * The panel is collapsible (accordion, grid 0fr→1fr) so it doesn't push the
+ * composer down when many subagents are active. It auto-opens whenever any agent
+ * is running and can be collapsed manually by the user.
  */
 export function AgentsPanel() {
   const agents = useStore((s) => (s.activeId ? s.agents[s.activeId] : undefined));
   const cancelAgent = useStore((s) => s.cancelAgent);
 
-  if (!agents || agents.length === 0) return null;
+  const [open, setOpen] = useState(false);
 
-  const running = agents.filter((a) => a.status === "running").length;
+  const running = agents ? agents.filter((a) => a.status === "running").length : 0;
+
+  // Auto-open when subagents start running; leave user's choice alone when all
+  // are terminal.
+  useEffect(() => {
+    if (running > 0) setOpen(true);
+  }, [running]);
+
+  if (!agents || agents.length === 0) return null;
 
   return (
     <section
       aria-label="Subagents"
       className="mx-3 mb-2 overflow-hidden rounded-md border border-border bg-panel"
     >
-      <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 text-[11px] uppercase tracking-wide text-faint">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 border-b border-border px-3 py-1.5 text-[11px] uppercase tracking-wide text-faint transition-colors hover:text-fg motion-reduce:transition-none"
+      >
         <span
           className={`pc-dot ${running > 0 ? "pc-dot--ring" : "pc-dot--success"}`}
           aria-hidden="true"
         />
-        {running > 0
-          ? `${running} subagent${running === 1 ? "" : "s"} running`
-          : `${agents.length} subagent${agents.length === 1 ? "" : "s"}`}
+        <span className="flex-1 text-left">
+          {running > 0
+            ? `${running} subagent${running === 1 ? "" : "s"} running`
+            : `${agents.length} subagent${agents.length === 1 ? "" : "s"}`}
+        </span>
+        <span aria-hidden="true">{open ? "▾" : "▸"}</span>
+      </button>
+      {/* Smooth expand/collapse via a grid 0fr->1fr accordion (the overflow-hidden
+          child can shrink to 0). The ul stays mounted so it animates both ways. */}
+      <div
+        className="grid transition-[grid-template-rows] duration-200 ease-out motion-reduce:transition-none"
+        style={{ gridTemplateRows: open ? "1fr" : "0fr" }}
+      >
+        <div className="overflow-hidden">
+          <ul className="max-h-40 overflow-auto" aria-hidden={!open}>
+            {agents.map((a) => (
+              <AgentRow key={a.id} agent={a} onStop={() => void cancelAgent(a.id)} />
+            ))}
+          </ul>
+        </div>
       </div>
-      <ul className="max-h-40 overflow-auto">
-        {agents.map((a) => (
-          <AgentRow key={a.id} agent={a} onStop={() => void cancelAgent(a.id)} />
-        ))}
-      </ul>
     </section>
   );
 }

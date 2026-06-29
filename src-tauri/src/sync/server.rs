@@ -42,6 +42,12 @@ pub struct DesktopCommandHandler {
     pub oauth_refresh: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// Upper bound on how many rows a single `FetchMessages` page may request. Clamps
+/// a phone-supplied `limit` so one pagination request can't be coerced into
+/// serializing a huge page that blows the Noise frame cap (~65 KB) — the same
+/// reason catch-up is windowed. Matches the catch-up window order of magnitude.
+const MAX_PAGE_LIMIT: i64 = 200;
+
 /// Map a phone-supplied permission decision string to a [`Decision`], validated
 /// against an explicit allowlist. Only "allow"/"deny" are meaningful; ANY other
 /// value (typo, future variant, hostile input from a confirmed-but-misbehaving
@@ -154,6 +160,28 @@ impl CommandHandler for DesktopCommandHandler {
                             eprintln!("phone-sync: list_sessions after create failed: {e}");
                         }
                     }
+                }
+                Ok(())
+            }
+            // Scroll-up pagination: fetch an OLDER page of a session's history and
+            // publish it back as a `MessagePage`. The initial catch-up ships only the
+            // recent window (`messages_tail`), so a client scrolling up past it asks
+            // for the rows before its smallest held seq. `limit` is clamped to
+            // `MAX_PAGE_LIMIT` so a request can't force an over-sized frame. Best-
+            // effort fan-out like `CreateSession` (a no-op when no client is attached).
+            RemoteCommand::FetchMessages {
+                session_id,
+                before_seq,
+                limit,
+            } => {
+                let limit = (limit as i64).clamp(1, MAX_PAGE_LIMIT);
+                let (messages, has_more) = self.db.messages_page(&session_id, before_seq, limit);
+                if let Some(hub) = self.app.try_state::<SyncHub>() {
+                    hub.publish_frame(SyncFrame::MessagePage {
+                        session_id,
+                        messages,
+                        has_more,
+                    });
                 }
                 Ok(())
             }

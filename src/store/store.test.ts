@@ -2254,6 +2254,145 @@ describe("remote client", () => {
       expect(st.remoteRejected).toBe(true);
       expect(st.remoteRejectReason).toBeNull();
     });
+
+    it("message_delta seeds pagination (hasMore + oldestSeq) from the window", () => {
+      // The catch-up window starts at seq 5 (older history exists), so the smallest
+      // held seq is the page cursor and hasMore is true.
+      useStore.getState().applyFrame({
+        t: "message_delta",
+        session_id: "s1",
+        messages: [row({ id: "r5", seq: 5 }), row({ id: "r6", seq: 6 })],
+      });
+      expect(useStore.getState().messagePaging.s1).toEqual({
+        hasMore: true,
+        loading: false,
+        oldestSeq: 5,
+      });
+    });
+
+    it("message_delta with the first message (seq 0) reports no more history", () => {
+      useStore.getState().applyFrame({
+        t: "message_delta",
+        session_id: "s1",
+        messages: [row({ id: "r0", seq: 0 }), row({ id: "r1", seq: 1 })],
+      });
+      expect(useStore.getState().messagePaging.s1.hasMore).toBe(false);
+      expect(useStore.getState().messagePaging.s1.oldestSeq).toBe(0);
+    });
+
+    it("message_page PREPENDS older rows (doesn't replace), keeps ascending order", () => {
+      // Hold the recent window (seq 5,6); a page brings seq 3,4 to PREPEND.
+      useStore.setState({
+        messages: {
+          s1: [
+            { id: "r5", role: "user", blocks: [{ kind: "text", text: "five" }], createdAt: 5 },
+            { id: "r6", role: "user", blocks: [{ kind: "text", text: "six" }], createdAt: 6 },
+          ],
+        },
+        messagePaging: { s1: { hasMore: true, loading: true, oldestSeq: 5 } },
+      });
+
+      useStore.getState().applyFrame({
+        t: "message_page",
+        session_id: "s1",
+        messages: [row({ id: "r3", seq: 3 }), row({ id: "r4", seq: 4 })],
+        has_more: true,
+      });
+
+      const ids = useStore.getState().messages.s1.map((m) => m.id);
+      expect(ids).toEqual(["r3", "r4", "r5", "r6"]); // prepended, ascending
+      const paging = useStore.getState().messagePaging.s1;
+      expect(paging.hasMore).toBe(true);
+      expect(paging.loading).toBe(false); // the page clears the loading guard
+      expect(paging.oldestSeq).toBe(3); // cursor advanced to the new oldest
+    });
+
+    it("message_page dedupes rows already held (no duplicates) and sets hasMore false at the start", () => {
+      useStore.setState({
+        messages: {
+          s1: [{ id: "r2", role: "user", blocks: [{ kind: "text", text: "two" }], createdAt: 2 }],
+        },
+        messagePaging: { s1: { hasMore: true, loading: true, oldestSeq: 2 } },
+      });
+
+      // The page overlaps r2 (already held) and adds r0,r1; has_more=false (start).
+      useStore.getState().applyFrame({
+        t: "message_page",
+        session_id: "s1",
+        messages: [row({ id: "r0", seq: 0 }), row({ id: "r1", seq: 1 }), row({ id: "r2", seq: 2 })],
+        has_more: false,
+      });
+
+      const ids = useStore.getState().messages.s1.map((m) => m.id);
+      expect(ids).toEqual(["r0", "r1", "r2"]); // r2 not duplicated
+      expect(useStore.getState().messagePaging.s1.hasMore).toBe(false);
+      expect(useStore.getState().messagePaging.s1.oldestSeq).toBe(0);
+    });
+  });
+
+  describe("loadOlderMessages", () => {
+    const setPaged = (over: Partial<{ hasMore: boolean; loading: boolean; oldestSeq: number }>) =>
+      useStore.setState({
+        remoteConnected: true,
+        activeId: "s1",
+        messagePaging: { s1: { hasMore: true, loading: false, oldestSeq: 5, ...over } },
+      });
+
+    it("sends fetch_messages with the smallest held seq and flips loading true", async () => {
+      setPaged({ oldestSeq: 5 });
+
+      await useStore.getState().loadOlderMessages("s1");
+
+      expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({
+        cmd: "fetch_messages",
+        session_id: "s1",
+        before_seq: 5,
+        limit: 100,
+      });
+      expect(useStore.getState().messagePaging.s1.loading).toBe(true);
+    });
+
+    it("does nothing when not remote-connected", async () => {
+      setPaged({ oldestSeq: 5 });
+      useStore.setState({ remoteConnected: false });
+
+      await useStore.getState().loadOlderMessages("s1");
+
+      expect(m.phoneSyncSendCommand).not.toHaveBeenCalled();
+    });
+
+    it("does nothing when there is no more history (hasMore false)", async () => {
+      setPaged({ hasMore: false });
+
+      await useStore.getState().loadOlderMessages("s1");
+
+      expect(m.phoneSyncSendCommand).not.toHaveBeenCalled();
+    });
+
+    it("does nothing when a fetch is already loading", async () => {
+      setPaged({ loading: true });
+
+      await useStore.getState().loadOlderMessages("s1");
+
+      expect(m.phoneSyncSendCommand).not.toHaveBeenCalled();
+    });
+
+    it("does nothing when pagination is unseeded for the session", async () => {
+      useStore.setState({ remoteConnected: true, activeId: "s1", messagePaging: {} });
+
+      await useStore.getState().loadOlderMessages("s1");
+
+      expect(m.phoneSyncSendCommand).not.toHaveBeenCalled();
+    });
+
+    it("does not request before seq 0 (the first message) — marks hasMore false instead", async () => {
+      setPaged({ oldestSeq: 0 });
+
+      await useStore.getState().loadOlderMessages("s1");
+
+      expect(m.phoneSyncSendCommand).not.toHaveBeenCalled();
+      expect(useStore.getState().messagePaging.s1.hasMore).toBe(false);
+    });
   });
 
   describe("live stream reducer", () => {

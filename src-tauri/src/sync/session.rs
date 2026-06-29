@@ -9,9 +9,12 @@
 //! What stays here: [`serve_catch_up`], the DESKTOP side of the catch-up exchange,
 //! because it reads from `crate::db::Db` (the SQLite store), which is desktop-only
 //! and not part of the wasm client. It answers a phone's `Hello` with the current
-//! `SessionList` then one `MessageDelta` per requested cursor.
+//! `SessionList` then one bounded `MessageDelta` per session (see
+//! [`serve_catch_up_with_cursors`] for how cursors scope each session's delta).
 
-use crate::db::Db;
+use std::collections::HashMap;
+
+use crate::db::{Db, SYNC_CACHE_WINDOW};
 use crate::sync::protocol::{Cursor, SyncFrame};
 
 // Re-export the shared session surface so every existing `crate::sync::session::…`
@@ -26,16 +29,8 @@ pub use portcode_sync::session::{
 };
 
 /// Desktop side: answer a phone's catch-up request. Reads the phone's `Hello`,
-/// sends the current session list, then one `MessageDelta` per requested cursor
-/// (only the rows newer than that cursor's `seq`).
-///
-/// A cursor list is the phone's per-session high-water marks, so it gets deltas
-/// only for sessions it already knows about. A session that appears in the
-/// `SessionList` but has no cursor (e.g. created while the phone was away) is
-/// picked up by a follow-up catch-up once the phone has seen the new id. Note
-/// `messages_since` degrades a DB read error to an empty delta (see `db.rs`), so a
-/// transient read failure for one session looks like "up to date" rather than an
-/// error on this path; a `list_sessions` failure, by contrast, is propagated.
+/// sends the current session list, then one `MessageDelta` for EVERY session (see
+/// [`serve_catch_up_with_cursors`]).
 pub async fn serve_catch_up<C: FrameChannel + ?Sized>(
     channel: &mut C,
     db: &Db,
@@ -48,7 +43,25 @@ pub async fn serve_catch_up<C: FrameChannel + ?Sized>(
 }
 
 /// Desktop side: the catch-up REPLY, given the phone's cursors already read from
-/// its `Hello`. Sends the current `SessionList` then one `MessageDelta` per cursor.
+/// its `Hello`. Sends the current `SessionList`, then one `MessageDelta` for EVERY
+/// session in that list (not just the cursor-listed ones).
+///
+/// The cursors are the client's per-session high-water marks: for a session it
+/// already holds, we send only the rows newer than its cursor; for a session it has
+/// NO cursor for — a fresh web client that sent an empty `Hello`, or a phone that
+/// missed a session created while it was away — we send the full tail (`seq > -1`).
+/// Either way the delta is BOUNDED to the last [`SYNC_CACHE_WINDOW`] rows via
+/// `Db::messages_tail`, so it can't blow the Noise frame cap; older history is
+/// fetched on demand by scroll-up pagination (`RemoteCommand::FetchMessages`). An
+/// up-to-date cursor still yields an empty delta (unchanged behavior).
+///
+/// This is what makes desktop chat history appear on a web client: the wasm client
+/// sends `Hello { cursors: [] }`, so the old per-cursor loop sent ZERO deltas and
+/// no history; iterating sessions instead delivers each one's recent window.
+///
+/// `messages_tail` degrades a DB read error to an empty delta (see `db.rs`), so a
+/// transient read failure for one session looks like "up to date" rather than an
+/// error on this path; a `list_sessions` failure, by contrast, is propagated.
 ///
 /// Split out from [`serve_catch_up`] for the first-pairing path: there the desktop
 /// reads the phone's early `Hello` itself (while watching the pre-trust channel for
@@ -59,17 +72,26 @@ pub async fn serve_catch_up_with_cursors<C: FrameChannel + ?Sized>(
     db: &Db,
     cursors: Vec<Cursor>,
 ) -> Result<(), String> {
+    let sessions = db.list_sessions().map_err(|e| e.to_string())?;
+
+    // The client's per-session high-water marks, for the sessions it already holds.
+    let cursor_seqs: HashMap<String, i64> =
+        cursors.into_iter().map(|c| (c.session_id, c.seq)).collect();
+
     channel
         .send(&SyncFrame::SessionList {
-            sessions: db.list_sessions().map_err(|e| e.to_string())?,
+            sessions: sessions.clone(),
         })
         .await?;
 
-    for cursor in cursors {
-        let messages = db.messages_since(&cursor.session_id, cursor.seq);
+    // One bounded delta PER session. Use the client's cursor seq when it has one,
+    // else -1 (full tail) for a session it has never seen.
+    for session in &sessions {
+        let after_seq = cursor_seqs.get(&session.id).copied().unwrap_or(-1);
+        let messages = db.messages_tail(&session.id, after_seq, SYNC_CACHE_WINDOW);
         channel
             .send(&SyncFrame::MessageDelta {
-                session_id: cursor.session_id,
+                session_id: session.id.clone(),
                 messages,
             })
             .await?;
@@ -234,5 +256,145 @@ mod tests {
             },
         );
         serve_res.unwrap();
+    }
+
+    /// Read the catch-up reply directly off the phone end: a `SessionList` followed
+    /// by exactly `expect_sessions` `MessageDelta` frames (one per session), returned
+    /// as `(session_id, messages)` pairs. Used for the empty-cursor path, where
+    /// `request_catch_up` would read zero deltas (it reads one per cursor).
+    async fn read_catch_up(
+        phone: &mut MemChannel,
+        expect_sessions: usize,
+    ) -> (
+        Vec<crate::db::SessionRow>,
+        Vec<(String, Vec<crate::db::MessageRow>)>,
+    ) {
+        let sessions = match phone.recv().await.unwrap() {
+            SyncFrame::SessionList { sessions } => sessions,
+            other => panic!("expected SessionList, got {other:?}"),
+        };
+        let mut deltas = Vec::with_capacity(expect_sessions);
+        for _ in 0..expect_sessions {
+            match phone.recv().await.unwrap() {
+                SyncFrame::MessageDelta {
+                    session_id,
+                    messages,
+                } => deltas.push((session_id, messages)),
+                other => panic!("expected MessageDelta, got {other:?}"),
+            }
+        }
+        (sessions, deltas)
+    }
+
+    #[tokio::test]
+    async fn empty_cursors_still_deliver_full_history_for_every_session() {
+        // The web-client path: the wasm client connects with EMPTY cursors. The old
+        // per-cursor loop sent zero deltas (so no desktop history ever reached the
+        // browser); now every session gets its full-tail delta regardless of cursors.
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        db.create_session("s1", "Alpha", None, None, 100).unwrap();
+        db.append_message("s1", &user("a1"), 101); // seq 0
+        db.append_message("s1", &user("a2"), 102); // seq 1
+        db.create_session("s2", "Beta", None, None, 200).unwrap();
+        db.append_message("s2", &user("b1"), 201); // seq 0
+
+        let (mut desktop, mut phone) = mem_pair();
+        // Empty cursors, exactly what the wasm `Session::connect` sends. Sent up
+        // front (the channel is unbounded, so it buffers) so `serve_catch_up` can
+        // read it while we read its reply off `phone` — both on the one `phone` half.
+        phone
+            .send(&SyncFrame::Hello {
+                device_id: "web".into(),
+                cursors: vec![],
+            })
+            .await
+            .unwrap();
+        let (serve_res, (sessions, deltas)) = tokio::join!(
+            serve_catch_up(&mut desktop, &db),
+            read_catch_up(&mut phone, 2)
+        );
+        serve_res.unwrap();
+
+        // A delta per session (not zero), each with that session's full history.
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(deltas.len(), 2);
+        let by_id: std::collections::HashMap<_, _> = deltas.into_iter().collect();
+        assert_eq!(by_id["s1"].len(), 2);
+        assert_eq!(by_id["s1"][0].seq, 0);
+        assert_eq!(by_id["s1"][1].seq, 1);
+        assert_eq!(by_id["s2"].len(), 1);
+        assert_eq!(by_id["s2"][0].seq, 0);
+    }
+
+    #[tokio::test]
+    async fn empty_cursor_catch_up_caps_the_delta_at_the_window() {
+        // A session longer than SYNC_CACHE_WINDOW must not serialize its whole
+        // history into one frame (the Noise frame cap). The delta is bounded to the
+        // last `SYNC_CACHE_WINDOW` rows — the most RECENT ones, in ascending order.
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        db.create_session("s1", "Alpha", None, None, 100).unwrap();
+        let total = SYNC_CACHE_WINDOW + 25;
+        for i in 0..total {
+            db.append_message("s1", &user(&format!("m{i}")), 1000 + i);
+        }
+
+        let (mut desktop, mut phone) = mem_pair();
+        phone
+            .send(&SyncFrame::Hello {
+                device_id: "web".into(),
+                cursors: vec![],
+            })
+            .await
+            .unwrap();
+        let (serve_res, (_sessions, deltas)) = tokio::join!(
+            serve_catch_up(&mut desktop, &db),
+            read_catch_up(&mut phone, 1)
+        );
+        serve_res.unwrap();
+
+        let (_, messages) = &deltas[0];
+        // Capped at the window (not `total`), holding the MOST RECENT rows: last seq is
+        // total-1, first is the window's start; rows stay ascending.
+        assert_eq!(messages.len() as i64, SYNC_CACHE_WINDOW);
+        assert_eq!(messages.first().unwrap().seq, total - SYNC_CACHE_WINDOW);
+        assert_eq!(messages.last().unwrap().seq, total - 1);
+    }
+
+    #[tokio::test]
+    async fn a_partial_cursor_set_serves_known_sessions_incrementally_and_new_ones_fully() {
+        // A phone reconnects holding s1 up to seq 0 but has never seen s2 (created
+        // while it was away). s1 gets only the rows newer than its cursor; s2 — with
+        // no cursor — gets its full tail.
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        db.create_session("s1", "Alpha", None, None, 100).unwrap();
+        db.append_message("s1", &user("a1"), 101); // seq 0 (phone has this)
+        db.append_message("s1", &user("a2"), 102); // seq 1 (new)
+        db.create_session("s2", "Beta", None, None, 200).unwrap();
+        db.append_message("s2", &user("b1"), 201); // seq 0 (phone never saw s2)
+
+        let (mut desktop, mut phone) = mem_pair();
+        phone
+            .send(&SyncFrame::Hello {
+                device_id: "phone-1".into(),
+                cursors: vec![Cursor {
+                    session_id: "s1".into(),
+                    seq: 0,
+                }],
+            })
+            .await
+            .unwrap();
+        let (serve_res, (_sessions, deltas)) = tokio::join!(
+            serve_catch_up(&mut desktop, &db),
+            read_catch_up(&mut phone, 2)
+        );
+        serve_res.unwrap();
+
+        let by_id: std::collections::HashMap<_, _> = deltas.into_iter().collect();
+        // s1: only the row newer than the cursor (seq 1).
+        assert_eq!(by_id["s1"].len(), 1);
+        assert_eq!(by_id["s1"][0].seq, 1);
+        // s2: full history (no cursor → full tail).
+        assert_eq!(by_id["s2"].len(), 1);
+        assert_eq!(by_id["s2"][0].seq, 0);
     }
 }
