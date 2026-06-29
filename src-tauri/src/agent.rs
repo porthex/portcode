@@ -1008,7 +1008,7 @@ fn subagent_label(description: &str, prompt: &str) -> String {
     if boundary == 0 {
         boundary = collapsed
             .char_indices()
-            .take_while(|&(i, _)| i <= MAX)
+            .take_while(|&(i, c)| i + c.len_utf8() <= MAX)
             .last()
             .map(|(i, c)| i + c.len_utf8())
             .unwrap_or(collapsed.len());
