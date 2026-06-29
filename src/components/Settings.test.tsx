@@ -828,15 +828,14 @@ describe("SettingsPanel — appearance toggles", () => {
     );
   });
 
-  it("annotates the auto-update hint with the staging channel when on staging", () => {
-    useStore.setState({ updateChannel: "staging" });
-    renderPanel({ autoUpdate: true });
-    expect(screen.getByText(/\(staging channel\)/)).toBeInTheDocument();
-  });
-
-  it("omits the staging annotation on the stable channel", () => {
+  it("shows the plain stable auto-update hint with no channel annotation", () => {
+    // Portcode ships a single `stable` channel — the retired staging feed used
+    // to append a "(staging channel)" note, which must never appear now.
     useStore.setState({ updateChannel: "stable" });
     renderPanel({ autoUpdate: true });
+    expect(
+      screen.getByText("Download and install new versions automatically, then prompt to relaunch."),
+    ).toBeInTheDocument();
     expect(screen.queryByText(/\(staging channel\)/)).not.toBeInTheDocument();
   });
 

@@ -332,9 +332,10 @@ export interface UpdateInfo {
   date: string | null;
 }
 
-/** Which release feed this build follows: the public `stable` channel or the
- *  pre-release `staging` channel testers opt into. Returned by `update_channel`. */
-export type UpdateChannel = "stable" | "staging";
+/** Which release feed this build follows. Portcode ships a single public
+ *  `stable` channel (the rolling `staging` pre-release feed was retired).
+ *  Returned by `update_channel`. */
+export type UpdateChannel = "stable";
 
 // ── Phone Sync ────────────────────────────────────────────────────────────────
 

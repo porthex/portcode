@@ -41,8 +41,8 @@ jobs:
     name: Build · sign · SBOM · publish (Windows)
     runs-on: windows-latest
     # Only cut releases from a version tag or the `release` branch. A manual
-    # workflow_dispatch on any other ref (e.g. `staging`) is skipped, so it can
-    # never stamp a `release`-environment deployment from the wrong branch.
+    # workflow_dispatch on any other ref is skipped, so it can never stamp a
+    # `release`-environment deployment from the wrong branch.
     if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/release'
     # Protected environment: the owner attaches the signing secrets here and adds
     # required-reviewer / branch rules so releases can't be cut unreviewed.

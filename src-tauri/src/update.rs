@@ -21,15 +21,11 @@
 use tauri::Emitter;
 use tauri_plugin_updater::UpdaterExt;
 
-/// The compile-time release channel. Defaults to `"stable"`; a build with
-/// `PORTCODE_CHANNEL=staging` (or the common aliases) opts into the rolling
-/// pre-release channel. `build.rs` reruns when this env var changes so a stable
-/// and a staging build never share a cached artifact.
+/// The release channel. Portcode ships a single `"stable"` channel: all builds
+/// follow GitHub's `releases/latest` redirect. (The retired staging/pre-release
+/// update feed used to override this; it no longer exists.)
 pub fn channel() -> &'static str {
-    match option_env!("PORTCODE_CHANNEL") {
-        Some("staging") | Some("pre-release") | Some("prerelease") | Some("beta") => "staging",
-        _ => "stable",
-    }
+    "stable"
 }
 
 /// Update metadata handed to the frontend. camelCase to match the TS client.
@@ -49,16 +45,12 @@ pub(crate) struct UpdateInfo {
     date: Option<String>,
 }
 
-/// Build a channel-aware updater. The stable channel uses GitHub's
-/// `releases/latest` redirect; the staging channel pins the rolling `staging`
-/// pre-release tag. We override the endpoint at runtime instead of in
-/// `tauri.conf.json` so the config's stable endpoint stays the default and only
-/// a staging build diverges.
+/// Build the updater. The stable channel uses GitHub's `releases/latest`
+/// redirect, which resolves to the most recent published, non-prerelease
+/// Release. We set the endpoint at runtime (rather than in `tauri.conf.json`) so
+/// the manifest URL lives next to the channel logic it depends on.
 fn build_updater(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
-    let endpoint = match channel() {
-        "staging" => "https://github.com/porthex/portcode/releases/download/staging/latest.json",
-        _ => "https://github.com/porthex/portcode/releases/latest/download/latest.json",
-    };
+    let endpoint = "https://github.com/porthex/portcode/releases/latest/download/latest.json";
     // `reqwest::Url` IS `url::Url` (single `url` version in the lock), and reqwest
     // is already a direct dependency — so we get a correctly-typed endpoint without
     // adding `url` as a new dep.
@@ -136,7 +128,7 @@ pub fn update_relaunch(app: tauri::AppHandle) {
     app.restart();
 }
 
-/// Report the compile-time channel so the UI can adjust copy (e.g. "staging").
+/// Report the release channel so the UI can adjust copy. Always `"stable"`.
 #[tauri::command]
 pub fn update_channel() -> &'static str {
     channel()

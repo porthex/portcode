@@ -3987,11 +3987,12 @@ describe("auto-update", () => {
 
   describe("loadUpdateChannel", () => {
     it("stores the channel reported by the core", async () => {
-      m.getUpdateChannel.mockResolvedValue("staging");
+      m.getUpdateChannel.mockResolvedValue("stable");
 
       await useStore.getState().loadUpdateChannel();
 
-      expect(useStore.getState().updateChannel).toBe("staging");
+      expect(m.getUpdateChannel).toHaveBeenCalledTimes(1);
+      expect(useStore.getState().updateChannel).toBe("stable");
     });
 
     it("keeps the default channel when the command is unavailable", async () => {

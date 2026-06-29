@@ -163,7 +163,7 @@ export async function relaunchApp(): Promise<void> {
   return mock.relaunchApp();
 }
 
-/** Which release feed this build follows (`stable` / `staging`). */
+/** Which release feed this build follows (always `stable`). */
 export async function getUpdateChannel(): Promise<UpdateChannel> {
   if (isTauri()) {
     const { core } = await tauri();
