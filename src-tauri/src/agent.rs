@@ -946,6 +946,76 @@ fn subagent_answer(description: &str, final_text: &str, stop_reason: &str) -> St
     }
 }
 
+/// Derive a meaningful label for a sub-agent from the tool input.
+///
+/// Priority:
+/// 1. Use `description` as-is when it is non-empty, not the generic placeholder
+///    `"subagent"` (case-insensitive), and at least 3 characters long.
+/// 2. Otherwise derive a label from the first non-empty line of `prompt`: trim
+///    it, collapse internal whitespace, strip a leading Markdown bullet or
+///    heading marker, and truncate to ~60 characters on a word boundary
+///    (appending `"…"` when truncated).
+/// 3. If both are blank fall back to `"subagent"`.
+fn subagent_label(description: &str, prompt: &str) -> String {
+    let d = description.trim();
+    if d.len() >= 3 && !d.eq_ignore_ascii_case("subagent") {
+        return d.to_string();
+    }
+
+    // Derive from the first non-empty line of the prompt.
+    let first = prompt
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if first.is_empty() {
+        return "subagent".to_string();
+    }
+
+    // Strip a leading Markdown bullet or heading marker (e.g. "- ", "# ", "## ").
+    let stripped = first
+        .trim_start_matches(|c: char| c == '#' || c == '-' || c == '*' || c == '>')
+        .trim_start();
+    let text = if stripped.is_empty() { first } else { stripped };
+
+    // Collapse internal whitespace into single spaces.
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    const MAX: usize = 60;
+    if collapsed.len() <= MAX {
+        return collapsed;
+    }
+
+    // Truncate on a word boundary (never slice through a multibyte character).
+    // Walk char indices; keep the last boundary position that still fits in MAX.
+    let mut boundary = 0usize;
+    let mut prev_was_space = false;
+    for (idx, ch) in collapsed.char_indices() {
+        if idx > MAX {
+            break;
+        }
+        if ch == ' ' {
+            if !prev_was_space {
+                boundary = idx;
+            }
+            prev_was_space = true;
+        } else {
+            prev_was_space = false;
+        }
+    }
+    // If no word boundary found at all (one giant token), cut at the last safe
+    // char boundary ≤ MAX.
+    if boundary == 0 {
+        boundary = collapsed
+            .char_indices()
+            .take_while(|&(i, c)| i + c.len_utf8() <= MAX)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(collapsed.len());
+    }
+    format!("{}…", collapsed[..boundary].trim_end())
+}
+
 /// The `AgentFinished` status string for a subagent that ran to completion: a
 /// cancelled run reports `"cancelled"`, anything else `"ok"`. (A subagent that
 /// errored out — `run_loop_core` returned `Err` — reports `"error"`; see
@@ -1053,12 +1123,13 @@ impl tools::Spawner for AgentSpawner {
         if self.cancel.load(Ordering::Relaxed) {
             child_cancel.store(true, Ordering::Relaxed);
         }
+        let label = subagent_label(&spec.description, &spec.prompt);
         emit(
             &self.app,
             &self.parent_channel,
             StreamEvent::AgentStarted {
                 agent_id: agent_id.clone(),
-                description: spec.description.clone(),
+                description: label,
                 parent_id: self.self_id.clone(),
             },
         );
@@ -1244,8 +1315,8 @@ mod tests {
         assistant_text, background, batch_cancelled, child_can_spawn, derive_title, finish_status,
         is_terminal_auth_error, precheck_outcome, reassemble_results, resolve_system_prompt,
         session_of, spawn_background_task, spawn_status, step_limit_exceeded, subagent_answer,
-        tool_result_block, tool_result_event, AgentConfig, Block, ChatMessage, Db, Decision,
-        LoopOutcome, Persist, StreamEvent, CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS,
+        subagent_label, tool_result_block, tool_result_event, AgentConfig, Block, ChatMessage, Db,
+        Decision, LoopOutcome, Persist, StreamEvent, CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS,
         MAX_PARALLEL_AGENTS, MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
     };
     use std::path::Path;
@@ -1349,6 +1420,104 @@ mod tests {
         assert!(note.contains("without a text summary"));
         assert!(note.contains("audit deps"));
         assert!(note.contains("cancelled"));
+    }
+
+    #[test]
+    fn subagent_label_passes_through_a_good_description() {
+        // A real, non-generic description of at least 3 chars is used as-is.
+        assert_eq!(
+            subagent_label("audit deps", "find vulnerable crates"),
+            "audit deps"
+        );
+        assert_eq!(
+            subagent_label("Fix auth bug", "irrelevant prompt"),
+            "Fix auth bug"
+        );
+    }
+
+    #[test]
+    fn subagent_label_falls_back_to_prompt_when_description_is_generic_or_short() {
+        // The literal placeholder "subagent" (any case) and short/empty strings
+        // trigger a derivation from the prompt's first line.
+        assert_eq!(
+            subagent_label("subagent", "Search for vulnerable crates in Cargo.toml"),
+            "Search for vulnerable crates in Cargo.toml"
+        );
+        assert_eq!(
+            subagent_label("SUBAGENT", "Analyse the login flow"),
+            "Analyse the login flow"
+        );
+        assert_eq!(
+            subagent_label("", "Run the test suite"),
+            "Run the test suite"
+        );
+        assert_eq!(
+            subagent_label("  ", "Run the test suite"),
+            "Run the test suite"
+        );
+        // A two-char description is too short and falls back to the prompt.
+        assert_eq!(
+            subagent_label("ab", "Do something useful"),
+            "Do something useful"
+        );
+    }
+
+    #[test]
+    fn subagent_label_uses_first_nonempty_prompt_line() {
+        let prompt = "\n\n  \nActual task line\nSecond line of prompt";
+        assert_eq!(subagent_label("subagent", prompt), "Actual task line");
+    }
+
+    #[test]
+    fn subagent_label_strips_markdown_prefix() {
+        assert_eq!(
+            subagent_label("", "- List all open PRs"),
+            "List all open PRs"
+        );
+        assert_eq!(subagent_label("", "## Review security"), "Review security");
+        assert_eq!(subagent_label("", "# Heading task"), "Heading task");
+        assert_eq!(subagent_label("", "* Bullet task"), "Bullet task");
+        assert_eq!(subagent_label("", "> Quoted task"), "Quoted task");
+    }
+
+    #[test]
+    fn subagent_label_truncates_long_prompts_on_word_boundary() {
+        // 70 'a's followed by a space and "overflow" — must truncate before 60 chars.
+        let long = format!("{} overflow", "a".repeat(70));
+        let label = subagent_label("", &long);
+        // Result must end with '…' and must be at most 61 bytes (60 + the 3-byte
+        // UTF-8 ellipsis '…').
+        assert!(label.ends_with('…'), "expected ellipsis, got: {label:?}");
+        assert!(
+            label.len() <= 63,
+            "label too long ({} bytes): {label:?}",
+            label.len()
+        );
+    }
+
+    #[test]
+    fn subagent_label_truncates_safely_on_multibyte_input() {
+        // 30 two-byte characters (é, U+00E9) gives 60 bytes exactly at position 30 —
+        // truncating at byte 60 would land on a char boundary here, but the test also
+        // exercises the path through `char_indices` safely.
+        let repeated = "é".repeat(30); // 60 bytes, each char 2 bytes
+        let prompt = format!("{repeated} and more text");
+        let label = subagent_label("subagent", &prompt);
+        // The label must be valid UTF-8 (no panic) and at most 63 bytes.
+        assert!(label.len() <= 63, "label too long: {}", label.len());
+        // Emoji prompt — each emoji is 4 bytes.
+        let emoji_prompt = "🚀".repeat(20); // 80 bytes total
+        let emoji_label = subagent_label("", &emoji_prompt);
+        assert!(!emoji_label.is_empty());
+        // Must be valid UTF-8 — collecting chars proves there's no half-cut codepoint.
+        let _chars: Vec<char> = emoji_label.chars().collect();
+    }
+
+    #[test]
+    fn subagent_label_both_empty_returns_fallback() {
+        assert_eq!(subagent_label("", ""), "subagent");
+        assert_eq!(subagent_label("subagent", ""), "subagent");
+        assert_eq!(subagent_label("subagent", "  \n  "), "subagent");
     }
 
     #[test]

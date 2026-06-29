@@ -47,6 +47,7 @@ describe("AgentsPanel", () => {
 
     render(<AgentsPanel />);
 
+    // Running agents auto-open the panel so rows are visible.
     expect(screen.getByText("audit deps")).toBeInTheDocument();
     expect(screen.getByText("step 3")).toBeInTheDocument();
     // The header summarizes the running count.
@@ -68,11 +69,14 @@ describe("AgentsPanel", () => {
 
     render(<AgentsPanel />);
 
+    // Status text is always in the DOM (ul stays mounted at height 0 when collapsed).
     expect(screen.getByText("done")).toBeInTheDocument();
     expect(screen.getByText("stopped")).toBeInTheDocument();
     expect(screen.getByText("error")).toBeInTheDocument();
-    // No agent is running, so no Stop button is offered.
-    expect(screen.queryByRole("button")).toBeNull();
+    // No agent is running, so no Stop button — only the header toggle button.
+    const buttons = screen.getAllByRole("button");
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0]).toHaveAttribute("aria-expanded", "false");
     // Header falls back to a plain count when nothing is running.
     expect(screen.getByText("3 subagents")).toBeInTheDocument();
   });
@@ -85,6 +89,7 @@ describe("AgentsPanel", () => {
 
     render(<AgentsPanel />);
 
+    // Running agents auto-open the panel, so Stop buttons are visible.
     fireEvent.click(screen.getByRole("button", { name: "Stop subagent: second" }));
     await Promise.resolve();
 
@@ -92,7 +97,7 @@ describe("AgentsPanel", () => {
     expect(m.cancelAgentById).toHaveBeenCalledTimes(1);
   });
 
-  it("only running subagents get a Stop button", () => {
+  it("only running subagents get a Stop button (plus the header toggle)", () => {
     seed([
       agent({ id: "run", description: "running one", status: "running", step: 1 }),
       agent({ id: "done", description: "done one", status: "ok", step: 2 }),
@@ -100,8 +105,96 @@ describe("AgentsPanel", () => {
 
     render(<AgentsPanel />);
 
+    // Running agent auto-opens, so we see: header toggle + 1 Stop button.
     const buttons = screen.getAllByRole("button");
-    expect(buttons).toHaveLength(1);
-    expect(buttons[0]).toHaveAccessibleName("Stop subagent: running one");
+    // The Stop button for the running agent.
+    const stopButtons = buttons.filter((b) => b.getAttribute("aria-label")?.startsWith("Stop"));
+    expect(stopButtons).toHaveLength(1);
+    expect(stopButtons[0]).toHaveAccessibleName("Stop subagent: running one");
+  });
+
+  // ── Collapsible accordion behaviour ─────────────────────────────────────
+
+  it("is collapsed by default when agents exist but none are running", () => {
+    seed([agent({ id: "a1", status: "ok", step: 2 })]);
+
+    render(<AgentsPanel />);
+
+    // Match only the header toggle (its name starts with a count, e.g. "1 subagent
+    // running" / "3 subagents") — not the per-row "Stop subagent: …" buttons.
+    const toggle = screen.getByRole("button", { name: /\d+ subagents?/i });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("auto-opens when a running agent is present", () => {
+    seed([agent({ id: "a1", status: "running", step: 1 })]);
+
+    render(<AgentsPanel />);
+
+    // Match only the header toggle (its name starts with a count, e.g. "1 subagent
+    // running" / "3 subagents") — not the per-row "Stop subagent: …" buttons.
+    const toggle = screen.getByRole("button", { name: /\d+ subagents?/i });
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("clicking the header toggle expands the collapsed panel", () => {
+    seed([agent({ id: "a1", status: "ok", step: 2 })]);
+
+    render(<AgentsPanel />);
+
+    // Match only the header toggle (its name starts with a count, e.g. "1 subagent
+    // running" / "3 subagents") — not the per-row "Stop subagent: …" buttons.
+    const toggle = screen.getByRole("button", { name: /\d+ subagents?/i });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(toggle);
+
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("clicking the header toggle again collapses the expanded panel", () => {
+    // Start expanded (running agent auto-opens it).
+    seed([agent({ id: "a1", status: "running", step: 1 })]);
+
+    render(<AgentsPanel />);
+
+    // Match only the header toggle (its name starts with a count, e.g. "1 subagent
+    // running" / "3 subagents") — not the per-row "Stop subagent: …" buttons.
+    const toggle = screen.getByRole("button", { name: /\d+ subagents?/i });
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(toggle);
+
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("rows stay mounted in the DOM even when the panel is collapsed (grid-0fr)", () => {
+    // Non-running agents → collapsed by default.
+    seed([agent({ id: "a1", description: "audit deps", status: "ok", step: 2 })]);
+
+    render(<AgentsPanel />);
+
+    // Match only the header toggle (its name starts with a count, e.g. "1 subagent
+    // running" / "3 subagents") — not the per-row "Stop subagent: …" buttons.
+    const toggle = screen.getByRole("button", { name: /\d+ subagents?/i });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    // Row text still exists in the DOM (height 0, not unmounted).
+    expect(screen.getByText("audit deps")).toBeInTheDocument();
+  });
+
+  it("chevron reflects open state: ▸ when closed, ▾ when open", () => {
+    seed([agent({ id: "a1", status: "ok", step: 2 })]);
+
+    render(<AgentsPanel />);
+
+    // Match only the header toggle (its name starts with a count, e.g. "1 subagent
+    // running" / "3 subagents") — not the per-row "Stop subagent: …" buttons.
+    const toggle = screen.getByRole("button", { name: /\d+ subagents?/i });
+    expect(toggle).toHaveTextContent("▸");
+
+    fireEvent.click(toggle);
+
+    expect(toggle).toHaveTextContent("▾");
   });
 });

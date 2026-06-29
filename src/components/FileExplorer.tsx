@@ -195,29 +195,29 @@ function TreeNode({
   // same tick sees the latest value and cannot fire a duplicate listDir while
   // the first is still pending.
   const loading = useRef(false);
-  const appendDraft = useStore((s) => s.appendDraft);
   const { onContextMenu, menu } = useContextMenu();
 
   const toggle = async () => {
-    if (entry.isDir) {
-      const next = !open;
-      setOpen(next);
-      if (next && children === null && !loading.current) {
-        loading.current = true;
-        try {
-          setChildren(await ipc.listDir(entry.path));
-        } catch {
-          // A failed expand (permissions, backend error) must not leak an
-          // unhandled rejection or leave a stuck-open caret with no children:
-          // settle on an empty listing and collapse back to the closed state.
-          setChildren([]);
-          setOpen(false);
-        } finally {
-          loading.current = false;
-        }
+    // Directories expand/collapse; clicking a file is intentionally a no-op.
+    // (We used to fold the file path into the composer draft here, but that
+    // surprised people who clicked just to inspect a file — selection should
+    // never silently mutate the message they're composing.)
+    if (!entry.isDir) return;
+    const next = !open;
+    setOpen(next);
+    if (next && children === null && !loading.current) {
+      loading.current = true;
+      try {
+        setChildren(await ipc.listDir(entry.path));
+      } catch {
+        // A failed expand (permissions, backend error) must not leak an
+        // unhandled rejection or leave a stuck-open caret with no children:
+        // settle on an empty listing and collapse back to the closed state.
+        setChildren([]);
+        setOpen(false);
+      } finally {
+        loading.current = false;
       }
-    } else {
-      appendDraft(entry.path);
     }
   };
 
@@ -230,11 +230,6 @@ function TreeNode({
 
   const menuItems = (): ContextMenuItem[] => {
     const items: ContextMenuItem[] = [
-      {
-        label: "Insert into composer",
-        icon: <InsertGlyph />,
-        onSelect: () => appendDraft(entry.path),
-      },
       { label: "Copy path", icon: <CopyGlyph />, onSelect: copyPath },
     ];
     if (entry.isDir) {
@@ -267,7 +262,7 @@ function TreeNode({
         tabIndex={activeRow === entry.path ? 0 : -1}
         className={`pc-row--file flex w-full items-center gap-1.5 py-1 pr-2 text-left ${rowColor}`}
         style={{ paddingLeft: 10 + depth * 14 }}
-        title={entry.isDir ? entry.name : `Insert ${entry.path} into composer`}
+        title={entry.name}
       >
         {entry.isDir ? (
           <span aria-hidden="true" className="w-3 shrink-0 text-[10px] text-faint">
@@ -324,22 +319,6 @@ function TreeNode({
 }
 
 // ── Context-menu glyphs ──────────────────────────────────────────────────────
-function InsertGlyph() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d="M12 5v9" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-      <path
-        d="M8 11l4 4 4-4"
-        stroke="currentColor"
-        strokeWidth="1.7"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      <path d="M5 19h14" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-    </svg>
-  );
-}
-
 function CopyGlyph() {
   return (
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">

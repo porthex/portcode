@@ -221,6 +221,40 @@ fn oauth_logout() -> Result<(), String> {
 
 // ── sessions ─────────────────────────────────────────────────────────────────
 
+/// Best-effort fan-out of the current session list to any connected sync client
+/// (web/phone) after a desktop-initiated session change. Without this, a session
+/// created/renamed/deleted ON THE DESKTOP would stay invisible to a connected
+/// client until its next reconnect/catch-up — the catch-up `SessionList` is sent
+/// once, on Hello, and `forward_live` only carries `Live` frames. Mirrors the
+/// phone-`CreateSession` fan-out in `sync::server::DesktopCommandHandler`.
+///
+/// Resolves the `SyncHub` from managed state and publishes; a `list_sessions` read
+/// error is logged and swallowed (it must NOT fail the already-committed DB write),
+/// and `publish_frame` is itself a cheap no-op when no client is attached.
+///
+/// DESKTOP-ONLY behavior: only the desktop runs the sync SERVER (and `SyncHub::
+/// publish_frame` is `#[cfg(desktop)]`). On mobile — the phone is a pure remote
+/// CLIENT and never serves a session list — this is a no-op, so the shared
+/// `create/rename/delete_session` commands compile on both targets.
+#[cfg(desktop)]
+fn push_session_list(app: &AppHandle, db: &Db) {
+    if let Some(hub) = app.try_state::<sync::SyncHub>() {
+        match db.list_sessions() {
+            Ok(sessions) => {
+                hub.publish_frame(sync::protocol::SyncFrame::SessionList { sessions });
+            }
+            Err(e) => eprintln!("phone-sync: list_sessions after session change failed: {e}"),
+        }
+    }
+}
+
+/// Mobile no-op counterpart of [`push_session_list`]: the phone never serves sync
+/// clients, so there is nothing to fan out. Keeps the session commands target-
+/// agnostic without dragging the desktop-only `SyncHub::publish_frame` into the
+/// mobile build. `app`/`db` are unused here by design.
+#[cfg(mobile)]
+fn push_session_list(_app: &AppHandle, _db: &Db) {}
+
 #[tauri::command]
 fn list_sessions(state: State<AppState>) -> Vec<SessionRow> {
     state.db.list_sessions().unwrap_or_default()
@@ -228,6 +262,7 @@ fn list_sessions(state: State<AppState>) -> Vec<SessionRow> {
 
 #[tauri::command]
 fn create_session(
+    app: AppHandle,
     state: State<AppState>,
     id: String,
     title: Option<String>,
@@ -243,20 +278,34 @@ fn create_session(
             model.as_deref(),
             db::now_ms(),
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Notify any connected sync client of the new session (best-effort).
+    push_session_list(&app, &state.db);
+    Ok(())
 }
 
 #[tauri::command]
-fn rename_session(state: State<AppState>, id: String, title: String) -> Result<(), String> {
+fn rename_session(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+    title: String,
+) -> Result<(), String> {
     state
         .db
         .rename_session(&id, &title)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Push the updated titles to any connected sync client (best-effort).
+    push_session_list(&app, &state.db);
+    Ok(())
 }
 
 #[tauri::command]
-fn delete_session(state: State<AppState>, id: String) -> Result<(), String> {
-    state.db.delete_session(&id).map_err(|e| e.to_string())
+fn delete_session(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
+    state.db.delete_session(&id).map_err(|e| e.to_string())?;
+    // Push the pruned list to any connected sync client (best-effort).
+    push_session_list(&app, &state.db);
+    Ok(())
 }
 
 #[tauri::command]
