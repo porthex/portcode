@@ -18,6 +18,15 @@ members = [
     "src-tauri",
 ]
 
+# Dev profile — tuned for the fastest edit -> rebuild -> relaunch loop (self-dev /
+# dogfooding on a capable machine). The default `debug = 2` (full debug info) is the
+# single biggest tax on LINK time for the large desktop binary; "line-tables-only"
+# keeps panic/backtrace file:line (so traces stay useful) while dropping the heavy
+# type/variable debuginfo that dominates link time. opt-level (0) and incremental (on)
+# stay at the dev defaults.
+[profile.dev]
+debug = "line-tables-only"
+
 # Release profile for the desktop binary. In a workspace, profiles are ONLY
 # honored at the root — a `[profile.release]` left in `src-tauri/Cargo.toml` is
 # silently ignored (Cargo warns). These are the exact flags that previously lived
