@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::AppHandle;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+use crate::events::EventSink;
 use crate::llm::StreamEvent;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -201,7 +201,7 @@ pub fn deny_all(pending: &Pending, session_id: &str) {
 /// existing settings keep behaving identically.
 #[allow(clippy::too_many_arguments)]
 pub async fn gate(
-    app: &AppHandle,
+    sink: &dyn EventSink,
     channel: &str,
     mode: PermissionMode,
     rules: &[Rule],
@@ -244,11 +244,11 @@ pub async fn gate(
     let (tx, mut rx) = oneshot::channel();
     pending.lock().unwrap().insert(id.clone(), (session_id, tx));
 
-    // Route through the canonical emit chokepoint so a paired phone receives the
-    // prompt too. Emitting directly here (the old bug) reached only the desktop, so
-    // a remote turn that hit an "ask" tool hung forever with no prompt on either end.
-    crate::sync::emit_event(
-        app,
+    // Route through the canonical emit chokepoint (the [`EventSink`]) so a paired
+    // phone receives the prompt too. Emitting directly here (the old bug) reached
+    // only the desktop, so a remote turn that hit an "ask" tool hung forever with no
+    // prompt on either end. `AppEventSink::emit` forwards to `sync::emit_event`.
+    sink.emit(
         channel,
         StreamEvent::PermissionRequest {
             id: id.clone(),

@@ -19,6 +19,7 @@ use crate::agent;
 use crate::agents;
 use crate::background;
 use crate::db::{self, Db};
+use crate::events::{AppEventSink, EventSink};
 use crate::permissions::{self, Decision, Pending};
 use crate::settings::Settings;
 use crate::sync::protocol::{RemoteCommand, SyncFrame};
@@ -71,7 +72,11 @@ impl CommandHandler for DesktopCommandHandler {
             // blocked by a turn. Each arg is an owned clone → the spawned future is
             // `Send + 'static` (nothing borrowed from `&self` escapes).
             RemoteCommand::Run { session_id, text } => {
-                let app = self.app.clone();
+                // Wrap the AppHandle in the concrete EventSink so the agent core sees
+                // only the trait (its sole Tauri coupling now lives behind it). Same
+                // sink the desktop `run_agent` command builds, so a phone-driven turn
+                // mirrors identically.
+                let sink: Arc<dyn EventSink> = Arc::new(AppEventSink(self.app.clone()));
                 let http = self.http.clone();
                 let settings = self.settings.clone();
                 let db = self.db.clone();
@@ -82,7 +87,7 @@ impl CommandHandler for DesktopCommandHandler {
                 let oauth_refresh = self.oauth_refresh.clone();
                 tauri::async_runtime::spawn(async move {
                     agent::run(
-                        app,
+                        sink,
                         http,
                         settings,
                         db,

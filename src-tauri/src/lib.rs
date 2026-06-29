@@ -15,6 +15,10 @@ mod background;
 // ever calls `SentryAndroid.init`). Compiles on every target. See `consent.rs`.
 mod consent;
 mod db;
+// The event-emission seam ([`EventSink`] + the production [`AppEventSink`]). The
+// trait is SHARED because `llm::LlmProvider` (shared) takes `&dyn EventSink`; the
+// concrete `AppEventSink` is desktop-only (gated inside `events`).
+mod events;
 mod llm;
 #[cfg(desktop)]
 mod oauth;
@@ -459,11 +463,16 @@ async fn run_agent(
     let background = state.background.clone();
     let oauth_refresh = state.oauth_refresh.clone();
 
+    // Wrap the AppHandle in the concrete EventSink at the command boundary, so the
+    // agent core receives only the trait — its sole Tauri coupling (event emission)
+    // now lives behind `events::EventSink`.
+    let sink: Arc<dyn events::EventSink> = Arc::new(events::AppEventSink(app));
+
     // Run in the background so the command returns immediately and the frontend
     // can register its cancel handle before the run finishes.
     tauri::async_runtime::spawn(async move {
         agent::run(
-            app,
+            sink,
             http,
             settings,
             db,
