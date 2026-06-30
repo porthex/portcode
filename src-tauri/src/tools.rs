@@ -302,9 +302,37 @@ fn reject_if_protected(base: &Path, full: &Path) -> Result<(), String> {
 /// blocked, the Phase-2 promotion gate, and git rollback. Crucially this runs at
 /// the TOOL layer, so it holds even in `auto`/`bypass` permission mode where the
 /// user never sees the command.
+///
+/// **Hardened against two additional bypasses (Phase 2 increment 1):**
+///
+/// * **PowerShell cmdlet aliases** — short aliases (`sc`, `ac`, `clc`, `ni`,
+///   `mi`, `cpi`, `ri`, `rni`) are matched as whole tokens so they don't
+///   false-match substrings like "basic" (which contains "sc").
+///   `WRITE_INDICATORS` covers the full cmdlet name; the separate alias check
+///   below covers the abbreviated forms.
+///
+/// * **Windows 8.3 short names** — `PERMIS~1.RS` is the 8.3 alias for
+///   `permissions.rs`. The scanner detects the `NAME~<digit>` pattern in path
+///   tokens and checks whether the stem prefix matches the start of any
+///   protected filename or directory component. This is a pure string/regex
+///   heuristic (no filesystem resolution), so it can produce false positives on
+///   an unlikely-but-real `~1` name in a non-protected context; that's the
+///   safe direction for a defense-in-depth guard.
+///
+/// **Remaining documented residual gaps** (mitigated by fs_write/fs_edit hard-
+/// block + promotion health-gate + git rollback):
+///
+/// * Command obfuscation: base64-encoded payloads, string concatenation,
+///   environment-variable indirection, `iex`/`Invoke-Expression`, etc.
+/// * COM/WMI/P-Invoke paths that bypass cmdlets entirely.
+/// * `~2`, `~3`, … variants where the first match is a different file (extremely
+///   unlikely for the protected set, but not impossible on a heavily populated
+///   src dir).
 fn shell_targets_protected_path(command: &str) -> Option<&'static str> {
     let lower = command.to_lowercase();
-    // A write must be expressed somehow: a redirection or a file-mutating command.
+    // ── write-indicator check ────────────────────────────────────────────────
+    // A write must be expressed somehow: a redirection, a file-mutating cmdlet
+    // (full name), or a PowerShell cmdlet ALIAS matched as a whole token.
     const WRITE_INDICATORS: &[&str] = &[
         ">",
         "set-content",
@@ -333,12 +361,30 @@ fn shell_targets_protected_path(command: &str) -> Option<&'static str> {
         "rd ",
         "rmdir",
     ];
-    if !WRITE_INDICATORS.iter().any(|w| lower.contains(w)) {
+    // Short PowerShell cmdlet aliases that are not safe to match as substrings
+    // ("sc" appears in "basic", "describe", etc.) — checked as whole tokens.
+    // Each alias maps to the same full cmdlet that is already in WRITE_INDICATORS,
+    // so this list only needs to cover the abbreviated forms.
+    const WRITE_ALIASES: &[&str] = &[
+        "sc",  // Set-Content
+        "ac",  // Add-Content
+        "clc", // Clear-Content
+        "ni",  // New-Item
+        "mi",  // Move-Item
+        "cpi", // Copy-Item
+        "ri",  // Remove-Item
+        "rni", // Rename-Item
+    ];
+    let has_write_indicator = WRITE_INDICATORS.iter().any(|w| lower.contains(w))
+        || token_matches_any(&lower, WRITE_ALIASES);
+    if !has_write_indicator {
         return None;
     }
+    // ── protected-path reference check ──────────────────────────────────────
     // The command must also reference a protected path. Match on the LAST segment
-    // (the filename) for files and on the directory prefix for protected dirs, with
-    // both `/` and `\` accepted since a shell command can use either separator.
+    // (the filename) for files and on the directory prefix for protected dirs,
+    // with both `/` and `\` accepted since a shell command can use either
+    // separator. Additionally check Windows 8.3 short names (e.g. PERMIS~1.RS).
     for (prefix, reason) in PROTECTED {
         let p = prefix.trim_end_matches('/');
         let p_back = p.replace('/', "\\");
@@ -358,8 +404,106 @@ fn shell_targets_protected_path(command: &str) -> Option<&'static str> {
                 }
             }
         }
+        // 8.3 short-name check: if the command contains a token like `NAME~<N>`
+        // (optionally `.EXT`), check whether the stem prefix matches the start of
+        // any component (filename stem or directory segment) of this protected
+        // entry. This is a conservative heuristic — it can block an innocent `~1`
+        // token that happens to share a prefix with a protected file, but that's
+        // the safe direction for a defense-in-depth guard.
+        if command_contains_short_name_for(p, &lower) {
+            return Some(reason);
+        }
     }
     None
+}
+
+/// Return `true` if any whitespace/punctuation-delimited token in `lower` (a
+/// pre-lowercased command string) exactly matches one of the given `aliases`.
+///
+/// Splitting on non-alphanumeric characters catches the common forms:
+/// `sc file.rs`, `(sc file.rs)`, `; sc file.rs`, `;sc file.rs`.
+fn token_matches_any(lower: &str, aliases: &[&str]) -> bool {
+    // Split on any char that is not a letter or digit. This is more reliable
+    // than inserting spaces around each alias because it handles punctuation
+    // delimiters (semicolons, pipes, parens) that PowerShell uses.
+    lower
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|tok| aliases.contains(&tok))
+}
+
+/// Return `true` if `lower` (pre-lowercased command string) contains a Windows
+/// 8.3 short-name token that plausibly refers to the protected path `p`
+/// (already lowercased, forward-slash separated).
+///
+/// The 8.3 pattern is `<stem>~<digit>` optionally followed by `.ext`.  We
+/// extract the stem (up to 8 chars), strip it to at most 6 chars (Windows
+/// truncates the stem to 6 before appending `~N`), and check whether it is a
+/// prefix of any path *component* (segment) of `p` — i.e., a filename stem or
+/// directory name in the protected entry.
+fn command_contains_short_name_for(p: &str, lower: &str) -> bool {
+    // Collect the stems of all path components we need to protect.
+    // For "src-tauri/src/permissions.rs" → ["src-tauri", "src", "permissions"].
+    // For "src-tauri/src/" (dir entry) → ["src-tauri", "src"].
+    let protected_stems: Vec<&str> = p
+        .split('/')
+        .map(|seg| {
+            // Strip the file extension so we compare stem-to-stem.
+            if let Some(dot) = seg.rfind('.') {
+                &seg[..dot]
+            } else {
+                seg
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Walk every slash/backslash/space/paren-delimited token in the command
+    // and test it against the 8.3 pattern.
+    for tok in lower.split(|c: char| {
+        c == '/'
+            || c == '\\'
+            || c == ' '
+            || c == '\t'
+            || c == '('
+            || c == ')'
+            || c == '"'
+            || c == '\''
+            || c == ';'
+            || c == '|'
+    }) {
+        // Strip a leading extension-dot if this is just an extension token.
+        let tok = tok.trim_matches('.');
+        if tok.is_empty() {
+            continue;
+        }
+        // Locate `~<digit>` — that's the 8.3 marker.
+        if let Some(tilde_pos) = tok.find('~') {
+            let after_tilde = &tok[tilde_pos + 1..];
+            // The char immediately after `~` must be a digit (1–9).
+            let first = after_tilde.chars().next();
+            if !first.is_some_and(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            // Extract the base stem (the part before `~`), capped at 6 chars
+            // because Windows truncates the long name stem to 6 before `~N`.
+            let raw_stem = &tok[..tilde_pos];
+            let cmp_stem = if raw_stem.len() > 6 {
+                &raw_stem[..6]
+            } else {
+                raw_stem
+            };
+            if cmp_stem.is_empty() {
+                continue;
+            }
+            // Check whether this stem is a prefix of any protected component.
+            for pstem in &protected_stems {
+                if pstem.starts_with(cmp_stem) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 // ── path helpers ─────────────────────────────────────────────────────────────
@@ -1367,6 +1511,128 @@ mod tests {
         // Both present → blocked.
         assert!(shell_targets_protected_path("Set-Content deny.toml ''").is_some());
         assert!(shell_targets_protected_path("echo '' > src-tauri/src/agent.rs").is_some());
+    }
+
+    // ── PowerShell alias bypass hardening ─────────────────────────────────────
+
+    #[test]
+    fn shell_scan_blocks_ps_alias_sc_against_protected_path() {
+        // `sc` is the built-in alias for Set-Content. It must be blocked when
+        // combined with a protected path, just like the full cmdlet name.
+        assert!(
+            shell_targets_protected_path("sc src-tauri/src/permissions.rs 'x'").is_some(),
+            "`sc` alias + protected path must be blocked"
+        );
+        // Other aliases likewise.
+        assert!(
+            shell_targets_protected_path("ni src-tauri/src/permissions.rs").is_some(),
+            "`ni` (New-Item) alias + protected path must be blocked"
+        );
+        assert!(
+            shell_targets_protected_path("ri src-tauri/src/permissions.rs").is_some(),
+            "`ri` (Remove-Item) alias + protected path must be blocked"
+        );
+        assert!(
+            shell_targets_protected_path("mi old.txt rust-toolchain.toml").is_some(),
+            "`mi` (Move-Item) alias + protected path must be blocked"
+        );
+        assert!(
+            shell_targets_protected_path("rni src-tauri/src/permissions.rs newname.rs").is_some(),
+            "`rni` (Rename-Item) alias + protected path must be blocked"
+        );
+    }
+
+    #[test]
+    fn shell_scan_alias_check_requires_whole_token_not_substring() {
+        // "sc" appears as a substring in many innocent words. The alias check
+        // must NOT fire on substrings — only on the alias standing alone as a
+        // whitespace/punctuation-delimited token.
+        assert!(
+            shell_targets_protected_path("basic src-tauri/src/permissions.rs").is_none(),
+            "\"sc\" inside \"basic\" must not match the alias"
+        );
+        assert!(
+            shell_targets_protected_path("describe deny.toml").is_none(),
+            "\"sc\" inside \"describe\" must not match the alias (no write indicator)"
+        );
+        // `ni` inside "unit" or "unix": not a standalone token.
+        assert!(
+            shell_targets_protected_path("unix src-tauri/src/permissions.rs").is_none(),
+            "\"ni\" inside \"unix\" must not trigger the alias check"
+        );
+    }
+
+    #[test]
+    fn shell_scan_alias_sc_against_non_protected_path_is_allowed() {
+        // The guard requires BOTH a write indicator AND a protected path.
+        // `sc` against an ordinary file must pass through.
+        assert!(
+            shell_targets_protected_path("sc src-tauri/src/db.rs 'x'").is_none(),
+            "`sc` against a non-protected path must not be blocked"
+        );
+        assert!(
+            shell_targets_protected_path("ni build/output.txt").is_none(),
+            "`ni` against a non-protected path must not be blocked"
+        );
+    }
+
+    // ── Windows 8.3 short-name bypass hardening ───────────────────────────────
+
+    #[test]
+    fn shell_scan_blocks_8dot3_short_name_for_protected_file() {
+        // `PERMIS~1.RS` is the canonical Windows 8.3 short name for
+        // `permissions.rs` when it is the first (or only) matching file in the
+        // directory. A redirection to that token must be caught.
+        assert!(
+            shell_targets_protected_path("echo x > src-tauri\\src\\PERMIS~1.RS").is_some(),
+            "8.3 short name PERMIS~1.RS with redirection must be blocked"
+        );
+        // Also blocked when the path uses forward slashes.
+        assert!(
+            shell_targets_protected_path("Set-Content src-tauri/src/PERMIS~1.RS 'x'").is_some(),
+            "8.3 short name with Set-Content (forward slash) must be blocked"
+        );
+        // `sc` alias + 8.3 name — both bypass channels combined.
+        assert!(
+            shell_targets_protected_path("sc src-tauri/src/PERMIS~1.RS 'x'").is_some(),
+            "`sc` alias + 8.3 short name must be blocked"
+        );
+    }
+
+    #[test]
+    fn shell_scan_blocks_8dot3_short_name_for_protected_dir() {
+        // `SYNCS~1` could be the 8.3 short name for the `sync` directory under
+        // `src-tauri/src/sync/`. Test a write into that dir via the short name.
+        assert!(
+            shell_targets_protected_path("echo x > src-tauri\\src\\SYNC~1\\server.rs").is_some(),
+            "8.3 short name for protected dir must be blocked"
+        );
+    }
+
+    #[test]
+    fn shell_scan_reads_of_protected_paths_still_allowed_with_8dot3() {
+        // A read command (cat / git log) naming a protected file via its 8.3
+        // short name must NOT be blocked — no write indicator present.
+        assert!(
+            shell_targets_protected_path("cat src-tauri\\src\\PERMIS~1.RS").is_none(),
+            "read of 8.3 short name (no write indicator) must be allowed"
+        );
+    }
+
+    #[test]
+    fn shell_scan_8dot3_against_non_protected_path_is_allowed() {
+        // The 8.3 check only fires when the stem prefix matches a protected
+        // entry. An innocent `~1` token whose prefix does not match any protected
+        // file or directory must pass through, provided there is a write
+        // indicator (so the dual-condition still applies to the whole function).
+        //
+        // "db.rs" has stem "db" → "db~1.rs" → prefix "db" does NOT match any
+        // protected component ("permissions", "secrets", "oauth", "tools",
+        // "agent", "sync", "github", "tauri", "rust-toolchain", "deny", …).
+        assert!(
+            shell_targets_protected_path("sc src-tauri/src/DB~1.RS 'x'").is_none(),
+            "8.3 short name for a non-protected file must not be blocked"
+        );
     }
 
     // ── sandbox-escape via reparse points (junction / symlink) ────────────────

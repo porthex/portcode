@@ -146,3 +146,26 @@ indirection) is a documented residual gap** — mitigated by the file tools bein
 hard-blocked (the agent's normal edit path), the Phase-2 promotion health-gate, and
 git rollback. The protected source files are themselves git-tracked, so any sneaked
 change is visible in the diff before promotion.
+
+The scanner has been hardened against two additional bypass vectors:
+
+* **PowerShell cmdlet aliases** — short aliases (`sc`/Set-Content, `ac`/Add-Content,
+  `clc`/Clear-Content, `ni`/New-Item, `mi`/Move-Item, `cpi`/Copy-Item,
+  `ri`/Remove-Item, `rni`/Rename-Item) are matched as whole tokens so they cannot
+  hide inside innocent words like "basic" or "describe". Previously only the full
+  cmdlet name was listed, so `sc permissions.rs 'x'` slipped through.
+
+* **Windows 8.3 short names** — `PERMIS~1.RS` is the 8.3 alias Windows assigns to
+  `permissions.rs` when it is the first file in the directory whose name starts with
+  the same six characters. The scanner detects the `NAME~<digit>` pattern in path
+  tokens and checks whether the stem prefix (capped at 6 chars, matching Windows'
+  truncation rule) is a prefix of any protected filename stem or directory component.
+  Previously `echo x > src-tauri\src\PERMIS~1.RS` bypassed the scan entirely.
+
+**Remaining documented residual gaps** (defense-in-depth; primary protection is the
+`fs_write`/`fs_edit` hard-block + promotion health-gate + git rollback):
+
+* Command obfuscation — base64 payloads, string concatenation, environment-variable
+  indirection, `iex`/`Invoke-Expression`, COM/WMI paths, etc.
+* 8.3 `~2`, `~3`, … collision variants (extremely unlikely for the protected file set
+  but not impossible on a heavily populated directory).
