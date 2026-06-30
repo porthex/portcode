@@ -1,21 +1,25 @@
-//! Self-dev Phase-2 promotion supervisor (SLICE 1: the automated GATE + UX).
+//! Self-dev Phase-2 promotion supervisor (the automated GATE + UX + apply-restart).
 //!
 //! Portcode can be built while it runs it, dogfood-style (see `docs/SELF_DEV.md`).
-//! "Promotion" is the act of moving the working tree into the running dev build.
-//! This module owns the SAFE FRONT HALF of that pipeline:
+//! "Promotion" is the act of moving the working tree into the running dev build:
 //!
 //! ```text
-//! Idle → Snapshotting → Testing{Frontend} → Testing{Rust} → Done | Failed{step,msg}
+//! Idle → Snapshotting → Testing{Frontend} → Testing{Rust} → Done → Applying
+//!                                                           ↘ Failed{step,msg}
 //! ```
 //!
-//! 1. **Snapshot** the SQLite DB (a recoverable point if a later swap goes wrong).
+//! 1. **Snapshot** the SQLite DB (a recoverable point if a change misbehaves).
 //! 2. **Gate** the change behind the test suites: `pnpm test` then
-//!    `cargo test --workspace`.
+//!    `cargo test --workspace` (SLICE 1).
+//! 3. **Apply** — on a green gate, a user-confirmed `promote_apply` restarts the
+//!    dev build so the change takes effect (SLICE 2).
 //!
-//! On green, a future SLICE 2 would restart the dev build onto the new binary.
-//! That restart — and any process/binary swap — is explicitly NOT built here:
-//! Slice 1 stops once the gate has run and reports pass/fail. No process is
-//! touched.
+//! The restart can't happen in-process — `tauri dev` compiles the Rust binary once
+//! at startup and `app.restart()` would relaunch the SAME binary. So `promote_apply`
+//! exits with [`promote::RESTART_EXIT_CODE`] and an external restart-loop wrapper
+//! (`scripts/dev-self-loop.mjs`, run via `pnpm app:dev:self:loop`) relaunches
+//! `tauri dev`, which recompiles. Safety lives in the GATE that runs first; rollback
+//! is a `git revert` + another apply.
 //!
 //! The WHOLE module is compiled only under `cfg(all(desktop, feature =
 //! "self-dev"))`, so a production build (no `--features self-dev`) contains zero

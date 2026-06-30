@@ -435,6 +435,10 @@ describe("Tauri command serialization", () => {
     invoke.mockResolvedValue(status);
     await expect(ipc.promoteStatus()).resolves.toBe(status);
     expect(invoke).toHaveBeenCalledWith("promote_status");
+
+    invoke.mockResolvedValue(undefined);
+    await expect(ipc.promoteApply()).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("promote_apply");
   });
 
   it("onPromoteEvent listens on the selfdev channel and unwraps the payload", async () => {
@@ -506,6 +510,7 @@ describe("browser fallback (no Tauri core)", () => {
 
     await expect(ipc.promoteBegin()).resolves.toBeUndefined();
     await expect(ipc.promoteCancel()).resolves.toBeUndefined();
+    await expect(ipc.promoteApply()).resolves.toBeUndefined();
     await expect(ipc.promoteStatus()).resolves.toEqual({
       phase: "idle",
       message: null,

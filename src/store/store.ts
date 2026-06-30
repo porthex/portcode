@@ -280,6 +280,8 @@ interface AppState {
   // ── Self-dev promotion ──────────────────────────────────────────────────────
   beginPromotion: () => Promise<void>;
   cancelPromotion: () => Promise<void>;
+  // Apply a passed gate: restart the dev build to apply the change (SLICE 2).
+  applyPromotion: () => Promise<void>;
   // Apply a pushed `selfdev://promote` status (or a polled `promote_status`).
   applyPromoteStatus: (status: PromoteStatus) => void;
   // Subscribe to the promote control event; returns the unlisten handle.
@@ -2487,7 +2489,7 @@ export const useStore = create<AppState>((set, get) => ({
     set((st) => ({ update: { ...IDLE_UPDATE, info: st.update.info } }));
   },
 
-  // ── Self-dev promotion (SLICE 1) ────────────────────────────────────────────
+  // ── Self-dev promotion ──────────────────────────────────────────────────────
 
   async beginPromotion() {
     // Optimistically reflect "starting" so the badge reacts instantly; the
@@ -2508,6 +2510,25 @@ export const useStore = create<AppState>((set, get) => ({
       // here beyond a best-effort call.
     } catch {
       // Command unavailable / nothing running — harmless.
+    }
+  },
+
+  async applyPromotion() {
+    // Show "applying" BEFORE the call: on success the Rust command calls
+    // `app.exit()` to relaunch onto the rebuilt binary, so the await never settles
+    // and anything after it is unreachable — the badge must be set first. A reject
+    // (gate not green, or no restart-loop wrapper active) then falls through to the
+    // catch and lands a failed phase with the reason, so the user knows to launch
+    // `pnpm app:dev:self:loop`.
+    set({
+      promotePhase: "applying",
+      promoteMessage: "Restarting the dev build to apply…",
+      promoteProgress: 1,
+    });
+    try {
+      await ipc.promoteApply();
+    } catch (err) {
+      set({ promotePhase: "failed", promoteMessage: errMessage(err), promoteProgress: 1 });
     }
   },
 

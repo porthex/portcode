@@ -1394,10 +1394,10 @@ pub fn run() {
         update::update_channel
     ]);
 
-    // DESKTOP + self-dev — the same surface PLUS the promotion supervisor trio
-    // (`promote_begin`/`promote_cancel`/`promote_status`). Compiled only with
-    // `--features self-dev`; the `not(feature = "self-dev")` arm above is what
-    // ships in production.
+    // DESKTOP + self-dev — the same surface PLUS the promotion supervisor commands
+    // (`promote_begin`/`promote_cancel`/`promote_status`/`promote_apply`). Compiled
+    // only with `--features self-dev`; the `not(feature = "self-dev")` arm above is
+    // what ships in production.
     #[cfg(all(desktop, feature = "self-dev"))]
     let builder = builder.invoke_handler(tauri::generate_handler![
         get_settings,
@@ -1443,7 +1443,8 @@ pub fn run() {
         // not carry those hidden items).
         selfdev::promote::promote_begin,
         selfdev::promote::promote_cancel,
-        selfdev::promote::promote_status
+        selfdev::promote::promote_status,
+        selfdev::promote::promote_apply
     ]);
 
     // MOBILE — the remote-CLIENT subset. Shared settings/secrets/sessions +

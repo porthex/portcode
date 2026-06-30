@@ -17,6 +17,7 @@
     "app:dev": "tauri dev",
     "app:build": "tauri build",
     "app:dev:self": "tauri dev --config src-tauri/tauri.dev.conf.json",
+    "app:dev:self:loop": "node scripts/dev-self-loop.mjs",
     "app:build:self": "tauri build --config src-tauri/tauri.dev.conf.json",
     "watch:rust": "cd src-tauri && bacon",
     "lint": "eslint .",

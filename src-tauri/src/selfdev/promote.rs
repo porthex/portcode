@@ -1,9 +1,10 @@
-//! The promotion state machine + its three Tauri commands.
+//! The promotion state machine + its four Tauri commands.
 //!
-//! State machine (SLICE 1 — no swap/relaunch):
+//! State machine:
 //!
 //! ```text
-//! Idle → Snapshotting → Testing{Frontend} → Testing{Rust} → Done | Failed{step,msg}
+//! Idle → Snapshotting → Testing{Frontend} → Testing{Rust} → Done → Applying
+//!                                                          ↘ Failed{step,msg}
 //! ```
 //!
 //! - `promote_begin` — errors if a promotion is already running; otherwise spawns
@@ -11,6 +12,9 @@
 //! - `promote_cancel` — trips the shared cancel flag; the pipeline short-circuits
 //!   to `Failed { step, "cancelled" }` between steps.
 //! - `promote_status` — a snapshot of the current phase as a [`PromoteStatusDto`].
+//! - `promote_apply` — on a green gate (`Done`), restarts the dev build to apply
+//!   the change (SLICE 2): records `Applying`, then exits with [`RESTART_EXIT_CODE`]
+//!   so the external restart-loop wrapper relaunches `tauri dev` (recompiling).
 //!
 //! Progress is emitted on the `selfdev://promote` CONTROL event (via `app.emit`
 //! directly — this is not a conversation StreamEvent, so it never touches the
@@ -25,6 +29,18 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::selfdev::{health, snapshot};
 use crate::AppState;
 
+/// Exit code the dev build uses to ask its restart-loop wrapper
+/// (`scripts/dev-self-loop.mjs`, via `pnpm app:dev:self:loop`) to relaunch the
+/// `tauri dev` process — which recompiles, applying the Rust change the gate just
+/// approved. MUST stay in sync with `RESTART_EXIT_CODE` in that script. Any other
+/// exit code stops the loop.
+pub(crate) const RESTART_EXIT_CODE: i32 = 86;
+
+/// Env var the restart-loop wrapper sets on its child. When it is `"1"` a wrapper
+/// is watching for [`RESTART_EXIT_CODE`]; otherwise `promote_apply` refuses, since
+/// exiting would just close the app with nothing to relaunch it.
+const RESTART_LOOP_ENV: &str = "PORTCODE_SELFDEV_RESTART_LOOP";
+
 /// Which gate step we are on (or failed at). Serializes to a snake_case string so
 /// the frontend `PromotePhase` union (in `types.ts`) matches the wire shape.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -38,8 +54,11 @@ pub enum PromotePhase {
     TestingFrontend,
     /// Running the Rust test suite (`cargo test --workspace`).
     TestingRust,
-    /// The gate passed end-to-end. (Slice 2 would restart here.)
+    /// The gate passed end-to-end. The dev build can now restart to apply (Slice 2).
     Done,
+    /// The user accepted a passed gate — the dev build is exiting so its restart-loop
+    /// wrapper relaunches onto the rebuilt binary (Slice 2).
+    Applying,
     /// A step failed (or was cancelled). `step`/`message` carry the detail.
     Failed,
 }
@@ -55,6 +74,7 @@ impl PromotePhase {
             PromotePhase::TestingFrontend => 0.4,
             PromotePhase::TestingRust => 0.7,
             PromotePhase::Done => 1.0,
+            PromotePhase::Applying => 1.0,
             PromotePhase::Failed => 1.0,
         }
     }
@@ -256,12 +276,14 @@ async fn run_pipeline_with<S, SFut, F, FFut, R, RFut>(
         return fail(app, phase, "Rust tests", &e);
     }
 
-    // 4. Gate passed. SLICE 2 would restart the dev build here; Slice 1 stops.
+    // 4. Gate passed. The restart that APPLIES the change is a separate,
+    //    user-confirmed step (`promote_apply`) — never automatic — so the gate
+    //    can pass without forcing a relaunch mid-edit.
     set_phase(
         app,
         phase,
         PromotePhase::Done,
-        Some("Gate passed — tests green. (Restart is Slice 2.)".to_string()),
+        Some("Gate passed — tests green. Apply to restart the dev build.".to_string()),
     );
 }
 
@@ -283,6 +305,28 @@ fn fail(app: &AppHandle, phase: &Arc<Mutex<PhaseState>>, step: &str, reason: &st
         PromotePhase::Failed,
         Some(format!("{step}: {reason}")),
     );
+}
+
+/// True when a restart-loop wrapper is active (env `PORTCODE_SELFDEV_RESTART_LOOP=1`).
+fn restart_loop_active() -> bool {
+    std::env::var(RESTART_LOOP_ENV)
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Whether `promote_apply` may proceed: the gate must have passed (`Done`) AND a
+/// restart-loop wrapper must be active (so exiting actually relaunches the build).
+/// Pure, so it is unit-testable without an `AppHandle` — the real command calls
+/// `app.exit`, which would otherwise kill the test process.
+fn apply_decision(phase: &PromotePhase, loop_active: bool) -> Result<(), String> {
+    match phase {
+        PromotePhase::Done if loop_active => Ok(()),
+        PromotePhase::Done => Err(
+            "restart loop not active — launch the dev build with `pnpm app:dev:self:loop` so the app can relaunch onto the rebuilt binary"
+                .to_string(),
+        ),
+        _ => Err("the gate has not passed; run a promotion to green before applying".to_string()),
+    }
 }
 
 // ── Tauri commands ───────────────────────────────────────────────────────────
@@ -334,6 +378,36 @@ pub fn promote_status(app: AppHandle) -> PromoteStatusDto {
         message: guard.message.clone(),
         progress: guard.phase.progress(),
     }
+}
+
+/// Apply a passed gate by relaunching the dev build (SLICE 2). Valid only in the
+/// `Done` phase AND when a restart-loop wrapper is active (see [`RESTART_LOOP_ENV`]);
+/// otherwise it returns an error and the app stays put. On success it records
+/// `Applying`, emits a final event, then exits the process with [`RESTART_EXIT_CODE`]
+/// so the wrapper relaunches `tauri dev` (which recompiles, applying the change).
+/// Rollback, if a change misbehaves, is a `git revert` + another apply — the safety
+/// lives in the gate that ran before this point.
+#[tauri::command]
+pub fn promote_apply(app: AppHandle) -> Result<(), String> {
+    let promote = app.state::<PromoteState>();
+    let phase = promote.phase.lock().unwrap().phase.clone();
+    apply_decision(&phase, restart_loop_active())?;
+
+    // Record `Applying` and emit it — best-effort only: `app.exit` may terminate the
+    // process before the event flushes, so NO UI path depends on it (the frontend
+    // `applyPromotion` sets the `applying` badge optimistically before this call).
+    // This keeps `promote_status` truthful for anything that reads it before exit.
+    let phase_arc = promote.phase.clone();
+    set_phase(
+        &app,
+        &phase_arc,
+        PromotePhase::Applying,
+        Some("Restarting the dev build to apply…".to_string()),
+    );
+    // `app.exit` ultimately calls `std::process::exit`, but its Rust return type is
+    // `()` (not `!`), so the trailing `Ok(())` is required to satisfy the signature.
+    app.exit(RESTART_EXIT_CODE);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -413,7 +487,7 @@ mod tests {
 
         record(
             PromotePhase::Done,
-            Some("Gate passed — tests green. (Restart is Slice 2.)".to_string()),
+            Some("Gate passed — tests green. Apply to restart the dev build.".to_string()),
         );
         log
     }
@@ -497,6 +571,7 @@ mod tests {
         assert!(PromotePhase::TestingFrontend.progress() < PromotePhase::TestingRust.progress());
         assert!(PromotePhase::TestingRust.progress() < PromotePhase::Done.progress());
         assert_eq!(PromotePhase::Done.progress(), 1.0);
+        assert_eq!(PromotePhase::Applying.progress(), 1.0);
     }
 
     #[test]
@@ -511,7 +586,38 @@ mod tests {
         assert!(st.is_running());
         st.phase.lock().unwrap().phase = PromotePhase::Done;
         assert!(!st.is_running());
+        st.phase.lock().unwrap().phase = PromotePhase::Applying;
+        assert!(!st.is_running());
         st.phase.lock().unwrap().phase = PromotePhase::Failed;
         assert!(!st.is_running());
+    }
+
+    #[test]
+    fn apply_decision_requires_done_and_an_active_loop() {
+        // Done + wrapper present → allowed.
+        assert!(apply_decision(&PromotePhase::Done, true).is_ok());
+        // Done but no wrapper → refused, with a pointer to the loop script.
+        let e = apply_decision(&PromotePhase::Done, false).unwrap_err();
+        assert!(e.contains("app:dev:self:loop"), "got: {e}");
+        // Any non-Done phase → refused regardless of the loop.
+        for p in [
+            PromotePhase::Idle,
+            PromotePhase::Snapshotting,
+            PromotePhase::TestingFrontend,
+            PromotePhase::TestingRust,
+            PromotePhase::Applying,
+            PromotePhase::Failed,
+        ] {
+            assert!(apply_decision(&p, true).is_err(), "{p:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn restart_exit_code_is_a_distinctive_nonzero() {
+        // Inside the portable 0–255 exit-code space, clear of the common 0/1/2 and
+        // the sysexits 64–78 range so it can't be confused with a real failure code.
+        assert_eq!(RESTART_EXIT_CODE, 86);
+        assert!((3..=255).contains(&RESTART_EXIT_CODE));
+        assert!(!(64..=78).contains(&RESTART_EXIT_CODE));
     }
 }

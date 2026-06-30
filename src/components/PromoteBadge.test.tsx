@@ -106,6 +106,25 @@ describe("PromoteBadge — done", () => {
     fireEvent.click(screen.getByRole("button", { name: /Gate passed/ }));
     expect(beginPromotion).toHaveBeenCalledTimes(1);
   });
+
+  it("offers Apply & Restart that triggers applyPromotion", () => {
+    const applyPromotion = vi.fn();
+    useStore.setState({ applyPromotion });
+    renderBadge("done");
+
+    fireEvent.click(screen.getByRole("button", { name: /Apply & Restart/ }));
+    expect(applyPromotion).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("PromoteBadge — applying", () => {
+  it("shows a shimmering Restarting… pill", () => {
+    renderBadge("applying", "Restarting the dev build to apply…");
+    const pill = screen.getByTestId("promote-applying");
+    expect(pill).toHaveTextContent("Restarting…");
+    // Reuses the running-phase shimmer to mark it as live.
+    expect(pill.querySelector(".pc-shimmer")).not.toBeNull();
+  });
 });
 
 describe("PromoteBadge — failed", () => {

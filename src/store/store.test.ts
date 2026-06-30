@@ -63,6 +63,7 @@ vi.mock("../lib/ipc", () => ({
   promoteBegin: vi.fn(),
   promoteCancel: vi.fn(),
   promoteStatus: vi.fn(),
+  promoteApply: vi.fn(),
   onPromoteEvent: vi.fn(),
 }));
 
@@ -136,6 +137,7 @@ beforeEach(() => {
   m.promoteBegin.mockResolvedValue(undefined);
   m.promoteCancel.mockResolvedValue(undefined);
   m.promoteStatus.mockResolvedValue({ phase: "idle", message: null, progress: 0 });
+  m.promoteApply.mockResolvedValue(undefined);
   m.onPromoteEvent.mockResolvedValue(() => {});
 });
 
@@ -4030,7 +4032,7 @@ describe("auto-update", () => {
   });
 });
 
-describe("self-dev promotion (SLICE 1)", () => {
+describe("self-dev promotion", () => {
   describe("beginPromotion", () => {
     it("optimistically enters snapshotting and invokes ipc.promoteBegin", async () => {
       m.promoteBegin.mockResolvedValue(undefined);
@@ -4072,6 +4074,31 @@ describe("self-dev promotion (SLICE 1)", () => {
     });
   });
 
+  describe("applyPromotion", () => {
+    it("invokes ipc.promoteApply and reflects the optimistic applying phase", async () => {
+      m.promoteApply.mockResolvedValue(undefined);
+
+      await useStore.getState().applyPromotion();
+
+      expect(m.promoteApply).toHaveBeenCalledTimes(1);
+      const st = useStore.getState();
+      expect(st.promotePhase).toBe("applying");
+      expect(st.promoteProgress).toBe(1);
+    });
+
+    it("lands a failed phase (never throws) when promoteApply rejects", async () => {
+      // e.g. the gate isn't green, or no restart-loop wrapper is active.
+      m.promoteApply.mockRejectedValue(new Error("restart loop not active"));
+
+      await expect(useStore.getState().applyPromotion()).resolves.toBeUndefined();
+
+      const st = useStore.getState();
+      expect(st.promotePhase).toBe("failed");
+      expect(st.promoteMessage).toBe("restart loop not active");
+      expect(st.promoteProgress).toBe(1);
+    });
+  });
+
   describe("applyPromoteStatus", () => {
     it("mirrors a pushed status into the slice fields", () => {
       useStore.getState().applyPromoteStatus({
@@ -4096,6 +4123,18 @@ describe("self-dev promotion (SLICE 1)", () => {
       const st = useStore.getState();
       expect(st.promotePhase).toBe("failed");
       expect(st.promoteMessage).toBe("Rust tests: exit code 101");
+      expect(st.promoteProgress).toBe(1);
+    });
+
+    it("mirrors a pushed applying status (the server-driven restart beat)", () => {
+      useStore.getState().applyPromoteStatus({
+        phase: "applying",
+        message: "Restarting the dev build to apply…",
+        progress: 1,
+      });
+
+      const st = useStore.getState();
+      expect(st.promotePhase).toBe("applying");
       expect(st.promoteProgress).toBe(1);
     });
   });

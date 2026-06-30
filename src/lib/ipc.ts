@@ -205,7 +205,7 @@ export async function onUpdaterEvent(
   return mock.onUpdaterEvent(handler);
 }
 
-// ── Self-dev promotion supervisor (SLICE 1: gate + UX) ──────────────────────────
+// ── Self-dev promotion supervisor (gate + UX + apply-restart) ───────────────────
 // Desktop self-dev build only — these commands exist solely when the Rust core is
 // compiled with `--features self-dev`. On any other host (production desktop, web
 // client, vite preview) they are inert: the commands are absent / the mock no-ops,
@@ -240,6 +240,19 @@ export async function promoteStatus(): Promise<PromoteStatus> {
     return core.invoke<PromoteStatus>("promote_status");
   }
   return mock.promoteStatus();
+}
+
+/** Apply a passed gate: restart the dev build so the change takes effect (SLICE 2).
+ *  Rejects unless the gate is `done` AND a restart-loop wrapper is active
+ *  (`pnpm app:dev:self:loop`). On success the app exits to relaunch, so this call
+ *  may never resolve in-process. */
+export async function promoteApply(): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("promote_apply");
+    return;
+  }
+  return mock.promoteApply();
 }
 
 /** Subscribe to the `selfdev://promote` control event — each transition pushes the
@@ -716,6 +729,9 @@ const mock = (() => {
     },
     async promoteStatus(): Promise<PromoteStatus> {
       return { phase: "idle", message: null, progress: 0 };
+    },
+    async promoteApply() {
+      // no-op: the preview has no dev build to restart.
     },
     async onPromoteEvent(_cb: (status: PromoteStatus) => void): Promise<Unlisten> {
       return () => {}; // inert subscription; the preview never promotes.

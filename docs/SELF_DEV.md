@@ -3,9 +3,10 @@
 Self-dev mode is how you **build Portcode while living inside Portcode** — the
 fastest way to find real bugs is to use the app all day as you change it.
 
-This document covers **Phase 1**, which is shippable today and adds no risk to
-the normal app. Phase 2 (the automatic, gated build-promotion supervisor) is
-sketched at the bottom but intentionally **not** built yet.
+This document covers **Phase 1** (the side-by-side dev build, shippable today and
+adding no risk to the normal app) and **Phase 2** (the gated promotion supervisor
+that lets the running dev build apply its own changes) — both now built behind the
+`self-dev` Cargo feature, so a production build carries none of it.
 
 > **Why not "two synced instances that auto-swap on every change"?**
 > That was the original idea. A multi-agent feasibility study found it isn't
@@ -58,6 +59,10 @@ build, and only do the full rebuild when you actually want to run the change.
 # Run the self-dev app with live frontend reload (separate data dir + DEV pill).
 pnpm app:dev:self
 
+# Same, but UNDER THE RESTART LOOP so the in-app promote gate can apply its own
+# Rust changes (Phase 2). Builds with `--features self-dev`; see Phase 2 below.
+pnpm app:dev:self:loop
+
 # Build an installable "Portcode Dev" you can keep alongside your normal app.
 pnpm app:build:self
 
@@ -101,18 +106,42 @@ nothing in the UI triggers it), so it stays exactly the build you compiled.
 
 ---
 
-## Phase 2 (roadmap — not built yet)
+## Phase 2 — the promotion supervisor (BUILT)
 
-When a meaningful **Rust** change is ready to validate, a small supervisor
-(`scripts/self-dev.*`) would promote it safely, blue-green style:
+When a **Rust** change is ready to validate, the in-app promotion supervisor lets
+the running dev build apply it safely. It is **feature-gated** behind the
+`self-dev` Cargo feature (`#[cfg(all(desktop, feature = "self-dev"))]`), so a
+production build carries none of it. Live in `src-tauri/src/selfdev/`.
 
-1. **Snapshot** the stable `portcode.db` (after a WAL checkpoint).
-2. **Build** the candidate, then **health-gate** it (`pnpm test` + `cargo test`).
-3. **Promote** only on green; keep the previous binary at a fixed path so a
-   broken candidate **auto-rolls-back**.
-4. **Sequential, not concurrent** (the 8 GB machine can't sustain two live
-   instances plus a rebuild): close stable → build → gate → relaunch as the new
-   stable.
+**The model — gate + restart the dev build** (not a blue-green binary swap). The
+original blue-green sketch (keep two binaries, auto-roll-back to the old one) was
+dropped: `tauri dev` compiles the binary once at startup and `app.restart()` only
+relaunches the _same_ binary, so the running app can't recompile itself — the swap
+plumbing wasn't worth it. Instead, **safety lives in a test GATE**, and applying a
+change is just a controlled relaunch of `tauri dev` (which recompiles). Rollback,
+if something slips through, is a `git revert` + another apply.
+
+**The flow** (the **Promote** control sits beside the DEV pill in the title bar):
+
+1. **Promote** → **Snapshot** the dev `portcode.db` (after a WAL checkpoint) to a
+   recoverable copy under `selfdev/`.
+2. **Gate** the change: `pnpm test`, then `cargo test --workspace`. Any failure
+   (or a cancel) stops here and shows why — nothing is applied.
+3. On green → **Gate passed ✓**, with an **↻ Apply & Restart** button.
+4. **Apply** → the app records `applying` and exits with a distinctive code
+   (`86`). An external **restart-loop wrapper** sees that code and relaunches
+   `tauri dev`, which **recompiles**, bringing the change live. Any other exit
+   code stops the loop.
+
+Because the app can't recompile itself, **Apply only works under the wrapper** —
+run the dev build with `pnpm app:dev:self:loop` (which sets
+`PORTCODE_SELFDEV_RESTART_LOOP=1` and passes `--no-watch`, so changes apply only
+through the gate, never on every save). Without the wrapper, `promote_apply`
+refuses rather than closing the app with nothing to relaunch it.
+
+Commands: `promote_begin` / `promote_cancel` / `promote_status` / `promote_apply`
+(registered only with `--features self-dev`); progress is pushed on the
+`selfdev://promote` event and drives the `PromoteBadge`.
 
 ### Increment 1 — protected-paths denylist (BUILT)
 
@@ -149,13 +178,13 @@ change is visible in the diff before promotion.
 
 The scanner has been hardened against two additional bypass vectors:
 
-* **PowerShell cmdlet aliases** — short aliases (`sc`/Set-Content, `ac`/Add-Content,
+- **PowerShell cmdlet aliases** — short aliases (`sc`/Set-Content, `ac`/Add-Content,
   `clc`/Clear-Content, `ni`/New-Item, `mi`/Move-Item, `cpi`/Copy-Item,
   `ri`/Remove-Item, `rni`/Rename-Item) are matched as whole tokens so they cannot
   hide inside innocent words like "basic" or "describe". Previously only the full
   cmdlet name was listed, so `sc permissions.rs 'x'` slipped through.
 
-* **Windows 8.3 short names** — `PERMIS~1.RS` is the 8.3 alias Windows assigns to
+- **Windows 8.3 short names** — `PERMIS~1.RS` is the 8.3 alias Windows assigns to
   `permissions.rs` when it is the first file in the directory whose name starts with
   the same six characters. The scanner detects the `NAME~<digit>` pattern in path
   tokens and checks whether the stem prefix (capped at 6 chars, matching Windows'
@@ -165,7 +194,7 @@ The scanner has been hardened against two additional bypass vectors:
 **Remaining documented residual gaps** (defense-in-depth; primary protection is the
 `fs_write`/`fs_edit` hard-block + promotion health-gate + git rollback):
 
-* Command obfuscation — base64 payloads, string concatenation, environment-variable
+- Command obfuscation — base64 payloads, string concatenation, environment-variable
   indirection, `iex`/`Invoke-Expression`, COM/WMI paths, etc.
-* 8.3 `~2`, `~3`, … collision variants (extremely unlikely for the protected file set
+- 8.3 `~2`, `~3`, … collision variants (extremely unlikely for the protected file set
   but not impossible on a heavily populated directory).

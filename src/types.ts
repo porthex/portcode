@@ -337,7 +337,7 @@ export interface UpdateInfo {
  *  Returned by `update_channel`. */
 export type UpdateChannel = "stable";
 
-// ── Self-dev promotion supervisor (SLICE 1: gate + UX, no swap/restart) ─────────
+// ── Self-dev promotion supervisor (gate + UX + apply-restart) ───────────────────
 
 /**
  * The phase of the self-dev promotion pipeline. Mirrors the Rust `PromotePhase`
@@ -346,8 +346,10 @@ export type UpdateChannel = "stable";
  * - `snapshotting`     — taking the recoverable DB snapshot.
  * - `testing_frontend` — running the frontend gate (`pnpm test`).
  * - `testing_rust`     — running the Rust gate (`cargo test --workspace`).
- * - `done`             — the gate passed end-to-end. (A binary swap + restart is
- *   the deliberately-unbuilt SLICE 2.)
+ * - `done`             — the gate passed end-to-end; the dev build can now restart
+ *   to apply the change (`applyPromotion` → `promote_apply`).
+ * - `applying`         — the user accepted a passed gate; the dev build is exiting
+ *   so its restart-loop wrapper relaunches onto the rebuilt binary (SLICE 2).
  * - `failed`           — a step failed or was cancelled; `message` carries why.
  */
 export type PromotePhase =
@@ -356,6 +358,7 @@ export type PromotePhase =
   | "testing_frontend"
   | "testing_rust"
   | "done"
+  | "applying"
   | "failed";
 
 /**

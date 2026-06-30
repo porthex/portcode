@@ -12,17 +12,22 @@ import { useStore } from "../store/store";
  *   `pc-shimmer` look).
  * - `testing_frontend` — "Testing FE…" + shimmer.
  * - `testing_rust`     — "Testing RS…" + shimmer.
- * - `done`             — "Gate passed ✓" (success).
+ * - `done`             — "Gate passed ✓" (re-runs the gate) PLUS an "↻ Apply &
+ *   Restart" button that calls {@link applyPromotion} to relaunch onto the change.
+ * - `applying`         — "Restarting…" + shimmer (the dev build is exiting to
+ *   relaunch via the restart-loop wrapper).
  * - `failed`           — a warning pill carrying the failure `message`.
  *
- * NO binary swap and NO restart happen here — the gate runs and reports; the
- * restart is SLICE 2. Renders nothing in the normal (stable) build.
+ * The apply-restart only works under the restart-loop wrapper
+ * (`pnpm app:dev:self:loop`); otherwise the Rust command rejects and the badge
+ * shows the failure. Renders nothing in the normal (stable) build.
  */
 export function PromoteBadge() {
   const phase = useStore((s) => s.promotePhase);
   const message = useStore((s) => s.promoteMessage);
   const beginPromotion = useStore((s) => s.beginPromotion);
   const cancelPromotion = useStore((s) => s.cancelPromotion);
+  const applyPromotion = useStore((s) => s.applyPromotion);
 
   if (!isSelfDev()) return null;
 
@@ -83,15 +88,36 @@ export function PromoteBadge() {
       )}
 
       {phase === "done" && (
-        <button
-          type="button"
-          onClick={() => void beginPromotion()}
-          title="Gate passed — tests green. Click to run again. (Restart is Slice 2.)"
-          className="pc-pill pc-pill--success transition-colors hover:brightness-110"
+        <>
+          <button
+            type="button"
+            onClick={() => void beginPromotion()}
+            title="Gate passed — tests green. Click to re-run the gate."
+            className="pc-pill pc-pill--success transition-colors hover:brightness-110"
+          >
+            <span className="pc-dot pc-dot--success" />
+            Gate passed ✓
+          </button>
+          <button
+            type="button"
+            onClick={() => void applyPromotion()}
+            title="Restart the dev build to apply the change (recompiles). Requires `pnpm app:dev:self:loop`."
+            className="pc-pill pc-pill--accent transition-colors hover:brightness-110"
+          >
+            <span className="pc-dot pc-dot--accent" />↻ Apply &amp; Restart
+          </button>
+        </>
+      )}
+
+      {phase === "applying" && (
+        <span
+          className="pc-pill pc-pill--accent"
+          data-testid="promote-applying"
+          title="Restarting the dev build to apply the change"
         >
-          <span className="pc-dot pc-dot--success" />
-          Gate passed ✓
-        </button>
+          <span className="pc-dot pc-dot--accent pc-shimmer" />
+          Restarting…
+        </span>
       )}
 
       {phase === "failed" && (
