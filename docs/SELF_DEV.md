@@ -114,7 +114,35 @@ When a meaningful **Rust** change is ready to validate, a small supervisor
    instances plus a rebuild): close stable → build → gate → relaunch as the new
    stable.
 
+### Increment 1 — protected-paths denylist (BUILT)
+
 Prerequisite safety for Phase 2 (because the agent can edit Portcode's own
-source): a **protected-paths denylist** in `tools.rs::resolve_for_write` so a
-single approved write can't silently neuter `permissions.rs` / `secrets.rs` /
-`oauth.rs` / `sync/` / `.github/`.
+source): a **protected-paths denylist** so a single approved write can't silently
+neuter Portcode's own guards. Implemented in `src-tauri/src/tools.rs`:
+
+- A **compiled-in** `const PROTECTED: &[(&str, &str)]` (path-prefix → reason) —
+  deliberately not a runtime config file, which the agent could just `fs_write` to
+  empty. A future settings layer may only ever ADD entries; this const set is
+  always unioned in and can never be removed or disabled (the floor only rises).
+- Covered: `src-tauri/src/permissions.rs`, `secrets.rs`, `oauth.rs`, `sync/**`,
+  `tools.rs` + `agent.rs` (anti-tamper — the agent can't rewrite its own guards or
+  this very denylist), `.github/**`, `tauri.conf.json`, `tauri.dev.conf.json`,
+  `rust-toolchain.toml`, `deny.toml`.
+- Enforced at the single write chokepoint: `protected_reason()` is matched on the
+  workspace-relative, normalized path (case-insensitive; immune to `./`, `..`, and
+  Windows' silently-stripped trailing dots/spaces). `fs_write` is gated at the end
+  of `resolve_for_write`; `fs_edit` (which resolves an existing file) is gated right
+  after `resolve_existing` in both `run` and `preview`.
+
+**The `shell` bypass** — `shell` runs arbitrary commands with `cwd = workspace` and
+never resolves a write target, so `Set-Content permissions.rs …` would otherwise
+sidestep the denylist. Closed with `shell_targets_protected_path()`, a conservative
+TEXTUAL pre-exec scan run at the tool layer (so it holds even in `auto`/`bypass`
+permission mode, where the user never sees the command). It blocks a command that
+BOTH names a protected path AND carries a write indicator (redirection, or a known
+file-mutating cmdlet/command). A full shell parser is infeasible and would be a
+footgun, so **path/indicator obfuscation (string concat, base64, env-var
+indirection) is a documented residual gap** — mitigated by the file tools being
+hard-blocked (the agent's normal edit path), the Phase-2 promotion health-gate, and
+git rollback. The protected source files are themselves git-tracked, so any sneaked
+change is visible in the diff before promotion.

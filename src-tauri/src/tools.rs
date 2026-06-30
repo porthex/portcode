@@ -183,6 +183,185 @@ pub fn read_only_registry() -> Registry {
     ])
 }
 
+// ── protected paths (safety-critical denylist) ───────────────────────────────
+//
+// Self-dev mode lets the agent edit Portcode while Portcode runs it. That makes a
+// handful of files uniquely dangerous to let the agent rewrite: the permission
+// gate, the credential/OAuth/sync code, the tool layer and agent loop themselves
+// (anti-tamper — the agent must not disable its own guards), the CI workflows, and
+// the build/release config. A successful write to any of these could neuter every
+// other safety control in one shot.
+//
+// The denylist is COMPILED IN, not a runtime config file: a config file would just
+// be one more thing the agent could `fs_write` to empty, disabling the guard. A
+// future settings layer may ADD entries, but this const set is always unioned in
+// and can never be removed or disabled — the floor only ever rises.
+//
+// Entries are workspace-RELATIVE path prefixes in forward-slash form. A prefix
+// matches a path equal to it (a protected file) or any path under it (a protected
+// directory). The repo root IS the workspace in self-dev, so e.g. the permission
+// gate is `src-tauri/src/permissions.rs` and the CI workflows are `.github/`.
+const PROTECTED: &[(&str, &str)] = &[
+    // The permission gate itself.
+    ("src-tauri/src/permissions.rs", "the permission gate"),
+    // Credential / auth / secret handling.
+    ("src-tauri/src/secrets.rs", "credential storage"),
+    ("src-tauri/src/oauth.rs", "the OAuth flow"),
+    // The phone-sync transport / pairing / server (remote-control surface).
+    ("src-tauri/src/sync/", "the phone-sync layer"),
+    // Anti-tamper: the tool layer and agent loop must not rewrite their own guards.
+    ("src-tauri/src/tools.rs", "the tool layer (anti-tamper)"),
+    ("src-tauri/src/agent.rs", "the agent loop (anti-tamper)"),
+    // CI / supply-chain: workflows, lockfile-audit policy, toolchain pin, build cfg.
+    (".github/", "CI workflows"),
+    ("src-tauri/tauri.conf.json", "the Tauri build config"),
+    (
+        "src-tauri/tauri.dev.conf.json",
+        "the Tauri dev build config",
+    ),
+    ("rust-toolchain.toml", "the pinned Rust toolchain"),
+    ("deny.toml", "the cargo-deny supply-chain policy"),
+];
+
+/// Normalize a workspace-relative path to the canonical form the denylist matches
+/// against: forward slashes, lowercased (Windows is case-insensitive, and matching
+/// case-insensitively everywhere is strictly safer — it can only reject MORE), with
+/// `.` segments dropped and trailing dots/spaces stripped from each segment.
+///
+/// Windows silently strips trailing dots and spaces from path components when it
+/// opens a file (`permissions.rs.` and `permissions.rs ` both open `permissions.rs`),
+/// so a denylist that didn't strip them could be trivially sidestepped. `..` is not
+/// handled here on purpose: callers pass an already base-contained, `..`-free path.
+fn normalize_rel(rel: &Path) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Normal(s) => {
+                let seg = s.to_string_lossy().to_lowercase();
+                // Strip Windows' silently-ignored trailing dots/spaces per segment.
+                let trimmed = seg.trim_end_matches(['.', ' ']);
+                if !trimmed.is_empty() {
+                    parts.push(trimmed.to_string());
+                }
+            }
+            // Prefix/RootDir/ParentDir can't appear in a base-relative, normalized
+            // path; if one somehow does, fold it to nothing rather than matching.
+            _ => {}
+        }
+    }
+    parts.join("/")
+}
+
+/// If `rel` (a workspace-relative path) is safety-critical, return the human reason
+/// it's protected; otherwise `None`. Matching is on the NORMALIZED path so it's
+/// immune to `./`, case differences, and trailing dots/spaces. A denylist entry
+/// matches the exact file or anything beneath a protected directory.
+fn protected_reason(rel: &Path) -> Option<&'static str> {
+    let norm = normalize_rel(rel);
+    for (prefix, reason) in PROTECTED {
+        let p = prefix.trim_end_matches('/');
+        if norm == p || norm.starts_with(&format!("{p}/")) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+/// Reject a write whose resolved, base-contained target is on the protected
+/// denylist. `full` is the canonicalized absolute destination and `base` the
+/// canonical workspace root — so the relative path we match is exactly what landed
+/// on disk, not the raw (possibly `./`-laden) argument. The shared rejection point
+/// for `fs_write` and `fs_edit`.
+fn reject_if_protected(base: &Path, full: &Path) -> Result<(), String> {
+    if let Ok(rel) = full.strip_prefix(base) {
+        if let Some(reason) = protected_reason(rel) {
+            return Err(format!(
+                "'{}' is a protected, safety-critical path ({reason}) and cannot be \
+                 modified by the agent. This guard is compiled in and cannot be disabled \
+                 from inside the workspace.",
+                rel.to_string_lossy().replace('\\', "/")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Scan a `shell` command for an attempt to write a protected path, closing the
+/// bypass where `shell` could otherwise sidestep [`reject_if_protected`] (it runs
+/// arbitrary commands with `current_dir = workspace` and never resolves a write
+/// target). Returns the reason if the command BOTH names a protected path AND
+/// carries a write indicator (a redirection or a known file-mutating command).
+///
+/// This is a deliberately conservative TEXTUAL scan, not a shell parser: a full
+/// PowerShell/cmd parser is infeasible and would be a footgun (cf. the permission
+/// gate's literal-prefix matcher). It reliably stops the naive, non-adversarial
+/// case — an honest-but-misguided agent literally writing `permissions.rs` — and
+/// any path/indicator obfuscation (string concat, base64, env-var indirection)
+/// remains a documented residual gap, mitigated by the file tools being hard-
+/// blocked, the Phase-2 promotion gate, and git rollback. Crucially this runs at
+/// the TOOL layer, so it holds even in `auto`/`bypass` permission mode where the
+/// user never sees the command.
+fn shell_targets_protected_path(command: &str) -> Option<&'static str> {
+    let lower = command.to_lowercase();
+    // A write must be expressed somehow: a redirection or a file-mutating command.
+    const WRITE_INDICATORS: &[&str] = &[
+        ">",
+        "set-content",
+        "add-content",
+        "clear-content",
+        "out-file",
+        "tee-object",
+        "tee ",
+        "new-item",
+        "move-item",
+        "copy-item",
+        "rename-item",
+        "remove-item",
+        "writealltext",
+        "writealllines",
+        "writeallbytes",
+        "appendalltext",
+        "[io.file]",
+        "[system.io.file]",
+        // cmd / posix-ish aliases usable in the supported shells.
+        "del ",
+        "erase ",
+        "move ",
+        "copy ",
+        "ren ",
+        "rd ",
+        "rmdir",
+    ];
+    if !WRITE_INDICATORS.iter().any(|w| lower.contains(w)) {
+        return None;
+    }
+    // The command must also reference a protected path. Match on the LAST segment
+    // (the filename) for files and on the directory prefix for protected dirs, with
+    // both `/` and `\` accepted since a shell command can use either separator.
+    for (prefix, reason) in PROTECTED {
+        let p = prefix.trim_end_matches('/');
+        let p_back = p.replace('/', "\\");
+        if lower.contains(&p.to_lowercase()) || lower.contains(&p_back.to_lowercase()) {
+            return Some(reason);
+        }
+        // Also catch a bare filename reference (e.g. `permissions.rs`) for the
+        // file entries, since a command run with cwd=workspace may not spell the
+        // full relative path.
+        if !prefix.ends_with('/') {
+            if let Some(name) = Path::new(p).file_name() {
+                let name = name.to_string_lossy().to_lowercase();
+                // Only treat a bare filename as a hit if it's distinctive enough to
+                // not be a common name elsewhere; all protected files qualify.
+                if lower.contains(&name) {
+                    return Some(reason);
+                }
+            }
+        }
+    }
+    None
+}
+
 // ── path helpers ─────────────────────────────────────────────────────────────
 
 fn base_dir(ctx: &ToolCtx) -> Result<PathBuf, String> {
@@ -280,6 +459,10 @@ fn resolve_for_write(base: &Path, p: &str) -> Result<PathBuf, String> {
     if !real.starts_with(base) {
         return Err(format!("path '{p}' is outside the workspace"));
     }
+    // Final gate: the destination is inside the workspace — now reject it if it's a
+    // safety-critical, protected path. Done AFTER canonicalize + containment so the
+    // relative path we match is exactly what would land on disk.
+    reject_if_protected(base, &real)?;
     Ok(real)
 }
 
@@ -661,6 +844,11 @@ impl Tool for FsEdit {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let full = resolve_existing(&base, p).ok()?;
+        // fs_edit resolves through `resolve_existing` (the file must already exist),
+        // so the protected check lives here rather than in `resolve_for_write`.
+        // A protected target previews nothing (the prompt falls back to the summary)
+        // and `run` rejects it outright.
+        reject_if_protected(&base, &full).ok()?;
         let content = tokio::fs::read_to_string(&full).await.ok()?;
         let (updated, _) = compute_edit(&content, old, new, replace_all, p).ok()?;
         Some(unified_diff(&content, &updated))
@@ -676,6 +864,9 @@ impl Tool for FsEdit {
             .unwrap_or(false);
 
         let full = resolve_existing(&base, p)?;
+        // Reject a write to a protected, safety-critical path. fs_edit uses
+        // `resolve_existing`, so (unlike fs_write) this is its dedicated gate.
+        reject_if_protected(&base, &full)?;
         let content = tokio::fs::read_to_string(&full)
             .await
             .map_err(|e| format!("failed to read '{p}': {e}"))?;
@@ -808,6 +999,21 @@ impl Tool for Shell {
             .get("background")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        // Close the shell bypass: `shell` runs with cwd=workspace and never goes
+        // through `resolve_for_write`, so a write cmdlet/redirection could otherwise
+        // sidestep the protected denylist. Scan the command BEFORE spawning, at the
+        // tool layer — so it holds even in auto/bypass permission mode where the user
+        // never sees the command. Conservative textual scan; obfuscation is a
+        // documented residual gap (see `shell_targets_protected_path`).
+        if let Some(reason) = shell_targets_protected_path(command) {
+            return Err(format!(
+                "This command appears to write a protected, safety-critical path \
+                 ({reason}). The agent's file tools cannot modify protected paths, and \
+                 the shell may not be used to do so either. This guard is compiled in \
+                 and cannot be disabled from inside the workspace."
+            ));
+        }
 
         // Resolve the background runner BEFORE spawning, so an unavailable
         // background mode errors without leaving an orphan process.
@@ -944,6 +1150,223 @@ mod tests {
             .unwrap_err()
             .contains("outside the workspace"));
         std::fs::remove_dir_all(&b).ok();
+    }
+
+    // ── protected-paths denylist ──────────────────────────────────────────────
+
+    #[test]
+    fn protected_reason_matches_files_dirs_and_is_normalized() {
+        // Exact protected files.
+        assert!(protected_reason(Path::new("src-tauri/src/permissions.rs")).is_some());
+        assert!(protected_reason(Path::new("deny.toml")).is_some());
+        assert!(protected_reason(Path::new("rust-toolchain.toml")).is_some());
+        // Anything UNDER a protected directory.
+        assert!(protected_reason(Path::new("src-tauri/src/sync/server.rs")).is_some());
+        assert!(protected_reason(Path::new(".github/workflows/ci.yml")).is_some());
+        // The protected dir prefix itself.
+        assert!(protected_reason(Path::new("src-tauri/src/sync")).is_some());
+
+        // Case-insensitive (Windows opens paths case-insensitively).
+        assert!(protected_reason(Path::new("SRC-TAURI/SRC/Permissions.RS")).is_some());
+        // `.` segments and trailing dots/spaces (Windows strips them on open) must
+        // not let an attacker dodge the match.
+        assert!(protected_reason(Path::new("src-tauri/./src/permissions.rs")).is_some());
+        assert!(protected_reason(Path::new("src-tauri/src/permissions.rs.")).is_some());
+        assert!(protected_reason(Path::new("src-tauri/src/permissions.rs ")).is_some());
+
+        // Benign siblings are allowed.
+        assert!(protected_reason(Path::new("src-tauri/src/db.rs")).is_none());
+        assert!(protected_reason(Path::new("src/App.tsx")).is_none());
+        // A name that only PREFIX-collides must not match (sync vs syncfoo.rs).
+        assert!(protected_reason(Path::new("src-tauri/src/syncfoo.rs")).is_none());
+        assert!(protected_reason(Path::new("src-tauri/src/permissions_ui.rs")).is_none());
+    }
+
+    #[tokio::test]
+    async fn fs_write_rejects_each_protected_path() {
+        // Each protected entry must be rejected for fs_write::run. Use a real
+        // workspace and create the dirs/files so resolution itself succeeds and the
+        // protected gate is what does the rejecting (not a missing-path error).
+        let ws = unique_temp_dir("protected_write");
+        let ctx = ToolCtx::new(ws.clone());
+        for rel in [
+            "src-tauri/src/permissions.rs",
+            "src-tauri/src/secrets.rs",
+            "src-tauri/src/oauth.rs",
+            "src-tauri/src/tools.rs",
+            "src-tauri/src/agent.rs",
+            "src-tauri/tauri.conf.json",
+            "src-tauri/tauri.dev.conf.json",
+            "rust-toolchain.toml",
+            "deny.toml",
+        ] {
+            let err = FsWrite
+                .run(json!({ "path": rel, "content": "pwned" }), &ctx)
+                .await
+                .unwrap_err();
+            assert!(
+                err.contains("protected"),
+                "fs_write to {rel} should be rejected as protected, got: {err}"
+            );
+            // The write must NOT have created the file.
+            assert!(
+                !ws.join(rel).exists(),
+                "protected file {rel} must not be created"
+            );
+        }
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_write_and_edit_reject_a_file_inside_a_protected_dir() {
+        let ws = unique_temp_dir("protected_dir");
+        let ctx = ToolCtx::new(ws.clone());
+        // fs_write into sync/**.
+        let err = FsWrite
+            .run(
+                json!({ "path": "src-tauri/src/sync/foo.rs", "content": "x" }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("protected"), "got: {err}");
+        assert!(!ws.join("src-tauri/src/sync/foo.rs").exists());
+
+        // fs_edit on an existing file inside sync/** is also rejected — and its
+        // preview yields nothing (None) for the protected target.
+        let secret = ws.join("src-tauri/src/sync/server.rs");
+        std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        std::fs::write(&secret, "let trusted = true;\n").unwrap();
+        let input = json!({
+            "path": "src-tauri/src/sync/server.rs",
+            "old_string": "true",
+            "new_string": "false"
+        });
+        assert!(
+            FsEdit.preview(&input, &ctx).await.is_none(),
+            "edit-preview of a protected path must yield no diff"
+        );
+        let err = FsEdit.run(input, &ctx).await.unwrap_err();
+        assert!(err.contains("protected"), "got: {err}");
+        // The file is untouched.
+        assert_eq!(
+            std::fs::read_to_string(&secret).unwrap(),
+            "let trusted = true;\n"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_edit_preview_and_run_reject_a_protected_file() {
+        let ws = unique_temp_dir("protected_edit");
+        let ctx = ToolCtx::new(ws.clone());
+        let gate = ws.join("src-tauri/src/permissions.rs");
+        std::fs::create_dir_all(gate.parent().unwrap()).unwrap();
+        std::fs::write(&gate, "Decision::Deny\n").unwrap();
+
+        let input = json!({
+            "path": "src-tauri/src/permissions.rs",
+            "old_string": "Deny",
+            "new_string": "Allow"
+        });
+        // Preview must refuse (None), and run must error — the gate file stays put.
+        assert!(FsEdit.preview(&input, &ctx).await.is_none());
+        let err = FsEdit.run(input, &ctx).await.unwrap_err();
+        assert!(err.contains("protected"), "got: {err}");
+        assert_eq!(std::fs::read_to_string(&gate).unwrap(), "Decision::Deny\n");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_write_allows_a_benign_sibling_of_a_protected_file() {
+        // db.rs lives next to the protected permissions.rs but is NOT protected.
+        let ws = unique_temp_dir("benign_sibling");
+        let ctx = ToolCtx::new(ws.clone());
+        let out = FsWrite
+            .run(
+                json!({ "path": "src-tauri/src/db.rs", "content": "// ok\n" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("Created"), "got: {out}");
+        assert_eq!(
+            std::fs::read_to_string(ws.join("src-tauri/src/db.rs")).unwrap(),
+            "// ok\n"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_write_rejects_a_protected_path_case_insensitively() {
+        // A differently-cased spelling must still be rejected (Windows opens paths
+        // case-insensitively, so an exact-case-only denylist would be bypassable).
+        let ws = unique_temp_dir("protected_case");
+        let ctx = ToolCtx::new(ws.clone());
+        let err = FsWrite
+            .run(
+                json!({ "path": "src-tauri/src/Permissions.RS", "content": "x" }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("protected"), "got: {err}");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_write_to_a_protected_path_via_dotdot_is_rejected_as_escape_first() {
+        // A `..` that resolves back to a protected path is rejected — here the
+        // lexical-escape guard fires first (it leaves the workspace), which is the
+        // stronger rejection. Either way the write never lands.
+        let ws = unique_temp_dir("protected_dotdot");
+        let ctx = ToolCtx::new(ws.clone());
+        let err = FsWrite
+            .run(json!({ "path": "../permissions.rs", "content": "x" }), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("outside the workspace") || err.contains("protected"),
+            "a parent-escape write must be rejected, got: {err}"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn shell_blocks_a_write_to_a_protected_path() {
+        // The shell bypass is closed at the tool layer: a write cmdlet/redirection
+        // naming a protected path is rejected before anything spawns, regardless of
+        // permission mode.
+        let ctx = ToolCtx::new(base());
+        for command in [
+            "Set-Content src-tauri/src/permissions.rs 'Allow'",
+            "echo x > src-tauri\\src\\oauth.rs",
+            "Out-File -FilePath deny.toml -InputObject ''",
+            "Remove-Item src-tauri/src/sync/server.rs",
+            "Move-Item a.txt rust-toolchain.toml",
+        ] {
+            let err = Shell
+                .run(json!({ "command": command }), &ctx)
+                .await
+                .unwrap_err();
+            assert!(
+                err.contains("protected"),
+                "shell command should be blocked: `{command}` — got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_scan_requires_both_a_protected_path_and_a_write_indicator() {
+        // A protected path with no write indicator is NOT blocked by the scan (reads
+        // like `cat`/`git log` are allowed; the file tools' read path is unaffected).
+        assert!(shell_targets_protected_path("git log src-tauri/src/permissions.rs").is_none());
+        assert!(shell_targets_protected_path("cat deny.toml").is_none());
+        // A write indicator against a benign path is fine.
+        assert!(shell_targets_protected_path("Set-Content src-tauri/src/db.rs 'x'").is_none());
+        // Both present → blocked.
+        assert!(shell_targets_protected_path("Set-Content deny.toml ''").is_some());
+        assert!(shell_targets_protected_path("echo '' > src-tauri/src/agent.rs").is_some());
     }
 
     // ── sandbox-escape via reparse points (junction / symlink) ────────────────
