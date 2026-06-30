@@ -9,12 +9,12 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::stream::StreamExt;
 use serde_json::Value;
-use tauri::AppHandle;
 use uuid::Uuid;
 
 use crate::agents;
 use crate::background;
 use crate::db::{self, Db};
+use crate::events::EventSink;
 use crate::llm::{self, Block, ChatMessage, StreamEvent};
 use crate::oauth;
 use crate::permissions::{self, Decision, Pending};
@@ -72,11 +72,6 @@ fn batch_cancelled(prev_cancelled: bool, cancel_flag: bool) -> bool {
 /// because the user pressed Stop. Anthropic requires a result for every tool_use,
 /// so we post this (as an error) rather than dropping the block.
 const CANCELLED_TOOL_RESULT: &str = "Cancelled: the user stopped the turn before this tool ran.";
-
-fn emit(app: &AppHandle, channel: &str, ev: StreamEvent) {
-    // Canonical chokepoint: delivers to the desktop UI and mirrors to the phone.
-    crate::sync::emit_event(app, channel, ev);
-}
 
 fn system_prompt(workspace: &Path) -> String {
     format!(
@@ -250,7 +245,7 @@ async fn ensure_fresh(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
-    app: AppHandle,
+    sink: Arc<dyn EventSink>,
     http: reqwest::Client,
     settings: Arc<Mutex<Settings>>,
     db: Arc<Db>,
@@ -283,8 +278,7 @@ pub async fn run(
         }
     };
     if already_running {
-        emit(
-            &app,
+        sink.emit(
             &channel,
             StreamEvent::Error {
                 message: "A turn is already running for this session.".to_string(),
@@ -293,8 +287,7 @@ pub async fn run(
         return;
     }
 
-    emit(
-        &app,
+    sink.emit(
         &channel,
         StreamEvent::TurnStart {
             message_id: Uuid::new_v4().to_string(),
@@ -317,7 +310,7 @@ pub async fn run(
     let ask_lock = Arc::new(tokio::sync::Mutex::new(()));
 
     let result = run_inner(
-        &app,
+        &sink,
         &http,
         &settings,
         &db,
@@ -341,14 +334,14 @@ pub async fn run(
     }
 
     match result {
-        Ok(stop_reason) => emit(&app, &channel, StreamEvent::TurnEnd { stop_reason }),
-        Err(message) => emit(&app, &channel, StreamEvent::Error { message }),
+        Ok(stop_reason) => sink.emit(&channel, StreamEvent::TurnEnd { stop_reason }),
+        Err(message) => sink.emit(&channel, StreamEvent::Error { message }),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_inner(
-    app: &AppHandle,
+    sink: &Arc<dyn EventSink>,
     http: &reqwest::Client,
     settings: &Arc<Mutex<Settings>>,
     db: &Arc<Db>,
@@ -413,7 +406,7 @@ async fn run_inner(
     // which already denies mutating tools in plan mode.
     let spawner: Option<Arc<dyn tools::Spawner>> = if registry.find("task").is_some() {
         Some(Arc::new(AgentSpawner {
-            app: app.clone(),
+            sink: sink.clone(),
             http: http.clone(),
             settings: settings.clone(),
             pending: pending.clone(),
@@ -438,7 +431,7 @@ async fn run_inner(
     // in this version, so their `shell` runs foreground.
     if registry.find("shell").is_some() {
         ctx.background = Some(Arc::new(BackgroundLauncher {
-            app: app.clone(),
+            sink: sink.clone(),
             background: background.clone(),
             session_channel: channel.to_string(),
             session_id: session_id.to_string(),
@@ -467,7 +460,7 @@ async fn run_inner(
     // and usage all flow on the same `agent://{session}` channel, and every
     // message persists to the session.
     let outcome = run_loop_core(
-        app,
+        sink.as_ref(),
         http,
         provider.as_ref(),
         &snapshot,
@@ -569,7 +562,7 @@ struct LoopOutcome {
 ///    `Ephemeral` for a subagent (in-memory only).
 #[allow(clippy::too_many_arguments)]
 async fn run_loop_core(
-    app: &AppHandle,
+    sink: &dyn EventSink,
     http: &reqwest::Client,
     provider: &dyn llm::LlmProvider,
     snapshot: &Settings,
@@ -620,7 +613,7 @@ async fn run_loop_core(
                 system,
                 &messages,
                 &tool_specs,
-                app,
+                sink,
                 agent_channel,
                 cancel,
             )
@@ -630,8 +623,7 @@ async fn run_loop_core(
         // subagent's token cost rolls up into the parent session's total rather
         // than streaming to an unwatched child channel and being lost. For the
         // interactive run the two channels are identical, so this is unchanged.
-        emit(
-            app,
+        sink.emit(
             session_channel,
             StreamEvent::Usage {
                 input_tokens: turn.input_tokens,
@@ -648,8 +640,7 @@ async fn run_loop_core(
         // the session channel (where the panel listens). `steps` is its 1-based turn
         // count. The interactive run (`agent_id == None`) has no panel row.
         if let Some(id) = agent_id {
-            emit(
-                app,
+            sink.emit(
                 session_channel,
                 StreamEvent::AgentProgress {
                     agent_id: id.to_string(),
@@ -700,7 +691,7 @@ async fn run_loop_core(
                 if batch_cancelled(cancelled, cancel.load(Ordering::Relaxed)) {
                     cancelled = true;
                     let output = CANCELLED_TOOL_RESULT.to_string();
-                    emit(app, agent_channel, tool_result_event(id, &output, true));
+                    sink.emit(agent_channel, tool_result_event(id, &output, true));
                     done.push((i, output, true));
                     continue;
                 }
@@ -713,7 +704,7 @@ async fn run_loop_core(
                         if cancel.load(Ordering::Relaxed) {
                             cancelled = true;
                             let output = CANCELLED_TOOL_RESULT.to_string();
-                            emit(app, agent_channel, tool_result_event(id, &output, true));
+                            sink.emit(agent_channel, tool_result_event(id, &output, true));
                             done.push((i, output, true));
                         } else {
                             let input = input.clone();
@@ -732,7 +723,7 @@ async fn run_loop_core(
                 let (output, is_error) = match registry.find(name) {
                     Some(tool) => {
                         gate_and_run(
-                            app,
+                            sink,
                             session_channel,
                             snapshot,
                             pending,
@@ -748,7 +739,7 @@ async fn run_loop_core(
                     }
                     None => (format!("Unknown tool: {name}"), true),
                 };
-                emit(app, agent_channel, tool_result_event(id, &output, is_error));
+                sink.emit(agent_channel, tool_result_event(id, &output, is_error));
                 done.push((i, output, is_error));
             }
 
@@ -759,8 +750,7 @@ async fn run_loop_core(
                 let mut stream =
                     futures_util::stream::iter(task_futs).buffer_unordered(MAX_PARALLEL_AGENTS);
                 while let Some((i, output, is_error)) = stream.next().await {
-                    emit(
-                        app,
+                    sink.emit(
                         agent_channel,
                         tool_result_event(tool_uses[i].0, &output, is_error),
                     );
@@ -874,7 +864,7 @@ fn precheck_outcome(decision: Decision, cancelled_now: bool) -> Option<(&'static
 /// a time). The lock is held only across the gate, never across a tool's work.
 #[allow(clippy::too_many_arguments)]
 async fn gate_and_run(
-    app: &AppHandle,
+    sink: &dyn EventSink,
     session_channel: &str,
     snapshot: &Settings,
     pending: &Pending,
@@ -892,7 +882,7 @@ async fn gate_and_run(
         let diff = tool.preview(input, ctx).await;
         let _prompt = ask_lock.lock().await;
         permissions::gate(
-            app,
+            sink,
             session_channel,
             snapshot.permission_mode,
             &snapshot.rules,
@@ -1056,7 +1046,7 @@ fn session_of(channel: &str) -> &str {
 /// launches, so nesting stays depth-bounded.
 #[derive(Clone)]
 struct AgentSpawner {
-    app: AppHandle,
+    sink: Arc<dyn EventSink>,
     http: reqwest::Client,
     settings: Arc<Mutex<Settings>>,
     pending: Pending,
@@ -1122,8 +1112,7 @@ impl tools::Spawner for AgentSpawner {
             child_cancel.store(true, Ordering::Relaxed);
         }
         let label = subagent_label(&spec.description, &spec.prompt);
-        emit(
-            &self.app,
+        self.sink.emit(
             &self.parent_channel,
             StreamEvent::AgentStarted {
                 agent_id: agent_id.clone(),
@@ -1165,7 +1154,7 @@ impl tools::Spawner for AgentSpawner {
         }];
 
         let result = run_loop_core(
-            &self.app,
+            self.sink.as_ref(),
             &self.http,
             provider.as_ref(),
             &snapshot,
@@ -1188,8 +1177,7 @@ impl tools::Spawner for AgentSpawner {
         // ALWAYS announce completion and deregister, on success OR error, so the
         // panel never shows a ghost agent and the registry never leaks a flag.
         let status = spawn_status(&result);
-        emit(
-            &self.app,
+        self.sink.emit(
             &self.parent_channel,
             StreamEvent::AgentFinished {
                 agent_id: agent_id.clone(),
@@ -1214,7 +1202,7 @@ impl tools::Spawner for AgentSpawner {
 /// waiter's abort handle so a session Stop can kill it.
 #[derive(Clone)]
 struct BackgroundLauncher {
-    app: AppHandle,
+    sink: Arc<dyn EventSink>,
     background: background::Background,
     /// The session's `agent://{session}` channel — where start/finish events go.
     /// (Lifecycle events ride the session channel because a finish can land after
@@ -1258,8 +1246,7 @@ impl tools::BackgroundRunner for BackgroundLauncher {
     fn launch(&self, command: String, child: tokio::process::Child) -> String {
         let id = Uuid::new_v4().to_string();
         // Announce the launch right away so the UI can show it as running.
-        emit(
-            &self.app,
+        self.sink.emit(
             &self.session_channel,
             StreamEvent::BackgroundTaskStarted {
                 id: id.clone(),
@@ -1267,7 +1254,7 @@ impl tools::BackgroundRunner for BackgroundLauncher {
             },
         );
 
-        let app = self.app.clone();
+        let sink = self.sink.clone();
         let bg = self.background.clone();
         let channel = self.session_channel.clone();
         let task_id = id.clone();
@@ -1290,8 +1277,7 @@ impl tools::BackgroundRunner for BackgroundLauncher {
                     ),
                     Err(e) => (-1, format!("background command failed: {e}")),
                 };
-                emit(
-                    &app,
+                sink.emit(
                     &channel,
                     StreamEvent::BackgroundTaskFinished {
                         id: task_id.clone(),

@@ -16,11 +16,11 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::AppHandle;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
 
+use crate::events::EventSink;
 use crate::secrets::Credential;
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -248,11 +248,6 @@ impl TurnBuilder {
     }
 }
 
-fn emit(app: &AppHandle, channel: &str, ev: StreamEvent) {
-    // Canonical chokepoint: delivers to the desktop UI and mirrors to the phone.
-    crate::sync::emit_event(app, channel, ev);
-}
-
 /// Stream a single assistant turn. Emits text/tool events as they arrive and
 /// returns the fully assembled turn so the agent loop can act on tool calls.
 #[allow(clippy::too_many_arguments)]
@@ -263,7 +258,7 @@ pub async fn stream_turn(
     system: &str,
     messages: &[ChatMessage],
     tools: &[Value],
-    app: &AppHandle,
+    sink: &dyn EventSink,
     channel: &str,
     cancel: &Arc<AtomicBool>,
 ) -> Result<TurnResult, String> {
@@ -348,7 +343,7 @@ pub async fn stream_turn(
             // The pure parser folds the event into the turn and tells us what to
             // emit; the live path only owns the side effect of emitting it.
             for ev in builder.process(data)? {
-                emit(app, channel, ev);
+                sink.emit(channel, ev);
             }
         }
     }
@@ -373,7 +368,7 @@ pub trait LlmProvider: Send + Sync {
         system: &str,
         messages: &[ChatMessage],
         tools: &[Value],
-        app: &AppHandle,
+        sink: &dyn EventSink,
         channel: &str,
         cancel: &Arc<AtomicBool>,
     ) -> Result<TurnResult, String>;
@@ -397,12 +392,12 @@ impl LlmProvider for AnthropicProvider {
         system: &str,
         messages: &[ChatMessage],
         tools: &[Value],
-        app: &AppHandle,
+        sink: &dyn EventSink,
         channel: &str,
         cancel: &Arc<AtomicBool>,
     ) -> Result<TurnResult, String> {
         stream_turn(
-            http, cred, model, system, messages, tools, app, channel, cancel,
+            http, cred, model, system, messages, tools, sink, channel, cancel,
         )
         .await
     }
