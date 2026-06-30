@@ -306,6 +306,18 @@ impl Db {
         })
     }
 
+    /// Force a full WAL checkpoint (`TRUNCATE`), folding every committed write
+    /// from the write-ahead log back into the main database file and resetting
+    /// the WAL. After this returns the main `portcode.db` file is a complete,
+    /// self-contained snapshot — so a plain file copy of it captures all data
+    /// (the self-dev promotion snapshot relies on this before copying the DB).
+    ///
+    /// Used by `selfdev::snapshot`; harmless to call at any time.
+    pub fn checkpoint_wal(&self) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")
+    }
+
     /// Idempotently add the `confirmed` column to a legacy `paired_devices`
     /// table. No-op when the column already exists (fresh DBs create it inline).
     fn migrate_add_confirmed(conn: &Connection) -> rusqlite::Result<()> {

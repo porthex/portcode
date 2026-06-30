@@ -14,6 +14,14 @@ publish = false
 name = "portcode_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# Optional, off-by-default capabilities. `self-dev` compiles the Phase-2
+# promotion supervisor (`src/selfdev/`): snapshot the DB, then run the frontend +
+# Rust test gate. It is feature-gated so a PRODUCTION build (no `--features
+# self-dev`) contains ZERO self-dev code — the supervisor only ships in the
+# dogfood "Portcode Dev" build that is built with the feature enabled.
+[features]
+self-dev = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

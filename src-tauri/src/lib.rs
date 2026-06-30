@@ -25,7 +25,12 @@ mod oauth;
 mod permissions;
 #[cfg(desktop)]
 mod scrub;
+// Self-dev Phase-2 promotion supervisor (the automated gate + UX). Behind a Cargo
+// feature so a production build (no `--features self-dev`) carries ZERO self-dev
+// code; the whole module is `#![cfg(all(desktop, feature = "self-dev"))]` too.
 mod secrets;
+#[cfg(all(desktop, feature = "self-dev"))]
+mod selfdev;
 mod settings;
 mod sync;
 #[cfg(desktop)]
@@ -1297,6 +1302,12 @@ pub fn run() {
             // so this must be registered during setup.
             app.manage(sync::SyncHub::new());
 
+            // Self-dev promotion supervisor state — managed ONLY in the feature-
+            // gated self-dev build, so production never carries it. The 3 promote
+            // commands resolve it via `app.state::<PromoteState>()`.
+            #[cfg(all(desktop, feature = "self-dev"))]
+            app.manage(selfdev::PromoteState::new());
+
             // BUG 1 FIX: the desktop is the SYNC SERVER — auto-start the accept loop
             // at launch so a paired phone has something to connect to. (Previously
             // `phone_sync_listen` existed but was never invoked.) Desktop-only: the
@@ -1336,7 +1347,13 @@ pub fn run() {
     //
     // DESKTOP — the full surface (byte-identical to the pre-split list): all
     // settings/sessions + OAuth + workspace file-tree + agent + the sync SERVER.
-    #[cfg(desktop)]
+    //
+    // `generate_handler!` can't carry per-item `cfg`, so the self-dev promotion
+    // trio is registered by a SEPARATE feature-gated arm below: EXACTLY ONE of the
+    // two desktop arms compiles (the `feature = "self-dev"` arm when the feature is
+    // on, the `not(...)` arm otherwise), keeping production's command surface
+    // byte-identical to before.
+    #[cfg(all(desktop, not(feature = "self-dev")))]
     let builder = builder.invoke_handler(tauri::generate_handler![
         get_settings,
         save_settings,
@@ -1375,6 +1392,58 @@ pub fn run() {
         update::update_download_and_install,
         update::update_relaunch,
         update::update_channel
+    ]);
+
+    // DESKTOP + self-dev — the same surface PLUS the promotion supervisor trio
+    // (`promote_begin`/`promote_cancel`/`promote_status`). Compiled only with
+    // `--features self-dev`; the `not(feature = "self-dev")` arm above is what
+    // ships in production.
+    #[cfg(all(desktop, feature = "self-dev"))]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        get_settings,
+        save_settings,
+        set_api_key,
+        start_oauth_login,
+        oauth_status,
+        oauth_logout,
+        list_sessions,
+        create_session,
+        rename_session,
+        delete_session,
+        get_messages,
+        save_draft,
+        get_draft,
+        get_drafts,
+        get_usage,
+        get_all_usage,
+        search_messages,
+        list_dir,
+        run_agent,
+        cancel_agent,
+        cancel_agent_by_id,
+        resolve_permission,
+        telemetry_set_consent,
+        phone_sync_status,
+        phone_sync_begin_pairing,
+        phone_sync_unpair,
+        phone_sync_listen,
+        phone_sync_connect,
+        phone_sync_send_command,
+        phone_sync_disconnect,
+        confirm_pairing,
+        reject_pairing,
+        // Auto-updater surface (desktop-only; phone never self-updates).
+        update::update_check,
+        update::update_download_and_install,
+        update::update_relaunch,
+        update::update_channel,
+        // Self-dev promotion supervisor (feature-gated; absent in production).
+        // Referenced at the real module path so `generate_handler!` finds the
+        // command's macro-generated `__cmd__*` items (a `pub use` re-export does
+        // not carry those hidden items).
+        selfdev::promote::promote_begin,
+        selfdev::promote::promote_cancel,
+        selfdev::promote::promote_status
     ]);
 
     // MOBILE — the remote-CLIENT subset. Shared settings/secrets/sessions +

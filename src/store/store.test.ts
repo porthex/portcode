@@ -60,6 +60,10 @@ vi.mock("../lib/ipc", () => ({
   relaunchApp: vi.fn(),
   getUpdateChannel: vi.fn(),
   onUpdaterEvent: vi.fn(),
+  promoteBegin: vi.fn(),
+  promoteCancel: vi.fn(),
+  promoteStatus: vi.fn(),
+  onPromoteEvent: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -129,6 +133,10 @@ beforeEach(() => {
   m.relaunchApp.mockResolvedValue(undefined);
   m.getUpdateChannel.mockResolvedValue("stable");
   m.onUpdaterEvent.mockResolvedValue(() => {});
+  m.promoteBegin.mockResolvedValue(undefined);
+  m.promoteCancel.mockResolvedValue(undefined);
+  m.promoteStatus.mockResolvedValue({ phase: "idle", message: null, progress: 0 });
+  m.onPromoteEvent.mockResolvedValue(() => {});
 });
 
 describe("init", () => {
@@ -4018,6 +4026,98 @@ describe("auto-update", () => {
       expect(st.update.error).toBeNull();
       // info is preserved so a later relaunch/re-check still knows the version.
       expect(st.update.info).toEqual(info());
+    });
+  });
+});
+
+describe("self-dev promotion (SLICE 1)", () => {
+  describe("beginPromotion", () => {
+    it("optimistically enters snapshotting and invokes ipc.promoteBegin", async () => {
+      m.promoteBegin.mockResolvedValue(undefined);
+
+      await useStore.getState().beginPromotion();
+
+      expect(m.promoteBegin).toHaveBeenCalledTimes(1);
+      const st = useStore.getState();
+      // Optimistic phase; the real phases then arrive via applyPromoteStatus.
+      expect(st.promotePhase).toBe("snapshotting");
+      expect(st.promoteMessage).toBeNull();
+    });
+
+    it("lands a failed phase (never throws) when promoteBegin rejects", async () => {
+      m.promoteBegin.mockRejectedValue(new Error("a promotion is already in progress"));
+
+      await expect(useStore.getState().beginPromotion()).resolves.toBeUndefined();
+
+      const st = useStore.getState();
+      expect(st.promotePhase).toBe("failed");
+      expect(st.promoteMessage).toBe("a promotion is already in progress");
+      expect(st.promoteProgress).toBe(1);
+    });
+  });
+
+  describe("cancelPromotion", () => {
+    it("invokes ipc.promoteCancel", async () => {
+      m.promoteCancel.mockResolvedValue(undefined);
+
+      await useStore.getState().cancelPromotion();
+
+      expect(m.promoteCancel).toHaveBeenCalledTimes(1);
+    });
+
+    it("swallows a failure (command unavailable / nothing running)", async () => {
+      m.promoteCancel.mockRejectedValue(new Error("no command"));
+
+      await expect(useStore.getState().cancelPromotion()).resolves.toBeUndefined();
+    });
+  });
+
+  describe("applyPromoteStatus", () => {
+    it("mirrors a pushed status into the slice fields", () => {
+      useStore.getState().applyPromoteStatus({
+        phase: "testing_rust",
+        message: null,
+        progress: 0.7,
+      });
+
+      const st = useStore.getState();
+      expect(st.promotePhase).toBe("testing_rust");
+      expect(st.promoteMessage).toBeNull();
+      expect(st.promoteProgress).toBe(0.7);
+    });
+
+    it("carries the failure message and progress on a failed status", () => {
+      useStore.getState().applyPromoteStatus({
+        phase: "failed",
+        message: "Rust tests: exit code 101",
+        progress: 1,
+      });
+
+      const st = useStore.getState();
+      expect(st.promotePhase).toBe("failed");
+      expect(st.promoteMessage).toBe("Rust tests: exit code 101");
+      expect(st.promoteProgress).toBe(1);
+    });
+  });
+
+  describe("subscribePromoteEvents", () => {
+    it("subscribes via ipc.onPromoteEvent and routes events through applyPromoteStatus", async () => {
+      let pushed: ((s: import("../types").PromoteStatus) => void) | null = null;
+      const off = vi.fn();
+      m.onPromoteEvent.mockImplementation(async (cb) => {
+        pushed = cb;
+        return off;
+      });
+
+      const unlisten = await useStore.getState().subscribePromoteEvents();
+      expect(m.onPromoteEvent).toHaveBeenCalledTimes(1);
+      expect(unlisten).toBe(off);
+
+      // A pushed event flows into the slice.
+      pushed!({ phase: "done", message: "Gate passed", progress: 1 });
+      const st = useStore.getState();
+      expect(st.promotePhase).toBe("done");
+      expect(st.promoteMessage).toBe("Gate passed");
     });
   });
 });

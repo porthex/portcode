@@ -212,6 +212,15 @@ const PROTECTED: &[(&str, &str)] = &[
     // Anti-tamper: the tool layer and agent loop must not rewrite their own guards.
     ("src-tauri/src/tools.rs", "the tool layer (anti-tamper)"),
     ("src-tauri/src/agent.rs", "the agent loop (anti-tamper)"),
+    // Anti-tamper: the self-dev promotion supervisor (the gate the agent must pass
+    // to ship a change) and the updater. Letting the agent rewrite either from
+    // inside the workspace would let a self-dev build neuter its own promotion gate
+    // or hijack the update channel.
+    (
+        "src-tauri/src/selfdev/",
+        "the self-dev supervisor (anti-tamper)",
+    ),
+    ("src-tauri/src/update.rs", "the updater"),
     // CI / supply-chain: workflows, lockfile-audit policy, toolchain pin, build cfg.
     (".github/", "CI workflows"),
     ("src-tauri/tauri.conf.json", "the Tauri build config"),
@@ -1309,6 +1318,10 @@ mod tests {
         assert!(protected_reason(Path::new(".github/workflows/ci.yml")).is_some());
         // The protected dir prefix itself.
         assert!(protected_reason(Path::new("src-tauri/src/sync")).is_some());
+        // Self-dev supervisor (dir) + updater (file) anti-tamper entries.
+        assert!(protected_reason(Path::new("src-tauri/src/selfdev/promote.rs")).is_some());
+        assert!(protected_reason(Path::new("src-tauri/src/selfdev")).is_some());
+        assert!(protected_reason(Path::new("src-tauri/src/update.rs")).is_some());
 
         // Case-insensitive (Windows opens paths case-insensitively).
         assert!(protected_reason(Path::new("SRC-TAURI/SRC/Permissions.RS")).is_some());

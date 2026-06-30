@@ -10,6 +10,7 @@ import type {
   PairingPayload,
   PairingRequest,
   PhoneSyncStatus,
+  PromoteStatus,
   RemoteCommand,
   SearchHit,
   Session,
@@ -202,6 +203,54 @@ export async function onUpdaterEvent(
     };
   }
   return mock.onUpdaterEvent(handler);
+}
+
+// ── Self-dev promotion supervisor (SLICE 1: gate + UX) ──────────────────────────
+// Desktop self-dev build only — these commands exist solely when the Rust core is
+// compiled with `--features self-dev`. On any other host (production desktop, web
+// client, vite preview) they are inert: the commands are absent / the mock no-ops,
+// so a missing command never throws and the PromoteBadge (gated on isSelfDev())
+// is never even mounted there.
+
+/** Begin a promotion (snapshot → frontend gate → Rust gate). Returns immediately;
+ *  follow progress via {@link onPromoteEvent}. Rejects if one is already running. */
+export async function promoteBegin(): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("promote_begin");
+    return;
+  }
+  return mock.promoteBegin();
+}
+
+/** Request cancellation of an in-flight promotion. Idempotent. */
+export async function promoteCancel(): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("promote_cancel");
+    return;
+  }
+  return mock.promoteCancel();
+}
+
+/** A snapshot of the current promotion phase. */
+export async function promoteStatus(): Promise<PromoteStatus> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<PromoteStatus>("promote_status");
+  }
+  return mock.promoteStatus();
+}
+
+/** Subscribe to the `selfdev://promote` control event — each transition pushes the
+ *  full {@link PromoteStatus}. Returns an unlisten handle; inert in the browser
+ *  mock (the preview runs no real promotion). */
+export async function onPromoteEvent(cb: (status: PromoteStatus) => void): Promise<Unlisten> {
+  if (isTauri()) {
+    const { event } = await tauri();
+    return event.listen<PromoteStatus>("selfdev://promote", (ev) => cb(ev.payload));
+  }
+  return mock.onPromoteEvent(cb);
 }
 
 // ── Phone Sync ────────────────────────────────────────────────────────────────
@@ -655,6 +704,21 @@ const mock = (() => {
       ) => void,
     ): Promise<Unlisten> {
       return () => {}; // inert: the preview never downloads an update.
+    },
+    // Self-dev promotion — inert in the preview (no Rust gate to run). The badge is
+    // gated on isSelfDev() so it never mounts here, but the mock keeps the calls
+    // safe no-ops anyway.
+    async promoteBegin() {
+      // no-op: the preview runs no real promotion.
+    },
+    async promoteCancel() {
+      // no-op.
+    },
+    async promoteStatus(): Promise<PromoteStatus> {
+      return { phase: "idle", message: null, progress: 0 };
+    },
+    async onPromoteEvent(_cb: (status: PromoteStatus) => void): Promise<Unlisten> {
+      return () => {}; // inert subscription; the preview never promotes.
     },
     async phoneSyncStatus() {
       return { ...phoneSyncState, paired: [...phoneSyncState.paired] };

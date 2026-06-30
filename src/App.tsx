@@ -15,6 +15,8 @@ import { InstallGate } from "./components/InstallGate";
 import { CrashConsentPrompt } from "./components/CrashConsentPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { ChannelBadge } from "./components/ChannelBadge";
+import { PromoteBadge } from "./components/PromoteBadge";
+import { isSelfDev } from "./lib/channel";
 import { isTauri, isWebClientMode, onUpdaterEvent } from "./lib/ipc";
 import { getInstallState } from "./lib/installGate";
 import { initTelemetry, shutdownTelemetry, telemetryConfigured } from "./lib/telemetry";
@@ -77,6 +79,27 @@ export default function App() {
       cancelled = true;
       unlisten?.();
       clearInterval(interval);
+    };
+  }, [remoteMode]);
+
+  // Self-dev promotion (SLICE 1) — subscribe to the `selfdev://promote` control
+  // event so the PromoteBadge follows the gate's phases. Only in the self-dev
+  // build (isSelfDev()) and never on the phone/remote shell; the subscribe is an
+  // inert no-op on any host where the command is absent, so this can't throw.
+  useEffect(() => {
+    if (!isSelfDev() || remoteMode) return;
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    void useStore
+      .getState()
+      .subscribePromoteEvents()
+      .then((off) => {
+        if (cancelled) off();
+        else unlisten = off;
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
     };
   }, [remoteMode]);
 
@@ -332,6 +355,7 @@ function TitleBar({ fileToggleRef }: { fileToggleRef?: React.Ref<HTMLButtonEleme
       </div>
       <div className="flex shrink-0 items-center gap-2.5">
         <ChannelBadge />
+        <PromoteBadge />
         {!isTauri() && (
           <span className="pc-pill pc-pill--warn">
             <span className="pc-dot pc-dot--warn" />

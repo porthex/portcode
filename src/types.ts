@@ -337,6 +337,40 @@ export interface UpdateInfo {
  *  Returned by `update_channel`. */
 export type UpdateChannel = "stable";
 
+// ── Self-dev promotion supervisor (SLICE 1: gate + UX, no swap/restart) ─────────
+
+/**
+ * The phase of the self-dev promotion pipeline. Mirrors the Rust `PromotePhase`
+ * (snake_case on the wire):
+ * - `idle`             — at rest; nothing running.
+ * - `snapshotting`     — taking the recoverable DB snapshot.
+ * - `testing_frontend` — running the frontend gate (`pnpm test`).
+ * - `testing_rust`     — running the Rust gate (`cargo test --workspace`).
+ * - `done`             — the gate passed end-to-end. (A binary swap + restart is
+ *   the deliberately-unbuilt SLICE 2.)
+ * - `failed`           — a step failed or was cancelled; `message` carries why.
+ */
+export type PromotePhase =
+  | "idle"
+  | "snapshotting"
+  | "testing_frontend"
+  | "testing_rust"
+  | "done"
+  | "failed";
+
+/**
+ * Status of the self-dev promotion pipeline, as returned by `promote_status` and
+ * pushed on the `selfdev://promote` control event. Mirrors the Rust
+ * `PromoteStatusDto` / `PromoteEvent` (camelCase). `progress` is a coarse 0–1
+ * stage hint (the gate steps are long and opaque, so it's a stage indicator, not a
+ * byte-accurate bar). `message` is the failure reason or a short success note.
+ */
+export interface PromoteStatus {
+  phase: PromotePhase;
+  message: string | null;
+  progress: number;
+}
+
 // ── Phone Sync ────────────────────────────────────────────────────────────────
 
 /** A phone that has been paired with this desktop device. */

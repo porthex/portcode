@@ -15,6 +15,8 @@ import type {
   PendingPermission,
   PermissionMode,
   PhoneSyncStatus,
+  PromotePhase,
+  PromoteStatus,
   RemoteCommand,
   Rule,
   SearchHit,
@@ -192,6 +194,11 @@ interface AppState {
   update: UpdateState; // in-app update flow state, drives the UpdateBanner
   updateChannel: UpdateChannel; // which release feed this build follows
 
+  // ── Self-dev promotion supervisor (SLICE 1, self-dev build only) ───────────────
+  promotePhase: PromotePhase; // current gate phase, drives the PromoteBadge
+  promoteMessage: string | null; // failure reason / success note from the pipeline
+  promoteProgress: number; // coarse 0–1 stage hint
+
   init: () => Promise<void>;
   retryInit: () => Promise<void>;
   retryLoad: (id: string) => Promise<void>;
@@ -269,6 +276,14 @@ interface AppState {
   setAutoUpdate: (enabled: boolean) => Promise<void>;
   loadUpdateChannel: () => Promise<void>;
   dismissUpdateBanner: () => void;
+
+  // ── Self-dev promotion ──────────────────────────────────────────────────────
+  beginPromotion: () => Promise<void>;
+  cancelPromotion: () => Promise<void>;
+  // Apply a pushed `selfdev://promote` status (or a polled `promote_status`).
+  applyPromoteStatus: (status: PromoteStatus) => void;
+  // Subscribe to the promote control event; returns the unlisten handle.
+  subscribePromoteEvents: () => Promise<() => void>;
 }
 
 // Project the active session's run onto the three mirror fields. Called in every
@@ -863,6 +878,11 @@ export const useStore = create<AppState>((set, get) => ({
   // check + channel load on a desktop mount.
   update: IDLE_UPDATE,
   updateChannel: "stable",
+
+  // Self-dev promotion: idle until the user presses Promote in the self-dev build.
+  promotePhase: "idle",
+  promoteMessage: null,
+  promoteProgress: 0,
 
   async init() {
     // The phone/remote client has no local sessions DB or settings — its session
@@ -2465,6 +2485,42 @@ export const useStore = create<AppState>((set, get) => ({
   // re-check / relaunch still knows which version was staged.
   dismissUpdateBanner() {
     set((st) => ({ update: { ...IDLE_UPDATE, info: st.update.info } }));
+  },
+
+  // ── Self-dev promotion (SLICE 1) ────────────────────────────────────────────
+
+  async beginPromotion() {
+    // Optimistically reflect "starting" so the badge reacts instantly; the
+    // pushed `selfdev://promote` events then drive the real phases. A reject
+    // (already running, or no self-dev command) lands as a failed phase.
+    set({ promotePhase: "snapshotting", promoteMessage: null, promoteProgress: 0.15 });
+    try {
+      await ipc.promoteBegin();
+    } catch (err) {
+      set({ promotePhase: "failed", promoteMessage: errMessage(err), promoteProgress: 1 });
+    }
+  },
+
+  async cancelPromotion() {
+    try {
+      await ipc.promoteCancel();
+      // The pipeline emits the resulting `failed` (cancelled) phase; nothing to set
+      // here beyond a best-effort call.
+    } catch {
+      // Command unavailable / nothing running — harmless.
+    }
+  },
+
+  applyPromoteStatus(status) {
+    set({
+      promotePhase: status.phase,
+      promoteMessage: status.message,
+      promoteProgress: status.progress,
+    });
+  },
+
+  async subscribePromoteEvents() {
+    return ipc.onPromoteEvent((status) => get().applyPromoteStatus(status));
   },
 }));
 

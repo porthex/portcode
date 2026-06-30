@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
 
 import App from "./App";
@@ -106,6 +106,9 @@ vi.mock("./lib/ipc", () => ({
   onUpdaterEvent: vi.fn(),
   getUpdateChannel: vi.fn(),
   checkForUpdate: vi.fn(),
+  // Self-dev promotion: App subscribes to the `selfdev://promote` control event,
+  // but only in the self-dev build (isSelfDev()). Stubbed harmless here.
+  onPromoteEvent: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -142,6 +145,7 @@ beforeEach(() => {
   m.onUpdaterEvent.mockResolvedValue(() => {});
   m.getUpdateChannel.mockResolvedValue("stable");
   m.checkForUpdate.mockResolvedValue(null);
+  m.onPromoteEvent.mockResolvedValue(() => {});
 });
 
 describe("App layout", () => {
@@ -489,6 +493,42 @@ describe("TitleBar", () => {
     expect(
       screen.getByRole("button", { name: "Open command palette (Ctrl+K)" }),
     ).toBeInTheDocument();
+  });
+});
+
+describe("self-dev promotion (gate UX)", () => {
+  // The promote subscription effect + PromoteBadge are gated on the self-dev
+  // channel flag, so these tests stub it on and tear it down after.
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("subscribes to selfdev://promote on mount in the self-dev build", async () => {
+    vi.stubEnv("VITE_PORTCODE_CHANNEL", "dev");
+    const off = vi.fn();
+    m.onPromoteEvent.mockResolvedValue(off);
+
+    const { unmount } = render(<App />);
+
+    // The effect installs the control-event subscription (only in self-dev).
+    await waitFor(() => expect(m.onPromoteEvent).toHaveBeenCalledTimes(1));
+    // The PromoteBadge mounts beside the DEV pill, idle → a Promote button.
+    expect(screen.getByTestId("promote-badge")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Promote" })).toBeInTheDocument();
+
+    // Unmount tears the subscription down so it can't leak across remounts.
+    unmount();
+    expect(off).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not subscribe (and hides the badge) in the normal build", async () => {
+    vi.stubEnv("VITE_PORTCODE_CHANNEL", "stable");
+
+    render(<App />);
+    await waitFor(() => expect(useStore.getState().sessions).toHaveLength(1));
+
+    expect(m.onPromoteEvent).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("promote-badge")).not.toBeInTheDocument();
   });
 });
 

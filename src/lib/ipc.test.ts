@@ -421,6 +421,41 @@ describe("Tauri command serialization", () => {
     expect(offProgress).toHaveBeenCalledTimes(1);
     expect(offFinished).toHaveBeenCalledTimes(1);
   });
+
+  it("self-dev promotion commands invoke their core counterparts", async () => {
+    const { ipc, invoke } = await load();
+
+    await expect(ipc.promoteBegin()).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("promote_begin");
+
+    await expect(ipc.promoteCancel()).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("promote_cancel");
+
+    const status = { phase: "testing_rust", message: null, progress: 0.7 };
+    invoke.mockResolvedValue(status);
+    await expect(ipc.promoteStatus()).resolves.toBe(status);
+    expect(invoke).toHaveBeenCalledWith("promote_status");
+  });
+
+  it("onPromoteEvent listens on the selfdev channel and unwraps the payload", async () => {
+    const { ipc, listen } = await load();
+    const offEvent = vi.fn();
+    let registered: ((ev: { payload: unknown }) => void) | null = null;
+    listen.mockImplementation(async (_channel, cb) => {
+      registered = cb as (ev: { payload: unknown }) => void;
+      return offEvent;
+    });
+
+    const seen: unknown[] = [];
+    const off = await ipc.onPromoteEvent((s) => seen.push(s));
+    expect(listen).toHaveBeenCalledWith("selfdev://promote", expect.any(Function));
+
+    registered!({ payload: { phase: "done", message: "Gate passed", progress: 1 } });
+    expect(seen).toContainEqual({ phase: "done", message: "Gate passed", progress: 1 });
+
+    off();
+    expect(offEvent).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("browser fallback (no Tauri core)", () => {
@@ -460,6 +495,27 @@ describe("browser fallback (no Tauri core)", () => {
     const off = await ipc.onUpdaterEvent((e) => events.push(e));
     off(); // inert unlisten — safe to call
     expect(events).toHaveLength(0);
+
+    // Nothing crossed the (absent) native bridge.
+    expect(invoke).not.toHaveBeenCalled();
+    expect(listen).not.toHaveBeenCalled();
+  });
+
+  it("self-dev promotion commands are inert in the browser", async () => {
+    const { ipc, invoke, listen } = await load();
+
+    await expect(ipc.promoteBegin()).resolves.toBeUndefined();
+    await expect(ipc.promoteCancel()).resolves.toBeUndefined();
+    await expect(ipc.promoteStatus()).resolves.toEqual({
+      phase: "idle",
+      message: null,
+      progress: 0,
+    });
+
+    const seen: unknown[] = [];
+    const off = await ipc.onPromoteEvent((s) => seen.push(s));
+    off(); // inert unlisten — safe to call
+    expect(seen).toHaveLength(0);
 
     // Nothing crossed the (absent) native bridge.
     expect(invoke).not.toHaveBeenCalled();
