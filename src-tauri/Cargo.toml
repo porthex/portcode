@@ -83,7 +83,7 @@ similar = "3"
 # cross-compile probe or the Linux CI leg. Relocating an already-resolved dep to
 # a target table does not change its version/features, so Cargo.lock stays valid.
 [target."cfg(windows)".dependencies]
-keyring = { version = "3", features = ["windows-native"] }
+keyring = { version = "4", features = ["windows-native"] }
 
 # Native QR scanner for the phone's pairing screen — built ONLY for the mobile
 # targets. The desktop advertises the pairing QR (it never scans one), so gating
