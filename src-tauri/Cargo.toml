@@ -116,7 +116,7 @@ sentry = { version = "0.34", default-features = false, features = ["backtrace", 
 # the binary as an OUT-OF-PROCESS crash monitor (EmbarkStudios crash-handler), so
 # native segfaults AND `panic = "abort"` aborts are captured even though they can't
 # unwind in-process. Gated to DESKTOP (mirrors `sentry`): the phone is a remote client.
-tauri-plugin-sentry = "=0.2.0"
+tauri-plugin-sentry = "=0.5.0"
 # Resolves `<app_config_dir>` WITHOUT a Tauri app handle — the consent file is read in
 # the re-exec'd crash-reporter process, which has no `AppHandle`. Tauri's own
 # `app_config_dir()` is `dirs::config_dir().join(<identifier>)`, so this reproduces the
