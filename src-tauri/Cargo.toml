@@ -80,10 +80,10 @@ similar = "3"
 # On Android/Linux there is no working keyring backend, so `src/secrets.rs` uses
 # an app-private file store instead and keyring is not a dependency there at all —
 # gating it to `cfg(windows)` means it is never compiled for the Android
-# cross-compile probe or the Linux CI leg. Relocating an already-resolved dep to
-# a target table does not change its version/features, so Cargo.lock stays valid.
+# cross-compile probe or the Linux CI leg. keyring 4's default `v1` feature keeps
+# the Entry API and selects its native Windows Credential Manager store.
 [target."cfg(windows)".dependencies]
-keyring = { version = "4", features = ["windows-native"] }
+keyring = "4"
 
 # Native QR scanner for the phone's pairing screen — built ONLY for the mobile
 # targets. The desktop advertises the pairing QR (it never scans one), so gating
