@@ -1,47 +1,35 @@
 # iOS Web Client Plan — Phone Sync over iroh-in-the-browser (Vercel PWA)
 
-> **Status:** Design / RFC. Not yet implemented. This document is the buildable
-> plan for shipping a **browser-based Phone Sync client** — a static PWA hosted
-> on Vercel that an **iOS** user opens, pairs with their desktop Portcode, and
-> uses to watch and drive a live coding session.
+> **Status:** Implementation landed; real-device acceptance is still open. The
+> workspace split, browser iroh transport, WASM wrapper, static PWA, scanner,
+> durable pairing state, and reconnect-on-resume lifecycle are in the tree and
+> covered by automated tests. A real relay pairing and the iOS device/lifecycle
+> checks below are required before calling the client usable end to end.
 >
 > It builds directly on the existing Phone Sync stack (`src-tauri/src/sync/`,
 > see `docs/ANDROID_APP_PLAN.md`) and reuses that Rust protocol code **compiled
 > to WebAssembly** rather than reimplementing it in JavaScript.
 
-## Implementation status
+## Acceptance matrix
 
-The **browser-client frontend foundation** (the locally-verifiable parts of
-§5.6–§5.9) has landed; the WASM transport + Rust workspace split are next.
+This matrix is the source of truth. “Implemented” means the code and automated
+verification exist; it does **not** substitute for a real browser, relay, or iOS
+lifecycle test.
 
-**Done:**
+| Capability                      | Evidence in tree                                           | Automated status                                             | Real-world acceptance                                                                 |
+| ------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------- |
+| Shared sync workspace           | `Cargo.toml`, `crates/portcode-sync/`                      | ✅ Native workspace tests and WASM compile gate              | Not device-specific                                                                   |
+| Browser iroh + Noise transport  | `crates/portcode-sync/src/transport_wasm.rs`               | ✅ Builds/lints for `wasm32-unknown-unknown`                 | ⏳ Pair a browser to a real desktop through a relay and exchange frames               |
+| WASM interop package            | `crates/portcode-wasm/`, `web/wasm/portcode-wasm/`         | ✅ `wasm-pack` build plus committed-artifact freshness check | ⏳ Exercise the committed artifact in mobile Safari                                   |
+| Web client and runtime dispatch | `web/entry.tsx`, `src/lib/webSession.ts`, `src/lib/ipc.ts` | ✅ Unit-tested and included by `pnpm build:web`              | ⏳ Complete a real pair → command → live-frame flow                                   |
+| Install/scanner/storage         | `src/lib/installGate.ts`, `webScanner.ts`, `webStorage.ts` | ✅ Unit-tested camera/file and IndexedDB seams               | ⏳ Verify installed-PWA camera permission, file fallback, and durable identity on iOS |
+| Background/resume lifecycle     | `src/lib/pwaLifecycle.ts`, `webClientLifecycle.ts`         | ✅ Deterministic lifecycle/backoff tests                     | ⏳ Lock/background on real iOS, resume, reconnect, and catch up without loss          |
+| Static deployment               | `vite.web.config.ts`, `vercel.json`, PWA assets            | ✅ Static bundle builds                                      | ⏳ Validate production headers, asset loading, and relay configuration                |
+| Phase 0 device spike            | Manual real-device gate                                    | Not automatable                                              | ⏳ Required: real iOS Safari and installed PWA over a real relay                      |
 
-- `src/lib/webSession.ts` — the WASM transport boundary: the `WebSession` /
-  `WebSessionConnector` interfaces the future iroh-in-browser module implements,
-  a deterministic mock connector, an injectable connector registry, and
-  ipc-shaped wrappers.
-- `src/lib/webStorage.ts` — IndexedDB pinned-peer + device-identity persistence
-  with `navigator.storage.persist()` request/verify (§5.7/§5.8).
-- `src/lib/installGate.ts` — installed/standalone/iOS detection + pairing gate
-  with Share→Add-to-Home-Screen guidance (§5.7).
-- `src/lib/pwaLifecycle.ts` — visibility/online/pageshow watcher + reconnect
-  controller with full-jitter exponential backoff (§5.8, the session-persistence
-  core).
-- `src/lib/webScanner.ts` — browser QR capture (camera + file fallback) with an
-  injectable decoder (zxing-wasm wired later) (§5.9).
-- `src/lib/ipc.ts` — `setWebClientMode()` seam routing the Phone Sync client
-  surface through `webSession` (off by default; Tauri always wins).
-- PWA + Vercel build target: `web/index.html` (manifest + Apple meta + web CSP),
-  `web/entry.tsx`, `vite.web.config.ts` (→ `web-dist/`), `public/manifest.webmanifest`,
-  `vercel.json`, and `pnpm build:web`.
-
-All shipped with unit tests; the full suite + coverage gate stay green, and
-`pnpm build:web` produces a deployable static bundle.
-
-**Next:** Phase 0 on-device iOS spike (the go/no-go gate), then the Rust
-`portcode-sync` crate extraction + the real iroh-in-browser `WebSessionConnector`
-that replaces the mock, then wiring `installGate`/`pwaLifecycle`/`webStorage` into
-the React tree and the live store.
+The remaining release blockers are therefore operational acceptance, not the
+workspace/WASM/frontend implementation: real relay pairing, iOS background and
+resume behavior, and the Phase 0 device spike remain open.
 
 ---
 
@@ -52,7 +40,7 @@ the React tree and the live store.
 | **Transport**         | Reuse **iroh in the browser (WASM)** — dial the desktop directly into the existing iroh network. No bespoke relay protocol, no WebSocket-tunnel-of-our-own. |
 | **What Vercel hosts** | **Only the static client UI** (the PWA: HTML/JS/CSS/wasm). No backend functions, no relay, no persistent server on Vercel.                                  |
 | **Primary target**    | **iOS** (Safari + installed Home-Screen PWA). Android/desktop browsers are a free side-benefit, not the design driver.                                      |
-| **This deliverable**  | A deeply-researched, buildable design — not code yet.                                                                                                       |
+| **This document**     | The implementation record and acceptance plan; device-only checks remain open.                                                                              |
 
 Everything below honours those four constraints. Where a constraint forces a
 non-obvious decision (e.g. Vercel _cannot_ be the relay), it is called out.
@@ -84,12 +72,11 @@ Crucially, the existing protocol code is already structured to make this cheap:
   RustCrypto/dalek).
 - The shared `session.rs` uses **only `tokio::sync` channels** (broadcast/mpsc),
   which work on wasm — no `tokio::time`, no `tokio::spawn` in shared code.
-- `protocol.rs` / `noise.rs` / `session.rs` are already cross-platform and carry
-  no desktop-only assumptions; only `transport.rs` (native iroh endpoint) needs
-  a browser sibling.
-- The frontend already has the seams: `connectRemote` / `applyFrame` /
+- `protocol.rs` / `noise.rs` / `session.rs` are cross-platform; the shared
+  transport abstraction now has native and browser implementations.
+- The frontend uses the shared seams: `connectRemote` / `applyFrame` /
   `reconnectRemote` in `store.ts`, `remoteMode` shell, `RemotePairing.tsx`, and
-  an `ipc.ts` that already carries a browser mock.
+  runtime-dispatched `ipc.ts`; tests retain an injectable browser mock.
 
 ---
 
@@ -220,8 +207,8 @@ Four parallel research streams informed this plan. Highlights:
 
 ### 5.1 Rust workspace restructure
 
-Today all sync code lives inside the `src-tauri` crate. To target both native
-(desktop) and `wasm32` from one source of truth, extract a shared crate:
+The sync core has been extracted from `src-tauri` so native desktop and
+`wasm32` use one source of truth:
 
 ```text
 portcode/
@@ -247,13 +234,13 @@ portcode/
 └── src/, web/, package.json, ...   # frontends (§5.6)
 ```
 
-**Migration is mechanical, not a rewrite:**
+**Landed structure:**
 
-- `protocol.rs`, `noise.rs`, `session.rs`, `pairing.rs` move into
-  `portcode-sync` **unchanged** (verified wasm-safe in §2).
-- `transport.rs` splits: the `SyncFrame` length-framing + a new `Transport`
-  trait stay shared; the iroh `Endpoint`/`Connection` code becomes
-  `transport_native.rs`; a new `transport_wasm.rs` builds the browser endpoint.
+- `protocol.rs`, `noise.rs`, `session.rs`, and `pairing.rs` live in
+  `portcode-sync` and are shared by native and WASM builds.
+- `transport.rs` owns the shared abstraction/framing;
+  `transport_native.rs` and `transport_wasm.rs` provide target-specific iroh
+  endpoints.
 - `server.rs`, `pairing_gate.rs` (both already `#[cfg(desktop)]`) and `client.rs`
   stay in `src-tauri` — they depend on Tauri/agent/db and are not part of the
   wasm client. `src-tauri` re-exports shared types from `portcode-sync` so the
@@ -265,8 +252,8 @@ portcode/
 
 ### 5.2 The `Transport` trait (the one real abstraction)
 
-`session.rs`'s loops already talk to traits (`FrameSink`/`FrameSource`/
-`FrameChannel`). We add a connection-establishment trait so the session loop is
+`session.rs`'s loops talk to traits (`FrameSink`/`FrameSource`/`FrameChannel`).
+The connection-establishment abstraction keeps the session loop
 transport-agnostic:
 
 ```rust
@@ -406,25 +393,24 @@ impl Session {
 
 Goal: **maximum reuse** of the existing React app, minimum fork.
 
-- **Build target split.** Add a second Vite entry/config that builds a
+- **Build target split.** A second Vite entry/config builds a
   **browser** bundle (no `@tauri-apps/*`), output to `web-dist/`, deployed to
   Vercel. The Tauri build keeps using `dist/` unchanged.
-- **`ipc.ts` becomes runtime-dispatched.** Today it has a Tauri path + a browser
-  mock. Replace the mock with a **real WASM-backed implementation**: detect
-  "web client" mode and route `phoneSyncConnect`/`SendCommand`/`Disconnect` +
+- **`ipc.ts` is runtime-dispatched.** The web entry installs the real
+  **WASM-backed implementation** and routes web-client
+  `phoneSyncConnect`/`SendCommand`/`Disconnect` calls plus
   the frame listener to the `Session` wasm class from §5.4. The Tauri path is
   untouched.
-- **`scanner.ts` gets a browser impl.** Today `isScannerAvailable()` is
-  Tauri-mobile only. Add a web implementation using `getUserMedia` +
-  **zxing-wasm**, with a `<input type="file" accept="image/*" capture>` fallback
+- **The scanner has a browser implementation.** `webScanner.ts` uses camera
+  capture with **zxing-wasm** and a
+  `<input type="file" accept="image/*" capture>` fallback
   for when camera permission is denied/unpersisted.
 - **Reused unchanged:** `store.ts` (`connectRemote`, `applyFrame`,
   `reconnectRemote`, `disconnectRemote`, `remoteMode`, `remoteConnected`,
   `remoteSas`, `remoteDropped`), `RemotePairing.tsx`, `Chat`, `Message`,
   `PermissionPrompt`, `ToolCall`. `remoteMode` flips on for the web build.
-- **Lazy-load the wasm.** `import()` the wasm-bindgen glue behind the pairing
-  action (or on first connect), with `React.lazy` for the session screens, so
-  the PWA shell paints fast on mobile before the ~hundreds-of-KB wasm arrives.
+- **The WASM is lazy-loaded.** `webSession.ts` imports the wasm-bindgen glue on
+  first connection so the PWA shell paints before the WASM payload arrives.
 
 ### 5.7 iOS PWA layer
 
@@ -538,10 +524,9 @@ New frontend code **must** ship with tests in the same change (per `CLAUDE.md`).
   (`cargo build --target wasm32-unknown-unknown` + `wasm-pack test --headless`
   for the Noise round-trip). Rust tests run in CI (the crate is too heavy to
   build on low-RAM dev machines — **verify via CI**).
-- **Frontend:** the reused store/components keep their `*.test.tsx`. New code —
-  the WASM-backed `ipc` adapter, the web `scanner`, the install-gate, the
-  reconnect/visibility logic — needs matching vitest tests (mock the `Session`
-  wasm class) to keep coverage ≥ threshold and avoid reddening `main` post-merge.
+- **Frontend:** the reused store/components and the WASM adapter, scanner,
+  install gate, storage, and reconnect/visibility wiring have matching Vitest
+  coverage. Keep those tests hermetic and extend them with each behavior change.
 - **E2E (wdio):** add a browser-mode smoke that pairs against a headless desktop
   - local relay and exercises connect → command → frame → background → resume.
 - **iOS on-device:** the Phase 0 spike and a manual pre-launch checklist
@@ -552,15 +537,15 @@ New frontend code **must** ship with tests in the same change (per `CLAUDE.md`).
 
 ## 8. Phased roadmap
 
-| Phase                                              | Goal                                                                                                 | Exit criteria                                                                                                                                                                                                  |
-| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **0. iOS proof-of-connection (spike)** ⚠️ do first | De-risk the one unknown: does iroh-in-browser actually hold a connection on real iOS?                | A throwaway wasm page on **real iOS Safari + installed PWA** dials a native iroh desktop through a relay, exchanges bytes, and survives a background→resume reconnect. **Go/no-go gate for everything below.** |
-| **1. Workspace restructure**                       | Extract `portcode-sync`; desktop builds unchanged against it.                                        | `cargo build` (desktop) + `cargo test` green; `cargo build --target wasm32-unknown-unknown` of `portcode-sync` compiles.                                                                                       |
-| **2. WASM transport + interop**                    | `transport_wasm.rs` + `portcode-wasm` `Session` class; Noise handshake works browser↔desktop.        | A Node/headless harness pairs, gets a SAS, sends a command, receives a `Live` frame through the relay.                                                                                                         |
-| **3. Web frontend**                                | Vercel build target; WASM-backed `ipc`; web `scanner`; reuse store/UI.                               | A desktop-browser PWA pairs, drives a real session, mirrors live frames.                                                                                                                                       |
-| **4. iOS PWA hardening**                           | Install gate, manifest/meta/splash, IndexedDB + `persist()`, visibility reconnect + cursor catch-up. | On real iOS: install → pair → run a turn → lock phone 1 min → resume with full catch-up, no data loss.                                                                                                         |
-| **5. Web Push + polish**                           | Installed-PWA push for permission/turn events + App Badge; CSP/SRI; size budget.                     | Push pulls user back to a pending permission; Lighthouse PWA pass; wasm gzip budget met.                                                                                                                       |
-| **6. Self-host relay + launch**                    | Replace public relay with self-hosted, version-pinned `iroh-relay`; docs.                            | Stable relay; runbook; `SECURITY.md` updated; README "Phone Sync" status moved from roadmap → alpha.                                                                                                           |
+| Phase                                | Implementation status                              | Remaining exit criterion                                                                                                            |
+| ------------------------------------ | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| **0. iOS proof-of-connection spike** | ⏳ Not performed                                   | Real iOS Safari and installed PWA dial a desktop through a real relay, exchange frames, background, resume, reconnect, and catch up |
+| **1. Workspace restructure**         | ✅ Landed                                          | Keep native tests and WASM compile gate green                                                                                       |
+| **2. WASM transport + interop**      | ✅ Landed in source and committed browser artifact | Prove relay-backed handshake/SAS/command/live-frame exchange against a real desktop                                                 |
+| **3. Web frontend**                  | ✅ Landed and unit-tested                          | Complete the real desktop-browser acceptance path                                                                                   |
+| **4. iOS PWA hardening**             | ✅ Lifecycle/storage/install code landed           | On real iOS: install → pair → run → lock for at least 1 minute → resume with full catch-up and no data loss                         |
+| **5. Web Push + polish**             | ✅ Push/badge foundation landed                    | Validate notification re-entry and production PWA/size/security checks                                                              |
+| **6. Self-host relay + launch**      | Deployment assets landed; launch acceptance open   | Operate a version-pinned relay, complete runbook/security review, and pass the device matrix before changing product status         |
 
 ---
 

@@ -96,8 +96,10 @@ not both at once. Two reasons, both because login/sync state is shared:
 Running them one at a time sidesteps both entirely. (Running them
 _simultaneously_, with separated identity + safe handoff, is Phase 2.)
 
-The dev build does **not** auto-update itself (the updater is pull-only and
-nothing in the UI triggers it), so it stays exactly the build you compiled.
+The dev channel suppresses updater checks and downloads, so it stays exactly the build you
+compiled. This guard is part of the stabilization sprint: the visible DEV channel, not merely the
+separate bundle identifier, is the source of truth. Keep this invariant covered when changing the
+updater bootstrap.
 
 ---
 

@@ -9,12 +9,12 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::stream::StreamExt;
 use serde_json::Value;
-use tauri::AppHandle;
 use uuid::Uuid;
 
 use crate::agents;
 use crate::background;
 use crate::db::{self, Db};
+use crate::events::EventSink;
 use crate::llm::{self, Block, ChatMessage, StreamEvent};
 use crate::oauth;
 use crate::permissions::{self, Decision, Pending};
@@ -72,11 +72,6 @@ fn batch_cancelled(prev_cancelled: bool, cancel_flag: bool) -> bool {
 /// because the user pressed Stop. Anthropic requires a result for every tool_use,
 /// so we post this (as an error) rather than dropping the block.
 const CANCELLED_TOOL_RESULT: &str = "Cancelled: the user stopped the turn before this tool ran.";
-
-fn emit(app: &AppHandle, channel: &str, ev: StreamEvent) {
-    // Canonical chokepoint: delivers to the desktop UI and mirrors to the phone.
-    crate::sync::emit_event(app, channel, ev);
-}
 
 fn system_prompt(workspace: &Path) -> String {
     format!(
@@ -250,7 +245,7 @@ async fn ensure_fresh(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
-    app: AppHandle,
+    sink: Arc<dyn EventSink>,
     http: reqwest::Client,
     settings: Arc<Mutex<Settings>>,
     db: Arc<Db>,
@@ -283,8 +278,7 @@ pub async fn run(
         }
     };
     if already_running {
-        emit(
-            &app,
+        sink.emit(
             &channel,
             StreamEvent::Error {
                 message: "A turn is already running for this session.".to_string(),
@@ -293,8 +287,7 @@ pub async fn run(
         return;
     }
 
-    emit(
-        &app,
+    sink.emit(
         &channel,
         StreamEvent::TurnStart {
             message_id: Uuid::new_v4().to_string(),
@@ -317,7 +310,7 @@ pub async fn run(
     let ask_lock = Arc::new(tokio::sync::Mutex::new(()));
 
     let result = run_inner(
-        &app,
+        &sink,
         &http,
         &settings,
         &db,
@@ -341,14 +334,14 @@ pub async fn run(
     }
 
     match result {
-        Ok(stop_reason) => emit(&app, &channel, StreamEvent::TurnEnd { stop_reason }),
-        Err(message) => emit(&app, &channel, StreamEvent::Error { message }),
+        Ok(stop_reason) => sink.emit(&channel, StreamEvent::TurnEnd { stop_reason }),
+        Err(message) => sink.emit(&channel, StreamEvent::Error { message }),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_inner(
-    app: &AppHandle,
+    sink: &Arc<dyn EventSink>,
     http: &reqwest::Client,
     settings: &Arc<Mutex<Settings>>,
     db: &Arc<Db>,
@@ -413,7 +406,7 @@ async fn run_inner(
     // which already denies mutating tools in plan mode.
     let spawner: Option<Arc<dyn tools::Spawner>> = if registry.find("task").is_some() {
         Some(Arc::new(AgentSpawner {
-            app: app.clone(),
+            sink: sink.clone(),
             http: http.clone(),
             settings: settings.clone(),
             pending: pending.clone(),
@@ -438,7 +431,7 @@ async fn run_inner(
     // in this version, so their `shell` runs foreground.
     if registry.find("shell").is_some() {
         ctx.background = Some(Arc::new(BackgroundLauncher {
-            app: app.clone(),
+            sink: sink.clone(),
             background: background.clone(),
             session_channel: channel.to_string(),
             session_id: session_id.to_string(),
@@ -467,7 +460,7 @@ async fn run_inner(
     // and usage all flow on the same `agent://{session}` channel, and every
     // message persists to the session.
     let outcome = run_loop_core(
-        app,
+        sink.as_ref(),
         http,
         provider.as_ref(),
         &snapshot,
@@ -569,7 +562,7 @@ struct LoopOutcome {
 ///    `Ephemeral` for a subagent (in-memory only).
 #[allow(clippy::too_many_arguments)]
 async fn run_loop_core(
-    app: &AppHandle,
+    sink: &dyn EventSink,
     http: &reqwest::Client,
     provider: &dyn llm::LlmProvider,
     snapshot: &Settings,
@@ -620,7 +613,7 @@ async fn run_loop_core(
                 system,
                 &messages,
                 &tool_specs,
-                app,
+                sink,
                 agent_channel,
                 cancel,
             )
@@ -630,8 +623,7 @@ async fn run_loop_core(
         // subagent's token cost rolls up into the parent session's total rather
         // than streaming to an unwatched child channel and being lost. For the
         // interactive run the two channels are identical, so this is unchanged.
-        emit(
-            app,
+        sink.emit(
             session_channel,
             StreamEvent::Usage {
                 input_tokens: turn.input_tokens,
@@ -648,8 +640,7 @@ async fn run_loop_core(
         // the session channel (where the panel listens). `steps` is its 1-based turn
         // count. The interactive run (`agent_id == None`) has no panel row.
         if let Some(id) = agent_id {
-            emit(
-                app,
+            sink.emit(
                 session_channel,
                 StreamEvent::AgentProgress {
                     agent_id: id.to_string(),
@@ -700,7 +691,7 @@ async fn run_loop_core(
                 if batch_cancelled(cancelled, cancel.load(Ordering::Relaxed)) {
                     cancelled = true;
                     let output = CANCELLED_TOOL_RESULT.to_string();
-                    emit(app, agent_channel, tool_result_event(id, &output, true));
+                    sink.emit(agent_channel, tool_result_event(id, &output, true));
                     done.push((i, output, true));
                     continue;
                 }
@@ -713,7 +704,7 @@ async fn run_loop_core(
                         if cancel.load(Ordering::Relaxed) {
                             cancelled = true;
                             let output = CANCELLED_TOOL_RESULT.to_string();
-                            emit(app, agent_channel, tool_result_event(id, &output, true));
+                            sink.emit(agent_channel, tool_result_event(id, &output, true));
                             done.push((i, output, true));
                         } else {
                             let input = input.clone();
@@ -732,7 +723,7 @@ async fn run_loop_core(
                 let (output, is_error) = match registry.find(name) {
                     Some(tool) => {
                         gate_and_run(
-                            app,
+                            sink,
                             session_channel,
                             snapshot,
                             pending,
@@ -748,7 +739,7 @@ async fn run_loop_core(
                     }
                     None => (format!("Unknown tool: {name}"), true),
                 };
-                emit(app, agent_channel, tool_result_event(id, &output, is_error));
+                sink.emit(agent_channel, tool_result_event(id, &output, is_error));
                 done.push((i, output, is_error));
             }
 
@@ -759,8 +750,7 @@ async fn run_loop_core(
                 let mut stream =
                     futures_util::stream::iter(task_futs).buffer_unordered(MAX_PARALLEL_AGENTS);
                 while let Some((i, output, is_error)) = stream.next().await {
-                    emit(
-                        app,
+                    sink.emit(
                         agent_channel,
                         tool_result_event(tool_uses[i].0, &output, is_error),
                     );
@@ -874,7 +864,7 @@ fn precheck_outcome(decision: Decision, cancelled_now: bool) -> Option<(&'static
 /// a time). The lock is held only across the gate, never across a tool's work.
 #[allow(clippy::too_many_arguments)]
 async fn gate_and_run(
-    app: &AppHandle,
+    sink: &dyn EventSink,
     session_channel: &str,
     snapshot: &Settings,
     pending: &Pending,
@@ -892,7 +882,7 @@ async fn gate_and_run(
         let diff = tool.preview(input, ctx).await;
         let _prompt = ask_lock.lock().await;
         permissions::gate(
-            app,
+            sink,
             session_channel,
             snapshot.permission_mode,
             &snapshot.rules,
@@ -946,6 +936,74 @@ fn subagent_answer(description: &str, final_text: &str, stop_reason: &str) -> St
     }
 }
 
+/// Derive a meaningful label for a sub-agent from the tool input.
+///
+/// Priority:
+/// 1. Use `description` as-is when it is non-empty, not the generic placeholder
+///    `"subagent"` (case-insensitive), and at least 3 characters long.
+/// 2. Otherwise derive a label from the first non-empty line of `prompt`: trim
+///    it, collapse internal whitespace, strip a leading Markdown bullet or
+///    heading marker, and truncate to ~60 characters on a word boundary
+///    (appending `"…"` when truncated).
+/// 3. If both are blank fall back to `"subagent"`.
+fn subagent_label(description: &str, prompt: &str) -> String {
+    let d = description.trim();
+    if d.len() >= 3 && !d.eq_ignore_ascii_case("subagent") {
+        return d.to_string();
+    }
+
+    // Derive from the first non-empty line of the prompt.
+    let first = prompt
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if first.is_empty() {
+        return "subagent".to_string();
+    }
+
+    // Strip a leading Markdown bullet or heading marker (e.g. "- ", "# ", "## ").
+    let stripped = first.trim_start_matches(['#', '-', '*', '>']).trim_start();
+    let text = if stripped.is_empty() { first } else { stripped };
+
+    // Collapse internal whitespace into single spaces.
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    const MAX: usize = 60;
+    if collapsed.len() <= MAX {
+        return collapsed;
+    }
+
+    // Truncate on a word boundary (never slice through a multibyte character).
+    // Walk char indices; keep the last boundary position that still fits in MAX.
+    let mut boundary = 0usize;
+    let mut prev_was_space = false;
+    for (idx, ch) in collapsed.char_indices() {
+        if idx > MAX {
+            break;
+        }
+        if ch == ' ' {
+            if !prev_was_space {
+                boundary = idx;
+            }
+            prev_was_space = true;
+        } else {
+            prev_was_space = false;
+        }
+    }
+    // If no word boundary found at all (one giant token), cut at the last safe
+    // char boundary ≤ MAX.
+    if boundary == 0 {
+        boundary = collapsed
+            .char_indices()
+            .take_while(|&(i, c)| i + c.len_utf8() <= MAX)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(collapsed.len());
+    }
+    format!("{}…", collapsed[..boundary].trim_end())
+}
+
 /// The `AgentFinished` status string for a subagent that ran to completion: a
 /// cancelled run reports `"cancelled"`, anything else `"ok"`. (A subagent that
 /// errored out — `run_loop_core` returned `Err` — reports `"error"`; see
@@ -988,7 +1046,7 @@ fn session_of(channel: &str) -> &str {
 /// launches, so nesting stays depth-bounded.
 #[derive(Clone)]
 struct AgentSpawner {
-    app: AppHandle,
+    sink: Arc<dyn EventSink>,
     http: reqwest::Client,
     settings: Arc<Mutex<Settings>>,
     pending: Pending,
@@ -1053,12 +1111,12 @@ impl tools::Spawner for AgentSpawner {
         if self.cancel.load(Ordering::Relaxed) {
             child_cancel.store(true, Ordering::Relaxed);
         }
-        emit(
-            &self.app,
+        let label = subagent_label(&spec.description, &spec.prompt);
+        self.sink.emit(
             &self.parent_channel,
             StreamEvent::AgentStarted {
                 agent_id: agent_id.clone(),
-                description: spec.description.clone(),
+                description: label,
                 parent_id: self.self_id.clone(),
             },
         );
@@ -1096,7 +1154,7 @@ impl tools::Spawner for AgentSpawner {
         }];
 
         let result = run_loop_core(
-            &self.app,
+            self.sink.as_ref(),
             &self.http,
             provider.as_ref(),
             &snapshot,
@@ -1119,8 +1177,7 @@ impl tools::Spawner for AgentSpawner {
         // ALWAYS announce completion and deregister, on success OR error, so the
         // panel never shows a ghost agent and the registry never leaks a flag.
         let status = spawn_status(&result);
-        emit(
-            &self.app,
+        self.sink.emit(
             &self.parent_channel,
             StreamEvent::AgentFinished {
                 agent_id: agent_id.clone(),
@@ -1145,7 +1202,7 @@ impl tools::Spawner for AgentSpawner {
 /// waiter's abort handle so a session Stop can kill it.
 #[derive(Clone)]
 struct BackgroundLauncher {
-    app: AppHandle,
+    sink: Arc<dyn EventSink>,
     background: background::Background,
     /// The session's `agent://{session}` channel — where start/finish events go.
     /// (Lifecycle events ride the session channel because a finish can land after
@@ -1189,8 +1246,7 @@ impl tools::BackgroundRunner for BackgroundLauncher {
     fn launch(&self, command: String, child: tokio::process::Child) -> String {
         let id = Uuid::new_v4().to_string();
         // Announce the launch right away so the UI can show it as running.
-        emit(
-            &self.app,
+        self.sink.emit(
             &self.session_channel,
             StreamEvent::BackgroundTaskStarted {
                 id: id.clone(),
@@ -1198,7 +1254,7 @@ impl tools::BackgroundRunner for BackgroundLauncher {
             },
         );
 
-        let app = self.app.clone();
+        let sink = self.sink.clone();
         let bg = self.background.clone();
         let channel = self.session_channel.clone();
         let task_id = id.clone();
@@ -1221,8 +1277,7 @@ impl tools::BackgroundRunner for BackgroundLauncher {
                     ),
                     Err(e) => (-1, format!("background command failed: {e}")),
                 };
-                emit(
-                    &app,
+                sink.emit(
                     &channel,
                     StreamEvent::BackgroundTaskFinished {
                         id: task_id.clone(),
@@ -1244,8 +1299,8 @@ mod tests {
         assistant_text, background, batch_cancelled, child_can_spawn, derive_title, finish_status,
         is_terminal_auth_error, precheck_outcome, reassemble_results, resolve_system_prompt,
         session_of, spawn_background_task, spawn_status, step_limit_exceeded, subagent_answer,
-        tool_result_block, tool_result_event, AgentConfig, Block, ChatMessage, Db, Decision,
-        LoopOutcome, Persist, StreamEvent, CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS,
+        subagent_label, tool_result_block, tool_result_event, AgentConfig, Block, ChatMessage, Db,
+        Decision, LoopOutcome, Persist, StreamEvent, CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS,
         MAX_PARALLEL_AGENTS, MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
     };
     use std::path::Path;
@@ -1349,6 +1404,104 @@ mod tests {
         assert!(note.contains("without a text summary"));
         assert!(note.contains("audit deps"));
         assert!(note.contains("cancelled"));
+    }
+
+    #[test]
+    fn subagent_label_passes_through_a_good_description() {
+        // A real, non-generic description of at least 3 chars is used as-is.
+        assert_eq!(
+            subagent_label("audit deps", "find vulnerable crates"),
+            "audit deps"
+        );
+        assert_eq!(
+            subagent_label("Fix auth bug", "irrelevant prompt"),
+            "Fix auth bug"
+        );
+    }
+
+    #[test]
+    fn subagent_label_falls_back_to_prompt_when_description_is_generic_or_short() {
+        // The literal placeholder "subagent" (any case) and short/empty strings
+        // trigger a derivation from the prompt's first line.
+        assert_eq!(
+            subagent_label("subagent", "Search for vulnerable crates in Cargo.toml"),
+            "Search for vulnerable crates in Cargo.toml"
+        );
+        assert_eq!(
+            subagent_label("SUBAGENT", "Analyse the login flow"),
+            "Analyse the login flow"
+        );
+        assert_eq!(
+            subagent_label("", "Run the test suite"),
+            "Run the test suite"
+        );
+        assert_eq!(
+            subagent_label("  ", "Run the test suite"),
+            "Run the test suite"
+        );
+        // A two-char description is too short and falls back to the prompt.
+        assert_eq!(
+            subagent_label("ab", "Do something useful"),
+            "Do something useful"
+        );
+    }
+
+    #[test]
+    fn subagent_label_uses_first_nonempty_prompt_line() {
+        let prompt = "\n\n  \nActual task line\nSecond line of prompt";
+        assert_eq!(subagent_label("subagent", prompt), "Actual task line");
+    }
+
+    #[test]
+    fn subagent_label_strips_markdown_prefix() {
+        assert_eq!(
+            subagent_label("", "- List all open PRs"),
+            "List all open PRs"
+        );
+        assert_eq!(subagent_label("", "## Review security"), "Review security");
+        assert_eq!(subagent_label("", "# Heading task"), "Heading task");
+        assert_eq!(subagent_label("", "* Bullet task"), "Bullet task");
+        assert_eq!(subagent_label("", "> Quoted task"), "Quoted task");
+    }
+
+    #[test]
+    fn subagent_label_truncates_long_prompts_on_word_boundary() {
+        // 70 'a's followed by a space and "overflow" — must truncate before 60 chars.
+        let long = format!("{} overflow", "a".repeat(70));
+        let label = subagent_label("", &long);
+        // Result must end with '…' and must be at most 61 bytes (60 + the 3-byte
+        // UTF-8 ellipsis '…').
+        assert!(label.ends_with('…'), "expected ellipsis, got: {label:?}");
+        assert!(
+            label.len() <= 63,
+            "label too long ({} bytes): {label:?}",
+            label.len()
+        );
+    }
+
+    #[test]
+    fn subagent_label_truncates_safely_on_multibyte_input() {
+        // 30 two-byte characters (é, U+00E9) gives 60 bytes exactly at position 30 —
+        // truncating at byte 60 would land on a char boundary here, but the test also
+        // exercises the path through `char_indices` safely.
+        let repeated = "é".repeat(30); // 60 bytes, each char 2 bytes
+        let prompt = format!("{repeated} and more text");
+        let label = subagent_label("subagent", &prompt);
+        // The label must be valid UTF-8 (no panic) and at most 63 bytes.
+        assert!(label.len() <= 63, "label too long: {}", label.len());
+        // Emoji prompt — each emoji is 4 bytes.
+        let emoji_prompt = "🚀".repeat(20); // 80 bytes total
+        let emoji_label = subagent_label("", &emoji_prompt);
+        assert!(!emoji_label.is_empty());
+        // Must be valid UTF-8 — collecting chars proves there's no half-cut codepoint.
+        let _chars: Vec<char> = emoji_label.chars().collect();
+    }
+
+    #[test]
+    fn subagent_label_both_empty_returns_fallback() {
+        assert_eq!(subagent_label("", ""), "subagent");
+        assert_eq!(subagent_label("subagent", ""), "subagent");
+        assert_eq!(subagent_label("subagent", "  \n  "), "subagent");
     }
 
     #[test]

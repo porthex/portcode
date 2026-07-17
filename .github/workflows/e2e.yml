@@ -1,16 +1,8 @@
 name: E2E
 
-# End-to-end smoke test: build the Tauri app and drive the real window through
-# tauri-driver + WebdriverIO. This is a dedicated workflow (kept separate from
-# ci.yml) because it is heavier than the unit gates — it compiles the Rust app
-# and boots a live WebView2 window.
-#
-# Windows-only today: tauri-driver supports Windows and Linux (not macOS), and
-# Portcode is Windows-first. When the Linux app target turns on, add
-# `ubuntu-latest` here with WebKitGTK + xvfb (see the Tauri WebDriver CI guide).
-#
-# This workflow performs NO telemetry or network reporting — it only builds and
-# tests the code.
+# Build the real Tauri app and inspect its live WebView2 renderer through a
+# loopback-only DevTools endpoint. Kept separate from ci.yml because compiling
+# Rust and booting a desktop window is heavier than the unit gates.
 
 on:
   push:
@@ -27,7 +19,7 @@ concurrency:
 
 jobs:
   e2e:
-    name: Smoke (tauri-driver · WebdriverIO)
+    name: Smoke (Tauri - WebView2)
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -40,11 +32,10 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: 20
+          # Node 22 provides the stable built-in WebSocket client used for CDP.
+          node-version: 22
           cache: pnpm
 
-      # The channel, MSVC target, and components are pinned by
-      # rust-toolchain.toml, so rustup materializes the correct toolchain.
       - name: Materialize pinned Rust toolchain
         run: rustup show
 
@@ -53,34 +44,14 @@ jobs:
         with:
           workspaces: src-tauri
 
-      # tauri-driver needs a Microsoft Edge Driver whose version matches the
-      # runner's Edge. msedgedriver-tool downloads the matching build; add it to
-      # PATH so tauri-driver finds it.
-      - name: Install Microsoft Edge Driver (matches the runner's Edge)
-        shell: pwsh
-        run: |
-          cargo install --git https://github.com/chippers/msedgedriver-tool
-          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\edgedriver" | Out-Null
-          Set-Location "$env:RUNNER_TEMP\edgedriver"
-          & "$HOME\.cargo\bin\msedgedriver-tool.exe"
-          "$env:RUNNER_TEMP\edgedriver" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-
-      # The tauri-driver version is independent of the app's Tauri version.
-      - name: Install tauri-driver
-        run: cargo install tauri-driver --locked
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # Fast gate: type-check the E2E sources before the expensive build (the
-      # WebdriverIO runner transpiles with tsx, which does not type-check).
-      - name: Type-check E2E sources
+      - name: Type-check E2E source
         run: pnpm test:e2e:typecheck
 
-      # Build the debug binary in its own cache-friendly step, then tell the
-      # runner to reuse it instead of rebuilding inside onPrepare.
       - name: Build debug app
-        run: pnpm tauri build --debug --no-bundle
+        run: pnpm tauri build --config src-tauri/tauri.e2e.conf.json --debug --no-bundle
 
       - name: Run E2E smoke test
         run: pnpm test:e2e

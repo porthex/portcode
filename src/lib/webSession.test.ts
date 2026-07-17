@@ -346,11 +346,9 @@ function createFakeWasmSession(opts: { withOnDisconnected?: boolean; withReject?
 describe("createWasmConnector (real connector, faked wasm module)", () => {
   it("adapts the wasm Session: connect returns its sas/peerPublicKey", async () => {
     const fake = createFakeWasmSession();
-    const load = vi.fn(
-      async (): Promise<WasmModule> => ({
-        Session: { connect: vi.fn(async () => fake.session) },
-      }),
-    );
+    const load = vi.fn(async (): Promise<WasmModule> => ({
+      Session: { connect: vi.fn(async () => fake.session) },
+    }));
     const connector = createWasmConnector(load);
     const session = await connector.connect("the-qr", true);
     expect(session.sas).toBe("WASM-SAS");

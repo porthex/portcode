@@ -15,6 +15,10 @@ mod background;
 // ever calls `SentryAndroid.init`). Compiles on every target. See `consent.rs`.
 mod consent;
 mod db;
+// The event-emission seam ([`EventSink`] + the production [`AppEventSink`]). The
+// trait is SHARED because `llm::LlmProvider` (shared) takes `&dyn EventSink`; the
+// concrete `AppEventSink` is desktop-only (gated inside `events`).
+mod events;
 mod llm;
 #[cfg(desktop)]
 mod oauth;
@@ -221,6 +225,40 @@ fn oauth_logout() -> Result<(), String> {
 
 // ── sessions ─────────────────────────────────────────────────────────────────
 
+/// Best-effort fan-out of the current session list to any connected sync client
+/// (web/phone) after a desktop-initiated session change. Without this, a session
+/// created/renamed/deleted ON THE DESKTOP would stay invisible to a connected
+/// client until its next reconnect/catch-up — the catch-up `SessionList` is sent
+/// once, on Hello, and `forward_live` only carries `Live` frames. Mirrors the
+/// phone-`CreateSession` fan-out in `sync::server::DesktopCommandHandler`.
+///
+/// Resolves the `SyncHub` from managed state and publishes; a `list_sessions` read
+/// error is logged and swallowed (it must NOT fail the already-committed DB write),
+/// and `publish_frame` is itself a cheap no-op when no client is attached.
+///
+/// DESKTOP-ONLY behavior: only the desktop runs the sync SERVER (and `SyncHub::
+/// publish_frame` is `#[cfg(desktop)]`). On mobile — the phone is a pure remote
+/// CLIENT and never serves a session list — this is a no-op, so the shared
+/// `create/rename/delete_session` commands compile on both targets.
+#[cfg(desktop)]
+fn push_session_list(app: &AppHandle, db: &Db) {
+    if let Some(hub) = app.try_state::<sync::SyncHub>() {
+        match db.list_sessions() {
+            Ok(sessions) => {
+                hub.publish_frame(sync::protocol::SyncFrame::SessionList { sessions });
+            }
+            Err(e) => eprintln!("phone-sync: list_sessions after session change failed: {e}"),
+        }
+    }
+}
+
+/// Mobile no-op counterpart of [`push_session_list`]: the phone never serves sync
+/// clients, so there is nothing to fan out. Keeps the session commands target-
+/// agnostic without dragging the desktop-only `SyncHub::publish_frame` into the
+/// mobile build. `app`/`db` are unused here by design.
+#[cfg(mobile)]
+fn push_session_list(_app: &AppHandle, _db: &Db) {}
+
 #[tauri::command]
 fn list_sessions(state: State<AppState>) -> Vec<SessionRow> {
     state.db.list_sessions().unwrap_or_default()
@@ -228,6 +266,7 @@ fn list_sessions(state: State<AppState>) -> Vec<SessionRow> {
 
 #[tauri::command]
 fn create_session(
+    app: AppHandle,
     state: State<AppState>,
     id: String,
     title: Option<String>,
@@ -243,20 +282,34 @@ fn create_session(
             model.as_deref(),
             db::now_ms(),
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Notify any connected sync client of the new session (best-effort).
+    push_session_list(&app, &state.db);
+    Ok(())
 }
 
 #[tauri::command]
-fn rename_session(state: State<AppState>, id: String, title: String) -> Result<(), String> {
+fn rename_session(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+    title: String,
+) -> Result<(), String> {
     state
         .db
         .rename_session(&id, &title)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Push the updated titles to any connected sync client (best-effort).
+    push_session_list(&app, &state.db);
+    Ok(())
 }
 
 #[tauri::command]
-fn delete_session(state: State<AppState>, id: String) -> Result<(), String> {
-    state.db.delete_session(&id).map_err(|e| e.to_string())
+fn delete_session(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
+    state.db.delete_session(&id).map_err(|e| e.to_string())?;
+    // Push the pruned list to any connected sync client (best-effort).
+    push_session_list(&app, &state.db);
+    Ok(())
 }
 
 #[tauri::command]
@@ -410,11 +463,16 @@ async fn run_agent(
     let background = state.background.clone();
     let oauth_refresh = state.oauth_refresh.clone();
 
+    // Wrap the AppHandle in the concrete EventSink at the command boundary, so the
+    // agent core receives only the trait — its sole Tauri coupling (event emission)
+    // now lives behind `events::EventSink`.
+    let sink: Arc<dyn events::EventSink> = Arc::new(events::AppEventSink(app));
+
     // Run in the background so the command returns immediately and the frontend
     // can register its cancel handle before the run finishes.
     tauri::async_runtime::spawn(async move {
         agent::run(
-            app,
+            sink,
             http,
             settings,
             db,
@@ -544,7 +602,7 @@ fn phone_sync_status(state: State<AppState>) -> Result<PhoneSyncStatus, String> 
 fn phone_sync_begin_pairing(
     state: State<AppState>,
 ) -> Result<sync::pairing::PairingPayload, String> {
-    use rand::RngCore as _;
+    use rand::Rng as _;
 
     // Snapshot the live address under the lock, then DROP the guard before building
     // the payload — keep the critical section to a synchronous `ep.addr()` call.
@@ -565,7 +623,7 @@ fn phone_sync_begin_pairing(
     // nonce here lets us register it on the gate.
     let identity = sync::pairing::device_identity()?;
     let mut nonce = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::rng().fill_bytes(&mut nonce);
 
     let payload = match live_addr {
         // Same identity + this nonce, but the node_addr is the live full address

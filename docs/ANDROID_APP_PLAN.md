@@ -1,10 +1,10 @@
 # Portcode Android App — Implementation Plan
 
-> Status: **planning + scaffolded.** The Tauri v2 Android project is generated
-> (`src-tauri/gen/android`, committed). This doc grounds the rest of the build in
-> Portcode's _actual_ code + the real blockers, and sequences it into shippable,
-> CI-verifiable increments. Companion to [`PHONE_SYNC_PLAN.md`](./PHONE_SYNC_PLAN.md)
-> (the now-merged Sync Engine).
+> Status: **remote client implemented; device/release acceptance pending.** The
+> Tauri Android scaffold, mobile/desktop capability split, sync-client commands,
+> remote-mode UI, and QR pairing surface are in the tree. Android CI builds a
+> debug APK but remains non-blocking. Physical-device pairing, background/resume,
+> release signing, and distribution are not yet validated.
 >
 > Goal: an Android app that pairs with a desktop and **drives/continues a coding
 > session from the phone** — the phone is a **remote control surface**, the desktop
@@ -28,7 +28,11 @@
   `NDK_HOME`/`ANDROID_NDK_ROOT` exported — they were empty; point them at
   `…\Sdk\ndk\27.0.12077973`.)
 
-So the **shell builds**; the app's _behaviour_ is the work.
+- ✅ **Remote-client/platform split landed** — desktop-only agent, tools, server,
+  secrets, and updater surfaces are `cfg(desktop)`; mobile registers the sync
+  client commands and renders `remoteMode` with native QR scanning.
+- ⚠️ **Acceptance remains** — the non-blocking CI probe proves cross-compilation,
+  not physical-device pairing, lifecycle resilience, or release readiness.
 
 ---
 
@@ -42,19 +46,17 @@ device, and shipping the shell/file tools in a mobile binary is wrong + a securi
 smell. The phone should **only** speak the sync _client_ side of the protocol and
 render the session.
 
-This means the mobile build is **not** "the desktop app compiled for android." It
-is a **different surface over the same crate**, selected by a Cargo **feature** (or
-`cfg(mobile)`):
+The mobile build is **not** "the desktop app compiled for Android." It is a
+different surface over the same crate, selected by `cfg(mobile)` / `cfg(desktop)`:
 
 ```
 desktop build  =  agent + tools + llm + keyring(windows) + sync SERVER (phone_sync_listen)
 mobile build   =  sync CLIENT (connect/pair/catch-up/live/command send) + remote UI + keyring(android) + QR scan
 ```
 
-**Decision needed from the owner:** confirm "phone = pure remote client" (recommended;
-matches the research doc). The alternative (phone also runs an agent) is out of scope
-
-- infeasible (no LLM key/workspace on device).
+That architectural decision is implemented: the phone is a pure remote client.
+Running the agent, workspace tools, or desktop sync server on the phone remains
+out of scope.
 
 ---
 
@@ -66,9 +68,9 @@ matches the research doc). The alternative (phone also runs an agent) is out of 
 > (~7 min) and produces a debug APK. **`openssl-sys` was the _only_ actual build
 > blocker.** The items I'd predicted (keyring, agent/tools/shell — the §2.1 table)
 > turned out **not** to block compilation at all; they are _architecture_ concerns,
-> not build errors. **Net: the platform split (§4) is no longer a prerequisite to
-> build/ship an Android APK — it's a product decision we can make at leisure.** The
-> CI probe (§5) now uploads the APK as an artifact every run.
+> not build errors. The platform split was therefore implemented as a product and
+> security boundary rather than a cross-compile fix. The CI probe (§5) uploads a
+> debug APK artifact when the build succeeds.
 
 ### 2.0 Blocker #1 — `openssl-sys` native cross-compile (✅ FIXED in #37)
 
@@ -96,62 +98,53 @@ builds + tests pass.
 
 ### 2.1 NON-blockers — these compile fine (architecture concerns, not build errors)
 
-The probe proved the items below do **not** block the Android build (keyring's
-`windows-native` is internally `cfg`-gated/inert off-Windows; the agent/tools/shell
-and sync server use cross-platform crates). They still matter as _product_ choices —
-you don't want the agent running on a phone — but that is the §4 split: an
-optimization, **not** a build prerequisite. The table doubles as the §4 to-do list.
+The probe proved the predicted items below did **not** block cross-compilation.
+The product split has since landed, so this table records the implemented
+resolution rather than an open to-do list.
 
-| Blocker                                                                                         | Where                                                                                          | Fix                                                                                                                                                                                                                                                                                                                                                 |
-| ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`keyring` `windows-native` feature won't compile for android** _(predicted)_                  | `Cargo.toml` `keyring = { features = ["windows-native"] }`                                     | Make the feature per-target: `windows-native` only under `cfg(windows)`; on android use the **Android Keystore** (e.g. `keyring` with the `linux`/`secret-service` backends don't apply — use a small JNI bridge to `AndroidKeyStore`, or an encrypted-file fallback in app-private storage). Likely a `secrets.rs` trait with a per-platform impl. |
-| **Agent/tools/shell are desktop-only**                                                          | `agent.rs`, `tools.rs`, `llm.rs`, the `run_agent`/`cancel_agent`/`resolve_permission` commands | Gate behind `#[cfg(not(mobile))]` / a `desktop` feature. The mobile `run()` registers only the client + remote commands.                                                                                                                                                                                                                            |
-| **`shell` tool uses `tokio::process` (PowerShell)**                                             | `tools.rs`                                                                                     | Excluded with the tools (above).                                                                                                                                                                                                                                                                                                                    |
-| **The sync SERVER (`phone_sync_listen`, `DesktopCommandHandler`, `server.rs`) is desktop-only** | `sync/server.rs`, `lib.rs`                                                                     | Gate `#[cfg(not(mobile))]`; mobile gets the _client_ listener counterpart.                                                                                                                                                                                                                                                                          |
-| **Windows-only deps in the tree** (the iroh/tauri `windows-*` crates)                           | resolved via target-gating already                                                             | iroh/snow/tokio/serde are cross-platform; the `windows-*` crates are `cfg(windows)` so they drop out for android automatically. Verify in CI.                                                                                                                                                                                                       |
+| Concern                                         | Implemented resolution                                                                                       |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| Desktop credentials and executable capabilities | Desktop secrets, agent, tools, shell, and updater modules are excluded from mobile with `cfg(desktop)`       |
+| Desktop sync server                             | Server/listener and `DesktopCommandHandler` stay desktop-only; mobile registers client connect/send commands |
+| Mobile identity persistence                     | Mobile uses the app-private mobile persistence path rather than the Windows credential backend               |
+| Windows-only dependencies                       | Target gating keeps Windows-only crates out of the Android target                                            |
 
 The **sync protocol core is already cross-platform** (`sync/{protocol,noise,transport,session,pairing,mod}.rs` use only iroh/snow/tokio/serde/base64) — it compiles for android as-is. That's the big win: the hard part (the encrypted session protocol) is reusable on the phone unchanged.
 
 ---
 
-## 3. The mobile sync CLIENT (the new Rust)
+## 3. The mobile sync client (implemented)
 
-Mirror of the desktop server, on the phone side. Most primitives already exist:
+The phone-side mirror of the desktop server is implemented:
 
-- `transport::connect_and_pair(endpoint, peer_addr, local_noise_private)` — **already
-  built** (the initiator side; currently carries a narrow `dead_code` allow — it
-  becomes live here).
-- `session::request_catch_up(channel, device_id, cursors)` — **already built**.
-- New: a **client session loop** — the dual of the server's `forward_live` +
+- The initiator transport dials the desktop address from `PairingPayload` and
+  establishes the Noise channel.
+- The session client requests catch-up from its persisted cursors.
+- A **client session loop** — the dual of the server's `forward_live` +
   `handle_commands`: split the channel, spawn (a) a recv loop that decodes incoming
   `SyncFrame::Live`/`SessionList`/`MessageDelta` and pushes them to the UI (via a
   Tauri event, e.g. `phone-sync://session`), and (b) a send path that turns UI
   actions into `SyncFrame::Command` (`Run`/`Cancel`/`Permission`/`CreateSession`).
   This is protocol-level + **CI-verifiable on the desktop Rust job** (no android
-  needed) — a good _first_ increment.
-- New mobile commands (`#[cfg(mobile)]`): `phone_sync_connect(qr_payload)` (decode
+  needed).
+- Mobile commands: `phone_sync_connect(qr_payload)` (decode
   the QR, dial the desktop's `EndpointAddr`, run the XX pairing as initiator, show
   the SAS for the user to compare, persist the pinned key), `phone_sync_send(command)`,
   and the event stream the UI subscribes to.
 
-**Addressing:** pairing needs the phone to reach the desktop's `EndpointAddr`. The
-QR payload (`PairingPayload`) today carries the Noise pubkey + nonce; **it must also
-carry the desktop's iroh `EndpointId` (+ relay URL or direct addrs)** so the phone
-can dial. Extend `PairingPayload` + the desktop `phone_sync_begin_pairing` to
-include the iroh node addr. (Small protocol addition.)
+`PairingPayload` carries the desktop iroh node address needed for the phone to
+dial. The remaining proof is a real device reaching a real desktop through the
+configured network/relay path.
 
 ---
 
-## 4. The mobile UI (remote mode)
+## 4. The mobile UI (remote mode implemented)
 
-- **`ipc.ts` third path.** Today: Tauri-local (desktop) or browser-mock. Add a
-  **remote** path: under `mobile`, `runAgent`/sessions/messages proxy to the desktop
+- **`ipc.ts` mobile path.** Under `mobile`, sessions/messages proxy to the desktop
   via the mobile commands + the `phone-sync://session` event stream (fold `Live`
   `StreamEvent`s with the _same reducer_ the desktop store uses — already factored).
-- **QR-scan pairing screen.** The phone scans the desktop's QR (from the desktop's
-  PHONE SYNC settings). Use a Tauri mobile camera/QR plugin (or a JS QR lib +
-  `getUserMedia`), then call `phone_sync_connect`. Show the **SAS** for out-of-band
-  comparison before trusting the channel.
+- **QR-scan pairing screen.** The mobile surface uses the Tauri barcode-scanner
+  plugin, calls `phone_sync_connect`, and shows the SAS comparison before trust.
 - Reuse the whole Chat/Composer/Message UI as-is (the phone renders the same session).
   Hide desktop-only affordances (workspace picker, file tree) on mobile.
 
@@ -159,16 +152,16 @@ include the iroh node addr. (Small protocol addition.)
 
 ## 5. CI + build verification (overcome the 8GB local wall)
 
-The desktop crate already can't build on the 8GB dev box; android is heavier.
-**Add an `android-build` CI job** (separate workflow, `workflow_dispatch` +
-`pull_request` touching mobile paths, so it doesn't slow every PR):
+The dedicated `android-build` workflow is implemented with `workflow_dispatch`
+and path-filtered pull-request triggers:
 
 - ubuntu runner (has the Android SDK pre-installed), set up JDK 17, pnpm install,
   `rustup target add aarch64-linux-android` (+ others), export `NDK_HOME`, then
   `pnpm tauri android build --apk --target aarch64` (or `cargo ndk`/`cargo build
 --target aarch64-linux-android` for a faster compile-only check).
-- This is where the §2 blockers surface concretely — fix them iteratively against
-  this job. **Verify the cross-compile in CI, not on the dev box.**
+- The job builds and uploads a debug APK. It intentionally remains
+  `continue-on-error`, so it is a non-blocking signal rather than a required
+  merge gate. Promote it only after physical-device behavior is stable.
 
 ---
 
@@ -193,13 +186,13 @@ The desktop crate already can't build on the 8GB dev box; android is heavier.
    captured the real blockers (and proved openssl-sys was the only one).
 4. **Drop the `openssl-sys` blocker** (reqwest → rustls) — ✅ **DONE (#37)**. With
    this, **the whole app cross-compiles for Android** (probe green). Architecture-neutral.
-5. **Platform split** (§2.1) — ⏸ **OWNER-GATED**: `secrets.rs` per-target keyring;
-   `#[cfg(mobile)]` to exclude agent/tools/server; the mobile `run()` + client commands.
-   **No longer a _build_ blocker** (the app already compiles) — this is the _product_
-   decision to make the mobile binary a lean remote client. Confirm the architecture (§1) first.
-6. **Remote-mode `ipc.ts`** + the QR-scan pairing screen (§4). ✅ frontend-CI-verifiable.
-7. **On-device** (owner): install the debug APK (now built by the §5 probe as an
-   artifact), SAS-compare a real pairing end-to-end.
+5. **Platform split** (§2.1) — ✅ **IMPLEMENTED**: desktop-only capability cluster
+   excluded from mobile; mobile run path registers the sync-client commands.
+6. **Remote-mode `ipc.ts` + QR pairing UI** (§4) — ✅ **IMPLEMENTED** with mobile
+   platform detection, native scanning, remote shell, and automated tests.
+7. **On-device acceptance** — ⏳ **NEXT GATE**: install the debug APK, pair with a
+   real desktop through the relay/network path, verify SAS, run/cancel/permission
+   flows, background/lock, resume/reconnect, and catch up without loss.
 8. **Signing + push** (owner / later phases).
 
 ---
@@ -213,10 +206,11 @@ The desktop crate already can't build on the 8GB dev box; android is heavier.
   sole build blocker** (the predicted source-level ones don't block compilation).
 - ✅ `reqwest` → rustls (#37): **the app now cross-compiles for Android**; the probe is
   green and uploads a debug APK artifact on every run.
-- ⏸ **Next, owner-gated:** the §5 platform split (the product decision to make the
-  mobile binary a lean remote client), then remote-mode UI, on-device install, signing/push.
+- ✅ Platform split, mobile sync commands, remote-mode UI, and QR pairing surface landed.
+- ⏳ **Next:** increment 7 physical-device and background/resume acceptance, then
+  release signing, distribution, and push/wake work.
 
 The protocol foundation being already cross-platform + merged, plus the now-unblocked
 Android cross-compile, is what makes the rest tractable — the phone reuses the hard,
-tested crypto/transport/session code unchanged; the remaining work is the (optional)
-platform split and the mobile UI.
+tested crypto/transport/session code unchanged. The remaining work is real-device
+validation and production release infrastructure, not the client architecture.
