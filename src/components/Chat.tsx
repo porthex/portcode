@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useStore } from "../store/store";
 import { MessageView } from "./Message";
 import { Composer } from "./Composer";
@@ -31,8 +31,21 @@ export function Chat() {
   // Mirror of stuckToBottom in render state so the "scroll to latest" button can
   // appear/hide reactively (the ref alone wouldn't re-render).
   const [pinned, setPinned] = useState(true);
+  // Anchor for preserving scroll position across a PREPEND (scroll-up pagination):
+  // the prior render's scrollHeight + the id of the prior first message. When older
+  // rows land in front, the content above the viewport grows; restoring scrollTop by
+  // the height delta keeps the message the user was reading visually in place instead
+  // of jumping. Tracked per the messages array's identity.
+  const prevScrollHeight = useRef(0);
+  const prevFirstId = useRef<string | null>(null);
+
+  // Distance from the top below which scrolling up triggers loading older history.
+  const LOAD_OLDER_THRESHOLD_PX = 200;
 
   // Track whether the user is near the bottom; a programmatic scroll keeps it true.
+  // Also drives scroll-up pagination: when the user nears the TOP in remote mode and
+  // older history exists, request the next page. Live store reads (getState) avoid a
+  // stale closure without re-subscribing the listener on every paging change.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -40,6 +53,19 @@ export function Chat() {
       const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
       stuckToBottom.current = atBottom;
       setPinned(atBottom);
+      // Near the top → load older messages (remote mode only). Read live state so the
+      // guards (connected / hasMore / not already loading) reflect the latest store,
+      // not the values captured when this listener was attached.
+      if (el.scrollTop < LOAD_OLDER_THRESHOLD_PX) {
+        const st = useStore.getState();
+        const id = st.activeId;
+        if (!id || !st.remoteConnected) return;
+        const p = st.messagePaging[id];
+        // hasMore === false means we already hold the first message; undefined (not
+        // yet seeded) and true both allow a probe. Skip while a fetch is in flight.
+        if (p?.loading || p?.hasMore === false) return;
+        void st.loadOlderMessages(id);
+      }
     };
     el.addEventListener("scroll", onScroll, { passive: true });
     return () => el.removeEventListener("scroll", onScroll);
@@ -70,6 +96,32 @@ export function Chat() {
     el.scrollIntoView?.({ block: "center" });
     clearScrollTarget();
   }, [scrollTargetId, messages, clearScrollTarget]);
+
+  // Preserve the reading position when an older page is PREPENDED. Runs on every
+  // messages change, before paint: if the first message id changed (rows were added
+  // in front) while NOT pinned to the bottom, bump scrollTop by the height the
+  // prepend added, so the previously-visible message stays put instead of the view
+  // snapping upward. The activeId reset effect (which pins to bottom) handles a
+  // session switch; here we only act on a same-session prepend.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) {
+      prevScrollHeight.current = 0;
+      prevFirstId.current = null;
+      return;
+    }
+    const firstId = messages[0]?.id ?? null;
+    const prepended =
+      !stuckToBottom.current &&
+      prevFirstId.current !== null &&
+      firstId !== prevFirstId.current &&
+      el.scrollHeight > prevScrollHeight.current;
+    if (prepended) {
+      el.scrollTop += el.scrollHeight - prevScrollHeight.current;
+    }
+    prevScrollHeight.current = el.scrollHeight;
+    prevFirstId.current = firstId;
+  }, [messages]);
 
   // The decode reveal grows the transcript height between store updates, so follow
   // it to the bottom while a turn streams — but only while the user is still pinned

@@ -4,21 +4,18 @@ name: Android
 #
 # WHY THIS EXISTS (docs/ANDROID_APP_PLAN.md §5): the Tauri crate is too heavy to
 # build on low-RAM dev machines, and the Android cross-compile is heavier still.
-# This job runs the real `tauri android build` in CI to surface the concrete
-# build blockers (ANDROID_APP_PLAN.md §2) — primarily the desktop-only
-# dependencies (`keyring` `windows-native`, the agent/tools/shell) that must be
-# `cfg(mobile)`-excluded before the app can cross-compile for Android.
+# This job runs the real `tauri android build` in CI to preserve the Android
+# cross-compile signal and publish a sideloadable debug APK. The desktop/mobile
+# capability split and remote-client surface have landed; the remaining gates
+# are physical-device behavior, lifecycle resilience, and release signing.
 #
-# STATUS — blocker probe, NON-BLOCKING. Until the platform split
-# (ANDROID_APP_PLAN.md §4, which needs owner architecture sign-off) lands, the
-# unmodified app is NOT expected to cross-compile. So the job is
-# `continue-on-error: true`: it captures the blockers in its step log without
-# gating any PR or reddening `main` (it is not one of the required status checks).
-# Once the split makes it pass, drop `continue-on-error` and broaden the `paths`
-# filter (to `src-tauri/**`, `src/**`, …) to promote this into a real merge gate.
+# STATUS — cross-compile probe, NON-BLOCKING. The build currently succeeds and
+# uploads a debug APK, but `continue-on-error: true` remains intentional until
+# increment 7's physical-device pairing/background/resume matrix is stable. Only
+# then should this become a required merge gate.
 #
 # It triggers narrowly — this workflow file, the Android scaffold, or manual
-# dispatch — so it does NOT add a (currently-failing) check to every backend PR.
+# dispatch — so it does not add the heavier Android build to every backend PR.
 
 on:
   workflow_dispatch:
@@ -47,8 +44,8 @@ jobs:
   android-build:
     name: Android (aarch64 cross-compile probe)
     runs-on: ubuntu-latest
-    # NON-BLOCKING until the platform split (see header): captures the blockers,
-    # never fails the workflow or gates a PR.
+    # NON-BLOCKING until physical-device acceptance is stable (see header); the
+    # probe reports regressions without gating a PR.
     continue-on-error: true
     env:
       # Match the NDK the dev box uses; Tauri's Gradle plugin resolves the NDK
@@ -121,7 +118,7 @@ jobs:
       # As of the rustls switch (#37, dropping the openssl-sys native dep) this
       # SUCCEEDS: the whole app cross-compiles for Android. The job stays
       # non-blocking for now (it is not yet a required check); promote it once the
-      # owner confirms the mobile architecture (ANDROID_APP_PLAN §1/§4).
+      # physical-device/background acceptance matrix passes (ANDROID_APP_PLAN §7).
       - name: Android cross-compile (debug apk)
         run: pnpm tauri android build --apk --debug --target aarch64
 

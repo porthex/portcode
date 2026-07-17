@@ -33,7 +33,6 @@ export function SettingsPanel() {
   const setCrashReporting = useStore((s) => s.setCrashReporting);
 
   const setAutoUpdate = useStore((s) => s.setAutoUpdate);
-  const updateChannel = useStore((s) => s.updateChannel);
   const update = useStore((s) => s.update);
   const checkForUpdate = useStore((s) => s.checkForUpdate);
   const [checkingForUpdate, setCheckingForUpdate] = useState(false);
@@ -376,11 +375,7 @@ export function SettingsPanel() {
                 <>
                   <ToggleRow
                     label="Automatic updates"
-                    hint={
-                      updateChannel === "staging"
-                        ? "Download and install new versions automatically, then prompt to relaunch. (staging channel)"
-                        : "Download and install new versions automatically, then prompt to relaunch."
-                    }
+                    hint="Download and install new versions automatically, then prompt to relaunch."
                     on={settings.autoUpdate}
                     onToggle={() => void setAutoUpdate(!settings.autoUpdate)}
                   />

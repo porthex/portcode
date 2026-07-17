@@ -56,6 +56,17 @@ pub enum RemoteCommand {
     Permission { id: String, decision: String },
     /// Open a new session — proxies to `create_session`.
     CreateSession { title: Option<String> },
+    /// Request an older page of a session's history for scroll-up pagination. The
+    /// initial catch-up ships only the most-recent `SYNC_CACHE_WINDOW` rows
+    /// (`Db::messages_tail`), so scrolling up past them asks the desktop for the
+    /// rows STRICTLY BEFORE `before_seq` (up to `limit`). The desktop answers with a
+    /// [`SyncFrame::MessagePage`]. `before_seq` is the smallest seq the client
+    /// currently holds for the session.
+    FetchMessages {
+        session_id: String,
+        before_seq: i64,
+        limit: u32,
+    },
 }
 
 /// Everything that crosses the encrypted channel, in both directions.
@@ -75,6 +86,17 @@ pub enum SyncFrame {
     MessageDelta {
         session_id: String,
         messages: Vec<MessageRow>,
+    },
+    /// desktop → phone: an OLDER page of one session's history, answering a
+    /// [`RemoteCommand::FetchMessages`] (scroll-up pagination). `messages` are the
+    /// rows before the requested cursor, ascending; `has_more` is true when still
+    /// older history exists beyond this page (so the client keeps offering "load
+    /// more"). Distinct from `MessageDelta` (which is the append-only catch-up of
+    /// recent/new rows): a page is PREPENDED to the held history, a delta appended.
+    MessagePage {
+        session_id: String,
+        messages: Vec<MessageRow>,
+        has_more: bool,
     },
     /// desktop → phone: a live agent event, forwarded verbatim from `agent://{id}`.
     Live {
@@ -201,6 +223,47 @@ mod tests {
         assert!(json.contains("\"t\":\"pairing_reject\""), "{json}");
         assert!(json.contains("\"reason\":null"), "{json}");
         round_trips(&no_reason);
+    }
+
+    #[test]
+    fn fetch_messages_command_round_trips_with_snake_case_fields() {
+        let frame = SyncFrame::Command {
+            command: RemoteCommand::FetchMessages {
+                session_id: "s1".into(),
+                before_seq: 42,
+                limit: 100,
+            },
+        };
+        let json = serde_json::to_string(&frame).expect("encode");
+        // Variant tag is snake_case; the fields keep their snake_case names so the
+        // TS `{ cmd: "fetch_messages"; session_id; before_seq; limit }` matches.
+        assert!(json.contains("\"cmd\":\"fetch_messages\""), "{json}");
+        assert!(json.contains("\"session_id\":\"s1\""), "{json}");
+        assert!(json.contains("\"before_seq\":42"), "{json}");
+        assert!(json.contains("\"limit\":100"), "{json}");
+        round_trips(&frame);
+    }
+
+    #[test]
+    fn message_page_frame_round_trips_with_has_more() {
+        let frame = SyncFrame::MessagePage {
+            session_id: "s1".into(),
+            messages: vec![MessageRow {
+                id: "m1".into(),
+                session_id: "s1".into(),
+                seq: 2,
+                role: "user".into(),
+                content: vec![Block::Text {
+                    text: "older".into(),
+                }],
+                created_at: 999,
+            }],
+            has_more: true,
+        };
+        let json = serde_json::to_string(&frame).expect("encode");
+        assert!(json.contains("\"t\":\"message_page\""), "{json}");
+        assert!(json.contains("\"has_more\":true"), "{json}");
+        round_trips(&frame);
     }
 
     #[test]

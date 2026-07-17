@@ -23,6 +23,8 @@
   "packages": {
     ".": {
       "package-name": "portcode",
+      "draft": true,
+      "force-tag-creation": true,
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
         {
