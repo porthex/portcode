@@ -388,8 +388,8 @@ describe("Tauri command serialization", () => {
     await expect(ipc.relaunchApp()).resolves.toBeUndefined();
     expect(invoke).toHaveBeenCalledWith("update_relaunch");
 
-    invoke.mockResolvedValue("staging");
-    await expect(ipc.getUpdateChannel()).resolves.toBe("staging");
+    invoke.mockResolvedValue("stable");
+    await expect(ipc.getUpdateChannel()).resolves.toBe("stable");
     expect(invoke).toHaveBeenCalledWith("update_channel");
   });
 

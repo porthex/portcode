@@ -8,11 +8,57 @@ updates:
   # JavaScript / TypeScript frontend (pnpm uses the npm ecosystem).
   - package-ecosystem: npm
     directory: "/"
+    # Keep dependency work on the development branch even if the repository's
+    # default branch is changed accidentally.
+    target-branch: main
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
+    # Keep updates reviewable by risk surface. A formatter failure should not
+    # block a runtime or security update in the same oversized PR.
     groups:
-      patch-and-minor:
+      sentry:
+        patterns:
+          - "@sentry/*"
+        update-types:
+          - minor
+          - patch
+      tauri:
+        patterns:
+          - "@tauri-apps/*"
+        update-types:
+          - minor
+          - patch
+      tailwind:
+        patterns:
+          - tailwindcss
+          - "@tailwindcss/*"
+        update-types:
+          - minor
+          - patch
+      vite-vitest:
+        patterns:
+          - vite
+          - "@vitejs/*"
+          - vitest
+          - "@vitest/*"
+        update-types:
+          - minor
+          - patch
+      lint-format:
+        patterns:
+          - eslint
+          - typescript-eslint
+          - prettier
+          - globals
+          - lint-staged
+        update-types:
+          - minor
+          - patch
+      webdriverio:
+        patterns:
+          - webdriverio
+          - "@wdio/*"
         update-types:
           - minor
           - patch
@@ -22,9 +68,10 @@ updates:
     labels:
       - dependencies
 
-  # Rust (Tauri) backend — the single crate lives in /src-tauri.
+  # Rust workspace. The root manifest owns the workspace-wide Cargo.lock.
   - package-ecosystem: cargo
-    directory: "/src-tauri"
+    directory: "/"
+    target-branch: main
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
@@ -41,6 +88,7 @@ updates:
   # GitHub Actions used by the workflows in .github/workflows.
   - package-ecosystem: github-actions
     directory: "/"
+    target-branch: main
     schedule:
       interval: weekly
     open-pull-requests-limit: 10

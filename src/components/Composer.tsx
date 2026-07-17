@@ -31,6 +31,12 @@ function prettyTool(name: string): string {
   return TOOL_PHRASES[name] ?? `running ${name}…`;
 }
 
+// How long the plan-mode notice lingers before it auto-dismisses itself. The
+// reminder has done its job once seen; it shouldn't hog the composer forever.
+// This is a LOCAL dismiss only — the persisted permission mode is untouched.
+// Exported so tests can advance fake timers by the exact dwell.
+export const PLAN_BANNER_AUTO_DISMISS_MS = 8000;
+
 // The live presence phrases, derived from REAL turn/stream state (never padded
 // latency). The dot color honors the brand semantics: cyan = the agent at work,
 // danger = a Stop in flight, faint = at rest.
@@ -254,12 +260,34 @@ export function Composer() {
  * control). Shown only while plan mode is active; desktop-only (the mode is a
  * desktop-side gate setting). Exiting switches back to the Default mode so the
  * next message can mutate the workspace.
+ *
+ * The notice is also dismissable two ways WITHOUT touching the persisted mode:
+ * a ✕ close button and an auto-close timer. Both are purely local (no
+ * updateSettings) so plan mode stays armed — the banner is just a reminder, and
+ * a reminder that can't be put away is nagware. The local dismiss resets each
+ * time plan mode is (re-)entered, so the reminder returns on a fresh entry.
  */
 function PlanModeBanner() {
   const mode = useStore((s) => s.settings.permissionMode);
   const updateSettings = useStore((s) => s.updateSettings);
   const remoteMode = useStore((s) => s.remoteMode);
-  if (remoteMode || mode !== "plan") return null;
+  // Local, non-persisting dismiss — never written back to settings.
+  const [dismissed, setDismissed] = useState(false);
+
+  // Re-entering plan mode should surface the reminder again, so clear any prior
+  // local dismiss whenever the mode changes (in particular on a re-entry to plan).
+  useEffect(() => setDismissed(false), [mode]);
+
+  // Auto-close: the reminder fades itself out after a sensible dwell so it can't
+  // permanently crowd the composer. Cleared on unmount / mode change so a stale
+  // timer can't dismiss a freshly re-shown banner.
+  useEffect(() => {
+    if (mode !== "plan") return;
+    const t = setTimeout(() => setDismissed(true), PLAN_BANNER_AUTO_DISMISS_MS);
+    return () => clearTimeout(t);
+  }, [mode]);
+
+  if (remoteMode || mode !== "plan" || dismissed) return null;
   return (
     <div
       role="status"
@@ -269,13 +297,24 @@ function PlanModeBanner() {
         <strong>Plan mode</strong> — the agent will design a plan and won’t modify files. Approve to
         apply.
       </span>
-      <button
-        type="button"
-        onClick={() => void updateSettings({ permissionMode: "default" })}
-        className="shrink-0 rounded border border-accent-2/50 bg-accent-2/15 px-2.5 py-1 text-accent-2 hover:bg-accent-2/25"
-      >
-        Exit plan mode
-      </button>
+      <div className="flex shrink-0 items-center gap-2">
+        <button
+          type="button"
+          onClick={() => void updateSettings({ permissionMode: "default" })}
+          className="shrink-0 rounded border border-accent-2/50 bg-accent-2/15 px-2.5 py-1 text-accent-2 hover:bg-accent-2/25"
+        >
+          Exit plan mode
+        </button>
+        <button
+          type="button"
+          onClick={() => setDismissed(true)}
+          aria-label="Dismiss plan mode notice"
+          title="Dismiss"
+          className="shrink-0 rounded px-1 leading-none text-accent-2/70 hover:text-accent-2"
+        >
+          ✕
+        </button>
+      </div>
     </div>
   );
 }

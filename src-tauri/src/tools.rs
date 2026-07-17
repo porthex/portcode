@@ -878,7 +878,7 @@ impl Tool for Task {
         let description = input
             .get("description")
             .and_then(|v| v.as_str())
-            .unwrap_or("subagent")
+            .unwrap_or_default()
             .to_string();
         let spawner = ctx.spawner.as_ref().ok_or_else(|| {
             "Subagents are not available in this run (nested too deep, or this run is \
@@ -1364,6 +1364,46 @@ mod tests {
         let spec = seen.lock().unwrap().clone().expect("spawner was invoked");
         assert_eq!(spec.description, "audit deps");
         assert_eq!(spec.prompt, "find vulnerable crates");
+    }
+
+    #[tokio::test]
+    async fn task_tool_absent_description_produces_empty_spec_description() {
+        use std::sync::Mutex;
+        // When the model omits `description`, the tool must forward an EMPTY string
+        // (not the old "subagent" literal) to the spawner. The real label derivation
+        // now happens centrally in `AgentSpawner::spawn` via `subagent_label`, so
+        // forwarding an empty string keeps the wire format clean and lets the spawn
+        // site derive a meaningful label from the prompt.
+        struct RecordingSpawner {
+            seen: Arc<Mutex<Option<SubagentSpec>>>,
+        }
+        #[async_trait]
+        impl Spawner for RecordingSpawner {
+            async fn spawn(&self, spec: SubagentSpec) -> Result<String, String> {
+                *self.seen.lock().unwrap() = Some(spec.clone());
+                Ok("ok".to_string())
+            }
+        }
+        let seen = Arc::new(Mutex::new(None));
+        let ctx = ToolCtx {
+            workspace: base(),
+            spawner: Some(Arc::new(RecordingSpawner { seen: seen.clone() })),
+            background: None,
+        };
+        // No "description" key at all.
+        Task.run(
+            json!({ "prompt": "analyse all open PRs for merge conflicts" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let spec = seen.lock().unwrap().clone().expect("spawner was invoked");
+        assert_eq!(
+            spec.description, "",
+            "absent description must arrive at the spawner as an empty string, \
+             not the old \"subagent\" placeholder"
+        );
+        assert_eq!(spec.prompt, "analyse all open PRs for merge conflicts");
     }
 
     #[test]
