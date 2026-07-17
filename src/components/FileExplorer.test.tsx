@@ -7,15 +7,16 @@ import * as ipc from "../lib/ipc";
 import type { DirEntry } from "../types";
 
 // FileExplorer loads directory entries from the backend via `ipc.listDir` and
-// folds file clicks into the real store (`appendDraft`) / opens a workspace
-// (`openWorkspace`). We mock only the IPC boundary and drive the genuine
-// zustand store, asserting rendered tree behaviour and the store/ipc effects.
+// opens a workspace (`openWorkspace`). Selecting a file is purely navigational —
+// it never folds anything into the composer draft. We mock only the IPC boundary
+// and drive the genuine zustand store, asserting rendered tree behaviour and the
+// store/ipc effects.
 vi.mock("../lib/ipc", () => ({
   listDir: vi.fn(),
   openFolder: vi.fn(),
   saveSettings: vi.fn(),
-  // appendDraft → setDraft debounces a durable saveDraft; mock it so the timer
-  // never reaches a real backend.
+  // Any draft write (e.g. a leftover setDraft) debounces a durable saveDraft;
+  // mock it so the timer never reaches a real backend.
   saveDraft: vi.fn(),
 }));
 
@@ -294,8 +295,9 @@ describe("FileExplorer tree", () => {
     expect(await screen.findByText("▾")).toBeInTheDocument();
   });
 
-  it("clicking a file appends its path to the composer draft instead of fetching", async () => {
-    // appendDraft now keys the draft by the active session, so one must be active.
+  it("clicking a file is a no-op: it neither mutates the draft nor refetches", async () => {
+    // Selecting a file must NOT silently inject its path into the composer the
+    // user is writing. A click on a file row does nothing (dirs still toggle).
     useStore.setState({ activeId: "s1" });
     m.listDir.mockResolvedValueOnce([
       entry({ name: "notes.md", path: "docs/notes.md", isDir: false }),
@@ -306,8 +308,8 @@ describe("FileExplorer tree", () => {
 
     fireEvent.click(fileBtn);
 
-    // appendDraft folded the path into the active session's draft; no second listDir.
-    await waitFor(() => expect(useStore.getState().drafts.s1).toBe("docs/notes.md "));
+    // The active session's draft stays untouched, and no extra listDir fires.
+    expect(useStore.getState().drafts.s1).toBeUndefined();
     expect(m.listDir).toHaveBeenCalledTimes(1);
   });
 });
@@ -590,7 +592,7 @@ describe("FileExplorer right-click context menu", () => {
     });
   });
 
-  it("opens a file menu with Insert into composer + Copy path (no Expand/Collapse)", async () => {
+  it("opens a file menu with Copy path only (no Insert into composer, no Expand/Collapse)", async () => {
     m.listDir.mockResolvedValueOnce([entry({ name: "notes.md", path: "docs/notes.md" })]);
     render(<FileExplorer />);
 
@@ -598,25 +600,28 @@ describe("FileExplorer right-click context menu", () => {
     fireEvent.contextMenu(fileRow);
 
     const menu = screen.getByRole("menu");
-    expect(
-      within(menu).getByRole("menuitem", { name: "Insert into composer" }),
-    ).toBeInTheDocument();
     expect(within(menu).getByRole("menuitem", { name: "Copy path" })).toBeInTheDocument();
+    // Selecting a file must never inject its path into the composer, so the
+    // "Insert into composer" action is gone.
+    expect(
+      within(menu).queryByRole("menuitem", { name: "Insert into composer" }),
+    ).not.toBeInTheDocument();
     // Files have no expand/collapse action.
     expect(within(menu).queryByRole("menuitem", { name: "Expand" })).not.toBeInTheDocument();
   });
 
-  it("inserts the file path into the composer from the menu", async () => {
-    // appendDraft now keys the draft by the active session, so one must be active.
+  it("does not offer an Insert-into-composer action and never mutates the draft", async () => {
     useStore.setState({ activeId: "s1" });
     m.listDir.mockResolvedValueOnce([entry({ name: "notes.md", path: "docs/notes.md" })]);
     render(<FileExplorer />);
 
     const fileRow = await screen.findByRole("treeitem", { name: /notes\.md/ });
     fireEvent.contextMenu(fileRow);
-    fireEvent.click(screen.getByRole("menuitem", { name: "Insert into composer" }));
 
-    expect(useStore.getState().drafts.s1).toBe("docs/notes.md ");
+    expect(
+      screen.queryByRole("menuitem", { name: "Insert into composer" }),
+    ).not.toBeInTheDocument();
+    expect(useStore.getState().drafts.s1).toBeUndefined();
   });
 
   it("copies the file path to the clipboard from the menu", async () => {

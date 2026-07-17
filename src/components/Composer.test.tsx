@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 
-import { Composer } from "./Composer";
+import { Composer, PLAN_BANNER_AUTO_DISMISS_MS } from "./Composer";
 import { useStore } from "../store/store";
 import { DEFAULT_SETTINGS, type ComposerPhase, type Session, type Usage } from "../types";
 
@@ -612,6 +612,56 @@ describe("Composer plan-mode banner", () => {
     render(<Composer />);
 
     expect(screen.queryByRole("button", { name: /Exit plan mode/i })).not.toBeInTheDocument();
+  });
+
+  it("auto-dismisses the banner after the dwell WITHOUT persisting a mode change", () => {
+    vi.useFakeTimers();
+    try {
+      useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "plan" } });
+      render(<Composer />);
+
+      // Reminder is up on entry.
+      expect(screen.getByText("Plan mode")).toBeInTheDocument();
+
+      // After the dwell it auto-closes — a LOCAL dismiss, so settings are untouched.
+      act(() => vi.advanceTimersByTime(PLAN_BANNER_AUTO_DISMISS_MS));
+      expect(screen.queryByText("Plan mode")).not.toBeInTheDocument();
+      // The persisted permission mode was never changed by the timer.
+      expect(m.saveSettings).not.toHaveBeenCalled();
+      expect(useStore.getState().settings.permissionMode).toBe("plan");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("dismisses on the ✕ close button without persisting a mode change", () => {
+    useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "plan" } });
+    render(<Composer />);
+
+    expect(screen.getByText("Plan mode")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Dismiss plan mode notice/i }));
+
+    // The notice is gone, but the persisted mode stays "plan" (no settings save).
+    expect(screen.queryByText("Plan mode")).not.toBeInTheDocument();
+    expect(m.saveSettings).not.toHaveBeenCalled();
+    expect(useStore.getState().settings.permissionMode).toBe("plan");
+  });
+
+  it("re-shows the banner when plan mode is re-entered after a dismiss", () => {
+    useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "plan" } });
+    const { rerender } = render(<Composer />);
+
+    // Dismiss via the ✕ button.
+    fireEvent.click(screen.getByRole("button", { name: /Dismiss plan mode notice/i }));
+    expect(screen.queryByText("Plan mode")).not.toBeInTheDocument();
+
+    // Leave plan mode, then re-enter it — the local dismiss must reset.
+    act(() => useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "default" } }));
+    rerender(<Composer />);
+    act(() => useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "plan" } }));
+    rerender(<Composer />);
+
+    expect(screen.getByText("Plan mode")).toBeInTheDocument();
   });
 });
 

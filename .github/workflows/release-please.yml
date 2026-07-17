@@ -10,8 +10,8 @@
 #   - keeps all THREE version files in lockstep — package.json (the `node`
 #     release type) plus src-tauri/Cargo.toml and src-tauri/tauri.conf.json
 #     (wired as `extra-files` in release-please-config.json).
-# Merging that release PR tags the release (vX.Y.Z) and publishes a GitHub
-# Release whose notes are categorized by .github/release.yml.
+# Merging that release PR tags the release (vX.Y.Z), creates a DRAFT GitHub
+# Release, and explicitly dispatches both platform build workflows at that tag.
 #
 # This job only edits metadata and talks to the GitHub API — it compiles
 # nothing — so it runs on the cheapest hosted runner rather than the Windows
@@ -28,6 +28,9 @@ on:
     branches: [release]
 
 permissions:
+  # `workflow_dispatch` is intentionally used because events caused by the
+  # built-in GITHUB_TOKEN do not recursively trigger other workflows.
+  actions: write
   contents: write
   pull-requests: write
 
@@ -41,6 +44,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Run release-please
+        id: release
         uses: googleapis/release-please-action@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -50,3 +54,23 @@ jobs:
           # `release`, not the repo's default branch. release-please derives its
           # release-PR head branch name from this target.
           target-branch: release
+
+      # Keep these as separate steps: if one dispatch fails, the other still
+      # gets an independent attempt and a clear status in the workflow log.
+      - name: Dispatch Windows release build
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          gh workflow run release.yml
+          --repo "$GITHUB_REPOSITORY"
+          --ref "${{ steps.release.outputs.tag_name }}"
+
+      - name: Dispatch Linux release build
+        if: always() && steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          gh workflow run release-linux.yml
+          --repo "$GITHUB_REPOSITORY"
+          --ref "${{ steps.release.outputs.tag_name }}"

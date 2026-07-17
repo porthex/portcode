@@ -462,6 +462,89 @@ describe("Chat scroll-to-latest affordance", () => {
   });
 });
 
+describe("Chat scroll-up pagination (remote mode)", () => {
+  // Pretend the scroller is tall and the user scrolled to the TOP, so the scroll
+  // listener's near-top check fires (scrollTop < 200).
+  const stubScrolledToTop = (el: HTMLElement) => {
+    Object.defineProperty(el, "scrollHeight", { value: 1000, configurable: true });
+    Object.defineProperty(el, "clientHeight", { value: 300, configurable: true });
+    el.scrollTop = 0;
+  };
+
+  const remoteSession = (over: Partial<{ hasMore: boolean; loading: boolean }> = {}) => {
+    const loadOlderMessages = vi.fn(async () => {});
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "hi"), userMessage("m2", "yo")] },
+      streaming: false,
+      remoteConnected: true,
+      messagePaging: { s1: { hasMore: true, loading: false, oldestSeq: 5, ...over } },
+      loadOlderMessages,
+    });
+    return loadOlderMessages;
+  };
+
+  it("calls loadOlderMessages when scrolled to the top with more history", () => {
+    const loadOlderMessages = remoteSession();
+
+    const { container } = render(<Chat />);
+    const scroller = container.querySelector(".overflow-y-auto") as HTMLElement;
+    stubScrolledToTop(scroller);
+    fireEvent.scroll(scroller);
+
+    expect(loadOlderMessages).toHaveBeenCalledWith("s1");
+  });
+
+  it("does not paginate when not remote-connected", () => {
+    const loadOlderMessages = remoteSession();
+    useStore.setState({ remoteConnected: false });
+
+    const { container } = render(<Chat />);
+    const scroller = container.querySelector(".overflow-y-auto") as HTMLElement;
+    stubScrolledToTop(scroller);
+    fireEvent.scroll(scroller);
+
+    expect(loadOlderMessages).not.toHaveBeenCalled();
+  });
+
+  it("does not paginate when there is no more history", () => {
+    const loadOlderMessages = remoteSession({ hasMore: false });
+
+    const { container } = render(<Chat />);
+    const scroller = container.querySelector(".overflow-y-auto") as HTMLElement;
+    stubScrolledToTop(scroller);
+    fireEvent.scroll(scroller);
+
+    expect(loadOlderMessages).not.toHaveBeenCalled();
+  });
+
+  it("does not paginate while a fetch is already loading", () => {
+    const loadOlderMessages = remoteSession({ loading: true });
+
+    const { container } = render(<Chat />);
+    const scroller = container.querySelector(".overflow-y-auto") as HTMLElement;
+    stubScrolledToTop(scroller);
+    fireEvent.scroll(scroller);
+
+    expect(loadOlderMessages).not.toHaveBeenCalled();
+  });
+
+  it("does not paginate when the user is not near the top", () => {
+    const loadOlderMessages = remoteSession();
+
+    const { container } = render(<Chat />);
+    const scroller = container.querySelector(".overflow-y-auto") as HTMLElement;
+    // Scrolled DOWN, away from the top — the near-top check must not fire.
+    Object.defineProperty(scroller, "scrollHeight", { value: 1000, configurable: true });
+    Object.defineProperty(scroller, "clientHeight", { value: 300, configurable: true });
+    scroller.scrollTop = 700;
+    fireEvent.scroll(scroller);
+
+    expect(loadOlderMessages).not.toHaveBeenCalled();
+  });
+});
+
 describe("Chat EmptyState auth affordance", () => {
   it("nudges to sign in when unauthenticated on desktop", () => {
     useStore.setState({

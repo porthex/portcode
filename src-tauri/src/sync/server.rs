@@ -19,6 +19,7 @@ use crate::agent;
 use crate::agents;
 use crate::background;
 use crate::db::{self, Db};
+use crate::events::{AppEventSink, EventSink};
 use crate::permissions::{self, Decision, Pending};
 use crate::settings::Settings;
 use crate::sync::protocol::{RemoteCommand, SyncFrame};
@@ -41,6 +42,12 @@ pub struct DesktopCommandHandler {
     pub background: background::Background,
     pub oauth_refresh: Arc<tokio::sync::Mutex<()>>,
 }
+
+/// Upper bound on how many rows a single `FetchMessages` page may request. Clamps
+/// a phone-supplied `limit` so one pagination request can't be coerced into
+/// serializing a huge page that blows the Noise frame cap (~65 KB) — the same
+/// reason catch-up is windowed. Matches the catch-up window order of magnitude.
+const MAX_PAGE_LIMIT: i64 = 200;
 
 /// Map a phone-supplied permission decision string to a [`Decision`], validated
 /// against an explicit allowlist. Only "allow"/"deny" are meaningful; ANY other
@@ -65,7 +72,11 @@ impl CommandHandler for DesktopCommandHandler {
             // blocked by a turn. Each arg is an owned clone → the spawned future is
             // `Send + 'static` (nothing borrowed from `&self` escapes).
             RemoteCommand::Run { session_id, text } => {
-                let app = self.app.clone();
+                // Wrap the AppHandle in the concrete EventSink so the agent core sees
+                // only the trait (its sole Tauri coupling now lives behind it). Same
+                // sink the desktop `run_agent` command builds, so a phone-driven turn
+                // mirrors identically.
+                let sink: Arc<dyn EventSink> = Arc::new(AppEventSink(self.app.clone()));
                 let http = self.http.clone();
                 let settings = self.settings.clone();
                 let db = self.db.clone();
@@ -76,7 +87,7 @@ impl CommandHandler for DesktopCommandHandler {
                 let oauth_refresh = self.oauth_refresh.clone();
                 tauri::async_runtime::spawn(async move {
                     agent::run(
-                        app,
+                        sink,
                         http,
                         settings,
                         db,
@@ -154,6 +165,28 @@ impl CommandHandler for DesktopCommandHandler {
                             eprintln!("phone-sync: list_sessions after create failed: {e}");
                         }
                     }
+                }
+                Ok(())
+            }
+            // Scroll-up pagination: fetch an OLDER page of a session's history and
+            // publish it back as a `MessagePage`. The initial catch-up ships only the
+            // recent window (`messages_tail`), so a client scrolling up past it asks
+            // for the rows before its smallest held seq. `limit` is clamped to
+            // `MAX_PAGE_LIMIT` so a request can't force an over-sized frame. Best-
+            // effort fan-out like `CreateSession` (a no-op when no client is attached).
+            RemoteCommand::FetchMessages {
+                session_id,
+                before_seq,
+                limit,
+            } => {
+                let limit = (limit as i64).clamp(1, MAX_PAGE_LIMIT);
+                let (messages, has_more) = self.db.messages_page(&session_id, before_seq, limit);
+                if let Some(hub) = self.app.try_state::<SyncHub>() {
+                    hub.publish_frame(SyncFrame::MessagePage {
+                        session_id,
+                        messages,
+                        has_more,
+                    });
                 }
                 Ok(())
             }
