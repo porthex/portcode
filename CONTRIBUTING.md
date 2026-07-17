@@ -66,9 +66,9 @@ need the following toolchain:
   (Portcode uses `x86_64-pc-windows-msvc`, **not** the GNU toolchain).
 - **WebView2 runtime** — ships with Windows 11; on Windows 10 install the
   Evergreen runtime if it isn't already present.
-- **Rust** ≥ 1.91 (stable, MSVC). [`rust-toolchain.toml`](rust-toolchain.toml)
-  selects the moving stable channel and required components; each crate's
-  `rust-version` is the minimum supported compiler.
+- **Rust** via rustup (MSVC). [`rust-toolchain.toml`](rust-toolchain.toml) pins
+  contributor and CI builds to **1.96.0** for reproducible generated WASM;
+  each crate's `rust-version` (**1.91**) remains the minimum supported compiler.
 - **Node.js** (LTS) with **pnpm via Corepack**. This project uses **pnpm only** —
   do not use `npm` or `yarn`, as that would desync `pnpm-lock.yaml`.
 

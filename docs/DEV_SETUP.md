@@ -35,13 +35,14 @@ Or open the installer manually and check **Desktop development with C++**.
 
 ### 3. Rust via rustup
 
-`rust-toolchain.toml` in the repo root selects the moving stable channel,
-components (rustfmt, clippy), and targets (win-msvc, linux-gnu). `rustup`
-materializes this automatically the first time you build — no manual toolchain
-juggling required.
+`rust-toolchain.toml` in the repo root pins Rust **1.96.0**, components
+(rustfmt, clippy), and targets (win-msvc, linux-gnu). The exact compiler pin
+keeps the committed WASM glue reproducible; upgrade it deliberately together
+with that artifact. `rustup` materializes it automatically the first time you
+build — no manual toolchain juggling required.
 
 The crate requires Rust 1.91 or later (`rust-version` in `src-tauri/Cargo.toml`).
-Current stable exceeds this.
+The pinned toolchain exceeds this.
 
 ```powershell
 winget install Rustlang.Rustup

@@ -23,6 +23,7 @@ Files (all tracked):
 ## Regenerating
 
 ```sh
+rustc --version # expected: rustc 1.96.0 (from rust-toolchain.toml)
 wasm-pack --version # expected: wasm-pack 0.15.0 (matches CI)
 wasm-pack build --target web crates/portcode-wasm
 cp crates/portcode-wasm/pkg/portcode_wasm.js \
