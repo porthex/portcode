@@ -602,7 +602,7 @@ fn phone_sync_status(state: State<AppState>) -> Result<PhoneSyncStatus, String> 
 fn phone_sync_begin_pairing(
     state: State<AppState>,
 ) -> Result<sync::pairing::PairingPayload, String> {
-    use rand::RngCore as _;
+    use rand::Rng as _;
 
     // Snapshot the live address under the lock, then DROP the guard before building
     // the payload — keep the critical section to a synchronous `ep.addr()` call.
@@ -623,7 +623,7 @@ fn phone_sync_begin_pairing(
     // nonce here lets us register it on the gate.
     let identity = sync::pairing::device_identity()?;
     let mut nonce = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::rng().fill_bytes(&mut nonce);
 
     let payload = match live_addr {
         // Same identity + this nonce, but the node_addr is the live full address

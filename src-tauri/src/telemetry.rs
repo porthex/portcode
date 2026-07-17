@@ -43,7 +43,7 @@
 // The owner explicitly chose to ship full native minidumps accepting this residual
 // risk (the DECISION that authorized Phase 2).
 //
-// PERFORMANCE TRACING: sentry-rust (verified through 0.41) has NO
+// PERFORMANCE TRACING: sentry-rust (verified through 0.42) has NO
 // `before_send_transaction` hook — it is a JS/Python-SDK feature that does not
 // exist on the Rust ClientOptions. Rather than ship transaction events
 // (names/spans) that we could not route through the allowlist scrubber, we set
@@ -287,7 +287,7 @@ fn redact_json(v: &mut serde_json::Value) {
 
 /// Belt-and-suspenders: serialize the event, redact every string anywhere in it,
 /// then deserialize back. `protocol::Event` derives `Deserialize` WITHOUT
-/// `#[serde(borrow)]` (verified against sentry-types 0.34 `protocol/v7.rs`), so its
+/// `#[serde(borrow)]` (verified against sentry-types 0.42 `protocol/v7.rs`), so its
 /// `Cow` fields deserialize as owned and `Event<'static>: DeserializeOwned` holds —
 /// the round-trip compiles. Fails CLOSED (returns `None`, dropping the event) if
 /// either step fails, so a serialization quirk can never let an unscrubbed event

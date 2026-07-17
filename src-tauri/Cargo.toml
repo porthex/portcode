@@ -53,7 +53,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # `src/oauth.rs` are credited to opencode (MIT) and the official Claude Code CLI.
 sha2 = "0.10"
 base64 = "0.22"
-rand = "0.8"
+rand = "0.10"
 
 # Phone Sync E2E crypto (Phase 1): application-layer Noise so the relay stays
 # blind. Default features give Noise_*_25519_ChaChaPoly_BLAKE2s (Curve25519 +
@@ -80,10 +80,10 @@ similar = "3"
 # On Android/Linux there is no working keyring backend, so `src/secrets.rs` uses
 # an app-private file store instead and keyring is not a dependency there at all —
 # gating it to `cfg(windows)` means it is never compiled for the Android
-# cross-compile probe or the Linux CI leg. Relocating an already-resolved dep to
-# a target table does not change its version/features, so Cargo.lock stays valid.
+# cross-compile probe or the Linux CI leg. keyring 4's default `v1` feature keeps
+# the Entry API and selects its native Windows Credential Manager store.
 [target."cfg(windows)".dependencies]
-keyring = { version = "3", features = ["windows-native"] }
+keyring = "4"
 
 # Native QR scanner for the phone's pairing screen — built ONLY for the mobile
 # targets. The desktop advertises the pairing QR (it never scans one), so gating
@@ -107,16 +107,16 @@ tauri-plugin-barcode-scanner = "2"
 # stack/OS contexts. The whole pipeline is compile-time-inert without a build-time
 # `SENTRY_DSN` (see `telemetry::dsn`), preserving "zero telemetry by default".
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-sentry = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+sentry = { version = "0.42", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 # Phase 2 — desktop minidump capture + the webview→Rust envelope bridge. The plugin
-# RE-EXPORTS `sentry` + `sentry-rust-minidump` and pins `sentry ^0.34`, so it aligns
-# with the `sentry` dep above WITHOUT forcing a version bump (verified against the
-# published `tauri-plugin-sentry` 0.2.0 Cargo.toml). Exact-pinned because 0.3.x bumps
-# `sentry` to 0.35. The plugin's `sentry-rust-minidump` (also 0.34-aligned) re-execs
-# the binary as an OUT-OF-PROCESS crash monitor (EmbarkStudios crash-handler), so
-# native segfaults AND `panic = "abort"` aborts are captured even though they can't
-# unwind in-process. Gated to DESKTOP (mirrors `sentry`): the phone is a remote client.
-tauri-plugin-sentry = "=0.2.0"
+# pins `sentry ^0.42` and `sentry-rust-minidump ^0.13`, so the direct SDK above must
+# stay on the same release line: their `Client` types cross the minidump API boundary.
+# Exact-pin the plugin so a future SDK bump cannot silently split those types again.
+# Its minidump helper re-execs the binary as an OUT-OF-PROCESS crash monitor
+# (EmbarkStudios crash-handler), so native segfaults AND `panic = "abort"` aborts are
+# captured even though they can't unwind in-process. Gated to DESKTOP (mirrors
+# `sentry`): the phone is a remote client.
+tauri-plugin-sentry = "=0.5.0"
 # Resolves `<app_config_dir>` WITHOUT a Tauri app handle — the consent file is read in
 # the re-exec'd crash-reporter process, which has no `AppHandle`. Tauri's own
 # `app_config_dir()` is `dirs::config_dir().join(<identifier>)`, so this reproduces the

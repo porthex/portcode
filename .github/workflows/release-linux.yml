@@ -85,7 +85,7 @@ jobs:
           workspaces: src-tauri
 
       - name: Build app and bundle AppImage + deb
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           # Built-in token — used only to create the release and upload assets.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

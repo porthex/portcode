@@ -48,10 +48,16 @@ const stopApp = async () => {
   const child = appProcess;
   appProcess = undefined;
   if (appPid !== undefined) {
-    try {
-      process.kill(appPid);
-    } catch {
-      // The app already exited.
+    const stopped = spawnSync("taskkill.exe", ["/PID", String(appPid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    if (stopped.status !== 0) {
+      try {
+        process.kill(appPid);
+      } catch {
+        // The app already exited.
+      }
     }
     appPid = undefined;
   }
@@ -64,24 +70,23 @@ const stopApp = async () => {
 };
 
 const startApp = async () => {
-  const escapedApplication = application.replaceAll("'", "''");
-  const command =
-    `$app = Start-Process -FilePath '${escapedApplication}' -PassThru -WindowStyle Normal; ` +
-    `[Console]::Out.WriteLine($app.Id); Wait-Process -Id $app.Id`;
-  appProcess = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
+  appProcess = spawn(application, [], {
+    cwd: projectRoot,
     stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: false,
   });
+  appProcess.stdout?.on("data", capture);
   appProcess.stderr?.on("data", capture);
   appPid = await new Promise<number>((resolve, reject) => {
     const timeout = setTimeout(
       () => reject(new Error("Timed out while launching Portcode.")),
-      10000,
+      30000,
     );
-    appProcess?.stdout?.once("data", (chunk: Buffer) => {
+    appProcess?.once("spawn", () => {
       clearTimeout(timeout);
-      const pid = Number.parseInt(chunk.toString().trim(), 10);
-      if (Number.isFinite(pid)) resolve(pid);
-      else reject(new Error(`Invalid Portcode process id: ${chunk.toString()}`));
+      const pid = appProcess?.pid;
+      if (pid !== undefined) resolve(pid);
+      else reject(new Error("Portcode started without a process id."));
     });
     appProcess?.once("error", (error) => {
       clearTimeout(timeout);
