@@ -31,8 +31,8 @@ on:
     types: [published]
   workflow_dispatch:
 
-# `contents: write` is required for tauri-action to create the GitHub Release
-# and upload the bundle assets. Everything else stays read-only.
+# `contents: write` is required for tauri-action to upload bundle assets to the
+# already-published GitHub Release. Everything else stays read-only.
 permissions:
   contents: write
 
@@ -104,12 +104,12 @@ jobs:
           # `--bundles` overrides the config's Windows-only `nsis` target, so
           # only the Linux desktop formats are produced. (Tauri v2 CLI flag.)
           args: --bundles deb,appimage
-          # On a tag push, cut a DRAFT release named for the tag with the
-          # bundles attached. On manual dispatch, `github.ref_type` is `branch`,
-          # so tagName is empty and tauri-action just builds (no release).
+          # A `release: published` run targets the existing non-draft release.
+          # On manual dispatch, `github.ref_type` is `branch`, so tagName is
+          # empty and tauri-action just builds without touching a release.
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: ${{ github.ref_type == 'tag' && format('Portcode {0}', github.ref_name) || '' }}
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
 
       # Always keep the built bundles as workflow artifacts — useful for manual
