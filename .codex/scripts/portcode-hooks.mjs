@@ -59,7 +59,7 @@ function piiReason(candidate, label) {
 }
 
 function memoryWriteCandidate(toolName, toolInput) {
-  const input = typeof toolInput === "string" ? { patch: toolInput } : toolInput ?? {};
+  const input = typeof toolInput === "string" ? { patch: toolInput } : (toolInput ?? {});
   const serialized = typeof toolInput === "string" ? toolInput : JSON.stringify(input);
   const targetsMemory = /\.claude[\\/]memory[\\/]/i.test(serialized);
 
@@ -114,7 +114,8 @@ export function handleHook(payload, projectRoot = findProjectRoot(payload?.cwd |
     }
 
     const graphExists = existsSync(join(projectRoot, GRAPH_PATH));
-    const searchesSource = /(^|[\s;&|])(rg|grep|ripgrep|find|fd|ack|ag|Get-Content|Select-String)\b/i.test(command);
+    const searchesSource =
+      /(^|[\s;&|])(rg|grep|ripgrep|find|fd|ack|ag|Get-Content|Select-String)\b/i.test(command);
     const alreadyUsesGraphify = /\bgraphify\s+(query|path|explain)\b/i.test(command);
     if (graphExists && searchesSource && !alreadyUsesGraphify) {
       return hookContext(
@@ -138,5 +139,6 @@ function main() {
   if (result) process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
-const invokedDirectly = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
+const invokedDirectly =
+  process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
 if (invokedDirectly) main();

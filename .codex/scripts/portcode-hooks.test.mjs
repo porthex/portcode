@@ -50,7 +50,8 @@ test("PreToolUse denies PII added to project memory through apply_patch", () => 
 });
 
 test("PreToolUse permits clean project-memory patches", () => {
-  const patch = "*** Update File: .claude/memory/project-memory.md\n+Architecture uses a Tauri shell.";
+  const patch =
+    "*** Update File: .claude/memory/project-memory.md\n+Architecture uses a Tauri shell.";
   const result = handleHook(
     { hook_event_name: "PreToolUse", tool_name: "apply_patch", tool_input: { patch } },
     fixture(),
@@ -61,7 +62,10 @@ test("PreToolUse permits clean project-memory patches", () => {
 test("PreToolUse checks memory before blanket staging", () => {
   const root = fixture();
   const sensitiveEmail = ["person", "example.com"].join("@");
-  writeFileSync(join(root, ".claude", "memory", "project-memory.md"), `contact ${sensitiveEmail}\n`);
+  writeFileSync(
+    join(root, ".claude", "memory", "project-memory.md"),
+    `contact ${sensitiveEmail}\n`,
+  );
   const result = handleHook(
     { hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "git add ." } },
     root,
