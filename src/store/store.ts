@@ -96,6 +96,15 @@ interface AppState {
   sessions: Session[];
   activeId: string | null;
   messages: Record<string, Message[]>; // sessionId -> messages
+  // Per-session scroll-up pagination state (remote mode). `hasMore` is whether the
+  // desktop holds older history beyond what we hold (seeded from each message_page
+  // frame; undefined entry = unknown, treated as "might have more"); `loading` guards
+  // against firing a second fetch while one is in flight; `oldestSeq` is the smallest
+  // `seq` currently held for the session — the `before_seq` cursor the next page
+  // request walks back from. The in-memory `Message` doesn't carry `seq`, so it is
+  // tracked here from the seq-bearing `message_delta`/`message_page` rows. Keyed by
+  // sessionId.
+  messagePaging: Record<string, { hasMore: boolean; loading: boolean; oldestSeq: number }>;
   usage: Record<string, Usage>; // sessionId -> cumulative token usage
   agents: Record<string, AgentInfo[]>; // sessionId -> live subagents (the agents panel)
   backgroundTasks: Record<string, BackgroundTaskInfo[]>; // sessionId -> background shell tasks
@@ -241,6 +250,8 @@ interface AppState {
   applyFrame: (frame: SyncFrame) => void;
   connectRemote: (qr: string, verified?: boolean) => Promise<void>;
   sendRemoteCommand: (command: RemoteCommand) => Promise<void>;
+  // Request the next older page of a session's history (scroll-up pagination).
+  loadOlderMessages: (sessionId: string) => Promise<void>;
   disconnectRemote: () => Promise<void>;
   reconnectRemote: () => Promise<void>;
   openRemoteSession: (id: string) => Promise<void>;
@@ -592,6 +603,11 @@ const usageFromRows = (rows: SessionUsage[]): Record<string, Usage> => {
 const COMPOSER_SETTLE_MS = 900;
 let settleTimer: ReturnType<typeof setTimeout> | null = null;
 
+// How many older messages one scroll-up pagination request fetches (the desktop
+// clamps it to its own max). Comfortably under the catch-up window so a page is a
+// modest, send-safe increment.
+const PAGE_SIZE = 100;
+
 const clearSettleTimer = (): void => {
   if (settleTimer !== null) {
     clearTimeout(settleTimer);
@@ -777,6 +793,7 @@ export const useStore = create<AppState>((set, get) => ({
   sessions: [],
   activeId: null,
   messages: {},
+  messagePaging: {},
   usage: {},
   agents: {},
   backgroundTasks: {},
@@ -1944,15 +1961,52 @@ export const useStore = create<AppState>((set, get) => ({
       case "message_delta":
         set((st) => {
           const activeId = st.activeId ?? frame.session_id;
+          // Seed pagination for this session from the catch-up rows. `seq` is
+          // contiguous from 0, so the smallest held seq tells us both the next page
+          // cursor (oldestSeq) and whether older history exists (oldestSeq > 0). An
+          // EMPTY delta replaces the list and leaves no seq to page from → no more.
+          const seqs = frame.messages.map((m) => m.seq);
+          // An empty delta leaves no seq to page from (oldestSeq 0, no more). Else the
+          // smallest held seq is the page cursor, and older history exists iff it > 0.
+          const oldestSeq = seqs.length === 0 ? 0 : Math.min(...seqs);
+          const paging = { hasMore: oldestSeq > 0, loading: false, oldestSeq };
           return {
             // Catch-up is authoritative for this session: REPLACE its message list.
             // This is what reconciles any optimistic user message we appended.
             messages: { ...st.messages, [frame.session_id]: frame.messages.map(rowToMessage) },
+            messagePaging: { ...st.messagePaging, [frame.session_id]: paging },
             activeId,
             ...projectActiveRun({ activeId, runs: st.runs }),
           };
         });
         break;
+      case "message_page": {
+        // Scroll-up pagination: an OLDER page to PREPEND (vs message_delta, which
+        // replaces). Merge ahead of the held list (dedupe by seq/id, keep ascending),
+        // record hasMore from the frame, advance the oldest-held cursor, and clear the
+        // loading guard for this session.
+        const sid = frame.session_id;
+        const pageSeqs = frame.messages.map((m) => m.seq);
+        set((st) => {
+          const prev = st.messagePaging[sid];
+          // The new oldest cursor is the smallest seq across the prepended page and
+          // what we already tracked; an empty page leaves the prior cursor in place.
+          const prevOldest = prev?.oldestSeq ?? Number.POSITIVE_INFINITY;
+          const oldestSeq =
+            pageSeqs.length === 0 ? (prev?.oldestSeq ?? 0) : Math.min(prevOldest, ...pageSeqs);
+          return {
+            messages: {
+              ...st.messages,
+              [sid]: prependMessages(st.messages[sid] ?? [], frame.messages),
+            },
+            messagePaging: {
+              ...st.messagePaging,
+              [sid]: { hasMore: frame.has_more, loading: false, oldestSeq },
+            },
+          };
+        });
+        break;
+      }
       case "live":
         // Keep the remote idle watchdog alive: any live frame for the active session
         // is proof the desktop is still talking, so reset its last-activity clock.
@@ -2035,6 +2089,8 @@ export const useStore = create<AppState>((set, get) => ({
       agents: {},
       // ...and no background tasks; the desktop's live frames repopulate them.
       backgroundTasks: {},
+      // ...and no pagination cursors; the desktop's catch-up reseeds them per session.
+      messagePaging: {},
       streaming: false,
       cancel: null,
       pendingPermission: null,
@@ -2078,6 +2134,8 @@ export const useStore = create<AppState>((set, get) => ({
           remoteChatOpen: false,
           // The channel is dead — every remote-driven run is gone.
           runs: {},
+          // ...and pagination cursors are stale; the reconnect's catch-up reseeds them.
+          messagePaging: {},
           streaming: false,
           cancel: null,
           pendingPermission: null,
@@ -2169,12 +2227,51 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         remoteDropped: true,
         runs: {},
+        // Drop pagination cursors/loading guards too — a reconnect's catch-up reseeds
+        // them; otherwise a `loading: true` left by an in-flight fetch_messages would
+        // wedge pagination for the session.
+        messagePaging: {},
         streaming: false,
         cancel: null,
         pendingPermission: null,
         composerPhase: "idle",
       });
     }
+  },
+
+  // Request the next older page of a session's history (scroll-up pagination).
+  // Guards: only over a live remote link, only when there might be more history
+  // (hasMore !== false), only one fetch in flight per session, and only when we
+  // actually hold a row to page back from (an empty session has no cursor). Sets
+  // the loading flag synchronously so a burst of scroll events can't fire duplicate
+  // requests; the matching `message_page` frame clears it (and reconnect/drop reset
+  // the whole `messagePaging` map). The page size is a fixed `PAGE_SIZE`.
+  async loadOlderMessages(sessionId) {
+    if (!get().remoteConnected) return;
+    const paging = get().messagePaging[sessionId];
+    // Unknown (undefined) paging means catch-up hasn't seeded it yet — nothing to
+    // page from. hasMore === false means we hold the very first message already.
+    if (!paging || paging.loading || paging.hasMore === false) return;
+    const beforeSeq = paging.oldestSeq;
+    // Defensive: seq 0 is the first message, so there's nothing strictly before it.
+    if (beforeSeq <= 0) {
+      set((st) => ({
+        messagePaging: {
+          ...st.messagePaging,
+          [sessionId]: { ...paging, hasMore: false },
+        },
+      }));
+      return;
+    }
+    set((st) => ({
+      messagePaging: { ...st.messagePaging, [sessionId]: { ...paging, loading: true } },
+    }));
+    await get().sendRemoteCommand({
+      cmd: "fetch_messages",
+      session_id: sessionId,
+      before_seq: beforeSeq,
+      limit: PAGE_SIZE,
+    });
   },
 
   async disconnectRemote() {
@@ -2206,6 +2303,8 @@ export const useStore = create<AppState>((set, get) => ({
       remoteChatOpen: false,
       // The turn is over — don't strand a stuck composer; drop every run too.
       runs: {},
+      // Pagination cursors belong to the torn-down session; clear them.
+      messagePaging: {},
       streaming: false,
       cancel: null,
       pendingPermission: null,
@@ -2395,6 +2494,18 @@ function errMessage(err: unknown): string {
 // in-memory Message shape the UI renders.
 function rowToMessage(r: MessageRow): Message {
   return { id: r.id, role: r.role, blocks: r.content, createdAt: r.createdAt };
+}
+
+// Prepend an OLDER page of catch-up rows ahead of the held messages, deduping by id
+// (so a page that overlaps what we already hold can't double a message) and keeping
+// the result in ascending order — the page is older, so it goes in front. Used by
+// the `message_page` (scroll-up pagination) path; never replaces, only extends back.
+function prependMessages(existing: Message[], older: MessageRow[]): Message[] {
+  if (older.length === 0) return existing;
+  const held = new Set(existing.map((m) => m.id));
+  const prefix = older.filter((r) => !held.has(r.id)).map(rowToMessage);
+  if (prefix.length === 0) return existing;
+  return [...prefix, ...existing];
 }
 
 // Apply fn to the LAST message of a session, immutably. No-op when the session

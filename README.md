@@ -13,7 +13,6 @@ without writing the code yourself: you direct and review, the AI does the work.
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![CI](https://github.com/porthex/portcode/actions/workflows/ci.yml/badge.svg)](https://github.com/porthex/portcode/actions/workflows/ci.yml)
-![Frontend coverage: 98.9%](https://img.shields.io/badge/frontend%20coverage-98.9%25-2ea043)
 ![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white)
 ![Status: early alpha](https://img.shields.io/badge/status-early%20alpha-orange)
 ![Built with Rust + Tauri](https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri-CE422B?logo=rust&logoColor=white)
@@ -60,9 +59,8 @@ say so than oversell it.
   You direct and review; you don't have to write code.
 - **🆓 Open source & free.** Apache-2.0. The whole editor — agent loop, tools, permission gate,
   UI — is in this repo, yours to read, fork, and extend.
-- **⚡ Native & fast.** A Rust + Tokio core in a [Tauri](https://tauri.app) shell: the release
-  binary is ~6 MB and idles around ~32 MB of RAM, reusing the WebView2 runtime already on
-  Windows rather than shipping its own browser engine.
+- **⚡ Native & fast.** A Rust + Tokio core in a [Tauri](https://tauri.app) shell reuses the
+  WebView2 runtime already on Windows rather than shipping its own browser engine.
 - **🛡️ Private & local by design.** Your key lives in **Windows Credential Manager**, file tools
   are sandboxed to your workspace, every mutating action is gated, and there is **no telemetry by
   default** — nothing leaves your machine except the calls to the model you chose. (Crash reporting
@@ -153,8 +151,13 @@ auth, choose one:
 ## Features
 
 - **Streaming agent loop** over the Anthropic Messages API, with a live token + cost meter.
-- **7 workspace-sandboxed tools** — `fs_read`, `list`, `glob`, `grep` (read-only) plus
-  `fs_write`, `fs_edit`, `shell` (mutating, gated).
+- **8 tools** — `fs_read`, `list`, `glob`, `grep` (workspace-sandboxed, read-only),
+  `fs_write`, `fs_edit`, and `shell` (mutating and permission-gated), plus `task` for
+  bounded subagent work. Shell commands start in the workspace but are not an OS-level sandbox.
+- **Permission modes and rules** — including a read-only plan mode and pre-apply diffs for file
+  changes.
+- **Subagents and background tasks** — parallel bounded subagent execution and non-blocking
+  long-running shell jobs, with live status and cancellation.
 - **Permission gate** — `allow` / `ask` / `deny` (+ "always allow") for every mutating tool,
   enforced in the Rust core, not just the UI.
 - **Reviewable diffs** — edits render as colorized unified diffs before they touch disk;
@@ -242,7 +245,8 @@ The near-term engineering plan lives in [docs/ROADMAP.md](docs/ROADMAP.md). The 
    (see the [iOS web client plan](docs/IOS_WEB_CLIENT_PLAN.md)), with a self-hosted, version-pinned
    [`iroh-relay`](relay/) for the always-on relay leg; the on-device iOS go/no-go spike is the
    next gate before it's usable end-to-end.
-5. **Signed installers + auto-update** — so you don't have to build from source.
+5. **First production release** — the signed-installer and updater clients are implemented; the
+   remaining gate is a signed, draft-first release run verified on a clean machine before publish.
 
 ---
 
@@ -252,11 +256,9 @@ Contributions are welcome — Portcode is developed in the open. Start with
 [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the local quality gates, and a few
 Windows-specific gotchas worth knowing before your first build.
 
-<div align="center">
-  <img src="docs/coverage.svg" alt="Frontend test coverage: 98.9% statements, 100% lines and functions, across 177 tests" width="600" />
-  <br />
-  <sub>Frontend coverage — refreshed on every <code>main</code> / <code>release</code> build. Contributors are never gated on it; see <a href="CONTRIBUTING.md#quality-gates--run-before-you-push">Quality gates</a>.</sub>
-</div>
+Frontend coverage is measured on canonical branch builds and protected by a regression floor;
+contributor PRs are not gated on a manually maintained percentage. See
+[CONTRIBUTING.md](CONTRIBUTING.md#quality-gates--run-before-you-push).
 
 - New contributors merge after a quick, one-time **[CLA](CLA.md)** signature (handled
   automatically by a bot on your first PR).

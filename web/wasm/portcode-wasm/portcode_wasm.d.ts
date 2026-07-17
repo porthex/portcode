@@ -13,7 +13,7 @@ export type ReadableStreamType = "bytes";
  * / `create_session`) — the phone never runs tools or touches the workspace
  * itself.
  */
-export type RemoteCommand = { cmd: "run"; session_id: string; text: string } | { cmd: "cancel"; session_id: string } | { cmd: "cancel_agent"; agent_id: string } | { cmd: "permission"; id: string; decision: string } | { cmd: "create_session"; title: string | null };
+export type RemoteCommand = { cmd: "run"; session_id: string; text: string } | { cmd: "cancel"; session_id: string } | { cmd: "cancel_agent"; agent_id: string } | { cmd: "permission"; id: string; decision: string } | { cmd: "create_session"; title: string | null } | { cmd: "fetch_messages"; session_id: string; before_seq: number; limit: number };
 
 /**
  * A session header row. (Was `crate::db::SessionRow`.)
@@ -54,7 +54,7 @@ export type StreamEvent = { type: "turn_start"; messageId: string } | { type: "t
 /**
  * Everything that crosses the encrypted channel, in both directions.
  */
-export type SyncFrame = { t: "hello"; device_id: string; cursors: Cursor[] } | { t: "session_list"; sessions: SessionRow[] } | { t: "message_delta"; session_id: string; messages: MessageRow[] } | { t: "live"; session_id: string; event: StreamEvent } | { t: "command"; command: RemoteCommand } | { t: "ack"; session_id: string; seq: number } | { t: "pairing_reject"; reason: string | null };
+export type SyncFrame = { t: "hello"; device_id: string; cursors: Cursor[] } | { t: "session_list"; sessions: SessionRow[] } | { t: "message_delta"; session_id: string; messages: MessageRow[] } | { t: "message_page"; session_id: string; messages: MessageRow[]; has_more: boolean } | { t: "live"; session_id: string; event: StreamEvent } | { t: "command"; command: RemoteCommand } | { t: "ack"; session_id: string; seq: number } | { t: "pairing_reject"; reason: string | null };
 
 /**
  * One end\'s high-water mark for a session: \"I already hold every message up to
