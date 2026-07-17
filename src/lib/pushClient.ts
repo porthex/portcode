@@ -56,8 +56,7 @@ export type PushSkipReason =
  *  desktop, or a typed skip reason. A discriminated union so callers `switch` on it
  *  rather than catching exceptions. */
 export type PushResult =
-  | { ok: true; registration: PushRegistration }
-  | { ok: false; reason: PushSkipReason };
+  { ok: true; registration: PushRegistration } | { ok: false; reason: PushSkipReason };
 
 /** The slice of `ServiceWorkerContainer` we use: `ready` resolves to the active
  *  registration whose `pushManager` we subscribe through. */
