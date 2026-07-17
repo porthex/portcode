@@ -38,7 +38,7 @@ concurrency:
 
 jobs:
   release:
-    name: Build · sign · SBOM · publish (Windows)
+    name: Build · sign · SBOM · attach to draft (Windows)
     runs-on: windows-latest
     # Only cut releases from a version tag or the `release` branch. A manual
     # workflow_dispatch on any other ref is skipped, so it can never stamp a
@@ -255,8 +255,8 @@ jobs:
           if ($bom.bomFormat -ne "CycloneDX") { throw "Unexpected bomFormat: $($bom.bomFormat)" }
           Write-Host "SBOM OK: $($bom.bomFormat) $($bom.specVersion); components: $($bom.components.Count)"
 
-      # ── Publish to GitHub Releases (tag refs only) ────────────────────────────
-      - name: Publish release assets
+      # ── Attach assets to the draft Release (tag refs only) ───────────────────
+      - name: Attach assets to draft release
         if: github.ref_type == 'tag'
         shell: pwsh
         env:
@@ -274,7 +274,9 @@ jobs:
           # Idempotent: create the release if it doesn't exist yet, else upload.
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag @assets --title $tag --generate-notes --verify-tag
+            # The clean-VM verification gate happens before publication. This
+            # fallback must therefore match release-please's draft-first policy.
+            gh release create $tag @assets --title $tag --generate-notes --verify-tag --draft
           } else {
             gh release upload $tag @assets --clobber
           }

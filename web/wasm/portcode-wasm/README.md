@@ -23,6 +23,7 @@ Files (all tracked):
 ## Regenerating
 
 ```sh
+wasm-pack --version # expected: wasm-pack 0.15.0 (matches CI)
 wasm-pack build --target web crates/portcode-wasm
 cp crates/portcode-wasm/pkg/portcode_wasm.js \
    crates/portcode-wasm/pkg/portcode_wasm_bg.wasm \

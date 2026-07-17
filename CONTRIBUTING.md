@@ -66,9 +66,9 @@ need the following toolchain:
   (Portcode uses `x86_64-pc-windows-msvc`, **not** the GNU toolchain).
 - **WebView2 runtime** — ships with Windows 11; on Windows 10 install the
   Evergreen runtime if it isn't already present.
-- **Rust** ≥ 1.77 (stable, MSVC). The pinned toolchain and components live in
-  [`rust-toolchain.toml`](rust-toolchain.toml), so `rustup` will fetch the right
-  channel automatically.
+- **Rust** ≥ 1.91 (stable, MSVC). [`rust-toolchain.toml`](rust-toolchain.toml)
+  selects the moving stable channel and required components; each crate's
+  `rust-version` is the minimum supported compiler.
 - **Node.js** (LTS) with **pnpm via Corepack**. This project uses **pnpm only** —
   do not use `npm` or `yarn`, as that would desync `pnpm-lock.yaml`.
 
@@ -99,8 +99,9 @@ required today.
 > _Maintainer stub:_ if a custom NSIS plugin or template step is introduced
 > later, document it here. Do not invent one.
 
-Code signing (Azure Trusted Signing) and the auto-updater are wired in a later
-phase and are **not** part of a local build.
+Production signing is wired into the protected release workflow, and the updater client is
+implemented. Local builds remain unsigned and do not prove the production release path; releases
+are built as drafts and clean-machine verified before a maintainer publishes them.
 
 ---
 

@@ -16,6 +16,7 @@ import { CrashConsentPrompt } from "./components/CrashConsentPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { ChannelBadge } from "./components/ChannelBadge";
 import { isTauri, isWebClientMode, onUpdaterEvent } from "./lib/ipc";
+import { isSelfDev } from "./lib/channel";
 import { getInstallState } from "./lib/installGate";
 import { initTelemetry, shutdownTelemetry, telemetryConfigured } from "./lib/telemetry";
 
@@ -52,7 +53,9 @@ export default function App() {
   // The store actions it calls are all defensive (swallow a missing-command), and
   // the listener + interval are torn down on unmount.
   useEffect(() => {
-    if (!isTauri() || remoteMode) return;
+    // Self-dev builds keep their own data and must never replace themselves with
+    // a stable release through the production updater.
+    if (!isTauri() || remoteMode || isSelfDev()) return;
     let cancelled = false;
     let unlisten: (() => void) | null = null;
     const s = useStore.getState();

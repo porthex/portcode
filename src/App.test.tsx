@@ -112,6 +112,7 @@ const m = vi.mocked(ipc);
 const initialState = useStore.getState();
 
 beforeEach(() => {
+  vi.unstubAllEnvs();
   vi.clearAllMocks();
   // Restore a pristine store between tests (zustand has no built-in reset).
   useStore.setState(initialState, true);
@@ -145,6 +146,30 @@ beforeEach(() => {
 });
 
 describe("App layout", () => {
+  it("checks for updates when the stable desktop app mounts", async () => {
+    m.isTauri.mockReturnValue(true);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(m.onUpdaterEvent).toHaveBeenCalledTimes(1);
+      expect(m.getUpdateChannel).toHaveBeenCalledTimes(1);
+      expect(m.checkForUpdate).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("keeps self-dev builds isolated from the production updater", async () => {
+    vi.stubEnv("VITE_PORTCODE_CHANNEL", "dev");
+    m.isTauri.mockReturnValue(true);
+
+    render(<App />);
+    await waitFor(() => expect(useStore.getState().sessions).toHaveLength(1));
+
+    expect(m.onUpdaterEvent).not.toHaveBeenCalled();
+    expect(m.getUpdateChannel).not.toHaveBeenCalled();
+    expect(m.checkForUpdate).not.toHaveBeenCalled();
+  });
+
   it("runs init() on mount: creates a first session and renders the core shell", async () => {
     render(<App />);
 
