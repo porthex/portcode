@@ -7,7 +7,7 @@ start from a fresh clone with no access to your local machine or your user-level
 
 ## What's here
 
-- `memory/project-memory.md` — durable, project-scoped, **PII-free** knowledge store.
+- `memory/project-memory.md` — local-only, durable, project-scoped, **PII-free** knowledge store (Git-ignored).
 - `scripts/session-start.sh` — SessionStart hook: loads project memory into context and
   does best-effort env-prep (`pnpm install`, optional graphify refresh) in cloud sessions.
 - `scripts/scrub-memory.mjs` (+ `scrub-memory.test.mjs`) — zero-dependency PII scrubber.
@@ -19,22 +19,23 @@ start from a fresh clone with no access to your local machine or your user-level
 
 ## Project memory
 
-Durable knowledge lives at **`.claude/memory/project-memory.md`**. It is committed, so it
-survives across sessions and devices, and it is **auto-loaded each session** by the
-SessionStart hook (`scripts/session-start.sh`), which injects it as `additionalContext`.
+Durable knowledge lives at **`.claude/memory/project-memory.md`**. It is local-only and
+Git-ignored, so it survives sessions on the same machine but does not travel with clones.
+The SessionStart hook (`scripts/session-start.sh`) injects it as `additionalContext` when
+the file exists and otherwise no-ops cleanly.
 
-To record a new durable fact, run **`/memory`**. The command distills durable, project-
-scoped facts from the session and appends them **through the scrubber**.
+To record a new durable fact, run **`/memory`**. The command creates the local file when
+needed, distills durable project-scoped facts, and appends them **through the scrubber**.
 
 ## THE HARD RULE
 
-**Never put personal data in memory or any committed `.claude/` file. No emails, names,
-usernames, home paths (`/home/<u>`, `/Users/<u>`, `C:\Users\<u>`), IPs, hostnames,
-tokens/keys, or machine specifics. This repo is PUBLIC.**
+**Never commit or force-add `memory/project-memory.md`. Keep emails, names, usernames,
+home paths (`/home/<u>`, `/Users/<u>`, `C:\Users\<u>`), IPs, hostnames, tokens/keys,
+and machine specifics out of it anyway so deliberate copies remain safe.**
 
-The PreToolUse PII guard (`scripts/scrub-memory.mjs --hook`) enforces this on writes to the
-memory file and on `git add`/`git commit` of it, and `/memory` routes additions through the
-scrubber. **Treat both as a backstop, not a license to be careless** — keep entries about
+The PreToolUse PII guard (`scripts/scrub-memory.mjs --hook`) checks writes to the memory
+file and attempts to stage it, and `/memory` routes additions through the scrubber.
+**Treat both as a backstop, not a license to be careless** — keep entries about
 the PROJECT, not about who is working on it.
 
 ## Scrubber usage
@@ -70,14 +71,14 @@ frontend coverage gate.)
     exits 0 and never stalls or fails a session. STDOUT is JSON-only; logs go to STDERR.
 - **PreToolUse** (existing graphify hooks): steer the agent to `graphify query/explain/path`
   before grepping or reading source files.
-- **PreToolUse** PII guard (`Write|Edit|Bash`): runs `scrub-memory.mjs --hook` to block
-  writes/commits that would add PII to committed memory.
+- **PreToolUse** PII guard (`Write|Edit|Bash`): runs `scrub-memory.mjs --hook` to protect
+  the local memory and block attempts to stage unsafe content.
 
 ## Web / iOS notes
 
-These files work in cloud sessions because they are **committed** and the cloud clones the
-repo. Your user-level `~/.claude` config does **not** carry over — anything you need in a
-web/iOS session must live here in the repo.
+The reusable configuration works in cloud sessions because it is committed and cloned.
+The local memory file is intentionally absent from fresh web/iOS clones; create it there
+only when that environment needs its own local memory.
 
 ## Serena (optional, local LSP navigation)
 

@@ -6,7 +6,7 @@ allowed-tools: Read, Edit, Bash
 
 You are updating Portcode's durable project memory at `.claude/memory/project-memory.md`.
 
-1. Read `.claude/memory/project-memory.md` (its rules + current entries).
+1. Read `.claude/memory/project-memory.md` (its rules + current entries). If it does not exist, create it locally with the standard headings: Architecture, Conventions, Decisions, Gotchas, and Active workstreams. Never stage it.
 2. From the current session (and `$ARGUMENTS` if given), select ONLY facts that are:
    - durable (true beyond this session), and
    - PROJECT-scoped (about the codebase / architecture / conventions / decisions / gotchas), and

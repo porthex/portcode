@@ -1,0 +1,33 @@
+{
+  "description": "Portcode project memory and Graphify guidance for Codex.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$(git rev-parse --show-toplevel)/.codex/scripts/portcode-hooks.mjs\"",
+            "commandWindows": "powershell -NoProfile -Command \"$root = git rev-parse --show-toplevel; node (Join-Path $root '.codex/scripts/portcode-hooks.mjs')\"",
+            "timeout": 30,
+            "statusMessage": "Loading Portcode project memory"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|apply_patch|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$(git rev-parse --show-toplevel)/.codex/scripts/portcode-hooks.mjs\"",
+            "commandWindows": "powershell -NoProfile -Command \"$root = git rev-parse --show-toplevel; node (Join-Path $root '.codex/scripts/portcode-hooks.mjs')\"",
+            "timeout": 30,
+            "statusMessage": "Checking Portcode project guidance"
+          }
+        ]
+      }
+    ]
+  }
+}

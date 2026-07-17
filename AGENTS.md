@@ -3,6 +3,7 @@
 This project can generate a local knowledge graph at `graphify-out/` with god nodes, community structure, and cross-file relationships. The generated graph is optional and Git-ignored.
 
 Rules:
+
 - For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
 - If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
@@ -13,7 +14,8 @@ Rules:
 Portcode enforces a **frontend coverage gate on `main`/`release`**: the `Coverage` CI job runs `pnpm test:coverage` against the thresholds in `vitest.config.ts` (statements / lines / functions — branch coverage is intentionally not gated). Coverage on `main`/`release` must stay at or above the threshold, or **`main` goes red**.
 
 When you add or change **frontend** code (`src/`):
-- **Run `pnpm test:coverage` and make sure it passes the threshold before opening a PR.** Contributor PRs are *not* gated on coverage (PR CI runs plain `pnpm test`), but the post-merge `main`/`release` job IS — so a feature that lands under-tested will red `main` even though its PR was green.
+
+- **Run `pnpm test:coverage` and make sure it passes the threshold before opening a PR.** Contributor PRs are _not_ gated on coverage (PR CI runs plain `pnpm test`), but the post-merge `main`/`release` job IS — so a feature that lands under-tested will red `main` even though its PR was green.
 - **New code must come with tests.** If you add an export/store action/component, extend the matching `*.test.ts(x)` in the same change. (This exact gap — OAuth shipping without test updates — once reddened `main`.)
 - If `test:coverage` reports a shortfall, cover the new lines rather than lowering the threshold.
 
@@ -25,8 +27,8 @@ You can build Portcode while running it, dogfood-style. `pnpm app:dev:self` runs
 
 ## Project memory
 
-Durable, project-scoped knowledge lives locally in `.claude/memory/project-memory.md`. It is auto-loaded each session by the SessionStart hook, ignored by Git, and does not travel with clones.
+Durable, project-scoped knowledge lives locally in `.claude/memory/project-memory.md`. It is shared by Claude Code and Codex on this machine and auto-loaded by their respective SessionStart hooks. The file is ignored by Git and does not travel with clones.
 
-- To record a new durable fact, run `/memory`; it initializes the local file when needed and appends through the PII scrubber.
+- In Claude Code, run `/memory`. In Codex, use the `project-memory` skill. Both initialize the local file when needed and pass additions through the same PII scrubber.
 - HARD RULE: never commit or force-add `.claude/memory/project-memory.md`. Keep personal data, credentials, machine details, and other sensitive information out of it anyway so the file remains safe to copy deliberately.
 - Code-structure questions still go through graphify first (see the graphify section); project memory is for architecture decisions, conventions, gotchas, and active workstreams — not a duplicate of the graph.

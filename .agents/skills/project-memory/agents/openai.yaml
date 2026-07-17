@@ -1,0 +1,4 @@
+interface:
+  display_name: "Project Memory"
+  short_description: "Record durable PII-free repository knowledge safely."
+  default_prompt: "Distill durable project-scoped facts from this task into the repository memory after scrubbing sensitive data."

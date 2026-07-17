@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// scrub-memory.mjs — zero-dependency PII/secret scrubber for Portcode's committed
-// project memory. This is the privacy backstop for a PUBLIC repo.
+// scrub-memory.mjs — zero-dependency PII/secret scrubber for Portcode's local
+// project memory. The memory file is Git-ignored; this keeps deliberate copies safe.
 //
 // CLI modes (see .claude/README.md / spec §6):
 //   node scrub-memory.mjs --check <file...>   exit 0 if clean; exit 2 if ANY pattern
@@ -203,7 +203,7 @@ function runPipe() {
 }
 
 // --hook: read PreToolUse JSON from stdin. Only act on writes/commits that target
-// committed memory. Emit deny JSON if those would introduce PII. Otherwise stay silent.
+// local memory. Emit deny JSON if those would introduce PII. Otherwise stay silent.
 // NEVER exits nonzero; NEVER blocks unrelated tools.
 function runHook() {
   let payload;
@@ -216,7 +216,7 @@ function runHook() {
   const toolName = payload.tool_name || "";
   const toolInput = payload.tool_input || payload || {};
 
-  // Does this action touch the committed memory store? We only police that path.
+  // Does this action touch the local memory store? We only police that path.
   const MEMORY_RE = /\.claude\/memory\//;
 
   let candidateText = null; // the text whose PII we should evaluate
@@ -261,7 +261,7 @@ function runHook() {
     .map((h) => `${h.line} (${h.pattern})`)
     .join(", ");
   const reason =
-    `Blocked: this would write PII/secrets into committed memory (${label}). ` +
+    `Blocked: this would write PII/secrets into local project memory (${label}). ` +
     `Hits at lines: ${detail}. Run the value through .claude/scripts/scrub-memory.mjs ` +
     `or remove it. This repo is PUBLIC — no personal data in memory.`;
 

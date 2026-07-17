@@ -23,6 +23,17 @@ crates/portcode-wasm/pkg
 # env / secrets
 .env
 .env.local
+.env.*
+!.env.example
+!.env.*.example
+!.env.selfdev
+
+# Local agent/server configuration may contain credentials or machine paths.
+.mcp.json
+.claude/settings.local.json
+.claude/auth.json
+.codex/config.local.toml
+.codex/auth.json
 *.local
 # editor
 .vscode/*
@@ -80,10 +91,14 @@ graphify-out/
 .swarm/
 .hive-mind/
 .claude-flow/
+.codex-worktrees/
+.pnpm-store/
 ruvector.db
 ruvector.db-*
-# `memory init` also syncs a copy of the shared memory DB into the committed .claude/
-# dir — NEVER commit it (this repo is public). Ignore only the db files; the rest of
-# .claude/ (CLAUDE.md, skills, settings, memory/) stays committed.
+# Agent memory is local-only. Keep reusable instructions, skills, hooks, and
+# scrubbers committed, but never commit live memory content or local databases.
+.claude/memory/
+.codex/memory/
+.agents/memory/
 .claude/**/*.db
 .claude/**/*.db-*
