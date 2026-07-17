@@ -185,7 +185,7 @@ jobs:
 
       # ── Supply-chain gate (same as release.yml): licenses · advisories · bans ─
       - name: Supply-chain audit (cargo-deny)
-        uses: EmbarkStudios/cargo-deny-action@v2.0.20
+        uses: EmbarkStudios/cargo-deny-action@v2.1.1
         with:
           manifest-path: src-tauri/Cargo.toml
           command: check
