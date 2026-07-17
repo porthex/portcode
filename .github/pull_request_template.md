@@ -32,9 +32,9 @@ Run these locally before pushing (CI runs them too — see
 - [ ] `pnpm format:check` passes
 - [ ] `pnpm typecheck` passes
 - [ ] `pnpm test` passes
-- [ ] `cargo fmt --manifest-path src-tauri/Cargo.toml --check` passes
-- [ ] `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` passes
-- [ ] `cargo test --manifest-path src-tauri/Cargo.toml` passes
+- [ ] `cargo fmt --all --check` passes
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
+- [ ] `cargo test --workspace` passes
 - [ ] I added or updated tests for this change (or explained why none are needed)
 
 ## Security sensitivity

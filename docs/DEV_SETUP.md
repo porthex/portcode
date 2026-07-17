@@ -11,8 +11,8 @@ Dev" build) as fast as possible.
 
 ## Prerequisites
 
-All five items below are required. The last one (bacon) is optional and only
-needed for the `pnpm watch:rust` Rust feedback loop.
+The first four items below are required. The last one (bacon) is optional and
+only needed for the `pnpm watch:rust` Rust feedback loop.
 
 ### 1. Visual Studio Build Tools with MSVC
 
@@ -35,13 +35,14 @@ Or open the installer manually and check **Desktop development with C++**.
 
 ### 3. Rust via rustup
 
-`rust-toolchain.toml` in the repo root pins the exact channel (stable),
-components (rustfmt, clippy), and targets (win-msvc, linux-gnu). `rustup`
-materializes this automatically the first time you build — no manual toolchain
-juggling required.
+`rust-toolchain.toml` in the repo root pins Rust **1.96.0**, components
+(rustfmt, clippy), and targets (win-msvc, linux-gnu). The exact compiler pin
+keeps the committed WASM glue reproducible; upgrade it deliberately together
+with that artifact. `rustup` materializes it automatically the first time you
+build — no manual toolchain juggling required.
 
 The crate requires Rust 1.91 or later (`rust-version` in `src-tauri/Cargo.toml`).
-Current stable exceeds this.
+The pinned toolchain exceeds this.
 
 ```powershell
 winget install Rustlang.Rustup

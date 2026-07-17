@@ -233,7 +233,9 @@ jobs:
       - name: Install wasm-pack
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack
+          # Generated glue is tool-version-sensitive; keep CI and the committed
+          # browser artifact reproducible across upstream wasm-pack releases.
+          tool: wasm-pack@0.15.0
       - name: wasm-pack build the Session wrapper (interop surface)
         run: wasm-pack build --target web crates/portcode-wasm
 
@@ -332,7 +334,7 @@ jobs:
         if: steps.changed.outputs.run == 'true'
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack
+          tool: wasm-pack@0.15.0
 
       - name: wasm-pack build the Session wrapper
         if: steps.changed.outputs.run == 'true'

@@ -34,24 +34,27 @@ Two different things share the name **`release`** — don't conflate them:
   the `vX.Y.Z` tags are created.
 - **The `release` GitHub _environment_** — a deployment environment (Settings →
   Environments) that holds the **signing secrets** and required reviewers. It is
-  used by the signed Windows build job in `release.yml` (added by **PR #8**, see
-  below). An _environment_ gates a workflow job; it is **not** a branch.
+  used by the signed Windows build job in `release.yml`. An _environment_ gates
+  a workflow job; it is **not** a branch.
 
 A release flows through **both**: the `vX.Y.Z` tag is created on the `release`
 **branch**, and the signed build job that the tag triggers runs in the `release`
 **environment** so it can read the signing secrets.
 
-### What's wired today vs. once PR #8 lands
+### What is wired today
 
-- **Today (on `main`):** release-please (changelog + 3-file version sync, now
-  targeting `release`) and **`release-linux.yml`**, which on a `v*` tag builds
-  the **unsigned** Linux bundles (AppImage + `.deb`) and attaches them to a
-  **draft** GitHub Release.
-- **Once PR #8 lands:** **`release.yml`** adds the **signed Windows** build —
-  NSIS installer, Authenticode (Azure Trusted Signing), Tauri updater signature,
-  `latest.json`, SBOM, and checksums — running in the `release` **environment**.
-  Until PR #8 merges, treat the Windows-signing sections (§4–§7, §9) as the
-  target process.
+- **release-please** owns the version/changelog PR on `release`. Merging it creates
+  the tag and a **draft** GitHub Release. `force-tag-creation` is enabled because
+  the platform workflows are dispatched against that tag before publication.
+- The release-please workflow then explicitly dispatches both platform workflows at that tag.
+  This is deliberate: events created with the built-in `GITHUB_TOKEN` do not recursively trigger
+  other workflows reliably.
+- **`release.yml`** builds the Windows NSIS installer and, when protected secrets are present,
+  adds Authenticode, the Tauri updater signature, `latest.json`, checksums, and the SBOM.
+- **`release-linux.yml`** builds unsigned AppImage and `.deb` bundles.
+
+Both platform workflows upload into the same draft. Neither workflow publishes it. A maintainer
+publishes only after the acceptance checklist passes.
 
 ---
 
@@ -67,9 +70,8 @@ A release flows through **both**: the `vX.Y.Z` tag is created on the `release`
    pushes to `release`, opens (or updates) a **release PR** there; merging it
    bumps the version in all **three** files, updates `CHANGELOG.md`, and creates
    the **`vX.Y.Z` tag** on `release`.
-4. **The tag drives the build.** The `v*` tag triggers the release workflows:
-   `release-linux.yml` (today → unsigned AppImage/`.deb`) and, once **PR #8**
-   lands, the signed Windows `release.yml` running in the `release` environment.
+4. **The release workflow orchestrates the build.** After release-please creates the tag and
+   draft Release, it explicitly dispatches `release.yml` and `release-linux.yml` at that exact tag.
 5. **Verify** the build (§9), then **publish** the draft Release so it goes live
    (and, on Windows, `latest.json` enables auto-update).
 6. **Sync the bump back to `main`** so the version files and `CHANGELOG.md` on
@@ -129,9 +131,9 @@ possible.
 
 ## 2. How the pipeline is wired
 
-Two tag-triggered workflows can build a release. Both fire on a **`v*`** tag
-(branch-agnostic) — the tag release-please creates on `release` — so cutting the
-release is the same action regardless of which builders are enabled.
+Two tag-scoped workflows build a release. They accept a **`v*`** tag push or an explicit
+`workflow_dispatch`; the release-please workflow uses the explicit path after it creates a tag so
+the built-in-token recursion rule cannot leave a draft without builders.
 
 ### `release-linux.yml` — unsigned Linux bundles (live today)
 
@@ -142,7 +144,7 @@ release is the same action regardless of which builders are enabled.
   the Windows installer is. The only token used is the built-in `GITHUB_TOKEN`,
   solely to upload assets.
 
-### `release.yml` — signed Windows installer (added by PR #8)
+### `release.yml` — signed Windows installer
 
 - **Triggers** on `push` of a **`v*`** tag, and on **`workflow_dispatch`** (a
   manual, unpublished **dry run**). The heavy signed `tauri build` is kept **out**
@@ -173,7 +175,7 @@ release is the same action regardless of which builders are enabled.
 7. **SHA-256 checksums** over the final (post-sign) bytes → `SHA256SUMS.txt`.
 8. **Updater manifest** `latest.json` (§5) — _gated_.
 9. **CycloneDX SBOM** via `cdxgen` (§6) → `portcode.cdx.json`, then validated.
-10. **Publish** assets to the GitHub Release on tag refs (§7); on a non-tag dry
+10. **Attach** assets to the draft GitHub Release on tag refs (§7); on a non-tag dry
     run, the same artifacts are uploaded as a workflow artifact
     (`portcode-unpublished`) for inspection instead.
 
@@ -233,7 +235,7 @@ signature over the installer before applying it.
 - **Owner generates the key once** with `pnpm tauri signer generate` (see §10).
   The **private key is NEVER committed** — it lives only in the password manager
   and in the `release` environment secrets. The **public key lives in
-  `src-tauri/tauri.conf.json`** (the `updater` plugin config added by PR #8).
+  `src-tauri/tauri.conf.json`** under the updater plugin config.
 - In CI, **after** Authenticode signing, `tauri signer sign <installer>` writes a
   detached **`<installer>.sig`** over the _final_ installer bytes. (Order matters:
   Authenticode embeds a certificate into the binary, so the updater signature must
@@ -282,17 +284,17 @@ Both are attached to the release (§7).
 
 ---
 
-## 7. Publish to GitHub Releases
+## 7. Attach assets to the draft GitHub Release
 
-Publishing is **gated to tag refs (`v*`)**. The publish step is **idempotent**:
+Attaching assets is **gated to tag refs (`v*`)**. The upload step is **idempotent**:
 
 - If a Release for the tag **already exists** (the release-please path — its merge
   created the tag and a draft Release), the workflow **uploads the assets to it**
   (`--clobber`).
-- If it **does not** exist (e.g. a manually pushed tag), the workflow **creates**
-  the Release with auto-generated notes.
+- If it **does not** exist (e.g. a manually pushed tag), the workflow creates a
+  **draft** Release with auto-generated notes.
 
-Assets attached (signed Windows build, once PR #8 lands):
+Assets attached by the signed Windows build:
 
 - `Portcode_<version>_x64-setup.exe` — the signed installer
 - `SHA256SUMS.txt` — checksums
@@ -351,7 +353,7 @@ your secret vault — **never** in the repo.
 3. **Generate the updater key** — on a trusted machine, run
    `pnpm tauri signer generate` (offline). Store the **private key + password** in
    a password manager; **never commit it**. Paste the **public key** into the
-   `updater` config in `src-tauri/tauri.conf.json` (PR #8). Add the private key as
+   `updater` config in `src-tauri/tauri.conf.json`. Add the private key as
    `TAURI_SIGNING_PRIVATE_KEY` and its password as
    `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 4. **Azure Trusted Signing** — create the Trusted Signing account + certificate
@@ -386,8 +388,8 @@ your secret vault — **never** in the repo.
 ## 9. Verify on a clean Windows VM
 
 Do this on a **fresh Windows VM** (no dev toolchain, no prior Portcode install)
-before publishing a draft release. (Applies to the signed Windows build from
-`release.yml`, once PR #8 lands.)
+before publishing a draft release. This applies to the signed Windows build from
+`release.yml`.
 
 1. **Download** `Portcode_<version>_x64-setup.exe` and `SHA256SUMS.txt` from the
    (draft) release.
@@ -451,8 +453,10 @@ Before cutting a release:
 - [ ] _(Recommended)_ a **dry run** was triggered via `workflow_dispatch` on a
       non-tag ref and the `portcode-unpublished` artifact was inspected.
 
-Then merge the release-please PR (on `release`) and let the `v*` tag drive the
-rest. Afterward, sync the bump back to `main` (§1).
+Then merge the release-please PR on `release`. Confirm that orchestration created the tag and a
+**draft** Release, and that both dispatched platform workflows completed against that same tag.
+Run §9 against the draft assets; publish only after every check passes. Afterward, sync the bump
+back to `main` (§1).
 
 ---
 
@@ -460,8 +464,8 @@ rest. Afterward, sync the bump back to `main` (§1).
 
 | What                     | Where (relative to repo root)                                               |
 | ------------------------ | --------------------------------------------------------------------------- |
-| Signed Windows release   | `.github/workflows/release.yml` (added by PR #8)                            |
-| Linux release (today)    | `.github/workflows/release-linux.yml`                                       |
+| Signed Windows release   | `.github/workflows/release.yml`                                             |
+| Linux release            | `.github/workflows/release-linux.yml`                                       |
 | Changelog + version bump | `.github/workflows/release-please.yml` (targets the `release` branch)       |
 | Per-PR CI (no signing)   | `.github/workflows/ci.yml`                                                  |
 | NSIS installer           | `src-tauri/target/release/bundle/nsis/Portcode_<version>_x64-setup.exe`     |
