@@ -166,12 +166,25 @@ export const MessageView = memo(function MessageView({
     },
   ];
 
+  // If the user has text selected inside this message, let the native copy menu
+  // through instead of stealing it with the custom one. A selection elsewhere
+  // must not suppress this message's actions.
+  const handleContextMenu = (e: React.MouseEvent) => {
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed) {
+      for (let index = 0; index < sel.rangeCount; index += 1) {
+        if (sel.getRangeAt(index).intersectsNode(e.currentTarget)) return;
+      }
+    }
+    onContextMenu(menuItems)(e);
+  };
+
   return (
     <div
       id={`pc-msg-${message.id}`}
       className={`mb-5 flex gap-[11px] ${isUser ? "justify-end" : "pc-msg-enter"}`}
       style={isActive ? undefined : SETTLED_ROW_STYLE}
-      onContextMenu={onContextMenu(menuItems)}
+      onContextMenu={handleContextMenu}
     >
       {!isUser && <Avatar />}
       <div className={`min-w-0 ${isUser ? "max-w-[82%]" : "flex-1"}`}>

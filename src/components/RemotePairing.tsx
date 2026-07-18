@@ -62,8 +62,26 @@ export function RemotePairing() {
   const videoRef = useRef<HTMLVideoElement>(null);
   // Aborts the in-flight web scan when the user taps Cancel / hits Escape.
   const scanAbortRef = useRef<AbortController | null>(null);
+  // Native scans are cancelled through the plugin rather than an AbortSignal.
+  // Track the live call so StrictMode cleanup and ordinary navigation do not
+  // issue a stray cancel against a later scan.
+  const nativeScanActiveRef = useRef(false);
 
   const scanMode = detectScanMode();
+
+  // Abort any in-flight scan when the component unmounts (e.g. the user navigates
+  // away while the camera overlay is up). Cancel/Escape already do this on a live
+  // component; this effect covers the unmount path the interactive handlers miss.
+  useEffect(() => {
+    return () => {
+      scanAbortRef.current?.abort();
+      // Native mode: cancel the plugin's scan (fire-and-forget; we can't await here).
+      if (nativeScanActiveRef.current) {
+        nativeScanActiveRef.current = false;
+        void cancelScan();
+      }
+    };
+  }, []);
 
   // Dial a payload. connectRemote never throws — it folds failures into
   // store.remoteError, which the pair panel surfaces inline. On success it flips
@@ -106,7 +124,10 @@ export function RemotePairing() {
     setScanning(true);
 
     if (scanMode === "native") {
-      const outcome = await scanQrPayload();
+      nativeScanActiveRef.current = true;
+      const outcome = await scanQrPayload().finally(() => {
+        nativeScanActiveRef.current = false;
+      });
       setScanning(false);
       await handleScanOutcome(outcome);
       return;
@@ -145,6 +166,7 @@ export function RemotePairing() {
 
   const onCancelScan = async () => {
     if (scanMode === "native") {
+      nativeScanActiveRef.current = false;
       await cancelScan();
     } else {
       // WEB: abort the scan loop → scanWithCamera stops the stream tracks and
@@ -338,31 +360,27 @@ function PairPanel({
                 : "Show the QR from your desktop"}
         </div>
 
-        {/* photo-upload fallback — for locked-down devices where the live camera is
-            denied/unavailable. A still photo of the QR is decoded the same way. */}
-        {canScan && (
-          <>
-            <input
-              ref={fileRef}
-              type="file"
-              accept="image/*"
-              capture="environment"
-              onChange={onPickPhoto}
-              disabled={connecting}
-              className="sr-only"
-              aria-hidden="true"
-              tabIndex={-1}
-            />
-            <button
-              type="button"
-              onClick={() => fileRef.current?.click()}
-              disabled={scanning || connecting}
-              className="mx-auto mt-2.5 inline-flex items-center gap-1.5 rounded-md border border-accent-2/25 bg-accent-2/[0.06] px-3 py-1.5 font-mono text-[10px] tracking-[1px] text-accent-2 transition hover:bg-accent-2/15 disabled:opacity-40"
-            >
-              <span aria-hidden="true">▣</span> Upload a photo of the QR
-            </button>
-          </>
-        )}
+        {/* photo-upload fallback — available regardless of live-camera presence;
+            any host can decode a still photo of the desktop QR. */}
+        <input
+          ref={fileRef}
+          type="file"
+          accept="image/*"
+          capture="environment"
+          onChange={onPickPhoto}
+          disabled={connecting}
+          className="sr-only"
+          aria-hidden="true"
+          tabIndex={-1}
+        />
+        <button
+          type="button"
+          onClick={() => fileRef.current?.click()}
+          disabled={scanning || connecting}
+          className="mx-auto mt-2.5 inline-flex items-center gap-1.5 rounded-md border border-accent-2/25 bg-accent-2/[0.06] px-3 py-1.5 font-mono text-[10px] tracking-[1px] text-accent-2 transition hover:bg-accent-2/15 disabled:opacity-40"
+        >
+          <span aria-hidden="true">▣</span> Upload a photo of the QR
+        </button>
 
         {/* divider */}
         <div className="my-4 flex items-center gap-3 font-mono text-[10px] tracking-[2px] text-faint/70">

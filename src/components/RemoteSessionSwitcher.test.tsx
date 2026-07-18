@@ -115,4 +115,15 @@ describe("RemoteSessionSwitcher", () => {
     // With nothing focusable inside, the trap keeps focus on the container.
     expect(document.activeElement).toBe(dialog);
   });
+
+  it("steps into the first item when Tab is pressed from the container", () => {
+    render(<RemoteSessionSwitcher onClose={onClose} />);
+    const dialog = screen.getByRole("dialog", { name: "Switch session" });
+    const rows = screen.getAllByRole("button", { name: /Alpha|Beta/ });
+
+    dialog.focus();
+    fireEvent.keyDown(dialog, { key: "Tab" });
+
+    expect(document.activeElement).toBe(rows[0]);
+  });
 });
