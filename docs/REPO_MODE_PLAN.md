@@ -267,7 +267,88 @@ libgit2 raises build cost.
 
 ---
 
-## 8. Decisions needed before build
+## 8. Repo Mode across all apps (one engine, many surfaces)
+
+Portcode is already **one brain, many remote surfaces**. The desktop (Tauri) runs the agent,
+tools, `shell`, secrets, and the sync **server**; the **Android app** (`docs/ANDROID_APP_PLAN.md`)
+and the **iOS/web PWA** (`docs/IOS_WEB_CLIENT_PLAN.md`) are **remote clients** over the
+encrypted iroh + Noise channel — _"the phone is a remote control surface, the desktop stays
+the brain."_ Both remotes share one Rust crate, `portcode-sync` (the planned workspace
+extraction), and the existing `remoteMode` shell / `applyFrame` reducer / `RemoteCommand` +
+`SyncFrame` protocol.
+
+**Repo Mode inherits this model unchanged.** Its engine — libgit2 clone, the sandboxed FS
+tools, the push-capable GitHub token in the OS keychain, graphify indexing, git ops — is
+**desktop-only for the same reason `agent`/`tools`/`shell` are already `#[cfg(not(mobile))]`:**
+a phone has no workspace, no shell, and nowhere safe to hold a push-capable token; a browser
+has no filesystem at all. So:
+
+> **Repo Mode = a desktop engine + Repo-Mode-aware remote surfaces.** No surface clones
+> in-browser or on-phone. The remotes _drive and review_ a workspace hosted on a paired,
+> running desktop. There is no cloud host (that's the §5 anti-feature).
+
+### 8.1 Capability matrix
+
+| Capability                     | Desktop (engine)     | Android (remote)                        | iOS / Web PWA (remote)             |
+| ------------------------------ | -------------------- | --------------------------------------- | ---------------------------------- |
+| Connect GitHub / hold token    | ✅ token in keychain | initiate only; token stays desktop      | initiate only; token stays desktop |
+| Repo picker → clone → index    | ✅ executes locally  | request + watch progress                | request + watch progress           |
+| Run agent task                 | ✅                   | mirror + send `Run`/`Cancel`            | mirror + send `Run`/`Cancel`       |
+| **Graph-impact plan approval** | ✅ full graph viz    | approve (graph → list on small screens) | approve (graph → list)             |
+| Permission / plan approval     | ✅                   | ✅ (`Command(Permission)`)              | ✅ (`Command(Permission)`)         |
+| Native diff review             | ✅ side-by-side      | read-only mirrored diff                 | read-only mirrored diff            |
+| Per-hunk stage / commit        | ✅                   | trigger via command                     | trigger via command                |
+| **Push / open PR approval**    | ✅ **desktop-only**  | draft + view status only                | draft + view status only           |
+| Offline use                    | ✅ (local engine)    | ✗ (needs paired desktop)                | ✗ (needs paired desktop)           |
+
+Push/PR approval staying desktop-only is the security position (M13 / §9 Q7): a paired remote
+must not be able to approve a push the desktop policy would refuse.
+
+### 8.2 Protocol additions (additive, ride the existing channel)
+
+Extend `RemoteCommand` / `SyncFrame` in `portcode-sync` — additive, exactly like the
+`WorkspaceList` / `WorkspaceUpsert` frames in §4.6, and reusing them:
+
+- **Commands (remote → desktop):** `ListRepos`, `CloneRepo{owner,repo,branch}`,
+  `OpenWorkspace{id}`, `RequestDiff{path?}`, `Commit{message}`, `DraftPr{...}`. Push/PR
+  _execution_ requires a desktop-side confirmation, not just a remote command.
+- **Frames (desktop → remote):** `WorkspaceList`, `CloneProgress`, `RepoContext`
+  (branch/dirty/recent-commits), `Diff`. All E2E-encrypted.
+- **Token never crosses:** the `emit_event` redactor (security **M5**) runs before
+  `hub.publish`, so no token/secret reaches a remote even though the stream is mirrored.
+
+### 8.3 Per-surface notes
+
+- **Desktop** — the full experience of §3–§6, and the **only** surface that works standalone
+  (no pairing, fully offline).
+- **Android (remote)** — Tauri-mobile client; per its plan, desktop-only affordances (file
+  tree, raw workspace picker) are hidden, but Repo Mode _adds_ a mobile-appropriate repo
+  picker + diff viewer that drive the desktop. An FCM "doorbell" wakes the phone when the
+  agent needs a plan/permission approval. The Android Keystore holds only the **pairing**
+  key — never the GitHub token.
+- **iOS / Web PWA (remote)** — iroh-in-browser (WASM), relay-only, install-gated. Repo Mode
+  rides the same `remoteMode` / `applyFrame` path. iOS backgrounding drops the socket, so a
+  long desktop clone or agent run survives via **resume-by-cursor** (`Db::messages_since`
+  replays the missed stream on reconnect — the desktop kept working the whole time). Web Push
+  pulls the user back for a pending plan/permission decision.
+
+### 8.4 Build leverage
+
+Repo Mode's remote surface is **additive frames on the `portcode-sync` crate that the web and
+Android roadmaps are already extracting** — so the same work lands the capability on desktop,
+iOS/web, and Android at once, with one protocol and one crypto implementation to audit.
+
+### 8.5 The honest constraint (and the future option)
+
+Today the phone/web surfaces require a **paired, running desktop** — there is no always-on
+host, by design (your code and secrets never leave your machine). If "use Repo Mode with no
+desktop awake" becomes a goal, the clean path is a **headless / always-on desktop host** (the
+same engine run as a background service the remotes dial) — **not** a cloud backend, which
+stays the anti-feature. Captured as a §9 decision.
+
+---
+
+## 9. Decisions needed before build
 
 1. **GitHub App provisioning & auth flow (biggest):** who owns the App registration, is
    token-expiry enabled, and can the token exchange be done **without** embedding a client
@@ -283,8 +364,14 @@ libgit2 raises build cost.
    submodules/LFS deferred from v1.
 6. **`allow` policy in Repo Mode** — should a token-bearing repo session even allow the
    global `allow` policy, or force an `ask`-floor for all writes? Recommendation: `ask`-floor.
+7. **Remote approval authority (cross-app):** can a paired remote (Android / iOS-web) approve
+   a `git_push` / PR, or are those desktop-only? Recommendation: desktop-only (§8.1, M13).
+8. **Headless desktop host (cross-app):** do we want Repo Mode usable when no desktop UI is
+   awake? If so, ship a headless/always-on host of the same engine — explicitly **not** a
+   cloud backend (§8.5). Defer past v1 unless prioritized.
 
 ---
 
 _Companion design tracks (UX, backend, differentiation, security) and the competitor matrix
-were produced as part of this effort and can be expanded into standalone docs on request._
+were produced as part of this effort and can be expanded into standalone docs on request.
+Cross-app surfacing (§8) builds on `docs/ANDROID_APP_PLAN.md` and `docs/IOS_WEB_CLIENT_PLAN.md`._
