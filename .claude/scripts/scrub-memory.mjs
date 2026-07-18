@@ -36,14 +36,28 @@ function shellTokens(command) {
     current = "";
   };
 
-  for (const char of String(command ?? "")) {
+  const source = String(command ?? "");
+  for (let index = 0; index < source.length; index++) {
+    const char = source[index];
     if (quote) {
+      if (quote === '"' && char === "\\" && index + 1 < source.length) {
+        current += char + source[index + 1];
+        index += 1;
+        continue;
+      }
       if (char === quote) quote = null;
       else current += char;
       continue;
     }
     if (char === '"' || char === "'") {
       quote = char;
+      continue;
+    }
+    if (char === "\\" && index + 1 < source.length) {
+      // Preserve the escape for dual POSIX/Windows path interpretation, but
+      // keep the escaped character inside this token (notably escaped spaces).
+      current += char + source[index + 1];
+      index += 1;
       continue;
     }
     if (/\s/.test(char)) {
@@ -76,7 +90,7 @@ function normalizedAbsolute(path) {
 }
 
 function parsePathspec(token) {
-  let path = String(token).replace(/\\/g, "/");
+  let path = String(token);
   let exclude = false;
   let top = false;
   let literal = false;
@@ -102,24 +116,48 @@ function parsePathspec(token) {
   return { path, exclude, top, literal };
 }
 
-function pathspecCouldSelectProjectMemory(token, gitCwd, projectRoot) {
-  const parsed = parsePathspec(token);
-  if (parsed.exclude) return { exclude: true, matches: false };
+function unescapePosixToken(token) {
+  const source = String(token);
+  let result = "";
+  for (let index = 0; index < source.length; index++) {
+    if (source[index] === "\\" && index + 1 < source.length) {
+      result += source[index + 1];
+      index += 1;
+    } else {
+      result += source[index];
+    }
+  }
+  return result;
+}
 
+function parsedPathspecCouldSelectProjectMemory(parsed, gitCwd, projectRoot) {
+  if (parsed.exclude) return false;
   const base = parsed.top ? projectRoot : gitCwd;
   const target = normalizedAbsolute(resolve(projectRoot, PROJECT_MEMORY_PATH));
   const wildcardIndex = parsed.literal ? -1 : parsed.path.search(/[?*[]/);
   if (wildcardIndex >= 0) {
     const staticPrefix = parsed.path.slice(0, wildcardIndex);
-    if (!staticPrefix) return { exclude: false, matches: true };
+    if (!staticPrefix) return true;
     const prefix = normalizedAbsolute(resolve(base, staticPrefix));
-    return { exclude: false, matches: target.startsWith(prefix) };
+    return target.startsWith(prefix);
   }
 
   const candidate = normalizedAbsolute(resolve(base, parsed.path || "."));
+  return target === candidate || target.startsWith(`${candidate}/`);
+}
+
+function pathspecCouldSelectProjectMemory(token, gitCwd, projectRoot) {
+  const interpretations = [
+    String(token).replace(/\\/g, "/"),
+    unescapePosixToken(token),
+  ].filter((value, index, all) => all.indexOf(value) === index);
+  const parsed = interpretations.map(parsePathspec);
+  const positive = parsed.filter((pathspec) => !pathspec.exclude);
   return {
-    exclude: false,
-    matches: target === candidate || target.startsWith(`${candidate}/`),
+    exclude: positive.length === 0,
+    matches: positive.some((pathspec) =>
+      parsedPathspecCouldSelectProjectMemory(pathspec, gitCwd, projectRoot),
+    ),
   };
 }
 
@@ -314,7 +352,16 @@ function commandCouldStageProjectMemory(command, projectRoot, commandCwd, depth)
   if (depth > 3) return true;
   const tokens = shellTokens(command);
   let shellCwd = resolve(commandCwd);
+  const cwdStack = [];
   for (let index = 0; index < tokens.length; index++) {
+    if (tokens[index] === "(") {
+      cwdStack.push(shellCwd);
+      continue;
+    }
+    if (tokens[index] === ")") {
+      shellCwd = cwdStack.pop() ?? shellCwd;
+      continue;
+    }
     const changedCwd = changedShellCwd(tokens, index, shellCwd);
     if (changedCwd) shellCwd = changedCwd;
     const nested = delegatedCommand(tokens, index);

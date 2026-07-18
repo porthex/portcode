@@ -67,6 +67,7 @@ test("PreToolUse denies file, directory, global-option, and blanket staging form
     "git -C .claude add -f memory/project-memory.md",
     "git -C .claude/memory add -f project-memory.md",
     "git add -f .claude/memory/./project-memory.md",
+    String.raw`git add -f .claude/memory/project-memory\.md`,
     "git add -f .claude/*",
     "git add -A",
     "git add --all .",
@@ -74,6 +75,7 @@ test("PreToolUse denies file, directory, global-option, and blanket staging form
     'git commit -am "memory safety"',
     "git commit --pathspec-from-file=paths.txt",
     "bash -lc 'git add -f .claude/memory/project-memory.md'",
+    "(cd src && git add .); git add .",
     "git update-index --add .claude/memory/project-memory.md",
   ];
   for (const command of commands) {
@@ -91,6 +93,7 @@ test("PreToolUse permits unrelated scoped staging and ordinary commits", () => {
     "git add .github/workflows/ci.yml",
     "git add -A src",
     "git -C src add .",
+    "(cd src && git add .); git add src",
     'git commit -m "ordinary change"',
   ];
   for (const command of commands) {
