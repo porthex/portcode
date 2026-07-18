@@ -58,6 +58,22 @@ pub enum GitChangeStatus {
     Unmerged,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub enum GitReviewBranchKind {
+    Local,
+    Remote,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitReviewBranch {
+    pub name: String,
+    pub revision: String,
+    pub kind: GitReviewBranchKind,
+    pub current: bool,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitChangedFile {
@@ -191,7 +207,11 @@ impl ResolvedScope {
             ),
             (Self::Unstaged { .. }, _) => ("Index".into(), "Working tree".into()),
             (Self::Branch { base_oid, .. }, GitReviewScope::Branch { base }) => (
-                format!("merge-base({base}) · {}", short_oid(base_oid)),
+                format!(
+                    "merge-base({}) · {}",
+                    branch_display_name(base),
+                    short_oid(base_oid)
+                ),
                 "HEAD".into(),
             ),
             (Self::Commit { oid }, GitReviewScope::Commit { revision }) => {
@@ -251,6 +271,33 @@ pub async fn get_git_review_manifest(
 ) -> Result<GitReviewManifest, String> {
     let workspace = configured_workspace(&state)?;
     build_manifest(&workspace, scope).await
+}
+
+/// List concrete local and remote branches from the repository that owns the
+/// configured workspace. Symbolic aliases such as `origin/HEAD` are omitted so
+/// every option resolves to an actual review base.
+#[tauri::command]
+pub async fn get_git_review_branches(
+    state: State<'_, AppState>,
+) -> Result<Vec<GitReviewBranch>, String> {
+    let workspace = configured_workspace(&state)?;
+    let context = repository_context(&workspace).await?;
+    let output = run_ok(
+        &context.root,
+        vec![
+            OsString::from("for-each-ref"),
+            OsString::from("--format=%(refname)%00%(HEAD)%00%(symref)%00"),
+            OsString::from("--"),
+            OsString::from("refs/heads"),
+            OsString::from("refs/remotes"),
+        ],
+        512 * 1024,
+    )
+    .await?;
+    if output.truncated {
+        return Err("The repository has too many branches to list safely.".into());
+    }
+    parse_review_branches(&output.stdout)
 }
 
 /// Return one typed, line-addressable patch. The snapshot precondition prevents
@@ -1324,6 +1371,54 @@ fn strict_path(path: &[u8]) -> Result<String, String> {
     strict_text(path, "Git path").map(str::to_string)
 }
 
+fn parse_review_branches(output: &[u8]) -> Result<Vec<GitReviewBranch>, String> {
+    let fields: Vec<&[u8]> = output.split(|byte| *byte == 0).collect();
+    let mut branches = Vec::new();
+    for record in fields.chunks(3) {
+        if record.len() < 3 {
+            break;
+        }
+        let refname = strict_text(record[0], "Git branch")?.trim_start_matches(&['\r', '\n'][..]);
+        let head = strict_text(record[1], "Git branch marker")?.trim();
+        let symbolic_target = strict_text(record[2], "Git symbolic branch")?.trim();
+        if refname.is_empty() || !symbolic_target.is_empty() {
+            continue;
+        }
+        let (name, kind) = if let Some(name) = refname.strip_prefix("refs/heads/") {
+            (name, GitReviewBranchKind::Local)
+        } else if let Some(name) = refname.strip_prefix("refs/remotes/") {
+            (name, GitReviewBranchKind::Remote)
+        } else {
+            continue;
+        };
+        if name.is_empty() || name.ends_with("/HEAD") {
+            continue;
+        }
+        branches.push(GitReviewBranch {
+            name: name.to_string(),
+            revision: refname.to_string(),
+            kind,
+            current: head == "*",
+        });
+    }
+    branches.sort_by(|left, right| {
+        right
+            .current
+            .cmp(&left.current)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(branches)
+}
+
+fn branch_display_name(revision: &str) -> &str {
+    revision
+        .strip_prefix("refs/heads/")
+        .or_else(|| revision.strip_prefix("refs/remotes/"))
+        .unwrap_or(revision)
+}
+
 fn strict_text<'a>(bytes: &'a [u8], label: &str) -> Result<&'a str, String> {
     std::str::from_utf8(bytes).map_err(|_| format!("{label} is not valid UTF-8."))
 }
@@ -1536,6 +1631,35 @@ u UU N... 100644 100644 100644 100644 a a a src/conflict.rs\0\
             identity(ResolvedScope::Commit {
                 oid: "oid-b".into()
             })
+        );
+    }
+
+    #[test]
+    fn parses_workspace_branches_and_omits_symbolic_remote_heads() {
+        let raw = b"refs/heads/main\0*\0\0\nrefs/heads/release\0 \0\0\nrefs/remotes/origin/HEAD\0 \0refs/remotes/origin/main\0\nrefs/remotes/origin/main\0 \0\0\n";
+        let branches = parse_review_branches(raw).unwrap();
+        assert_eq!(
+            branches,
+            vec![
+                GitReviewBranch {
+                    name: "main".into(),
+                    revision: "refs/heads/main".into(),
+                    kind: GitReviewBranchKind::Local,
+                    current: true,
+                },
+                GitReviewBranch {
+                    name: "release".into(),
+                    revision: "refs/heads/release".into(),
+                    kind: GitReviewBranchKind::Local,
+                    current: false,
+                },
+                GitReviewBranch {
+                    name: "origin/main".into(),
+                    revision: "refs/remotes/origin/main".into(),
+                    kind: GitReviewBranchKind::Remote,
+                    current: false,
+                },
+            ]
         );
     }
 

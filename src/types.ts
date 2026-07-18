@@ -203,6 +203,15 @@ export type GitReviewScope =
   | { kind: "branch"; base: string }
   | { kind: "commit"; revision: string };
 
+export interface GitReviewBranch {
+  /** User-facing short name, such as `main` or `origin/main`. */
+  name: string;
+  /** Fully qualified ref passed back to Git, avoiding ambiguous short names. */
+  revision: string;
+  kind: "local" | "remote";
+  current: boolean;
+}
+
 export type GitChangeArea = "staged" | "unstaged" | "untracked" | "committed";
 export type GitChangeStatus = "added" | "modified" | "deleted" | "renamed" | "copied" | "unmerged";
 

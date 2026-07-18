@@ -106,7 +106,7 @@ Support these typed targets:
 - **Working tree**: current files against `HEAD`, with staged, unstaged, and untracked groups.
 - **Staged**: index against `HEAD`.
 - **Unstaged**: working tree against index.
-- **Branch…**: current `HEAD` against the merge base of a selected local/ref branch.
+- **Branch…**: current `HEAD` against the merge base of a local or remote branch enumerated from the native workspace repository. The UI uses the shared inline Portcode `SelectMenu`; it never accepts a free-form branch name or opens an operating-system select popup.
 - **Commit…**: one commit or an explicit ref range.
 - **Last agent turn**: later phase, after Portcode records a reliable pre-turn baseline for agent-touched files.
 
@@ -193,6 +193,13 @@ type GitReviewScope =
   | { kind: "branch"; base: string }
   | { kind: "commit"; revision: string };
 
+interface GitReviewBranch {
+  name: string;
+  revision: string;
+  kind: "local" | "remote";
+  current: boolean;
+}
+
 interface GitReviewManifest {
   snapshotId: string;
   repositoryRoot: string;
@@ -237,12 +244,13 @@ Desktop commands:
 
 ```text
 get_git_review_manifest(scope) -> GitReviewManifest
+get_git_review_branches() -> GitReviewBranch[]
 get_git_review_file(snapshot_id, path) -> GitFilePatch
 start_git_review(snapshot_id, options) -> ReviewRunHandle
 cancel_git_review(review_id)
 ```
 
-`get_git_review_manifest` returns metadata only. `get_git_review_file` lazily materializes and parses one patch. Starting an AI review materializes the bounded review corpus and computes a content-derived snapshot hash.
+`get_git_review_manifest` returns metadata only. `get_git_review_branches` lists concrete local and remote refs from the repository that owns the configured workspace, omitting symbolic aliases such as `origin/HEAD`; it accepts no frontend path. `get_git_review_file` lazily materializes and parses one patch. Starting an AI review materializes the bounded review corpus and computes a content-derived snapshot hash.
 
 The file endpoint revalidates its snapshot both before and immediately after patch generation. It returns only ordinary two-way unified hunks and rejects combined merge-diff output as unsupported. Conflict entries can still be inspected when Git supplies an ordinary two-way patch; no Phase 1 action resolves or mutates a conflict.
 

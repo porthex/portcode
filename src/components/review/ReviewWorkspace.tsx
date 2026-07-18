@@ -8,9 +8,11 @@ import type {
   GitDiffHunk,
   GitDiffLine,
   GitFilePatch,
+  GitReviewBranch,
   GitReviewManifest,
   GitReviewScope,
 } from "../../types";
+import { SelectMenu, type SelectMenuGroup } from "../SelectMenu";
 
 type ScopeKind = GitReviewScope["kind"];
 type CommentSide = "base" | "head";
@@ -41,6 +43,19 @@ const AREA_LABELS: Record<GitChangeArea, string> = {
 
 const AREA_ORDER: GitChangeArea[] = ["staged", "unstaged", "untracked", "committed"];
 
+const REVIEW_SCOPE_GROUPS: SelectMenuGroup[] = [
+  {
+    id: "scope",
+    options: [
+      { value: "workingTree", label: "Working tree" },
+      { value: "staged", label: "Staged" },
+      { value: "unstaged", label: "Unstaged" },
+      { value: "branch", label: "Branch…" },
+      { value: "commit", label: "Commit…" },
+    ],
+  },
+];
+
 export function ReviewWorkspace({ active = true }: { active?: boolean }) {
   const workspace = useStore((state) => state.settings.workspace);
   const activeId = useStore((state) => state.activeId);
@@ -53,7 +68,10 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
 
   const [scope, setScope] = useState<GitReviewScope>({ kind: "workingTree" });
   const [scopeKind, setScopeKind] = useState<ScopeKind>("workingTree");
-  const [reference, setReference] = useState("origin/main");
+  const [reference, setReference] = useState("");
+  const [branches, setBranches] = useState<GitReviewBranch[]>([]);
+  const [branchesLoading, setBranchesLoading] = useState(false);
+  const [branchesError, setBranchesError] = useState<string | null>(null);
   const [manifest, setManifest] = useState<GitReviewManifest | null>(null);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [patch, setPatch] = useState<GitFilePatch | null>(null);
@@ -73,6 +91,7 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
   const manifestBusy = useRef(false);
   const manifestQueued = useRef(false);
   const patchRequest = useRef(0);
+  const branchRequest = useRef(0);
   const previousStreaming = useRef(streaming);
   const previousActive = useRef(active);
   const activeRef = useRef(active);
@@ -131,6 +150,29 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
     }
   }, []);
 
+  const loadBranches = useCallback(async () => {
+    const request = ++branchRequest.current;
+    setBranchesLoading(true);
+    try {
+      const next = await ipc.getGitReviewBranches();
+      if (request !== branchRequest.current) return;
+      setBranches(next);
+      setReference((current) =>
+        next.some((branch) => branch.revision === current)
+          ? current
+          : (preferredBranch(next)?.revision ?? ""),
+      );
+      setBranchesError(null);
+    } catch (error) {
+      if (request !== branchRequest.current) return;
+      setBranches([]);
+      setReference("");
+      setBranchesError(errorMessage(error));
+    } finally {
+      if (request === branchRequest.current) setBranchesLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     // React Strict Mode replays setup/cleanup in development. Restore the mount
     // guard before the replayed scope effect queues its replacement request.
@@ -160,15 +202,34 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
   }, [refresh, scope, workspace]);
 
   useEffect(() => {
+    branchRequest.current += 1;
+    setBranches([]);
+    setReference("");
+    setBranchesError(null);
+    setBranchesLoading(false);
+  }, [workspace]);
+
+  useEffect(() => {
+    if (!active || scopeKind !== "branch") return;
+    void loadBranches();
+    return () => {
+      branchRequest.current += 1;
+    };
+  }, [active, loadBranches, scopeKind, workspace]);
+
+  useEffect(() => {
     if (!active) return;
-    const onFocus = () => void refresh();
+    const onFocus = () => {
+      void refresh();
+      if (scopeKind === "branch") void loadBranches();
+    };
     const interval = window.setInterval(() => void refresh(), 10_000);
     window.addEventListener("focus", onFocus);
     return () => {
       window.removeEventListener("focus", onFocus);
       window.clearInterval(interval);
     };
-  }, [active, refresh]);
+  }, [active, loadBranches, refresh, scopeKind]);
 
   useEffect(() => {
     if (active && !previousActive.current) {
@@ -222,6 +283,10 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
   }, [active, manifest, scope, selectedPath]);
 
   const groups = useMemo(() => groupFiles(manifest), [manifest]);
+  const branchGroups = useMemo(
+    () => reviewBranchGroups(branches, branchesLoading, branchesError),
+    [branches, branchesError, branchesLoading],
+  );
   const selectedFile = manifest?.files.find((file) => file.path === selectedPath) ?? null;
   const currentComments = comments.filter(
     (comment) =>
@@ -246,6 +311,22 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
       setScope({ kind });
     }
   };
+
+  const chooseBranch = (base: string) => {
+    setReference(base);
+    setScope({ kind: "branch", base });
+  };
+
+  useEffect(() => {
+    if (scopeKind !== "branch" || branchesLoading || branches.length === 0) return;
+    const selected =
+      branches.find((branch) => branch.revision === reference) ?? preferredBranch(branches);
+    if (!selected) return;
+    if (reference !== selected.revision) setReference(selected.revision);
+    if (scope.kind !== "branch" || scope.base !== selected.revision) {
+      setScope({ kind: "branch", base: selected.revision });
+    }
+  }, [branches, branchesLoading, reference, scope, scopeKind]);
 
   const addComment = () => {
     const body = commentBody.trim();
@@ -279,8 +360,8 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
       aria-label="Review workspace"
       className="flex min-h-0 flex-1 flex-col overflow-hidden bg-bg/80"
     >
-      <header className="flex min-h-[54px] shrink-0 flex-wrap items-center gap-2 border-b border-border bg-panel/75 px-3 py-2">
-        <div className="mr-1 min-w-0">
+      <header className="flex min-h-[54px] shrink-0 flex-nowrap items-center gap-2 overflow-x-auto border-b border-border bg-panel/75 px-3 py-2">
+        <div className="mr-1 min-w-[150px] flex-1">
           <div className="font-mono text-[9px] uppercase tracking-[0.18em] text-accent-2">
             Review workspace
           </div>
@@ -288,43 +369,49 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
             {manifest?.repositoryRoot ?? workspace ?? "Current directory"}
           </div>
         </div>
-        <label className="sr-only" htmlFor="review-scope">
-          Review scope
-        </label>
-        <select
+        <SelectMenu
           id="review-scope"
-          aria-label="Review scope"
+          label="Review scope"
           value={scopeKind}
-          onChange={(event) => chooseScopeKind(event.target.value as ScopeKind)}
-          className="rounded-md border border-border-2 bg-panel-2 px-2.5 py-1.5 text-[11px] text-fg outline-none focus:border-accent-2"
-        >
-          <option value="workingTree">Working tree</option>
-          <option value="staged">Staged</option>
-          <option value="unstaged">Unstaged</option>
-          <option value="branch">Branch…</option>
-          <option value="commit">Commit…</option>
-        </select>
-        {(scopeKind === "branch" || scopeKind === "commit") && (
-          <form
-            className="flex min-w-[220px] flex-1 items-center gap-1.5"
-            onSubmit={(event) => {
-              event.preventDefault();
-              applyScope();
-            }}
-          >
-            <input
-              aria-label={scopeKind === "branch" ? "Base branch or revision" : "Commit revision"}
+          groups={REVIEW_SCOPE_GROUPS}
+          onChange={(value) => chooseScopeKind(value as ScopeKind)}
+          className="w-[142px] shrink-0"
+          buttonClassName="rounded-md px-2.5 py-1.5 text-[11px]"
+        />
+        <div data-testid="review-scope-control" className="min-w-[240px] flex-1">
+          {scopeKind === "branch" ? (
+            <SelectMenu
+              label="Base branch"
               value={reference}
-              onChange={(event) => setReference(event.target.value)}
-              className="min-w-0 flex-1 rounded-md border border-border-2 bg-bg px-2.5 py-1.5 font-mono text-[11px] text-fg outline-none focus:border-accent-2"
+              groups={branchGroups}
+              onChange={chooseBranch}
+              disabled={branchesLoading || branches.length === 0}
+              title={branchesError ?? "Choose a branch from the current workspace"}
+              className="w-full"
+              buttonClassName="rounded-md px-2.5 py-1.5 font-mono text-[11px]"
             />
-            <button type="submit" className="pc-btn-deny px-2.5 py-1.5 text-[11px]">
-              Apply
-            </button>
-          </form>
-        )}
+          ) : scopeKind === "commit" ? (
+            <form
+              className="flex items-center gap-1.5"
+              onSubmit={(event) => {
+                event.preventDefault();
+                applyScope();
+              }}
+            >
+              <input
+                aria-label="Commit revision"
+                value={reference}
+                onChange={(event) => setReference(event.target.value)}
+                className="min-w-0 flex-1 rounded-md border border-border-2 bg-bg px-2.5 py-1.5 font-mono text-[11px] text-fg outline-none focus:border-accent-2"
+              />
+              <button type="submit" className="pc-btn-deny px-2.5 py-1.5 text-[11px]">
+                Apply
+              </button>
+            </form>
+          ) : null}
+        </div>
         {manifest && (
-          <div className="ml-auto flex items-center gap-2 font-mono text-[10px]">
+          <div className="flex shrink-0 items-center gap-2 font-mono text-[10px]">
             <span className="hidden max-w-[250px] truncate text-faint min-[900px]:inline">
               {manifest.baseLabel} → {manifest.targetLabel}
             </span>
@@ -335,16 +422,19 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
         <button
           type="button"
           aria-label="Refresh review"
-          onClick={() => void refresh()}
+          onClick={() => {
+            void refresh();
+            if (scopeKind === "branch") void loadBranches();
+          }}
           disabled={refreshing}
-          className="rounded-md border border-border-2 px-2.5 py-1.5 text-[11px] text-muted outline-none hover:border-accent-2/50 hover:text-fg focus-visible:ring-2 focus-visible:ring-accent-2/25 disabled:opacity-50"
+          className="shrink-0 rounded-md border border-border-2 px-2.5 py-1.5 text-[11px] text-muted outline-none hover:border-accent-2/50 hover:text-fg focus-visible:ring-2 focus-visible:ring-accent-2/25 disabled:opacity-50"
         >
           {refreshing ? "Refreshing…" : "Refresh"}
         </button>
         <button
           type="button"
           onClick={() => setWorkspaceSurface("chat")}
-          className="rounded-md px-2 py-1.5 text-[11px] text-faint outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-accent-2/25"
+          className="shrink-0 rounded-md px-2 py-1.5 text-[11px] text-faint outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-accent-2/25"
         >
           Back to chat
         </button>
@@ -778,6 +868,59 @@ function FileCounts({ file, compact = false }: { file: GitChangedFile; compact?:
       <span className="text-danger">−{file.deletions ?? 0}</span>
     </span>
   );
+}
+
+function preferredBranch(branches: GitReviewBranch[]) {
+  return (
+    branches.find((branch) => branch.kind === "remote" && branch.name === "origin/main") ??
+    branches.find((branch) => branch.kind === "remote" && !branch.current) ??
+    branches.find((branch) => !branch.current) ??
+    branches[0]
+  );
+}
+
+function reviewBranchGroups(
+  branches: GitReviewBranch[],
+  loading: boolean,
+  error: string | null,
+): SelectMenuGroup[] {
+  if (error || branches.length === 0) {
+    return [
+      {
+        id: "branch-status",
+        options: [
+          {
+            value: "",
+            label: loading
+              ? "Loading branches…"
+              : error
+                ? "Branches unavailable"
+                : "No branches found",
+            disabled: true,
+          },
+        ],
+      },
+    ];
+  }
+  return [
+    {
+      id: "local",
+      label: "Local",
+      options: branches
+        .filter((branch) => branch.kind === "local")
+        .map((branch) => ({
+          value: branch.revision,
+          label: `${branch.name}${branch.current ? " (current)" : ""}`,
+        })),
+    },
+    {
+      id: "remote",
+      label: "Remote",
+      options: branches
+        .filter((branch) => branch.kind === "remote")
+        .map((branch) => ({ value: branch.revision, label: branch.name })),
+    },
+  ].filter((group) => group.options.length > 0);
 }
 
 function groupFiles(manifest: GitReviewManifest | null) {
