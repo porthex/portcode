@@ -714,6 +714,13 @@ fn resolve_permission(state: State<AppState>, id: String, decision: String) {
 
 // ── Opt-in crash reporting (Phase 1b desktop / Phase 3 Android) ──────────────
 
+#[cfg(any(mobile, test))]
+fn require_app_config_dir<E: std::fmt::Display>(
+    resolved: Result<PathBuf, E>,
+) -> Result<PathBuf, String> {
+    resolved.map_err(|e| format!("failed to resolve app config directory: {e}"))
+}
+
 /// Mirror the frontend's crash-reporting consent into the native host, on BOTH
 /// desktop and mobile. The frontend calls `ipc.setTelemetryConsent` on every Tauri
 /// build, so this command is now registered on both targets (Phase 3).
@@ -733,26 +740,43 @@ fn resolve_permission(state: State<AppState>, id: String, decision: String) {
 ///
 /// The whole pipeline stays inert by default: no DSN ⇒ the SDK is never initialized
 /// on either platform, so this command is a pure flag write with no telemetry effect.
+/// On mobile, failure to resolve the authoritative app-config directory is returned
+/// to the caller instead of writing to a fallback path that Android never reads.
 #[tauri::command]
-fn telemetry_set_consent(app: AppHandle, enabled: bool) {
+fn telemetry_set_consent(app: AppHandle, enabled: bool) -> Result<(), String> {
     #[cfg(desktop)]
     {
         let _ = &app; // desktop resolves the path without an AppHandle
         telemetry::set_consent(enabled);
+        Ok(())
     }
     #[cfg(mobile)]
     {
         // On Android `dirs::config_dir()` does NOT reliably point at the app sandbox,
         // so resolve the app-private config dir from Tauri (it IS inside the sandbox)
-        // and write the flag there. Falls back to the temp dir if unavailable — a
-        // best-effort write whose failure mode is the privacy-safe one (flag absent ⇒
-        // Kotlin reads consent OFF ⇒ SDK never inits). See `consent.rs` /
-        // `PortcodeApplication.kt` for the exact path agreement + device-verify note.
-        let dir = app
-            .path()
-            .app_config_dir()
-            .unwrap_or_else(|_| std::env::temp_dir());
+        // and write the flag there. A fallback path would not be read by Kotlin and
+        // could falsely report that an opt-out succeeded, so resolution fails closed.
+        let dir = require_app_config_dir(app.path().app_config_dir())?;
         consent::set_consent_in(&dir, enabled);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod telemetry_consent_command_tests {
+    use super::*;
+
+    #[test]
+    fn app_config_resolution_failure_is_not_replaced_with_a_fallback() {
+        let err = require_app_config_dir(Err::<PathBuf, _>("unavailable"))
+            .expect_err("an unresolved authoritative path must fail closed");
+        assert!(err.contains("unavailable"));
+
+        let expected = PathBuf::from("authoritative-config");
+        assert_eq!(
+            require_app_config_dir(Ok::<_, &str>(expected.clone())).unwrap(),
+            expected
+        );
     }
 }
 

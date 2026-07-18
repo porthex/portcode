@@ -381,24 +381,35 @@ impl Db {
     }
 
     pub fn list_sessions(&self) -> rusqlite::Result<Vec<SessionRow>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, title, workspace, model, created_at, updated_at
-             FROM sessions ORDER BY updated_at DESC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            let workspace: Option<String> = r.get(2)?;
-            Ok(SessionRow {
-                id: r.get(0)?,
-                title: r.get(1)?,
-                branch: git_branch(workspace.as_deref()),
-                workspace,
-                model: r.get(3)?,
-                created_at: r.get(4)?,
-                updated_at: r.get(5)?,
+        // Collect database fields under the mutex, then release it before reading
+        // each workspace's `.git/HEAD`; filesystem I/O must not serialize all DB work.
+        let rows: Vec<SessionRow> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, title, workspace, model, created_at, updated_at
+                 FROM sessions ORDER BY updated_at DESC",
+            )?;
+            let mapped = stmt.query_map([], |r| {
+                Ok(SessionRow {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    branch: None,
+                    workspace: r.get(2)?,
+                    model: r.get(3)?,
+                    created_at: r.get(4)?,
+                    updated_at: r.get(5)?,
+                })
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|mut session| {
+                session.branch = git_branch(session.workspace.as_deref());
+                session
             })
-        })?;
-        rows.collect()
+            .collect())
     }
 
     pub fn create_session(

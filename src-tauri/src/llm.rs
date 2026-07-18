@@ -237,11 +237,22 @@ impl TurnBuilder {
     /// truncated — surface it instead of silently dropping the block. A
     /// half-built tool call would otherwise just vanish and the turn would look
     /// fine.
-    fn finish(self) -> Result<TurnResult, String> {
-        if self.current.is_some() && self.stop_reason != "cancelled" {
-            return Err(
-                "The response was cut off before it finished. Please try again.".to_string(),
-            );
+    fn finish(mut self) -> Result<TurnResult, String> {
+        match self.current.take() {
+            // Preserve partial assistant text that was already emitted to the UI.
+            Some(Building::Text(text)) if self.stop_reason == "cancelled" => {
+                if !text.is_empty() {
+                    self.blocks.push(Block::Text { text });
+                }
+            }
+            // A partial tool call has no valid input and must not be emitted.
+            Some(_) if self.stop_reason == "cancelled" => {}
+            Some(_) => {
+                return Err(
+                    "The response was cut off before it finished. Please try again.".to_string(),
+                );
+            }
+            None => {}
         }
         Ok(TurnResult {
             content: self.blocks,
@@ -1233,9 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_turn_with_open_block_finishes_ok() {
-        // Cancellation legitimately stops mid-block, so finish() must not treat
-        // the still-open block as a truncation.
+    fn cancelled_turn_with_open_text_block_keeps_partial_text() {
         let mut b = TurnBuilder::new();
         b.process(r#"{"type":"content_block_start","content_block":{"type":"text","text":""}}"#)
             .unwrap();
@@ -1246,6 +1255,40 @@ mod tests {
             .finish()
             .expect("a cancelled turn is not a truncation error");
         assert_eq!(result.stop_reason, "cancelled");
+        assert!(matches!(
+            result.content.as_slice(),
+            [Block::Text { text }] if text == "hi"
+        ));
+    }
+
+    #[test]
+    fn cancelled_turn_with_empty_open_text_block_keeps_nothing() {
+        let mut b = TurnBuilder::new();
+        b.process(r#"{"type":"content_block_start","content_block":{"type":"text","text":""}}"#)
+            .unwrap();
+        b.mark_cancelled();
+
+        let result = b.finish().expect("a cancelled turn finalizes");
+        assert_eq!(result.stop_reason, "cancelled");
+        assert!(result.content.is_empty());
+    }
+
+    #[test]
+    fn cancelled_turn_with_open_tool_block_drops_partial_call() {
+        let mut b = TurnBuilder::new();
+        b.process(
+            r#"{"type":"content_block_start","content_block":{"type":"tool_use","id":"t","name":"read_file"}}"#,
+        )
+        .unwrap();
+        b.process(
+            r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"pa"}}"#,
+        )
+        .unwrap();
+        b.mark_cancelled();
+
+        let result = b.finish().expect("a cancelled turn finalizes");
+        assert_eq!(result.stop_reason, "cancelled");
+        assert!(result.content.is_empty());
     }
 
     #[test]
