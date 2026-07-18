@@ -20,12 +20,14 @@ function PopoverHost({ onOpenSettings = () => {} }: { onOpenSettings?: () => voi
       <button type="button">Outside control</button>
       <PlanUsagePopover
         open={open}
+        provider="openai"
         triggerRef={triggerRef}
         onClose={() => setOpen(false)}
         onOpenSettings={() => {
           onOpenSettings();
           setOpen(false);
         }}
+        onRemainingChange={() => {}}
       />
     </>
   );

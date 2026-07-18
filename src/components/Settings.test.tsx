@@ -340,6 +340,35 @@ describe("SettingsPanel — structure", () => {
     );
   });
 
+  it("keeps the clicked route active while its smooth scroll crosses other sections", () => {
+    vi.useFakeTimers();
+    const { container } = renderPanel();
+    const content = container.querySelector<HTMLElement>(".pc-settings-content")!;
+    const permissionsSection = document.getElementById("pc-settings-permissions")!;
+    const interfaceSection = document.getElementById("pc-settings-interface")!;
+    const systemSection = document.getElementById("pc-settings-system")!;
+    const devicesSection = document.getElementById("pc-settings-devices")!;
+
+    Object.defineProperty(content, "scrollTop", { configurable: true, value: 420 });
+    Object.defineProperty(permissionsSection, "offsetTop", { configurable: true, value: 240 });
+    Object.defineProperty(interfaceSection, "offsetTop", { configurable: true, value: 390 });
+    Object.defineProperty(systemSection, "offsetTop", { configurable: true, value: 620 });
+    Object.defineProperty(devicesSection, "offsetTop", { configurable: true, value: 840 });
+
+    const systemRoute = screen.getByRole("button", { name: "Privacy & updates" });
+    fireEvent.click(systemRoute);
+    fireEvent.scroll(content);
+
+    expect(systemRoute).toHaveAttribute("aria-current", "location");
+
+    act(() => vi.advanceTimersByTime(700));
+    fireEvent.scroll(content);
+    expect(screen.getByRole("button", { name: "Interface" })).toHaveAttribute(
+      "aria-current",
+      "location",
+    );
+  });
+
   it("removes desktop-only destinations from the map in remote mode", () => {
     useStore.setState({ remoteMode: true });
     renderPanel();

@@ -6,17 +6,21 @@ import { PlanUsagePanel } from "./PlanUsagePanel";
 
 interface PlanUsagePopoverProps {
   open: boolean;
+  provider: ProviderId;
   triggerRef: RefObject<HTMLButtonElement | null>;
   onClose: () => void;
   onOpenSettings: (provider?: ProviderId) => void;
+  onRemainingChange: (remaining: number | null) => void;
 }
 
 /** Fast, non-modal plan check anchored above the persistent status HUD. */
 export function PlanUsagePopover({
   open,
+  provider,
   triggerRef,
   onClose,
   onOpenSettings,
+  onRemainingChange,
 }: PlanUsagePopoverProps) {
   const panelRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -61,8 +65,8 @@ export function PlanUsagePopover({
     >
       <header className="pc-plan-quick__header">
         <div>
-          <span>GPT + CLAUDE</span>
-          <strong>Plan limits</strong>
+          <span>{provider === "openai" ? "OPENAI · GPT" : "ANTHROPIC · CLAUDE"}</span>
+          <strong>Plan usage</strong>
         </div>
         <button
           ref={closeRef}
@@ -73,7 +77,12 @@ export function PlanUsagePopover({
           ×
         </button>
       </header>
-      <PlanUsagePanel compact onOpenSettings={onOpenSettings} />
+      <PlanUsagePanel
+        compact
+        onlyProvider={provider}
+        onOpenSettings={onOpenSettings}
+        onRemainingChange={onRemainingChange}
+      />
       <footer className="pc-plan-quick__footer">
         <span>Included allowance, separate from API billing</span>
         <button type="button" onClick={() => onOpenSettings()}>

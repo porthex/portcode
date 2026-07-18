@@ -80,6 +80,12 @@ function remainingPercent(window: PlanUsageWindow): number {
   return Math.round(Math.max(0, Math.min(100, 100 - window.usedPercent)));
 }
 
+/** The most constrained provider window is the useful one-number plan summary. */
+export function lowestPlanRemaining(snapshots: PlanUsageSnapshot[]): number | null {
+  const remaining = snapshots.flatMap((snapshot) => snapshot.windows.map(remainingPercent));
+  return remaining.length > 0 ? Math.min(...remaining) : null;
+}
+
 function UsageWindowRow({ window }: { window: PlanUsageWindow }) {
   const remaining = remainingPercent(window);
   const tone = remaining <= 10 ? "danger" : remaining <= 25 ? "warn" : "normal";
@@ -220,16 +226,22 @@ function ProviderUsageCard({
  * subscription backend never hides a healthy snapshot from the other. */
 export function PlanUsagePanel({
   compact = false,
+  onlyProvider,
   onOpenSettings,
+  onRemainingChange,
 }: {
   compact?: boolean;
+  onlyProvider?: ProviderId;
   onOpenSettings?: (provider: ProviderId) => void;
+  onRemainingChange?: (remaining: number | null) => void;
 } = {}) {
   const claude = useStore((state) => state.oauthStatus);
   const openai = useStore((state) => state.openAIAuthStatus);
   const claudeSignedIn = Boolean(claude?.signedIn);
   const openaiSignedIn = Boolean(openai?.signedIn);
   const openAIAvailable = openai?.available !== false;
+  const showClaude = onlyProvider !== "openai";
+  const showOpenAI = onlyProvider !== "anthropic" && openAIAvailable;
   const [states, setStates] = useState<Record<ProviderId, UsageState>>({
     anthropic: EMPTY,
     openai: EMPTY,
@@ -275,23 +287,53 @@ export function PlanUsagePanel({
   }, []);
 
   useEffect(() => {
-    void refresh("anthropic", claudeSignedIn);
-  }, [claudeSignedIn, refresh]);
+    void refresh("anthropic", showClaude && claudeSignedIn);
+  }, [claudeSignedIn, refresh, showClaude]);
 
   useEffect(() => {
-    void refresh("openai", openAIAvailable && openaiSignedIn);
-  }, [openAIAvailable, openaiSignedIn, refresh]);
+    void refresh("openai", showOpenAI && openaiSignedIn);
+  }, [openaiSignedIn, refresh, showOpenAI]);
 
   const latest = useMemo(
     () =>
-      Math.max(states.anthropic.snapshot?.updatedAt ?? 0, states.openai.snapshot?.updatedAt ?? 0),
-    [states.anthropic.snapshot?.updatedAt, states.openai.snapshot?.updatedAt],
+      Math.max(
+        showClaude ? (states.anthropic.snapshot?.updatedAt ?? 0) : 0,
+        showOpenAI ? (states.openai.snapshot?.updatedAt ?? 0) : 0,
+      ),
+    [
+      showClaude,
+      showOpenAI,
+      states.anthropic.snapshot?.updatedAt,
+      states.openai.snapshot?.updatedAt,
+    ],
   );
-  const refreshing = states.anthropic.loading || (openAIAvailable && states.openai.loading);
+  const refreshing =
+    (showClaude && states.anthropic.loading) || (showOpenAI && states.openai.loading);
   const refreshAll = () => {
-    void refresh("anthropic", claudeSignedIn);
-    if (openAIAvailable) void refresh("openai", openaiSignedIn);
+    if (showClaude) void refresh("anthropic", claudeSignedIn);
+    if (showOpenAI) void refresh("openai", openaiSignedIn);
   };
+
+  useEffect(() => {
+    if (!onRemainingChange) return;
+    const snapshots = [
+      showClaude ? states.anthropic.snapshot : null,
+      showOpenAI ? states.openai.snapshot : null,
+    ].filter((snapshot): snapshot is PlanUsageSnapshot => snapshot !== null);
+    if (snapshots.length > 0) {
+      onRemainingChange(lowestPlanRemaining(snapshots));
+    } else if (!(showClaude && claudeSignedIn) && !(showOpenAI && openaiSignedIn)) {
+      onRemainingChange(null);
+    }
+  }, [
+    claudeSignedIn,
+    onRemainingChange,
+    openaiSignedIn,
+    showClaude,
+    showOpenAI,
+    states.anthropic.snapshot,
+    states.openai.snapshot,
+  ]);
 
   return (
     <div className={`pc-plan-usage${compact ? " pc-plan-usage--compact" : ""}`}>
@@ -306,14 +348,16 @@ export function PlanUsagePanel({
           type="button"
           className="pc-settings-action"
           onClick={refreshAll}
-          disabled={refreshing || (!claudeSignedIn && !(openAIAvailable && openaiSignedIn))}
+          disabled={
+            refreshing || (!(showClaude && claudeSignedIn) && !(showOpenAI && openaiSignedIn))
+          }
           aria-label="Refresh all plan usage"
         >
           <span aria-hidden="true">↻</span> {refreshing ? "Refreshing" : "Refresh all"}
         </button>
       </div>
       <div className="pc-plan-usage__grid">
-        {openAIAvailable && (
+        {showOpenAI && (
           <ProviderUsageCard
             provider="openai"
             account={openai?.account ?? null}
@@ -324,15 +368,17 @@ export function PlanUsagePanel({
             onOpenSettings={onOpenSettings}
           />
         )}
-        <ProviderUsageCard
-          provider="anthropic"
-          account={claude?.account ?? null}
-          tier={claude?.tier ?? null}
-          signedIn={claudeSignedIn}
-          state={states.anthropic}
-          onRefresh={() => void refresh("anthropic", claudeSignedIn)}
-          onOpenSettings={onOpenSettings}
-        />
+        {showClaude && (
+          <ProviderUsageCard
+            provider="anthropic"
+            account={claude?.account ?? null}
+            tier={claude?.tier ?? null}
+            signedIn={claudeSignedIn}
+            state={states.anthropic}
+            onRefresh={() => void refresh("anthropic", claudeSignedIn)}
+            onOpenSettings={onOpenSettings}
+          />
+        )}
       </div>
       <p className="pc-plan-usage__note">
         Short-term and weekly limits apply at the same time. Work pauses when either reaches 0%.

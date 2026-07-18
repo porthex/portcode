@@ -48,6 +48,15 @@ describe("PlanUsagePanel", () => {
     expect(m.getPlanUsage).not.toHaveBeenCalled();
   });
 
+  it("can scope the quick view to only the active chat provider", () => {
+    render(<PlanUsagePanel onlyProvider="openai" />);
+
+    expect(screen.getByRole("article", { name: "GPT plan usage" })).toBeInTheDocument();
+    expect(screen.queryByRole("article", { name: "Claude plan usage" })).not.toBeInTheDocument();
+    expect(screen.getAllByText("Not connected")).toHaveLength(1);
+    expect(m.getPlanUsage).not.toHaveBeenCalled();
+  });
+
   it("omits OpenAI usage when the native build marks that capability unavailable", () => {
     useStore.setState({
       openAIAuthStatus: {

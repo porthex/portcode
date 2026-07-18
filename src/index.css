@@ -817,6 +817,16 @@ input[type="radio"]:not(:disabled) {
   outline: 1px solid rgba(33, 230, 255, 0.72);
   outline-offset: -2px;
 }
+.pc-hud-plan-value {
+  color: var(--color-success);
+  font-variant-numeric: tabular-nums;
+}
+.pc-hud-plan-value--warn {
+  color: var(--color-warn);
+}
+.pc-hud-plan-value--danger {
+  color: var(--color-danger);
+}
 
 /* Fast plan check: portaled above the clipped HUD, below full-screen Settings. */
 .pc-plan-quick {
