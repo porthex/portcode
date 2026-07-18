@@ -18,13 +18,11 @@ describe("redactSecrets", () => {
   });
 
   it("redacts emails", () => {
-    expect(redactSecrets("contact a667066706670@gmail.com now")).toBe(
-      "contact [redacted-email] now",
-    );
+    expect(redactSecrets("contact person@example.test now")).toBe("contact [redacted-email] now");
   });
 
   it("strips the username from home directories on every OS shape", () => {
-    expect(redactSecrets("C:\\Users\\Memphi$\\dev\\app")).toBe("C:\\Users\\~user\\dev\\app");
+    expect(redactSecrets("C:\\Users\\test-user\\dev\\app")).toBe("C:\\Users\\~user\\dev\\app");
     expect(redactSecrets("C:/Users/Alice/file.ts")).toBe("C:/Users/~user/file.ts");
     expect(redactSecrets("/home/alice/code/x")).toBe("/home/~user/code/x");
     expect(redactSecrets("/Users/bob/x")).toBe("/Users/~user/x");
@@ -107,11 +105,11 @@ function pollutedEvent(): ErrorEvent {
     event_id: "e1",
     level: "error",
     server_name: "DESKTOP-SECRET",
-    user: { email: "a667066706670@gmail.com", ip_address: "1.2.3.4" },
+    user: { email: "person@example.test", ip_address: "1.2.3.4" },
     request: { headers: { Authorization: "Bearer abc.def123" } },
     extra: { prompt: "write my novel about sk-ant-leak999999" },
     tags: { apiKey: "sk-ant-tagleak123456" },
-    contexts: { device: { name: "Memphis-PC" }, app: { app_version: "5.0.0" } },
+    contexts: { device: { name: "test-host" }, app: { app_version: "5.0.0" } },
     breadcrumbs: [
       // `ipc` is a dropped category — this whole breadcrumb must vanish.
       {
@@ -135,9 +133,9 @@ function pollutedEvent(): ErrorEvent {
             frames: [
               {
                 function: "scan",
-                filename: "C:\\Users\\Memphi$\\app\\scanner.ts",
-                module: "C:\\Users\\Memphi$\\app\\scanner",
-                abs_path: "C:\\Users\\Memphi$\\app\\scanner.ts",
+                filename: "C:\\Users\\test-user\\app\\scanner.ts",
+                module: "C:\\Users\\test-user\\app\\scanner",
+                abs_path: "C:\\Users\\test-user\\app\\scanner.ts",
                 lineno: 10,
                 colno: 2,
                 in_app: true,
@@ -165,9 +163,9 @@ describe("scrubEvent", () => {
       "sk-ant-ctx-leak123456",
       "sk-ant-uicrumb-leak123456",
       "sk-ant-uicrumbdata-leak123456",
-      "a667066706670@gmail.com",
-      "Memphi$",
-      "Memphis-PC",
+      "person@example.test",
+      "test-user",
+      "test-host",
       "DESKTOP-SECRET",
       "1.2.3.4",
     ]) {
@@ -263,10 +261,10 @@ describe("scrubTransaction (performance events)", () => {
       event_id: "t1",
       transaction: "GET /home/alice/secret?key=sk-ant-txn-leak123456",
       server_name: "DESKTOP-SECRET",
-      user: { email: "a667066706670@gmail.com" },
+      user: { email: "person@example.test" },
       contexts: {
         app: { app_version: "5.0.0" },
-        device: { name: "Memphis-PC" },
+        device: { name: "test-host" },
         trace: { op: "navigation", description: "load sk-ant-trace-leak123456", trace_id: "abc" },
       },
       spans: [
@@ -286,8 +284,8 @@ describe("scrubTransaction (performance events)", () => {
       "sk-ant-txn-leak123456",
       "sk-ant-trace-leak123456",
       "sk-ant-span-leak123456",
-      "a667066706670@gmail.com",
-      "Memphis-PC",
+      "person@example.test",
+      "test-host",
       "DESKTOP-SECRET",
       "alice",
     ]) {

@@ -91,7 +91,7 @@ class SentryEventScrubberTest {
     fun `email address is redacted`() {
         assertEquals(
             "contact [redacted-email] now",
-            scrub("contact a667066706670@gmail.com now")
+            scrub("contact person@example.test now")
         )
     }
 
@@ -227,7 +227,7 @@ class SentryEventScrubberTest {
             append("provider sk-0123456789abcdef0123 ")
             append("Authorization: Bearer abc.def-ghi123 ")
             append(""""x-api-key":"sk-ant-headerleak123456" """)
-            append("mail a667066706670@gmail.com ")
+            append("mail person@example.test ")
             append("ip 1.2.3.4 ")
             append("path C:\\Users\\Memphi\$\\secret ")
             append("home /home/alice/secret ")
@@ -242,7 +242,7 @@ class SentryEventScrubberTest {
             "sk-0123456789abcdef0123",
             "abc.def-ghi123",
             "sk-ant-headerleak123456",
-            "a667066706670@gmail.com",
+            "person@example.test",
             "1.2.3.4",
             "Memphi\$",
             "alice",
