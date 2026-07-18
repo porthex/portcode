@@ -1360,7 +1360,7 @@ u UU N... 100644 100644 100644 100644 a a a src/conflict.rs\0\
 
     #[test]
     fn parses_numstat_renames_and_binary_markers() {
-        let raw = b"12\t4\tsrc/app.ts\0-\t-\tasset.png\00\t0\t\0old.rs\0new.rs\0";
+        let raw = b"12\t4\tsrc/app.ts\0-\t-\tasset.png\x000\t0\t\0old.rs\0new.rs\0";
         let stats = parse_numstat_z(raw).unwrap();
         assert_eq!(stats["src/app.ts"].additions, Some(12));
         assert!(stats["asset.png"].binary());

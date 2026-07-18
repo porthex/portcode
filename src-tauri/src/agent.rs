@@ -1445,13 +1445,15 @@ impl tools::BackgroundRunner for BackgroundLauncher {
 #[cfg(test)]
 mod tests {
     use super::{
-        assistant_text, background, batch_cancelled, child_can_spawn, derive_title, finish_status,
-        is_terminal_auth_error, precheck_outcome, reassemble_results, resolve_system_prompt,
-        session_of, spawn_background_task, spawn_status, step_limit_exceeded, subagent_answer,
-        subagent_label, tool_result_block, tool_result_event, AgentConfig, Block, ChatMessage, Db,
-        Decision, LoopOutcome, Persist, StreamEvent, CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS,
-        MAX_PARALLEL_AGENTS, MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
+        assistant_text, background, batch_cancelled, canonicalize_tool_history, child_can_spawn,
+        derive_title, finish_status, is_terminal_auth_error, precheck_outcome, reassemble_results,
+        resolve_system_prompt, session_of, spawn_background_task, spawn_status,
+        step_limit_exceeded, subagent_answer, subagent_label, tool_result_block, tool_result_event,
+        AgentConfig, Block, ChatMessage, Db, Decision, LoopOutcome, Persist, StreamEvent,
+        CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS, MAX_PARALLEL_AGENTS, MAX_SUBAGENT_DEPTH,
+        SUBAGENT_STEER,
     };
+    use crate::tool_names;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;

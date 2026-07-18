@@ -264,7 +264,7 @@ mod tests {
 
     #[test]
     fn parses_porcelain_v2_branch_and_change_records() {
-        let output = b"# branch.oid 0123456789abcdef\0# branch.head main\0# branch.upstream origin/main\0# branch.ab +3 -2\01 .M details file.rs\02 R. details new.rs\0old.rs\0u UU details merge.rs\0? new.txt\0! ignored.txt\0";
+        let output = b"# branch.oid 0123456789abcdef\0# branch.head main\0# branch.upstream origin/main\0# branch.ab +3 -2\x001 .M details file.rs\x002 R. details new.rs\0old.rs\0u UU details merge.rs\0? new.txt\0! ignored.txt\0";
         let facts = parse_status(output);
 
         assert_eq!(facts.branch.as_deref(), Some("main"));
