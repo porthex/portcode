@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, act, cleanup, within } from "@testing-library/react";
 
 import { SettingsPanel } from "./Settings";
@@ -113,6 +113,12 @@ beforeEach(() => {
     nonce: "NONCE==",
   });
   m.phoneSyncUnpair.mockResolvedValue(undefined);
+});
+
+afterEach(() => {
+  // Several Settings tests intentionally use fake timers. Always restore the
+  // global clock even when an assertion fails so later suites cannot inherit it.
+  vi.useRealTimers();
 });
 
 describe("SettingsPanel — structure", () => {
