@@ -22,6 +22,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  repository-safety:
+    name: Repository safety (local-only files)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Reject tracked local project memory
+        shell: bash
+        run: |
+          tracked=()
+          while IFS= read -r -d '' path; do
+            normalized="${path,,}"
+            if [[ "$normalized" == ".claude/memory" || "$normalized" == .claude/memory/* ]]; then
+              tracked+=("$path")
+            fi
+          done < <(git ls-files -z)
+          if (( ${#tracked[@]} > 0 )); then
+            echo "::error::.claude/memory is local-only and must never be committed"
+            printf ' - %q\n' "${tracked[@]}"
+            exit 1
+          fi
+
   frontend:
     name: Frontend (lint · format · typecheck · test)
     strategy:
@@ -134,8 +159,8 @@ jobs:
   # Phase 1's exit criterion was that `portcode-sync` compiles to
   # wasm32-unknown-unknown; Phase 2 adds the real browser transport
   # (`transport_wasm.rs`) and the `portcode-wasm` `Session` cdylib that the PWA
-  # loads. This job is the source of truth (the wasm leg CANNOT be fully verified
-  # on low-RAM dev machines — per CLAUDE.md "verify Rust via CI") and gates BOTH
+  # loads. This job is the source of truth (the wasm leg cannot be fully verified
+  # in every local environment) and gates BOTH
   # crates for the browser target. `src-tauri` (Tauri desktop) is never a wasm
   # target. Linux-only: the wasm build needs LLVM clang (Apple/MSVC clang can't
   # target wasm32), and one OS leg is enough to prove the compile.
@@ -434,7 +459,7 @@ jobs:
           workspaces: src-tauri
 
       # Prebuilt binary — avoids compiling cargo-llvm-cov from source (which fails
-      # on the pinned toolchain's deps and is too heavy for low-RAM machines).
+      # on the pinned toolchain's dependencies).
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@v2
         with:

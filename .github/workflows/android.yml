@@ -2,8 +2,8 @@ name: Android
 
 # Cross-compile PROBE for the Tauri Android target.
 #
-# WHY THIS EXISTS (docs/ANDROID_APP_PLAN.md §5): the Tauri crate is too heavy to
-# build on low-RAM dev machines, and the Android cross-compile is heavier still.
+# WHY THIS EXISTS (docs/ANDROID_APP_PLAN.md §5): Android cross-compilation needs
+# a reproducible CI environment.
 # This job runs the real `tauri android build` in CI to preserve the Android
 # cross-compile signal and publish a sideloadable debug APK. The desktop/mobile
 # capability split and remote-client surface have landed; the remaining gates

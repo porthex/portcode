@@ -7,16 +7,18 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, writeFileSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { scrub } from "./scrub-memory.mjs";
+import { gitCommandCouldStageProjectMemory, scrub } from "./scrub-memory.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRUBBER = join(HERE, "scrub-memory.mjs");
+const SESSION_START = join(HERE, "session-start.sh");
+const PROJECT_ROOT = dirname(dirname(HERE));
 
 function redacted(input) {
   return scrub(input).text;
@@ -246,4 +248,125 @@ test("pipe mode: stdin -> scrubbed stdout", () => {
   assert.ok(s.includes("[REDACTED_HOME]"));
   assert.ok(s.includes("[REDACTED_EMAIL]"));
   assert.ok(!s.includes("bob@example.org"));
+});
+
+// --- project-memory hook boundary -----------------------------------------
+test("git staging guard catches file, directory, global-option, and blanket forms", () => {
+  const commands = [
+    "git add -f .claude/memory/project-memory.md",
+    "git add -f .claude/memory",
+    "git add -f .claude",
+    "git -C . add -f .claude/memory/project-memory.md",
+    "git -C .claude add -f memory/project-memory.md",
+    "git -C .claude/memory add -f project-memory.md",
+    'git.exe -C . add -f ".claude\\memory"',
+    "git add -f .claude/memory/./project-memory.md",
+    "git add -f .claude/memory/project-memory.*",
+    String.raw`git add -f .claude/memory/project-memory\.md`,
+    "git add -f .claude/*",
+    "git add -A",
+    "git add --all .",
+    "git add -A ':!src'",
+    "git add -f ':!.github'",
+    "git add --pathspec-from-file=paths.txt",
+    'git commit -am "memory safety"',
+    'git commit -a -m "memory safety"',
+    "git commit -s -- .claude/memory/project-memory.md",
+    "git commit --pathspec-from-file=paths.txt",
+    "bash -lc 'git add -f .claude/memory/project-memory.md'",
+    "(git add -f .claude/memory/project-memory.md)",
+    "(cd src && git add .); git add .",
+    "cd .claude && git add -f memory/project-memory.md",
+    "cd .claude/memory && git add -f project-memory.md",
+    "git -c alias.stage='add -f .claude/memory/project-memory.md' stage",
+    "git update-index --add .claude/memory/project-memory.md",
+    "git apply --cached memory.patch",
+  ];
+  for (const command of commands) {
+    assert.equal(gitCommandCouldStageProjectMemory(command), true, command);
+  }
+});
+
+test("git staging guard permits unrelated scoped staging and ordinary commits", () => {
+  const commands = [
+    "git add ./src",
+    "git add .github/workflows/ci.yml",
+    "git add .claudeish/readme.md",
+    "git add -A src",
+    "git -C src add .",
+    "(cd src && git add .); git add src",
+    'git commit -m "ordinary change"',
+    'git commit -m ".claude/memory is local-only"',
+  ];
+  for (const command of commands) {
+    assert.equal(gitCommandCouldStageProjectMemory(command), false, command);
+  }
+});
+
+test("git staging guard resolves paths from the shell command cwd", () => {
+  assert.equal(
+    gitCommandCouldStageProjectMemory(
+      "git add -f memory/project-memory.md",
+      PROJECT_ROOT,
+      join(PROJECT_ROOT, ".claude"),
+    ),
+    true,
+  );
+  assert.equal(
+    gitCommandCouldStageProjectMemory("git add .", PROJECT_ROOT, join(PROJECT_ROOT, "src")),
+    false,
+  );
+});
+
+test("--hook denies a directory-level force-add", () => {
+  const output = execFileSync("node", [SCRUBBER, "--hook"], {
+    input: JSON.stringify({
+      tool_name: "Bash",
+      tool_input: { command: "git -C . add -f .claude/memory" },
+    }),
+    encoding: "utf8",
+  });
+  const result = JSON.parse(output);
+  assert.equal(result.hookSpecificOutput.permissionDecision, "deny");
+});
+
+test("--hook honors the payload cwd", () => {
+  const output = execFileSync("node", [SCRUBBER, "--hook"], {
+    input: JSON.stringify({
+      cwd: join(PROJECT_ROOT, ".claude"),
+      tool_name: "Bash",
+      tool_input: { command: "git add -f memory/project-memory.md" },
+    }),
+    encoding: "utf8",
+  });
+  assert.equal(JSON.parse(output).hookSpecificOutput.permissionDecision, "deny");
+});
+
+function findBash() {
+  const candidates = [
+    process.env.BASH,
+    process.platform === "win32" ? "C:\\Program Files\\Git\\bin\\bash.exe" : "bash",
+    "bash",
+  ].filter(Boolean);
+  return candidates.find((candidate) => {
+    if (candidate.includes("\\") && !existsSync(candidate)) return false;
+    return spawnSync(candidate, ["--version"], { stdio: "ignore" }).status === 0;
+  });
+}
+
+const bash = findBash();
+test("SessionStart keeps stdout empty when local memory exists", { skip: !bash }, () => {
+  const root = mkdtempSync(join(tmpdir(), "session-start-"));
+  mkdirSync(join(root, ".claude", "memory"), { recursive: true });
+  writeFileSync(join(root, ".claude", "memory", "project-memory.md"), "# local only\n");
+  try {
+    const output = execFileSync(bash, [SESSION_START], {
+      cwd: root,
+      env: { ...process.env, CLAUDE_PROJECT_DIR: root, CLAUDE_CODE_REMOTE: "" },
+      encoding: "utf8",
+    });
+    assert.equal(output, "");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

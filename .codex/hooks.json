@@ -1,5 +1,5 @@
 {
-  "description": "Portcode project memory and Graphify guidance for Codex.",
+  "description": "Portcode local-memory protection and Graphify guidance for Codex.",
   "hooks": {
     "SessionStart": [
       {
@@ -10,7 +10,7 @@
             "command": "node \"$(git rev-parse --show-toplevel)/.codex/scripts/portcode-hooks.mjs\"",
             "commandWindows": "powershell -NoProfile -Command \"$root = git rev-parse --show-toplevel; node (Join-Path $root '.codex/scripts/portcode-hooks.mjs')\"",
             "timeout": 30,
-            "statusMessage": "Loading Portcode project memory"
+            "statusMessage": "Preparing Portcode project guidance"
           }
         ]
       }

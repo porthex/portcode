@@ -461,8 +461,8 @@ mod tests {
     fn scrub_event_strips_pii_and_secrets_everywhere() {
         let mut frame = Frame {
             function: Some("scan".to_string()),
-            filename: Some(r"C:\Users\Memphi$\app\scanner.ts".to_string()),
-            abs_path: Some(r"C:\Users\Memphi$\app\scanner.ts".to_string()),
+            filename: Some(r"C:\Users\test-user\app\scanner.ts".to_string()),
+            abs_path: Some(r"C:\Users\test-user\app\scanner.ts".to_string()),
             lineno: Some(10),
             colno: Some(2),
             in_app: Some(true),
@@ -501,7 +501,7 @@ mod tests {
         // `attach_stacktrace` is on, so a prime leak vector.
         let mut thread_frame = Frame {
             function: Some("worker".to_string()),
-            abs_path: Some(r"C:\Users\Memphi$\app\worker.ts".to_string()),
+            abs_path: Some(r"C:\Users\test-user\app\worker.ts".to_string()),
             context_line: Some("let t = 'sk-ant-thread-leak123456'".to_string()),
             symbol: Some("sk-ant-thread-leak123456".to_string()),
             ..Default::default()
@@ -557,7 +557,7 @@ mod tests {
             .to_mut()
             .images
             .push(DebugImage::Apple(AppleDebugImage {
-                name: r"C:\Users\Memphi$\app\portcode.exe".to_string(),
+                name: r"C:\Users\test-user\app\portcode.exe".to_string(),
                 arch: None,
                 cpu_type: None,
                 cpu_subtype: None,
@@ -573,7 +573,7 @@ mod tests {
             .tags
             .insert("apiKey".to_string(), "sk-ant-tagleak123456".to_string());
         event.user = Some(sentry::User {
-            email: Some("a667066706670@gmail.com".to_string()),
+            email: Some("person@example.test".to_string()),
             ..Default::default()
         });
 
@@ -599,8 +599,8 @@ mod tests {
             "sk-ant-culprit-leak123456",
             "sk-ant-uicrumb-leak123456",
             "sk-ant-uicrumbdata-leak123456",
-            "a667066706670@gmail.com",
-            "Memphi$",
+            "person@example.test",
+            "test-user",
             "DESKTOP-SECRET",
         ] {
             assert!(!blob.contains(secret), "secret survived scrub: {secret}");
@@ -657,7 +657,7 @@ mod tests {
             ..Default::default()
         };
         event.user = Some(sentry::User {
-            email: Some("a667066706670@gmail.com".to_string()),
+            email: Some("person@example.test".to_string()),
             ..Default::default()
         });
 
@@ -665,7 +665,7 @@ mod tests {
         let blob = serde_json::to_string(&out).expect("txn serializes");
         for secret in [
             "sk-ant-txn-leak123456",
-            "a667066706670@gmail.com",
+            "person@example.test",
             "DESKTOP-SECRET",
             "alice",
         ] {

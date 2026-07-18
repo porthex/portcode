@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn redacts_emails() {
         assert_eq!(
-            redact_secrets("contact a667066706670@gmail.com now"),
+            redact_secrets("contact person@example.test now"),
             "contact [redacted-email] now"
         );
     }
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn strips_the_username_from_home_directories_on_every_os_shape() {
         assert_eq!(
-            redact_secrets(r"C:\Users\Memphi$\dev\app"),
+            redact_secrets(r"C:\Users\test-user\dev\app"),
             r"C:\Users\~user\dev\app"
         );
         assert_eq!(
@@ -254,9 +254,9 @@ mod tests {
             "provider sk-0123456789abcdef0123 ",
             "Authorization: Bearer abc.def-ghi123 ",
             r#""x-api-key":"sk-ant-headerleak123456" "#,
-            "mail a667066706670@gmail.com ",
+            "mail person@example.test ",
             "ip 1.2.3.4 ",
-            r"path C:\Users\Memphi$\secret ",
+            r"path C:\Users\test-user\secret ",
             "home /home/alice/secret ",
             "blob QStvZ2VuZXJhdGVkbG9uZ2Jhc2U2NGtleXZhbHVlMTIzNDU2Nzg5MA=="
         );
@@ -266,9 +266,9 @@ mod tests {
             "sk-0123456789abcdef0123",
             "abc.def-ghi123",
             "sk-ant-headerleak123456",
-            "a667066706670@gmail.com",
+            "person@example.test",
             "1.2.3.4",
-            "Memphi$",
+            "test-user",
             "alice",
             "QStvZ2VuZXJhdGVkbG9uZ2Jhc2U2NGtleXZhbHVlMTIzNDU2Nzg5MA",
         ] {

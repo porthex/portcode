@@ -151,7 +151,7 @@ configured network/relay path.
 
 ---
 
-## 5. CI + build verification (overcome the 8GB local wall)
+## 5. CI + build verification
 
 The dedicated `android-build` workflow is implemented with `workflow_dispatch`
 and path-filtered pull-request triggers:

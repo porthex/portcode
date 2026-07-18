@@ -14,10 +14,9 @@ function fixture() {
   return root;
 }
 
-test("SessionStart injects the shared Claude/Codex project memory", () => {
+test("SessionStart never injects local project memory into agent context", () => {
   const result = handleHook({ hook_event_name: "SessionStart" }, fixture());
-  assert.equal(result.hookSpecificOutput.hookEventName, "SessionStart");
-  assert.match(result.hookSpecificOutput.additionalContext, /clean fact/);
+  assert.equal(result, null);
 });
 
 test("PreToolUse stays silent when no graph exists", () => {
@@ -59,16 +58,75 @@ test("PreToolUse permits clean project-memory patches", () => {
   assert.equal(result, null);
 });
 
-test("PreToolUse checks memory before blanket staging", () => {
+test("PreToolUse denies file, directory, global-option, and blanket staging forms", () => {
+  const commands = [
+    "git add -f .claude/memory/project-memory.md",
+    "git add -f .claude/memory",
+    "git add -f .claude",
+    "git -C . add -f .claude/memory/project-memory.md",
+    "git -C .claude add -f memory/project-memory.md",
+    "git -C .claude/memory add -f project-memory.md",
+    "git add -f .claude/memory/./project-memory.md",
+    String.raw`git add -f .claude/memory/project-memory\.md`,
+    "git add -f .claude/*",
+    "git add -A",
+    "git add --all .",
+    "git add -A ':!src'",
+    'git commit -am "memory safety"',
+    "git commit --pathspec-from-file=paths.txt",
+    "bash -lc 'git add -f .claude/memory/project-memory.md'",
+    "(cd src && git add .); git add .",
+    "git update-index --add .claude/memory/project-memory.md",
+  ];
+  for (const command of commands) {
+    const result = handleHook(
+      { hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command } },
+      fixture(),
+    );
+    assert.equal(result.hookSpecificOutput.permissionDecision, "deny", command);
+  }
+});
+
+test("PreToolUse permits unrelated scoped staging and ordinary commits", () => {
+  const commands = [
+    "git add ./src",
+    "git add .github/workflows/ci.yml",
+    "git add -A src",
+    "git -C src add .",
+    "(cd src && git add .); git add src",
+    'git commit -m "ordinary change"',
+  ];
+  for (const command of commands) {
+    const result = handleHook(
+      { hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command } },
+      fixture(),
+    );
+    assert.equal(result, null, command);
+  }
+});
+
+test("PreToolUse resolves relative paths from payload cwd", () => {
   const root = fixture();
-  const sensitiveEmail = ["person", "example.com"].join("@");
-  writeFileSync(
-    join(root, ".claude", "memory", "project-memory.md"),
-    `contact ${sensitiveEmail}\n`,
-  );
-  const result = handleHook(
-    { hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "git add ." } },
+  mkdirSync(join(root, "src"));
+  const denied = handleHook(
+    {
+      cwd: join(root, ".claude"),
+      hook_event_name: "PreToolUse",
+      tool_name: "Bash",
+      tool_input: { command: "git add -f memory/project-memory.md" },
+    },
     root,
   );
-  assert.equal(result.hookSpecificOutput.permissionDecision, "deny");
+  assert.equal(denied.hookSpecificOutput.permissionDecision, "deny");
+
+  const allowed = handleHook(
+    {
+      cwd: join(root, "src"),
+      hook_event_name: "PreToolUse",
+      tool_name: "Bash",
+      tool_input: { command: "git add ." },
+    },
+    root,
+  );
+  assert.equal(allowed, null);
 });

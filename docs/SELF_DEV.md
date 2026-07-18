@@ -11,8 +11,8 @@ sketched at the bottom but intentionally **not** built yet.
 > That was the original idea. A multi-agent feasibility study found it isn't
 > viable on this stack: the sync engine is thin-client↔host (not peer↔peer) and
 > serde-fragile across versions, one SQLite file + forward-only migrations makes
-> role swap-back dangerous, and two live instances + a Rust rebuild blow past an
-> 8 GB RAM machine. Phase 1 below delivers ~90% of the dogfooding benefit with
+> role swap-back dangerous, and two live instances plus a Rust rebuild can overwhelm a
+> typical development setup. Phase 1 below delivers ~90% of the dogfooding benefit with
 > none of that risk — the same pattern Chrome/VS Code/Zed use (a dev channel
 > alongside stable).
 
@@ -45,8 +45,8 @@ These hot-reload **live** in the running window via Vite (React Fast Refresh).
 Save the file, watch it update in under a second. No restart, no rebuild.
 
 **2. Engine change** — the Rust core under `src-tauri/`. There is no Rust hot
-reload: a change means a full `cargo` rebuild + app relaunch (minutes on a
-low-RAM machine). For tight feedback while editing Rust, run `pnpm watch:rust`
+reload: a change means a full `cargo` rebuild + app relaunch. For tight feedback
+while editing Rust, run `pnpm watch:rust`
 (see below) to get type/borrow/clippy errors in **seconds** without a full
 build, and only do the full rebuild when you actually want to run the change.
 
@@ -112,8 +112,8 @@ When a meaningful **Rust** change is ready to validate, a small supervisor
 2. **Build** the candidate, then **health-gate** it (`pnpm test` + `cargo test`).
 3. **Promote** only on green; keep the previous binary at a fixed path so a
    broken candidate **auto-rolls-back**.
-4. **Sequential, not concurrent** (the 8 GB machine can't sustain two live
-   instances plus a rebuild): close stable → build → gate → relaunch as the new
+4. **Sequential, not concurrent** (shared login and sync state must not be accessed
+   concurrently): close stable → build → gate → relaunch as the new
    stable.
 
 Prerequisite safety for Phase 2 (because the agent can edit Portcode's own

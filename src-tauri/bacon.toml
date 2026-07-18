@@ -5,7 +5,7 @@
 #
 # `check` is the default job: it surfaces type/borrow errors in seconds WITHOUT
 # producing a binary (far cheaper than a full `cargo build`), which is the whole
-# point on a low-RAM dev machine where a full Tauri build is minutes long.
+# point when a full Tauri build can take minutes.
 #
 # `clippy-ci` mirrors the CI lint gate (`cargo clippy --all-targets -- -D
 # warnings`) so local feedback matches what `main` enforces. Heavy `cargo test`
