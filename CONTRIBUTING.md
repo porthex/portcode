@@ -175,7 +175,7 @@ cargo test --workspace
 
 - **Add tests for new functionality**, especially around the security-sensitive
   boundaries (the permission gate, the workspace path sandbox, file edits, and
-  the `shell` path).
+  the `run_command` path).
 - **Coverage is not a merge gate.** Don't worry about your PR's test-coverage
   numbers — there's no threshold to clear and your change won't be blocked for
   low coverage, so never let it hold you back. That said, **high coverage is
@@ -255,7 +255,7 @@ delete the file).
 - If your change touches the UI, include a screenshot or short clip.
 - Make sure all [quality gates](#quality-gates--run-before-you-push) pass.
 - **Flag security-sensitive changes.** If your PR touches the permission gate,
-  secrets/credential handling, the `shell` execution path, the provider/LLM
+  secrets/credential handling, the `run_command` execution path, the provider/LLM
   code, or the release/signing workflows, call it out in the description — these
   paths get extra scrutiny.
 

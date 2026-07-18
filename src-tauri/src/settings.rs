@@ -9,6 +9,10 @@ use crate::permissions::{PermissionMode, Rule};
 pub struct Settings {
     pub provider: String,
     pub model: String,
+    /// Provider reasoning budget. Stored as an open string because model catalogs
+    /// can add new levels without requiring a Portcode release.
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
     /// Derived from the OS credential store at read time; never the source of truth.
     #[serde(default)]
     pub api_key_set: bool,
@@ -40,7 +44,13 @@ pub struct Settings {
 }
 
 fn default_typing_animation() -> bool {
-    true
+    // Streaming should feel instantaneous on a fresh or legacy install. The
+    // terminal decode effect remains available as an explicit UI preference.
+    false
+}
+
+fn default_reasoning_effort() -> String {
+    "medium".into()
 }
 
 fn default_auto_update() -> bool {
@@ -52,6 +62,7 @@ impl Default for Settings {
         Self {
             provider: "anthropic".into(),
             model: "claude-opus-4-8".into(),
+            reasoning_effort: default_reasoning_effort(),
             api_key_set: false,
             default_policy: "ask".into(),
             workspace: None,
@@ -103,15 +114,28 @@ mod tests {
         }"#;
         let s: Settings = serde_json::from_str(json).expect("legacy settings should deserialize");
         assert_eq!(s.default_policy, "allow");
+        assert_eq!(s.reasoning_effort, "medium");
         assert!(
-            s.typing_animation,
-            "missing typingAnimation defaults to true"
+            !s.typing_animation,
+            "missing typingAnimation defaults to lag-free false"
         );
         // Permission modes/rules were added later: a legacy file defaults them to
         // Default + empty, so its behaviour (allow/ask/deny via default_policy) is
         // unchanged — no silent safety downgrade or settings wipe.
         assert_eq!(s.permission_mode, PermissionMode::Default);
         assert!(s.rules.is_empty());
+    }
+
+    #[test]
+    fn reasoning_effort_is_camel_case_and_legacy_safe() {
+        let s = Settings {
+            reasoning_effort: "high".into(),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"reasoningEffort\":\"high\""));
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.reasoning_effort, "high");
     }
 
     #[test]
@@ -125,28 +149,41 @@ mod tests {
     }
 
     #[test]
-    fn permission_mode_and_rules_round_trip_camel_case() {
+    fn permission_mode_and_legacy_and_canonical_rules_round_trip_camel_case() {
         let s = Settings {
             permission_mode: PermissionMode::AcceptEdits,
-            rules: vec![Rule {
-                tool: "shell".into(),
-                command: Some("git ".into()),
-                decision: RuleDecision::Allow,
-            }],
+            rules: vec![
+                Rule {
+                    // Persisted pre-rename rules stay intact; the permission matcher
+                    // resolves this alias when it is evaluated.
+                    tool: "shell".into(),
+                    command: Some("git ".into()),
+                    decision: RuleDecision::Allow,
+                },
+                Rule {
+                    tool: "write_file".into(),
+                    command: None,
+                    decision: RuleDecision::Ask,
+                },
+            ],
             ..Settings::default()
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"permissionMode\":\"acceptEdits\""));
         assert!(json.contains("\"tool\":\"shell\""));
+        assert!(json.contains("\"tool\":\"write_file\""));
         assert!(json.contains("\"command\":\"git \""));
         assert!(json.contains("\"decision\":\"allow\""));
 
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.permission_mode, PermissionMode::AcceptEdits);
-        assert_eq!(back.rules.len(), 1);
+        assert_eq!(back.rules.len(), 2);
         assert_eq!(back.rules[0].tool, "shell");
         assert_eq!(back.rules[0].command.as_deref(), Some("git "));
         assert_eq!(back.rules[0].decision, RuleDecision::Allow);
+        assert_eq!(back.rules[1].tool, "write_file");
+        assert_eq!(back.rules[1].command, None);
+        assert_eq!(back.rules[1].decision, RuleDecision::Ask);
     }
 
     #[test]

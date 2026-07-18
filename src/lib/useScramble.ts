@@ -66,9 +66,13 @@ const DIGITS = "0123456789";
 // Frame cadence + per-character speed, tuned to the "fastest" decode from the
 // design mock: a word resolves in a few short frames. Exported for the tests so
 // they can advance an exact number of frames.
-export const STEP_MS = 22;
-const FRAMES_PER_CHAR = 1.5;
-const MIN_FRAMES = 3;
+export const STEP_MS = 16;
+const FRAMES_PER_CHAR = 0.75;
+const MIN_FRAMES = 2;
+// Never let the decorative decode animation trail the real stream by more than
+// roughly one short line. Large provider chunks and fast models otherwise build
+// a multi-second queue even though the response has already arrived.
+export const MAX_ANIMATED_BACKLOG_CHARS = 80;
 // A backgrounded tab pauses requestAnimationFrame, then resumes with the timestamp
 // jumped forward by seconds or minutes. Past this gap we snap straight to the final
 // text instead of grinding through thousands of catch-up frames (which would freeze
@@ -100,6 +104,20 @@ interface ActiveWord {
 interface Progress {
   settled: number;
   active: ActiveWord | null;
+}
+
+/** Fast-forward whole words until the remaining animated tail fits our budget. */
+function capBacklog(full: string, p: Progress): boolean {
+  const visibleStart = p.active?.start ?? p.settled;
+  if (full.length - visibleStart <= MAX_ANIMATED_BACKLOG_CHARS) return false;
+
+  let boundary = full.length - MAX_ANIMATED_BACKLOG_CHARS;
+  // Never reveal half a word merely to hit the exact character budget.
+  while (boundary < full.length && !isSpace(full[boundary])) boundary += 1;
+  while (boundary < full.length && isSpace(full[boundary])) boundary += 1;
+  p.settled = boundary;
+  p.active = null;
+  return true;
 }
 
 /**
@@ -210,7 +228,7 @@ export function useScramble(full: string, enabled: boolean): ScrambleView {
         raf = requestAnimationFrame(tick);
         return;
       }
-      let changed = false;
+      let changed = capBacklog(fullRef.current, progressRef.current);
       // Advance whole frames for the elapsed time so the cadence stays steady
       // regardless of the display's refresh rate.
       while (ts - lastTs >= STEP_MS) {

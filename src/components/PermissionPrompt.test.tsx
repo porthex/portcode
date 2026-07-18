@@ -67,12 +67,13 @@ describe("PermissionPrompt", () => {
     expect(screen.queryByRole("button")).toBeNull();
   });
 
-  it("shows the requested tool and summary when a permission is pending", () => {
+  it("shows a friendly label for a legacy permission request", () => {
     useStore.setState({ pendingPermission: pending({ tool: "fs_read", summary: "README.md" }) });
 
     render(<PermissionPrompt />);
 
-    expect(screen.getByText("fs_read")).toBeInTheDocument();
+    expect(screen.getByText("Read file")).toBeInTheDocument();
+    expect(screen.queryByText("fs_read")).not.toBeInTheDocument();
     expect(screen.getByText("README.md")).toBeInTheDocument();
     // All three actions are offered. The ⏎ hint lives on Deny (the focused,
     // safe default) so the affordance matches what Enter actually does.
@@ -89,7 +90,8 @@ describe("PermissionPrompt", () => {
     render(<PermissionPrompt />);
 
     const alert = screen.getByRole("alert");
-    expect(alert).toHaveTextContent("fs_write");
+    expect(alert).toHaveTextContent("Write file");
+    expect(alert).not.toHaveTextContent("fs_write");
     expect(alert).toHaveTextContent("src/secret.ts");
   });
 
@@ -155,7 +157,7 @@ describe("PermissionPrompt", () => {
     await flush();
 
     expect(m.saveSettings).toHaveBeenCalledWith({
-      rules: [{ tool: "fs_edit", decision: "allow" }],
+      rules: [{ tool: "edit_file", decision: "allow" }],
     });
     expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
     expect(useStore.getState().pendingPermission).toBeNull();

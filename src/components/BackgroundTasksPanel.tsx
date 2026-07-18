@@ -2,8 +2,8 @@ import { useStore } from "../store/store";
 import type { BackgroundTaskInfo, BackgroundTaskStatus } from "../types";
 
 /**
- * Background tasks panel — the `shell` commands the current session launched in
- * the background (the `shell` tool's `background` mode).
+ * Background tasks panel — commands the current session launched through
+ * `run_command` in background mode.
  *
  * Driven by the store's per-session `backgroundTasks` map, which a PERSISTENT
  * session listener populates (the `background_task_started` / `_finished`

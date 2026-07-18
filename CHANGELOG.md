@@ -14,6 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A redesigned chat and agent workspace with live Markdown formatting, grouped
+  project exploration, nested subagent activity, durable in-flight drafts, and
+  a docked environment/Git summary.
+- A first-class Git review workspace for inspecting changed files and diffs,
+  tracking snapshot-safe inline comments, and handing review context to agents.
+- Provider-aware settings, model and reasoning controls, included-plan usage,
+  and an experimental direct ChatGPT subscription provider that is enabled for
+  self-development but release-gated pending an approved production boundary.
+- Focused accessibility, cancellation, reconnect, large-transcript, and desktop
+  smoke-test coverage for the new interaction paths.
 - Open-source community-health and contributor infrastructure: `LICENSE`
   (Apache-2.0), `NOTICE`, `CLA.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`,
   `SECURITY.md`, `SUPPORT.md`, `GOVERNANCE.md`, issue/PR templates, and
@@ -22,6 +32,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (flat config) + Prettier, Rust toolchain pin + `rustfmt`/`clippy` config,
   Vitest, and a continuous-integration workflow (`ci.yml`) that runs lint,
   type-check, and tests on Windows.
+
+### Changed
+
+- Built-in tools now use provider-neutral canonical names (`read_file`,
+  `list_directory`, `find_files`, `search_text`, `write_file`, `edit_file`,
+  `run_command`, and `delegate_task`) while preserving legacy transcript and
+  permission-rule aliases.
+- Tool details are quieter and lazy by default, generated folders are hidden
+  until requested, Settings is organized as a searchable control deck, and the
+  sidebar toolbar stays bounded at narrow desktop widths.
+
+### Fixed
+
+- Markdown now formats during streaming, active exploration uses present-tense
+  wording, and interrupted tools or agents no longer remain visibly running.
+- Hardened run cancellation, credential refresh, permission-rule ordering,
+  session model persistence, remote teardown, and workspace Git inspection.
 
 ## [0.1.0] - 2026-06-19
 

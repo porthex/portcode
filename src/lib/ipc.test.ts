@@ -104,6 +104,46 @@ describe("Tauri command serialization", () => {
     expect(invoke).toHaveBeenCalledWith("oauth_logout");
   });
 
+  it("OpenAI subscription commands invoke auth and model catalogue counterparts", async () => {
+    const { ipc, invoke } = await load();
+    const status = { signedIn: true, expiresAt: 123, account: "a@openai.com", tier: "Plus" };
+    invoke.mockResolvedValue(status);
+    await expect(ipc.startOpenaiOauthLogin()).resolves.toBe(status);
+    expect(invoke).toHaveBeenCalledWith("start_openai_oauth_login");
+    await expect(ipc.openaiOauthStatus()).resolves.toBe(status);
+    expect(invoke).toHaveBeenCalledWith("openai_oauth_status");
+
+    const models = [
+      {
+        id: "gpt-live",
+        label: "GPT Live",
+        reasoningEfforts: ["low"],
+        defaultReasoningEffort: "low",
+      },
+    ];
+    invoke.mockResolvedValue(models);
+    await expect(ipc.openaiModels()).resolves.toBe(models);
+    expect(invoke).toHaveBeenCalledWith("openai_models");
+
+    invoke.mockResolvedValue(undefined);
+    await expect(ipc.openaiOauthLogout()).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("openai_oauth_logout");
+  });
+
+  it("get_plan_usage forwards the selected provider", async () => {
+    const { ipc, invoke } = await load();
+    const snapshot = {
+      provider: "openai",
+      plan: "Plus",
+      updatedAt: 123,
+      windows: [],
+    };
+    invoke.mockResolvedValue(snapshot);
+
+    await expect(ipc.getPlanUsage("openai")).resolves.toBe(snapshot);
+    expect(invoke).toHaveBeenCalledWith("get_plan_usage", { provider: "openai" });
+  });
+
   it("resolve_permission forwards id + decision", async () => {
     const { ipc, invoke } = await load();
     invoke.mockResolvedValue(undefined);
@@ -128,6 +168,7 @@ describe("Tauri command serialization", () => {
     invoke.mockResolvedValue(undefined);
     await ipc.createSession("s1", "Title", "C:/ws");
     await ipc.renameSession("s1", "Renamed");
+    await ipc.updateSessionModel("s1", "gpt-5.6-sol");
     await ipc.deleteSession("s1");
     await ipc.getMessages("s1");
     expect(invoke).toHaveBeenCalledWith("create_session", {
@@ -137,6 +178,10 @@ describe("Tauri command serialization", () => {
       model: undefined,
     });
     expect(invoke).toHaveBeenCalledWith("rename_session", { id: "s1", title: "Renamed" });
+    expect(invoke).toHaveBeenCalledWith("update_session_model", {
+      id: "s1",
+      model: "gpt-5.6-sol",
+    });
     expect(invoke).toHaveBeenCalledWith("delete_session", { id: "s1" });
     expect(invoke).toHaveBeenCalledWith("get_messages", { sessionId: "s1" });
   });
@@ -183,6 +228,38 @@ describe("Tauri command serialization", () => {
     invoke.mockResolvedValue([]);
     await ipc.listDir("src/components");
     expect(invoke).toHaveBeenCalledWith("list_dir", { sub: "src/components" });
+  });
+
+  it("get_workspace_summary is invoked without a frontend-supplied path", async () => {
+    const { ipc, invoke } = await load();
+    const summary = {
+      path: "C:/workspace",
+      configured: true,
+      git: { kind: "notRepository" },
+    } as const;
+    invoke.mockResolvedValue(summary);
+
+    await expect(ipc.getWorkspaceSummary()).resolves.toBe(summary);
+    expect(invoke).toHaveBeenCalledWith("get_workspace_summary");
+  });
+
+  it("serializes typed Git review scopes and snapshot-guarded file requests", async () => {
+    const { ipc, invoke } = await load();
+    const scope = { kind: "branch", base: "origin/main" } as const;
+    const manifest = { snapshotId: "snap-1", files: [] };
+    invoke.mockResolvedValueOnce(manifest);
+
+    await expect(ipc.getGitReviewManifest(scope)).resolves.toBe(manifest);
+    expect(invoke).toHaveBeenCalledWith("get_git_review_manifest", { scope });
+
+    const patch = { snapshotId: "snap-1", path: "src/App.tsx", hunks: [] };
+    invoke.mockResolvedValueOnce(patch);
+    await expect(ipc.getGitReviewFile(scope, "snap-1", "src/App.tsx")).resolves.toBe(patch);
+    expect(invoke).toHaveBeenCalledWith("get_git_review_file", {
+      scope,
+      snapshotId: "snap-1",
+      path: "src/App.tsx",
+    });
   });
 
   it("list_sessions is invoked with no arguments", async () => {
@@ -437,6 +514,7 @@ describe("browser fallback (no Tauri core)", () => {
     await expect(ipc.getSettings()).resolves.toEqual({
       provider: "anthropic",
       model: "claude-opus-4-8",
+      reasoningEffort: "medium",
       apiKeySet: false,
       defaultPolicy: "ask",
       workspace: null,
@@ -517,6 +595,57 @@ describe("browser fallback (no Tauri core)", () => {
       expect.arrayContaining([expect.objectContaining({ name: "App.tsx", isDir: false })]),
     );
     expect(await ipc.listDir("does/not/exist")).toEqual([]);
+  });
+
+  it("returns deterministic workspace facts in the browser preview", async () => {
+    const { ipc, invoke } = await load();
+
+    const summary = await ipc.getWorkspaceSummary();
+    expect(summary).toMatchObject({
+      path: "C:/dev/portcode",
+      configured: false,
+      git: {
+        kind: "repository",
+        branch: "main",
+        changedFiles: 6,
+        additions: 342,
+        deletions: 28,
+      },
+    });
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("returns deterministic review manifests and typed patches in browser preview", async () => {
+    const { ipc, invoke } = await load();
+
+    const manifest = await ipc.getGitReviewManifest({ kind: "workingTree" });
+    expect(manifest.snapshotId).toBe("preview-workingTree-workingTree");
+    expect(manifest.files.map((file) => file.path)).toContain("src/App.tsx");
+    expect(manifest.files.find((file) => file.path === "src/App.tsx")?.areas).toEqual([
+      "staged",
+      "unstaged",
+    ]);
+
+    const patch = await ipc.getGitReviewFile(
+      { kind: "workingTree" },
+      manifest.snapshotId,
+      "src/App.tsx",
+    );
+    expect(patch.hunks[0].lines.map((line) => line.kind)).toEqual([
+      "context",
+      "deletion",
+      "addition",
+      "addition",
+      "context",
+    ]);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("rejects a stale browser-preview review snapshot", async () => {
+    const { ipc } = await load();
+    await expect(
+      ipc.getGitReviewFile({ kind: "staged" }, "old-snapshot", "src/App.tsx"),
+    ).rejects.toThrow("stale");
   });
 
   it("openFolder returns the canned preview path", async () => {
@@ -626,6 +755,46 @@ describe("browser fallback (no Tauri core)", () => {
       tier: null,
     });
   });
+
+  it("OpenAI mock signs in, exposes deterministic capabilities, and logs out", async () => {
+    const { ipc } = await load();
+    expect((await ipc.openaiOauthStatus()).signedIn).toBe(false);
+    await expect(ipc.openaiModels()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "gpt-5.6-sol",
+          reasoningEfforts: expect.arrayContaining(["none", "max"]),
+        }),
+      ]),
+    );
+
+    const status = await ipc.startOpenaiOauthLogin();
+    expect(status).toMatchObject({
+      signedIn: true,
+      account: "preview@chatgpt.local",
+      tier: "ChatGPT Plus",
+    });
+    await ipc.openaiOauthLogout();
+    expect((await ipc.openaiOauthStatus()).signedIn).toBe(false);
+  });
+
+  it("browser plan-usage mocks require sign-in and expose both reset windows", async () => {
+    const { ipc, invoke } = await load();
+    await expect(ipc.getPlanUsage("anthropic")).rejects.toThrow(/Sign in with Claude/i);
+    await ipc.startOauthLogin();
+    const claude = await ipc.getPlanUsage("anthropic");
+    expect(claude).toMatchObject({ provider: "anthropic", plan: "Max" });
+    expect(claude.windows.map((window) => window.label)).toEqual([
+      "Current session",
+      "Weekly limit",
+    ]);
+
+    await ipc.startOpenaiOauthLogin();
+    const openai = await ipc.getPlanUsage("openai");
+    expect(openai).toMatchObject({ provider: "openai", plan: "Plus" });
+    expect(openai.windows).toHaveLength(2);
+    expect(invoke).not.toHaveBeenCalled();
+  });
 });
 
 describe("browser fallback agent stream", () => {
@@ -647,6 +816,10 @@ describe("browser fallback agent stream", () => {
     expect(types).toContain("usage");
     expect(types[types.length - 1]).toBe("turn_end");
     expect(types).not.toContain("permission_request");
+    expect(events.filter((e) => e.type === "tool_use").map((e) => e.name)).toEqual([
+      "read_file",
+      "edit_file",
+    ]);
   });
 
   it("raises a permission_request under the default ask policy, and cancel tears it down", async () => {
@@ -658,7 +831,9 @@ describe("browser fallback agent stream", () => {
     const { cancel } = await ipc.runAgent("s", "hi", "claude-opus-4-8", (e) => events.push(e));
     await vi.advanceTimersByTimeAsync(3000);
 
-    expect(events.some((e) => e.type === "permission_request")).toBe(true);
+    expect(events.find((e) => e.type === "permission_request")).toMatchObject({
+      tool: "edit_file",
+    });
 
     await cancel(); // resolves the pending gate (deny) and halts the run
     await vi.runAllTimersAsync();

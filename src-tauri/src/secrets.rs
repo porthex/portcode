@@ -10,9 +10,11 @@
 //!
 //! Either way the public API below is identical across targets — only the
 //! storage primitive differs, behind the private `backend` module. Credentials
-//! are stored under four separate accounts:
+//! are stored under provider-scoped accounts, including chunked `openai-oauth-*`
+//! entries that stay below Windows Credential Manager's per-entry size limit:
 //!   * `anthropic`         — a raw Anthropic API key (string).
 //!   * `anthropic-oauth`   — subscription OAuth tokens, serialized as JSON.
+//!   * `openai-oauth-*`    — chunked ChatGPT subscription OAuth credentials.
 //!   * `phone-sync-device` — the Noise static keypair, base64+JSON.
 //!   * `phone-sync-iroh`   — the iroh node secret key, base64.
 
@@ -24,6 +26,15 @@ use std::sync::OnceLock;
 
 const ACCOUNT: &str = "anthropic";
 const OAUTH_ACCOUNT: &str = "anthropic-oauth";
+/// Legacy single-entry account, retained for migration and cleanup.
+const OPENAI_OAUTH_ACCOUNT: &str = "openai-oauth";
+const OPENAI_OAUTH_MANIFEST_ACCOUNT: &str = "openai-oauth-manifest";
+const OPENAI_OAUTH_CHUNK_PREFIX: &str = "openai-oauth-chunk";
+/// Base64 is ASCII, so 1024 characters are 1024 UTF-16 code unitsâ€”comfortably
+/// below Windows Credential Manager's 2560-unit password limit.
+const OPENAI_OAUTH_CHUNK_CHARS: usize = 1024;
+/// Defensive corruption/abuse bound. Real token sets currently need fewer than 16.
+const OPENAI_OAUTH_MAX_CHUNKS: usize = 64;
 const DEVICE_ACCOUNT: &str = "phone-sync-device";
 const IROH_ACCOUNT: &str = "phone-sync-iroh";
 
@@ -184,11 +195,85 @@ pub struct OAuthTokens {
     pub plan: Option<String>,
 }
 
+/// ChatGPT subscription tokens. Kept separate from Anthropic OAuth so logout
+/// and refresh failures can only affect the provider that produced them.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct OpenAiOAuthTokens {
+    pub access_token: String,
+    pub refresh_token: String,
+    #[serde(default)]
+    pub id_token: Option<String>,
+    pub expires_at: i64,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub is_fedramp: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+struct OpenAiOAuthManifest {
+    version: u8,
+    slot: String,
+    chunks: usize,
+}
+
+fn openai_chunk_account(slot: &str, index: usize) -> String {
+    format!("{OPENAI_OAUTH_CHUNK_PREFIX}-{slot}-{index}")
+}
+
+fn valid_openai_manifest(manifest: &OpenAiOAuthManifest) -> bool {
+    manifest.version == 1
+        && matches!(manifest.slot.as_str(), "a" | "b")
+        && (1..=OPENAI_OAUTH_MAX_CHUNKS).contains(&manifest.chunks)
+}
+
+fn read_openai_manifest() -> Option<OpenAiOAuthManifest> {
+    let value = backend::get(OPENAI_OAUTH_MANIFEST_ACCOUNT)?;
+    let manifest: OpenAiOAuthManifest = serde_json::from_str(&value).ok()?;
+    valid_openai_manifest(&manifest).then_some(manifest)
+}
+
+fn encode_openai_chunks(tokens: &OpenAiOAuthTokens) -> Result<Vec<String>, String> {
+    let json = serde_json::to_vec(tokens).map_err(|e| e.to_string())?;
+    let encoded = B64.encode(json);
+    let chunks: Vec<String> = encoded
+        .as_bytes()
+        .chunks(OPENAI_OAUTH_CHUNK_CHARS)
+        // STANDARD base64 is ASCII, so byte chunks are always valid UTF-8.
+        .map(|chunk| String::from_utf8(chunk.to_vec()).expect("base64 is ASCII"))
+        .collect();
+    if chunks.is_empty() || chunks.len() > OPENAI_OAUTH_MAX_CHUNKS {
+        return Err("OpenAI credential payload is too large to store securely.".into());
+    }
+    Ok(chunks)
+}
+
+fn decode_openai_chunks(chunks: &[String]) -> Option<OpenAiOAuthTokens> {
+    let encoded = chunks.concat();
+    let json = B64.decode(encoded).ok()?;
+    serde_json::from_slice(&json).ok()
+}
+
+fn delete_openai_slot(slot: &str, chunks: usize) -> Result<(), String> {
+    let mut first_error = None;
+    for index in 0..chunks.min(OPENAI_OAUTH_MAX_CHUNKS) {
+        if let Err(error) = backend::delete(&openai_chunk_account(slot, index)) {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 /// The credential the agent should authenticate with for a given request.
 #[derive(Clone)]
 pub enum Credential {
     ApiKey(String),
     OAuth(OAuthTokens),
+    OpenAiOAuth(OpenAiOAuthTokens),
 }
 
 // ── API key ──────────────────────────────────────────────────────────────────
@@ -224,6 +309,84 @@ pub fn set_oauth(tokens: &OAuthTokens) -> Result<(), String> {
 /// successful clear (logging out when not signed in is not an error).
 pub fn clear_oauth() -> Result<(), String> {
     backend::delete(OAUTH_ACCOUNT)
+}
+
+pub fn get_openai_oauth() -> Option<OpenAiOAuthTokens> {
+    if let Some(manifest) = read_openai_manifest() {
+        let chunks: Option<Vec<String>> = (0..manifest.chunks)
+            .map(|index| backend::get(&openai_chunk_account(&manifest.slot, index)))
+            .collect();
+        if let Some(tokens) = chunks.as_deref().and_then(decode_openai_chunks) {
+            return Some(tokens);
+        }
+    }
+
+    // Migration path for builds that stored the complete JSON in one entry.
+    let json = backend::get(OPENAI_OAUTH_ACCOUNT)?;
+    serde_json::from_str(&json).ok()
+}
+
+pub fn set_openai_oauth(tokens: &OpenAiOAuthTokens) -> Result<(), String> {
+    let chunks = encode_openai_chunks(tokens)?;
+    let previous = read_openai_manifest();
+    let slot = if previous
+        .as_ref()
+        .is_some_and(|manifest| manifest.slot == "a")
+    {
+        "b"
+    } else {
+        "a"
+    };
+
+    // Write a complete inactive slot first. If any chunk fails, the previous
+    // manifest remains authoritative and refresh/login can safely retry.
+    for (index, chunk) in chunks.iter().enumerate() {
+        if let Err(error) = backend::set(&openai_chunk_account(slot, index), chunk) {
+            let _ = delete_openai_slot(slot, index);
+            return Err(error);
+        }
+    }
+
+    let manifest = OpenAiOAuthManifest {
+        version: 1,
+        slot: slot.into(),
+        chunks: chunks.len(),
+    };
+    let manifest_json = serde_json::to_string(&manifest).map_err(|e| e.to_string())?;
+    if let Err(error) = backend::set(OPENAI_OAUTH_MANIFEST_ACCOUNT, &manifest_json) {
+        let _ = delete_openai_slot(slot, chunks.len());
+        return Err(error);
+    }
+
+    // The new slot is now committed. Cleanup is best-effort: stale chunks are
+    // unreachable without the manifest and will also be swept on logout.
+    let _ = backend::delete(OPENAI_OAUTH_ACCOUNT);
+    if let Some(previous) = previous.filter(|manifest| manifest.slot != slot) {
+        let _ = delete_openai_slot(&previous.slot, previous.chunks);
+    }
+    Ok(())
+}
+
+pub fn clear_openai_oauth() -> Result<(), String> {
+    let mut first_error = None;
+    for result in [
+        backend::delete(OPENAI_OAUTH_MANIFEST_ACCOUNT),
+        backend::delete(OPENAI_OAUTH_ACCOUNT),
+    ] {
+        if let Err(error) = result {
+            first_error.get_or_insert(error);
+        }
+    }
+
+    // Sweep both slots completely. Either can contain unreachable trailing
+    // chunks from a formerly larger token set or a partial pre-commit write.
+    for slot in ["a", "b"] {
+        if let Err(error) = delete_openai_slot(slot, OPENAI_OAUTH_MAX_CHUNKS) {
+            first_error.get_or_insert(error);
+        }
+    }
+
+    first_error.map_or(Ok(()), Err)
 }
 
 // ── Phone Sync device identity ───────────────────────────────────────────────
@@ -291,6 +454,16 @@ pub fn load_credential() -> Option<Credential> {
     None
 }
 
+/// Load only the credential owned by `provider`; never send one service's
+/// bearer token to another service after a model/provider switch.
+pub fn load_credential_for(provider: &str) -> Option<Credential> {
+    match provider {
+        "anthropic" => load_credential(),
+        "openai" => get_openai_oauth().map(Credential::OpenAiOAuth),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +482,72 @@ mod tests {
         assert_eq!(back.access_token, "access-123");
         assert_eq!(back.refresh_token, "refresh-456");
         assert_eq!(back.expires_at, 1_700_000_000);
+    }
+
+    #[test]
+    fn openai_oauth_tokens_round_trip_with_account_claims() {
+        let t = OpenAiOAuthTokens {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            id_token: Some("id".into()),
+            expires_at: 1_700_000_000,
+            account_id: Some("acct_123".into()),
+            email: Some("user@example.com".into()),
+            plan: Some("plus".into()),
+            is_fedramp: true,
+        };
+        let back: OpenAiOAuthTokens =
+            serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(back.account_id.as_deref(), Some("acct_123"));
+        assert_eq!(back.plan.as_deref(), Some("plus"));
+        assert!(back.is_fedramp);
+    }
+
+    #[test]
+    fn openai_oauth_chunk_encoding_stays_under_windows_limit_and_round_trips() {
+        let tokens = OpenAiOAuthTokens {
+            access_token: "a".repeat(3_500),
+            refresh_token: "r".repeat(2_800),
+            id_token: Some("i".repeat(3_200)),
+            expires_at: 1_900_000_000,
+            account_id: Some("acct_123".into()),
+            email: Some("user@example.com".into()),
+            plan: Some("plus".into()),
+            is_fedramp: false,
+        };
+
+        let chunks = encode_openai_chunks(&tokens).unwrap();
+        assert!(chunks.len() > 1);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.encode_utf16().count() <= OPENAI_OAUTH_CHUNK_CHARS));
+
+        let decoded = decode_openai_chunks(&chunks).unwrap();
+        assert_eq!(decoded.access_token, tokens.access_token);
+        assert_eq!(decoded.refresh_token, tokens.refresh_token);
+        assert_eq!(decoded.id_token, tokens.id_token);
+        assert_eq!(decoded.account_id, tokens.account_id);
+        assert_eq!(decoded.email, tokens.email);
+        assert_eq!(decoded.expires_at, tokens.expires_at);
+    }
+
+    #[test]
+    fn openai_oauth_manifest_rejects_untrusted_slots_and_chunk_counts() {
+        assert!(valid_openai_manifest(&OpenAiOAuthManifest {
+            version: 1,
+            slot: "a".into(),
+            chunks: 2,
+        }));
+        assert!(!valid_openai_manifest(&OpenAiOAuthManifest {
+            version: 1,
+            slot: "../other".into(),
+            chunks: 2,
+        }));
+        assert!(!valid_openai_manifest(&OpenAiOAuthManifest {
+            version: 1,
+            slot: "b".into(),
+            chunks: OPENAI_OAUTH_MAX_CHUNKS + 1,
+        }));
     }
 
     // Pure encoding test (no keyring I/O — that can't run on headless CI): binary

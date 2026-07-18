@@ -10,7 +10,8 @@
 //! portcode_sync::wire::…`), so every existing `crate::llm::StreamEvent` /
 //! `crate::db::SessionRow` path in the desktop keeps resolving to the SAME type —
 //! the move is source-compatible. The serde shapes are load-bearing (they match
-//! `src/types.ts` and the Anthropic content-block format); do not alter them.
+//! `src/types.ts` and provider persistence); alter them only with matching
+//! desktop, phone-sync, and frontend compatibility updates.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -44,6 +45,21 @@ pub enum Block {
         content: String,
         #[serde(default)]
         is_error: bool,
+    },
+    /// Opaque OpenAI reasoning state required when continuing a Responses turn
+    /// after tool calls. It is persisted on desktop but filtered from UI and
+    /// Phone Sync payloads.
+    Reasoning {
+        /// Model that produced this opaque state. Never sent to OpenAI; used to
+        /// avoid replaying model-specific reasoning after a model switch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        summary: Vec<Value>,
     },
 }
 

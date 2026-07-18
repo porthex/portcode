@@ -277,6 +277,25 @@ describe("Sidebar", () => {
   // that masqueraded as live system stats. Those numbers were static placeholders
   // and there is no backend command to source them. The chrome now shows only
   // honest, real-state labels — mirroring the StatusHud honesty fix.
+  it("uses the active OpenAI model's ChatGPT auth indicator", () => {
+    useStore.setState({
+      sessions: [session({ model: "gpt-5.6-sol" })],
+      activeId: "s1",
+      settings: settings({ provider: "openai", model: "gpt-5.6-sol", apiKeySet: true }),
+      openAIAuthStatus: {
+        signedIn: true,
+        expiresAt: null,
+        account: "you@openai.com",
+        tier: "ChatGPT Plus",
+      },
+    });
+
+    render(<Sidebar />);
+
+    expect(screen.getByText("OPENAI")).toBeInTheDocument();
+    expect(screen.queryByText("KEY SET")).toBeNull();
+  });
+
   describe("footer chrome (honest, no fabricated telemetry)", () => {
     it("never renders the old hardcoded RAM/MB telemetry but keeps the stack label", () => {
       m.isTauri.mockReturnValue(false);
@@ -499,6 +518,21 @@ describe("Sidebar", () => {
         session({ id: "c", title: "Banana", updatedAt: 200 }),
       ],
       activeId: "a" as string | null,
+    });
+
+    it("keeps Sort and Group together on their own bounded toolbar row", () => {
+      useStore.setState({ ...threeSessions(), groupBy: "workspace" });
+      render(<Sidebar />);
+
+      const controls = screen.getByRole("group", { name: "Session organization controls" });
+      const sort = within(controls).getByRole("button", { name: "Sort sessions (Recent)" });
+      const group = within(controls).getByRole("button", {
+        name: "Group sessions (Workspace)",
+      });
+
+      expect(sort).toHaveClass("pc-sess-ctrl--wide");
+      expect(group).toHaveClass("pc-sess-ctrl--wide");
+      expect(within(controls).queryByRole("button", { name: "New folder" })).toBeNull();
     });
 
     it("opens the sort menu, checks the active option, and reorders on pick", () => {

@@ -1,4 +1,5 @@
-import { memo, useMemo, useState } from "react";
+import { memo, useId, useMemo, useState } from "react";
+import { toolLabel } from "../lib/toolNames";
 import type { ContentBlock } from "../types";
 
 type ResultBlock = Extract<ContentBlock, { kind: "tool_result" }>;
@@ -13,38 +14,47 @@ export const ToolCall = memo(function ToolCall({
   result?: ResultBlock;
 }) {
   const [open, setOpen] = useState(false);
-  const summary = summarize(name, input);
+  const [hasOpened, setHasOpened] = useState(false);
+  const detailsId = useId();
+  const label = toolLabel(name);
+  const summary = summarize(input);
   const pending = !result;
   const error = result?.isError;
   const output = result?.output;
+  const interrupted = Boolean(error && output?.startsWith("Interrupted:"));
   // Scanning the output for diff markers and tallying +/- counts is O(n) over
   // potentially large tool output. Memoize so toggling open/collapse (or any
   // unrelated re-render) doesn't re-scan unchanged output.
   const { isDiff, counts } = useMemo(() => {
+    if (!hasOpened) return { isDiff: false, counts: null };
     const diff = !error && output != null && looksLikeDiff(output);
     return { isDiff: diff, counts: diff ? diffCounts(output) : null };
-  }, [output, error]);
-  // Pretty-printing the input is pure on `input`; memoize so unrelated
-  // re-renders (e.g. toggling open/collapse) don't re-stringify it.
-  const inputJson = useMemo(() => JSON.stringify(input, null, 2), [input]);
-  // summarize() falls back to the tool name when there's no summarizable input,
-  // so only fold the summary into the spoken label when it adds a distinct
-  // target — otherwise a screen reader hears the name twice.
-  const target = summary === name ? "" : ` ${summary}`;
+  }, [output, error, hasOpened]);
+  const target = summary ? ` ${summary}` : "";
 
   return (
-    <div className="pc-toolcall">
+    <div
+      className={`pc-toolcall ${pending ? "pc-toolcall--active" : ""} ${
+        interrupted ? "pc-toolcall--interrupted" : ""
+      }`}
+    >
       <button
-        onClick={() => setOpen((o) => !o)}
+        onClick={() =>
+          setOpen((current) => {
+            if (!current) setHasOpened(true);
+            return !current;
+          })
+        }
         className="pc-toolcall__head"
         aria-expanded={open}
-        aria-label={`${name}${target}${
-          error ? ", failed" : pending ? ", running" : ", completed"
+        aria-controls={detailsId}
+        aria-label={`${label}${target}${
+          interrupted ? ", interrupted" : error ? ", failed" : pending ? ", running" : ", completed"
         }, ${open ? "collapse" : "expand"} output`}
       >
-        <StatusDot pending={pending} error={error} />
-        <span className="pc-toolcall__name">{name}</span>
-        {summary !== name && <span className="pc-toolcall__path min-w-0 flex-1">{summary}</span>}
+        <StatusDot pending={pending} error={error} interrupted={interrupted} />
+        <span className="pc-toolcall__name">{label}</span>
+        {summary && <span className="pc-toolcall__path min-w-0 flex-1">{summary}</span>}
         <span className="ml-auto flex items-center gap-2">
           {counts && (counts.adds > 0 || counts.dels > 0) && (
             <>
@@ -59,46 +69,144 @@ export const ToolCall = memo(function ToolCall({
           <span className="text-faint">{open ? "▾" : "▸"}</span>
         </span>
       </button>
-      {/* Smooth expand/collapse via a grid 0fr->1fr accordion (the overflow-hidden
-          child can shrink to 0). Body stays mounted so it animates both ways. */}
-      <div
-        className="grid transition-[grid-template-rows] duration-200 ease-out motion-reduce:transition-none"
-        style={{ gridTemplateRows: open ? "1fr" : "0fr" }}
-      >
-        <div className="overflow-hidden">
-          <div className="pc-toolcall__body" aria-hidden={!open}>
-            <div className="mb-1 text-[10px] uppercase tracking-wide text-faint">Input</div>
-            <pre className="mb-2 overflow-x-auto font-mono text-[11.5px] text-fg select-text">
-              {inputJson}
-            </pre>
-            {result && (
-              <>
-                <div className="mb-1 text-[10px] uppercase tracking-wide text-faint">
-                  {error ? "Error" : "Result"}
-                </div>
-                {isDiff ? (
-                  <DiffView text={result.output} />
-                ) : (
-                  <pre
-                    className={`max-h-72 overflow-auto font-mono text-[11.5px] select-text ${
-                      error ? "text-danger" : "text-muted"
-                    }`}
-                  >
-                    {result.output}
-                  </pre>
-                )}
-              </>
-            )}
-          </div>
-        </div>
-      </div>
+      {/* Collapsed tool payloads are intentionally unmounted. A single read can
+          return megabytes, and keeping dozens of hidden JSON/result trees alive
+          made tool-heavy turns pay their full DOM/layout cost forever. */}
+      {open && (
+        <ToolCallDetails
+          id={detailsId}
+          name={name}
+          label={label}
+          input={input}
+          result={result}
+          error={error}
+          interrupted={interrupted}
+          isDiff={isDiff}
+        />
+      )}
     </div>
   );
 });
 
-function StatusDot({ pending, error }: { pending: boolean; error?: boolean }) {
+const ToolCallDetails = memo(function ToolCallDetails({
+  id,
+  name,
+  label,
+  input,
+  result,
+  error,
+  interrupted,
+  isDiff,
+}: {
+  id: string;
+  name: string;
+  label: string;
+  input: unknown;
+  result?: ResultBlock;
+  error?: boolean;
+  interrupted: boolean;
+  isDiff: boolean;
+}) {
+  // Both operations are deferred until disclosure. In particular, inputs may
+  // include large command payloads that should not be serialized while hidden.
+  const inputJson = useMemo(() => JSON.stringify(input, null, 2), [input]);
+
+  return (
+    <div id={id} className="pc-toolcall__body" role="region" aria-label={`${label} details`}>
+      <div className="mb-2 text-[10px] text-faint">
+        Tool ID <code className="ml-1 select-text text-muted">{name}</code>
+      </div>
+      <div className="mb-1 text-[10px] uppercase tracking-wide text-faint">Input</div>
+      <pre className="mb-2 overflow-x-auto font-mono text-[11.5px] text-fg select-text">
+        {inputJson}
+      </pre>
+      {result && (
+        <>
+          <div className="mb-1 text-[10px] uppercase tracking-wide text-faint">
+            {interrupted ? "Interrupted" : error ? "Error" : "Result"}
+          </div>
+          {isDiff ? (
+            <DiffView text={result.output} />
+          ) : (
+            <PlainOutput text={result.output} error={error} interrupted={interrupted} />
+          )}
+        </>
+      )}
+    </div>
+  );
+});
+
+// Plain output is a single text node rather than one node per line, but very
+// large strings still carry a substantial layout/copy cost in WebView. Keep a
+// generous readable prefix and reveal the complete output only on explicit ask.
+const MAX_PLAIN_OUTPUT_CHARS = 40_000;
+
+const PlainOutput = memo(function PlainOutput({
+  text,
+  error,
+  interrupted,
+}: {
+  text: string;
+  error?: boolean;
+  interrupted?: boolean;
+}) {
+  const [showAll, setShowAll] = useState(false);
+  const { shown, hidden } = useMemo(() => {
+    if (text.length <= MAX_PLAIN_OUTPUT_CHARS) return { shown: text, hidden: 0 };
+    return {
+      shown: text.slice(0, MAX_PLAIN_OUTPUT_CHARS),
+      hidden: text.length - MAX_PLAIN_OUTPUT_CHARS,
+    };
+  }, [text]);
+
+  return (
+    <div>
+      <pre
+        className={`max-h-72 overflow-auto font-mono text-[11.5px] select-text ${
+          interrupted ? "text-warn" : error ? "text-danger" : "text-muted"
+        }`}
+      >
+        {showAll ? text : shown}
+        {!showAll &&
+          hidden > 0 &&
+          `\n\n… ${hidden.toLocaleString("en-US")} more characters (truncated)`}
+      </pre>
+      {!showAll && hidden > 0 && (
+        <button
+          type="button"
+          className="mt-2 text-[11px] text-accent-2 hover:underline"
+          onClick={() => setShowAll(true)}
+        >
+          Show full output
+        </button>
+      )}
+    </div>
+  );
+});
+
+function StatusDot({
+  pending,
+  error,
+  interrupted,
+}: {
+  pending: boolean;
+  error?: boolean;
+  interrupted?: boolean;
+}) {
   // done → success, running → warn (pulsing), pending input → accent.
   const variant = pending ? "pc-dot--warn" : "pc-dot--success";
+  if (interrupted) {
+    return (
+      <span
+        aria-hidden="true"
+        className="pc-dot"
+        style={{
+          background: "var(--color-warn)",
+          boxShadow: "0 0 8px color-mix(in srgb, var(--color-warn) 75%, transparent)",
+        }}
+      />
+    );
+  }
   if (error) {
     return (
       <span
@@ -157,12 +265,12 @@ const DiffView = memo(function DiffView({ text }: { text: string }) {
   );
 });
 
-function summarize(name: string, input: unknown): string {
+function summarize(input: unknown): string | null {
   if (input && typeof input === "object") {
     const o = input as Record<string, unknown>;
     if (typeof o.path === "string") return o.path;
     if (typeof o.command === "string") return o.command;
     if (typeof o.pattern === "string") return o.pattern;
   }
-  return name;
+  return null;
 }

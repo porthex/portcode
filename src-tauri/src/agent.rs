@@ -20,6 +20,7 @@ use crate::oauth;
 use crate::permissions::{self, Decision, Pending};
 use crate::secrets::{self, Credential};
 use crate::settings::Settings;
+use crate::tool_names;
 use crate::tools::{self, ToolCtx};
 
 type Cancels = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
@@ -35,12 +36,12 @@ const MAX_AGENT_STEPS: usize = 50;
 
 /// Maximum subagent nesting depth. The user-facing run is depth 0; a subagent it
 /// launches is depth 1, and so on. A confused or injected agent that keeps calling
-/// `task` could otherwise fan out without bound, so a subagent at this depth is
-/// handed no `task` tool (and the spawner refuses past it as a backstop).
+/// `delegate_task` could otherwise fan out without bound, so a subagent at this
+/// depth is handed no delegation tool (and the spawner refuses as a backstop).
 const MAX_SUBAGENT_DEPTH: usize = 3;
 
 /// How many subagents from ONE tool-use batch run concurrently. The model can
-/// emit several `task` calls in a turn; they run in parallel up to this cap (the
+/// emit several `delegate_task` calls in a turn; they run in parallel up to this cap (the
 /// rest queue), so a wide fan-out can't open unbounded simultaneous model streams.
 const MAX_PARALLEL_AGENTS: usize = 4;
 
@@ -83,7 +84,7 @@ claim to be \"Portcode\" or \"Porthex\". You help the user understand and modify
 code in their workspace.\n\n\
 Workspace root: {}\n\
 Operating system: Windows.\n\
-Shell: the `shell` tool runs PowerShell (Windows PowerShell 5.1) by default, so write commands \
+Shell: the `run_command` tool runs PowerShell (Windows PowerShell 5.1) by default, so write commands \
 in PowerShell syntax (e.g. $env:VAR, here-strings, cmdlets, `;` to chain). Pass shell=\"cmd\" \
 for the legacy command prompt or shell=\"pwsh\" for PowerShell 7+ when a command needs that \
 shell's quoting or semantics.\n\n\
@@ -119,10 +120,10 @@ pub(crate) struct AgentConfig {
 }
 
 /// Plan-mode steer appended to the system prompt. Paired with the read-only
-/// registry so the model both *can't* mutate (no write/edit/shell tools) and
+/// registry so the model both *can't* mutate (no write/edit/command tools) and
 /// *knows* it shouldn't — it should design and explain instead.
 const PLAN_MODE_STEER: &str = "You are in PLAN MODE. Do NOT modify anything in this turn: \
-the file-writing, editing, and shell tools are intentionally unavailable. Investigate with the \
+the file-writing, editing, and command-execution tools are intentionally unavailable. Investigate with the \
 read-only tools, then lay out a clear, concrete plan for the change — the files you'd touch and \
 what you'd do in each — and explain your approach. Tell the user to approve the plan (exit plan \
 mode) when they want you to apply it.";
@@ -138,7 +139,7 @@ impl AgentConfig {
         }
     }
 
-    /// Plan mode: a READ-ONLY tool registry (no write/edit/shell) plus the
+    /// Plan mode: a READ-ONLY tool registry (no write/edit/command) plus the
     /// plan-mode steer on top of the default workspace prompt. Defense-in-depth
     /// with the permission gate, which also denies every mutating tool when the
     /// permission mode is `Plan`.
@@ -193,14 +194,41 @@ fn is_terminal_auth_error(err: &str) -> bool {
 /// `refresh_lock` serializes concurrent turns, and the stored token is re-read
 /// under the lock so a token another turn just refreshed is reused rather than
 /// refreshed again.
-async fn ensure_fresh(
+pub(crate) async fn ensure_fresh(
     http: &reqwest::Client,
     cred: Credential,
     refresh_lock: &tokio::sync::Mutex<()>,
 ) -> Result<Credential, String> {
     let tokens = match cred {
         Credential::OAuth(t) => t,
-        api_key => return Ok(api_key),
+        Credential::OpenAiOAuth(tokens) => {
+            crate::openai_oauth::ensure_direct_subscription_enabled()?;
+            if tokens.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS {
+                return Ok(Credential::OpenAiOAuth(tokens));
+            }
+            let _guard = refresh_lock.lock().await;
+            // Never fall back to the caller's stale in-memory credential here.
+            // Logout may have cleared it while this turn waited for the lock;
+            // persisting a refresh of that stale value would resurrect logout.
+            let current = secrets::get_openai_oauth()
+                .ok_or("Your ChatGPT subscription session was removed. Sign in again.")?;
+            if current.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS {
+                return Ok(Credential::OpenAiOAuth(current));
+            }
+            return match crate::openai_oauth::refresh(http, &current).await {
+                Ok(refreshed) => {
+                    secrets::set_openai_oauth(&refreshed)?;
+                    Ok(Credential::OpenAiOAuth(refreshed))
+                }
+                Err(error) if crate::openai_oauth::is_terminal_auth_error(&error) => {
+                    let _ = secrets::clear_openai_oauth();
+                    Err("Your ChatGPT subscription session expired. Please sign in again in Settings."
+                        .into())
+                }
+                Err(error) => Err(error),
+            };
+        }
+        Credential::ApiKey(key) => return Ok(Credential::ApiKey(key)),
     };
 
     if tokens.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS {
@@ -210,7 +238,10 @@ async fn ensure_fresh(
     let _guard = refresh_lock.lock().await;
     // Re-check under the lock: another turn may have refreshed already. Prefer
     // the freshest stored token over the one we came in with.
-    let current = secrets::get_oauth().unwrap_or(tokens);
+    // Requiring the stored credential prevents a refresh that was queued before
+    // logout from recreating the cleared Claude session.
+    let current = secrets::get_oauth()
+        .ok_or("Your Claude subscription session was removed. Sign in again.")?;
     if current.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS {
         return Ok(Credential::OAuth(current));
     }
@@ -241,6 +272,48 @@ async fn ensure_fresh(
     refreshed.plan = current.plan;
     secrets::set_oauth(&refreshed)?;
     Ok(Credential::OAuth(refreshed))
+}
+
+/// Recover one OpenAI 401 without retry loops. This runs before any tool result
+/// can be executed: the provider reports the HTTP status before consuming SSE.
+async fn recover_openai_unauthorized(
+    http: &reqwest::Client,
+    failed_credential: &Credential,
+    refresh_lock: &tokio::sync::Mutex<()>,
+) -> Result<Credential, String> {
+    crate::openai_oauth::ensure_direct_subscription_enabled()?;
+    let Credential::OpenAiOAuth(failed) = failed_credential else {
+        return Err("OpenAI authentication recovery received the wrong credential type.".into());
+    };
+    let _guard = refresh_lock.lock().await;
+    let current = secrets::get_openai_oauth()
+        .ok_or("Your ChatGPT subscription session was removed. Sign in again.")?;
+    if failed.account_id.is_some()
+        && current.account_id.is_some()
+        && failed.account_id != current.account_id
+    {
+        return Err(
+            "The signed-in ChatGPT account changed during this turn. Start the turn again.".into(),
+        );
+    }
+    // Another turn may already have recovered and persisted a rotated token.
+    if current.access_token != failed.access_token {
+        return Ok(Credential::OpenAiOAuth(current));
+    }
+    match crate::openai_oauth::refresh(http, &current).await {
+        Ok(refreshed) => {
+            secrets::set_openai_oauth(&refreshed)?;
+            Ok(Credential::OpenAiOAuth(refreshed))
+        }
+        Err(error) if crate::openai_oauth::is_terminal_auth_error(&error) => {
+            let _ = secrets::clear_openai_oauth();
+            Err(
+                "Your ChatGPT subscription session expired. Please sign in again in Settings."
+                    .into(),
+            )
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -367,20 +440,28 @@ async fn run_inner(
         .unwrap_or_else(|| snapshot.model.clone());
     snapshot.model = active_model;
 
-    let cred = secrets::load_credential().ok_or(
-        "No credentials set. Sign in with your Claude subscription or add an Anthropic API key in Settings.",
-    )?;
+    // Resolve only from the selected model so an unknown slug cannot inherit a
+    // different configured provider and send a request to the wrong service.
+    let provider_name = llm::provider_name_for_model(&snapshot.model)?;
+    if provider_name == "openai" {
+        // Fail before persisting the user's message when a release build or
+        // runtime policy has disabled the direct subscription transport.
+        crate::openai_oauth::ensure_direct_subscription_enabled()?;
+    }
+    let cred = secrets::load_credential_for(provider_name).ok_or_else(|| match provider_name {
+        "openai" => "No OpenAI credentials set. Sign in with your ChatGPT subscription in Settings.".to_string(),
+        _ => "No Anthropic credentials set. Sign in with your Claude subscription or add an Anthropic API key in Settings.".to_string(),
+    })?;
 
     // Resolve the LLM provider up front, alongside the credential check above:
     // both are pre-flight config validations that fail before any DB write (so an
     // unconfigured run never half-persists). An unknown `provider` value fails
-    // here with a clear message instead of silently calling Anthropic. Anthropic
-    // is the only provider today; `llm::LlmProvider` is the seam others plug into.
-    let provider = llm::provider_for(&snapshot.provider)?;
+    // here with a clear message instead of silently calling a different service.
+    let provider = llm::provider_for(provider_name)?;
 
     // No configured workspace falls back to the process working directory — but
     // never to an empty path (the old `unwrap_or_default()`), which would silently
-    // root every file/shell tool at "" and produce confusing errors.
+    // root every file/command tool at "" and produce confusing errors.
     let workspace = match snapshot.workspace.clone() {
         Some(w) => PathBuf::from(w),
         None => std::env::current_dir().map_err(|e| {
@@ -400,36 +481,39 @@ async fn run_inner(
     } = config;
     let system = resolve_system_prompt(system_override, prompt_steer, &workspace);
 
-    // Attach a subagent spawner only when this run actually exposes the `task`
-    // tool. Plan mode's read-only registry has no `task`, so it gets no spawner and
+    // Attach a subagent spawner only when this run exposes `delegate_task`.
+    // Plan mode's read-only registry has no delegation tool, so it gets no spawner and
     // can never launch a (mutating) subagent — defense-in-depth with the gate,
     // which already denies mutating tools in plan mode.
-    let spawner: Option<Arc<dyn tools::Spawner>> = if registry.find("task").is_some() {
-        Some(Arc::new(AgentSpawner {
-            sink: sink.clone(),
-            http: http.clone(),
-            settings: settings.clone(),
-            pending: pending.clone(),
-            agents: agents.clone(),
-            cancel: cancel.clone(),
-            refresh_lock: refresh_lock.clone(),
-            ask_lock: ask_lock.clone(),
-            parent_channel: channel.to_string(),
-            workspace: workspace.clone(),
-            // The top-level run is not itself a registered subagent, so the
-            // children it launches have no parent agent id.
-            self_id: None,
-            depth: 1,
-        }))
-    } else {
-        None
-    };
+    let spawner: Option<Arc<dyn tools::Spawner>> =
+        if registry.find(tool_names::DELEGATE_TASK).is_some() {
+            Some(Arc::new(AgentSpawner {
+                sink: sink.clone(),
+                http: http.clone(),
+                // Freeze the resolved per-session model/provider/effort so children
+                // inherit this run, not a possibly different global default.
+                run_settings: snapshot.clone(),
+                pending: pending.clone(),
+                agents: agents.clone(),
+                cancel: cancel.clone(),
+                refresh_lock: refresh_lock.clone(),
+                ask_lock: ask_lock.clone(),
+                parent_channel: channel.to_string(),
+                workspace: workspace.clone(),
+                // The top-level run is not itself a registered subagent, so the
+                // children it launches have no parent agent id.
+                self_id: None,
+                depth: 1,
+            }))
+        } else {
+            None
+        };
     let mut ctx = ToolCtx::new(workspace);
     ctx.spawner = spawner;
-    // Attach a background runner only when this run exposes `shell` (plan mode's
+    // Attach a background runner only when this run exposes `run_command` (plan mode's
     // read-only registry has none, so it can't background). Subagents don't get one
-    // in this version, so their `shell` runs foreground.
-    if registry.find("shell").is_some() {
+    // in this version, so their `run_command` calls run foreground.
+    if registry.find(tool_names::RUN_COMMAND).is_some() {
         ctx.background = Some(Arc::new(BackgroundLauncher {
             sink: sink.clone(),
             background: background.clone(),
@@ -440,6 +524,10 @@ async fn run_inner(
 
     // Load prior turns from the DB, then persist the new user message.
     let mut messages = db.load_chat_messages(session_id);
+    // Older rows store the original Portcode tool names. Normalize only this
+    // in-memory provider transcript so every historical tool call matches the new
+    // canonical specs; the DB and UI history remain byte-for-byte untouched.
+    canonicalize_tool_history(&mut messages);
     let is_first = messages.is_empty();
 
     let user_msg = ChatMessage {
@@ -605,11 +693,19 @@ async fn run_loop_core(
         // Refresh an expiring OAuth token before each turn (no-op for API keys).
         cred = ensure_fresh(http, cred, refresh_lock).await?;
 
-        let turn = provider
+        // Keep the kill switch adjacent to the actual Responses request as well
+        // as in preflight/refresh, so a runtime disable takes effect between
+        // agent steps without waiting for token expiry.
+        if matches!(&cred, Credential::OpenAiOAuth(_)) {
+            crate::openai_oauth::ensure_direct_subscription_enabled()?;
+        }
+
+        let first_attempt = provider
             .stream_turn(
                 http,
                 &cred,
                 &snapshot.model,
+                &snapshot.reasoning_effort,
                 system,
                 &messages,
                 &tool_specs,
@@ -617,7 +713,38 @@ async fn run_loop_core(
                 agent_channel,
                 cancel,
             )
-            .await?;
+            .await;
+        let mut turn = match first_attempt {
+            Err(error)
+                if error == "OpenAI response authentication failed (401)."
+                    && matches!(&cred, Credential::OpenAiOAuth(_)) =>
+            {
+                cred = recover_openai_unauthorized(http, &cred, refresh_lock).await?;
+                crate::openai_oauth::ensure_direct_subscription_enabled()?;
+                // Exactly one retry. A second 401 is returned as-is and never
+                // triggers another refresh/retry cycle.
+                provider
+                    .stream_turn(
+                        http,
+                        &cred,
+                        &snapshot.model,
+                        &snapshot.reasoning_effort,
+                        system,
+                        &messages,
+                        &tool_specs,
+                        sink,
+                        agent_channel,
+                        cancel,
+                    )
+                    .await?
+            }
+            Ok(turn) => turn,
+            Err(error) => return Err(error),
+        };
+        // Providers currently canonicalize their streamed tool-use events too;
+        // keep this provider-agnostic backstop so a future provider cannot write
+        // a newly returned legacy alias into the DB or bypass canonical gating.
+        canonicalize_tool_blocks(&mut turn.content);
 
         // Usage is a SESSION-level event: route it to `session_channel` so a
         // subagent's token cost rolls up into the parent session's total rather
@@ -665,7 +792,7 @@ async fn run_loop_core(
 
         if turn.stop_reason == "tool_use" {
             // This batch's tool calls, in order. Regular tools run sequentially with
-            // the usual gate/cancel semantics; `task` calls (subagents) are deferred
+            // the usual gate/cancel semantics; `delegate_task` calls are deferred
             // and run CONCURRENTLY afterwards, since they are independent and
             // long-running. Results are slotted back in tool_use order regardless.
             let tool_uses: Vec<(&str, &str, &Value)> = turn
@@ -696,11 +823,11 @@ async fn run_loop_core(
                     continue;
                 }
 
-                // Subagents run in parallel: defer the (non-mutating, ungated) `task`
+                // Subagents run in parallel: defer the non-mutating delegation
                 // call to the concurrent phase below. A final cancel re-check first,
                 // mirroring the sequential path.
-                if name == "task" {
-                    if let Some(tool) = registry.find("task") {
+                if tool_names::canonical(name) == tool_names::DELEGATE_TASK {
+                    if let Some(tool) = registry.find(tool_names::DELEGATE_TASK) {
                         if cancel.load(Ordering::Relaxed) {
                             cancelled = true;
                             let output = CANCELLED_TOOL_RESULT.to_string();
@@ -717,7 +844,7 @@ async fn run_loop_core(
                         }
                         continue;
                     }
-                    // No task tool in this registry → fall through to "unknown tool".
+                    // No delegation tool in this registry → fall through to "unknown tool".
                 }
 
                 let (output, is_error) = match registry.find(name) {
@@ -731,7 +858,6 @@ async fn run_loop_core(
                             ask_lock,
                             tool,
                             ctx,
-                            name,
                             input,
                             &mut cancelled,
                         )
@@ -809,6 +935,25 @@ fn assistant_text(content: &[Block]) -> String {
         .join("")
 }
 
+/// Normalize legacy tool-use names in a provider-bound transcript without
+/// touching tool ids, inputs, results, or the persisted/UI copy in the database.
+fn canonicalize_tool_history(messages: &mut [ChatMessage]) {
+    for message in messages {
+        canonicalize_tool_blocks(&mut message.content);
+    }
+}
+
+fn canonicalize_tool_blocks(content: &mut [Block]) {
+    for block in content {
+        if let Block::ToolUse { name, .. } = block {
+            let canonical = tool_names::canonical(name).to_string();
+            if canonical != *name {
+                *name = canonical;
+            }
+        }
+    }
+}
+
 /// The streamed `ToolResult` event for one finished tool call.
 fn tool_result_event(id: &str, output: &str, is_error: bool) -> StreamEvent {
     StreamEvent::ToolResult {
@@ -872,12 +1017,11 @@ async fn gate_and_run(
     ask_lock: &tokio::sync::Mutex<()>,
     tool: &dyn tools::Tool,
     ctx: &ToolCtx,
-    name: &str,
     input: &Value,
     cancelled: &mut bool,
 ) -> (String, bool) {
     let decision = if tool.mutating() {
-        // Compute the pre-apply diff (fs_write/fs_edit) so the prompt can show the
+        // Compute the pre-apply diff (write_file/edit_file) so the prompt can show the
         // change BEFORE it's written.
         let diff = tool.preview(input, ctx).await;
         let _prompt = ask_lock.lock().await;
@@ -889,7 +1033,7 @@ async fn gate_and_run(
             &snapshot.default_policy,
             pending,
             cancel,
-            name,
+            tool.name(),
             &tool.summarize(input, ctx),
             input,
             diff,
@@ -916,7 +1060,7 @@ async fn gate_and_run(
 
 /// Whether a subagent at `depth` may itself spawn children — i.e. is still under
 /// the nesting cap. A subagent AT the cap is a leaf: it gets no spawner and no
-/// `task` tool.
+/// `delegate_task` tool.
 fn child_can_spawn(depth: usize) -> bool {
     depth < MAX_SUBAGENT_DEPTH
 }
@@ -1040,7 +1184,7 @@ fn session_of(channel: &str) -> &str {
         .unwrap_or(channel)
 }
 
-/// Launches subagents for the `task` tool. Holds owned clones of everything a
+/// Launches subagents for `delegate_task`. Holds owned clones of everything a
 /// child run needs, so it can outlive the call that built it and spawn children on
 /// demand. One per parent run; cloned (with `depth + 1`) onto each child it
 /// launches, so nesting stays depth-bounded.
@@ -1048,7 +1192,7 @@ fn session_of(channel: &str) -> &str {
 struct AgentSpawner {
     sink: Arc<dyn EventSink>,
     http: reqwest::Client,
-    settings: Arc<Mutex<Settings>>,
+    run_settings: Settings,
     pending: Pending,
     /// Live-subagent registry: each child registers its OWN cancel flag here so the
     /// agents panel can Stop one without the others, and a session-wide Stop can
@@ -1088,11 +1232,16 @@ impl tools::Spawner for AgentSpawner {
             ));
         }
 
-        let snapshot = { self.settings.lock().unwrap().clone() };
-        let cred = secrets::load_credential().ok_or(
-            "No credentials set. Sign in with your Claude subscription or add an Anthropic API key in Settings.",
-        )?;
-        let provider = llm::provider_for(&snapshot.provider)?;
+        let snapshot = self.run_settings.clone();
+        let provider_name = llm::provider_name_for_model(&snapshot.model)?;
+        if provider_name == "openai" {
+            crate::openai_oauth::ensure_direct_subscription_enabled()?;
+        }
+        let cred = secrets::load_credential_for(provider_name).ok_or_else(|| match provider_name {
+            "openai" => "No OpenAI credentials set. Sign in with your ChatGPT subscription in Settings.".to_string(),
+            _ => "No Anthropic credentials set. Sign in with your Claude subscription or add an Anthropic API key in Settings.".to_string(),
+        })?;
+        let provider = llm::provider_for(provider_name)?;
 
         let agent_id = Uuid::new_v4().to_string();
         let session_id = session_of(&self.parent_channel).to_string();
@@ -1122,7 +1271,7 @@ impl tools::Spawner for AgentSpawner {
         );
 
         // A child may spawn its own children only while still under the cap; at the
-        // last allowed depth it gets no spawner and no `task` tool (a leaf).
+        // last allowed depth it gets no spawner and no `delegate_task` tool (a leaf).
         let can_spawn = child_can_spawn(self.depth);
         let registry = tools::subagent_registry(can_spawn);
         let child_spawner: Option<Arc<dyn tools::Spawner>> = if can_spawn {
@@ -1138,7 +1287,7 @@ impl tools::Spawner for AgentSpawner {
         let ctx = ToolCtx {
             workspace: self.workspace.clone(),
             spawner: child_spawner,
-            // Subagents run `shell` in the foreground (no background runner) in this
+            // Subagents run `run_command` in the foreground (no background runner) in this
             // version, so a subagent can't spawn its own background tasks yet.
             background: None,
         };
@@ -1196,8 +1345,8 @@ impl tools::Spawner for AgentSpawner {
     }
 }
 
-/// Launches and tracks background `shell` tasks for the `shell` tool's background
-/// mode. Owns the process lifecycle: it announces the launch, waits for the child
+/// Launches and tracks background `run_command` calls. Owns the process lifecycle:
+/// it announces the launch, waits for the child
 /// off-thread, reports completion on the session channel, and registers the
 /// waiter's abort handle so a session Stop can kill it.
 #[derive(Clone)]
@@ -1367,7 +1516,7 @@ mod tests {
             text_block("First. "),
             Block::ToolUse {
                 id: "t1".into(),
-                name: "fs_read".into(),
+                name: "read_file".into(),
                 input: serde_json::json!({ "path": "x" }),
             },
             text_block("Second."),
@@ -1378,12 +1527,46 @@ mod tests {
         assert_eq!(
             assistant_text(&[Block::ToolUse {
                 id: "t".into(),
-                name: "shell".into(),
+                name: "run_command".into(),
                 input: serde_json::json!({}),
             }]),
             ""
         );
         assert_eq!(assistant_text(&[]), "");
+    }
+
+    #[test]
+    fn provider_history_normalizes_legacy_tool_names_without_changing_other_blocks() {
+        let mut messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: tool_names::LEGACY_ALIASES
+                .iter()
+                .enumerate()
+                .map(|(index, (legacy, _))| Block::ToolUse {
+                    id: format!("call-{index}"),
+                    name: (*legacy).into(),
+                    input: serde_json::json!({ "index": index }),
+                })
+                .chain(std::iter::once(text_block("unchanged")))
+                .collect(),
+        }];
+
+        canonicalize_tool_history(&mut messages);
+
+        for (index, expected_name) in tool_names::CANONICAL_NAMES.iter().enumerate() {
+            match &messages[0].content[index] {
+                Block::ToolUse { id, name, input } => {
+                    assert_eq!(id, &format!("call-{index}"));
+                    assert_eq!(name, *expected_name);
+                    assert_eq!(input, &serde_json::json!({ "index": index }));
+                }
+                other => panic!("expected tool use, got {other:?}"),
+            }
+        }
+        match messages[0].content.last() {
+            Some(Block::Text { text }) => assert_eq!(text, "unchanged"),
+            other => panic!("expected unchanged text block, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1720,7 +1903,16 @@ mod tests {
         let cfg = AgentConfig::default_run();
         assert_eq!(
             spec_names(&cfg),
-            ["fs_read", "list", "glob", "grep", "fs_write", "fs_edit", "shell", "task"]
+            [
+                "read_file",
+                "list_directory",
+                "find_files",
+                "search_text",
+                "write_file",
+                "edit_file",
+                "run_command",
+                "delegate_task"
+            ]
         );
         assert!(cfg.system_prompt.is_none());
         assert!(cfg.prompt_steer.is_none());
@@ -1731,7 +1923,10 @@ mod tests {
         // Plan mode hands the model only the read-only tools (no write/edit/shell)
         // and a steer that tells it to design rather than mutate.
         let cfg = AgentConfig::plan_run();
-        assert_eq!(spec_names(&cfg), ["fs_read", "list", "glob", "grep"]);
+        assert_eq!(
+            spec_names(&cfg),
+            ["read_file", "list_directory", "find_files", "search_text"]
+        );
         let steer = cfg.prompt_steer.expect("plan mode carries a steer");
         assert!(steer.contains("PLAN MODE"));
     }

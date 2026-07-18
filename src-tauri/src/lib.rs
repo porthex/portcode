@@ -19,10 +19,18 @@ mod db;
 // trait is SHARED because `llm::LlmProvider` (shared) takes `&dyn EventSink`; the
 // concrete `AppEventSink` is desktop-only (gated inside `events`).
 mod events;
+#[cfg(desktop)]
+mod git;
+#[cfg(desktop)]
+mod git_review;
 mod llm;
 #[cfg(desktop)]
 mod oauth;
+#[cfg(desktop)]
+mod openai_oauth;
 mod permissions;
+#[cfg(desktop)]
+mod plan_usage;
 #[cfg(desktop)]
 mod scrub;
 mod secrets;
@@ -30,12 +38,15 @@ mod settings;
 mod sync;
 #[cfg(desktop)]
 mod telemetry;
+mod tool_names;
 #[cfg(desktop)]
 mod tools;
 // Auto-updater command surface (desktop only — the phone is a remote client and
 // never self-updates). The whole module is `#![cfg(desktop)]` internally too.
 #[cfg(desktop)]
 mod update;
+#[cfg(desktop)]
+mod workspace;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -61,18 +72,18 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     pub pending: permissions::Pending,
-    /// Live subagents (the `task` tool), keyed by agent id, so the agents panel can
+    /// Live subagents (`delegate_task`), keyed by agent id, so the agents panel can
     /// Stop one without the rest. DESKTOP-ONLY — only the desktop runs the agent
     /// loop that spawns subagents; the phone is a pure remote client.
     #[cfg(desktop)]
     pub agents: agents::Agents,
-    /// Live background `shell` tasks, keyed by task id, so a session Stop can kill
+    /// Live background `run_command` tasks, keyed by task id, so a session Stop can kill
     /// the ones it launched. DESKTOP-ONLY — only the desktop runs the agent loop.
     #[cfg(desktop)]
     pub background: background::Background,
-    /// Serializes OAuth token refreshes so concurrent agent turns don't each
-    /// hit the token endpoint (single-flight). Guards no data — held only for
-    /// the duration of a refresh.
+    /// Serializes every OAuth credential mutation across refresh, interactive
+    /// login persistence, and logout. Refreshes stay single-flight, and a queued
+    /// refresh can never recreate a credential that logout cleared.
     pub oauth_refresh: Arc<tokio::sync::Mutex<()>>,
     /// The phone's live remote-control session, when connected. Holds the
     /// command-injection sender + the session task handle; `None` when not
@@ -115,6 +126,9 @@ fn save_settings(state: State<AppState>, settings: Value) -> Settings {
         }
         if let Some(m) = settings.get("model").and_then(|v| v.as_str()) {
             s.model = m.to_string();
+        }
+        if let Some(effort) = settings.get("reasoningEffort").and_then(|v| v.as_str()) {
+            s.reasoning_effort = effort.to_string();
         }
         if let Some(p) = settings.get("defaultPolicy").and_then(|v| v.as_str()) {
             s.default_policy = p.to_string();
@@ -164,6 +178,11 @@ fn set_api_key(key: String) -> Result<(), String> {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OAuthStatus {
+    /// Whether this authentication capability is enabled by the current build
+    /// and runtime policy. A disabled provider reports signed_out even if an old
+    /// credential remains stored, so UI controls cannot imply it is usable.
+    available: bool,
+    unavailable_reason: Option<String>,
     signed_in: bool,
     expires_at: Option<i64>,
     account: Option<String>,
@@ -184,12 +203,16 @@ fn tier_label(plan: Option<&str>) -> Option<String> {
 fn current_oauth_status() -> OAuthStatus {
     match secrets::get_oauth() {
         Some(t) => OAuthStatus {
+            available: true,
+            unavailable_reason: None,
             signed_in: true,
             expires_at: Some(t.expires_at),
             account: t.email,
             tier: tier_label(t.plan.as_deref()),
         },
         None => OAuthStatus {
+            available: true,
+            unavailable_reason: None,
             signed_in: false,
             expires_at: None,
             account: None,
@@ -203,6 +226,10 @@ fn current_oauth_status() -> OAuthStatus {
 #[cfg(desktop)]
 #[tauri::command]
 async fn start_oauth_login(state: State<'_, AppState>) -> Result<OAuthStatus, String> {
+    // Hold the same mutation lock used by refresh for the entire interactive
+    // flow. If logout is requested while the browser is open it waits and then
+    // clears the newly persisted credential, rather than being resurrected.
+    let _guard = state.oauth_refresh.lock().await;
     let http = state.http.clone();
     let tokens = oauth::run_loopback_login(&http).await?;
     secrets::set_oauth(&tokens)?;
@@ -219,8 +246,155 @@ fn oauth_status() -> Result<OAuthStatus, String> {
 /// Forget the stored subscription tokens (sign out). Idempotent.
 #[cfg(desktop)]
 #[tauri::command]
-fn oauth_logout() -> Result<(), String> {
+async fn oauth_logout(state: State<'_, AppState>) -> Result<(), String> {
+    let _guard = state.oauth_refresh.lock().await;
     secrets::clear_oauth()
+}
+
+#[cfg(desktop)]
+fn openai_tier_label(plan: Option<&str>) -> Option<String> {
+    plan.map(|plan| {
+        let mut chars = plan.chars();
+        let title = chars
+            .next()
+            .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+            .unwrap_or_default();
+        format!("ChatGPT {title}")
+    })
+}
+
+#[cfg(desktop)]
+fn current_openai_oauth_status() -> OAuthStatus {
+    if let Err(reason) = openai_oauth::ensure_direct_subscription_enabled() {
+        return OAuthStatus {
+            available: false,
+            unavailable_reason: Some(reason),
+            signed_in: false,
+            expires_at: None,
+            account: None,
+            tier: None,
+        };
+    }
+    match secrets::get_openai_oauth() {
+        Some(tokens) => OAuthStatus {
+            available: true,
+            unavailable_reason: None,
+            signed_in: true,
+            expires_at: Some(tokens.expires_at),
+            account: tokens.email,
+            tier: openai_tier_label(tokens.plan.as_deref()),
+        },
+        None => OAuthStatus {
+            available: true,
+            unavailable_reason: None,
+            signed_in: false,
+            expires_at: None,
+            account: None,
+            tier: None,
+        },
+    }
+}
+
+#[cfg(desktop)]
+async fn fresh_openai_tokens(
+    state: &State<'_, AppState>,
+) -> Result<secrets::OpenAiOAuthTokens, String> {
+    const REFRESH_SKEW_SECS: i64 = 300;
+    openai_oauth::ensure_direct_subscription_enabled()?;
+    let tokens = secrets::get_openai_oauth()
+        .ok_or("Sign in with your ChatGPT subscription in Settings first.")?;
+    if tokens.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS {
+        return Ok(tokens);
+    }
+    let _guard = state.oauth_refresh.lock().await;
+    let current = secrets::get_openai_oauth()
+        .ok_or("Your ChatGPT subscription session was removed. Sign in again.")?;
+    if current.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS {
+        return Ok(current);
+    }
+    match openai_oauth::refresh(&state.http, &current).await {
+        Ok(refreshed) => {
+            secrets::set_openai_oauth(&refreshed)?;
+            Ok(refreshed)
+        }
+        Err(error) if openai_oauth::is_terminal_auth_error(&error) => {
+            let _ = secrets::clear_openai_oauth();
+            Err(
+                "Your ChatGPT subscription session expired. Please sign in again in Settings."
+                    .into(),
+            )
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn start_openai_oauth_login(state: State<'_, AppState>) -> Result<OAuthStatus, String> {
+    // Serialize login, persistence, refresh, and logout. Holding the lock through
+    // the browser flow gives a concurrent logout deterministic "last action"
+    // semantics: it clears the credential after login finishes.
+    let _guard = state.oauth_refresh.lock().await;
+    let tokens = openai_oauth::run_loopback_login(&state.http).await?;
+    secrets::set_openai_oauth(&tokens)?;
+    Ok(current_openai_oauth_status())
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+fn openai_oauth_status() -> Result<OAuthStatus, String> {
+    Ok(current_openai_oauth_status())
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn openai_oauth_logout(state: State<'_, AppState>) -> Result<(), String> {
+    let _guard = state.oauth_refresh.lock().await;
+    secrets::clear_openai_oauth()
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn openai_models(
+    state: State<'_, AppState>,
+) -> Result<Vec<openai_oauth::OpenAiModel>, String> {
+    let tokens = fresh_openai_tokens(&state).await?;
+    openai_oauth::models(&state.http, &tokens).await
+}
+
+/// Fetch a display-safe subscription quota snapshot for one signed-in provider.
+/// Credentials stay in the native secret store; only percentages, reset windows,
+/// plan display metadata, and the snapshot timestamp cross the IPC boundary.
+#[cfg(desktop)]
+#[tauri::command]
+async fn get_plan_usage(
+    state: State<'_, AppState>,
+    provider: String,
+) -> Result<plan_usage::PlanUsageSnapshot, String> {
+    match provider.as_str() {
+        "anthropic" => {
+            let tokens = secrets::get_oauth()
+                .ok_or("Sign in with your Claude subscription in Settings first.")?;
+            let credential = agent::ensure_fresh(
+                &state.http,
+                secrets::Credential::OAuth(tokens),
+                &state.oauth_refresh,
+            )
+            .await?;
+            let secrets::Credential::OAuth(tokens) = credential else {
+                return Err("Claude usage received the wrong credential type.".into());
+            };
+            plan_usage::anthropic(&state.http, &tokens).await
+        }
+        "openai" => {
+            let tokens = fresh_openai_tokens(&state).await?;
+            // Re-check directly before the usage request so a runtime kill
+            // switch applied after refresh still prevents network access.
+            openai_oauth::ensure_direct_subscription_enabled()?;
+            plan_usage::openai(&state.http, &tokens).await
+        }
+        _ => Err("Unknown plan-usage provider.".into()),
+    }
 }
 
 // ── sessions ─────────────────────────────────────────────────────────────────
@@ -300,6 +474,22 @@ fn rename_session(
         .rename_session(&id, &title)
         .map_err(|e| e.to_string())?;
     // Push the updated titles to any connected sync client (best-effort).
+    push_session_list(&app, &state.db);
+    Ok(())
+}
+
+#[tauri::command]
+fn update_session_model(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+    model: String,
+) -> Result<(), String> {
+    state
+        .db
+        .update_session_model(&id, &model)
+        .map_err(|e| e.to_string())?;
+    // Keep a connected phone's authoritative session list in sync with the DB.
     push_session_list(&app, &state.db);
     Ok(())
 }
@@ -1344,9 +1534,15 @@ pub fn run() {
         start_oauth_login,
         oauth_status,
         oauth_logout,
+        start_openai_oauth_login,
+        openai_oauth_status,
+        openai_oauth_logout,
+        openai_models,
+        get_plan_usage,
         list_sessions,
         create_session,
         rename_session,
+        update_session_model,
         delete_session,
         get_messages,
         save_draft,
@@ -1355,6 +1551,9 @@ pub fn run() {
         get_usage,
         get_all_usage,
         search_messages,
+        workspace::get_workspace_summary,
+        git_review::get_git_review_manifest,
+        git_review::get_git_review_file,
         list_dir,
         run_agent,
         cancel_agent,
@@ -1392,6 +1591,7 @@ pub fn run() {
         list_sessions,
         create_session,
         rename_session,
+        update_session_model,
         delete_session,
         get_messages,
         save_draft,

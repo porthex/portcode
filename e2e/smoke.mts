@@ -15,10 +15,18 @@ type RenderState = {
   headerVisible: boolean;
 };
 
+type JourneyState = {
+  settingsOpened: boolean;
+  modelMenuOpened: boolean;
+  settingsClosed: boolean;
+  composerAcceptedDraft: boolean;
+  fatalFallbackVisible: boolean;
+};
+
 type CdpResponse = {
   id?: number;
   error?: { message: string };
-  result?: { result?: { value?: RenderState } };
+  result?: { result?: { value?: unknown } };
 };
 
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -168,11 +176,31 @@ const inspectUi = async (socket: WebSocket) => {
   };
 
   await send("Runtime.enable");
+  const evaluate = async <T,>(expression: string): Promise<T | undefined> => {
+    const response = await send("Runtime.evaluate", { expression, returnByValue: true });
+    return response.result?.result?.value as T | undefined;
+  };
+
+  const waitForValue = async <T,>(
+    label: string,
+    expression: string,
+    accept: (value: T | undefined) => boolean,
+    timeoutMs = 10000,
+  ): Promise<T> => {
+    const deadline = Date.now() + timeoutMs;
+    let value: T | undefined;
+    while (Date.now() < deadline) {
+      value = await evaluate<T>(expression);
+      if (accept(value)) return value as T;
+      await delay(100);
+    }
+    throw new Error(`${label} did not become ready: ${JSON.stringify(value)}`);
+  };
+
   const deadline = Date.now() + 30000;
   let state: RenderState | undefined;
   while (Date.now() < deadline) {
-    const response = await send("Runtime.evaluate", {
-      expression: `(() => {
+    state = await evaluate<RenderState>(`(() => {
         const root = document.querySelector('#root');
         const shell = document.querySelector('#root > div');
         const header = document.querySelector('header');
@@ -183,21 +211,128 @@ const inspectUi = async (socket: WebSocket) => {
           shellVisible: visible(shell),
           headerVisible: visible(header),
         };
-      })()`,
-      returnByValue: true,
-    });
-    state = response.result?.result?.value;
+      })()`);
     if (
       state?.title === "Portcode" &&
       state.rootChildren > 0 &&
       state.shellVisible &&
       state.headerVisible
     ) {
-      return state;
+      break;
     }
     await delay(250);
   }
-  throw new Error(`React shell did not become ready: ${JSON.stringify(state)}`);
+  if (!state?.shellVisible || !state.headerVisible) {
+    throw new Error(`React shell did not become ready: ${JSON.stringify(state)}`);
+  }
+
+  // Exercise the real WebView journey that previously escaped the smoke gate:
+  // Settings render isolation, the Portcode-native model listbox, and React's
+  // controlled composer. No prompt is submitted and no provider call is made.
+  const settingsButtonClicked = await evaluate<boolean>(`(() => {
+    const button = document.querySelector('button[aria-label="Settings"], button[title="Settings"]');
+    if (!(button instanceof HTMLButtonElement)) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!settingsButtonClicked) throw new Error("Could not find the Settings button.");
+
+  const settingsOpened = await waitForValue<boolean>(
+    "Settings dialog",
+    `!!document.querySelector('[role="dialog"][aria-labelledby="pc-settings-title"]')`,
+    Boolean,
+  );
+
+  const modelClicked = await evaluate<boolean>(`(() => {
+    const model = document.querySelector('#pc-settings-claude-model[role="combobox"]');
+    if (!(model instanceof HTMLButtonElement)) return false;
+    model.click();
+    return true;
+  })()`);
+  if (!modelClicked) throw new Error("Could not find the themed model picker.");
+  const modelMenuOpened = await waitForValue<boolean>(
+    "Model listbox",
+    `(() => {
+      const list = document.querySelector('#pc-settings-claude-model-listbox[role="listbox"]');
+      return !!list && list.querySelectorAll('[role="option"]').length >= 2;
+    })()`,
+    Boolean,
+  );
+
+  await evaluate(`document.querySelector('#pc-settings-claude-model[role="combobox"]')?.click()`);
+  await evaluate(`document.querySelector('button[aria-label="Close settings"]')?.click()`);
+  const settingsClosed = await waitForValue<boolean>(
+    "Settings close",
+    `!document.querySelector('[role="dialog"][aria-labelledby="pc-settings-title"]')`,
+    Boolean,
+  );
+
+  await waitForValue<boolean>(
+    "Composer readiness",
+    `(() => {
+      const composer = document.querySelector('textarea[aria-label="Message Portcode"]');
+      return composer instanceof HTMLTextAreaElement && !composer.disabled;
+    })()`,
+    Boolean,
+    30000,
+  );
+  const composerFocused = await evaluate<boolean>(`(() => {
+      const composer = document.querySelector('textarea[aria-label="Message Portcode"]');
+      if (!(composer instanceof HTMLTextAreaElement)) return false;
+      composer.focus();
+      composer.select();
+      return true;
+    })()`);
+  if (!composerFocused) throw new Error("Could not find the controlled composer.");
+  await send("Input.insertText", { text: "Portcode E2E draft — never sent" });
+  const composerAcceptedDraft = await waitForValue<boolean>(
+    "Composer draft",
+    `document.querySelector('textarea[aria-label="Message Portcode"]')?.value === 'Portcode E2E draft — never sent'`,
+    Boolean,
+  );
+  await evaluate(`(() => {
+      const composer = document.querySelector('textarea[aria-label="Message Portcode"]');
+      if (!(composer instanceof HTMLTextAreaElement)) return false;
+      composer.focus();
+      composer.select();
+      return true;
+    })()`);
+  await send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "Backspace",
+    code: "Backspace",
+    windowsVirtualKeyCode: 8,
+    nativeVirtualKeyCode: 8,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Backspace",
+    code: "Backspace",
+    windowsVirtualKeyCode: 8,
+    nativeVirtualKeyCode: 8,
+  });
+  await waitForValue<boolean>(
+    "Composer clear",
+    `document.querySelector('textarea[aria-label="Message Portcode"]')?.value === ''`,
+    Boolean,
+  );
+
+  const fatalFallbackVisible = Boolean(
+    await evaluate<boolean>(`(() => {
+      const text = document.body.textContent ?? '';
+      return text.includes('Something went wrong') || !!document.querySelector('[role="alertdialog"]');
+    })()`),
+  );
+  if (fatalFallbackVisible) throw new Error("A fatal or Settings recovery fallback appeared.");
+
+  return {
+    ...state,
+    settingsOpened,
+    modelMenuOpened,
+    settingsClosed,
+    composerAcceptedDraft,
+    fatalFallbackVisible,
+  } satisfies RenderState & JourneyState;
 };
 
 const main = async () => {
@@ -233,7 +368,7 @@ const main = async () => {
   const socket = await connect(targetUrl);
   try {
     const state = await inspectUi(socket);
-    console.log(`E2E smoke passed: ${JSON.stringify(state)}`);
+    console.log(`E2E desktop journey passed: ${JSON.stringify(state)}`);
   } finally {
     socket.close();
   }

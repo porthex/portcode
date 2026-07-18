@@ -27,7 +27,7 @@ To help us triage quickly, please include as much as you can:
 - A description of the vulnerability and its impact.
 - Portcode version, Windows build (`winver`), and WebView2 runtime version.
 - Step-by-step reproduction, ideally with a minimal proof of concept.
-- Whether a `shell` command, a file write/edit, or an API key was involved.
+- Whether a `run_command` call, a file write/edit, or an API key was involved.
 - Any logs or screenshots — with secrets and API keys redacted.
 
 ## Our response
@@ -55,11 +55,11 @@ receives security fixes; please update before reporting.
 Portcode’s security posture rests on a few load-bearing boundaries. A report
 that demonstrates breaking one of these is **in scope**:
 
-- **Permission-gate bypass** — a mutating tool (`fs_write`, `fs_edit`, `shell`)
+- **Permission-gate bypass** — a mutating tool (`write_file`, `edit_file`, `run_command`)
   executing without going through the `allow` / `ask` / `deny` gate.
 - **Workspace-sandbox escape** — a file tool reading or writing outside the
   configured workspace root (path-traversal, symlink, or normalization bugs).
-- **Unauthorized `shell` execution** — running a command without the gate, or a
+- **Unauthorized `run_command` execution** — running a command without the gate, or a
   summary shown to the user that does not match what is executed.
 - **Credential exfiltration** — extracting a stored secret (an API key _or_ a
   subscription OAuth token) from the Windows Credential Manager, from logs, from

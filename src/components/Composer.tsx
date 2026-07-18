@@ -1,6 +1,17 @@
 import { useEffect, useRef, useState } from "react";
+import { toolPresence } from "../lib/toolNames";
 import { useStore } from "../store/store";
-import { DANGER_MODES, estimateCost, PROVIDERS } from "../types";
+import {
+  DANGER_MODES,
+  MODEL_PRICING,
+  estimateCost,
+  modelInfo,
+  providerForModel,
+  providerGroups,
+  reasoningEffortLabel,
+  type PermissionMode,
+} from "../types";
+import { SelectMenu } from "./SelectMenu";
 
 /** Read the active session's model, falling back to the global default. */
 function useActiveModel(): string {
@@ -13,29 +24,6 @@ function useActiveModel(): string {
 // Auto-grow cap; kept in sync with the textarea's inline maxHeight so the JS
 // target and the CSS clip agree (otherwise the grow stops short at the smaller).
 const MAX_TEXTAREA_H = 220;
-
-// The core's tool names → honest, human presence phrases. Falls back to a generic
-// "running <name>…" for any tool not in the map, so a newly added core tool is
-// still surfaced truthfully rather than silently hidden.
-const TOOL_PHRASES: Record<string, string> = {
-  fs_read: "reading a file…",
-  fs_write: "writing a file…",
-  fs_edit: "editing a file…",
-  list: "browsing files…",
-  glob: "finding files…",
-  grep: "searching the code…",
-  shell: "running a command…",
-  task: "delegating to a subagent…",
-};
-function prettyTool(name: string): string {
-  return TOOL_PHRASES[name] ?? `running ${name}…`;
-}
-
-// How long the plan-mode notice lingers before it auto-dismisses itself. The
-// reminder has done its job once seen; it shouldn't hog the composer forever.
-// This is a LOCAL dismiss only — the persisted permission mode is untouched.
-// Exported so tests can advance fake timers by the exact dwell.
-export const PLAN_BANNER_AUTO_DISMISS_MS = 8000;
 
 // The live presence phrases, derived from REAL turn/stream state (never padded
 // latency). The dot color honors the brand semantics: cyan = the agent at work,
@@ -51,7 +39,7 @@ function presenceFor(
   // A tool is concretely running — name it honestly (driven by real tool_use events).
   // Gated on the "thinking" phase (reliably reset to idle at every turn end) so a
   // residual tool label can never surface on a new turn before its first real event.
-  if (phase === "thinking" && tool) return { text: prettyTool(tool), dot: "pc-dot pc-dot--cyan" };
+  if (phase === "thinking" && tool) return { text: toolPresence(tool), dot: "pc-dot pc-dot--cyan" };
   return { text: "thinking with you…", dot: "pc-dot pc-dot--cyan" };
 }
 
@@ -66,7 +54,15 @@ export function Composer() {
   const activeTool = useStore((s) => s.activeTool);
   const send = useStore((s) => s.send);
   const stop = useStore((s) => s.stop);
+  const newSession = useStore((s) => s.newSession);
+  const setShowSettings = useStore((s) => s.setShowSettings);
   const remoteMode = useStore((s) => s.remoteMode);
+  const activeModel = useActiveModel();
+  const openAIModels = useStore((s) => s.openAIModels);
+  const settings = useStore((s) => s.settings);
+  const oauthStatus = useStore((s) => s.oauthStatus);
+  const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
+  const settingsError = useStore((s) => s.settingsError);
   const ref = useRef<HTMLTextAreaElement>(null);
   // The pixel height of a single, empty row. Captured lazily from a collapsed
   // textarea so the post-submit collapse has a concrete target to ease toward —
@@ -75,7 +71,26 @@ export function Composer() {
   const rowHeightRef = useRef<number | null>(null);
 
   // Send is fireable only with non-whitespace content and no turn in flight.
-  const canSend = text.trim().length > 0 && !streaming;
+  const activeProvider = providerForModel(activeModel, openAIModels);
+  const openAIUnavailable = activeProvider === "openai" && openAIAuthStatus?.available === false;
+  const authenticated =
+    remoteMode ||
+    (activeProvider === "openai"
+      ? !openAIUnavailable && !!openAIAuthStatus?.signedIn
+      : !!oauthStatus?.signedIn || settings.apiKeySet);
+  const authHint =
+    activeProvider === "openai"
+      ? openAIUnavailable
+        ? (openAIAuthStatus?.unavailableReason ??
+          "ChatGPT subscription access is unavailable in this build")
+        : "Sign in with ChatGPT in Settings to send"
+      : "Sign in with Claude or add an API key in Settings to send";
+  const authAction = openAIUnavailable
+    ? "Open settings"
+    : activeProvider === "openai"
+      ? "Connect ChatGPT"
+      : "Connect Claude";
+  const canSend = text.trim().length > 0 && !streaming && authenticated;
   // Armed cue (motor anticipation): a one-shot pulse the moment Send becomes
   // fireable. Seeded from the initial value so a restored draft doesn't pulse on
   // mount — only a genuine disabled→enabled transition arms it.
@@ -103,16 +118,27 @@ export function Composer() {
   }, [armed]);
 
   const stopping = composerPhase === "stopping";
-  const presence = presenceFor(streaming, composerPhase, activeTool);
-  // Honest hint (only when it applies): Shift+Enter inserts a newline, so we only
-  // claim it once the draft is actually multi-line.
-  const multiline = text.includes("\n");
+  const presence = !activeId
+    ? { text: "Create or select a chat to start", dot: "pc-dot--idle" }
+    : !authenticated
+      ? { text: authHint, dot: "pc-dot pc-dot--danger" }
+      : presenceFor(streaming, composerPhase, activeTool);
+  const placeholder = !activeId
+    ? "Create or select a chat to begin…"
+    : streaming
+      ? "Draft your next message while Portcode works…"
+      : settings.permissionMode === "plan"
+        ? "Describe what you want planned — files will stay untouched…"
+        : "Describe a task, ask a question, or give an instruction…";
 
   // Keep the textarea height in sync when the draft changes externally
   // (e.g. a file path inserted from the explorer, or switching sessions).
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
+    if (rowHeightRef.current == null && el.clientHeight > 0) {
+      rowHeightRef.current = el.clientHeight;
+    }
     el.style.height = "auto";
     const next = Math.min(el.scrollHeight, MAX_TEXTAREA_H);
     // Memoize the single-row height the first time we see a collapsed textarea,
@@ -121,10 +147,9 @@ export function Composer() {
     el.style.height = next + "px";
   }, [text]);
 
-  // Return focus to the composer when a turn finishes — the textarea blurs when it
-  // goes disabled at turn start, which otherwise breaks the keyboard flow (you'd have
-  // to click back in). Only when nothing else grabbed focus (a permission button, the
-  // palette, another input), and never on mobile/remote where it would pop the keyboard.
+  // Return focus to the composer when a turn finishes if focus was otherwise lost.
+  // Never steal it from a permission button, picker, or another input, and never pop
+  // the software keyboard on the phone. Drafting remains available during the run.
   useEffect(() => {
     if (streaming || remoteMode) return;
     const el = ref.current;
@@ -133,7 +158,7 @@ export function Composer() {
 
   const submit = async () => {
     const t = text;
-    if (!t.trim() || streaming) return;
+    if (!t.trim() || streaming || !authenticated) return;
     setText("");
     // Collapse to the measured single-row height (a px target) so the declared
     // transition-[height] can ease the shrink; fall back to "auto" only if we
@@ -162,189 +187,191 @@ export function Composer() {
   };
 
   return (
-    <div className="border-t border-border bg-panel/80 px-6 pb-3 pt-3.5">
-      <PlanModeBanner />
-      {/* State-bearing neon frame: still + glowing at rest, FLOWING only while a turn
-          streams (data-busy) — motion encodes state instead of perpetual wallpaper. */}
+    <div className="pc-composer-dock">
+      {/* The perimeter is deliberately quiet at rest. Focus, a sendable draft, and a
+          running turn each earn a distinct state cue instead of permanent rainbow noise. */}
       <div
         data-busy={streaming ? "true" : undefined}
+        data-armed={canSend ? "true" : undefined}
+        aria-busy={streaming}
         className="pc-neon-frame w-full max-w-none transition-[opacity,filter] duration-200 motion-reduce:transition-none"
       >
-        <div className="flex items-end gap-2.5 rounded-[12px] bg-panel px-3 py-2.5">
-          <textarea
-            ref={ref}
-            value={text}
-            onChange={(e) => {
-              setText(e.target.value);
-              autoGrow();
-            }}
-            onKeyDown={onKeyDown}
-            // Disabled while a turn streams, and when there's no active session to
-            // draft into — an enabled field whose keystrokes silently go nowhere
-            // (setDraft no-ops without an activeId) would be a dead-end, not honest.
-            disabled={streaming || !activeId}
-            aria-busy={streaming}
-            aria-label="Message Portcode"
-            rows={1}
-            placeholder="Describe a task, ask a question, or give an instruction…"
-            style={{ maxHeight: MAX_TEXTAREA_H }}
-            className="flex-1 resize-none bg-transparent text-[13.5px] leading-[1.5] text-fg outline-none transition-[height,opacity,filter] duration-150 ease-out motion-reduce:transition-none placeholder:text-faint select-text disabled:cursor-not-allowed disabled:opacity-60 disabled:saturate-[0.6]"
-          />
-          <ModelPicker />
-          {/* Send and Stop are STACKED in one slot and cross-fade (~130ms) rather than
-              swapping instantly — a change-blindness-safe transition (Norman gulf of
-              evaluation). The hidden control leaves the tab order and is unclickable. */}
-          <div className="relative h-[34px] w-[34px] shrink-0">
-            <button
-              onClick={() => void submit()}
-              disabled={!canSend}
-              tabIndex={streaming ? -1 : 0}
-              aria-hidden={streaming || undefined}
-              className={`pc-send pc-action ${streaming ? "pc-action--hidden" : "pc-action--shown"}${armed ? " pc-armed" : ""}`}
-              title="Send (Enter)"
-              aria-label="Send message"
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                <path
-                  d="M5 12h14M13 6l6 6-6 6"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              </svg>
-            </button>
-            <button
-              onClick={() => void stop()}
-              disabled={!streaming || stopping}
-              tabIndex={streaming ? 0 : -1}
-              aria-hidden={!streaming || undefined}
-              className={`pc-stop pc-action ${streaming ? "pc-action--shown" : "pc-action--hidden"}${stopping ? " pc-stop--stopping" : ""}`}
-              title="Stop"
-              aria-label={stopping ? "Stopping…" : "Stop generating"}
-            >
-              <span className="block h-3 w-3 rounded-sm bg-danger" />
-            </button>
+        <div className="pc-composer-surface">
+          <div className="pc-composer-input-zone">
+            <textarea
+              ref={ref}
+              value={text}
+              onChange={(e) => {
+                setText(e.target.value);
+                autoGrow();
+              }}
+              onKeyDown={onKeyDown}
+              // Per-session drafts are durable, so the writing surface stays available
+              // while Portcode works. Send remains gated until the current turn ends.
+              disabled={!activeId}
+              aria-describedby="pc-composer-status"
+              aria-label="Message Portcode"
+              rows={2}
+              placeholder={placeholder}
+              style={{ maxHeight: `min(${MAX_TEXTAREA_H}px, 30dvh)` }}
+              className="pc-composer-textarea resize-none bg-transparent text-fg outline-none transition-[height,opacity,filter] duration-150 ease-out motion-reduce:transition-none placeholder:text-muted select-text disabled:cursor-not-allowed disabled:opacity-60"
+            />
+          </div>
+
+          <div className="pc-composer-toolbar">
+            <div className="pc-composer-controls" aria-label="Turn controls">
+              <PermissionPicker />
+              <ModelPicker />
+              <ReasoningPicker />
+            </div>
+
+            <div className="pc-composer-state">
+              <span
+                id="pc-composer-status"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+                className="pc-composer-presence"
+              >
+                <span className={presence.dot} aria-hidden="true" />
+                <span>{presence.text}</span>
+              </span>
+              {settingsError ? (
+                <div className="pc-composer-recovery pc-composer-recovery--error">
+                  <span role="alert" title={settingsError}>
+                    That setting wasn’t saved
+                  </span>
+                  <button type="button" onClick={() => setShowSettings(true)}>
+                    Review settings
+                  </button>
+                </div>
+              ) : (
+                <>
+                  {!activeId && (
+                    <button
+                      type="button"
+                      className="pc-composer-recovery-action"
+                      onClick={() => void newSession()}
+                    >
+                      New chat
+                    </button>
+                  )}
+                  {activeId && !authenticated && (
+                    <button
+                      type="button"
+                      className="pc-composer-recovery-action"
+                      onClick={() => setShowSettings(true)}
+                    >
+                      {authAction}
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+
+            {/* Send and Stop remain stacked in one predictable slot. While Stop is
+                visible, the full writing surface stays available for the next draft. */}
+            <div className="pc-composer-action-slot">
+              <button
+                onClick={() => void submit()}
+                disabled={!canSend}
+                tabIndex={streaming ? -1 : 0}
+                aria-hidden={streaming || undefined}
+                className={`pc-send pc-action ${streaming ? "pc-action--hidden" : "pc-action--shown"}${armed ? " pc-armed" : ""}`}
+                title={authenticated ? "Send (Enter)" : authHint}
+                aria-label={authenticated ? "Send message" : authHint}
+              >
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none">
+                  <path
+                    d="M12 19V5M5.5 11.5 12 5l6.5 6.5"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
+              <button
+                onClick={() => void stop()}
+                disabled={!streaming || stopping}
+                tabIndex={streaming ? 0 : -1}
+                aria-hidden={!streaming || undefined}
+                className={`pc-stop pc-action ${streaming ? "pc-action--shown" : "pc-action--hidden"}${stopping ? " pc-stop--stopping" : ""}`}
+                title="Stop"
+                aria-label={stopping ? "Stopping…" : "Stop generating"}
+              >
+                <span className="block h-3 w-3 rounded-sm bg-danger" />
+              </button>
+            </div>
           </div>
         </div>
       </div>
-      <div className="mt-[7px] flex w-full max-w-none items-center justify-between gap-3 font-mono text-[10.5px]">
-        <div className="flex min-w-0 items-center gap-2.5">
-          <ModePill />
-          {/* Live status region (para-social presence + WCAG status): the presence
-              phrase is announced politely; the per-tick token counter is kept OUT of
-              this region (it lives in UsageMeter, aria-hidden) so AT isn't spammed. */}
-          <span
-            role="status"
-            aria-live="polite"
-            aria-atomic="true"
-            className="flex min-w-0 items-center gap-1.5 text-muted"
-          >
-            <span className={presence.dot} aria-hidden="true" />
-            <span className="truncate">{presence.text}</span>
-          </span>
-          {multiline && (
-            <span className="hidden whitespace-nowrap text-muted sm:inline" aria-hidden="true">
-              Shift+Enter for a new line
-            </span>
-          )}
-        </div>
+
+      <div className="pc-composer-meta">
+        <span className="pc-composer-shortcuts" aria-hidden="true">
+          {activeId
+            ? streaming
+              ? "Keep drafting · send unlocks when this run finishes"
+              : "Enter to send · Shift+Enter for a new line"
+            : "Your drafts are saved per chat"}
+        </span>
         <UsageMeter />
       </div>
     </div>
   );
 }
 
-/**
- * The plan-mode banner + "Exit plan mode" affordance (the approve-to-apply
- * control). Shown only while plan mode is active; desktop-only (the mode is a
- * desktop-side gate setting). Exiting switches back to the Default mode so the
- * next message can mutate the workspace.
- *
- * The notice is also dismissable two ways WITHOUT touching the persisted mode:
- * a ✕ close button and an auto-close timer. Both are purely local (no
- * updateSettings) so plan mode stays armed — the banner is just a reminder, and
- * a reminder that can't be put away is nagware. The local dismiss resets each
- * time plan mode is (re-)entered, so the reminder returns on a fresh entry.
- */
-function PlanModeBanner() {
+const MODE_PRESENTATION: Record<PermissionMode, { label: string; detail: string }> = {
+  default: { label: "Ask", detail: "confirms sensitive actions" },
+  acceptEdits: { label: "Edits allowed", detail: "workspace edits don’t ask" },
+  plan: { label: "Plan only", detail: "no files will change" },
+  auto: { label: "Auto approve", detail: "broad access" },
+  bypass: { label: "Bypass confirmations", detail: "no confirmations" },
+};
+
+/** Every desktop permission mode in one explicit, provider-native dropdown. */
+function PermissionPicker() {
   const mode = useStore((s) => s.settings.permissionMode);
   const updateSettings = useStore((s) => s.updateSettings);
   const remoteMode = useStore((s) => s.remoteMode);
-  // Local, non-persisting dismiss — never written back to settings.
-  const [dismissed, setDismissed] = useState(false);
-
-  // Re-entering plan mode should surface the reminder again, so clear any prior
-  // local dismiss whenever the mode changes (in particular on a re-entry to plan).
-  useEffect(() => setDismissed(false), [mode]);
-
-  // Auto-close: the reminder fades itself out after a sensible dwell so it can't
-  // permanently crowd the composer. Cleared on unmount / mode change so a stale
-  // timer can't dismiss a freshly re-shown banner.
-  useEffect(() => {
-    if (mode !== "plan") return;
-    const t = setTimeout(() => setDismissed(true), PLAN_BANNER_AUTO_DISMISS_MS);
-    return () => clearTimeout(t);
-  }, [mode]);
-
-  if (remoteMode || mode !== "plan" || dismissed) return null;
-  return (
-    <div
-      role="status"
-      className="mb-2.5 flex items-center justify-between gap-3 rounded-lg border border-accent-2/40 bg-accent-2/10 px-3 py-2 text-[11.5px] text-accent-2"
-    >
-      <span>
-        <strong>Plan mode</strong> — the agent will design a plan and won’t modify files. Approve to
-        apply.
-      </span>
-      <div className="flex shrink-0 items-center gap-2">
-        <button
-          type="button"
-          onClick={() => void updateSettings({ permissionMode: "default" })}
-          className="shrink-0 rounded border border-accent-2/50 bg-accent-2/15 px-2.5 py-1 text-accent-2 hover:bg-accent-2/25"
-        >
-          Exit plan mode
-        </button>
-        <button
-          type="button"
-          onClick={() => setDismissed(true)}
-          aria-label="Dismiss plan mode notice"
-          title="Dismiss"
-          className="shrink-0 rounded px-1 leading-none text-accent-2/70 hover:text-accent-2"
-        >
-          ✕
-        </button>
-      </div>
-    </div>
-  );
-}
-
-/**
- * The permission-mode pill — Portcode's native equivalent of the Shift+Tab mode
- * cycle. Clicking advances through the safe trio (default → accept edits → plan);
- * auto/bypass are Settings-only opt-in and never reached here. Shown in a danger
- * colour with a warning glyph when a loosened mode is active. Desktop-only — the
- * mode is a desktop-side gate setting the phone observes but doesn't drive.
- */
-function ModePill() {
-  const mode = useStore((s) => s.settings.permissionMode);
-  const cycle = useStore((s) => s.cyclePermissionMode);
-  const remoteMode = useStore((s) => s.remoteMode);
+  const streaming = useStore((s) => s.streaming);
   if (remoteMode) return null;
   const danger = DANGER_MODES.includes(mode);
+  const presentation = MODE_PRESENTATION[mode];
   return (
-    <button
-      type="button"
-      onClick={() => void cycle()}
-      title="Permission mode — click to cycle (default → accept edits → plan)"
-      aria-label={`Permission mode: ${mode}. Click to cycle.`}
-      className={`pc-mode-pill shrink-0 rounded px-1.5 py-0.5 uppercase ${
-        danger ? "text-danger" : "text-muted hover:text-fg"
-      }`}
-    >
-      {danger ? "⚠ " : ""}
-      {mode}
-    </button>
+    <div className="pc-composer-field pc-composer-field--permission">
+      <span className="pc-composer-field__label" aria-hidden="true">
+        Access
+      </span>
+      <SelectMenu
+        label="Permission mode"
+        title={`${presentation.label} — ${presentation.detail}`}
+        value={mode}
+        onChange={(next) => void updateSettings({ permissionMode: next as PermissionMode })}
+        disabled={streaming}
+        placement="top"
+        className="min-w-0"
+        buttonClassName={`pc-composer-select-button pc-permission-select${danger ? " pc-permission-select--danger" : ""}`}
+        groups={[
+          {
+            id: "standard-access",
+            label: "Standard access",
+            options: (["default", "acceptEdits", "plan"] as PermissionMode[]).map((value) => ({
+              value,
+              label: MODE_PRESENTATION[value].label,
+            })),
+          },
+          {
+            id: "elevated-access",
+            label: "Elevated access",
+            options: (["auto", "bypass"] as PermissionMode[]).map((value) => ({
+              value,
+              label: MODE_PRESENTATION[value].label,
+            })),
+          },
+        ]}
+      />
+    </div>
   );
 }
 
@@ -354,56 +381,116 @@ function ModelPicker() {
   const setSessionModel = useStore((s) => s.setSessionModel);
   const activeId = useStore((s) => s.activeId);
   const streaming = useStore((s) => s.streaming);
+  const remoteMode = useStore((s) => s.remoteMode);
+  const openAIModels = useStore((s) => s.openAIModels);
+  const groups = providerGroups(openAIModels).filter((provider) => provider.models.length > 0);
+  // The desktop owns session models and provider credentials. Until the remote
+  // protocol has an authoritative set-model command, showing a phone-side picker
+  // would promise a change that the next desktop session snapshot simply reverts.
+  if (remoteMode) return null;
   return (
-    <select
-      aria-label="Model"
-      value={model}
-      onChange={(e) => void setSessionModel(e.target.value)}
-      disabled={streaming || !activeId}
-      className="shrink-0 rounded-lg border border-border bg-panel-2 px-2.5 py-1.5 text-[12px] text-fg outline-none disabled:opacity-50"
-    >
-      {PROVIDERS.map((p) => (
-        <optgroup key={p.id} label={p.label}>
-          {p.models.map((mdl) => (
-            <option key={mdl.id} value={mdl.id}>
-              {mdl.label}
-            </option>
-          ))}
-        </optgroup>
-      ))}
-    </select>
+    <div className="pc-composer-field pc-composer-field--model">
+      <span className="pc-composer-field__label" aria-hidden="true">
+        Chat model
+      </span>
+      <SelectMenu
+        label="Model"
+        title={modelInfo(model, openAIModels)?.label ?? model}
+        value={model}
+        onChange={(next) => void setSessionModel(next)}
+        disabled={streaming || !activeId}
+        placement="top"
+        className="min-w-0"
+        buttonClassName="pc-composer-select-button"
+        groups={groups.map((provider) => ({
+          id: provider.id,
+          label: provider.label,
+          options: provider.models.map((candidate) => ({
+            value: candidate.id,
+            label: candidate.label,
+          })),
+        }))}
+      />
+    </div>
+  );
+}
+
+/** Compact reasoning control, shown only for OpenAI models that advertise it. */
+function ReasoningPicker() {
+  const model = useActiveModel();
+  const openAIModels = useStore((s) => s.openAIModels);
+  const effort = useStore((s) => s.settings.reasoningEffort);
+  const updateSettings = useStore((s) => s.updateSettings);
+  const streaming = useStore((s) => s.streaming);
+  const remoteMode = useStore((s) => s.remoteMode);
+  const supported = modelInfo(model, openAIModels)?.reasoningEfforts ?? [];
+  if (remoteMode || providerForModel(model, openAIModels) !== "openai" || supported.length === 0) {
+    return null;
+  }
+  return (
+    <div className="pc-composer-field pc-composer-field--reasoning">
+      <span className="pc-composer-field__label" aria-hidden="true">
+        Thinking default
+      </span>
+      <SelectMenu
+        label="Reasoning level"
+        title="Default reasoning level across chats"
+        value={effort}
+        onChange={(next) => void updateSettings({ reasoningEffort: next })}
+        disabled={streaming}
+        placement="top"
+        className="min-w-0"
+        buttonClassName="pc-composer-select-button"
+        groups={[
+          {
+            id: "reasoning",
+            options: supported.map((level) => ({
+              value: level,
+              label: reasoningEffortLabel(level),
+            })),
+          },
+        ]}
+      />
+    </div>
   );
 }
 
 function UsageMeter() {
   const model = useActiveModel();
+  const openAIModels = useStore((s) => s.openAIModels);
   const usage = useStore((s) => (s.activeId ? s.usage[s.activeId] : undefined));
   const total = usage ? usage.input + usage.output : 0;
   const cost = usage ? estimateCost(model, usage) : 0;
+  const openAI = providerForModel(model, openAIModels) === "openai";
+  const label = modelInfo(model, openAIModels)?.label ?? model;
+  if (total === 0) return null;
+  const costKnown = openAI || Object.prototype.hasOwnProperty.call(MODEL_PRICING, model);
+  const costLabel = openAI
+    ? "ChatGPT plan"
+    : costKnown
+      ? `$${cost.toFixed(cost < 0.01 ? 4 : 2)} estimated`
+      : "Cost unavailable";
   return (
-    <span className="flex shrink-0 items-center gap-1.5 text-muted">
-      {total > 0 && (
-        // aria-hidden: the token/cost numbers tick on every streaming delta, so they
-        // stay out of the assistive-tech announcement stream (the presence region is
-        // the spoken channel). tabular-nums keeps the counter from reflowing as digits
-        // change width.
-        <span
-          className="flex items-center gap-1.5 tabular-nums"
-          aria-hidden="true"
-          title={`${usage!.input.toLocaleString()} in · ${usage!.output.toLocaleString()} out`}
-        >
-          <span className="text-accent-2">{fmtTokens(total)} tok</span>
-          <span>·</span>
-          <span className="text-success">${cost.toFixed(cost < 0.01 ? 4 : 2)}</span>
-          <span>·</span>
-        </span>
-      )}
-      <span>{model}</span>
+    <span
+      role="group"
+      className="pc-composer-usage"
+      aria-label={`Session usage: ${total.toLocaleString()} tokens, ${usage!.input.toLocaleString()} input and ${usage!.output.toLocaleString()} output; ${costLabel}; ${label}`}
+    >
+      <span
+        aria-hidden="true"
+        title={`${usage!.input.toLocaleString()} in · ${usage!.output.toLocaleString()} out`}
+      >
+        <span className="pc-composer-usage__label">Session</span>
+        <span className="pc-composer-usage__tokens">{fmtTokens(total)} tokens</span>
+        <span>·</span>
+        <span>{costLabel}</span>
+      </span>
     </span>
   );
 }
 
 function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
   if (n >= 1000) return (n / 1000).toFixed(1) + "k";
   return String(n);
 }

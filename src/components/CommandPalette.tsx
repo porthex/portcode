@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "../store/store";
-import { MODELS } from "../types";
+import { modelCatalog } from "../types";
 import type { SearchHit } from "../types";
 
 interface Command {
@@ -19,9 +19,14 @@ export function CommandPalette() {
   const setShow = useStore((s) => s.setShowPalette);
   const newSession = useStore((s) => s.newSession);
   const toggleFiles = useStore((s) => s.toggleFiles);
+  const setWorkspaceSurface = useStore((s) => s.setWorkspaceSurface);
   const setShowSettings = useStore((s) => s.setShowSettings);
   const openWorkspace = useStore((s) => s.openWorkspace);
   const setSessionModel = useStore((s) => s.setSessionModel);
+  const openAIModels = useStore((s) => s.openAIModels);
+  const streaming = useStore((s) => s.streaming);
+  const remoteMode = useStore((s) => s.remoteMode);
+  const remoteConnected = useStore((s) => s.remoteConnected);
   const searchMessages = useStore((s) => s.searchMessages);
   const jumpToMessage = useStore((s) => s.jumpToMessage);
   const sessions = useStore((s) => s.sessions);
@@ -33,6 +38,16 @@ export function CommandPalette() {
   const commands = useMemo<Command[]>(
     () => [
       { id: "new", label: "New chat", glyph: "+", hint: "Ctrl+N", run: () => void newSession() },
+      ...(!remoteMode && !remoteConnected
+        ? [
+            {
+              id: "review",
+              label: "Open review workspace",
+              glyph: "±",
+              run: () => setWorkspaceSurface("review"),
+            },
+          ]
+        : []),
       { id: "files", label: "Toggle file explorer", glyph: "◤", hint: "Ctrl+B", run: toggleFiles },
       { id: "open", label: "Open folder…", glyph: "◈", run: () => void openWorkspace() },
       {
@@ -42,14 +57,27 @@ export function CommandPalette() {
         hint: "Ctrl+,",
         run: () => setShowSettings(true),
       },
-      ...MODELS.map((m) => ({
-        id: "model-" + m.id,
-        label: `Model: ${m.label}`,
-        glyph: "◉",
-        run: () => void setSessionModel(m.id),
-      })),
+      ...(!streaming && !remoteMode && !remoteConnected
+        ? modelCatalog(openAIModels).map((m) => ({
+            id: "model-" + m.id,
+            label: `Model: ${m.label}`,
+            glyph: "◉",
+            run: () => void setSessionModel(m.id),
+          }))
+        : []),
     ],
-    [newSession, toggleFiles, openWorkspace, setShowSettings, setSessionModel],
+    [
+      newSession,
+      toggleFiles,
+      setWorkspaceSurface,
+      openWorkspace,
+      setShowSettings,
+      setSessionModel,
+      openAIModels,
+      streaming,
+      remoteMode,
+      remoteConnected,
+    ],
   );
 
   const filtered = useMemo(() => {
@@ -99,7 +127,7 @@ export function CommandPalette() {
 
   const selRef = useRef<HTMLButtonElement>(null);
 
-  // Capture the opener (the ⌘K button or composer that triggered the palette) on
+  // Capture the opener (the Ctrl+K button or composer that triggered the palette) on
   // the rising edge of `show`, during render — BEFORE the search input's autoFocus
   // runs in commit and steals document.activeElement. A passive effect would
   // capture the input instead, so the restore below would no-op (the input is gone
@@ -190,7 +218,9 @@ export function CommandPalette() {
       >
         <div className="pc-sweep pc-sweep--cyan" />
         <div className="flex items-center gap-2.5 border-b border-border px-4 py-3.5">
-          <span className="font-mono text-accent">⌘</span>
+          <span aria-hidden="true" className="font-mono text-accent">
+            &gt;
+          </span>
           <input
             autoFocus
             aria-label="Command palette search"

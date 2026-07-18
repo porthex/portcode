@@ -35,31 +35,31 @@ beforeEach(() => {
 
 describe("summarize (header summary)", () => {
   it("prefers an input.path", () => {
-    render(<ToolCall name="fs_read" input={{ path: "src/main.ts" }} />);
+    render(<ToolCall name="read_file" input={{ path: "src/main.ts" }} />);
+    expect(screen.getByText("Read file")).toBeInTheDocument();
     expect(screen.getByText("src/main.ts")).toBeInTheDocument();
   });
 
   it("falls back to input.command when there is no path", () => {
-    render(<ToolCall name="shell" input={{ command: "ls -la" }} />);
+    render(<ToolCall name="run_command" input={{ command: "ls -la" }} />);
     expect(screen.getByText("ls -la")).toBeInTheDocument();
   });
 
   it("falls back to input.pattern when there is no path or command", () => {
-    render(<ToolCall name="grep" input={{ pattern: "TODO" }} />);
+    render(<ToolCall name="search_text" input={{ pattern: "TODO" }} />);
     expect(screen.getByText("TODO")).toBeInTheDocument();
   });
 
-  it("uses the tool name when input is an object without summarizable keys", () => {
-    // summarize() falls back to the name; the path span is suppressed so the
-    // name renders exactly once (the mono accent label) rather than twice.
+  it("humanizes an unknown tool when input has no summarizable keys", () => {
     const { container } = render(<ToolCall name="custom_tool" input={{ other: 1 }} />);
-    expect(screen.getAllByText("custom_tool")).toHaveLength(1);
+    expect(screen.getByText("Custom tool")).toBeInTheDocument();
+    expect(screen.queryByText("custom_tool")).not.toBeInTheDocument();
     expect(container.querySelector(".pc-toolcall__path")).toBeNull();
   });
 
   it("uses the tool name when input is not an object", () => {
     const { container } = render(<ToolCall name="noop" input={null} />);
-    expect(screen.getAllByText("noop")).toHaveLength(1);
+    expect(screen.getByText("Noop")).toBeInTheDocument();
     expect(container.querySelector(".pc-toolcall__path")).toBeNull();
   });
 
@@ -67,18 +67,15 @@ describe("summarize (header summary)", () => {
     const { container } = render(
       <ToolCall name="weird" input={{ path: 42, command: true, pattern: [] }} />,
     );
-    expect(screen.getAllByText("weird")).toHaveLength(1);
+    expect(screen.getByText("Weird")).toBeInTheDocument();
     expect(container.querySelector(".pc-toolcall__path")).toBeNull();
   });
 
-  it("renders the tool name once (no duplicate path span) for non-summarizable input", () => {
-    // A tool like list_sessions invoked with {} has no path/command/pattern, so
-    // summarize() returns the name. The header must not print "list_sessions
-    // list_sessions" — only the mono label, with the faint path span omitted.
+  it("renders a friendly label once for non-summarizable input", () => {
     render(<ToolCall name="list_sessions" input={{}} />);
     const head = screen.getByRole("button");
-    expect(screen.getAllByText("list_sessions")).toHaveLength(1);
-    expect(head.querySelector(".pc-toolcall__name")?.textContent).toBe("list_sessions");
+    expect(screen.getByText("List sessions")).toBeInTheDocument();
+    expect(head.querySelector(".pc-toolcall__name")?.textContent).toBe("List sessions");
     expect(head.querySelector(".pc-toolcall__path")).toBeNull();
   });
 
@@ -88,7 +85,7 @@ describe("summarize (header summary)", () => {
     // and absorb the free space — keeping the right-aligned ml-auto group
     // (the +/- diff counts and the ▸/▾ chevron) visible for an unbroken command.
     const longCommand = "x".repeat(400);
-    const { container } = render(<ToolCall name="shell" input={{ command: longCommand }} />);
+    const { container } = render(<ToolCall name="run_command" input={{ command: longCommand }} />);
     const path = container.querySelector(".pc-toolcall__path") as HTMLElement;
     expect(path).not.toBeNull();
     expect(path.textContent).toBe(longCommand);
@@ -128,34 +125,51 @@ describe("StatusDot", () => {
 });
 
 describe("collapse / expand toggle", () => {
-  it("keeps the body mounted but collapsed + hidden, with the ▸ caret, when not expanded", () => {
+  it("keeps heavy details unmounted, with the ▸ caret, when not expanded", () => {
     render(<ToolCall name="t" input={{ path: "a.ts" }} result={result()} />);
     expect(screen.getByText("▸")).toBeInTheDocument();
-    expect(screen.getByRole("button")).toHaveAttribute("aria-expanded", "false");
-    // The body stays mounted so it can animate open/closed, but is hidden from
-    // assistive tech (and visually clipped by the grid 0fr accordion) while collapsed.
-    expect(screen.getByText("Input").closest("[aria-hidden]")).toHaveAttribute(
-      "aria-hidden",
-      "true",
-    );
+    const toggle = screen.getByRole("button");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveAttribute("aria-controls");
+    // Neither serialized input nor result text should occupy the hidden DOM.
+    expect(screen.queryByText("Input")).not.toBeInTheDocument();
+    expect(screen.queryByText("ok")).not.toBeInTheDocument();
   });
 
   it("reveals the input + ▾ caret when expanded, and re-collapses on a second click", () => {
-    render(<ToolCall name="t" input={{ path: "a.ts" }} result={result()} />);
+    render(<ToolCall name="read_file" input={{ path: "a.ts" }} result={result()} />);
     const toggle = screen.getByRole("button");
-    const body = () => screen.getByText("Input").closest("[aria-hidden]");
+    const body = () => screen.queryByRole("region");
+
+    // The friendly action is visible; the technical ID stays inside diagnostics.
+    expect(screen.getByText("Read file")).toBeInTheDocument();
+    expect(screen.queryByText("read_file")).not.toBeInTheDocument();
 
     fireEvent.click(toggle);
     expect(screen.getByText("▾")).toBeInTheDocument();
     expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(body()).toHaveAttribute("aria-hidden", "false");
+    expect(body()).toHaveAttribute("id", toggle.getAttribute("aria-controls"));
+    expect(screen.getByText("Tool ID")).toBeInTheDocument();
+    expect(screen.getByText("read_file")).toBeInTheDocument();
     // input serialized as pretty JSON
     expect(screen.getByText(/"path": "a\.ts"/)).toBeInTheDocument();
 
     fireEvent.click(toggle);
     expect(screen.getByText("▸")).toBeInTheDocument();
     expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(body()).toHaveAttribute("aria-hidden", "true");
+    expect(body()).not.toBeInTheDocument();
+    expect(screen.queryByText("read_file")).not.toBeInTheDocument();
+    expect(screen.queryByText("Input")).not.toBeInTheDocument();
+  });
+
+  it("defers input serialization until details are opened", () => {
+    const toJSON = vi.fn(() => ({ path: "deferred.ts" }));
+    render(<ToolCall name="custom_tool" input={{ toJSON }} result={result()} />);
+
+    expect(toJSON).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button"));
+    expect(toJSON).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/"path": "deferred\.ts"/)).toBeInTheDocument();
   });
 
   it("exposes aria-expanded/aria-label that flip false→true for screen readers", () => {
@@ -166,7 +180,7 @@ describe("collapse / expand toggle", () => {
     // The accessible name now folds in the tool name, target, and run state
     // so a screen-reader user gets what the colored dot conveys visually.
     expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(toggle.getAttribute("aria-label")).toMatch(/^t a\.ts, completed, expand output$/);
+    expect(toggle.getAttribute("aria-label")).toMatch(/^T a\.ts, completed, expand output$/);
 
     fireEvent.click(toggle);
 
@@ -193,14 +207,10 @@ describe("collapse / expand toggle", () => {
     );
   });
 
-  it("announces the tool name once when summarize() falls back to it", () => {
-    // When the input has no summarizable field, summarize() returns the name,
-    // which the visible UI shows twice (mono label + summary span). The label
-    // must NOT double it — a screen reader should hear "custom_tool" once.
+  it("announces a friendly unknown-tool label once", () => {
     render(<ToolCall name="custom_tool" input={{ other: 1 }} />);
     const label = screen.getByRole("button").getAttribute("aria-label");
-    expect(label).not.toMatch(/custom_tool custom_tool/);
-    expect(label).toMatch(/^custom_tool, running, expand output$/);
+    expect(label).toMatch(/^Custom tool, running, expand output$/);
   });
 
   it("marks the decorative status dot aria-hidden so it isn't announced", () => {
@@ -228,6 +238,24 @@ describe("result block rendering", () => {
     expect(screen.getByText("all good")).toBeInTheDocument();
   });
 
+  it("truncates exceptionally large plain output with an explicit footer", () => {
+    const output = "x".repeat(60_000);
+    render(<ToolCall name="t" input={{}} result={result({ output })} />);
+
+    // Collapsed output remains absent even when it is exceptionally large.
+    expect(screen.queryByText(/more characters \(truncated\)/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+
+    expect(screen.getByText(/20,000 more characters \(truncated\)/)).toBeInTheDocument();
+    const pre = screen.getByText(/20,000 more characters/).closest("pre");
+    expect(pre?.textContent?.length).toBeLessThan(output.length);
+
+    fireEvent.click(screen.getByRole("button", { name: "Show full output" }));
+    expect(screen.queryByText(/more characters \(truncated\)/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Show full output" })).not.toBeInTheDocument();
+    expect(pre?.textContent).toBe(output);
+  });
+
   it("labels an error result 'Error', styles it danger, and never uses DiffView", () => {
     // Output LOOKS like a diff, but isError must force the plain <pre> path.
     const diffOutput = "@@ -1 +1 @@\n-old\n+new";
@@ -245,6 +273,26 @@ describe("result block rendering", () => {
     expect(pre).toHaveTextContent("@@ -1 +1 @@");
     expect(pre).toHaveTextContent("-old");
     expect(pre).toHaveTextContent("+new");
+  });
+
+  it("distinguishes an interrupted tool from a failed tool", () => {
+    render(
+      <ToolCall
+        name="fs_read"
+        input={{ path: "large.log" }}
+        result={result({
+          output: "Interrupted: the run was stopped before this tool returned a result.",
+          isError: true,
+        })}
+      />,
+    );
+
+    const toggle = screen.getByRole("button", { name: /read file.*interrupted.*expand output/i });
+    expect(toggle.closest(".pc-toolcall")).toHaveClass("pc-toolcall--interrupted");
+    fireEvent.click(toggle);
+    expect(screen.getByText("Interrupted")).toBeInTheDocument();
+    expect(screen.getByText(/^Interrupted:/)).toHaveClass("text-warn");
+    expect(screen.queryByText("Error")).not.toBeInTheDocument();
   });
 });
 
@@ -351,12 +399,14 @@ describe("looksLikeDiff / DiffView", () => {
     );
     const toggle = screen.getByRole("button");
 
-    // Header counts are derived from the memoized scan even while collapsed:
+    // Expensive diff detection/counting is deferred until the first disclosure.
+    expect(screen.queryByText("+1")).not.toBeInTheDocument();
+    expect(screen.queryByText("-1")).not.toBeInTheDocument();
+
+    fireEvent.click(toggle); // open
     // fullDiff has one "+added" / one "-removed" (file headers excluded).
     expect(screen.getByText("+1")).toBeInTheDocument();
     expect(screen.getByText("-1")).toBeInTheDocument();
-
-    fireEvent.click(toggle); // open
     const openHtml = (container.querySelector(".pc-diff") as HTMLElement).innerHTML;
     const openLineCount = container.querySelectorAll(".pc-diff .pc-diff-line").length;
 
@@ -458,6 +508,7 @@ describe("diff stat chips (+N / -N)", () => {
         result={result({ output: "@@ -0,0 +1,2 @@\n+one\n+two" })}
       />,
     );
+    fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText("+2")).toBeInTheDocument();
     expect(screen.queryByText("-0")).not.toBeInTheDocument();
   });
@@ -470,6 +521,7 @@ describe("diff stat chips (+N / -N)", () => {
         result={result({ output: "@@ -1,2 +0,0 @@\n-one\n-two" })}
       />,
     );
+    fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText("-2")).toBeInTheDocument();
     expect(screen.queryByText("+0")).not.toBeInTheDocument();
   });
@@ -482,6 +534,7 @@ describe("diff stat chips (+N / -N)", () => {
         result={result({ output: "@@ -1 +1 @@\n-old\n+new" })}
       />,
     );
+    fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText("+1")).toBeInTheDocument();
     expect(screen.getByText("-1")).toBeInTheDocument();
   });

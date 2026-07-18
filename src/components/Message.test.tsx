@@ -139,7 +139,7 @@ describe("MessageView — assistant role", () => {
     expect(usrRow.className).not.toContain("pc-msg-enter");
   });
 
-  it("renders a tool_use block as a ToolCall and pairs it with a non-error tool_result", () => {
+  it("renders a successful read as compact activity with raw details on demand", () => {
     render(
       <MessageView
         message={message("assistant", [
@@ -149,14 +149,25 @@ describe("MessageView — assistant role", () => {
       />,
     );
 
-    // ToolCall shows the tool name and, via summarize(), the input path.
-    expect(screen.getByText("fs_read")).toBeInTheDocument();
+    // Routine implementation details stay quiet by default.
+    expect(screen.getByText("Read file")).toBeInTheDocument();
     expect(screen.getByText("src/app.ts")).toBeInTheDocument();
+    expect(screen.queryByText("fs_read")).not.toBeInTheDocument();
+    expect(screen.queryByText("file contents")).not.toBeInTheDocument();
 
-    // The matched result feeds ToolCall; expand the disclosure to reveal output.
-    fireEvent.click(screen.getByRole("button"));
+    // First reveal operations, then reveal this operation's technical ID + result.
+    const activityToggle = screen.getByRole("button", { name: /read file.*expand details/i });
+    fireEvent.click(activityToggle);
+    expect(screen.getByText("Raw activity")).toBeInTheDocument();
+    expect(screen.queryByText("fs_read")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /read file.*expand output/i }));
+    expect(screen.getByText("fs_read")).toBeInTheDocument();
     expect(screen.getByText("Result")).toBeInTheDocument();
     expect(screen.getByText("file contents")).toBeInTheDocument();
+
+    fireEvent.click(activityToggle);
+    expect(screen.queryByText("fs_read")).not.toBeInTheDocument();
+    expect(screen.queryByText("file contents")).not.toBeInTheDocument();
   });
 
   it("passes an error tool_result through so ToolCall renders the error branch", () => {
@@ -169,7 +180,8 @@ describe("MessageView — assistant role", () => {
       />,
     );
 
-    expect(screen.getByText("shell")).toBeInTheDocument();
+    expect(screen.getByText("Run command")).toBeInTheDocument();
+    expect(screen.queryByText("shell")).not.toBeInTheDocument();
     expect(screen.getByText("ls")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button"));
@@ -189,7 +201,8 @@ describe("MessageView — assistant role", () => {
       />,
     );
 
-    expect(screen.getByText("fs_write")).toBeInTheDocument();
+    expect(screen.getByText("Write file")).toBeInTheDocument();
+    expect(screen.queryByText("fs_write")).not.toBeInTheDocument();
 
     // Expanding shows the input but no Result/Error section (result is undefined).
     fireEvent.click(screen.getByRole("button"));
@@ -248,36 +261,308 @@ describe("MessageView — assistant role", () => {
 
     expect(screen.getByText("first paragraph")).toBeInTheDocument();
     expect(screen.getByText("second paragraph")).toBeInTheDocument();
-    // summarize() prefers the pattern field for the collapsed summary.
-    expect(screen.getByText("grep")).toBeInTheDocument();
+    // Routine search activity is humanized; the raw tool name stays hidden.
+    expect(screen.getByText("Searched project")).toBeInTheDocument();
+    expect(screen.queryByText("grep")).not.toBeInTheDocument();
     expect(screen.getByText("TODO")).toBeInTheDocument();
+  });
+
+  it("groups consecutive read/search/list operations into one exploration row", () => {
+    render(
+      <MessageView
+        message={message("assistant", [
+          { kind: "tool_use", id: "r1", name: "read_file", input: { path: "a.ts" } },
+          { kind: "tool_result", toolUseId: "r1", output: "a", isError: false },
+          { kind: "tool_use", id: "r2", name: "search_text", input: { pattern: "TODO" } },
+          { kind: "tool_result", toolUseId: "r2", output: "match", isError: false },
+          { kind: "tool_use", id: "r3", name: "list_directory", input: { path: "src" } },
+          { kind: "tool_result", toolUseId: "r3", output: "files", isError: false },
+        ])}
+      />,
+    );
+
+    expect(screen.getAllByRole("button")).toHaveLength(1);
+    expect(screen.getByText("Explored project")).toBeInTheDocument();
+    expect(screen.getByText("1 file read · 1 search · 1 folder listed")).toBeInTheDocument();
+    expect(screen.queryByText("read_file")).not.toBeInTheDocument();
+    expect(screen.queryByText("search_text")).not.toBeInTheDocument();
+    expect(screen.queryByText("list_directory")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /explored project.*expand details/i }));
+    expect(screen.getByText("3 operations")).toBeInTheDocument();
+    expect(screen.getByText("Read file")).toBeInTheDocument();
+    expect(screen.getByText("Search project")).toBeInTheDocument();
+    expect(screen.getByText("Browse folder")).toBeInTheDocument();
+    // Raw result payloads are still lazy until their individual card is opened.
+    expect(screen.queryByText("match")).not.toBeInTheDocument();
+  });
+
+  it("keeps a grouped activity in the present tense until the assistant turn settles", () => {
+    const activityMessage = message("assistant", [
+      { kind: "tool_use", id: "r1", name: "read_file", input: { path: "a.ts" } },
+      { kind: "tool_result", toolUseId: "r1", output: "a", isError: false },
+      { kind: "tool_use", id: "r2", name: "search_text", input: { pattern: "TODO" } },
+      { kind: "tool_result", toolUseId: "r2", output: "match", isError: false },
+    ]);
+    const { rerender } = render(<MessageView message={activityMessage} isActive />);
+
+    const runningToggle = screen.getByRole("button", {
+      name: /exploring project.*1 file read.*1 search.*running.*expand details/i,
+    });
+    expect(runningToggle.closest(".pc-toolcall")).toHaveClass("pc-toolcall--active");
+    expect(screen.queryByText("Explored project")).not.toBeInTheDocument();
+
+    fireEvent.click(runningToggle);
+    expect(screen.getByText("2 operations")).toBeInTheDocument();
+    expect(screen.getByText("Read file")).toBeInTheDocument();
+    expect(screen.getByText("Search project")).toBeInTheDocument();
+
+    rerender(<MessageView message={activityMessage} />);
+
+    const completedToggle = screen.getByRole("button", {
+      name: /explored project.*1 file read.*1 search.*completed.*collapse details/i,
+    });
+    expect(completedToggle.closest(".pc-toolcall")).not.toHaveClass("pc-toolcall--active");
+    expect(screen.queryByText("Exploring project")).not.toBeInTheDocument();
+    expect(screen.getByText("2 operations")).toBeInTheDocument();
+  });
+
+  it("keeps a completed single read in the present tense while its assistant turn is active", () => {
+    const readMessage = message("assistant", [
+      { kind: "tool_use", id: "read", name: "read_file", input: { path: "src/app.ts" } },
+      { kind: "tool_result", toolUseId: "read", output: "contents", isError: false },
+    ]);
+    const { rerender } = render(<MessageView message={readMessage} isActive />);
+
+    expect(
+      screen.getByRole("button", {
+        name: /reading file.*src\/app\.ts.*running.*expand details/i,
+      }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Read file")).not.toBeInTheDocument();
+
+    rerender(<MessageView message={readMessage} />);
+
+    expect(
+      screen.getByRole("button", {
+        name: /read file.*src\/app\.ts.*completed.*expand details/i,
+      }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Reading file")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["list_directory", { path: "src" }, "Browsing folder", "Browsed folder"],
+    ["glob", { pattern: "**/*.tsx" }, "Finding files", "Found files"],
+    ["search_text", { pattern: "TODO" }, "Searching project", "Searched project"],
+  ])("switches %s activity from present to settled wording", (name, input, active, settled) => {
+    const activityMessage = message("assistant", [
+      { kind: "tool_use", id: name, name, input },
+      { kind: "tool_result", toolUseId: name, output: "done", isError: false },
+    ]);
+    const { rerender } = render(<MessageView message={activityMessage} isActive />);
+
+    expect(screen.getByText(active)).toBeInTheDocument();
+    expect(screen.queryByText(settled)).not.toBeInTheDocument();
+
+    rerender(<MessageView message={activityMessage} />);
+
+    expect(screen.getByText(settled)).toBeInTheDocument();
+    expect(screen.queryByText(active)).not.toBeInTheDocument();
+  });
+
+  it("keeps failed reads and mutating tools individually visible", () => {
+    render(
+      <MessageView
+        message={message("assistant", [
+          { kind: "tool_use", id: "bad", name: "read_file", input: { path: "missing.ts" } },
+          { kind: "tool_result", toolUseId: "bad", output: "not found", isError: true },
+          { kind: "tool_use", id: "edit", name: "edit_file", input: { path: "a.ts" } },
+          { kind: "tool_result", toolUseId: "edit", output: "done", isError: false },
+          { kind: "tool_use", id: "ok", name: "find_files", input: { pattern: "**/*.ts" } },
+          { kind: "tool_result", toolUseId: "ok", output: "a.ts", isError: false },
+        ])}
+      />,
+    );
+
+    expect(screen.getByText("Read file")).toBeInTheDocument();
+    expect(screen.getByText("Edit file")).toBeInTheDocument();
+    expect(screen.getByText("Found files")).toBeInTheDocument();
+    expect(screen.queryByText("find_files")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /read file.*failed.*expand output/i }));
+    expect(screen.getByText("Error")).toBeInTheDocument();
+    expect(screen.getByText("not found")).toBeInTheDocument();
+  });
+
+  it("announces a pending exploration group as running", () => {
+    render(
+      <MessageView
+        message={message("assistant", [
+          { kind: "tool_use", id: "pending", name: "grep", input: { pattern: "needle" } },
+        ])}
+        isActive
+      />,
+    );
+
+    const toggle = screen.getByRole("button", { name: /searching project/i });
+    expect(toggle).toHaveAccessibleName(/running, expand details/i);
+    expect(toggle.closest(".pc-toolcall")).toHaveClass("pc-toolcall--active");
+  });
+
+  it("treats an unmatched historical tool as interrupted after reload", () => {
+    render(
+      <MessageView
+        message={message("assistant", [
+          { kind: "tool_use", id: "orphaned", name: "fs_read", input: { path: "old.log" } },
+        ])}
+      />,
+    );
+
+    const toggle = screen.getByRole("button", { name: /read file.*interrupted.*expand output/i });
+    expect(toggle).not.toHaveAccessibleName(/running/);
+    fireEvent.click(toggle);
+    expect(
+      screen.getByText(/historical tool did not record a terminal result/i),
+    ).toBeInTheDocument();
+  });
+
+  it("humanizes a targetless folder listing without exposing the raw tool name", () => {
+    render(
+      <MessageView
+        message={message("assistant", [
+          { kind: "tool_use", id: "listing", name: "list", input: null },
+          { kind: "tool_result", toolUseId: "listing", output: "a.ts", isError: false },
+        ])}
+      />,
+    );
+
+    expect(screen.getByText("Browsed folder")).toBeInTheDocument();
+    expect(screen.getByText("Workspace")).toBeInTheDocument();
+    expect(screen.queryByText("list")).not.toBeInTheDocument();
+  });
+
+  it("lets settled offscreen rows use browser content visibility without applying it to active output", () => {
+    const settled = render(
+      <MessageView message={message("assistant", [{ kind: "text", text: "settled" }])} />,
+    );
+    expect(settled.container.firstElementChild).toHaveStyle({
+      contentVisibility: "auto",
+      containIntrinsicSize: "auto 140px",
+    });
+
+    const active = render(
+      <MessageView
+        message={{ ...message("assistant", [{ kind: "text", text: "active" }]), id: "m2" }}
+        isActive
+      />,
+    );
+    expect(active.container.firstElementChild).not.toHaveStyle({ contentVisibility: "auto" });
   });
 });
 
 describe("MessageView — typing animation", () => {
   // Freeze requestAnimationFrame so the reveal never advances during the test:
   // assertions stay deterministic and no setState escapes React's act().
+  let previousTypingAnimation = false;
   beforeEach(() => {
+    const settings = useStore.getState().settings;
+    previousTypingAnimation = settings.typingAnimation;
+    useStore.setState({ settings: { ...settings, typingAnimation: true } });
     vi.stubGlobal("requestAnimationFrame", () => 0);
     vi.stubGlobal("cancelAnimationFrame", () => {});
   });
   afterEach(() => {
+    const settings = useStore.getState().settings;
+    useStore.setState({ settings: { ...settings, typingAnimation: previousTypingAnimation } });
     vi.unstubAllGlobals();
   });
 
-  it("renders the in-flight assistant turn in the body typography with a blinking caret", () => {
+  it("formats structured Markdown immediately and keeps the streaming caret", () => {
+    const source = [
+      "## Project summary",
+      "",
+      "**Portcode** uses `Rust`.",
+      "",
+      "- Fast",
+      "- Native",
+    ].join("\n");
     const { container } = render(
+      <MessageView message={message("assistant", [{ kind: "text", text: source }])} isActive />,
+    );
+
+    // Structured source bypasses the high-frequency decorative scramble so the
+    // current provider delta can go through GFM immediately.
+    expect(container.querySelector(".pc-caret")).not.toBeNull();
+    expect(container.querySelector(".prose-pc")).not.toBeNull();
+    expect(screen.getByRole("heading", { level: 2, name: "Project summary" })).toBeInTheDocument();
+    expect(container.querySelector("strong")?.textContent).toBe("Portcode");
+    expect(container.querySelector("code")?.textContent).toBe("Rust");
+    expect(screen.getByRole("list")).toBeInTheDocument();
+    expect(screen.getAllByRole("listitem").map((item) => item.textContent)).toEqual([
+      "Fast",
+      "Native",
+    ]);
+    expect(container.querySelector(".pc-caret")?.closest("li")).toBe(
+      screen.getAllByRole("listitem")[1],
+    );
+    expect(container.querySelector(".pc-scramble")).toBeNull();
+  });
+
+  it("bypasses the scramble for single emphasis and incomplete structured chunks", () => {
+    const { container, rerender } = render(
+      <MessageView message={message("assistant", [{ kind: "text", text: "*italic*" }])} isActive />,
+    );
+    expect(container.querySelector("em")?.textContent).toBe("italic");
+    expect(container.querySelector(".pc-scramble")).toBeNull();
+
+    rerender(
       <MessageView
-        message={message("assistant", [{ kind: "text", text: "**bold** text" }])}
+        message={message("assistant", [{ kind: "text", text: "**still writing" }])}
+        isActive
+      />,
+    );
+    expect(container.textContent).toContain("**still writing");
+    expect(container.querySelector(".pc-scramble")).toBeNull();
+    expect(container.querySelector(".pc-caret")).not.toBeNull();
+
+    rerender(
+      <MessageView
+        message={message("assistant", [{ kind: "text", text: "**still writing**" }])}
+        isActive
+      />,
+    );
+    expect(container.querySelector("strong")?.textContent).toBe("still writing");
+    expect(container.querySelector(".pc-caret")).not.toBeNull();
+
+    rerender(
+      <MessageView
+        message={message("assistant", [{ kind: "text", text: "```ts\nconst partial = true" }])}
+        isActive
+      />,
+    );
+    expect(container.querySelector("pre code")?.textContent).toContain("const partial = true");
+    expect(container.querySelector("pre code .pc-caret")).not.toBeNull();
+    expect(container.querySelector(".pc-scramble")).toBeNull();
+  });
+
+  it("switches a growing plain block to Markdown without duplicate text", () => {
+    const { container, rerender } = render(
+      <MessageView message={message("assistant", [{ kind: "text", text: "Hello " }])} isActive />,
+    );
+    expect(container.querySelector(".prose-pc")).toHaveAttribute("aria-hidden", "true");
+
+    rerender(
+      <MessageView
+        message={message("assistant", [{ kind: "text", text: "Hello\n\n## Summary" }])}
         isActive
       />,
     );
 
-    // The active turn shows the decode view in the SAME .prose-pc body typography as
-    // the settled markdown (so it resolves in place) + a caret, not formatted markdown.
+    expect(screen.getByRole("heading", { level: 2, name: "Summary" })).toBeInTheDocument();
+    expect(container.textContent?.match(/Hello/g)).toHaveLength(1);
+    expect(container.querySelector(".pc-scramble")).toBeNull();
     expect(container.querySelector(".pc-caret")).not.toBeNull();
-    expect(container.querySelector(".prose-pc")).not.toBeNull();
-    expect(container.querySelector("strong")).toBeNull();
   });
 
   it("renders a finished (inactive) turn as markdown with no caret", () => {
@@ -289,32 +574,33 @@ describe("MessageView — typing animation", () => {
     expect(container.querySelector("strong")).not.toBeNull();
   });
 
-  it("renders the active turn as cheap plain text (no markdown) when the decode is off", () => {
-    // typingAnimation off (also the reduced-motion default) means the active row
-    // does not animate — instead of re-running ReactMarkdown + rehype-highlight on
-    // every streaming delta, it renders static plain text in the .prose-pc body
-    // typography so it resolves in place when the turn settles.
+  it("formats active headings, emphasis, lists, and inline code when the decode is off", () => {
+    // This is the default path: active source is parsed as GFM on each provider
+    // delta, while expensive syntax highlighting waits for the row to settle.
     const prev = useStore.getState().settings;
     useStore.setState({ settings: { ...prev, typingAnimation: false } });
     try {
+      const source = [
+        "## Project summary",
+        "",
+        "**Portcode** uses `Rust`.",
+        "",
+        "- Fast",
+        "- Native",
+      ].join("\n");
       const { container } = render(
-        <MessageView
-          message={message("assistant", [{ kind: "text", text: "**bold** and plain" }])}
-          isActive
-        />,
+        <MessageView message={message("assistant", [{ kind: "text", text: source }])} isActive />,
       );
 
-      // The growing reply is plain text in a .prose-pc <p> — NOT highlighted markdown.
       const prose = container.querySelector(".prose-pc");
       expect(prose).not.toBeNull();
-      const p = prose!.querySelector("p");
-      expect(p).not.toBeNull();
-      expect(p!.className).toContain("whitespace-pre-wrap");
-      expect(p!.textContent).toBe("**bold** and plain");
-      // No markdown parse and no syntax highlighting ran on the streaming row.
-      expect(container.querySelector("strong")).toBeNull();
-      expect(container.querySelector("code.hljs")).toBeNull();
-      // It is the static path, not the animated decode — no caret/scramble.
+      expect(
+        screen.getByRole("heading", { level: 2, name: "Project summary" }),
+      ).toBeInTheDocument();
+      expect(container.querySelector("strong")?.textContent).toBe("Portcode");
+      expect(container.querySelector("code")?.textContent).toBe("Rust");
+      expect(screen.getByRole("list")).toBeInTheDocument();
+      expect(screen.getAllByRole("listitem")).toHaveLength(2);
       expect(container.querySelector(".pc-caret")).toBeNull();
       expect(container.querySelector(".pc-scramble")).toBeNull();
     } finally {
@@ -322,20 +608,82 @@ describe("MessageView — typing animation", () => {
     }
   });
 
-  it("renders the SAME content as markdown once the turn is inactive (decode off)", () => {
-    // The plain streaming branch only applies while active; once the row settles
-    // (isActive false), the same text re-renders through ReactMarkdown.
+  it("defers fenced-code highlighting until the active turn settles", () => {
+    const prev = useStore.getState().settings;
+    useStore.setState({ settings: { ...prev, typingAnimation: false } });
+    try {
+      const code = "```js\nconst answer = 42;\n```";
+      const { container, rerender } = render(
+        <MessageView message={message("assistant", [{ kind: "text", text: code }])} isActive />,
+      );
+
+      const activeCode = container.querySelector("pre code");
+      expect(activeCode?.textContent).toContain("const answer = 42;");
+      expect(activeCode).not.toHaveClass("hljs");
+
+      rerender(<MessageView message={message("assistant", [{ kind: "text", text: code }])} />);
+      expect(container.querySelector("pre code")).toHaveClass("hljs");
+    } finally {
+      useStore.setState({ settings: prev });
+    }
+  });
+
+  it("keeps incomplete Markdown visible and safe while more deltas are pending", () => {
+    const prev = useStore.getState().settings;
+    useStore.setState({ settings: { ...prev, typingAnimation: false } });
+    try {
+      const { container, rerender } = render(
+        <MessageView
+          message={message("assistant", [{ kind: "text", text: "**still writing" }])}
+          isActive
+        />,
+      );
+      expect(container.textContent).toContain("**still writing");
+
+      rerender(
+        <MessageView
+          message={message("assistant", [{ kind: "text", text: "[partial link](" }])}
+          isActive
+        />,
+      );
+      expect(container.textContent).toContain("[partial link](");
+
+      rerender(
+        <MessageView
+          message={message("assistant", [{ kind: "text", text: "```ts\nconst partial = true" }])}
+          isActive
+        />,
+      );
+      expect(container.querySelector("pre code")?.textContent).toContain("const partial = true");
+    } finally {
+      useStore.setState({ settings: prev });
+    }
+  });
+
+  it("keeps ReactMarkdown's link and raw-HTML safety during streaming", () => {
     const prev = useStore.getState().settings;
     useStore.setState({ settings: { ...prev, typingAnimation: false } });
     try {
       const { container } = render(
         <MessageView
-          message={message("assistant", [{ kind: "text", text: "**bold** and plain" }])}
+          message={message("assistant", [
+            {
+              kind: "text",
+              text: "[safe](https://example.com) [unsafe](javascript:alert(1)) <script>alert(2)</script>",
+            },
+          ])}
+          isActive
         />,
       );
 
-      expect(container.querySelector("strong")).not.toBeNull();
-      expect(container.querySelector(".prose-pc")).not.toBeNull();
+      expect(screen.getByRole("link", { name: "safe" })).toHaveAttribute(
+        "href",
+        "https://example.com",
+      );
+      expect(screen.getByText("unsafe").getAttribute("href") ?? "").not.toMatch(/^javascript:/i);
+      expect(container.querySelector("script")).toBeNull();
+      expect(container.textContent).toContain("<script>alert(2)</script>");
+      expect(container.querySelector("[aria-live], [role='status']")).toBeNull();
     } finally {
       useStore.setState({ settings: prev });
     }
@@ -403,8 +751,12 @@ describe("MessageView — scramble decode (active turn)", () => {
   let rafQueue: FrameRequestCallback[] = [];
   let elapsed = 0;
   const T0 = 1000;
+  let previousTypingAnimation = false;
 
   beforeEach(() => {
+    const settings = useStore.getState().settings;
+    previousTypingAnimation = settings.typingAnimation;
+    useStore.setState({ settings: { ...settings, typingAnimation: true } });
     rafQueue = [];
     elapsed = 0;
     vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
@@ -414,6 +766,8 @@ describe("MessageView — scramble decode (active turn)", () => {
     vi.stubGlobal("cancelAnimationFrame", () => {});
   });
   afterEach(() => {
+    const settings = useStore.getState().settings;
+    useStore.setState({ settings: { ...settings, typingAnimation: previousTypingAnimation } });
     vi.unstubAllGlobals();
   });
 
@@ -432,10 +786,10 @@ describe("MessageView — scramble decode (active turn)", () => {
     tick(T0 + elapsed * STEP_MS);
   }
 
-  it("decodes the in-flight word as a glowing accent tail, not markdown", () => {
+  it("keeps the glowing decode animation for genuinely plain prose", () => {
     const { container } = render(
       <MessageView
-        message={message("assistant", [{ kind: "text", text: "**Hello** world " }])}
+        message={message("assistant", [{ kind: "text", text: "Hello world " }])}
         isActive
       />,
     );
@@ -443,13 +797,11 @@ describe("MessageView — scramble decode (active turn)", () => {
     prime();
     step(1);
 
-    // The decoding tail is wrapped in .pc-scramble (the accent glow), in the same
-    // .prose-pc body typography as settled markdown, with a caret, and is NOT yet
-    // rendered as Markdown.
+    // Plain prose still takes the per-frame decode path. Structured source takes
+    // the live Markdown path tested above, avoiding an AST parse on every frame.
     expect(container.querySelector(".pc-scramble")).not.toBeNull();
     expect(container.querySelector(".prose-pc")).not.toBeNull();
     expect(container.querySelector(".pc-caret")).not.toBeNull();
-    expect(container.querySelector("strong")).toBeNull();
 
     // The decoding wrapper is hidden from assistive tech: its ~45/sec glyph churn
     // would flood the chat live region. The settled markdown re-announces in place.

@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 
+import { toolLabel } from "../lib/toolNames";
 import { useStore } from "../store/store";
 
 export function PermissionPrompt() {
@@ -39,6 +40,8 @@ export function PermissionPrompt() {
 
   if (!pending) return null;
 
+  const label = toolLabel(pending.tool);
+
   return (
     <div role="alert" className="pc-gate px-6 py-3.5">
       <div className="flex flex-col gap-[11px]">
@@ -46,9 +49,9 @@ export function PermissionPrompt() {
           <span className="pc-gate__icon">!</span>
           <span>
             Portcode wants to run{" "}
-            <code className="rounded bg-warn/10 px-1.5 py-0.5 font-mono text-warn">
-              {pending.tool}
-            </code>{" "}
+            <strong className="rounded bg-warn/10 px-1.5 py-0.5 font-medium text-warn">
+              {label}
+            </strong>{" "}
             on{" "}
             <span
               className="font-mono text-fg break-words line-clamp-2 [overflow-wrap:anywhere]"

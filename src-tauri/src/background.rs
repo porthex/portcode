@@ -1,4 +1,4 @@
-//! Live background shell tasks (the `shell` tool's `background` mode), tracked so a
+//! Live background command tasks (`run_command` with `background: true`), tracked so a
 //! session-wide Stop can kill the ones it launched. Each entry holds the waiter
 //! task's [`AbortHandle`]; the child process is spawned `kill_on_drop`, so aborting
 //! the waiter (which owns the child) kills the process. Desktop-only: only the

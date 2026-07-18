@@ -1,7 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 
-import { DEFAULT_SETTINGS, type Message, type Session, type Settings, type Usage } from "../types";
+import {
+  DEFAULT_SETTINGS,
+  type Message,
+  type PlanUsageSnapshot,
+  type ProviderId,
+  type Session,
+  type Settings,
+  type Usage,
+} from "../types";
 import { useStore } from "../store/store";
 import { StatusHud } from "./StatusHud";
 
@@ -11,6 +19,8 @@ import { StatusHud } from "./StatusHud";
 // must NOT assert hardcoded/unverifiable facts: the tools segment counts tool
 // calls actually made this session, the workspace segment reflects a connected
 // folder, and the link segment tracks the live `streaming` flag.
+const getPlanUsage = vi.hoisted(() => vi.fn());
+
 vi.mock("../lib/ipc", () => ({
   getSettings: vi.fn(),
   listSessions: vi.fn(),
@@ -21,6 +31,7 @@ vi.mock("../lib/ipc", () => ({
   resolvePermission: vi.fn(),
   openFolder: vi.fn(),
   runAgent: vi.fn(),
+  getPlanUsage,
 }));
 
 const initialState = useStore.getState();
@@ -93,7 +104,7 @@ describe("StatusHud", () => {
 
     render(<StatusHud />);
 
-    expect(screen.getByText("0 TOOL CALLS")).toBeInTheDocument();
+    expect(screen.getByText("0 ACTIONS")).toBeInTheDocument();
   });
 
   it("uses the singular label for exactly one tool call", () => {
@@ -105,7 +116,7 @@ describe("StatusHud", () => {
 
     render(<StatusHud />);
 
-    expect(screen.getByText("1 TOOL CALL")).toBeInTheDocument();
+    expect(screen.getByText("1 ACTION")).toBeInTheDocument();
   });
 
   it("counts tool_use blocks across the active session's messages", () => {
@@ -123,7 +134,30 @@ describe("StatusHud", () => {
 
     render(<StatusHud />);
 
-    expect(screen.getByText("3 TOOL CALLS")).toBeInTheDocument();
+    expect(screen.getByText("3 ACTIONS")).toBeInTheDocument();
+  });
+
+  it("does not rescan stable historical blocks when a new transcript array arrives", () => {
+    let scans = 0;
+    const blocks = new Proxy(toolUseMsg(2).blocks, {
+      get(target, property, receiver) {
+        if (property === Symbol.iterator) scans += 1;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const historical: Message = { ...toolUseMsg(2), id: "cached", blocks };
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      messages: { s1: [historical] },
+    });
+    render(<StatusHud />);
+    expect(scans).toBe(1);
+
+    // Streaming replaces the outer session array but preserves historical
+    // Message objects. Their block trees should stay cached.
+    useStore.setState({ messages: { s1: [historical] } });
+    expect(scans).toBe(1);
   });
 
   it("falls back to zero tool calls when the active session has no message entry", () => {
@@ -135,7 +169,7 @@ describe("StatusHud", () => {
 
     render(<StatusHud />);
 
-    expect(screen.getByText("0 TOOL CALLS")).toBeInTheDocument();
+    expect(screen.getByText("0 ACTIONS")).toBeInTheDocument();
   });
 
   it("reflects the live streaming flag in the link segment", () => {
@@ -224,7 +258,7 @@ describe("StatusHud", () => {
     expect(screen.getByText(/NEURAL LINK/)).toBeInTheDocument();
     expect(screen.queryByText(/POLICY:/)).not.toBeInTheDocument();
     expect(screen.queryByText(/WORKSPACE LINKED/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/TOOL CALL/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/ACTIONS?/)).not.toBeInTheDocument();
   });
 
   it("renders cumulative token usage for the active session", () => {
@@ -238,6 +272,69 @@ describe("StatusHud", () => {
     render(<StatusHud />);
 
     expect(screen.getByText(`${(1540).toLocaleString()} tok`)).toBeInTheDocument();
+  });
+
+  it("opens a one-click plan-limits popover and restores focus on Escape", async () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      oauthStatus: {
+        signedIn: true,
+        expiresAt: null,
+        account: "claude@example.com",
+        tier: "Claude Max",
+      },
+      openAIAuthStatus: {
+        signedIn: true,
+        expiresAt: null,
+        account: "gpt@example.com",
+        tier: "ChatGPT Plus",
+      },
+    });
+    getPlanUsage.mockImplementation(async (provider: ProviderId): Promise<PlanUsageSnapshot> => ({
+      provider,
+      plan: provider === "openai" ? "Plus" : "Max",
+      updatedAt: Math.floor(Date.now() / 1000),
+      windows: [
+        {
+          id: "session",
+          label: "Current session",
+          usedPercent: provider === "openai" ? 20 : 35,
+          resetsAt: String(Math.floor(Date.now() / 1000) + 60 * 60),
+          windowMinutes: 300,
+        },
+      ],
+    }));
+
+    render(<StatusHud />);
+    const trigger = screen.getByRole("button", {
+      name: "Plan limits, 2 of 2 providers connected",
+    });
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(trigger);
+
+    expect(screen.getByRole("dialog", { name: "Plan usage quick view" })).toBeInTheDocument();
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    const gptCard = screen.getByRole("article", { name: "GPT plan usage" });
+    expect(
+      await within(gptCard).findByRole("progressbar", { name: "Current session remaining" }),
+    ).toHaveAttribute("aria-valuenow", "80");
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Plan usage quick view" })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
+  it("opens the detailed Settings usage section from the quick view", () => {
+    useStore.setState({ sessions: [session()], activeId: "s1", showSettings: false });
+    render(<StatusHud />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Plan limits,/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Open detailed usage in Settings →" }));
+
+    expect(useStore.getState().showSettings).toBe(true);
+    expect(screen.queryByRole("dialog", { name: "Plan usage quick view" })).not.toBeInTheDocument();
   });
 
   it("shows a running-subagents count only while subagents are running", () => {
@@ -316,6 +413,28 @@ describe("StatusHud", () => {
     expect(screen.queryByText(/^Σ /)).toBeNull();
   });
 
+  it("uses live OpenAI labels and never claims API-priced subscription spend", () => {
+    useStore.setState({
+      sessions: [session({ model: "gpt-live" })],
+      activeId: "s1",
+      openAIModels: [
+        {
+          id: "gpt-live",
+          label: "GPT Live Codex",
+          provider: "openai",
+          reasoningEfforts: ["high"],
+          defaultReasoningEffort: "high",
+        },
+      ],
+      usage: { s1: { input: 50_000, output: 10_000 } },
+    });
+
+    const { container } = render(<StatusHud />);
+
+    expect(screen.getByText("GPT LIVE CODEX")).toBeInTheDocument();
+    expect(container.textContent).not.toContain("$");
+  });
+
   it("drops the spend segment on the phone (remote mode) to fit a narrow bar", () => {
     useStore.setState({
       sessions: [session()],
@@ -325,5 +444,6 @@ describe("StatusHud", () => {
     });
     render(<StatusHud />);
     expect(screen.queryByText(/^Σ /)).toBeNull();
+    expect(screen.queryByRole("button", { name: /Plan limits,/ })).not.toBeInTheDocument();
   });
 });

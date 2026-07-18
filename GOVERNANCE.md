@@ -49,7 +49,7 @@ applications. A typical path:
 
 There is no fixed quota or timeline; the bar is trust and demonstrated judgment,
 weighted heavily for changes that touch the permission gate, secrets handling,
-the `shell` path, the provider/LLM code, and the release/signing pipeline.
+the `run_command` path, the provider/LLM code, and the release/signing pipeline.
 
 ---
 
@@ -59,7 +59,7 @@ the `shell` path, the provider/LLM code, and the release/signing pipeline.
   seek rough consensus; for routine work, one maintainer approval is enough (see
   CONTRIBUTING.md → _Review and merge_).
 - **Security-critical paths**: the permission gate, the workspace sandbox,
-  secrets/credential handling, the `shell` execution path, the provider/LLM
+  secrets/credential handling, the `run_command` execution path, the provider/LLM
   abstraction, the Tauri IPC/CSP configuration, and the release/signing
   workflows require the **maintainers specifically** (enforced via
   [`.github/CODEOWNERS`](.github/CODEOWNERS)) and may require two approvals.

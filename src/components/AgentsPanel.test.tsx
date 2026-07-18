@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 
 import { type AgentInfo } from "../types";
 import { useStore } from "../store/store";
@@ -33,6 +33,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   useStore.setState(initialState, true);
   m.cancelAgentById.mockResolvedValue(undefined);
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe("AgentsPanel", () => {
@@ -70,9 +74,9 @@ describe("AgentsPanel", () => {
     render(<AgentsPanel />);
 
     // Status text is always in the DOM (ul stays mounted at height 0 when collapsed).
-    expect(screen.getByText("done")).toBeInTheDocument();
+    expect(screen.getByText("completed")).toBeInTheDocument();
     expect(screen.getByText("stopped")).toBeInTheDocument();
-    expect(screen.getByText("error")).toBeInTheDocument();
+    expect(screen.getByText("failed")).toBeInTheDocument();
     // No agent is running, so no Stop button — only the header toggle button.
     const buttons = screen.getAllByRole("button");
     expect(buttons).toHaveLength(1);
@@ -97,6 +101,63 @@ describe("AgentsPanel", () => {
     expect(m.cancelAgentById).toHaveBeenCalledTimes(1);
   });
 
+  it("shows immediate stopping feedback and disables duplicate Stop requests", async () => {
+    let resolveCancel!: () => void;
+    m.cancelAgentById.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        resolveCancel = resolve;
+      }),
+    );
+    seed([agent({ id: "a1", description: "slow worker", step: 2 })]);
+
+    render(<AgentsPanel />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop subagent: slow worker" }));
+
+    const stopping = screen.getByRole("button", { name: "Stopping subagent: slow worker" });
+    expect(stopping).toBeDisabled();
+    expect(stopping).toHaveTextContent("Stopping…");
+    fireEvent.click(stopping);
+    expect(m.cancelAgentById).toHaveBeenCalledTimes(1);
+
+    resolveCancel();
+    await waitFor(() => expect(m.cancelAgentById).toHaveBeenCalledTimes(1));
+  });
+
+  it("offers a retry when a Stop request rejects", async () => {
+    const cancelAgent = vi.fn().mockRejectedValue(new Error("offline"));
+    useStore.setState({ cancelAgent });
+    seed([agent({ id: "a1", description: "remote worker", step: 2 })]);
+
+    render(<AgentsPanel />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop subagent: remote worker" }));
+
+    const retry = await screen.findByRole("button", {
+      name: "Retry stop subagent: remote worker",
+    });
+    expect(retry).toBeEnabled();
+    expect(retry).toHaveAttribute("title", "Stop was not confirmed. Try again.");
+  });
+
+  it("restores the Stop affordance when cancellation is not acknowledged", async () => {
+    vi.useFakeTimers();
+    seed([agent({ id: "a1", description: "quiet worker", step: 2 })]);
+
+    render(<AgentsPanel />);
+    fireEvent.click(screen.getByRole("button", { name: "Stop subagent: quiet worker" }));
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+
+    expect(screen.getByRole("button", { name: "Retry stop subagent: quiet worker" })).toBeEnabled();
+    expect(screen.getByText("still running")).toBeInTheDocument();
+  });
+
   it("only running subagents get a Stop button (plus the header toggle)", () => {
     seed([
       agent({ id: "run", description: "running one", status: "running", step: 1 }),
@@ -111,6 +172,39 @@ describe("AgentsPanel", () => {
     const stopButtons = buttons.filter((b) => b.getAttribute("aria-label")?.startsWith("Stop"));
     expect(stopButtons).toHaveLength(1);
     expect(stopButtons[0]).toHaveAccessibleName("Stop subagent: running one");
+  });
+
+  it("renders parentId relationships as nested, labelled subagent lists", () => {
+    seed([
+      agent({ id: "plan", description: "plan the work", status: "running", step: 1 }),
+      agent({ id: "code", parentId: "plan", description: "implement UI", step: 2 }),
+      agent({ id: "test", parentId: "code", description: "verify UI", step: 1 }),
+      agent({ id: "orphan", parentId: "missing", description: "orphaned task", step: 1 }),
+    ]);
+
+    render(<AgentsPanel />);
+
+    const planChildren = screen.getByRole("list", { name: "Subagents of plan the work" });
+    expect(within(planChildren).getByText("implement UI")).toBeInTheDocument();
+    const codeChildren = screen.getByRole("list", { name: "Subagents of implement UI" });
+    expect(within(codeChildren).getByText("verify UI")).toBeInTheDocument();
+
+    // Missing parents never make work disappear; the orphan is promoted to a
+    // root in the activity list.
+    expect(screen.getByText("orphaned task")).toBeInTheDocument();
+  });
+
+  it("surfaces malformed parent cycles once instead of recursing forever", () => {
+    seed([
+      agent({ id: "a", parentId: "b", description: "cycle A", step: 1 }),
+      agent({ id: "b", parentId: "a", description: "cycle B", step: 1 }),
+    ]);
+
+    render(<AgentsPanel />);
+
+    expect(screen.getAllByText("cycle A")).toHaveLength(1);
+    expect(screen.getAllByText("cycle B")).toHaveLength(1);
+    expect(screen.getByRole("list", { name: "Subagents of cycle A" })).toBeInTheDocument();
   });
 
   // ── Collapsible accordion behaviour ─────────────────────────────────────
@@ -166,6 +260,27 @@ describe("AgentsPanel", () => {
     fireEvent.click(toggle);
 
     expect(toggle).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("respects a manual collapse when another sibling starts running", () => {
+    seed([agent({ id: "a1", description: "first", status: "running", step: 1 })]);
+    render(<AgentsPanel />);
+
+    const toggle = screen.getByRole("button", { name: /1 subagent running/i });
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    act(() => {
+      seed([
+        agent({ id: "a1", description: "first", status: "running", step: 2 }),
+        agent({ id: "a2", description: "second", status: "running", step: 1 }),
+      ]);
+    });
+
+    expect(screen.getByRole("button", { name: /2 subagents running/i })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
   });
 
   it("rows stay mounted in the DOM even when the panel is collapsed (grid-0fr)", () => {

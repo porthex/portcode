@@ -1,9 +1,19 @@
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+} from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { useStore } from "../store/store";
 import {
+  ANTHROPIC_MODELS,
   DANGER_MODES,
-  MODELS,
+  modelInfo,
+  providerForModel,
+  reasoningEffortLabel,
   type PairingPayload,
   type PairingRequest,
   type PermissionMode,
@@ -11,6 +21,186 @@ import {
   type ToolPolicy,
 } from "../types";
 import * as ipc from "../lib/ipc";
+import { isCommandToolName, toolLabel, toolNamesEquivalent } from "../lib/toolNames";
+import { SelectMenu } from "./SelectMenu";
+import { PlanUsagePanel } from "./PlanUsagePanel";
+
+type SettingsSectionId =
+  "claude" | "openai" | "usage" | "permissions" | "interface" | "system" | "devices";
+
+interface SettingsSectionMeta {
+  id: SettingsSectionId;
+  label: string;
+  eyebrow: string;
+  description: string;
+  items: string[];
+  desktopOnly?: boolean;
+}
+
+const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
+  {
+    id: "claude",
+    label: "Claude",
+    eyebrow: "Anthropic",
+    description: "Claude models and Anthropic credentials.",
+    items: [
+      "Claude models",
+      "Claude default model",
+      "Claude subscription",
+      "Sign in with Claude",
+      "Anthropic API key",
+      "Claude API key",
+      "Credential Manager",
+    ],
+    desktopOnly: true,
+  },
+  {
+    id: "openai",
+    label: "OpenAI / GPT",
+    eyebrow: "OpenAI",
+    description: "GPT models, ChatGPT access, and reasoning.",
+    items: [
+      "OpenAI models",
+      "GPT models",
+      "OpenAI default model",
+      "Reasoning level",
+      "OpenAI subscription",
+      "ChatGPT sign in",
+      "OpenAI API keys",
+    ],
+    desktopOnly: true,
+  },
+  {
+    id: "usage",
+    label: "Plan usage",
+    eyebrow: "Allowance",
+    description: "Included Claude and GPT plan limits with local reset times.",
+    items: [
+      "Plan usage",
+      "Claude usage",
+      "GPT usage",
+      "Codex limits",
+      "Current session limit",
+      "Weekly limit",
+      "Reset time",
+      "Remaining usage",
+    ],
+    desktopOnly: true,
+  },
+  {
+    id: "permissions",
+    label: "Permissions",
+    eyebrow: "Safety gate",
+    description: "Control what the agent can do without asking.",
+    items: [
+      "Permission mode",
+      "Default policy",
+      "Accept edits",
+      "Plan mode",
+      "Auto mode",
+      "Bypass mode",
+      "Tool rules",
+      "Command prefix",
+    ],
+    desktopOnly: true,
+  },
+  {
+    id: "interface",
+    label: "Interface",
+    eyebrow: "Experience",
+    description: "Motion, atmosphere, and display density.",
+    items: ["Typing animation", "Neon rain", "Scanlines", "Interface scale", "Appearance"],
+  },
+  {
+    id: "system",
+    label: "Privacy & updates",
+    eyebrow: "System",
+    description: "Reporting choices and version control.",
+    items: [
+      "Automatic updates",
+      "Check for updates",
+      "Check now",
+      "Crash reports",
+      "Performance reports",
+      "Privacy",
+    ],
+  },
+  {
+    id: "devices",
+    label: "Phone sync",
+    eyebrow: "Devices",
+    description: "Pair, inspect, and revoke mobile access.",
+    items: ["Pair a phone", "Paired phones", "This device", "Pairing code", "Unpair"],
+    desktopOnly: true,
+  },
+];
+
+const SETTINGS_TARGET_IDS: Record<string, string> = {
+  "Claude models": "pc-setting-claude-model",
+  "Claude default model": "pc-setting-claude-model",
+  "Claude subscription": "pc-setting-claude",
+  "Sign in with Claude": "pc-setting-claude",
+  "Anthropic API key": "pc-setting-anthropic-api-key",
+  "Claude API key": "pc-setting-anthropic-api-key",
+  "Credential Manager": "pc-setting-anthropic-api-key",
+  "OpenAI models": "pc-setting-openai-model",
+  "GPT models": "pc-setting-openai-model",
+  "OpenAI default model": "pc-setting-openai-model",
+  "Reasoning level": "pc-setting-openai-reasoning",
+  "OpenAI subscription": "pc-setting-openai",
+  "ChatGPT sign in": "pc-setting-openai",
+  "OpenAI API keys": "pc-setting-openai-auth-note",
+  "Plan usage": "pc-setting-plan-usage",
+  "Claude usage": "pc-setting-plan-usage",
+  "GPT usage": "pc-setting-plan-usage",
+  "Codex limits": "pc-setting-plan-usage",
+  "Current session limit": "pc-setting-plan-usage",
+  "Weekly limit": "pc-setting-plan-usage",
+  "Reset time": "pc-setting-plan-usage",
+  "Remaining usage": "pc-setting-plan-usage",
+  "Permission mode": "pc-setting-permission-mode",
+  "Default policy": "pc-setting-default-policy",
+  "Accept edits": "pc-setting-permission-mode",
+  "Plan mode": "pc-setting-permission-mode",
+  "Auto mode": "pc-setting-permission-mode",
+  "Bypass mode": "pc-setting-permission-mode",
+  "Tool rules": "pc-setting-tool-rules",
+  "Shell command prefix": "pc-setting-tool-rules",
+  "Typing animation": "pc-setting-typing",
+  "Neon rain": "pc-setting-rain",
+  Scanlines: "pc-setting-scanlines",
+  "Interface scale": "pc-setting-scale",
+  Appearance: "pc-settings-interface",
+  "Automatic updates": "pc-setting-auto-update",
+  "Check for updates": "pc-setting-update-check",
+  "Check now": "pc-setting-update-check",
+  "Crash reports": "pc-setting-diagnostics",
+  "Performance reports": "pc-setting-diagnostics",
+  Privacy: "pc-setting-diagnostics",
+  "Pair a phone": "pc-setting-phone-pairing",
+  "Paired phones": "pc-setting-paired-phones",
+  "This device": "pc-setting-device-identity",
+  "Pairing code": "pc-setting-phone-pairing",
+  Unpair: "pc-setting-paired-phones",
+};
+
+function matchesSettingsQuery(section: SettingsSectionMeta, query: string) {
+  if (!query) return true;
+  const haystack = [section.label, section.eyebrow, section.description, ...section.items]
+    .join(" ")
+    .toLowerCase();
+  return query
+    .toLowerCase()
+    .trim()
+    .split(/\s+/)
+    .every((term) => haystack.includes(term));
+}
+
+function matchingSettingNames(section: SettingsSectionMeta, query: string) {
+  if (!query) return [];
+  const terms = query.toLowerCase().trim().split(/\s+/);
+  return section.items.filter((item) => terms.every((term) => item.toLowerCase().includes(term)));
+}
 
 export function SettingsPanel() {
   const settings = useStore((s) => s.settings);
@@ -22,6 +212,11 @@ export function SettingsPanel() {
   const oauthError = useStore((s) => s.oauthError);
   const loginWithClaude = useStore((s) => s.loginWithClaude);
   const logoutClaude = useStore((s) => s.logoutClaude);
+  const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
+  const openAIAuthError = useStore((s) => s.openAIAuthError);
+  const openAIModels = useStore((s) => s.openAIModels);
+  const loginWithOpenAI = useStore((s) => s.loginWithOpenAI);
+  const logoutOpenAI = useStore((s) => s.logoutOpenAI);
 
   const ambientRain = useStore((s) => s.ambientRain);
   const scanlines = useStore((s) => s.scanlines);
@@ -55,16 +250,122 @@ export function SettingsPanel() {
   const [savedKey, setSavedKey] = useState(false);
   const [keyError, setKeyError] = useState<string | null>(null);
   const [signingIn, setSigningIn] = useState(false);
+  const [signingInOpenAI, setSigningInOpenAI] = useState(false);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const modalRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLElement | null>(null);
   const saveBtnRef = useRef<HTMLButtonElement | null>(null);
+  const sectionRefs = useRef<Partial<Record<SettingsSectionId, HTMLElement | null>>>({});
+  const searchTargetRef = useRef<HTMLElement | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [activeSection, setActiveSection] = useState<SettingsSectionId>(
+    remoteMode ? "interface" : "claude",
+  );
 
   const signedIn = !!oauthStatus?.signedIn;
+  const signedInOpenAI = !!openAIAuthStatus?.signedIn;
+  const openAIAvailable = openAIAuthStatus?.available !== false;
+  const selectedModel = modelInfo(settings.model, openAIModels);
+  const selectedProvider = providerForModel(settings.model, openAIModels);
+  const claudeModelValue = selectedProvider === "anthropic" ? settings.model : "choose-claude";
+  const openAIModelValue = selectedProvider === "openai" ? settings.model : "choose-openai";
+  const reasoningEfforts =
+    selectedProvider === "openai" ? (selectedModel?.reasoningEfforts ?? []) : [];
+  const availableSections = useMemo(
+    () =>
+      SETTINGS_SECTIONS.filter(
+        (section) =>
+          !(remoteMode && section.desktopOnly) && (openAIAvailable || section.id !== "openai"),
+      ).map((section) => {
+        if (section.id === "openai" && reasoningEfforts.length === 0) {
+          return {
+            ...section,
+            items: section.items.filter((item) => item !== "Reasoning level"),
+          };
+        }
+        if (section.id === "system" && remoteMode) {
+          return {
+            ...section,
+            label: "Privacy",
+            description: "Control anonymous diagnostics.",
+            items: ["Crash reports", "Performance reports", "Privacy"],
+          };
+        }
+        return section;
+      }),
+    [openAIAvailable, reasoningEfforts.length, remoteMode],
+  );
+  const visibleSections = useMemo(
+    () => availableSections.filter((section) => matchesSettingsQuery(section, searchQuery)),
+    [availableSections, searchQuery],
+  );
+  const visibleSectionIds = useMemo(
+    () => new Set(visibleSections.map((section) => section.id)),
+    [visibleSections],
+  );
+  const activeSearchMatch = useMemo(() => {
+    if (!searchQuery) return null;
+    for (const section of visibleSections) {
+      const match = matchingSettingNames(section, searchQuery)[0];
+      if (match) return { label: match, targetId: SETTINGS_TARGET_IDS[match] };
+    }
+    return null;
+  }, [searchQuery, visibleSections]);
+  const sectionStatus: Record<SettingsSectionId, string> = {
+    claude: `${selectedProvider === "anthropic" ? "default" : "available"} · ${signedIn ? "signed in" : settings.apiKeySet ? "key stored" : "not connected"}`,
+    openai: `${selectedProvider === "openai" ? "default" : "available"} · ${signedInOpenAI ? "signed in" : "not connected"}`,
+    usage: `${Number(signedIn) + Number(openAIAvailable && signedInOpenAI)} of ${openAIAvailable ? 2 : 1} connected`,
+    permissions: `${settings.permissionMode} · ${settings.rules.length} rule${settings.rules.length === 1 ? "" : "s"}`,
+    interface: `${Math.round(uiScale * 100)}% · ${ambientRain || scanlines ? "effects on" : "effects off"}`,
+    system: remoteMode
+      ? `reports ${crashReporting === true ? "on" : "off"}`
+      : update.phase === "available"
+        ? `v${update.info?.version ?? "new"} available`
+        : `${settings.autoUpdate ? "auto update" : "manual update"} · reports ${crashReporting === true ? "on" : "off"}`,
+    devices: `${phoneSync?.paired.length ?? 0} paired`,
+  };
+
+  const navigateToSection = (id: SettingsSectionId) => {
+    setActiveSection(id);
+    sectionRefs.current[id]?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+  };
+
+  const onContentScroll = () => {
+    const content = contentRef.current;
+    if (!content || searchQuery) return;
+    const threshold = content.scrollTop + 120;
+    let current = availableSections[0]?.id;
+    for (const section of availableSections) {
+      const node = sectionRefs.current[section.id];
+      if (node && !node.classList.contains("hidden") && node.offsetTop <= threshold) {
+        current = section.id;
+      }
+    }
+    if (current) setActiveSection(current);
+  };
+
+  useEffect(() => {
+    if (!searchQuery || visibleSectionIds.has(activeSection)) return;
+    const first = visibleSections[0];
+    if (first) setActiveSection(first.id);
+  }, [activeSection, searchQuery, visibleSectionIds, visibleSections]);
+
+  useEffect(() => {
+    searchTargetRef.current?.classList.remove("pc-settings-target");
+    searchTargetRef.current = null;
+    if (!activeSearchMatch?.targetId) return;
+    const target = document.getElementById(activeSearchMatch.targetId);
+    if (!target || target.classList.contains("hidden")) return;
+    target.classList.add("pc-settings-target");
+    target.scrollIntoView?.({ behavior: "smooth", block: "center" });
+    searchTargetRef.current = target;
+    return () => target.classList.remove("pc-settings-target");
+  }, [activeSearchMatch]);
 
   // Close on Escape, mirroring CommandPalette/PermissionPrompt's keyboard affordance.
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setShowSettings(false);
+      if (e.key === "Escape" && !e.defaultPrevented) setShowSettings(false);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -157,15 +458,24 @@ export function SettingsPanel() {
     }
   };
 
+  const signInOpenAI = async () => {
+    setSigningInOpenAI(true);
+    try {
+      await loginWithOpenAI();
+    } finally {
+      setSigningInOpenAI(false);
+    }
+  };
+
   const saveLabel = savedKey ? "Saved" : saving ? "…" : settings.apiKeySet ? "Replace" : "Save";
 
   return (
     <div
-      className="pc-overlay items-start justify-center z-[58] p-6"
+      className="pc-overlay pc-settings-overlay items-start justify-center z-[58] p-6"
       onClick={() => setShowSettings(false)}
     >
       <div
-        className="pc-modal my-auto"
+        className="pc-modal pc-settings-shell my-auto"
         role="dialog"
         aria-modal="true"
         aria-labelledby="pc-settings-title"
@@ -177,8 +487,8 @@ export function SettingsPanel() {
         <div className="pc-sweep pc-sweep--accent" />
 
         {/* HEADER */}
-        <div className="flex items-center justify-between border-b border-border px-5 py-4">
-          <div className="flex items-center gap-2.5">
+        <div className="pc-settings-header">
+          <div className="pc-settings-brand">
             <svg
               width="16"
               height="16"
@@ -194,16 +504,16 @@ export function SettingsPanel() {
               <circle cx="12" cy="12" r="3" />
               <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
             </svg>
-            <span
-              id="pc-settings-title"
-              className="font-display font-semibold text-[16px] tracking-[1px]"
-            >
-              SETTINGS
+            <span>
+              <span className="pc-settings-brand__overline">PORTCODE / CONTROL DECK</span>
+              <span id="pc-settings-title" className="pc-settings-brand__title">
+                SETTINGS
+              </span>
             </span>
           </div>
           <button
             onClick={() => setShowSettings(false)}
-            className="flex h-7 w-7 items-center justify-center rounded-[7px] border border-border-2 text-muted transition-colors hover:border-accent/50 hover:text-accent"
+            className="pc-settings-close"
             aria-label="Close settings"
           >
             ✕
@@ -211,326 +521,871 @@ export function SettingsPanel() {
         </div>
 
         {/* BODY */}
-        <div className="flex flex-col gap-6 p-5 max-h-[72vh] overflow-y-auto">
-          {/* CONNECTION */}
-          <section className={remoteMode ? "hidden" : undefined}>
-            <div className="pc-eyebrow">CONNECTION</div>
-            <div className="flex flex-col gap-3.5">
-              <div>
-                <label className="mb-1.5 block text-[12.5px] font-medium text-fg">Provider</label>
-                <div className="flex items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 py-2.5 text-[12.5px] text-muted">
-                  <span className="pc-dot pc-dot--success" />
-                  Anthropic (Claude)
+        <div className="pc-settings-layout">
+          <aside className="pc-settings-rail" aria-label="Settings categories">
+            <div className="pc-settings-search">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="11" cy="11" r="7" />
+                <path d="m20 20-3.6-3.6" />
+              </svg>
+              <label htmlFor="pc-settings-search" className="sr-only">
+                Find a setting
+              </label>
+              <input
+                id="pc-settings-search"
+                type="search"
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                placeholder="Find a setting…"
+                autoComplete="off"
+              />
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery("")}
+                  aria-label="Clear settings search"
+                >
+                  ×
+                </button>
+              )}
+            </div>
+
+            <div className="pc-settings-search-status" aria-live="polite">
+              {searchQuery
+                ? `${visibleSections.length} categor${visibleSections.length === 1 ? "y" : "ies"} found`
+                : "Navigate the control deck"}
+            </div>
+
+            <nav className="pc-settings-nav" aria-label="Settings map">
+              {availableSections.map((section) => {
+                const visible = visibleSectionIds.has(section.id);
+                const matches = matchingSettingNames(section, searchQuery);
+                return (
+                  <button
+                    key={section.id}
+                    type="button"
+                    className="pc-settings-nav__item"
+                    data-active={activeSection === section.id ? "true" : undefined}
+                    data-filtered={!visible ? "true" : undefined}
+                    aria-label={section.label}
+                    aria-current={activeSection === section.id ? "location" : undefined}
+                    aria-controls={`pc-settings-${section.id}`}
+                    onClick={() => navigateToSection(section.id)}
+                  >
+                    <span className="pc-settings-nav__route" aria-hidden="true">
+                      <SettingsGlyph id={section.id} />
+                    </span>
+                    <span className="pc-settings-nav__copy">
+                      <strong>{section.label}</strong>
+                      <small>{matches[0] ?? sectionStatus[section.id]}</small>
+                    </span>
+                    <span className="pc-settings-nav__beacon" aria-hidden="true" />
+                  </button>
+                );
+              })}
+            </nav>
+
+            <div className="pc-settings-rail__readout" aria-hidden="true">
+              <span>LIVE CONFIG</span>
+              <span>{ipc.isTauri() ? "NATIVE" : "PREVIEW"}</span>
+            </div>
+          </aside>
+
+          <main ref={contentRef} className="pc-settings-content" onScroll={onContentScroll}>
+            {settingsError && (
+              <div className="pc-settings-global-error" role="alert">
+                <span aria-hidden="true">!</span>
+                <div>
+                  <strong>Couldn't save settings</strong>
+                  <p>{settingsError}</p>
                 </div>
               </div>
-
-              <div>
-                <label
-                  htmlFor="pc-settings-model"
-                  className="mb-1.5 block text-[12.5px] font-medium text-fg"
-                >
-                  Default model (new sessions)
-                </label>
-                <select
-                  id="pc-settings-model"
-                  value={settings.model}
-                  onChange={(e) => void updateSettings({ model: e.target.value })}
-                  className="pc-select w-full rounded-lg border border-border bg-panel-2 px-3 py-2.5 text-[12.5px] text-fg outline-none"
-                >
-                  {MODELS.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.label}
-                    </option>
-                  ))}
-                </select>
-                <p className="mt-1.5 text-[11px] text-faint">
-                  Used as the starting model for new chats. Change a chat&apos;s model from its
-                  composer.
-                </p>
-                {/* settingsError is shared by the model select and the permission
-                    policy buttons; surface it next to its higher control here. */}
-                {settingsError && (
-                  <p className="mt-1.5 text-[11px] text-danger" role="alert">
-                    Couldn't save settings: {settingsError}
-                  </p>
-                )}
+            )}
+            {searchQuery && visibleSections.length === 0 && (
+              <div className="pc-settings-empty">
+                <span aria-hidden="true">Ø</span>
+                <strong>No setting found</strong>
+                <p>Try “model”, “command”, “scanlines”, “reports”, or “phone”.</p>
+                <button type="button" onClick={() => setSearchQuery("")}>
+                  Clear search
+                </button>
               </div>
+            )}
 
-              <div>
-                <label className="mb-1.5 block text-[12.5px] font-medium text-fg">
-                  Subscription (Claude Pro/Max)
-                </label>
-                {signedIn ? (
-                  <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-panel-2 px-3 py-2.5">
-                    <div className="min-w-0 text-[12.5px]">
-                      <div className="flex items-center gap-1.5">
-                        <span className="pc-dot pc-dot--success" />
-                        <span className="min-w-0 truncate text-fg">
-                          Signed in{oauthStatus?.account ? ` as ${oauthStatus.account}` : ""}
-                        </span>
-                        {oauthStatus?.tier && (
-                          <span
-                            title={oauthStatus.tier}
-                            className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wider shadow-sm ${
-                              /max/i.test(oauthStatus.tier)
-                                ? "bg-gradient-to-r from-amber-300 to-amber-500 text-black"
-                                : "bg-gradient-to-r from-violet-400 to-indigo-500 text-white"
-                            }`}
-                          >
-                            {oauthStatus.tier.replace(/^Claude\s+/, "")}
-                          </span>
-                        )}
+            <div className="pc-settings-sections">
+              {/* CLAUDE */}
+              <section
+                id="pc-settings-claude"
+                ref={(node) => {
+                  sectionRefs.current.claude = node;
+                }}
+                className={`pc-settings-section ${
+                  remoteMode || !visibleSectionIds.has("claude") ? "hidden" : ""
+                }`}
+                onFocusCapture={() => setActiveSection("claude")}
+              >
+                <SettingsSectionHeader
+                  eyebrow="ANTHROPIC"
+                  title="Claude"
+                  description="Claude models, Claude account access, and the Anthropic API key live here—nothing in this section is sent to OpenAI."
+                  status={sectionStatus.claude}
+                  statusTone={signedIn || settings.apiKeySet ? "success" : "cyan"}
+                  tone="violet"
+                />
+                <div className="pc-settings-group pc-provider-section pc-provider-section--claude">
+                  <ProviderBanner
+                    provider="claude"
+                    vendor="Anthropic"
+                    title="Claude"
+                    active={selectedProvider === "anthropic"}
+                    model={selectedProvider === "anthropic" ? selectedModel?.label : undefined}
+                  />
+                  <div className="pc-provider-grid">
+                    <div id="pc-setting-claude-model" className="pc-provider-card">
+                      <div className="pc-provider-card__heading">
+                        <span>Model</span>
+                        <span>CLAUDE ONLY</span>
                       </div>
-                      {oauthStatus?.expiresAt != null && (
-                        <div className="mt-0.5 text-[11px] text-muted">
-                          Access expires {formatExpiry(oauthStatus.expiresAt)}
+                      <label
+                        htmlFor="pc-settings-claude-model"
+                        className="mb-1.5 block text-[12.5px] font-medium text-fg"
+                      >
+                        Claude model for new sessions
+                      </label>
+                      <SelectMenu
+                        id="pc-settings-claude-model"
+                        label="Claude model for new sessions"
+                        value={claudeModelValue}
+                        onChange={(next) => void updateSettings({ model: next })}
+                        className="w-full"
+                        buttonClassName="px-3 py-2.5 text-[12.5px]"
+                        groups={[
+                          {
+                            id: "claude-models",
+                            options: [
+                              {
+                                value: "choose-claude",
+                                label: "Choose a Claude model…",
+                                disabled: true,
+                              },
+                              ...ANTHROPIC_MODELS.map((model) => ({
+                                value: model.id,
+                                label: model.label,
+                              })),
+                            ],
+                          },
+                        ]}
+                      />
+                      <p className="mt-1.5 text-[11px] text-faint">
+                        Choosing a Claude model makes Anthropic the default for new chats.
+                      </p>
+                    </div>
+
+                    <div id="pc-setting-claude" className="pc-provider-card">
+                      <div className="pc-provider-card__heading">
+                        <span>Account</span>
+                        <span>CLAUDE PRO / MAX</span>
+                      </div>
+                      <h3>Claude subscription</h3>
+                      {signedIn ? (
+                        <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-panel-2 px-3 py-2.5">
+                          <div className="min-w-0 text-[12.5px]">
+                            <div className="flex items-center gap-1.5">
+                              <span className="pc-dot pc-dot--success" />
+                              <span className="min-w-0 truncate text-fg">
+                                Signed in{oauthStatus?.account ? ` as ${oauthStatus.account}` : ""}
+                              </span>
+                              {oauthStatus?.tier && (
+                                <span
+                                  title={oauthStatus.tier}
+                                  className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wider shadow-sm ${
+                                    /max/i.test(oauthStatus.tier)
+                                      ? "bg-gradient-to-r from-amber-300 to-amber-500 text-black"
+                                      : "bg-gradient-to-r from-violet-400 to-indigo-500 text-white"
+                                  }`}
+                                >
+                                  {oauthStatus.tier.replace(/^Claude\s+/, "")}
+                                </span>
+                              )}
+                            </div>
+                            {oauthStatus?.expiresAt != null && (
+                              <div className="mt-0.5 text-[11px] text-muted">
+                                Access expires {formatExpiry(oauthStatus.expiresAt)}
+                              </div>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            aria-label="Log out of Claude"
+                            onClick={() => void logoutClaude()}
+                            className="shrink-0 rounded-lg border border-border bg-panel px-3 py-2 text-[12.5px] text-muted hover:text-fg"
+                          >
+                            Log out
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => void signIn()}
+                          disabled={signingIn}
+                          className="pc-btn-accent w-full px-3 py-2.5 text-[12.5px] disabled:opacity-30"
+                        >
+                          {signingIn ? "Signing in…" : "Sign in with Claude"}
+                        </button>
+                      )}
+                      {oauthError && (
+                        <p className="mt-1.5 text-[11px] text-danger" role="alert">
+                          Sign-in failed: {oauthError}
+                        </p>
+                      )}
+                      <p className="mt-1.5 text-[11px] text-faint">
+                        Uses your eligible Claude subscription instead of API billing.
+                      </p>
+                    </div>
+
+                    <div
+                      id="pc-setting-anthropic-api-key"
+                      className="pc-provider-card pc-provider-card--wide"
+                    >
+                      <div className="pc-provider-card__heading">
+                        <span>API credential</span>
+                        <span>ANTHROPIC ONLY</span>
+                      </div>
+                      <label
+                        htmlFor="pc-settings-apikey"
+                        className="mb-1.5 block text-[12.5px] font-medium text-fg"
+                      >
+                        Anthropic API key
+                      </label>
+                      <div className="flex gap-2">
+                        <input
+                          id="pc-settings-apikey"
+                          type="password"
+                          value={apiKey}
+                          onChange={(e) => {
+                            setApiKey(e.target.value);
+                            // Clear a stale "Couldn't save key" as the user corrects it.
+                            if (keyError) setKeyError(null);
+                          }}
+                          placeholder={settings.apiKeySet ? "••••••••  (replace)" : "sk-ant-…"}
+                          className="flex-1 rounded-lg border border-border bg-panel-2 px-3 py-2.5 font-mono text-[12.5px] text-muted outline-none transition-colors focus:border-accent/50 select-text"
+                        />
+                        <button
+                          ref={saveBtnRef}
+                          type="button"
+                          onClick={() => void saveKey()}
+                          disabled={saving || !apiKey.trim()}
+                          className="pc-btn-accent px-4 py-2.5 text-[12.5px] disabled:opacity-30"
+                        >
+                          {saveLabel}
+                        </button>
+                      </div>
+                      {keyError && (
+                        <p className="mt-1.5 text-[11px] text-danger" role="alert">
+                          Couldn't save key: {keyError}
+                        </p>
+                      )}
+                      <span role="status" aria-live="polite" className="sr-only">
+                        {savedKey ? "Anthropic API key saved" : ""}
+                      </span>
+                      <p className="mt-1.5 text-[11px] text-faint">
+                        {signedIn
+                          ? "Optional while signed in with Claude. Subscription access takes priority."
+                          : settings.apiKeySet
+                            ? "An Anthropic key is stored in Windows Credential Manager."
+                            : "Stored in Windows Credential Manager and used only for Claude requests."}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              {/* OPENAI */}
+              <section
+                id="pc-settings-openai"
+                ref={(node) => {
+                  sectionRefs.current.openai = node;
+                }}
+                className={`pc-settings-section ${
+                  remoteMode || !visibleSectionIds.has("openai") ? "hidden" : ""
+                }`}
+                onFocusCapture={() => setActiveSection("openai")}
+              >
+                <SettingsSectionHeader
+                  eyebrow="OPENAI"
+                  title="GPT / Codex"
+                  description="OpenAI models, ChatGPT account access, and reasoning controls stay separate from Claude credentials."
+                  status={sectionStatus.openai}
+                  statusTone={signedInOpenAI ? "success" : "cyan"}
+                />
+                <div className="pc-settings-group pc-provider-section pc-provider-section--openai">
+                  <ProviderBanner
+                    provider="openai"
+                    vendor="OpenAI"
+                    title="GPT / Codex"
+                    active={selectedProvider === "openai"}
+                    model={selectedProvider === "openai" ? selectedModel?.label : undefined}
+                  />
+
+                  <div className="pc-provider-grid">
+                    <div id="pc-setting-openai-model" className="pc-provider-card">
+                      <div className="pc-provider-card__heading">
+                        <span>Model</span>
+                        <span>OPENAI ONLY</span>
+                      </div>
+                      <label
+                        htmlFor="pc-settings-openai-model"
+                        className="mb-1.5 block text-[12.5px] font-medium text-fg"
+                      >
+                        OpenAI model for new sessions
+                      </label>
+                      <SelectMenu
+                        id="pc-settings-openai-model"
+                        label="OpenAI model for new sessions"
+                        value={openAIModelValue}
+                        onChange={(next) => void updateSettings({ model: next })}
+                        className="w-full"
+                        buttonClassName="px-3 py-2.5 text-[12.5px]"
+                        groups={[
+                          {
+                            id: "openai-models",
+                            options: [
+                              {
+                                value: "choose-openai",
+                                label: "Choose a GPT model…",
+                                disabled: true,
+                              },
+                              ...openAIModels.map((model) => ({
+                                value: model.id,
+                                label: model.label,
+                              })),
+                            ],
+                          },
+                        ]}
+                      />
+                      <p className="mt-1.5 text-[11px] text-faint">
+                        Choosing a GPT model makes OpenAI the default for new chats.
+                      </p>
+                    </div>
+
+                    <div id="pc-setting-openai-reasoning" className="pc-provider-card">
+                      <div className="pc-provider-card__heading">
+                        <span>Model behavior</span>
+                        <span>GPT / CODEX</span>
+                      </div>
+                      <label
+                        htmlFor="pc-settings-reasoning"
+                        className="mb-1.5 block text-[12.5px] font-medium text-fg"
+                      >
+                        Reasoning level
+                      </label>
+                      {selectedProvider === "openai" && reasoningEfforts.length > 0 ? (
+                        <SelectMenu
+                          id="pc-settings-reasoning"
+                          label="Reasoning level"
+                          value={settings.reasoningEffort}
+                          onChange={(next) => void updateSettings({ reasoningEffort: next })}
+                          className="w-full"
+                          buttonClassName="px-3 py-2.5 text-[12.5px]"
+                          groups={[
+                            {
+                              id: "reasoning",
+                              options: reasoningEfforts.map((effort) => ({
+                                value: effort,
+                                label: reasoningEffortLabel(effort),
+                              })),
+                            },
+                          ]}
+                        />
+                      ) : (
+                        <div className="pc-provider-empty-control">
+                          Choose a GPT model to configure reasoning.
                         </div>
                       )}
+                      <p className="mt-1.5 text-[11px] text-faint">
+                        Available levels come from the selected OpenAI model.
+                      </p>
                     </div>
-                    <button
-                      onClick={() => void logoutClaude()}
-                      className="shrink-0 rounded-lg border border-border bg-panel px-3 py-2 text-[12.5px] text-muted hover:text-fg"
-                    >
-                      Log out
-                    </button>
-                  </div>
-                ) : (
-                  <button
-                    onClick={() => void signIn()}
-                    disabled={signingIn}
-                    className="pc-btn-accent w-full px-3 py-2.5 text-[12.5px] disabled:opacity-30"
-                  >
-                    {signingIn ? "Signing in…" : "Sign in with Claude"}
-                  </button>
-                )}
-                {oauthError && (
-                  <p className="mt-1.5 text-[11px] text-danger" role="alert">
-                    Sign-in failed: {oauthError}
-                  </p>
-                )}
-              </div>
 
-              <div>
-                <label
-                  htmlFor="pc-settings-apikey"
-                  className="mb-1.5 block text-[12.5px] font-medium text-fg"
-                >
-                  API key
-                </label>
-                <div className="flex gap-2">
-                  <input
-                    id="pc-settings-apikey"
-                    type="password"
-                    value={apiKey}
-                    onChange={(e) => {
-                      setApiKey(e.target.value);
-                      // Clear a stale "Couldn't save key" as the user corrects it.
-                      if (keyError) setKeyError(null);
-                    }}
-                    placeholder={settings.apiKeySet ? "••••••••  (replace)" : "sk-ant-…"}
-                    className="flex-1 rounded-lg border border-border bg-panel-2 px-3 py-2.5 font-mono text-[12.5px] text-muted outline-none transition-colors focus:border-accent/50 select-text"
-                  />
-                  <button
-                    ref={saveBtnRef}
-                    onClick={() => void saveKey()}
-                    disabled={saving || !apiKey.trim()}
-                    className="pc-btn-accent px-4 py-2.5 text-[12.5px] disabled:opacity-30"
-                  >
-                    {saveLabel}
-                  </button>
-                </div>
-                {keyError && (
-                  <p className="mt-1.5 text-[11px] text-danger" role="alert">
-                    Couldn't save key: {keyError}
-                  </p>
-                )}
-                <span role="status" aria-live="polite" className="sr-only">
-                  {savedKey ? "API key saved" : ""}
-                </span>
-                <p className="mt-1.5 text-[11px] text-faint">
-                  {signedIn
-                    ? "Signed in with Claude — Portcode uses your subscription; an API key is optional."
-                    : settings.apiKeySet
-                      ? "A key is stored in Windows Credential Manager."
-                      : "Stored securely in Windows Credential Manager — never on disk in plaintext."}
-                </p>
-              </div>
-            </div>
-          </section>
-
-          {/* PERMISSIONS */}
-          <PermissionSettings />
-
-          {/* APPEARANCE */}
-          <section>
-            <div className="pc-eyebrow pc-eyebrow--violet">APPEARANCE</div>
-            <div>
-              <ToggleRow
-                label="Typing animation"
-                hint="Reveal replies with a terminal-style typing effect."
-                on={settings.typingAnimation}
-                onToggle={() => void updateSettings({ typingAnimation: !settings.typingAnimation })}
-              />
-              {!remoteMode && (
-                <>
-                  <ToggleRow
-                    label="Automatic updates"
-                    hint="Download and install new versions automatically, then prompt to relaunch."
-                    on={settings.autoUpdate}
-                    onToggle={() => void setAutoUpdate(!settings.autoUpdate)}
-                  />
-                  {/* Manual check + live status. Gives auto-update-off users on-demand
-                      control (Claude Code only ever checks on its own schedule) and
-                      surfaces the current update state inline. */}
-                  <div className="flex items-center justify-between gap-4 py-1.5">
-                    <div>
-                      <div className="text-[12.5px] font-medium text-fg">Check for updates</div>
-                      <div className="mt-0.5 text-[11px] text-faint" aria-live="polite">
-                        {checkingForUpdate
-                          ? "Checking for updates…"
-                          : update.phase === "available"
-                            ? `Update available · v${update.info?.version ?? ""}`
-                            : update.phase === "downloading"
-                              ? "Downloading update…"
-                              : update.phase === "ready"
-                                ? "Update ready — relaunch to apply"
-                                : update.phase === "error"
-                                  ? "Last check failed — try again"
-                                  : "You're on the latest version."}
+                    <div id="pc-setting-openai" className="pc-provider-card pc-provider-card--wide">
+                      <div className="pc-provider-card__heading">
+                        <span>Authentication</span>
+                        <span>CHATGPT SUBSCRIPTION</span>
+                      </div>
+                      <h3>ChatGPT account</h3>
+                      {signedInOpenAI ? (
+                        <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-panel-2 px-3 py-2.5">
+                          <div className="min-w-0 text-[12.5px]">
+                            <div className="flex items-center gap-1.5">
+                              <span className="pc-dot pc-dot--success" />
+                              <span className="min-w-0 truncate text-fg">
+                                Signed in
+                                {openAIAuthStatus?.account ? ` as ${openAIAuthStatus.account}` : ""}
+                              </span>
+                              {openAIAuthStatus?.tier && (
+                                <span
+                                  title={openAIAuthStatus.tier}
+                                  className="shrink-0 rounded-full bg-gradient-to-r from-emerald-400 to-cyan-500 px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wider text-black shadow-sm"
+                                >
+                                  {openAIAuthStatus.tier.replace(/^ChatGPT\s+/i, "")}
+                                </span>
+                              )}
+                            </div>
+                            {openAIAuthStatus?.expiresAt != null && (
+                              <div className="mt-0.5 text-[11px] text-muted">
+                                Access expires {formatExpiry(openAIAuthStatus.expiresAt)}
+                              </div>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            aria-label="Log out of ChatGPT"
+                            onClick={() => void logoutOpenAI()}
+                            className="shrink-0 rounded-lg border border-border bg-panel px-3 py-2 text-[12.5px] text-muted hover:text-fg"
+                          >
+                            Log out
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => void signInOpenAI()}
+                          disabled={signingInOpenAI}
+                          className="w-full rounded-lg border border-accent-2/50 bg-accent-2/10 px-3 py-2.5 text-[12.5px] text-accent-2 transition-colors hover:bg-accent-2/20 disabled:opacity-30"
+                        >
+                          {signingInOpenAI ? "Signing in…" : "Sign in with ChatGPT"}
+                        </button>
+                      )}
+                      {openAIAuthError && (
+                        <p className="mt-1.5 text-[11px] text-danger" role="alert">
+                          OpenAI sign-in: {openAIAuthError}
+                        </p>
+                      )}
+                      <p className="mt-1.5 text-[11px] text-faint">
+                        Uses models included with your eligible ChatGPT subscription.
+                      </p>
+                      <div id="pc-setting-openai-auth-note" className="pc-provider-boundary">
+                        <strong>OpenAI API keys are not used by this integration.</strong>
+                        <span>
+                          OpenAI authenticates through ChatGPT sign-in. Your Anthropic key is never
+                          sent to OpenAI.
+                        </span>
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setCheckingForUpdate(true);
-                        void checkForUpdate().finally(() => setCheckingForUpdate(false));
-                      }}
-                      disabled={
-                        checkingForUpdate ||
-                        update.phase === "downloading" ||
-                        update.phase === "ready"
-                      }
-                      className="shrink-0 rounded-md border border-border-2 bg-panel-2/80 px-3 py-1 font-mono text-[11px] text-muted transition-colors hover:border-accent/50 hover:text-accent disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      {checkingForUpdate ? "Checking…" : "Check now"}
-                    </button>
-                  </div>
-                </>
-              )}
-              <ToggleRow
-                label="Neon rain"
-                hint="Ambient cyberpunk backdrop behind the app. Decorative only."
-                on={ambientRain}
-                onToggle={() => setAmbientRain(!ambientRain)}
-              />
-              <ToggleRow
-                label="Scanlines"
-                hint="CRT-style scanline overlay and vignette."
-                on={scanlines}
-                onToggle={() => setScanlines(!scanlines)}
-              />
-              <ScaleRow value={uiScale} onSelect={setUiScale} />
-            </div>
-          </section>
-
-          {/* PRIVACY */}
-          <section>
-            <div className="pc-eyebrow pc-eyebrow--violet">PRIVACY</div>
-            <div>
-              <ToggleRow
-                label="Crash & performance reports"
-                hint="Send anonymous, scrubbed crash + basic performance reports — never your prompts, code, files, or keys. Off by default."
-                on={crashReporting === true}
-                onToggle={() => setCrashReporting(crashReporting !== true)}
-              />
-            </div>
-          </section>
-
-          {/* PHONE SYNC */}
-          <section className={remoteMode ? "hidden" : undefined}>
-            <div className="pc-eyebrow">PHONE SYNC</div>
-            <div className="flex flex-col gap-3.5">
-              {phoneSync && (
-                <div>
-                  <label className="mb-1.5 block text-[12.5px] font-medium text-fg">
-                    This device
-                  </label>
-                  <div className="rounded-lg border border-border bg-panel-2 px-3 py-2.5 font-mono text-[11.5px] text-muted select-text">
-                    {truncateKey(phoneSync.devicePublicKey)}
                   </div>
                 </div>
-              )}
+              </section>
 
-              {phoneSync && phoneSync.paired.length > 0 && (
-                <div>
-                  <label className="mb-1.5 block text-[12.5px] font-medium text-fg">
-                    Paired phones
-                  </label>
-                  <div className="flex flex-col gap-1.5">
-                    {phoneSync.paired.map((device) => (
-                      <div
-                        key={device.publicKey}
-                        className="flex items-center justify-between gap-3 rounded-lg border border-border bg-panel-2 px-3 py-2"
-                      >
-                        <div className="min-w-0 text-[12.5px]">
-                          <div className="flex items-center gap-1.5">
-                            <span className="pc-dot pc-dot--success" />
-                            <span className="min-w-0 truncate text-fg">{device.name}</span>
-                          </div>
-                          <div className="mt-0.5 font-mono text-[11px] text-muted">
-                            {truncateKey(device.publicKey)}
+              {/* PLAN USAGE */}
+              <section
+                id="pc-settings-usage"
+                ref={(node) => {
+                  sectionRefs.current.usage = node;
+                }}
+                className={`pc-settings-section ${
+                  remoteMode || !visibleSectionIds.has("usage") ? "hidden" : ""
+                }`}
+                onFocusCapture={() => setActiveSection("usage")}
+              >
+                <SettingsSectionHeader
+                  eyebrow="PLAN ALLOWANCE"
+                  title="Plan usage"
+                  description="See the included allowance reported by Claude and GPT in one place. Percentages use one shared meaning: capacity remaining."
+                  status={sectionStatus.usage}
+                  statusTone={signedIn || signedInOpenAI ? "success" : "cyan"}
+                  tone="cyan"
+                />
+                <div
+                  id="pc-setting-plan-usage"
+                  className="pc-settings-group pc-settings-group--usage"
+                >
+                  <PlanUsagePanel />
+                </div>
+              </section>
+
+              {/* PERMISSIONS */}
+              <section
+                id="pc-settings-permissions"
+                ref={(node) => {
+                  sectionRefs.current.permissions = node;
+                }}
+                className={`pc-settings-section ${
+                  remoteMode || !visibleSectionIds.has("permissions") ? "hidden" : ""
+                }`}
+                onFocusCapture={() => setActiveSection("permissions")}
+              >
+                <SettingsSectionHeader
+                  eyebrow="PERMISSIONS"
+                  title="Permissions & safety"
+                  description="Set the agent's operating posture, then add precise exceptions where needed."
+                  status={sectionStatus.permissions}
+                  statusTone={DANGER_MODES.includes(settings.permissionMode) ? "danger" : "warn"}
+                  tone="amber"
+                />
+                <div className="pc-settings-group pc-settings-group--permissions">
+                  <PermissionSettings />
+                </div>
+              </section>
+
+              {/* APPEARANCE */}
+              <section
+                id="pc-settings-interface"
+                ref={(node) => {
+                  sectionRefs.current.interface = node;
+                }}
+                className={`pc-settings-section ${
+                  !visibleSectionIds.has("interface") ? "hidden" : ""
+                }`}
+                onFocusCapture={() => setActiveSection("interface")}
+              >
+                <SettingsSectionHeader
+                  eyebrow="APPEARANCE"
+                  title="Interface"
+                  description="Tune visual density, response motion, and the ambient layer around your work."
+                  status={sectionStatus.interface}
+                  statusTone="cyan"
+                  tone="violet"
+                />
+                <div className="pc-settings-group pc-settings-group--rows">
+                  <ToggleRow
+                    id="pc-setting-typing"
+                    label="Typing animation"
+                    hint="Reveal replies with a terminal-style typing effect."
+                    on={settings.typingAnimation}
+                    onToggle={() =>
+                      void updateSettings({ typingAnimation: !settings.typingAnimation })
+                    }
+                  />
+                  <ToggleRow
+                    id="pc-setting-rain"
+                    label="Neon rain"
+                    hint="Ambient cyberpunk backdrop behind the app. Decorative only."
+                    on={ambientRain}
+                    onToggle={() => setAmbientRain(!ambientRain)}
+                  />
+                  <ToggleRow
+                    id="pc-setting-scanlines"
+                    label="Scanlines"
+                    hint="CRT-style scanline overlay and vignette."
+                    on={scanlines}
+                    onToggle={() => setScanlines(!scanlines)}
+                  />
+                  <ScaleRow id="pc-setting-scale" value={uiScale} onSelect={setUiScale} />
+                </div>
+              </section>
+
+              {/* PRIVACY */}
+              <section
+                id="pc-settings-system"
+                ref={(node) => {
+                  sectionRefs.current.system = node;
+                }}
+                className={`pc-settings-section ${
+                  !visibleSectionIds.has("system") ? "hidden" : ""
+                }`}
+                onFocusCapture={() => setActiveSection("system")}
+              >
+                <SettingsSectionHeader
+                  eyebrow="PRIVACY"
+                  title={remoteMode ? "Privacy" : "Privacy & updates"}
+                  description={
+                    remoteMode
+                      ? "Control anonymous diagnostics for this interface."
+                      : "Control diagnostics and decide when Portcode changes under your feet."
+                  }
+                  status={sectionStatus.system}
+                  statusTone={
+                    update.phase === "error"
+                      ? "danger"
+                      : update.phase === "available"
+                        ? "warn"
+                        : "cyan"
+                  }
+                  tone="violet"
+                />
+                <div className="pc-settings-system-grid">
+                  {!remoteMode && (
+                    <div
+                      id="pc-setting-auto-update"
+                      className="pc-settings-group pc-settings-group--rows"
+                    >
+                      <div className="pc-settings-group__label">APP UPDATES</div>
+                      <ToggleRow
+                        label="Automatic updates"
+                        hint="Download and install new versions automatically, then prompt to relaunch."
+                        on={settings.autoUpdate}
+                        onToggle={() => void setAutoUpdate(!settings.autoUpdate)}
+                      />
+                      <div id="pc-setting-update-check" className="pc-setting-row">
+                        <div>
+                          <div className="text-[12.5px] font-medium text-fg">Check for updates</div>
+                          <div className="mt-0.5 text-[11px] text-faint" aria-live="polite">
+                            {checkingForUpdate
+                              ? "Checking for updates…"
+                              : update.phase === "available"
+                                ? `Update available · v${update.info?.version ?? ""}`
+                                : update.phase === "downloading"
+                                  ? "Downloading update…"
+                                  : update.phase === "ready"
+                                    ? "Update ready — relaunch to apply"
+                                    : update.phase === "error"
+                                      ? "Last check failed — try again"
+                                      : update.error
+                                        ? "Last check failed — try again"
+                                        : "You're on the latest version."}
                           </div>
                         </div>
                         <button
-                          onClick={() => void unpair(device.publicKey)}
-                          className="shrink-0 rounded-lg border border-border bg-panel px-3 py-2 text-[12.5px] text-muted hover:text-danger"
-                          aria-label={`Unpair ${device.name}`}
+                          type="button"
+                          onClick={() => {
+                            setCheckingForUpdate(true);
+                            void checkForUpdate().finally(() => setCheckingForUpdate(false));
+                          }}
+                          disabled={
+                            checkingForUpdate ||
+                            update.phase === "downloading" ||
+                            update.phase === "ready"
+                          }
+                          className="pc-settings-action"
                         >
-                          Unpair
+                          {checkingForUpdate ? "Checking…" : "Check now"}
                         </button>
                       </div>
-                    ))}
+                    </div>
+                  )}
+                  <div
+                    id="pc-setting-diagnostics"
+                    className="pc-settings-group pc-settings-group--rows"
+                  >
+                    <div className="pc-settings-group__label">ANONYMOUS DIAGNOSTICS</div>
+                    <ToggleRow
+                      label="Crash & performance reports"
+                      hint="Send anonymous, scrubbed crash + basic performance reports — never your prompts, code, files, or keys. Off by default."
+                      on={crashReporting === true}
+                      onToggle={() => setCrashReporting(crashReporting !== true)}
+                    />
+                    <div className="pc-settings-privacy-note">
+                      <span aria-hidden="true">◇</span>
+                      Prompts, code, files, and credentials never leave through diagnostics.
+                    </div>
                   </div>
                 </div>
-              )}
+              </section>
 
-              {/* Device-trust gate: a phone completed the handshake and is waiting
+              {/* PHONE SYNC */}
+              <section
+                id="pc-settings-devices"
+                ref={(node) => {
+                  sectionRefs.current.devices = node;
+                }}
+                className={`pc-settings-section ${
+                  remoteMode || !visibleSectionIds.has("devices") ? "hidden" : ""
+                }`}
+                onFocusCapture={() => setActiveSection("devices")}
+              >
+                <SettingsSectionHeader
+                  eyebrow="PHONE SYNC"
+                  title="Phone & devices"
+                  description="Extend this desktop to a trusted phone, then revoke access at any time."
+                  status={sectionStatus.devices}
+                  statusTone={phoneSync?.paired.length ? "success" : "cyan"}
+                />
+                <div className="pc-settings-group flex flex-col gap-3.5">
+                  {phoneSync && (
+                    <div id="pc-setting-device-identity">
+                      <label className="mb-1.5 block text-[12.5px] font-medium text-fg">
+                        This device
+                      </label>
+                      <div className="rounded-lg border border-border bg-panel-2 px-3 py-2.5 font-mono text-[11.5px] text-muted select-text">
+                        {truncateKey(phoneSync.devicePublicKey)}
+                      </div>
+                    </div>
+                  )}
+
+                  {phoneSync && phoneSync.paired.length > 0 && (
+                    <div id="pc-setting-paired-phones">
+                      <label className="mb-1.5 block text-[12.5px] font-medium text-fg">
+                        Paired phones
+                      </label>
+                      <div className="flex flex-col gap-1.5">
+                        {phoneSync.paired.map((device) => (
+                          <div
+                            key={device.publicKey}
+                            className="flex items-center justify-between gap-3 rounded-lg border border-border bg-panel-2 px-3 py-2"
+                          >
+                            <div className="min-w-0 text-[12.5px]">
+                              <div className="flex items-center gap-1.5">
+                                <span className="pc-dot pc-dot--success" />
+                                <span className="min-w-0 truncate text-fg">{device.name}</span>
+                              </div>
+                              <div className="mt-0.5 font-mono text-[11px] text-muted">
+                                {truncateKey(device.publicKey)}
+                              </div>
+                            </div>
+                            <button
+                              onClick={() => void unpair(device.publicKey)}
+                              className="shrink-0 rounded-lg border border-border bg-panel px-3 py-2 text-[12.5px] text-muted hover:text-danger"
+                              aria-label={`Unpair ${device.name}`}
+                            >
+                              Unpair
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Device-trust gate: a phone completed the handshake and is waiting
                   for this desktop user to compare its SAS and confirm. Until the
                   user confirms, the phone is served NOTHING. */}
-              {pairingRequest && (
-                <PairingConfirm
-                  request={pairingRequest}
-                  onConfirm={() => void confirmPairingRequest()}
-                  onReject={() => void rejectPairingRequest()}
-                />
-              )}
+                  {pairingRequest && (
+                    <PairingConfirm
+                      request={pairingRequest}
+                      onConfirm={() => void confirmPairingRequest()}
+                      onReject={() => void rejectPairingRequest()}
+                    />
+                  )}
 
-              {pairingPayload ? (
-                <PairingCode payload={pairingPayload} onDone={clearPairing} />
-              ) : (
-                <button
-                  onClick={() => void beginPairing()}
-                  className="pc-btn-accent w-full px-3 py-2.5 text-[12.5px]"
-                >
-                  Pair a phone
-                </button>
-              )}
-              {pairingError && (
-                <p className="mt-1.5 text-[11px] text-danger" role="alert">
-                  Pairing failed: {pairingError}
-                </p>
-              )}
+                  <div id="pc-setting-phone-pairing">
+                    {pairingPayload ? (
+                      <PairingCode payload={pairingPayload} onDone={clearPairing} />
+                    ) : (
+                      <button
+                        onClick={() => void beginPairing()}
+                        className="pc-btn-accent w-full px-3 py-2.5 text-[12.5px]"
+                      >
+                        Pair a phone
+                      </button>
+                    )}
+                  </div>
+                  {pairingError && (
+                    <p className="mt-1.5 text-[11px] text-danger" role="alert">
+                      Pairing failed: {pairingError}
+                    </p>
+                  )}
+                </div>
+              </section>
             </div>
-          </section>
+          </main>
         </div>
 
         {/* FOOTER */}
-        <div className="flex items-center justify-between border-t border-border px-5 py-3 font-mono text-[10.5px] text-faint">
-          <span className="text-muted">PORTCODE · PORTHEX</span>
+        <div className="pc-settings-footer">
+          <span className="text-muted">CHANGES SAVE AS YOU WORK</span>
           <span className="text-warn">{ipc.isTauri() ? "NATIVE CORE" : "PREVIEW (BROWSER)"}</span>
         </div>
       </div>
     </div>
+  );
+}
+
+function ProviderBanner({
+  provider,
+  vendor,
+  title,
+  active,
+  model,
+}: {
+  provider: "claude" | "openai";
+  vendor: string;
+  title: string;
+  active: boolean;
+  model?: string;
+}) {
+  return (
+    <div className={`pc-provider-banner pc-provider-banner--${provider}`}>
+      <div className="pc-provider-mark" aria-hidden="true">
+        {provider === "claude" ? "C" : "O"}
+      </div>
+      <div className="pc-provider-banner__copy">
+        <span>{vendor}</span>
+        <strong>{title}</strong>
+        <small>{model ?? "Choose a model to make this provider the default"}</small>
+      </div>
+      <div className={`pc-provider-state ${active ? "pc-provider-state--active" : ""}`}>
+        <span className={`pc-dot ${active ? "pc-dot--success" : "pc-dot--cyan"}`} />
+        {active ? "Default for new chats" : "Available"}
+      </div>
+    </div>
+  );
+}
+
+function SettingsSectionHeader({
+  eyebrow,
+  title,
+  description,
+  status,
+  statusTone = "cyan",
+  tone = "cyan",
+}: {
+  eyebrow: string;
+  title: string;
+  description: string;
+  status: string;
+  statusTone?: "cyan" | "success" | "warn" | "danger";
+  tone?: "cyan" | "violet" | "amber";
+}) {
+  return (
+    <header className={`pc-settings-section-head pc-settings-section-head--${tone}`}>
+      <div className="pc-settings-section-head__copy">
+        <div className="pc-eyebrow">{eyebrow}</div>
+        <h2>{title}</h2>
+        <p>{description}</p>
+      </div>
+      <div className="pc-settings-section-head__status">
+        <span className={`pc-dot pc-dot--${statusTone}`} />
+        <span>{status}</span>
+      </div>
+    </header>
+  );
+}
+
+function SettingsGlyph({ id }: { id: SettingsSectionId }) {
+  const paths: Record<SettingsSectionId, ReactNode> = {
+    claude: (
+      <>
+        <circle cx="12" cy="12" r="3" />
+        <path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1m0-12.8-2.1 2.1m-8.6 8.6-2.1 2.1" />
+      </>
+    ),
+    openai: (
+      <>
+        <path d="M8.2 4.6A5.1 5.1 0 0 1 17 8.1a5.1 5.1 0 0 1-1.3 9.8 5.1 5.1 0 0 1-8.8-3.5A5.1 5.1 0 0 1 8.2 4.6Z" />
+        <path d="m8.2 4.6 7.5 4.3v9m1.3-9.8-7.5 4.3-2.6 2m8.8 3.5-7.5-4.3v-9" />
+      </>
+    ),
+    usage: (
+      <>
+        <path d="M4 19V9m5 10V5m5 14v-7m5 7V3" />
+        <path d="M3 19.5h18" />
+      </>
+    ),
+    permissions: (
+      <path d="M12 3 5.5 6v5.2c0 4.2 2.7 7.9 6.5 9.8 3.8-1.9 6.5-5.6 6.5-9.8V6L12 3Zm-2.3 9 1.6 1.6 3.4-3.6" />
+    ),
+    interface: (
+      <>
+        <rect x="3" y="4" width="18" height="13" rx="2" />
+        <path d="M8 21h8m-4-4v4M7 8h4m-4 4h8" />
+      </>
+    ),
+    system: (
+      <>
+        <path d="M12 3a9 9 0 1 0 9 9" />
+        <path d="M12 7v5l3 2M16 3h5v5" />
+      </>
+    ),
+    devices: (
+      <>
+        <rect x="7" y="2.5" width="10" height="19" rx="2" />
+        <path d="M10 5h4m-3 13h2" />
+      </>
+    ),
+  };
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+      {paths[id]}
+    </svg>
   );
 }
 
@@ -733,16 +1588,24 @@ const UI_SCALES: { value: number; label: string }[] = [
 /** Interface-scale row: a segmented set of preset buttons wired to the store's
  *  uiScale/setUiScale. The active option is indicated with aria-pressed (not by
  *  colour alone) so it's conveyed to assistive tech and high-contrast users. */
-function ScaleRow({ value, onSelect }: { value: number; onSelect: (n: number) => void }) {
+function ScaleRow({
+  id,
+  value,
+  onSelect,
+}: {
+  id?: string;
+  value: number;
+  onSelect: (n: number) => void;
+}) {
   return (
-    <div className="flex flex-col gap-2 py-1.5">
+    <div id={id} className="pc-setting-block flex flex-col gap-2 py-1.5">
       <div>
         <div className="text-[12.5px] font-medium text-fg">Interface scale</div>
         <div className="text-[11px] text-faint mt-0.5">
           Resize the whole interface for comfort or density.
         </div>
       </div>
-      <div role="group" aria-label="Interface scale" className="flex gap-2">
+      <div role="group" aria-label="Interface scale" className="pc-scale-grid flex gap-2">
         {UI_SCALES.map((s) => {
           const active = value === s.value;
           return (
@@ -766,16 +1629,19 @@ function ScaleRow({ value, onSelect }: { value: number; onSelect: (n: number) =>
   );
 }
 
-const PERM_TOOLS = ["fs_read", "list", "glob", "grep", "fs_write", "fs_edit", "shell", "*"];
+// Only tools that can reach the permission gate belong here. Read-only and
+// delegation rules would never fire, so offering them would imply protection
+// the core does not need or apply.
+const PERM_TOOLS = ["write_file", "edit_file", "run_command", "*"] as const;
 
 const MODE_INFO: Record<PermissionMode, { label: string; hint: string }> = {
   default: { label: "Default", hint: "Use the policy below (ask / allow / deny)." },
   acceptEdits: {
     label: "Accept edits",
-    hint: "Auto-allow file writes & edits; still ask for shell.",
+    hint: "Auto-allow file changes; still ask before commands.",
   },
   plan: { label: "Plan", hint: "Read-only — deny every mutating tool." },
-  auto: { label: "Auto", hint: "Auto-allow EVERY mutating tool, including shell." },
+  auto: { label: "Auto", hint: "Auto-allow EVERY mutating tool, including commands." },
   bypass: { label: "Bypass", hint: "Skip the permission gate entirely." },
 };
 const MODE_ORDER: PermissionMode[] = ["default", "acceptEdits", "plan", "auto", "bypass"];
@@ -783,7 +1649,7 @@ const MODE_ORDER: PermissionMode[] = ["default", "acceptEdits", "plan", "auto", 
 /**
  * The permission mode + per-tool/command rule editor. auto/bypass require an
  * explicit danger acknowledgment to engage, and an over-broad allow rule (any
- * tool, or shell with no command prefix) is flagged loudly — the UI guardrails
+ * tool, or command execution with no prefix) is flagged loudly — the UI guardrails
  * the security review of the gate flagged as the layer that must enforce them.
  */
 function PermissionSettings() {
@@ -796,7 +1662,8 @@ function PermissionSettings() {
   const rules = settings.rules;
 
   const [confirmMode, setConfirmMode] = useState<PermissionMode | null>(null);
-  const [ruleTool, setRuleTool] = useState("shell");
+  const [confirmPolicy, setConfirmPolicy] = useState<ToolPolicy | null>(null);
+  const [ruleTool, setRuleTool] = useState("run_command");
   const [ruleCommand, setRuleCommand] = useState("");
   const [ruleDecision, setRuleDecision] = useState<ToolPolicy>("ask");
 
@@ -809,25 +1676,35 @@ function PermissionSettings() {
     }
   };
 
-  // An allow rule that matches everything (any tool, or shell with no command
+  const pickPolicy = (policy: ToolPolicy) => {
+    if (policy === "allow") {
+      setConfirmPolicy(policy);
+      return;
+    }
+    setConfirmPolicy(null);
+    void updateSettings({ defaultPolicy: policy });
+  };
+
+  // An allow rule that matches everything (any tool, or command execution with no
   // prefix) is the footgun the gate security review flagged — warn loudly.
   const overBroadAllow =
     ruleDecision === "allow" &&
-    (ruleTool === "*" || (ruleTool === "shell" && ruleCommand.trim() === ""));
+    (ruleTool === "*" || (isCommandToolName(ruleTool) && ruleCommand.trim() === ""));
 
   const addRule = () => {
-    const command = ruleTool === "shell" && ruleCommand.trim() ? ruleCommand : undefined;
+    const command = isCommandToolName(ruleTool) && ruleCommand.trim() ? ruleCommand : undefined;
     const rule: Rule = command
       ? { tool: ruleTool, command, decision: ruleDecision }
       : { tool: ruleTool, decision: ruleDecision };
-    if (
-      rules.some(
-        (r) => r.tool === rule.tool && r.command === rule.command && r.decision === rule.decision,
-      )
-    ) {
-      return; // exact duplicate — no-op
-    }
-    void updateSettings({ rules: [...rules, rule] });
+    const sameScope = (candidate: Rule) =>
+      toolNamesEquivalent(candidate.tool, rule.tool) && candidate.command === rule.command;
+    const first = rules[0];
+    if (first && sameScope(first) && first.decision === rule.decision) return;
+
+    // Rules are first-match. A newly added rule must precede a broad wildcard or
+    // tool rule that would otherwise shadow it; replace the same scope at the
+    // same time so the editor never creates a convincing-but-inert conflict.
+    void updateSettings({ rules: [rule, ...rules.filter((candidate) => !sameScope(candidate))] });
     setRuleCommand("");
   };
 
@@ -835,10 +1712,20 @@ function PermissionSettings() {
     void updateSettings({ rules: rules.filter((_, idx) => idx !== i) });
 
   return (
-    <section className={remoteMode ? "hidden" : undefined}>
-      <div className="pc-eyebrow pc-eyebrow--amber">PERMISSIONS</div>
+    <div className={remoteMode ? "hidden" : undefined}>
+      <div className="pc-settings-permission-intro">
+        <span className={DANGER_MODES.includes(mode) ? "text-danger" : "text-accent-2"}>
+          {DANGER_MODES.includes(mode) ? "CAUTION" : "CURRENT POSTURE"}
+        </span>
+        <strong>{MODE_INFO[mode].label}</strong>
+        <p>{MODE_INFO[mode].hint}</p>
+      </div>
 
-      <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
+      <div
+        id="pc-setting-permission-mode"
+        className="pc-permission-spectrum"
+        aria-label="Permission mode"
+      >
         {MODE_ORDER.map((m) => {
           const danger = DANGER_MODES.includes(m);
           const active = mode === m;
@@ -849,14 +1736,14 @@ function PermissionSettings() {
               onClick={() => pickMode(m)}
               title={MODE_INFO[m].hint}
               aria-pressed={active}
-              className={`rounded-lg border px-2 py-2 text-[11.5px] capitalize transition-colors ${
+              className={`pc-permission-mode ${
                 active
                   ? danger
-                    ? "border-danger/60 bg-danger/10 text-danger"
-                    : "border-accent-2/50 bg-accent-2/10 text-accent-2"
-                  : `border-border bg-panel-2 hover:border-accent-2/40 ${
-                      danger ? "text-danger/80" : "text-muted"
-                    }`
+                    ? "pc-permission-mode--active-danger"
+                    : "pc-permission-mode--active"
+                  : danger
+                    ? "pc-permission-mode--danger"
+                    : ""
               }`}
             >
               {danger ? "⚠ " : ""}
@@ -874,8 +1761,8 @@ function PermissionSettings() {
         >
           <p>
             ⚠ <strong className="capitalize">{MODE_INFO[confirmMode].label}</strong> lets the agent
-            run mutating tools — including shell commands — without asking. Only enable it if you
-            trust the task.
+            run mutating tools — including commands — without asking. Only enable it if you trust
+            the task.
           </p>
           <div className="mt-2 flex gap-2">
             <button
@@ -899,7 +1786,7 @@ function PermissionSettings() {
         </div>
       )}
 
-      <div className="mt-3">
+      <div id="pc-setting-default-policy" className="mt-3">
         <div className="mb-1 text-[11px] text-faint">
           Default-mode policy (used when the mode is Default)
         </div>
@@ -908,7 +1795,7 @@ function PermissionSettings() {
             <button
               key={p}
               type="button"
-              onClick={() => void updateSettings({ defaultPolicy: p })}
+              onClick={() => pickPolicy(p)}
               className={`flex-1 rounded-lg border px-3 py-2 text-[12.5px] capitalize transition-colors ${
                 settings.defaultPolicy === p
                   ? "border-accent-2/50 bg-accent-2/10 text-accent-2"
@@ -919,9 +1806,39 @@ function PermissionSettings() {
             </button>
           ))}
         </div>
+        {confirmPolicy === "allow" && (
+          <div
+            role="alert"
+            className="mt-2 rounded-lg border border-danger/50 bg-danger/10 p-2.5 text-[11.5px] text-danger"
+          >
+            <p>
+              ⚠ <strong>Allow by default</strong> lets every unmatched tool—including commands—run
+              without asking. Use specific rules when possible.
+            </p>
+            <div className="mt-2 flex gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  void updateSettings({ defaultPolicy: "allow" });
+                  setConfirmPolicy(null);
+                }}
+                className="rounded border border-danger/60 bg-danger/15 px-2.5 py-1 text-danger"
+              >
+                Enable default Allow
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmPolicy(null)}
+                className="rounded border border-border bg-panel-2 px-2.5 py-1 text-muted"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
-      <div className="mt-3">
+      <div id="pc-setting-tool-rules" className="mt-3">
         <div className="mb-1 text-[11px] text-faint">
           Rules — first match wins, evaluated before the mode default
         </div>
@@ -937,7 +1854,7 @@ function PermissionSettings() {
                 className="flex items-center justify-between gap-2 rounded border border-border bg-panel-2 px-2 py-1 text-[11.5px]"
               >
                 <span className="min-w-0 truncate font-mono">
-                  <span className="text-fg">{r.tool}</span>
+                  <span className="text-fg">{r.tool === "*" ? "Any tool" : toolLabel(r.tool)}</span>
                   {r.command ? <span className="text-muted"> “{r.command}”</span> : null}{" "}
                   <span
                     className={
@@ -965,19 +1882,25 @@ function PermissionSettings() {
         )}
 
         <div className="mt-2 flex flex-wrap items-center gap-2">
-          <select
-            aria-label="Rule tool"
+          <SelectMenu
+            label="Rule tool"
             value={ruleTool}
-            onChange={(e) => setRuleTool(e.target.value)}
-            className="rounded border border-border bg-panel-2 px-2 py-1 text-[11.5px] text-fg"
-          >
-            {PERM_TOOLS.map((t) => (
-              <option key={t} value={t}>
-                {t === "*" ? "any tool (*)" : t}
-              </option>
-            ))}
-          </select>
-          {ruleTool === "shell" && (
+            onChange={setRuleTool}
+            placement="top"
+            className="w-[136px]"
+            buttonClassName="px-2 py-1.5 font-mono text-[11.5px]"
+            groups={[
+              {
+                id: "tools",
+                label: "Agent tools",
+                options: PERM_TOOLS.map((tool) => ({
+                  value: tool,
+                  label: tool === "*" ? "Any tool" : toolLabel(tool),
+                })),
+              },
+            ]}
+          />
+          {isCommandToolName(ruleTool) && (
             <input
               aria-label="Command prefix"
               value={ruleCommand}
@@ -986,18 +1909,23 @@ function PermissionSettings() {
               className="min-w-0 flex-1 rounded border border-border bg-panel-2 px-2 py-1 text-[11.5px] text-fg"
             />
           )}
-          <select
-            aria-label="Rule decision"
+          <SelectMenu
+            label="Rule decision"
             value={ruleDecision}
-            onChange={(e) => setRuleDecision(e.target.value as ToolPolicy)}
-            className="rounded border border-border bg-panel-2 px-2 py-1 text-[11.5px] text-fg"
-          >
-            {(["allow", "ask", "deny"] as ToolPolicy[]).map((d) => (
-              <option key={d} value={d}>
-                {d}
-              </option>
-            ))}
-          </select>
+            onChange={(next) => setRuleDecision(next as ToolPolicy)}
+            placement="top"
+            className="w-[96px]"
+            buttonClassName="px-2 py-1.5 text-[11.5px] capitalize"
+            groups={[
+              {
+                id: "decisions",
+                options: (["allow", "ask", "deny"] as ToolPolicy[]).map((decision) => ({
+                  value: decision,
+                  label: decision,
+                })),
+              },
+            ]}
+          />
           <button
             type="button"
             onClick={addRule}
@@ -1008,33 +1936,38 @@ function PermissionSettings() {
         </div>
         {overBroadAllow && (
           <p role="alert" className="mt-1.5 text-[11px] text-danger">
-            ⚠ This allow rule matches {ruleTool === "*" ? "every tool" : "every shell command"} —
-            anything chained after a trusted prefix runs without asking. Prefer a specific tool and
-            command prefix.
+            ⚠ This allow rule matches {ruleTool === "*" ? "every tool" : "every command"} — anything
+            chained after a trusted prefix runs without asking. Prefer a specific tool and command
+            prefix.
           </p>
         )}
         <p className="mt-1.5 text-[11px] text-faint">
           A command prefix is a literal match — “git ” also matches “git x; rm -rf y”. It’s a
           convenience, not a guarantee.
         </p>
+        <p className="mt-1 text-[11px] text-faint">
+          Read-only browsing and delegated tasks never require permission rules.
+        </p>
       </div>
-    </section>
+    </div>
   );
 }
 
 function ToggleRow({
+  id,
   label,
   hint,
   on,
   onToggle,
 }: {
+  id?: string;
   label: string;
   hint: string;
   on: boolean;
   onToggle: () => void;
 }) {
   return (
-    <div className="flex items-center justify-between gap-4 py-1.5">
+    <div id={id} className="pc-setting-row">
       <div>
         <div className="text-[12.5px] font-medium text-fg">{label}</div>
         <div className="text-[11px] text-faint mt-0.5">{hint}</div>

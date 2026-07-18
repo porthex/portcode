@@ -9,7 +9,9 @@ import type {
   DraftEntry,
   Message,
   MessageRow,
+  ModelInfo,
   OAuthStatus,
+  OpenAIAuthStatus,
   PairingPayload,
   PairingRequest,
   PendingPermission,
@@ -29,10 +31,19 @@ import type {
   UpdateChannel,
   UpdateInfo,
   Usage,
+  WorkspaceSurface,
 } from "../types";
-import { CYCLE_MODES, DEFAULT_SETTINGS } from "../types";
+import {
+  CYCLE_MODES,
+  DEFAULT_SETTINGS,
+  OPENAI_FALLBACK_MODELS,
+  mergeOpenAIModels,
+  providerForModel,
+  reasoningEffortForModel,
+} from "../types";
 import * as ipc from "../lib/ipc";
 import { isMobilePlatform } from "../lib/platform";
+import { canonicalToolName, isCommandToolName, toolNamesEquivalent } from "../lib/toolNames";
 
 // ── Per-run state ─────────────────────────────────────────────────────────────
 // The streaming/cancel/pendingPermission of a single agent run. Today there is at
@@ -60,28 +71,42 @@ const EMPTY_RUN: RunState = { streaming: false, cancel: null, pendingPermission:
 const runKey = (sessionId: string): string => sessionId;
 
 // Build the scoped allow-RULE that "Always allow" adds, instead of flipping the
-// global policy to allow-everything. For a `shell` call it scopes to that exact
+// global policy to allow-everything. For a command call it scopes to that exact
 // command (a literal prefix — narrower and safer than a blanket allow); for any
-// other tool it allows just that tool. A shell call without a command string
-// falls back to a tool-level allow.
+// other tool it allows just that tool. Historical names are normalized before
+// persistence so new settings never extend the legacy vocabulary.
 const scopedAllowRule = (p: PendingPermission): Rule => {
-  if (p.tool === "shell") {
+  const tool = canonicalToolName(p.tool);
+  if (isCommandToolName(p.tool)) {
     const command = (p.input as { command?: unknown } | null)?.command;
     if (typeof command === "string" && command.length > 0) {
-      return { tool: "shell", command, decision: "allow" };
+      return { tool, command, decision: "allow" };
     }
   }
-  return { tool: p.tool, decision: "allow" };
+  return { tool, decision: "allow" };
+};
+
+const sameRuleScope = (left: Rule, right: Rule): boolean =>
+  toolNamesEquivalent(left.tool, right.tool) && left.command === right.command;
+
+// Rules are first-match. Put an explicit "Always allow" scope first so an older
+// broad ask/deny rule cannot silently shadow the choice the user just made, and
+// discard any equivalent legacy/canonical scope instead of leaving dead entries.
+const rulesWithEffectiveAllow = (rules: Rule[], allow: Rule): Rule[] => {
+  const first = rules[0];
+  if (first && sameRuleScope(first, allow) && first.decision === "allow") return rules;
+  return [allow, ...rules.filter((rule) => !sameRuleScope(rule, allow))];
 };
 
 /**
  * In-app auto-update state, driving the {@link UpdateBanner}.
- * - `idle`       — no update offered (or the banner was dismissed).
+ * - `idle`       — no update offered (or the banner was dismissed); `error` may
+ *                  retain a quiet background-check failure for Settings only.
  * - `available`  — an update exists; awaiting the user's Install (autoUpdate off).
  * - `downloading`— downloading + staging the update; `progress` is a 0–100 percent
  *                  (null = indeterminate, the server reported no total).
  * - `ready`      — downloaded + staged; awaiting a relaunch.
- * - `error`      — the check/download failed; `error` carries the message.
+ * - `error`      — an explicit check/download failed; `error` carries the message.
  */
 export interface UpdateState {
   phase: "idle" | "available" | "downloading" | "ready" | "error";
@@ -107,10 +132,13 @@ interface AppState {
   messagePaging: Record<string, { hasMore: boolean; loading: boolean; oldestSeq: number }>;
   usage: Record<string, Usage>; // sessionId -> cumulative token usage
   agents: Record<string, AgentInfo[]>; // sessionId -> live subagents (the agents panel)
-  backgroundTasks: Record<string, BackgroundTaskInfo[]>; // sessionId -> background shell tasks
+  backgroundTasks: Record<string, BackgroundTaskInfo[]>; // sessionId -> background command tasks
   settings: Settings;
   oauthStatus: OAuthStatus | null; // Claude subscription sign-in state
   oauthError: string | null; // last sign-in/out failure, surfaced in Settings
+  openAIAuthStatus: OpenAIAuthStatus | null; // ChatGPT subscription sign-in state
+  openAIAuthError: string | null; // OpenAI sign-in/out/catalog failure
+  openAIModels: ModelInfo[]; // live Codex catalogue merged over offline fallbacks
   phoneSync: PhoneSyncStatus | null; // phone sync device identity + paired devices
   pairingPayload: PairingPayload | null; // in-progress pairing code to display
   pairingError: string | null; // last begin-pairing/unpair failure, surfaced in Settings
@@ -132,6 +160,7 @@ interface AppState {
   showSidebar: boolean; // mobile: the session-list drawer (overlay) is open
   sidebarCollapsed: boolean; // desktop: the inline rail is collapsed to a 52px strip
   showPalette: boolean;
+  workspaceSurface: WorkspaceSurface; // desktop center route; review is workspace-scoped
 
   // ── Sessions sidebar organization (frontend-only overlay, persisted) ─────────
   // The Rust `Session` model is unchanged; folders/membership/archived/sort/group
@@ -154,7 +183,7 @@ interface AppState {
   // padded). Surfaced in the role="status" region beside the composer.
   composerPhase: ComposerPhase;
   // The tool the active turn is currently running (the core's tool name, e.g.
-  // `fs_read`/`shell`), or null between tools. Set on a real `tool_use` and cleared
+  // `read_file`/`run_command`), or null between tools. Set on a real `tool_use` and cleared
   // on its `tool_result`; surfaced as the "running <tool>…" presence phrase. Display
   // is streaming-gated, so a residual value can never show once a turn ends.
   activeTool: string | null;
@@ -223,6 +252,7 @@ interface AppState {
   cancelAgent: (agentId: string) => Promise<void>;
   setShowSettings: (v: boolean) => void;
   setShowPalette: (v: boolean) => void;
+  setWorkspaceSurface: (v: WorkspaceSurface) => void;
   // ── message search (⌘K jump to a past turn) ──
   searchMessages: (query: string) => Promise<SearchHit[]>;
   jumpToMessage: (sessionId: string, messageId: string) => Promise<void>;
@@ -236,6 +266,9 @@ interface AppState {
   refreshOAuthStatus: () => Promise<void>;
   loginWithClaude: () => Promise<void>;
   logoutClaude: () => Promise<void>;
+  refreshOpenAIStatus: () => Promise<void>;
+  loginWithOpenAI: () => Promise<void>;
+  logoutOpenAI: () => Promise<void>;
   refreshPhoneSync: () => Promise<void>;
   beginPairing: () => Promise<void>;
   unpair: (publicKey: string) => Promise<void>;
@@ -261,7 +294,7 @@ interface AppState {
   hydrateRememberedQr: (qr: string) => void;
 
   // ── Auto-update ───────────────────────────────────────────────────────────────
-  checkForUpdate: () => Promise<void>;
+  checkForUpdate: (options?: { background?: boolean }) => Promise<void>;
   startUpdateDownload: () => Promise<void>;
   applyUpdateProgress: (downloaded: number, total: number | null) => void;
   markUpdateReady: () => void;
@@ -379,11 +412,96 @@ const applyAgentEvent = (
   }
 };
 
-// ── Background shell tasks (the background-tasks panel) ───────────────────────
+// ── Background command tasks (the background-tasks panel) ────────────────────
 // Mirror the agent helpers, but background tasks intentionally OUTLIVE the turn
 // that launched them — so, unlike agents, they are never cleared on a turn
 // boundary. Exit code 0 reads as success; anything else (including the -1 the
 // backend reports for a child that failed to spawn) reads as an error.
+type TerminalAgentStatus = Exclude<AgentStatus, "running">;
+
+// A terminal top-level turn is also a terminal boundary for every child agent it
+// launched. Normally `agent_finished` arrives first; this closes the gap when Stop,
+// a transport drop, or a listener teardown makes that last lifecycle event miss UI.
+const terminalizeRunningAgents = (
+  agents: Record<string, AgentInfo[]>,
+  sessionId: string,
+  status: TerminalAgentStatus,
+): Record<string, AgentInfo[]> => {
+  const list = agents[sessionId];
+  if (!list?.some((agent) => agent.status === "running")) return agents;
+  return patchAgents(agents, sessionId, (current) =>
+    current.map((agent) => (agent.status === "running" ? { ...agent, status } : agent)),
+  );
+};
+
+const TOOL_INTERRUPTED_CANCELLED =
+  "Interrupted: the run was stopped before this tool returned a result.";
+const TOOL_INTERRUPTED_ERROR = "Interrupted: the run ended before this tool returned a result.";
+
+// ToolCall derives `running` solely from an absent matching tool_result. Append one
+// explicit terminal result per unmatched use at every turn boundary so a cancelled
+// stream can never leave a permanently pulsing card. The existing block schema also
+// round-trips through SQLite/Phone Sync and needs no renderer-specific sentinel.
+function finalizePendingTools(blocks: ContentBlock[], output: string): ContentBlock[] {
+  const resolved = new Set(
+    blocks.flatMap((block) => (block.kind === "tool_result" ? [block.toolUseId] : [])),
+  );
+  const finalized = new Set<string>();
+  const terminalResults: ContentBlock[] = [];
+  for (const block of blocks) {
+    if (block.kind !== "tool_use" || resolved.has(block.id) || finalized.has(block.id)) continue;
+    finalized.add(block.id);
+    terminalResults.push({
+      kind: "tool_result",
+      toolUseId: block.id,
+      output,
+      isError: true,
+    });
+  }
+  return terminalResults.length > 0 ? [...blocks, ...terminalResults] : blocks;
+}
+
+function latestPendingToolName(blocks: ContentBlock[]): string | null {
+  const resolved = new Set(
+    blocks.flatMap((block) => (block.kind === "tool_result" ? [block.toolUseId] : [])),
+  );
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    const block = blocks[i];
+    if (block.kind === "tool_use" && !resolved.has(block.id)) return block.name;
+  }
+  return null;
+}
+
+const terminalizeTurnState = (
+  st: AppState,
+  sessionId: string,
+  toolOutput: string,
+  agentStatus: TerminalAgentStatus,
+): Pick<AppState, "messages" | "agents"> => ({
+  messages: patchLast(st.messages, sessionId, (blocks) => finalizePendingTools(blocks, toolOutput)),
+  agents: terminalizeRunningAgents(st.agents, sessionId, agentStatus),
+});
+
+const terminalizeAllRunningTurns = (
+  st: AppState,
+  toolOutput: string,
+  agentStatus: TerminalAgentStatus,
+): Pick<AppState, "messages" | "agents"> => {
+  const sessionIds = new Set(
+    Object.entries(st.runs)
+      .filter(([, run]) => run.streaming)
+      .map(([sessionId]) => sessionId),
+  );
+  if (st.streaming && st.activeId) sessionIds.add(st.activeId);
+  let messages = st.messages;
+  let agents = st.agents;
+  for (const sessionId of sessionIds) {
+    messages = patchLast(messages, sessionId, (blocks) => finalizePendingTools(blocks, toolOutput));
+    agents = terminalizeRunningAgents(agents, sessionId, agentStatus);
+  }
+  return { messages, agents };
+};
+
 const bgStatus = (exitCode: number): BackgroundTaskStatus => (exitCode === 0 ? "ok" : "error");
 
 const patchBackgroundTasks = (
@@ -511,6 +629,27 @@ export const teardownAllBackgroundListeners = (): void => {
 // otherwise silently no-op every later send). Kept above the backend's own idle
 // timeout so the backend's specific error wins in the normal stalled-network case.
 const TURN_IDLE_TIMEOUT_MS = 150_000;
+
+// Serialize model writes per session so two quick selections cannot reach SQLite
+// out of order (a slower first invoke completing last would otherwise survive reload).
+const sessionModelWriteQueues = new Map<string, Promise<void>>();
+const enqueueSessionModelWrite = (sessionId: string, model: string): Promise<void> => {
+  const prior = sessionModelWriteQueues.get(sessionId);
+  const write = prior
+    ? prior.catch(() => {}).then(() => ipc.updateSessionModel(sessionId, model))
+    : ipc.updateSessionModel(sessionId, model);
+  sessionModelWriteQueues.set(sessionId, write);
+  const cleanup = () => {
+    if (sessionModelWriteQueues.get(sessionId) === write) sessionModelWriteQueues.delete(sessionId);
+  };
+  void write.then(cleanup, cleanup);
+  return write;
+};
+
+// Stop can land while runAgent is still awaiting its handle. Keep that intent
+// separate from `streaming` so the composer remains blocked until cancellation is
+// actually acknowledged (or fails visibly) instead of claiming the run stopped.
+const stopRequestedSessions = new Set<string>();
 
 // Remote-turn idle watchdog (symmetric with the local one in send()). In remote
 // mode the turn runs on the desktop and only a desktop-originated live frame can
@@ -800,6 +939,9 @@ export const useStore = create<AppState>((set, get) => ({
   settings: DEFAULT_SETTINGS,
   oauthStatus: null,
   oauthError: null,
+  openAIAuthStatus: null,
+  openAIAuthError: null,
+  openAIModels: OPENAI_FALLBACK_MODELS,
   phoneSync: null,
   pairingPayload: null,
   pairingError: null,
@@ -813,6 +955,7 @@ export const useStore = create<AppState>((set, get) => ({
   showSidebar: false,
   sidebarCollapsed: readPref("pc.sidebarCollapsed"),
   showPalette: false,
+  workspaceSurface: "chat",
   sortBy: readSort(),
   groupBy: readGroup(),
   folders: readJSON<SessionFolder[]>("pc.folders", []),
@@ -885,15 +1028,51 @@ export const useStore = create<AppState>((set, get) => ({
     // createSession/getMessages) are guarded so a failed startup surfaces an
     // error+retry panel instead of a permanently blank welcome shell.
     try {
-      const [settings, oauthStatus, phoneSync, backendDrafts, allUsage] = await Promise.all([
+      const openAIStatusPromise =
+        typeof ipc.openaiOauthStatus === "function"
+          ? ipc.openaiOauthStatus().catch(() => null)
+          : Promise.resolve(null);
+      const [
+        rawSettings,
+        oauthStatus,
+        openAIAuthStatus,
+        openAIModelRows,
+        phoneSync,
+        backendDrafts,
+        allUsage,
+      ] = await Promise.all([
         ipc.getSettings(),
         ipc.oauthStatus().catch(() => null),
+        openAIStatusPromise,
+        openAIStatusPromise.then((status) =>
+          status?.available !== false && typeof ipc.openaiModels === "function"
+            ? ipc.openaiModels().catch(() => [])
+            : [],
+        ),
         ipc.phoneSyncStatus().catch(() => null),
         // Resilient: an older core that predates these commands must not block
         // startup — fall back to empty (the localStorage mirror still restores drafts).
         ipc.getDrafts().catch(() => []),
         ipc.getAllUsage().catch(() => []),
       ]);
+      const openAIAvailable = openAIAuthStatus?.available !== false;
+      const openAIModels = openAIAvailable ? mergeOpenAIModels(openAIModelRows) : [];
+      const requestedModel = rawSettings.model ?? DEFAULT_SETTINGS.model;
+      const model =
+        !openAIAvailable && providerForModel(requestedModel, OPENAI_FALLBACK_MODELS) === "openai"
+          ? DEFAULT_SETTINGS.model
+          : requestedModel;
+      const settings: Settings = {
+        ...DEFAULT_SETTINGS,
+        ...rawSettings,
+        model,
+        provider: providerForModel(model, openAIModels),
+        reasoningEffort: reasoningEffortForModel(
+          model,
+          rawSettings.reasoningEffort ?? DEFAULT_SETTINGS.reasoningEffort,
+          openAIModels,
+        ),
+      };
       // Authoritative durable drafts merged under the already-hydrated optimistic
       // mirror; usage restored so per-session meters + workspace spend survive restart.
       const drafts = mergeDrafts(get().drafts, backendDrafts);
@@ -905,6 +1084,8 @@ export const useStore = create<AppState>((set, get) => ({
         set((st) => ({
           settings,
           oauthStatus,
+          openAIAuthStatus,
+          openAIModels,
           phoneSync,
           drafts,
           usage,
@@ -929,6 +1110,8 @@ export const useStore = create<AppState>((set, get) => ({
       set((st) => ({
         settings,
         oauthStatus,
+        openAIAuthStatus,
+        openAIModels,
         phoneSync,
         drafts,
         usage,
@@ -1194,13 +1377,49 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async setSessionModel(model) {
-    // Point the active session at the chosen model, then mirror it into
-    // settings.model so it becomes the "last used / default for new sessions".
+    // The picker is disabled/hidden in these states, but Command Palette can call
+    // the action directly. The store is authoritative: never mutate an in-flight
+    // run's identity, and never write the phone's local DB for a desktop-owned chat.
+    if (get().streaming || get().remoteMode || get().remoteConnected) return;
+    // Point the active session at the chosen model, persist that conversation's
+    // identity, then mirror it into settings.model so it becomes the last-used
+    // default for NEW sessions. The session write is distinct from global settings:
+    // without it the selector appears to work until reload, then silently reverts.
     const activeId = get().activeId;
-    if (activeId) {
+    const activeSession = activeId ? get().sessions.find((s) => s.id === activeId) : undefined;
+    if (activeId && activeSession) {
+      const previous = activeSession.model;
       set((st) => ({
         sessions: st.sessions.map((s) => (s.id === activeId ? { ...s, model } : s)),
+        settingsError: null,
       }));
+      try {
+        await enqueueSessionModelWrite(activeId, model);
+      } catch (err) {
+        // Revert only our still-current optimistic value. A faster second selection
+        // may already have landed while this write was in flight; never clobber it.
+        set((st) => {
+          const failedChoiceIsCurrent =
+            st.activeId === activeId &&
+            st.sessions.find((session) => session.id === activeId)?.model === model;
+          return {
+            sessions: st.sessions.map((s) =>
+              s.id === activeId && s.model === model ? { ...s, model: previous } : s,
+            ),
+            ...(failedChoiceIsCurrent ? { settingsError: errMessage(err) } : {}),
+          };
+        });
+        return;
+      }
+      // Model choices can race (native select + palette, or simply two fast clicks).
+      // Only the latest still-visible choice may become the global default; a slower
+      // earlier DB write must not overwrite settings after a newer selection wins.
+      if (
+        get().activeId !== activeId ||
+        get().sessions.find((session) => session.id === activeId)?.model !== model
+      ) {
+        return;
+      }
     }
     await get().updateSettings({ model });
   },
@@ -1274,11 +1493,18 @@ export const useStore = create<AppState>((set, get) => ({
           ...(sid !== null
             ? runPatch(st, sid, { streaming: false, pendingPermission: null })
             : projectActiveRun(st)),
+          ...(sid !== null
+            ? terminalizeTurnState(st, sid, TOOL_INTERRUPTED_ERROR, "error")
+            : { messages: st.messages, agents: st.agents }),
           composerPhase: "idle",
+          activeTool: null,
           messages:
             sid !== null
               ? patchLast(st.messages, sid, (b) =>
-                  appendText(b, "\n\n**The desktop stopped responding (timed out).**"),
+                  appendText(
+                    finalizePendingTools(b, TOOL_INTERRUPTED_ERROR),
+                    "\n\n**The desktop stopped responding (timed out).**",
+                  ),
                 )
               : st.messages,
         }));
@@ -1348,19 +1574,26 @@ export const useStore = create<AppState>((set, get) => ({
     let settled = false;
     let lastActivity = now();
     let watchdog: ReturnType<typeof setInterval> | null = null;
+    let watchdogCancelInFlight = false;
+    // More than one tool_use can arrive in a single model turn. Track all live ids
+    // so one fast result does not clear the presence label while a sibling tool is
+    // still outstanding; the most recently announced pending tool wins the label.
+    const pendingTools = new Map<string, string>();
 
-    // Stop the watchdog + the per-turn listener exactly once. `cancelBackend` also
-    // aborts a still-running turn on the core (watchdog timeout); a normal terminal
-    // event only needs to stop listening (no spurious cancel_agent).
-    const settle = (cancelBackend: boolean) => {
-      if (settled) return;
+    const markSettled = (): boolean => {
+      if (settled) return false;
       settled = true;
       if (watchdog !== null) {
         clearInterval(watchdog);
         watchdog = null;
       }
-      if (cancelBackend) void run?.cancel();
-      else run?.dispose();
+      return true;
+    };
+
+    // Stop the watchdog + the per-turn listener exactly once after a terminal event.
+    const settle = () => {
+      if (!markSettled()) return;
+      run?.dispose();
     };
 
     const onEvent = (e: StreamEvent) => {
@@ -1382,6 +1615,7 @@ export const useStore = create<AppState>((set, get) => ({
             set({ composerPhase: "thinking" });
           }
           // Surface the running tool in the presence line ("running <tool>…").
+          pendingTools.set(e.id, e.name);
           set({ activeTool: e.name });
           apply((blocks) => [
             ...blocks,
@@ -1390,7 +1624,8 @@ export const useStore = create<AppState>((set, get) => ({
           break;
         case "tool_result":
           // The tool finished — fall back to the generic "thinking with you…".
-          set({ activeTool: null });
+          pendingTools.delete(e.id);
+          set({ activeTool: Array.from(pendingTools.values()).pop() ?? null });
           apply((blocks) => [
             ...blocks,
             {
@@ -1427,17 +1662,44 @@ export const useStore = create<AppState>((set, get) => ({
           });
           break;
         case "error":
-          apply((blocks) => appendText(blocks, `\n\n**Error:** ${e.message}`));
-          settle(false);
+          stopRequestedSessions.delete(activeId);
+          apply((blocks) =>
+            appendText(
+              finalizePendingTools(blocks, TOOL_INTERRUPTED_ERROR),
+              `\n\n**Error:** ${e.message}`,
+            ),
+          );
+          pendingTools.clear();
+          settle();
           clearSettleTimer();
           setRun(set, activeId, { streaming: false, cancel: null, pendingPermission: null });
-          set({ composerPhase: "idle" });
+          set((st) => ({
+            composerPhase: "idle",
+            activeTool: null,
+            agents: terminalizeRunningAgents(st.agents, activeId, "error"),
+          }));
           break;
         case "turn_end":
-          settle(false);
+          stopRequestedSessions.delete(activeId);
+          apply((blocks) =>
+            finalizePendingTools(
+              blocks,
+              e.stopReason === "cancelled" ? TOOL_INTERRUPTED_CANCELLED : TOOL_INTERRUPTED_ERROR,
+            ),
+          );
+          pendingTools.clear();
+          settle();
           clearSettleTimer();
           setRun(set, activeId, { streaming: false, cancel: null, pendingPermission: null });
-          set({ composerPhase: "idle" });
+          set((st) => ({
+            composerPhase: "idle",
+            activeTool: null,
+            agents: terminalizeRunningAgents(
+              st.agents,
+              activeId,
+              e.stopReason === "cancelled" ? "cancelled" : "ok",
+            ),
+          }));
           break;
         case "agent_started":
         case "agent_progress":
@@ -1450,17 +1712,41 @@ export const useStore = create<AppState>((set, get) => ({
     watchdog = setInterval(() => {
       // The turn already ended or was stopped elsewhere (e.g. Stop) — just clean up.
       if (settled || !isStreaming()) {
-        settle(false);
+        settle();
         return;
       }
       // No event for the whole idle window → treat the turn as hung and recover, so
       // the composer can't stay disabled forever.
       if (now() - lastActivity < TURN_IDLE_TIMEOUT_MS) return;
-      settle(true);
-      onEvent({
-        type: "error",
-        message: "The agent stopped responding (timed out). Please try again.",
-      });
+      if (watchdogCancelInFlight) return;
+      // Cancellation must be acknowledged before we hide the listener or claim the
+      // timed-out run stopped. A rejected invoke keeps streaming locked and visible.
+      if (run === null) {
+        stopRequestedSessions.add(activeId);
+        set({ composerPhase: "stopping" });
+        return;
+      }
+      watchdogCancelInFlight = true;
+      void run
+        .cancel()
+        .then(() => {
+          markSettled(); // run.cancel disposed the listener after acknowledgement
+          onEvent({
+            type: "error",
+            message: "The agent stopped responding (timed out). Please try again.",
+          });
+        })
+        .catch((err) => {
+          watchdogCancelInFlight = false;
+          lastActivity = now();
+          apply((blocks) =>
+            appendText(
+              blocks,
+              `\n\n**The agent timed out, but cancellation could not be confirmed:** ${errMessage(err)}. It may still be running.`,
+            ),
+          );
+          set({ composerPhase: "thinking" });
+        });
     }, 1000);
 
     try {
@@ -1469,27 +1755,61 @@ export const useStore = create<AppState>((set, get) => ({
       const model = session?.model ?? get().settings.model;
       const handle = await ipc.runAgent(activeId, body, model, onEvent);
       run = handle;
+      const cancelRun = async () => {
+        await handle.cancel();
+        // handle.cancel unsubscribes only after cancel_agent is acknowledged.
+        markSettled();
+      };
       if (settled) {
         // A terminal event (or the watchdog) settled the turn before the handle
         // resolved. settle() already ran with run===null (a no-op), so the now-resolved
         // handle still needs its listener torn down. The terminal event already issued
         // any backend cancel it needed, so just dispose — no spurious cancel_agent.
         handle.dispose();
-      } else if (!isStreaming()) {
+      } else if (stopRequestedSessions.has(activeId)) {
         // The turn isn't settled, but streaming already flipped false — the user
         // pressed Stop DURING the await window, when the cancel handle was still null
         // so stop() couldn't abort the backend. Honor that Stop authoritatively now:
         // settle(true) cancels the still-pending backend turn (cancel_agent) AND
         // disposes the listener, so no further deltas can fold in and no stale Stop is
         // re-armed.
-        settle(true);
+        try {
+          await cancelRun();
+        } catch (err) {
+          stopRequestedSessions.delete(activeId);
+          lastActivity = now();
+          // Cancellation was not acknowledged. Keep streaming + listener + watchdog
+          // live, arm Stop for a retry, and state the uncertainty in the transcript.
+          setRun(set, activeId, { cancel: cancelRun });
+          apply((blocks) =>
+            appendText(
+              blocks,
+              `\n\n**Stop could not be confirmed:** ${errMessage(err)}. The agent may still be running.`,
+            ),
+          );
+          set({ composerPhase: "thinking" });
+          return;
+        }
+        stopRequestedSessions.delete(activeId);
+        // Stop may have landed while runAgent was still awaiting its cancel handle.
+        // The listener stayed alive during that gap, so close any tool/agent state
+        // that arrived after stop()'s first terminalization pass.
+        apply((blocks) => finalizePendingTools(blocks, TOOL_INTERRUPTED_CANCELLED));
+        pendingTools.clear();
+        set((st) => ({
+          ...runPatch(st, activeId, {
+            streaming: false,
+            cancel: null,
+            pendingPermission: null,
+          }),
+          activeTool: null,
+          composerPhase: "idle",
+          agents: terminalizeRunningAgents(st.agents, activeId, "cancelled"),
+        }));
       } else {
         // Stop aborts the run AND clears this turn's watchdog (owned by this closure).
         setRun(set, activeId, {
-          cancel: async () => {
-            settle(false);
-            await handle.cancel();
-          },
+          cancel: cancelRun,
         });
       }
     } catch (err) {
@@ -1502,24 +1822,53 @@ export const useStore = create<AppState>((set, get) => ({
     // by relabeling the presence to "stopping…" and stopping the settle fallback.
     clearSettleTimer();
     set({ composerPhase: "stopping" });
+    const activeId = get().activeId;
+    if (!activeId || !get().streaming) {
+      set({ composerPhase: "idle" });
+      return;
+    }
+    stopRequestedSessions.add(activeId);
     // Remote mode: the turn runs on the desktop, so stop it with a Cancel command
     // over the link (there is no local `cancel` handle on the phone).
     if (get().remoteConnected) {
       clearRemoteWatchdog(); // the turn is over — stop the idle watchdog
-      const activeId = get().activeId;
       if (activeId) await get().sendRemoteCommand({ cmd: "cancel", session_id: activeId });
+      stopRequestedSessions.delete(activeId);
+      if (get().remoteDropped) return;
+      set((st) => ({
+        ...terminalizeTurnState(st, activeId, TOOL_INTERRUPTED_CANCELLED, "cancelled"),
+        activeTool: null,
+      }));
       patchActiveRun(set, get, { streaming: false, pendingPermission: null });
       set({ composerPhase: "idle" });
       return;
     }
     const c = get().cancel;
+    // runAgent has not returned its handle yet. Keep streaming/stopping true; its
+    // post-await branch observes this intent and performs the acknowledged cancel.
+    if (!c) return;
     try {
-      if (c) await c();
-    } catch {
-      /* the cancel_agent IPC failed; recover the UI anyway so the composer isn't stuck */
-    } finally {
+      await c();
+      stopRequestedSessions.delete(activeId);
+      set((st) => ({
+        ...terminalizeTurnState(st, activeId, TOOL_INTERRUPTED_CANCELLED, "cancelled"),
+        activeTool: null,
+      }));
       patchActiveRun(set, get, { streaming: false, cancel: null, pendingPermission: null });
       set({ composerPhase: "idle" });
+    } catch (err) {
+      stopRequestedSessions.delete(activeId);
+      // The backend may still be executing. Retain the cancel handle + streaming
+      // lock, keep listening for a real terminal event, and make uncertainty visible.
+      set((st) => ({
+        messages: patchLast(st.messages, activeId, (blocks) =>
+          appendText(
+            blocks,
+            `\n\n**Stop could not be confirmed:** ${errMessage(err)}. The agent may still be running.`,
+          ),
+        ),
+        composerPhase: "thinking",
+      }));
     }
   },
 
@@ -1569,14 +1918,13 @@ export const useStore = create<AppState>((set, get) => ({
     patchActiveRun(set, get, { pendingPermission: null });
     await ipc.resolvePermission(id, decision);
     if (always && decision === "allow") {
-      // "Always allow" adds a SCOPED allow-rule for this tool (and, for shell,
+      // "Always allow" adds a SCOPED allow-rule for this tool (and, for commands,
       // this command) instead of flipping the global policy to allow-everything.
-      // Skip if an equivalent rule already exists so repeated clicks don't pile up
-      // duplicates.
       const rule = scopedAllowRule(p);
       const rules = get().settings.rules;
-      if (!rules.some((r) => r.tool === rule.tool && r.command === rule.command)) {
-        await get().updateSettings({ rules: [...rules, rule] });
+      const nextRules = rulesWithEffectiveAllow(rules, rule);
+      if (nextRules !== rules) {
+        await get().updateSettings({ rules: nextRules });
       }
     }
   },
@@ -1587,6 +1935,10 @@ export const useStore = create<AppState>((set, get) => ({
 
   setShowPalette(v) {
     set({ showPalette: v });
+  },
+
+  setWorkspaceSurface(v) {
+    set({ workspaceSurface: v });
   },
 
   setAmbientRain(v) {
@@ -1761,7 +2113,20 @@ export const useStore = create<AppState>((set, get) => ({
     // silently snap back to the old value) instead of being a swallowed rejection.
     set({ settingsError: null });
     try {
-      const next = await ipc.saveSettings(s);
+      const patch: Partial<Settings> = { ...s };
+      if (s.model) {
+        const provider = providerForModel(s.model, get().openAIModels);
+        const reasoningEffort = reasoningEffortForModel(
+          s.model,
+          s.reasoningEffort ?? get().settings.reasoningEffort,
+          get().openAIModels,
+        );
+        if (provider !== get().settings.provider) patch.provider = provider;
+        if (reasoningEffort !== get().settings.reasoningEffort) {
+          patch.reasoningEffort = reasoningEffort;
+        }
+      }
+      const next = await ipc.saveSettings(patch);
       set({ settings: next });
     } catch (err) {
       set({ settingsError: errMessage(err) });
@@ -1805,6 +2170,103 @@ export const useStore = create<AppState>((set, get) => ({
       set({ oauthStatus: { signedIn: false, expiresAt: null, account: null, tier: null } });
     } catch (err) {
       set({ oauthError: errMessage(err) });
+    }
+  },
+
+  async refreshOpenAIStatus() {
+    if (typeof ipc.openaiOauthStatus !== "function") return;
+    try {
+      const openAIAuthStatus = await ipc.openaiOauthStatus();
+      set({
+        openAIAuthStatus,
+        ...(openAIAuthStatus.available === false ? { openAIModels: [] } : {}),
+      });
+      if (
+        openAIAuthStatus.available === false ||
+        !openAIAuthStatus.signedIn ||
+        typeof ipc.openaiModels !== "function"
+      )
+        return;
+      const rows = await ipc.openaiModels();
+      const openAIModels = mergeOpenAIModels(rows);
+      set({ openAIModels });
+      const settings = get().settings;
+      const effort = reasoningEffortForModel(
+        settings.model,
+        settings.reasoningEffort,
+        openAIModels,
+      );
+      if (
+        providerForModel(settings.model, openAIModels) === "openai" &&
+        effort !== settings.reasoningEffort
+      ) {
+        await get().updateSettings({ provider: "openai", reasoningEffort: effort });
+      }
+    } catch {
+      // Transient / older core: retain the last auth state and fallback catalogue.
+    }
+  },
+
+  async loginWithOpenAI() {
+    set({ openAIAuthError: null });
+    if (typeof ipc.startOpenaiOauthLogin !== "function") {
+      set({ openAIAuthError: "This Portcode core does not support ChatGPT sign-in yet." });
+      return;
+    }
+    try {
+      const openAIAuthStatus = await ipc.startOpenaiOauthLogin();
+      set({ openAIAuthStatus });
+      if (openAIAuthStatus.available === false) {
+        set({
+          openAIModels: [],
+          openAIAuthError:
+            openAIAuthStatus.unavailableReason ??
+            "ChatGPT subscription access is unavailable in this build.",
+        });
+        return;
+      }
+      if (typeof ipc.openaiModels !== "function") return;
+      try {
+        const rows = await ipc.openaiModels();
+        const openAIModels = mergeOpenAIModels(rows);
+        set({ openAIModels });
+        const settings = get().settings;
+        const effort = reasoningEffortForModel(
+          settings.model,
+          settings.reasoningEffort,
+          openAIModels,
+        );
+        if (
+          providerForModel(settings.model, openAIModels) === "openai" &&
+          effort !== settings.reasoningEffort
+        ) {
+          await get().updateSettings({ provider: "openai", reasoningEffort: effort });
+        }
+      } catch (err) {
+        set({ openAIAuthError: `Signed in, but couldn't refresh models: ${errMessage(err)}` });
+      }
+    } catch (err) {
+      set({ openAIAuthError: errMessage(err) });
+    }
+  },
+
+  async logoutOpenAI() {
+    set({ openAIAuthError: null });
+    if (typeof ipc.openaiOauthLogout !== "function") return;
+    try {
+      await ipc.openaiOauthLogout();
+      set((state) => ({
+        openAIAuthStatus: {
+          signedIn: false,
+          expiresAt: null,
+          account: null,
+          tier: null,
+          available: state.openAIAuthStatus?.available,
+          unavailableReason: state.openAIAuthStatus?.unavailableReason ?? null,
+        },
+      }));
+    } catch (err) {
+      set({ openAIAuthError: errMessage(err) });
     }
   },
 
@@ -1913,7 +2375,8 @@ export const useStore = create<AppState>((set, get) => ({
     // Mirror disconnectRemote's teardown: flip the connection flags FIRST (before the
     // async reject) so no command is dispatched onto the closing channel, forget the
     // remembered pairing, and clear turn state. Then mark the pairing rejected.
-    set({
+    set((st) => ({
+      ...terminalizeAllRunningTurns(st, TOOL_INTERRUPTED_CANCELLED, "cancelled"),
       remoteConnected: false,
       remoteVerified: false,
       remoteSas: null,
@@ -1930,9 +2393,13 @@ export const useStore = create<AppState>((set, get) => ({
       // and bails before registering listeners.
       remoteConnecting: false,
       remoteChatOpen: false,
+      runs: {},
       streaming: false,
+      cancel: null,
       pendingPermission: null,
-    });
+      composerPhase: "idle",
+      activeTool: null,
+    }));
     writeStr("pc.lastPairingQr", null); // forget the remembered desktop too
     if (unlisten) unlisten();
     // Only reach for the channel if there was a live session — a reject from a
@@ -2024,7 +2491,8 @@ export const useStore = create<AppState>((set, get) => ({
         // Forget the remembered desktop — a rejected pairing must not offer one-tap
         // reconnect back into the desktop that just declined.
         writeStr("pc.lastPairingQr", null);
-        set({
+        set((st) => ({
+          ...terminalizeAllRunningTurns(st, TOOL_INTERRUPTED_ERROR, "error"),
           remoteConnected: false,
           remoteVerified: false,
           remoteSas: null,
@@ -2036,9 +2504,13 @@ export const useStore = create<AppState>((set, get) => ({
           lastPairingQr: null,
           remoteUnlisten: null,
           remoteChatOpen: false,
+          runs: {},
           streaming: false,
+          cancel: null,
           pendingPermission: null,
-        });
+          composerPhase: "idle",
+          activeTool: null,
+        }));
         break;
       }
       // command / ack / hello are phone-originated or not actionable inbound.
@@ -2074,7 +2546,8 @@ export const useStore = create<AppState>((set, get) => ({
     // prompt. If the desktop turn is genuinely still live, its catch-up/live frames
     // re-establish `streaming` after the dial.
     clearSettleTimer();
-    set({
+    set((st) => ({
+      ...terminalizeAllRunningTurns(st, TOOL_INTERRUPTED_ERROR, "error"),
       remoteUnlisten: null,
       remoteError: null,
       remoteVerified: false,
@@ -2095,7 +2568,8 @@ export const useStore = create<AppState>((set, get) => ({
       cancel: null,
       pendingPermission: null,
       composerPhase: "idle",
-    });
+      activeTool: null,
+    }));
     let unlistenFrame: (() => void) | null = null;
     let unlistenDrop: (() => void) | null = null;
     try {
@@ -2127,7 +2601,8 @@ export const useStore = create<AppState>((set, get) => ({
         // stuck on a stale `streaming`/`pendingPermission`.
         clearRemoteWatchdog();
         clearSettleTimer();
-        set({
+        set((st) => ({
+          ...terminalizeAllRunningTurns(st, TOOL_INTERRUPTED_ERROR, "error"),
           remoteConnected: false,
           remoteVerified: false,
           remoteDropped: true,
@@ -2140,7 +2615,8 @@ export const useStore = create<AppState>((set, get) => ({
           cancel: null,
           pendingPermission: null,
           composerPhase: "idle",
-        });
+          activeTool: null,
+        }));
       });
       // Remember the desktop across launches (public payload — no secret).
       writeStr("pc.lastPairingQr", qr);
@@ -2224,7 +2700,8 @@ export const useStore = create<AppState>((set, get) => ({
       }
       clearRemoteWatchdog(); // the turn can't proceed on a dropped link
       clearSettleTimer();
-      set({
+      set((st) => ({
+        ...terminalizeAllRunningTurns(st, TOOL_INTERRUPTED_ERROR, "error"),
         remoteDropped: true,
         runs: {},
         // Drop pagination cursors/loading guards too — a reconnect's catch-up reseeds
@@ -2235,7 +2712,8 @@ export const useStore = create<AppState>((set, get) => ({
         cancel: null,
         pendingPermission: null,
         composerPhase: "idle",
-      });
+        activeTool: null,
+      }));
     }
   },
 
@@ -2284,7 +2762,8 @@ export const useStore = create<AppState>((set, get) => ({
     // `phoneSyncDisconnect` is in flight.
     // User-initiated, so also clear the dropped flag and forget the pairing — the
     // reconnect prompt is for an unexpected drop, not an intentional teardown.
-    set({
+    set((st) => ({
+      ...terminalizeAllRunningTurns(st, TOOL_INTERRUPTED_CANCELLED, "cancelled"),
       remoteConnected: false,
       remoteVerified: false,
       remoteSas: null,
@@ -2309,7 +2788,8 @@ export const useStore = create<AppState>((set, get) => ({
       cancel: null,
       pendingPermission: null,
       composerPhase: "idle",
-    });
+      activeTool: null,
+    }));
     writeStr("pc.lastPairingQr", null); // forget the remembered desktop too
     if (unlisten) unlisten();
     await ipc.phoneSyncDisconnect();
@@ -2381,7 +2861,13 @@ export const useStore = create<AppState>((set, get) => ({
   // rejects. We swallow into `error` rather than throw, so a missing command never
   // crashes the app or surfaces an unhandled rejection (callers use `void`).
 
-  async checkForUpdate() {
+  async checkForUpdate(options) {
+    const background = options?.background === true;
+    // A periodic poll must never erase a staged update or interrupt an active
+    // download merely because the six-hour timer fired.
+    if (background && (get().update.phase === "downloading" || get().update.phase === "ready")) {
+      return;
+    }
     try {
       const info = await ipc.checkForUpdate();
       if (!info) {
@@ -2398,7 +2884,12 @@ export const useStore = create<AppState>((set, get) => ({
         set((st) => ({ update: { ...st.update, phase: "available", progress: null } }));
       }
     } catch (err) {
-      set((st) => ({ update: { ...st.update, phase: "error", error: errMessage(err) } }));
+      const error = errMessage(err);
+      set((st) => ({
+        // Startup/periodic network failures belong in Settings, not in a global
+        // workspace banner. Explicit checks still use the visible error phase.
+        update: background ? { ...st.update, error } : { ...st.update, phase: "error", error },
+      }));
     }
   },
 
@@ -2493,7 +2984,12 @@ function errMessage(err: unknown): string {
 // Convert a desktop catch-up row (MessageRow: carries sessionId + seq) to the
 // in-memory Message shape the UI renders.
 function rowToMessage(r: MessageRow): Message {
-  return { id: r.id, role: r.role, blocks: r.content, createdAt: r.createdAt };
+  // Phone Sync can carry OpenAI's encrypted reasoning continuation block. It is
+  // protocol state, never user-visible content, so strip it before Message UI.
+  const blocks = r.content.filter(
+    (block): block is ContentBlock => !("type" in block && block.type === "reasoning"),
+  );
+  return { id: r.id, role: r.role, blocks, createdAt: r.createdAt };
 }
 
 // Prepend an OLDER page of catch-up rows ahead of the held messages, deduping by id
@@ -2592,13 +3088,18 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       }));
       break;
     case "tool_result":
-      if (useStore.getState().activeId === sessionId) set(() => ({ activeTool: null }));
-      set((st) => ({
-        messages: patchLast(st.messages, sessionId, (b) => [
+      set((st) => {
+        const messages = patchLast(st.messages, sessionId, (b) => [
           ...b,
           { kind: "tool_result", toolUseId: e.id, output: e.output, isError: e.isError },
-        ]),
-      }));
+        ]);
+        const sessionMessages = messages[sessionId] ?? [];
+        const lastBlocks = sessionMessages[sessionMessages.length - 1]?.blocks ?? [];
+        return {
+          messages,
+          ...(st.activeId === sessionId ? { activeTool: latestPendingToolName(lastBlocks) } : {}),
+        };
+      });
       break;
     case "permission_request":
       // Store the request on its session's run; the mirror only pops the prompt
@@ -2638,12 +3139,16 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       }
       set((st) => ({
         messages: patchLast(st.messages, sessionId, (b) =>
-          appendText(b, `\n\n**Error:** ${e.message}`),
+          appendText(
+            finalizePendingTools(b, TOOL_INTERRUPTED_ERROR),
+            `\n\n**Error:** ${e.message}`,
+          ),
         ),
+        agents: terminalizeRunningAgents(st.agents, sessionId, "error"),
         // End this session's run (per-run state + the active-session mirror). Reset
         // the composer presence only when this is the active session.
         ...runPatch(st, sessionId, { streaming: false, pendingPermission: null }),
-        ...(st.activeId === sessionId ? { composerPhase: "idle" as const } : {}),
+        ...(st.activeId === sessionId ? { composerPhase: "idle" as const, activeTool: null } : {}),
       }));
       break;
     case "turn_end":
@@ -2651,8 +3156,16 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
         clearRemoteWatchdog();
         clearSettleTimer();
       }
-      setRun(set, sessionId, { streaming: false, pendingPermission: null });
-      if (useStore.getState().activeId === sessionId) set(() => ({ composerPhase: "idle" }));
+      set((st) => ({
+        ...runPatch(st, sessionId, { streaming: false, pendingPermission: null }),
+        ...terminalizeTurnState(
+          st,
+          sessionId,
+          e.stopReason === "cancelled" ? TOOL_INTERRUPTED_CANCELLED : TOOL_INTERRUPTED_ERROR,
+          e.stopReason === "cancelled" ? "cancelled" : "ok",
+        ),
+        ...(st.activeId === sessionId ? { composerPhase: "idle" as const, activeTool: null } : {}),
+      }));
       break;
     case "agent_started":
     case "agent_progress":

@@ -149,24 +149,59 @@ pub struct UiMessage {
     created_at: i64,
 }
 
-fn to_ui_block(b: &Block) -> UiBlock {
+fn to_ui_block(b: &Block) -> Option<UiBlock> {
     match b {
-        Block::Text { text } => UiBlock::Text { text: text.clone() },
-        Block::ToolUse { id, name, input } => UiBlock::ToolUse {
+        Block::Text { text } => Some(UiBlock::Text { text: text.clone() }),
+        Block::ToolUse { id, name, input } => Some(UiBlock::ToolUse {
             id: id.clone(),
             name: name.clone(),
             input: input.clone(),
-        },
+        }),
         Block::ToolResult {
             tool_use_id,
             content,
             is_error,
-        } => UiBlock::ToolResult {
+        } => Some(UiBlock::ToolResult {
             tool_use_id: tool_use_id.clone(),
             output: content.clone(),
             is_error: *is_error,
-        },
+        }),
+        // Reasoning is opaque provider continuation state, not display content.
+        Block::Reasoning { .. } => None,
     }
+}
+
+/// A stored assistant tool request without a later result is historical, not live:
+/// the frontend has no run handle after a reload and would otherwise render it as
+/// "running" forever. Add a display-only terminal result; canonical model history
+/// remains untouched, and a real persisted result wins whenever one exists.
+fn finalize_unmatched_ui_tools(blocks: &mut Vec<UiBlock>) {
+    let resolved: Vec<String> = blocks
+        .iter()
+        .filter_map(|block| match block {
+            UiBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut finalized = Vec::new();
+    for block in blocks.iter() {
+        let UiBlock::ToolUse { id, .. } = block else {
+            continue;
+        };
+        if !resolved.contains(id) && !finalized.contains(id) {
+            finalized.push(id.clone());
+        }
+    }
+    blocks.extend(
+        finalized
+            .into_iter()
+            .map(|tool_use_id| UiBlock::ToolResult {
+                tool_use_id,
+                output: "Interrupted: the previous run ended before this tool returned a result."
+                    .into(),
+                is_error: true,
+            }),
+    );
 }
 
 /// Escape LIKE wildcards so a literal query matches literally under
@@ -220,12 +255,17 @@ fn search_snippet(text: &str, needle: &str) -> Option<String> {
 /// `load_chat_messages`/`ui_messages`).
 fn row_to_message(r: &rusqlite::Row) -> rusqlite::Result<MessageRow> {
     let content: String = r.get(4)?;
+    let mut blocks: Vec<Block> = serde_json::from_str(&content).unwrap_or_default();
+    // Phone Sync is a display/control channel; inference always resumes on the
+    // desktop from the canonical DB. Do not replicate opaque encrypted reasoning
+    // state to display-only clients.
+    blocks.retain(|block| !matches!(block, Block::Reasoning { .. }));
     Ok(MessageRow {
         id: r.get(0)?,
         session_id: r.get(1)?,
         seq: r.get(2)?,
         role: r.get(3)?,
-        content: serde_json::from_str(&content).unwrap_or_default(),
+        content: blocks,
         created_at: r.get(5)?,
     })
 }
@@ -288,9 +328,11 @@ impl Db {
             );",
         )?;
         // Migrate pre-existing databases: the CREATE-IF-NOT-EXISTS above won't add
-        // a column to a table that already exists, so add `model` in place. A
-        // duplicate-column error (column already present) is expected and ignored.
-        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT", []);
+        // a column to a table that already exists, so add `model` in place.
+        // Probe first instead of swallowing every ALTER error: a real migration
+        // failure must fail startup rather than make model changes appear durable
+        // until the next reload.
+        Self::migrate_add_model(&conn)?;
         // ADDITIVE migration: a `paired_devices` table created before the
         // device-trust gate landed has no `confirmed` column. Add it without
         // dropping the table, defaulting every pre-existing row to 0 (untrusted).
@@ -304,6 +346,21 @@ impl Db {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Idempotently add the per-session `model` column to a legacy sessions table.
+    /// Existing rows intentionally remain NULL; the frontend falls back to the
+    /// last-used default until the user selects and persists a model for that chat.
+    fn migrate_add_model(conn: &Connection) -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+        let has_model = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(|c| c.ok())
+            .any(|name| name == "model");
+        if !has_model {
+            conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT", [])?;
+        }
+        Ok(())
     }
 
     /// Idempotently add the `confirmed` column to a legacy `paired_devices`
@@ -366,6 +423,18 @@ impl Db {
         conn.execute(
             "UPDATE sessions SET title = ?2 WHERE id = ?1",
             params![id, title],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the model selected for one existing session. This is deliberately
+    /// separate from global settings: changing the default for future chats must
+    /// not rewrite every existing conversation's provider/model identity.
+    pub fn update_session_model(&self, id: &str, model: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET model = ?2 WHERE id = ?1",
+            params![id, model],
         )?;
         Ok(())
     }
@@ -848,14 +917,14 @@ impl Db {
                 out.push(UiMessage {
                     id,
                     role,
-                    blocks: blocks.iter().map(to_ui_block).collect(),
+                    blocks: blocks.iter().filter_map(to_ui_block).collect(),
                     created_at: ts,
                 });
             } else {
                 let tool_results: Vec<UiBlock> = blocks
                     .iter()
                     .filter(|b| matches!(b, Block::ToolResult { .. }))
-                    .map(to_ui_block)
+                    .filter_map(to_ui_block)
                     .collect();
                 if !tool_results.is_empty() {
                     if let Some(last) = out.last_mut() {
@@ -865,7 +934,7 @@ impl Db {
                 let texts: Vec<UiBlock> = blocks
                     .iter()
                     .filter(|b| matches!(b, Block::Text { .. }))
-                    .map(to_ui_block)
+                    .filter_map(to_ui_block)
                     .collect();
                 if !texts.is_empty() {
                     out.push(UiMessage {
@@ -876,6 +945,9 @@ impl Db {
                     });
                 }
             }
+        }
+        for message in &mut out {
+            finalize_unmatched_ui_tools(&mut message.blocks);
         }
         out
     }
@@ -914,27 +986,40 @@ mod tests {
     #[test]
     fn to_ui_block_maps_each_variant_with_the_camelcase_serde_shape() {
         assert_eq!(
-            serde_json::to_value(to_ui_block(&Block::Text { text: "hi".into() })).unwrap(),
+            serde_json::to_value(to_ui_block(&Block::Text { text: "hi".into() }).unwrap()).unwrap(),
             json!({ "kind": "text", "text": "hi" })
         );
         assert_eq!(
-            serde_json::to_value(to_ui_block(&Block::ToolUse {
-                id: "t1".into(),
-                name: "fs_read".into(),
-                input: json!({ "path": "x" }),
-            }))
+            serde_json::to_value(
+                to_ui_block(&Block::ToolUse {
+                    id: "t1".into(),
+                    name: "fs_read".into(),
+                    input: json!({ "path": "x" }),
+                })
+                .unwrap()
+            )
             .unwrap(),
             json!({ "kind": "tool_use", "id": "t1", "name": "fs_read", "input": { "path": "x" } })
         );
         assert_eq!(
-            serde_json::to_value(to_ui_block(&Block::ToolResult {
-                tool_use_id: "t1".into(),
-                content: "ok".into(),
-                is_error: true,
-            }))
+            serde_json::to_value(
+                to_ui_block(&Block::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "ok".into(),
+                    is_error: true,
+                })
+                .unwrap()
+            )
             .unwrap(),
             json!({ "kind": "tool_result", "toolUseId": "t1", "output": "ok", "isError": true })
         );
+        assert!(to_ui_block(&Block::Reasoning {
+            model: Some("gpt-5.6-sol".into()),
+            id: Some("r1".into()),
+            encrypted_content: Some("opaque".into()),
+            summary: Vec::new(),
+        })
+        .is_none());
     }
 
     #[test]
@@ -950,6 +1035,41 @@ mod tests {
         assert_eq!(rows[1].workspace, None);
         // A non-existent workspace path resolves to no branch (not an error).
         assert_eq!(rows[0].branch, None);
+    }
+
+    #[test]
+    fn legacy_session_model_migrates_and_selected_model_round_trips() {
+        // Simulate the sessions table from before per-session models. Migration is
+        // additive: the conversation row survives, reads as no explicit model, and
+        // can then persist a selection that list_sessions returns after a reload.
+        let conn = Connection::open(Path::new(":memory:")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO sessions (id, title, workspace, created_at, updated_at)
+            VALUES ('legacy', 'Kept chat', NULL, 10, 20);",
+        )
+        .unwrap();
+
+        Db::migrate_add_model(&conn).unwrap();
+        Db::migrate_add_model(&conn).unwrap(); // idempotent on every later launch
+        let db = Db {
+            conn: Mutex::new(conn),
+        };
+
+        let before = db.list_sessions().unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].title, "Kept chat");
+        assert_eq!(before[0].model, None);
+
+        db.update_session_model("legacy", "gpt-5.6-sol").unwrap();
+        let after = db.list_sessions().unwrap();
+        assert_eq!(after[0].model.as_deref(), Some("gpt-5.6-sol"));
     }
 
     #[test]
@@ -1153,6 +1273,36 @@ mod tests {
     // Invariants protected here (ruflo tester, Phase 0 review): full pull,
     // strictly-greater boundary, up-to-date emptiness, ascending order, and
     // per-session isolation.
+
+    #[test]
+    fn ui_messages_terminalizes_an_unmatched_historical_tool_after_reload() {
+        let db = mem_db();
+        db.create_session("a", "A", None, None, 1).unwrap();
+        db.append_message(
+            "a",
+            &ChatMessage {
+                role: "assistant".into(),
+                content: vec![Block::ToolUse {
+                    id: "orphan".into(),
+                    name: "shell".into(),
+                    input: json!({ "command": "long task" }),
+                }],
+            },
+            2,
+        );
+
+        let ui = db.ui_messages("a");
+        let assistant = serde_json::to_value(&ui[0]).unwrap();
+        let blocks = assistant["blocks"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1]["kind"], "tool_result");
+        assert_eq!(blocks[1]["toolUseId"], "orphan");
+        assert_eq!(blocks[1]["isError"], true);
+        assert!(blocks[1]["output"]
+            .as_str()
+            .unwrap()
+            .starts_with("Interrupted:"));
+    }
 
     #[test]
     fn messages_since_minus_one_returns_all_rows() {

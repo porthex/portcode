@@ -5,10 +5,18 @@ import type {
   ConnectInfo,
   DirEntry,
   DraftEntry,
+  GitChangedFile,
+  GitFilePatch,
+  GitReviewManifest,
+  GitReviewScope,
   Message,
   OAuthStatus,
+  OpenAIAuthStatus,
+  OpenAIModelCatalogRow,
   PairingPayload,
   PairingRequest,
+  PlanUsageSnapshot,
+  ProviderId,
   PhoneSyncStatus,
   RemoteCommand,
   SearchHit,
@@ -19,6 +27,7 @@ import type {
   SyncFrame,
   UpdateChannel,
   UpdateInfo,
+  WorkspaceSummary,
 } from "../types";
 import {
   webOnPhoneSyncDisconnected,
@@ -123,6 +132,50 @@ export async function oauthLogout(): Promise<void> {
     return;
   }
   return mock.oauthLogout();
+}
+
+// ── ChatGPT subscription OAuth + live Codex model catalogue ─────────────────
+
+export async function startOpenaiOauthLogin(): Promise<OpenAIAuthStatus> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<OpenAIAuthStatus>("start_openai_oauth_login");
+  }
+  return mock.startOpenaiOauthLogin();
+}
+
+export async function openaiOauthStatus(): Promise<OpenAIAuthStatus> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<OpenAIAuthStatus>("openai_oauth_status");
+  }
+  return mock.openaiOauthStatus();
+}
+
+export async function openaiOauthLogout(): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("openai_oauth_logout");
+    return;
+  }
+  return mock.openaiOauthLogout();
+}
+
+export async function openaiModels(): Promise<OpenAIModelCatalogRow[]> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<OpenAIModelCatalogRow[]>("openai_models");
+  }
+  return mock.openaiModels();
+}
+
+/** Live included-plan quota windows for one signed-in subscription provider. */
+export async function getPlanUsage(provider: ProviderId): Promise<PlanUsageSnapshot> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<PlanUsageSnapshot>("get_plan_usage", { provider });
+  }
+  return mock.getPlanUsage(provider);
 }
 
 // ── Auto-update (desktop only) ─────────────────────────────────────────────────
@@ -400,6 +453,14 @@ export async function renameSession(id: string, title: string): Promise<void> {
   }
 }
 
+/** Persist the model selected for one existing conversation. */
+export async function updateSessionModel(id: string, model: string): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("update_session_model", { id, model });
+  }
+}
+
 export async function deleteSession(id: string): Promise<void> {
   if (isTauri()) {
     const { core } = await tauri();
@@ -485,6 +546,37 @@ export async function searchMessages(query: string): Promise<SearchHit[]> {
 }
 
 // ── workspace / files ─────────────────────────────────────────────────────────
+
+/** Read-only Git/workspace facts for the directory native agent runs currently use. */
+export async function getWorkspaceSummary(): Promise<WorkspaceSummary> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<WorkspaceSummary>("get_workspace_summary");
+  }
+  return mock.getWorkspaceSummary();
+}
+
+/** Read-only, workspace-scoped Git manifest. The repository root is native-owned. */
+export async function getGitReviewManifest(scope: GitReviewScope): Promise<GitReviewManifest> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<GitReviewManifest>("get_git_review_manifest", { scope });
+  }
+  return mock.getGitReviewManifest(scope);
+}
+
+/** Lazily load one typed patch, guarded by the manifest snapshot id. */
+export async function getGitReviewFile(
+  scope: GitReviewScope,
+  snapshotId: string,
+  path: string,
+): Promise<GitFilePatch> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<GitFilePatch>("get_git_review_file", { scope, snapshotId, path });
+  }
+  return mock.getGitReviewFile(scope, snapshotId, path);
+}
 
 export async function listDir(sub?: string): Promise<DirEntry[]> {
   if (isTauri()) {
@@ -582,10 +674,107 @@ export async function cancelAgentById(agentId: string): Promise<void> {
 // ── Browser mock ──────────────────────────────────────────────────────────────
 // A deterministic fake agent so the UI is alive without the Rust core.
 
+const PREVIEW_REVIEW_FILES: GitChangedFile[] = [
+  {
+    path: "src/App.tsx",
+    oldPath: null,
+    status: "modified",
+    areas: ["staged", "unstaged"],
+    additions: 12,
+    deletions: 3,
+    binary: false,
+  },
+  {
+    path: "src/components/ReviewWorkspace.tsx",
+    oldPath: null,
+    status: "added",
+    areas: ["untracked"],
+    additions: 84,
+    deletions: 0,
+    binary: false,
+  },
+  {
+    path: "README.md",
+    oldPath: null,
+    status: "modified",
+    areas: ["staged"],
+    additions: 6,
+    deletions: 1,
+    binary: false,
+  },
+  {
+    path: "assets/reviewer.png",
+    oldPath: null,
+    status: "modified",
+    areas: ["unstaged"],
+    additions: null,
+    deletions: null,
+    binary: true,
+  },
+];
+
+function previewReviewManifest(scope: GitReviewScope): GitReviewManifest {
+  let files: GitChangedFile[];
+  let baseLabel: string;
+  let targetLabel: string;
+  if (scope.kind === "staged") {
+    files = PREVIEW_REVIEW_FILES.filter((file) => file.areas.includes("staged")).map((file) => ({
+      ...file,
+      areas: ["staged"],
+    }));
+    baseLabel = "9c31f2ab";
+    targetLabel = "Index";
+  } else if (scope.kind === "unstaged") {
+    files = PREVIEW_REVIEW_FILES.filter(
+      (file) => file.areas.includes("unstaged") || file.areas.includes("untracked"),
+    ).map((file) => ({
+      ...file,
+      areas: file.areas.includes("untracked") ? ["untracked"] : ["unstaged"],
+    }));
+    baseLabel = "Index";
+    targetLabel = "Working tree";
+  } else if (scope.kind === "branch") {
+    files = PREVIEW_REVIEW_FILES.slice(0, 2).map((file) => ({
+      ...file,
+      areas: ["committed"],
+    }));
+    baseLabel = `merge-base(${scope.base}) · 17a19ee0`;
+    targetLabel = "HEAD";
+  } else if (scope.kind === "commit") {
+    files = PREVIEW_REVIEW_FILES.slice(0, 2).map((file) => ({
+      ...file,
+      areas: ["committed"],
+    }));
+    baseLabel = "parent of 9c31f2ab";
+    targetLabel = scope.revision;
+  } else {
+    files = PREVIEW_REVIEW_FILES.map((file) => ({ ...file, areas: [...file.areas] }));
+    baseLabel = "9c31f2ab";
+    targetLabel = "Working tree";
+  }
+  const additions = files.reduce((total, file) => total + (file.additions ?? 0), 0);
+  const deletions = files.reduce((total, file) => total + (file.deletions ?? 0), 0);
+  const detail =
+    scope.kind === "branch" ? scope.base : scope.kind === "commit" ? scope.revision : scope.kind;
+  return {
+    snapshotId: `preview-${scope.kind}-${detail}`,
+    repositoryRoot: "C:/dev/portcode",
+    scope,
+    baseLabel,
+    targetLabel,
+    headOid: "9c31f2ab16f0a5c9",
+    files,
+    additions,
+    deletions,
+    truncated: false,
+  };
+}
+
 const mock = (() => {
   let settings: Settings = {
     provider: "anthropic",
     model: "claude-opus-4-8",
+    reasoningEffort: "medium",
     apiKeySet: false,
     defaultPolicy: "ask",
     workspace: null,
@@ -597,6 +786,34 @@ const mock = (() => {
 
   // Fake subscription-auth state so the sign-in UX is testable without Tauri.
   let oauth: OAuthStatus = { signedIn: false, expiresAt: null, account: null, tier: null };
+  let openaiOauth: OpenAIAuthStatus = {
+    signedIn: false,
+    expiresAt: null,
+    account: null,
+    tier: null,
+    available: true,
+    unavailableReason: null,
+  };
+  const openaiCatalogue: OpenAIModelCatalogRow[] = [
+    {
+      id: "gpt-5.6-sol",
+      label: "GPT-5.6 Sol",
+      reasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+      defaultReasoningEffort: "medium",
+    },
+    {
+      id: "gpt-5.6-terra",
+      label: "GPT-5.6 Terra",
+      reasoningEfforts: ["low", "medium", "high"],
+      defaultReasoningEffort: "medium",
+    },
+    {
+      id: "gpt-5.6-luna",
+      label: "GPT-5.6 Luna",
+      reasoningEfforts: ["none", "low", "medium"],
+      defaultReasoningEffort: "low",
+    },
+  ];
 
   // Fake phone sync state: a stable mock identity + no paired phones by default.
   let phoneSyncState: PhoneSyncStatus = {
@@ -633,6 +850,66 @@ const mock = (() => {
     },
     async oauthLogout() {
       oauth = { signedIn: false, expiresAt: null, account: null, tier: null };
+    },
+    async startOpenaiOauthLogin() {
+      openaiOauth = {
+        signedIn: true,
+        expiresAt: Math.floor(Date.now() / 1000) + 8 * 60 * 60,
+        account: "preview@chatgpt.local",
+        tier: "ChatGPT Plus",
+        available: true,
+        unavailableReason: null,
+      };
+      return { ...openaiOauth };
+    },
+    async openaiOauthStatus() {
+      return { ...openaiOauth };
+    },
+    async openaiOauthLogout() {
+      openaiOauth = {
+        signedIn: false,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: true,
+        unavailableReason: null,
+      };
+    },
+    async openaiModels() {
+      return openaiCatalogue.map((model) => ({
+        ...model,
+        reasoningEfforts: [...model.reasoningEfforts],
+      }));
+    },
+    async getPlanUsage(provider: ProviderId): Promise<PlanUsageSnapshot> {
+      const now = Math.floor(Date.now() / 1000);
+      const signedIn = provider === "anthropic" ? oauth.signedIn : openaiOauth.signedIn;
+      if (!signedIn)
+        throw new Error(`Sign in with ${provider === "anthropic" ? "Claude" : "ChatGPT"} first.`);
+      return {
+        provider,
+        plan:
+          provider === "anthropic"
+            ? (oauth.tier?.replace(/^Claude\s+/i, "") ?? null)
+            : (openaiOauth.tier?.replace(/^ChatGPT\s+/i, "") ?? null),
+        updatedAt: now,
+        windows: [
+          {
+            id: "primary",
+            label: "Current session",
+            usedPercent: provider === "anthropic" ? 28 : 18,
+            resetsAt: String(now + 3 * 60 * 60),
+            windowMinutes: 300,
+          },
+          {
+            id: "secondary",
+            label: "Weekly limit",
+            usedPercent: provider === "anthropic" ? 57 : 34,
+            resetsAt: String(now + 4 * 24 * 60 * 60),
+            windowMinutes: 10_080,
+          },
+        ],
+      };
     },
     // Auto-update — inert in the preview: never offer an update, never relaunch,
     // never emit progress/finished. The desktop preview shows no update banner.
@@ -737,6 +1014,70 @@ const mock = (() => {
       };
       return tree[sub ?? ""] ?? [];
     },
+    async getWorkspaceSummary(): Promise<WorkspaceSummary> {
+      return {
+        path: settings.workspace ?? "C:/dev/portcode",
+        configured: settings.workspace !== null,
+        git: {
+          kind: "repository",
+          branch: "main",
+          detachedHead: null,
+          upstream: "origin/main",
+          ahead: 0,
+          behind: 0,
+          changedFiles: 6,
+          untrackedFiles: 1,
+          additions: 342,
+          deletions: 28,
+        },
+      };
+    },
+    async getGitReviewManifest(scope: GitReviewScope): Promise<GitReviewManifest> {
+      return previewReviewManifest(scope);
+    },
+    async getGitReviewFile(
+      scope: GitReviewScope,
+      snapshotId: string,
+      path: string,
+    ): Promise<GitFilePatch> {
+      const manifest = previewReviewManifest(scope);
+      if (manifest.snapshotId !== snapshotId) throw new Error("Review snapshot is stale.");
+      const file = manifest.files.find((candidate) => candidate.path === path);
+      if (!file) throw new Error("File is not part of this review.");
+      const binary = file.binary;
+      return {
+        snapshotId,
+        path,
+        oldPath: file.oldPath,
+        status: file.status,
+        binary,
+        filePatchHash: `preview-patch-${path}-${scope.kind}`,
+        truncated: false,
+        hunks: binary
+          ? []
+          : [
+              {
+                header: "@@ -12,3 +12,4 @@ export function preview() {",
+                oldStart: 12,
+                oldLines: 3,
+                newStart: 12,
+                newLines: 4,
+                lines: [
+                  { kind: "context", content: "  const mode = current;", oldLine: 12, newLine: 12 },
+                  { kind: "deletion", content: "  return oldValue;", oldLine: 13, newLine: null },
+                  {
+                    kind: "addition",
+                    content: "  const reviewed = true;",
+                    oldLine: null,
+                    newLine: 13,
+                  },
+                  { kind: "addition", content: "  return newValue;", oldLine: null, newLine: 14 },
+                  { kind: "context", content: "}", oldLine: 14, newLine: 15 },
+                ],
+              },
+            ],
+      };
+    },
     async runAgent(
       _sessionId: string,
       text: string,
@@ -766,7 +1107,12 @@ const mock = (() => {
         await delay(200);
         if (cancelled) return;
         const readId = crypto.randomUUID();
-        onEvent({ type: "tool_use", id: readId, name: "fs_read", input: { path: "src/App.tsx" } });
+        onEvent({
+          type: "tool_use",
+          id: readId,
+          name: "read_file",
+          input: { path: "src/App.tsx" },
+        });
         await delay(350);
         onEvent({
           type: "tool_result",
@@ -786,7 +1132,7 @@ const mock = (() => {
           onEvent({
             type: "permission_request",
             id: permId,
-            tool: "fs_edit",
+            tool: "edit_file",
             summary: "src/App.tsx",
             input: { path: "src/App.tsx", old_string: "return x;", new_string: "return x + 1;" },
           });
@@ -795,7 +1141,12 @@ const mock = (() => {
           }).then((v) => v);
         }
         if (cancelled) return;
-        onEvent({ type: "tool_use", id: writeId, name: "fs_edit", input: { path: "src/App.tsx" } });
+        onEvent({
+          type: "tool_use",
+          id: writeId,
+          name: "edit_file",
+          input: { path: "src/App.tsx" },
+        });
         await delay(250);
         onEvent({
           type: "tool_result",

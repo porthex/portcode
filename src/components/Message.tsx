@@ -7,6 +7,7 @@ import { useStore } from "../store/store";
 import { usePrefersReducedMotion, useScramble } from "../lib/useScramble";
 import { useContextMenu, type ContextMenuItem } from "./ContextMenu";
 import { ToolCall } from "./ToolCall";
+import { isRoutineToolName, ToolActivityGroup, type ActivityCall } from "./ToolActivityGroup";
 
 // Hoisted to module scope so they're referentially stable across renders —
 // otherwise a fresh array each render defeats React.memo on TextBlock and makes
@@ -15,10 +16,102 @@ import { ToolCall } from "./ToolCall";
 type MarkdownPlugins = NonNullable<ComponentProps<typeof ReactMarkdown>["remarkPlugins"]>;
 const REMARK_PLUGINS: MarkdownPlugins = [remarkGfm];
 const REHYPE_PLUGINS: MarkdownPlugins = [[rehypeHighlight, { detect: true }]];
+const ACTIVE_REHYPE_PLUGINS: MarkdownPlugins = [];
+const ACTIVE_CARET_REHYPE_PLUGINS: MarkdownPlugins = [rehypeStreamingCaret];
+
+type HastNode = {
+  type?: string;
+  tagName?: string;
+  properties?: Record<string, unknown>;
+  children?: HastNode[];
+};
+
+const CARET_UNSAFE_ELEMENTS = new Set([
+  "a",
+  "area",
+  "base",
+  "br",
+  "col",
+  "embed",
+  "hr",
+  "img",
+  "input",
+  "link",
+  "meta",
+  "param",
+  "source",
+  "track",
+  "wbr",
+]);
+
+// Put the streaming caret inside the final renderable Markdown element. A plain
+// sibling after ReactMarkdown's block nodes falls onto a detached new line after
+// headings, lists, and fenced code, which makes the live layout look unfinished.
+function rehypeStreamingCaret() {
+  return (tree: HastNode) => {
+    let target: HastNode | undefined;
+    const visit = (node: HastNode) => {
+      if (
+        node.type === "element" &&
+        node.children &&
+        node.tagName &&
+        !CARET_UNSAFE_ELEMENTS.has(node.tagName)
+      ) {
+        target = node;
+      }
+      node.children?.forEach(visit);
+    };
+    visit(tree);
+    target?.children?.push({
+      type: "element",
+      tagName: "span",
+      properties: { className: ["pc-caret"], ariaHidden: "true" },
+      children: [],
+    });
+  };
+}
+
+// Structured replies need to format while they stream, but running the whole
+// Markdown pipeline for every decorative scramble frame would make long turns
+// progressively more expensive. Once a block contains Markdown syntax, prefer
+// the live source (plus its caret) over the scramble. Plain prose keeps the
+// terminal-style decode animation.
+const BLOCK_MARKDOWN =
+  /(^|\n)[\t ]{0,3}(?:#{1,6}(?:[\t ]|$)|[-+*][\t ]+|\d+[.)][\t ]+|>[\t ]?|`{3,}|~{3,})/m;
+const SETEXT_THEMATIC_OR_CODE =
+  /(^|\n)(?:[\t ]{0,3}(?:={3,}|-{3,}|_{3,})[\t ]*(?=\n|$)|[\t ]{4}\S)/m;
+const INLINE_MARKDOWN =
+  /(?:\*\*|__|~~|`|!\[|\[[^\]\n]*\]\(|<https?:\/\/|https?:\/\/|www\.|(^|[\s([{])[*_](?=\S))/m;
+const TABLE_MARKDOWN = /(^|\n)[^\n|]+\|[^\n]+(?:\n|$)/m;
+
+function hasMarkdownSyntax(text: string): boolean {
+  return (
+    BLOCK_MARKDOWN.test(text) ||
+    SETEXT_THEMATIC_OR_CODE.test(text) ||
+    INLINE_MARKDOWN.test(text) ||
+    TABLE_MARKDOWN.test(text)
+  );
+}
 
 // A tool_result paired with its tool_use by toolUseId. Reused (not re-derived)
 // so the ToolCall props stay the existing narrowed shape.
 type ResultBlock = Extract<ContentBlock, { kind: "tool_result" }>;
+type ToolUseBlock = Extract<ContentBlock, { kind: "tool_use" }>;
+
+type RenderItem =
+  | { kind: "text"; block: Extract<ContentBlock, { kind: "text" }>; index: number }
+  | { kind: "tool"; block: ToolUseBlock; result?: ResultBlock }
+  | { kind: "activity"; calls: ActivityCall[] };
+
+// Let Chromium skip style/layout/paint work for settled rows outside the
+// viewport without removing them from the DOM. Keeping every message id present
+// preserves search-result jumps, transcript semantics, and prepend pagination.
+const SETTLED_ROW_STYLE = {
+  contentVisibility: "auto",
+  containIntrinsicSize: "auto 140px",
+} as const;
+const HISTORICAL_TOOL_INTERRUPTED =
+  "Interrupted: this historical tool did not record a terminal result.";
 
 // Memoised: while a turn streams, only the active assistant message's props change,
 // so history rows (incl. their markdown + syntax highlighting) don't re-render on
@@ -51,6 +144,14 @@ export const MessageView = memo(function MessageView({
     return m;
   }, [message.blocks]);
 
+  // Fold consecutive, successful/pending read-only primitives into one calm
+  // exploration row. A text block, mutation, delegation, unknown tool, or any
+  // error flushes the group and remains individually visible in exact order.
+  const renderItems = useMemo(
+    () => buildRenderItems(message.blocks, resultByUseId, isActive),
+    [message.blocks, resultByUseId, isActive],
+  );
+
   // Right-click → copy the message's text. Disabled when the message has no text
   // (e.g. a tool-only assistant turn). Plain text inside the bubble keeps its own
   // native selection menu; this is the convenience "copy the whole message".
@@ -69,6 +170,7 @@ export const MessageView = memo(function MessageView({
     <div
       id={`pc-msg-${message.id}`}
       className={`mb-5 flex gap-[11px] ${isUser ? "justify-end" : "pc-msg-enter"}`}
+      style={isActive ? undefined : SETTLED_ROW_STYLE}
       onContextMenu={onContextMenu(menuItems)}
     >
       {!isUser && <Avatar />}
@@ -79,23 +181,35 @@ export const MessageView = memo(function MessageView({
           </div>
         ) : (
           <div className="space-y-2">
-            {message.blocks.map((b, i) => {
-              if (b.kind === "text") {
+            {renderItems.map((item) => {
+              if (item.kind === "text") {
                 return (
                   <TextBlock
-                    key={i}
-                    text={b.text}
+                    key={`text-${item.index}`}
+                    text={item.block.text}
                     animate={animate}
                     active={isActive}
-                    caret={animate && i === lastTextIndex}
+                    caret={animate && item.index === lastTextIndex}
                   />
                 );
               }
-              if (b.kind === "tool_use") {
-                const result = resultByUseId.get(b.id);
-                return <ToolCall key={i} name={b.name} input={b.input} result={result} />;
+              if (item.kind === "activity") {
+                return (
+                  <ToolActivityGroup
+                    key={`activity-${item.calls[0].tool.id}`}
+                    calls={item.calls}
+                    active={isActive}
+                  />
+                );
               }
-              return null; // tool_result is rendered alongside its tool_use
+              return (
+                <ToolCall
+                  key={item.block.id}
+                  name={item.block.name}
+                  input={item.block.input}
+                  result={item.result}
+                />
+              );
             })}
             {message.blocks.length === 0 && <Thinking />}
           </div>
@@ -106,11 +220,52 @@ export const MessageView = memo(function MessageView({
   );
 });
 
-/**
- * A single assistant text block. While its turn is streaming it reveals one WORD
- * at a time as a "decode" — each word flickers through random glyphs and resolves
- * left-to-right; once the turn completes it re-renders as full Markdown.
- */
+function buildRenderItems(
+  blocks: ContentBlock[],
+  resultByUseId: Map<string, ResultBlock>,
+  isActive: boolean,
+): RenderItem[] {
+  const items: RenderItem[] = [];
+  let routine: ActivityCall[] = [];
+
+  const flushRoutine = () => {
+    if (routine.length === 0) return;
+    items.push({ kind: "activity", calls: routine });
+    routine = [];
+  };
+
+  blocks.forEach((block, index) => {
+    if (block.kind === "tool_result") return;
+    if (block.kind === "text") {
+      flushRoutine();
+      items.push({ kind: "text", block, index });
+      return;
+    }
+
+    const result =
+      resultByUseId.get(block.id) ??
+      (!isActive
+        ? {
+            kind: "tool_result" as const,
+            toolUseId: block.id,
+            output: HISTORICAL_TOOL_INTERRUPTED,
+            isError: true,
+          }
+        : undefined);
+    if (isRoutineToolName(block.name) && !result?.isError) {
+      routine.push({ tool: block, result });
+      return;
+    }
+
+    flushRoutine();
+    items.push({ kind: "tool", block, result });
+  });
+
+  flushRoutine();
+  return items;
+}
+
+/** A single assistant text block, rendered as Markdown even before it settles. */
 const TextBlock = memo(function TextBlock({
   text,
   animate,
@@ -122,24 +277,26 @@ const TextBlock = memo(function TextBlock({
   active: boolean;
   caret: boolean;
 }) {
-  if (animate) {
+  if (animate && !hasMarkdownSyntax(text)) {
     return <ScrambleText text={text} caret={caret} />;
   }
-  // Active but NOT animating (reduced-motion ON, or typingAnimation off): render
-  // cheap static plain text in the SAME .prose-pc body typography as the settled
-  // markdown, so the body resolves in place when ReactMarkdown takes over. This
-  // avoids re-running remark/rehype + syntax highlighting on every streaming
-  // delta — the whole accumulated reply was otherwise re-highlighted per chunk.
-  if (active) {
-    return (
-      <div className="prose-pc">
-        <p className="whitespace-pre-wrap break-words">{text}</p>
-      </div>
-    );
-  }
+
+  // Parse active source with the same safe Markdown renderer as settled output,
+  // but defer syntax highlighting until completion. Highlighting the entire
+  // accumulated response on every provider delta is disproportionately costly;
+  // fenced and inline code are still code-shaped while the turn is in flight.
   return (
     <div className="prose-pc">
-      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS}>
+      <ReactMarkdown
+        remarkPlugins={REMARK_PLUGINS}
+        rehypePlugins={
+          active
+            ? animate && caret
+              ? ACTIVE_CARET_REHYPE_PLUGINS
+              : ACTIVE_REHYPE_PLUGINS
+            : REHYPE_PLUGINS
+        }
+      >
         {text}
       </ReactMarkdown>
     </div>
