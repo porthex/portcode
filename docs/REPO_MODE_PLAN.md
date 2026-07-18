@@ -109,11 +109,16 @@ connect GitHub see no behavior change.
   otherwise Device Flow.** This hinges on the GitHub App registration details (§8 Q1).
 - **New `github_auth.rs`** (parallel to `oauth.rs`, sharing extracted PKCE helpers) and a
   thin **`github.rs`** REST/GraphQL client (`reqwest`) for: list installations, list repos,
-  list branches, get repo (default branch/clone URL), create PR, get user. Tokens are read
-  **only** by `github.rs` and the git credential callback — never returned in data structs.
-- **Token storage:** a new `github-oauth` account in `secrets.rs`, mirroring `OAuthTokens`
-  exactly (access + refresh + `expires_at`), with single-flight refresh modeled on
-  `agent.rs:108-156`.
+  list branches, get repo (default branch/clone URL), create PR, get user. User OAuth tokens
+  are read **only** by `github.rs`; the git credential callback receives only a just-in-time
+  installation token from the internal credential broker. Neither is returned in data
+  structs.
+- **Token storage:** `github-oauth` is the **user OAuth record only** (identity,
+  installation discovery, access + refresh + `expires_at`), with single-flight refresh
+  modeled on `agent.rs:108-156`. Repo-scoped GitHub App **installation tokens are a separate
+  credential class**: mint one just in time for the selected installation, keep it in
+  memory only for the operation, zero/drop it afterward, and never persist it in
+  `github-oauth`, SQLite, logs, URLs, or `.git/config`.
 
 ### 4.2 Git engine — **bundled `git2` (libgit2)**
 
@@ -122,33 +127,55 @@ connect GitHub see no behavior change.
   not yet mature). Build with `vendored-libgit2` + Windows **Schannel** transport (no
   OpenSSL dependency). Per `CLAUDE.md`, the crate is too heavy for low-RAM dev machines —
   **verify git via CI**, not local builds.
-- **New `git.rs`** scoped to `workspace.local_path`: `clone` (with `transfer_progress` →
-  Tauri events), `status`, `diff` (reuse `unified_diff`), `log`, `current_branch`,
-  `create_branch`, `checkout`, `add`, `commit`, `push`, `fetch`, `pull`, `detect_conflicts`.
-- **Auth without exposure:** token supplied via libgit2 `RemoteCallbacks::credentials`
-  (`x-access-token:<token>`), read from the vault at call time, **never** written into the
+- **New `git.rs`:** existing-repository operations are scoped to the canonical `local_path`
+  from the current device's validated, `ready` `workspace_bindings` row. `clone` alone
+  accepts a validated canonical target binding already in `cloning` state, emits
+  `transfer_progress` Tauri events, and transitions it to `ready` only after success (or
+  `failed` on error). Other operations are `status`, `diff` (reuse `unified_diff`), `log`,
+  `current_branch`, `create_branch`, `checkout`, `add`, `commit`, `push`, `fetch`,
+  `fast_forward_if_clean`, and `detect_conflicts`. There is no implicit pull/rebase
+  operation.
+- **Auth without exposure:** the just-in-time installation token is supplied via libgit2
+  `RemoteCallbacks::credentials` (`x-access-token:<token>`), **never** written into the
   remote URL or `.git/config`, never an env var.
+- **Audited `.git` mutation boundary:** generic FS tools and `shell` are unconditionally
+  blocked from writing `.git/**`. Only the internal libgit2 adapter may mutate Git metadata,
+  through an explicit operation allowlist: clone/init metadata, fetch, clean fast-forward,
+  checkout, create branch, stage, commit, push, and the one-time `core.hooksPath`
+  neutralization. Every allowlisted entry point validates the canonical workspace binding
+  and records an audit event; adding another `.git` writer requires a security review and a
+  named allowlist case.
 
 ### 4.3 Data model (additive)
 
 ```sql
 CREATE TABLE workspaces (
-  id, name, kind ('repo'|'path'), local_path, remote_url, provider, owner, repo,
+  id, name, kind ('repo'|'path'), remote_url, provider, owner, repo,
   default_branch, current_branch, graph_path, last_indexed_at, last_synced_sha,
   github_install_id, created_at, updated_at);
 CREATE TABLE workspace_settings (workspace_id FK, key, value, PRIMARY KEY(workspace_id,key));
+CREATE TABLE workspace_bindings (
+  workspace_id FK, device_id, local_path, clone_state, checked_out_sha,
+  updated_at, PRIMARY KEY(workspace_id,device_id));
 ALTER TABLE sessions ADD COLUMN workspace_id TEXT REFERENCES workspaces(id);  -- probe-and-add
 ```
 
-Working-dir resolution becomes: `workspace_id → workspaces.local_path`, else legacy
-`sessions.workspace` path, else global `Settings.workspace`, else `current_dir()`.
+`workspace_bindings` is device-local and is never replicated with another device's path.
+Its `clone_state` is an explicit state machine (`not_cloned` → `cloning` → `ready` or
+`failed`), not a hint inferred from path existence. For a session with `workspace_id`,
+working-dir resolution is strictly `(workspace_id, this_device_id) → ready binding →
+canonical local_path`; a missing, non-ready, mismatched, or non-canonical binding is a hard
+error and **must not fall back** to `sessions.workspace`, global settings, or `current_dir()`.
+Those fallbacks remain only for legacy sessions that have no `workspace_id`.
 
 ### 4.4 Agent integration
 
 - **Git tools** added to `default_registry()`: `git_status`/`git_diff`/`git_log` (read,
   auto), `git_branch`/`git_commit` (mutating, gated). **`git_push` is a user-driven Tauri
-  command in v1, not an autonomous agent tool.** All path args route through the existing
-  `resolve_existing`/`resolve_for_write` guards — git gets no sandbox exemption.
+  command in v1, not an autonomous agent tool.** All caller-supplied path args route through
+  the existing `resolve_existing`/`resolve_for_write` guards. The internal adapter's named
+  Git-metadata operations are the only `.git/**` exception; they do not grant agent FS or
+  shell tools any sandbox exemption.
 - **Repo-context injection** at `agent.rs:57-77`: a tight (<~400 token), capped, _lazy_
   block — branch, dirty summary, top-5 commits (recomputed per turn), plus a _cached_
   graphify summary read from disk. Repo content is framed as **untrusted data, not
@@ -166,13 +193,26 @@ Working-dir resolution becomes: `workspace_id → workspaces.local_path`, else l
 
 ### 4.6 Sync
 
-Sync **metadata + sessions (+ optionally a compact graph summary)**, **never** the working
-tree or tokens. New additive `WorkspaceList`/`WorkspaceUpsert` frames in `sync/protocol.rs`
-carry a tokenless `WorkspaceRow` (its `local_path` is advisory — each device keeps its own).
-Conflict model: append-only session log is already conflict-free; workspace metadata is
+Sync **metadata + sessions (+ optionally a compact graph summary)**, but the protocol schema
+has no fields for the working tree, device-local bindings, or credentials. New additive
+`WorkspaceList`/`WorkspaceUpsert` frames in `sync/protocol.rs` carry a credential-free
+`WorkspaceRow`; each device advertises only `clone_state`/availability and resolves its own
+`workspace_bindings` row locally. The no-credential release claim remains contingent on the
+M5 negative tests in §6 and §8.2. Conflict
+model: append-only session log is already conflict-free; workspace metadata is
 last-writer-wins on `updated_at`; the working tree is owned per-device and collaboration
-happens through GitHub (push/PR), not iroh. A soft active-device lock prevents two agents
-pushing the same branch.
+happens through GitHub (push/PR), not iroh.
+
+Branch mutation uses an **expiring owner lease**, not a soft presence lock. The lease carries
+`owner_device_id`, `lease_expires_at`, and a monotonically increasing `fencing_token`.
+Commit/push entry points require an unexpired lease and the current fencing token; renewal
+or takeover increments the token, so a stale owner is rejected even if it reconnects. Each
+local mutation checks the lease and token atomically in SQLite; the synchronized lease record
+uses `(fencing_token, owner_device_id)` ordering to converge. Because P2P peers can partition,
+GitHub remains the final cross-device arbiter: a push fetches immediately beforehand and
+supplies the expected remote-head OID to a compare-and-swap/lease-protected ref update. If
+the actual remote head differs, the push hard-fails and requires fetch/review/replan rather
+than rebasing or forcing implicitly.
 
 ---
 
@@ -217,15 +257,21 @@ raw tool output to the phone.
   `agent.rs:383-385`).
 - **M3** **`shell` env scrub** (`.env_clear()` + curated allowlist) so no secret is ever
   shell-readable.
-- **M4** Token via **credential helper / libgit2 callback** — never in URL, `.git/config`,
-  or env; clone/push run as a Portcode-spawned env-scrubbed child, not via the agent's shell.
-- **M5** **Redactor at `emit_event` before `hub.publish`** (masks `ghp_`/`gho_`/`github_pat_`
-  etc.) — covers UI, logs, and the phone-sync exfil path.
+- **M4** Installation token via the internal **libgit2 credential callback only** — never in
+  URL, `.git/config`, env, a generic credential helper, or the agent's shell. Clone/push are
+  internal allowlisted libgit2 operations, not child-process or shell operations.
+- **M5** **Default-deny sync projection:** raw tool output is never a sync-frame source.
+  `emit_event` maps only an explicit source allowlist into bounded structured fields,
+  scrubs each allowed field at construction, and applies a final credential redactor before
+  `hub.publish` (including `ghp_`/`gho_`/`github_pat_` patterns). Unit, property/fuzz, and
+  desktop-to-remote integration tests with canary secrets must prove the invariant before
+  release; the final redactor is defense in depth, not permission to mirror arbitrary text.
 - **M6** **Push restricted to the agent branch**; default-branch and force-push **refused**.
 - **M7** **Per-action risk tiers**: `shell`, `git_push`, dependency-install are **always-ask**
   and bypass the `allow` fast-path.
-- **M8** **Neutralize cloned-repo git hooks** (`core.hooksPath` → empty) + **block writes to
-  `.git/**`\*\*.
+- **M8** **Neutralize cloned-repo git hooks** (`core.hooksPath` → empty) + block generic
+  FS/shell writes to `.git/**`; only the audited libgit2 operation allowlist in §4.2 may
+  write Git metadata.
 - **M9** **Secret-scan gate on `git_commit`** + staging denylist (`.env*`, `*.pem`, `id_*`…).
 - **M10** **Installs off by default / always-ask**, `--ignore-scripts` where possible
   (postinstall scripts are the #1 real-world supply-chain vector).
@@ -235,30 +281,44 @@ raw tool output to the phone.
   approval is desktop-only.
 
 **Hardening-later:** Windows Job Object + restricted/low-integrity token for shell/git/
-install; GitHub App installation tokens (short-lived, per-repo) replacing PATs;
+install; narrower GitHub App permissions and shorter installation-token lifetimes;
 network-egress allowlist; shell command pre-screen; compile-time assertion that no
 `SyncFrame` can carry a credential.
 
 **Prompt-injection stance:** assume injection _succeeds_. Privilege is enforced by the gate,
-not the model — a fully co-opted agent still cannot push to main, read outside root, exfil
-the token, or run an install without explicit human approval. Containment, not detection.
+not the model. Only after M3–M5 and M13 enforcement plus their negative/canary integration
+tests pass may we claim that a fully co-opted agent cannot push to main, read outside root,
+exfiltrate a credential, or run an install without explicit human approval. Token-bearing
+Repo Mode and remote event mirroring remain disabled until that evidence exists.
+Containment, not detection.
 
 ---
 
 ## 7. Phased build order
 
+- **Phase 0 — Safety bootstrap (blocks all workspace execution).** Land and test **M1, M2,
+  and M8 first**: canonical repo-root binding, unconditional outside-root read refusal, and
+  the generic `.git/**` write block plus audited libgit2 allowlist/hook neutralization. Clone,
+  checkout, and every workspace-bound agent action hard-fail behind this bootstrap until all
+  three controls are implemented; no later phase may provide a compatibility fallback around
+  it. Clone itself is metadata-first/no-checkout: it applies the empty hooks path before the
+  first checkout, so repository hooks never execute during workspace creation.
 - **Phase 1 — Auth + read-only GitHub (no disk writes).** `secrets.rs` github account →
   `github_auth.rs` → `github.rs` (list repos/branches/user) → connect screen + repo picker.
 - **Phase 2 — Git engine + clone + workspace model.** `git2` (vendored, Schannel); `git.rs`
   clone/status/log/branch; `workspaces` tables + `sessions.workspace_id` migration;
-  `clone_repo` with progress; workspace switcher; graphify build-on-clone.
+  per-device `workspace_bindings` state; `clone_repo` with progress; workspace switcher;
+  graphify build-on-clone. This phase cannot clone or checkout until Phase 0's controls pass.
 - **Phase 3 — Agent integration.** Repo-context injection (lazy, capped, untrusted-framed);
-  read-only git tools; graph summary caching + incremental update; security M1–M3, M8, M11.
+  read-only git tools; graph summary caching + incremental update; security M3 and M11.
+  Workspace-bound agent actions remain disabled unless the current device has a canonical,
+  `ready` binding and the Phase 0 controls are active.
 - **Phase 4 — Write path.** `git.rs` commit/push (credential callback, branch-restricted);
   gated `git_commit`/`git_branch` tools; `git_create_pr`; native diff/review; security
   M4, M6, M7, M9, M10, M12; per-action risk tiers in `permissions.rs`.
 - **Phase 5 — Multi-device sync.** `WorkspaceList`/`WorkspaceUpsert` frames; "Clone here"
-  flow (re-clone + fast-forward + graph rebuild); active-device soft lock; redactor M5; M13.
+  flow (re-clone + fast-forward + graph rebuild); fenced expiring owner lease + expected
+  remote-head validation; default-deny sync projection/redactor M5; M13.
 
 **Testing gates (per `CLAUDE.md`):** new `src/` code ships with matching `*.test.ts(x)` and
 must pass `pnpm test:coverage` before a PR (the post-merge `main` Coverage job is gated).
@@ -278,7 +338,8 @@ extraction), and the existing `remoteMode` shell / `applyFrame` reducer / `Remot
 `SyncFrame` protocol.
 
 **Repo Mode inherits this model unchanged.** Its engine — libgit2 clone, the sandboxed FS
-tools, the push-capable GitHub token in the OS keychain, graphify indexing, git ops — is
+tools, the user OAuth record in the OS keychain, ephemeral push-capable installation tokens
+in desktop memory, graphify indexing, git ops — is
 **desktop-only for the same reason `agent`/`tools`/`shell` are already `#[cfg(not(mobile))]`:**
 a phone has no workspace, no shell, and nowhere safe to hold a push-capable token; a browser
 has no filesystem at all. So:
@@ -289,17 +350,17 @@ has no filesystem at all. So:
 
 ### 8.1 Capability matrix
 
-| Capability                     | Desktop (engine)     | Android (remote)                        | iOS / Web PWA (remote)             |
-| ------------------------------ | -------------------- | --------------------------------------- | ---------------------------------- |
-| Connect GitHub / hold token    | ✅ token in keychain | initiate only; token stays desktop      | initiate only; token stays desktop |
-| Repo picker → clone → index    | ✅ executes locally  | request + watch progress                | request + watch progress           |
-| Run agent task                 | ✅                   | mirror + send `Run`/`Cancel`            | mirror + send `Run`/`Cancel`       |
-| **Graph-impact plan approval** | ✅ full graph viz    | approve (graph → list on small screens) | approve (graph → list)             |
-| Permission / plan approval     | ✅                   | ✅ (`Command(Permission)`)              | ✅ (`Command(Permission)`)         |
-| Native diff review             | ✅ side-by-side      | read-only mirrored diff                 | read-only mirrored diff            |
-| Per-hunk stage / commit        | ✅                   | trigger via command                     | trigger via command                |
-| **Push / open PR approval**    | ✅ **desktop-only**  | draft + view status only                | draft + view status only           |
-| Offline use                    | ✅ (local engine)    | ✗ (needs paired desktop)                | ✗ (needs paired desktop)           |
+| Capability                     | Desktop (engine)                                   | Android (remote)                        | iOS / Web PWA (remote)             |
+| ------------------------------ | -------------------------------------------------- | --------------------------------------- | ---------------------------------- |
+| Connect GitHub / credentials   | ✅ OAuth in keychain; installation token in memory | initiate only; no credential frame      | initiate only; no credential frame |
+| Repo picker → clone → index    | ✅ executes locally                                | request + watch progress                | request + watch progress           |
+| Run agent task                 | ✅                                                 | mirror + send `Run`/`Cancel`            | mirror + send `Run`/`Cancel`       |
+| **Graph-impact plan approval** | ✅ full graph viz                                  | approve (graph → list on small screens) | approve (graph → list)             |
+| Permission / plan approval     | ✅                                                 | ✅ (`Command(Permission)`)              | ✅ (`Command(Permission)`)         |
+| Native diff review             | ✅ side-by-side                                    | read-only mirrored diff                 | read-only mirrored diff            |
+| Per-hunk stage / commit        | ✅                                                 | trigger via command                     | trigger via command                |
+| **Push / open PR approval**    | ✅ **desktop-only**                                | draft + view status only                | draft + view status only           |
+| Offline use                    | ✅ (local engine)                                  | ✗ (needs paired desktop)                | ✗ (needs paired desktop)           |
 
 Push/PR approval staying desktop-only is the security position (M13 / §9 Q7): a paired remote
 must not be able to approve a push the desktop policy would refuse.
@@ -313,9 +374,13 @@ Extend `RemoteCommand` / `SyncFrame` in `portcode-sync` — additive, exactly li
   `OpenWorkspace{id}`, `RequestDiff{path?}`, `Commit{message}`, `DraftPr{...}`. Push/PR
   _execution_ requires a desktop-side confirmation, not just a remote command.
 - **Frames (desktop → remote):** `WorkspaceList`, `CloneProgress`, `RepoContext`
-  (branch/dirty/recent-commits), `Diff`. All E2E-encrypted.
-- **Token never crosses:** the `emit_event` redactor (security **M5**) runs before
-  `hub.publish`, so no token/secret reaches a remote even though the stream is mirrored.
+  (branch/dirty/recent-commits), `Diff`. All E2E-encrypted. This list is also the source
+  allowlist: raw tool output and arbitrary `StreamEvent` text cannot be encoded as Repo Mode
+  sync frames; allowed structured fields are scrubbed before the final M5 redaction pass.
+- **Token-does-not-cross is a release invariant, not an assumed fact:** it may be claimed as
+  guaranteed only after M5's unit, property/fuzz, and desktop-to-remote canary-secret tests
+  pass in CI. Until then it remains a design target; encryption protects transport but does
+  not make an accidentally serialized token safe.
 
 ### 8.3 Per-surface notes
 
@@ -354,8 +419,9 @@ stays the anti-feature. Captured as a §9 decision.
    token-expiry enabled, and can the token exchange be done **without** embedding a client
    secret in the desktop binary? This picks loopback-PKCE vs Device Flow and confirms the
    refresh design.
-2. **PAT vs GitHub App installation tokens at launch** — materially changes the token-leak
-   blast radius (per-repo + 1h vs broad). Recommendation: App installation tokens.
+2. **Installation-token broker details** — PATs are out of scope. Confirm the minimum GitHub
+   App permissions, mint-before-operation path, maximum in-memory lifetime, concurrent-use
+   behavior, and zeroization/drop test strategy for non-persisted installation tokens.
 3. **Clone storage & quota** — managed dir location, disk-pressure / eviction policy for
    many large clones, and whether blobless/partial clone is the default for huge repos.
 4. **Graphify availability in shipped builds** — is the CLI guaranteed present, or is graph
