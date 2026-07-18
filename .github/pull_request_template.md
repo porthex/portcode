@@ -39,7 +39,7 @@ Run these locally before pushing (CI runs them too — see
 
 ## Security sensitivity
 
-- [ ] This PR touches a **security-sensitive path** — the permission gate, secrets / credential handling, the `shell` execution path, the provider/LLM code, the Tauri IPC/CSP config, or a release/signing workflow.
+- [ ] This PR touches a **security-sensitive path** — the permission gate, secrets / credential handling, the `run_command` execution path, the provider/LLM code, the Tauri IPC/CSP config, or a release/signing workflow.
 
 <!-- If checked: describe the security impact. These paths require maintainer review (CODEOWNERS) and get extra scrutiny. -->
 

@@ -19,6 +19,8 @@ export default tseslint.config(
       // with their own tsconfigs that otherwise break the TS parser's project-root
       // detection. Not first-party source.
       ".claude/worktrees/**",
+      // Codex uses the same ignored full-repository worktree layout.
+      ".codex-worktrees/**",
       // Committed but machine-generated wasm-bindgen output (wasm-pack --target web).
       // Linting the glue is meaningless and would flag its generated patterns; the
       // hand-written wiring lives in src/lib/webSession.ts, which IS linted.

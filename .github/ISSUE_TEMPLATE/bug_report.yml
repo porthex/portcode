@@ -116,11 +116,11 @@ body:
   - type: dropdown
     id: shell-or-write
     attributes:
-      label: Was a shell command or file write involved?
-      description: Portcode's mutating tools (`shell`, `fs_write`, `fs_edit`) go through the permission gate — this helps us narrow it down.
+      label: Was a command or file write involved?
+      description: Portcode's mutating tools (`run_command`, `write_file`, `edit_file`) go through the permission gate — this helps us narrow it down.
       options:
         - "No"
-        - "Yes — a shell command"
+        - "Yes — a command"
         - "Yes — a file write/edit"
         - "Yes — both"
         - Not sure

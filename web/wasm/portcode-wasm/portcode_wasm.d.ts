@@ -41,7 +41,7 @@ export interface SessionRow {
  * A single content block, matching the Anthropic content-block wire format.
  * (Was `crate::llm::Block`.)
  */
-export type Block = { type: "text"; text: string } | { type: "tool_use"; id: string; name: string; input: Value } | { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean };
+export type Block = { type: "text"; text: string } | { type: "tool_use"; id: string; name: string; input: Value } | { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean } | { type: "reasoning"; model?: string; id?: string; encrypted_content?: string; summary?: Value[] };
 
 /**
  * Events streamed to the frontend. Tagged + camelCased to match `StreamEvent`

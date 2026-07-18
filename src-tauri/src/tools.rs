@@ -10,16 +10,18 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::tool_names;
+
 pub struct ToolCtx {
     pub workspace: PathBuf,
     /// Launches subagents for the [`Task`] tool. `None` when this run can't spawn
-    /// (plan mode, or a subagent already at the nesting cap) — in which case `task`
-    /// isn't in the registry at all, so this is the runtime backstop rather than
+    /// (plan mode, or a subagent already at the nesting cap) — in which case
+    /// `delegate_task` isn't in the registry at all, so this is the runtime backstop rather than
     /// the primary guard. Implemented by the agent runtime so tools never depend on
     /// the agent loop internals; they only know this trait.
     pub spawner: Option<Arc<dyn Spawner>>,
-    /// Adopts a `shell` command launched in the background (`shell` with
-    /// `background: true`). `None` when this run can't background — the tool then
+    /// Adopts a `run_command` call launched with `background: true`. `None` when
+    /// this run can't background — the tool then
     /// reports that background mode is unavailable rather than blocking.
     pub background: Option<Arc<dyn BackgroundRunner>>,
 }
@@ -36,7 +38,7 @@ impl ToolCtx {
     }
 }
 
-/// What the `shell` tool needs to launch a long-running command in the background,
+/// What `run_command` needs to launch a long-running command in the background,
 /// without knowing how a run is wired. Implemented by `agent::BackgroundLauncher`,
 /// which owns the process lifecycle: it waits for the child off-thread, reports
 /// start/finish via stream events, and lets a session Stop kill it. The tool
@@ -72,7 +74,7 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &'static str;
     fn input_schema(&self) -> Value;
 
-    /// Mutating tools (write / edit / shell) go through the permission gate.
+    /// Mutating tools (write / edit / command) go through the permission gate.
     fn mutating(&self) -> bool {
         false
     }
@@ -92,7 +94,7 @@ pub trait Tool: Send + Sync {
     /// A pre-apply preview of the change as a unified diff, shown in the
     /// permission prompt BEFORE the tool runs. `None` (the default) means there
     /// is nothing to preview — read-only tools, or a mutating tool whose change
-    /// can't be diffed (e.g. shell). A file tool computes the proposed new
+    /// can't be diffed (e.g. `run_command`). A file tool computes the proposed new
     /// content WITHOUT writing it, so the diff shown is exactly what `run` would
     /// apply (they share the same logic — see `compute_edit`).
     async fn preview(&self, _input: &Value, _ctx: &ToolCtx) -> Option<String> {
@@ -120,7 +122,7 @@ impl Registry {
             .iter()
             .map(|t| {
                 json!({
-                    "name": t.name(),
+                    "name": tool_names::canonical(t.name()),
                     "description": t.description(),
                     "input_schema": t.input_schema(),
                 })
@@ -129,9 +131,10 @@ impl Registry {
     }
 
     pub fn find(&self, name: &str) -> Option<&dyn Tool> {
+        let canonical = tool_names::canonical(name);
         self.tools
             .iter()
-            .find(|t| t.name() == name)
+            .find(|t| tool_names::canonical(t.name()) == canonical)
             .map(|b| b.as_ref())
     }
 }
@@ -149,10 +152,10 @@ pub fn default_registry() -> Registry {
     ])
 }
 
-/// The tool set handed to a subagent: the full interactive set, plus the `task`
+/// The tool set handed to a subagent: the full interactive set, plus `delegate_task`
 /// tool only when the subagent may still spawn its own children (`can_spawn`).
 /// At the maximum nesting depth `can_spawn` is false, so a leaf subagent is never
-/// even offered `task` — the depth cap is enforced by omission here, with the
+/// even offered `delegate_task` — the depth cap is enforced by omission here, with the
 /// spawner refusing as a backstop.
 pub fn subagent_registry(can_spawn: bool) -> Registry {
     let mut tools: Vec<Box<dyn Tool>> = vec![
@@ -170,7 +173,7 @@ pub fn subagent_registry(can_spawn: bool) -> Registry {
     Registry::new(tools)
 }
 
-/// The read-only subset of the default registry — no `fs_write`/`fs_edit`/`shell`.
+/// The read-only subset of the default registry — no write/edit/command tools.
 /// Plan mode hands the agent this set so it can inspect the workspace but never
 /// mutate it (defense-in-depth with the permission gate, which also denies every
 /// mutating tool in plan mode).
@@ -342,7 +345,7 @@ struct FsRead;
 #[async_trait]
 impl Tool for FsRead {
     fn name(&self) -> &'static str {
-        "fs_read"
+        tool_names::READ_FILE
     }
     fn description(&self) -> &'static str {
         "Read a UTF-8 text file from the workspace and return its contents."
@@ -372,7 +375,7 @@ struct ListDir;
 #[async_trait]
 impl Tool for ListDir {
     fn name(&self) -> &'static str {
-        "list"
+        tool_names::LIST_DIRECTORY
     }
     fn description(&self) -> &'static str {
         "List files and directories at a path in the workspace (defaults to root)."
@@ -416,7 +419,7 @@ struct GlobTool;
 #[async_trait]
 impl Tool for GlobTool {
     fn name(&self) -> &'static str {
-        "glob"
+        tool_names::FIND_FILES
     }
     fn description(&self) -> &'static str {
         "Find files by glob pattern (e.g. '**/*.rs', 'src/**/*.ts'). Returns matching paths, gitignore-aware."
@@ -461,7 +464,7 @@ impl Tool for GlobTool {
             }
         })
         .await
-        .map_err(|e| format!("glob task failed: {e}"))?
+        .map_err(|e| format!("file search failed: {e}"))?
     }
 }
 
@@ -470,7 +473,7 @@ struct GrepTool;
 #[async_trait]
 impl Tool for GrepTool {
     fn name(&self) -> &'static str {
-        "grep"
+        tool_names::SEARCH_TEXT
     }
     fn description(&self) -> &'static str {
         "Search file contents with a regular expression. Returns 'path:line: text' matches, gitignore-aware."
@@ -532,7 +535,7 @@ impl Tool for GrepTool {
             }
         })
         .await
-        .map_err(|e| format!("grep task failed: {e}"))?
+        .map_err(|e| format!("text search failed: {e}"))?
     }
 }
 
@@ -543,7 +546,7 @@ struct FsWrite;
 #[async_trait]
 impl Tool for FsWrite {
     fn name(&self) -> &'static str {
-        "fs_write"
+        tool_names::WRITE_FILE
     }
     fn description(&self) -> &'static str {
         "Create or overwrite a file with the given contents. Parent directories are created as needed."
@@ -627,7 +630,7 @@ struct FsEdit;
 #[async_trait]
 impl Tool for FsEdit {
     fn name(&self) -> &'static str {
-        "fs_edit"
+        tool_names::EDIT_FILE
     }
     fn description(&self) -> &'static str {
         "Replace an exact string in a file. 'old_string' must appear exactly once unless 'replace_all' is true."
@@ -766,7 +769,7 @@ pub(crate) fn format_shell_output(out: &std::process::Output) -> String {
 #[async_trait]
 impl Tool for Shell {
     fn name(&self) -> &'static str {
-        "shell"
+        tool_names::RUN_COMMAND
     }
     fn description(&self) -> &'static str {
         "Run a shell command in the workspace. Defaults to PowerShell (Windows PowerShell 5.1, \
@@ -853,7 +856,7 @@ struct Task;
 #[async_trait]
 impl Tool for Task {
     fn name(&self) -> &'static str {
-        "task"
+        tool_names::DELEGATE_TASK
     }
     fn description(&self) -> &'static str {
         "Launch a subagent to handle a complex, well-scoped task autonomously. The \
@@ -1266,7 +1269,7 @@ mod tests {
             GrepTool.summarize(&json!({ "pattern": "foo" }), &ctx),
             "foo"
         );
-        assert_eq!(FsRead.summarize(&json!({}), &ctx), "fs_read"); // no recognized key → tool name
+        assert_eq!(FsRead.summarize(&json!({}), &ctx), "read_file"); // no recognized key → tool name
     }
 
     /// The tool names a registry advertises to the model, in order — read off
@@ -1283,8 +1286,53 @@ mod tests {
     fn default_registry_exposes_the_standard_tool_set_in_order() {
         assert_eq!(
             spec_names(&default_registry()),
-            ["fs_read", "list", "glob", "grep", "fs_write", "fs_edit", "shell", "task"]
+            [
+                "read_file",
+                "list_directory",
+                "find_files",
+                "search_text",
+                "write_file",
+                "edit_file",
+                "run_command",
+                "delegate_task"
+            ]
         );
+    }
+
+    #[test]
+    fn legacy_names_dispatch_to_their_canonical_tools_without_being_advertised() {
+        let registry = default_registry();
+        let advertised = spec_names(&registry);
+
+        for (legacy, canonical) in tool_names::LEGACY_ALIASES {
+            let resolved = registry
+                .find(legacy)
+                .unwrap_or_else(|| panic!("legacy alias {legacy} must still resolve"));
+            assert_eq!(resolved.name(), canonical);
+            assert!(registry.find(canonical).is_some());
+            assert!(
+                !advertised.iter().any(|name| name == legacy),
+                "legacy alias {legacy} leaked into the model-facing specs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_alias_dispatch_executes_the_canonical_implementation() {
+        let workspace = unique_temp_dir("legacy_alias_dispatch");
+        std::fs::write(workspace.join("hello.txt"), "hello from the alias").unwrap();
+        let ctx = ToolCtx::new(workspace.clone());
+        let registry = default_registry();
+
+        let output = registry
+            .find("fs_read")
+            .expect("the legacy read alias resolves")
+            .run(json!({ "path": "hello.txt" }), &ctx)
+            .await
+            .expect("the resolved canonical tool runs");
+
+        assert_eq!(output, "hello from the alias");
+        std::fs::remove_dir_all(workspace).ok();
     }
 
     #[test]
@@ -1293,12 +1341,29 @@ mod tests {
         // out further; a leaf subagent (at the cap) is never even offered `task`.
         assert_eq!(
             spec_names(&subagent_registry(true)),
-            ["fs_read", "list", "glob", "grep", "fs_write", "fs_edit", "shell", "task"]
+            [
+                "read_file",
+                "list_directory",
+                "find_files",
+                "search_text",
+                "write_file",
+                "edit_file",
+                "run_command",
+                "delegate_task"
+            ]
         );
         let leaf = subagent_registry(false);
         assert_eq!(
             spec_names(&leaf),
-            ["fs_read", "list", "glob", "grep", "fs_write", "fs_edit", "shell"]
+            [
+                "read_file",
+                "list_directory",
+                "find_files",
+                "search_text",
+                "write_file",
+                "edit_file",
+                "run_command"
+            ]
         );
         assert!(
             leaf.find("task").is_none(),
@@ -1410,8 +1475,18 @@ mod tests {
     fn read_only_registry_omits_every_mutating_tool() {
         // Plan mode's tool set: the read-only tools only — no fs_write/fs_edit/shell.
         let reg = read_only_registry();
-        assert_eq!(spec_names(&reg), ["fs_read", "list", "glob", "grep"]);
-        for mutating in ["fs_write", "fs_edit", "shell"] {
+        assert_eq!(
+            spec_names(&reg),
+            ["read_file", "list_directory", "find_files", "search_text"]
+        );
+        for mutating in [
+            "write_file",
+            "edit_file",
+            "run_command",
+            "fs_write",
+            "fs_edit",
+            "shell",
+        ] {
             assert!(
                 reg.find(mutating).is_none(),
                 "{mutating} must not be in the read-only registry"
@@ -1426,7 +1501,7 @@ mod tests {
         // mutating ones entirely. The agent loop never changes — only the set
         // of tools it is handed does.
         let reg = Registry::new(vec![Box::new(FsRead), Box::new(ListDir)]);
-        assert_eq!(spec_names(&reg), ["fs_read", "list"]);
+        assert_eq!(spec_names(&reg), ["read_file", "list_directory"]);
         assert!(reg.find("fs_read").is_some());
         assert!(
             reg.find("fs_write").is_none(),

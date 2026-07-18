@@ -39,8 +39,9 @@
 ## 1. The core architectural decision: the phone is a REMOTE CLIENT, not the app
 
 The desktop app (`src-tauri`) runs the agent locally: the LLM client (`llm.rs`),
-the agent loop (`agent.rs`), the **tools** (`tools.rs` — `fs_read/write/edit`,
-`glob`, `grep`, **`shell`** running PowerShell), and `keyring` secrets. **None of
+the agent loop (`agent.rs`), the **tools** (`tools.rs` — `read_file`, `write_file`,
+`edit_file`, `find_files`, `search_text`, and **`run_command`** running PowerShell), and
+`keyring` secrets. **None of
 that belongs on a phone:** there's no workspace, no PowerShell, no API key on the
 device, and shipping the shell/file tools in a mobile binary is wrong + a security
 smell. The phone should **only** speak the sync _client_ side of the protocol and

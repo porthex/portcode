@@ -1,9 +1,9 @@
 //! LLM message/event types, the [`LlmProvider`] trait seam, and the Anthropic
 //! streaming client.
 //!
-//! Portcode is Claude-first: `AnthropicProvider` is the only implementation
-//! today. The agent loop depends only on the [`LlmProvider`] trait, so other
-//! model providers slot in (the "any model" goal) by adding an impl + a
+//! The agent loop depends only on the [`LlmProvider`] trait. Anthropic Messages
+//! and OpenAI Responses map into the same neutral turn vocabulary; additional
+//! providers slot in by adding an impl + a
 //! [`provider_for`] arm — without touching the loop.
 //!
 //! `Block`/`ChatMessage` are serialized directly into the Anthropic Messages
@@ -13,6 +13,7 @@
 
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +23,7 @@ use futures_util::StreamExt;
 
 use crate::events::EventSink;
 use crate::secrets::Credential;
+use crate::tool_names;
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
@@ -50,6 +52,7 @@ fn build_system(cred: &Credential, system: &str) -> Value {
             { "type": "text", "text": system },
         ]),
         Credential::ApiKey(_) => Value::String(system.to_string()),
+        Credential::OpenAiOAuth(_) => Value::String(system.to_string()),
     }
 }
 
@@ -187,6 +190,7 @@ impl TurnBuilder {
             Some("content_block_stop") => match self.current.take() {
                 Some(Building::Text(s)) => self.blocks.push(Block::Text { text: s }),
                 Some(Building::Tool { id, name, json }) => {
+                    let name = tool_names::canonical(&name).to_string();
                     let input: Value = if json.trim().is_empty() {
                         json!({})
                     } else {
@@ -288,6 +292,9 @@ pub async fn stream_turn(
         Credential::OAuth(tokens) => req
             .header("authorization", format!("Bearer {}", tokens.access_token))
             .header("anthropic-beta", OAUTH_BETA),
+        Credential::OpenAiOAuth(_) => {
+            return Err("An OpenAI credential cannot authenticate an Anthropic request.".into())
+        }
     };
 
     let resp = req
@@ -353,7 +360,7 @@ pub async fn stream_turn(
 
 /// The LLM provider seam. The agent loop depends only on this trait, so adding a
 /// model provider means adding an `impl` + a [`provider_for`] arm — the loop
-/// itself never changes. `AnthropicProvider` is the only provider today.
+/// itself never changes.
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     /// Stream one assistant turn — same contract as [`stream_turn`]: emits
@@ -365,6 +372,7 @@ pub trait LlmProvider: Send + Sync {
         http: &reqwest::Client,
         cred: &Credential,
         model: &str,
+        reasoning_effort: &str,
         system: &str,
         messages: &[ChatMessage],
         tools: &[Value],
@@ -389,6 +397,7 @@ impl LlmProvider for AnthropicProvider {
         http: &reqwest::Client,
         cred: &Credential,
         model: &str,
+        _reasoning_effort: &str,
         system: &str,
         messages: &[ChatMessage],
         tools: &[Value],
@@ -403,15 +412,452 @@ impl LlmProvider for AnthropicProvider {
     }
 }
 
+fn openai_input(messages: &[ChatMessage], model: &str) -> Vec<Value> {
+    let mut input = Vec::new();
+    for message in messages {
+        for block in &message.content {
+            match block {
+                Block::Text { text } => input.push(json!({
+                    "type": "message",
+                    "role": message.role,
+                    "content": [{
+                        "type": if message.role == "assistant" { "output_text" } else { "input_text" },
+                        "text": text,
+                    }],
+                })),
+                Block::ToolUse { id, name, input: arguments } => input.push(json!({
+                    "type": "function_call",
+                    "call_id": id,
+                    "name": name,
+                    "arguments": serde_json::to_string(arguments).unwrap_or_else(|_| "{}".into()),
+                })),
+                Block::ToolResult { tool_use_id, content, .. } => input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": tool_use_id,
+                    "output": content,
+                })),
+                Block::Reasoning {
+                    model: source_model,
+                    id,
+                    encrypted_content,
+                    summary,
+                } => {
+                    if source_model
+                        .as_deref()
+                        .is_some_and(|source| source != model)
+                    {
+                        continue;
+                    }
+                    let mut item = json!({ "type": "reasoning", "summary": summary });
+                    if let Some(id) = id {
+                        item["id"] = Value::String(id.clone());
+                    }
+                    if let Some(encrypted) = encrypted_content {
+                        item["encrypted_content"] = Value::String(encrypted.clone());
+                    }
+                    input.push(item);
+                }
+            }
+        }
+    }
+    input
+}
+
+fn openai_tools(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .filter_map(|tool| {
+            let name = tool["name"].as_str()?;
+            Some(json!({
+                "type": "function",
+                "name": name,
+                "description": tool["description"].as_str().unwrap_or(""),
+                "parameters": tool.get("input_schema").cloned().unwrap_or_else(|| json!({"type":"object"})),
+                "strict": false,
+            }))
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct OpenAiFunction {
+    name: String,
+    arguments: String,
+}
+
+struct OpenAiTurnBuilder {
+    model: String,
+    blocks: Vec<Block>,
+    text: String,
+    functions: HashMap<String, OpenAiFunction>,
+    emitted_calls: HashSet<String>,
+    input_tokens: u32,
+    output_tokens: u32,
+    completed: bool,
+    cancelled: bool,
+}
+
+impl OpenAiTurnBuilder {
+    fn new(model: &str) -> Self {
+        Self {
+            model: model.into(),
+            blocks: Vec::new(),
+            text: String::new(),
+            functions: HashMap::new(),
+            emitted_calls: HashSet::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            completed: false,
+            cancelled: false,
+        }
+    }
+
+    fn flush_text(&mut self) {
+        if !self.text.is_empty() {
+            self.blocks.push(Block::Text {
+                text: std::mem::take(&mut self.text),
+            });
+        }
+    }
+
+    fn finish_function(&mut self, item: &Value) -> Option<StreamEvent> {
+        let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
+        if call_id.is_empty() || !self.emitted_calls.insert(call_id.clone()) {
+            return None;
+        }
+        let item_id = item["id"].as_str().unwrap_or(&call_id);
+        let partial = self.functions.remove(item_id).unwrap_or_default();
+        let name = item["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&partial.name)
+            .to_string();
+        let name = tool_names::canonical(&name).to_string();
+        // output_item.done is canonical. Use its complete arguments when present;
+        // deltas are only a fallback, so fragments can never be appended twice.
+        let arguments = item["arguments"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&partial.arguments);
+        let parsed = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+        self.flush_text();
+        self.blocks.push(Block::ToolUse {
+            id: call_id.clone(),
+            name: name.clone(),
+            input: parsed.clone(),
+        });
+        Some(StreamEvent::ToolUse {
+            id: call_id,
+            name,
+            input: parsed,
+        })
+    }
+
+    fn process(&mut self, data: &str) -> Result<Vec<StreamEvent>, String> {
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            return Ok(Vec::new());
+        }
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            return Ok(Vec::new());
+        };
+        let mut emitted = Vec::new();
+        match event["type"].as_str() {
+            Some("response.output_text.delta") => {
+                if let Some(delta) = event["delta"].as_str() {
+                    self.text.push_str(delta);
+                    emitted.push(StreamEvent::TextDelta { text: delta.into() });
+                }
+            }
+            Some("response.output_item.added") => {
+                let item = &event["item"];
+                if item["type"].as_str() == Some("function_call") {
+                    let key = item["id"]
+                        .as_str()
+                        .or_else(|| item["call_id"].as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    self.functions.insert(
+                        key,
+                        OpenAiFunction {
+                            name: item["name"].as_str().unwrap_or_default().into(),
+                            arguments: item["arguments"].as_str().unwrap_or_default().into(),
+                        },
+                    );
+                }
+            }
+            Some("response.function_call_arguments.delta") => {
+                if let (Some(item_id), Some(delta)) =
+                    (event["item_id"].as_str(), event["delta"].as_str())
+                {
+                    self.functions
+                        .entry(item_id.into())
+                        .or_default()
+                        .arguments
+                        .push_str(delta);
+                }
+            }
+            Some("response.output_item.done") => {
+                let item = &event["item"];
+                match item["type"].as_str() {
+                    Some("function_call") => {
+                        if let Some(tool) = self.finish_function(item) {
+                            emitted.push(tool);
+                        }
+                    }
+                    Some("reasoning") => {
+                        self.flush_text();
+                        self.blocks.push(Block::Reasoning {
+                            model: Some(self.model.clone()),
+                            id: item["id"].as_str().map(str::to_string),
+                            encrypted_content: item["encrypted_content"]
+                                .as_str()
+                                .map(str::to_string),
+                            summary: item["summary"].as_array().cloned().unwrap_or_default(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Some("response.completed") => {
+                self.completed = true;
+                let usage = &event["response"]["usage"];
+                self.input_tokens = usage["input_tokens"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    .min(u32::MAX as u64) as u32;
+                self.output_tokens = usage["output_tokens"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    .min(u32::MAX as u64) as u32;
+            }
+            Some("response.failed") | Some("response.incomplete") => {
+                let message = event["response"]["error"]["message"]
+                    .as_str()
+                    .or_else(|| event["response"]["incomplete_details"]["reason"].as_str())
+                    .unwrap_or("OpenAI response did not complete.");
+                return Err(message.into());
+            }
+            Some("error") => {
+                return Err(event["message"]
+                    .as_str()
+                    .or_else(|| event["error"]["message"].as_str())
+                    .unwrap_or("Unknown OpenAI streaming error.")
+                    .into())
+            }
+            _ => {}
+        }
+        Ok(emitted)
+    }
+
+    fn finish(mut self) -> Result<TurnResult, String> {
+        if !self.completed && !self.cancelled {
+            return Err(
+                "The OpenAI response stream ended before response.completed. Please try again."
+                    .into(),
+            );
+        }
+        self.flush_text();
+        let has_tools = self
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::ToolUse { .. }));
+        Ok(TurnResult {
+            content: self.blocks,
+            stop_reason: if self.cancelled {
+                "cancelled"
+            } else if has_tools {
+                "tool_use"
+            } else {
+                "end_turn"
+            }
+            .into(),
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+        })
+    }
+}
+
+/// `AtomicBool` has no wake mechanism, so poll it briefly while network I/O is
+/// pending. This keeps Stop responsive without changing the shared cancellation
+/// type used by the agent loop.
+async fn wait_for_cancellation(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+pub struct OpenAiProvider;
+
+#[async_trait]
+impl LlmProvider for OpenAiProvider {
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_turn(
+        &self,
+        http: &reqwest::Client,
+        cred: &Credential,
+        model: &str,
+        reasoning_effort: &str,
+        system: &str,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        sink: &dyn EventSink,
+        channel: &str,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<TurnResult, String> {
+        let Credential::OpenAiOAuth(tokens) = cred else {
+            return Err("OpenAI subscription inference requires ChatGPT sign-in.".into());
+        };
+        if model.trim().is_empty() {
+            return Err("Select an OpenAI model before sending a message.".into());
+        }
+        let reasoning_effort = if reasoning_effort.trim().is_empty() {
+            "medium"
+        } else {
+            reasoning_effort
+        };
+        let body = json!({
+            "model": model,
+            "instructions": system,
+            "input": openai_input(messages, model),
+            "tools": openai_tools(tools),
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "reasoning": { "effort": reasoning_effort },
+            "store": false,
+            "stream": true,
+            "include": ["reasoning.encrypted_content"],
+        });
+        let mut request = http
+            .post("https://chatgpt.com/backend-api/codex/responses")
+            .header("authorization", format!("Bearer {}", tokens.access_token))
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .header("originator", "portcode")
+            .header(
+                "user-agent",
+                concat!("Portcode/", env!("CARGO_PKG_VERSION")),
+            );
+        if let Some(account_id) = &tokens.account_id {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        if tokens.is_fedramp {
+            request = request.header("X-OpenAI-Fedramp", "true");
+        }
+        let mut builder = OpenAiTurnBuilder::new(model);
+        let response = tokio::select! {
+            biased;
+            _ = wait_for_cancellation(cancel) => {
+                builder.cancelled = true;
+                return builder.finish();
+            }
+            response = tokio::time::timeout(
+                Duration::from_secs(30),
+                request.json(&body).send(),
+            ) => response
+                .map_err(|_| "OpenAI request timed out before streaming began.".to_string())?
+                .map_err(|e| format!("OpenAI request failed: {e}"))?,
+        };
+        if !response.status().is_success() {
+            let status = response.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                return Err("OpenAI response authentication failed (401).".into());
+            }
+            let error = tokio::select! {
+                biased;
+                _ = wait_for_cancellation(cancel) => {
+                    builder.cancelled = true;
+                    return builder.finish();
+                }
+                error = response.json::<Value>() => error,
+            };
+            let message = error
+                .ok()
+                .and_then(|value| value["error"]["message"].as_str().map(str::to_string))
+                .unwrap_or_else(|| "request rejected".into());
+            return Err(format!("OpenAI response error ({status}): {message}"));
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut buffer = Vec::new();
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                builder.cancelled = true;
+                break;
+            }
+            let next = tokio::select! {
+                biased;
+                _ = wait_for_cancellation(cancel) => {
+                    builder.cancelled = true;
+                    break;
+                }
+                next = tokio::time::timeout(Duration::from_secs(120), stream.next()) => {
+                    next.map_err(|_| {
+                        "OpenAI stream stalled for 120 seconds. Please try again.".to_string()
+                    })?
+                }
+            };
+            let Some(chunk) = next else { break };
+            buffer.extend_from_slice(&chunk.map_err(|e| format!("OpenAI stream error: {e}"))?);
+            if buffer.len() > 1024 * 1024 {
+                return Err(
+                    "OpenAI sent an SSE frame larger than 1 MiB; the turn was aborted.".into(),
+                );
+            }
+            while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=end).collect();
+                let line = String::from_utf8_lossy(&line);
+                if let Some(data) = line.trim().strip_prefix("data:") {
+                    for event in builder.process(data)? {
+                        sink.emit(channel, event);
+                    }
+                }
+            }
+        }
+        if !buffer.is_empty() {
+            let line = String::from_utf8_lossy(&buffer);
+            if let Some(data) = line.trim().strip_prefix("data:") {
+                for event in builder.process(data)? {
+                    sink.emit(channel, event);
+                }
+            }
+        }
+        builder.finish()
+    }
+}
+
 /// Resolve the provider named by `settings.provider`. An unknown name fails the
 /// run with a clear message instead of silently defaulting to Anthropic, so a
 /// mis-set provider surfaces immediately rather than producing confusing calls.
 pub fn provider_for(name: &str) -> Result<Box<dyn LlmProvider>, String> {
     match name {
         "anthropic" => Ok(Box::new(AnthropicProvider)),
+        "openai" => Ok(Box::new(OpenAiProvider)),
         other => Err(format!(
-            "Unknown LLM provider '{other}'. Portcode currently supports: anthropic."
+            "Unknown LLM provider '{other}'. Portcode currently supports: anthropic, openai."
         )),
+    }
+}
+
+/// Infer the provider from the selected model. Unknown model slugs fail closed
+/// instead of falling back to a separately configured provider, which could
+/// otherwise route a request (and its credentials) to the wrong service.
+pub fn provider_name_for_model(model: &str) -> Result<&'static str, String> {
+    if model.starts_with("claude-") {
+        Ok("anthropic")
+    } else if model.starts_with("gpt-")
+        || model.starts_with("codex-")
+        || model.starts_with("openai-")
+        || model
+            .strip_prefix('o')
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|digit| digit.is_ascii_digit())
+    {
+        Ok("openai")
+    } else {
+        Err(format!(
+            "Cannot determine the LLM provider for model '{model}'. Select a recognized Claude or OpenAI model."
+        ))
     }
 }
 
@@ -428,6 +874,20 @@ mod tests {
             email: None,
             plan: None,
         })
+    }
+
+    #[tokio::test]
+    async fn cancellation_wait_observes_a_later_stop_signal() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&cancel);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            trigger.store(true, Ordering::Relaxed);
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), wait_for_cancellation(&cancel))
+            .await
+            .expect("cancellation polling should release pending OpenAI I/O");
     }
 
     #[test]
@@ -453,23 +913,173 @@ mod tests {
     }
 
     #[test]
-    fn provider_for_resolves_anthropic_and_rejects_unknown() {
-        // The only implemented provider resolves; anything else fails loudly,
-        // and the message names both the bad id and the supported one.
+    fn provider_for_resolves_both_and_rejects_unknown() {
         assert!(provider_for("anthropic").is_ok());
+        assert!(provider_for("openai").is_ok());
         // Extract the error without `unwrap_err()` — that requires the `Ok` type
         // (`Box<dyn LlmProvider>`) to be `Debug`, which a trait object is not.
-        let Err(err) = provider_for("openai") else {
+        let Err(err) = provider_for("other") else {
             panic!("an unknown provider must not resolve");
         };
         assert!(
-            err.contains("openai"),
+            err.contains("other"),
             "error should name the bad provider: {err}"
         );
         assert!(
             err.contains("anthropic"),
             "error should name the supported provider: {err}"
         );
+    }
+
+    #[test]
+    fn selected_model_determines_provider() {
+        assert_eq!(
+            provider_name_for_model("gpt-5.3-codex").expect("GPT models resolve to OpenAI"),
+            "openai"
+        );
+        assert_eq!(
+            provider_name_for_model("o3").expect("reasoning models resolve to OpenAI"),
+            "openai"
+        );
+        assert_eq!(
+            provider_name_for_model("claude-opus-4-8").expect("Claude models resolve to Anthropic"),
+            "anthropic"
+        );
+    }
+
+    #[test]
+    fn unknown_model_provider_fails_closed() {
+        let err = provider_name_for_model("custom-model")
+            .expect_err("an unknown model must not inherit another provider");
+        assert!(
+            err.contains("custom-model"),
+            "error should name the unrecognized model: {err}"
+        );
+        assert!(
+            err.contains("recognized Claude or OpenAI model"),
+            "error should explain how to recover: {err}"
+        );
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn openai_receives_only_the_registrys_canonical_tool_names() {
+        let registry = crate::tools::default_registry();
+        let functions = openai_tools(&registry.specs());
+        let advertised: Vec<&str> = functions
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("function name"))
+            .collect();
+
+        assert_eq!(advertised, crate::tool_names::CANONICAL_NAMES);
+        for (legacy, _) in crate::tool_names::LEGACY_ALIASES {
+            assert!(!advertised.contains(&legacy));
+        }
+    }
+
+    #[test]
+    fn openai_request_mapping_preserves_reasoning_and_tool_linkage() {
+        let input = openai_input(
+            &[
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: vec![
+                        Block::Reasoning {
+                            model: Some("gpt-5.3-codex".into()),
+                            id: Some("r1".into()),
+                            encrypted_content: Some("opaque".into()),
+                            summary: Vec::new(),
+                        },
+                        Block::ToolUse {
+                            id: "call_1".into(),
+                            name: "read_file".into(),
+                            input: json!({"path":"a"}),
+                        },
+                    ],
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: vec![Block::ToolResult {
+                        tool_use_id: "call_1".into(),
+                        content: "ok".into(),
+                        is_error: false,
+                    }],
+                },
+            ],
+            "gpt-5.3-codex",
+        );
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["encrypted_content"], "opaque");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call_1");
+
+        let switched = openai_input(
+            &[ChatMessage {
+                role: "assistant".into(),
+                content: vec![Block::Reasoning {
+                    model: Some("gpt-5.3-codex".into()),
+                    id: Some("r1".into()),
+                    encrypted_content: Some("opaque".into()),
+                    summary: Vec::new(),
+                }],
+            }],
+            "gpt-5.6-sol",
+        );
+        assert!(
+            switched.is_empty(),
+            "model-specific reasoning is not replayed after a switch"
+        );
+    }
+
+    #[test]
+    fn openai_parser_emits_canonical_tool_once_and_requires_completion() {
+        let mut builder = OpenAiTurnBuilder::new("gpt-5.3-codex");
+        builder
+            .process(r#"{"type":"response.function_call_arguments.delta","item_id":"item_1","delta":"{\"path\":\"a\"}"}"#)
+            .unwrap();
+        let events = builder
+            .process(r#"{"type":"response.output_item.done","item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"fs_read","arguments":"{\"path\":\"a\"}"}}"#)
+            .unwrap();
+        assert_eq!(
+            events,
+            [StreamEvent::ToolUse {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                input: json!({ "path": "a" }),
+            }]
+        );
+        assert!(builder
+            .process(r#"{"type":"response.output_item.done","item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"fs_read","arguments":"{}"}}"#)
+            .unwrap()
+            .is_empty());
+        builder
+            .process(r#"{"type":"response.completed","response":{"usage":{"input_tokens":9,"output_tokens":4}}}"#)
+            .unwrap();
+        let result = builder.finish().unwrap();
+        assert_eq!(result.stop_reason, "tool_use");
+        assert_eq!(result.input_tokens, 9);
+        assert_eq!(result.output_tokens, 4);
+        match &result.content[0] {
+            Block::ToolUse { id, name, input } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "read_file");
+                assert_eq!(input, &json!({"path":"a"}));
+            }
+            other => panic!("expected tool use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_parser_rejects_truncated_stream() {
+        let mut builder = OpenAiTurnBuilder::new("gpt-5.3-codex");
+        builder
+            .process(r#"{"type":"response.output_text.delta","delta":"partial"}"#)
+            .unwrap();
+        assert!(builder
+            .finish()
+            .expect_err("must reject truncation")
+            .contains("response.completed"));
     }
 
     // ---- TurnBuilder: the SSE event → turn state machine ----------------------
@@ -524,7 +1134,7 @@ mod tests {
     }
 
     #[test]
-    fn assembles_tool_use_block_and_emits_tooluse_event_on_stop() {
+    fn canonicalizes_legacy_tool_alias_in_block_and_stream_event() {
         let (b, events) = drive(&[
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"fs_read"}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
@@ -538,7 +1148,7 @@ mod tests {
             events,
             vec![StreamEvent::ToolUse {
                 id: "toolu_1".into(),
-                name: "fs_read".into(),
+                name: "read_file".into(),
                 input: json!({ "path": "a.txt" }),
             }]
         );
@@ -548,7 +1158,7 @@ mod tests {
         match &result.content[0] {
             Block::ToolUse { id, name, input } => {
                 assert_eq!(id, "toolu_1");
-                assert_eq!(name, "fs_read");
+                assert_eq!(name, "read_file");
                 assert_eq!(input, &json!({ "path": "a.txt" }));
             }
             other => panic!("expected a tool_use block, got {other:?}"),
@@ -565,7 +1175,7 @@ mod tests {
             events,
             vec![StreamEvent::ToolUse {
                 id: "toolu_x".into(),
-                name: "list".into(),
+                name: "list_directory".into(),
                 input: json!({}),
             }]
         );
@@ -688,7 +1298,7 @@ mod tests {
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Let me read it."}}"#,
             r#"{"type":"content_block_stop","index":0}"#,
-            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_2","name":"fs_read"}}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_2","name":"read_file"}}"#,
             r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"x\"}"}}"#,
             r#"{"type":"content_block_stop","index":1}"#,
             r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":15}}"#,
@@ -701,7 +1311,7 @@ mod tests {
                 },
                 StreamEvent::ToolUse {
                     id: "toolu_2".into(),
-                    name: "fs_read".into(),
+                    name: "read_file".into(),
                     input: json!({ "path": "x" }),
                 },
             ]

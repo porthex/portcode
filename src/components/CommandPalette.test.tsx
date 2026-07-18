@@ -3,7 +3,7 @@ import { render, screen, fireEvent } from "@testing-library/react";
 
 import { CommandPalette } from "./CommandPalette";
 import { useStore } from "../store/store";
-import { DEFAULT_SETTINGS, MODELS } from "../types";
+import { ANTHROPIC_MODELS, DEFAULT_SETTINGS, MODELS } from "../types";
 
 // The palette is a thin keyboard-driven view over the real store: each command
 // dispatches a store action, some of which reach the IPC bridge (newSession ->
@@ -17,6 +17,7 @@ vi.mock("../lib/ipc", () => ({
   createSession: vi.fn(),
   getMessages: vi.fn(),
   deleteSession: vi.fn(),
+  updateSessionModel: vi.fn(),
   saveSettings: vi.fn(),
   resolvePermission: vi.fn(),
   openFolder: vi.fn(),
@@ -30,7 +31,8 @@ const m = vi.mocked(ipc);
 const initialState = useStore.getState();
 
 // Fixed (non-model) command count, see CommandPalette.tsx.
-const FIXED_COMMANDS = 4;
+const FIXED_COMMANDS = 5;
+const REMOTE_FIXED_COMMANDS = 4;
 const TOTAL_COMMANDS = FIXED_COMMANDS + MODELS.length;
 
 const open = () => useStore.setState({ showPalette: true });
@@ -53,6 +55,7 @@ beforeEach(() => {
   m.getMessages.mockResolvedValue([]);
   m.createSession.mockResolvedValue(undefined);
   m.deleteSession.mockResolvedValue(undefined);
+  m.updateSessionModel.mockResolvedValue(undefined);
   m.saveSettings.mockImplementation(async (s) => ({ ...DEFAULT_SETTINGS, ...s }));
   m.resolvePermission.mockResolvedValue(undefined);
   m.openFolder.mockResolvedValue(null);
@@ -78,6 +81,32 @@ describe("visibility", () => {
     expect(screen.getByText("Model: Claude Opus 4.8")).toBeInTheDocument();
     // hint labels render for commands that declare one
     expect(screen.getByText("Ctrl+N")).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Command palette" })).not.toHaveTextContent("⌘");
+  });
+
+  it("omits model-changing commands while a turn is running", () => {
+    useStore.setState({ showPalette: true, streaming: true });
+    render(<CommandPalette />);
+
+    expect(commandButtons()).toHaveLength(FIXED_COMMANDS);
+    expect(screen.queryByText("Model: Claude Opus 4.8")).not.toBeInTheDocument();
+  });
+
+  it("omits local model commands when the desktop owns a remote chat", () => {
+    useStore.setState({ showPalette: true, remoteMode: true });
+    render(<CommandPalette />);
+
+    expect(commandButtons()).toHaveLength(REMOTE_FIXED_COMMANDS);
+    expect(screen.queryByText("Model: Claude Opus 4.8")).not.toBeInTheDocument();
+  });
+
+  it("uses the live model catalogue when OpenAI models are unavailable", () => {
+    useStore.setState({ showPalette: true, openAIModels: [] });
+    render(<CommandPalette />);
+
+    expect(commandButtons()).toHaveLength(FIXED_COMMANDS + ANTHROPIC_MODELS.length);
+    expect(screen.getByText("Model: Claude Opus 4.8")).toBeInTheDocument();
+    expect(screen.queryByText(/^Model: GPT/)).not.toBeInTheDocument();
   });
 
   it("gives the search input an accessible name (not just a placeholder)", () => {
@@ -129,7 +158,7 @@ describe("accessibility roles", () => {
 
     // arrowing down moves the active descendant to the next row
     fireEvent.keyDown(el, { key: "ArrowDown" });
-    expect(el).toHaveAttribute("aria-activedescendant", "pc-cmd-files");
+    expect(el).toHaveAttribute("aria-activedescendant", "pc-cmd-review");
   });
 
   it("clears aria-activedescendant when nothing matches", () => {
@@ -359,6 +388,16 @@ describe("running commands", () => {
     fireEvent.click(screen.getByText("Open settings"));
 
     expect(useStore.getState().showSettings).toBe(true);
+    expect(useStore.getState().showPalette).toBe(false);
+  });
+
+  it("opens the workspace-scoped review surface", () => {
+    open();
+    render(<CommandPalette />);
+
+    fireEvent.click(screen.getByText("Open review workspace"));
+
+    expect(useStore.getState().workspaceSurface).toBe("review");
     expect(useStore.getState().showPalette).toBe(false);
   });
 

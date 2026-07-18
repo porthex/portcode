@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook } from "@testing-library/react";
 
 import {
+  MAX_ANIMATED_BACKLOG_CHARS,
   STEP_MS,
   __resetReducedMotionForTests,
   usePrefersReducedMotion,
@@ -125,6 +126,18 @@ describe("useScramble", () => {
     rerender({ e: false });
     expect(result.current.display).toBe("Hello World");
     expect(result.current.scrambleStart).toBe(11);
+  });
+
+  it("caps animation backlog so fast streams never leave seconds of hidden text", () => {
+    const text = `${"word ".repeat(80)}tail`;
+    const { result } = renderHook(() => useScramble(text, true));
+
+    // The first animation frame fast-forwards whole words, leaving at most a
+    // short-line tail for the decorative decode effect.
+    prime();
+    expect(text.length - result.current.display.length).toBeLessThanOrEqual(
+      MAX_ANIMATED_BACKLOG_CHARS,
+    );
   });
 
   it("drops the active word when the text shrinks under it (reset)", () => {

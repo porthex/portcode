@@ -4,12 +4,42 @@ import { useStore } from "../store/store";
 import * as ipc from "../lib/ipc";
 import type { DirEntry } from "../types";
 
+// Directories that are useful occasionally but drown out source navigation in
+// day-to-day work. This is intentionally an allow-list of known generated or
+// implementation-owned names — source-oriented dotfolders such as .agents,
+// .cargo, .claude, .codex, and .github remain visible.
+const GENERATED_DIRECTORY_NAMES = new Set([
+  ".git",
+  ".next",
+  ".nuxt",
+  ".pnpm-store",
+  ".turbo",
+  ".vite",
+  "build",
+  "coverage",
+  "dist",
+  "graphify-out",
+  "node_modules",
+  "out",
+  "target",
+  "web-dist",
+]);
+
+function isGeneratedDirectory(entry: DirEntry): boolean {
+  return entry.isDir && GENERATED_DIRECTORY_NAMES.has(entry.name.toLowerCase());
+}
+
+function visibleEntries(entries: DirEntry[], showGenerated: boolean): DirEntry[] {
+  return showGenerated ? entries : entries.filter((entry) => !isGeneratedDirectory(entry));
+}
+
 export function FileExplorer() {
   const workspace = useStore((s) => s.settings.workspace);
   const openWorkspace = useStore((s) => s.openWorkspace);
   const workspaceError = useStore((s) => s.workspaceError);
   const toggleFiles = useStore((s) => s.toggleFiles);
   const [roots, setRoots] = useState<DirEntry[]>([]);
+  const [showGenerated, setShowGenerated] = useState(false);
   // Roving-tabindex active row: the path of the single treeitem that holds
   // tabIndex 0. Null until the user focuses a row, so the first root keeps the
   // default tab stop. One tab stop into the tree; arrow keys move within it.
@@ -93,7 +123,16 @@ export function FileExplorer() {
 
   // Exactly one treeitem must carry tabIndex 0. Honour an explicit focus choice;
   // otherwise default to the first root so the tree stays keyboard-reachable.
-  const activeRow = activePath ?? roots[0]?.path ?? null;
+  const visibleRoots = visibleEntries(roots, showGenerated);
+  const hiddenRootCount = roots.length - visibleRoots.length;
+  const activeRow = activePath ?? visibleRoots[0]?.path ?? null;
+
+  const toggleGenerated = () => {
+    setShowGenerated((shown) => !shown);
+    // The active row may be one that is about to disappear. Resetting gives the
+    // first visible source row the roving tab stop on the next render.
+    setActivePath(null);
+  };
 
   return (
     <aside
@@ -135,6 +174,28 @@ export function FileExplorer() {
           <span>Couldn’t open folder: {workspaceError}</span>
         </p>
       )}
+      <div className="flex items-center gap-2 border-b border-border/70 px-3.5 py-1 font-mono text-[9px] uppercase tracking-wide text-faint">
+        <span className="min-w-0 flex-1 truncate">
+          {showGenerated
+            ? "Generated visible"
+            : hiddenRootCount > 0
+              ? `${hiddenRootCount} generated hidden`
+              : "Generated hidden"}
+        </span>
+        <button
+          type="button"
+          onClick={toggleGenerated}
+          aria-pressed={showGenerated}
+          aria-label={
+            showGenerated
+              ? "Hide generated and internal folders"
+              : "Show generated and internal folders"
+          }
+          className="rounded px-1.5 py-0.5 text-[9px] text-accent-2 transition-colors hover:bg-accent-2/10 motion-reduce:transition-none"
+        >
+          {showGenerated ? "Hide" : "Show"}
+        </button>
+      </div>
       <div
         ref={treeRef}
         role="tree"
@@ -155,6 +216,18 @@ export function FileExplorer() {
               Open a folder
             </button>
           </div>
+        ) : visibleRoots.length === 0 ? (
+          <div className="px-3 py-6 text-center text-[11px] text-muted">
+            Only generated folders are hidden.
+            <br />
+            <button
+              type="button"
+              onClick={toggleGenerated}
+              className="pc-btn-ghost mt-2 px-2 py-1 text-[11px]"
+            >
+              Show generated folders
+            </button>
+          </div>
         ) : (
           // Key the rendered roots by workspace so a workspace switch remounts
           // every TreeNode, clearing stale open/children state from a prior
@@ -162,13 +235,14 @@ export function FileExplorer() {
           // (not a wrapper <div>) keeps role="tree" the direct parent of the
           // root treeitems, as the ARIA tree pattern requires.
           <Fragment key={workspace ?? "__none__"}>
-            {roots.map((e) => (
+            {visibleRoots.map((e) => (
               <TreeNode
                 key={e.path}
                 entry={e}
                 depth={0}
                 activeRow={activeRow}
                 onActivate={setActivePath}
+                showGenerated={showGenerated}
               />
             ))}
           </Fragment>
@@ -183,11 +257,13 @@ function TreeNode({
   depth,
   activeRow,
   onActivate,
+  showGenerated,
 }: {
   entry: DirEntry;
   depth: number;
   activeRow: string | null;
   onActivate: (path: string) => void;
+  showGenerated: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [children, setChildren] = useState<DirEntry[] | null>(null);
@@ -244,7 +320,12 @@ function TreeNode({
   };
 
   const glyph = entry.isDir ? null : fileGlyph(entry.name);
-  const rowColor = entry.isDir ? "text-fg" : (glyph!.rowClass ?? "text-muted");
+  const generated = isGeneratedDirectory(entry);
+  const rowColor = generated
+    ? "text-faint"
+    : entry.isDir
+      ? "text-fg"
+      : (glyph!.rowClass ?? "text-muted");
 
   return (
     <div>
@@ -256,13 +337,15 @@ function TreeNode({
         data-path={entry.path}
         aria-expanded={entry.isDir ? open : undefined}
         aria-level={depth + 1}
-        aria-label={entry.isDir ? `${entry.name} folder` : entry.name}
+        aria-label={
+          entry.isDir ? `${entry.name} folder${generated ? ", generated" : ""}` : entry.name
+        }
         // Roving tabindex: only the active row is a tab stop; arrow keys move
         // the active row within that single stop.
         tabIndex={activeRow === entry.path ? 0 : -1}
         className={`pc-row--file flex w-full items-center gap-1.5 py-1 pr-2 text-left ${rowColor}`}
         style={{ paddingLeft: 10 + depth * 14 }}
-        title={entry.name}
+        title={generated ? `${entry.name} — generated/internal` : entry.name}
       >
         {entry.isDir ? (
           <span aria-hidden="true" className="w-3 shrink-0 text-[10px] text-faint">
@@ -284,6 +367,14 @@ function TreeNode({
           </span>
         )}
         <span className="truncate">{entry.name}</span>
+        {generated && (
+          <span
+            className="ml-auto shrink-0 rounded border border-border px-1 text-[8px] uppercase tracking-wide text-faint"
+            aria-hidden="true"
+          >
+            generated
+          </span>
+        )}
       </button>
       {/* Smooth expand/collapse via the same grid 0fr->1fr accordion the app uses
           for ToolCall bodies and the file rail (the overflow-hidden child shrinks
@@ -299,14 +390,15 @@ function TreeNode({
             // so AT reports the parent/child level the aria-expanded above implies.
             // Once opened the group persists while collapsed (to animate), so
             // aria-hidden drops it from AT when the directory is closed.
-            <div role="group" aria-hidden={!open || undefined}>
-              {children.map((c) => (
+            <div role="group" aria-hidden={!open || undefined} inert={!open}>
+              {visibleEntries(children, showGenerated).map((c) => (
                 <TreeNode
                   key={c.path}
                   entry={c}
                   depth={depth + 1}
                   activeRow={activeRow}
                   onActivate={onActivate}
+                  showGenerated={showGenerated}
                 />
               ))}
             </div>

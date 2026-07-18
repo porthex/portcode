@@ -10,7 +10,14 @@ import {
   type SidebarRow,
 } from "../lib/sessionView";
 import { useStore } from "../store/store";
-import type { Session, SessionFolder, SessionGroup, SessionSort, SessionStatus } from "../types";
+import {
+  providerForModel,
+  type Session,
+  type SessionFolder,
+  type SessionGroup,
+  type SessionSort,
+  type SessionStatus,
+} from "../types";
 
 const SORT_OPTIONS: { value: SessionSort; label: string }[] = [
   { value: "recent", label: "Recent" },
@@ -61,6 +68,8 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   const setShowSettings = useStore((s) => s.setShowSettings);
   const settings = useStore((s) => s.settings);
   const oauthStatus = useStore((s) => s.oauthStatus);
+  const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
+  const openAIModels = useStore((s) => s.openAIModels);
 
   const sortBy = useStore((s) => s.sortBy);
   const groupBy = useStore((s) => s.groupBy);
@@ -80,12 +89,22 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   const setSidebarCollapsed = useStore((s) => s.setSidebarCollapsed);
 
   const signedInClaude = !!oauthStatus?.signedIn;
-  const authed = signedInClaude || settings.apiKeySet;
-  const authTitle = signedInClaude
-    ? "Signed in with Claude"
-    : settings.apiKeySet
-      ? "API key set"
-      : "Not authenticated";
+  const activeModel = sessions.find((session) => session.id === activeId)?.model ?? settings.model;
+  const activeProvider = providerForModel(activeModel, openAIModels);
+  const signedInOpenAI = !!openAIAuthStatus?.signedIn;
+  const authed =
+    activeProvider === "openai" ? signedInOpenAI : signedInClaude || settings.apiKeySet;
+  const authTitle =
+    activeProvider === "openai"
+      ? signedInOpenAI
+        ? "Signed in with ChatGPT"
+        : "Not signed in with ChatGPT"
+      : signedInClaude
+        ? "Signed in with Claude"
+        : settings.apiKeySet
+          ? "API key set"
+          : "Not authenticated";
+  const authLabel = activeProvider === "openai" ? "OPENAI" : signedInClaude ? "CLAUDE" : "KEY SET";
 
   // Which sort/group popover is open (transient, instance-local). Only one at a time.
   const [menu, setMenu] = useState<"sort" | "group" | null>(null);
@@ -671,52 +690,58 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         </button>
       </div>
 
-      {/* SESSIONS toolbar: label + total count, then New-folder / Sort / Group */}
+      {/* SESSIONS toolbar: keep identity/actions separate from the stateful view
+          controls so long group labels never escape the fixed-width sidebar. */}
       <div className="relative px-3 pb-1.5 pt-1">
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 items-center gap-2">
           <span className="font-mono text-[10.5px] uppercase tracking-[2px] text-faint">
             Sessions
           </span>
           <span className="pc-count" aria-hidden="true">
             {sessions.length}
           </span>
-          <div className="ml-auto flex items-center gap-1.5">
-            {groupBy === "none" && (
-              <button
-                onClick={() => {
-                  setMenu(null);
-                  addFolder();
-                }}
-                aria-label="New folder"
-                title="New folder"
-                className="pc-sess-ctrl"
-              >
-                <NewFolderIcon />
-              </button>
-            )}
+          {groupBy === "none" && (
             <button
-              onClick={() => setMenu((m) => (m === "sort" ? null : "sort"))}
-              aria-haspopup="menu"
-              aria-expanded={menu === "sort"}
-              aria-label={`Sort sessions (${sortLabel})`}
-              title="Sort"
-              className={`pc-sess-ctrl ${menu === "sort" || sortBy !== "recent" ? "pc-sess-ctrl--active" : ""}`}
+              onClick={() => {
+                setMenu(null);
+                addFolder();
+              }}
+              aria-label="New folder"
+              title="New folder"
+              className="pc-sess-ctrl ml-auto"
             >
-              <SortIcon />
-              {sortLabel}
+              <NewFolderIcon />
             </button>
-            <button
-              onClick={() => setMenu((m) => (m === "group" ? null : "group"))}
-              aria-haspopup="menu"
-              aria-expanded={menu === "group"}
-              aria-label={`Group sessions (${groupLabel})`}
-              title="Group"
-              className={`pc-sess-ctrl ${menu === "group" || groupBy !== "none" ? "pc-sess-ctrl--active" : ""}`}
-            >
-              <GroupIcon />
-              {groupLabel}
-            </button>
-          </div>
+          )}
+        </div>
+
+        <div
+          className="mt-1.5 grid min-w-0 grid-cols-2 gap-1.5"
+          role="group"
+          aria-label="Session organization controls"
+        >
+          <button
+            onClick={() => setMenu((m) => (m === "sort" ? null : "sort"))}
+            aria-haspopup="menu"
+            aria-expanded={menu === "sort"}
+            aria-label={`Sort sessions (${sortLabel})`}
+            title="Sort"
+            className={`pc-sess-ctrl pc-sess-ctrl--wide ${menu === "sort" || sortBy !== "recent" ? "pc-sess-ctrl--active" : ""}`}
+          >
+            <SortIcon />
+            <span className="pc-sess-ctrl__label">{sortLabel}</span>
+          </button>
+          <button
+            onClick={() => setMenu((m) => (m === "group" ? null : "group"))}
+            aria-haspopup="menu"
+            aria-expanded={menu === "group"}
+            aria-label={`Group sessions (${groupLabel})`}
+            title="Group"
+            className={`pc-sess-ctrl pc-sess-ctrl--wide ${menu === "group" || groupBy !== "none" ? "pc-sess-ctrl--active" : ""}`}
+          >
+            <GroupIcon />
+            <span className="pc-sess-ctrl__label">{groupLabel}</span>
+          </button>
         </div>
 
         {menu !== null && (
@@ -778,15 +803,15 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
       <div className="border-t border-border p-3">
         <button
           onClick={() => setShowSettings(true)}
+          aria-label="Settings"
+          title="Settings"
           className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-sm text-muted transition-colors hover:bg-panel-2 hover:text-fg"
         >
           <GearIcon />
           Settings
           {authed && (
             <span className="ml-auto flex items-center gap-1.5" title={authTitle}>
-              <span className="font-mono text-[10px] tracking-wide text-success">
-                {signedInClaude ? "CLAUDE" : "KEY SET"}
-              </span>
+              <span className="font-mono text-[10px] tracking-wide text-success">{authLabel}</span>
               <span className="pc-dot pc-dot--ring" aria-hidden="true" />
             </span>
           )}
@@ -821,13 +846,26 @@ function SessionRail() {
   const setSidebarCollapsed = useStore((s) => s.setSidebarCollapsed);
   const settings = useStore((s) => s.settings);
   const oauthStatus = useStore((s) => s.oauthStatus);
+  const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
+  const openAIModels = useStore((s) => s.openAIModels);
+  const activeId = useStore((s) => s.activeId);
 
-  const authed = !!oauthStatus?.signedIn || settings.apiKeySet;
-  const authTitle = oauthStatus?.signedIn
-    ? "Signed in with Claude"
-    : settings.apiKeySet
-      ? "API key set"
-      : "Not authenticated";
+  const activeModel = sessions.find((session) => session.id === activeId)?.model ?? settings.model;
+  const activeProvider = providerForModel(activeModel, openAIModels);
+  const authed =
+    activeProvider === "openai"
+      ? !!openAIAuthStatus?.signedIn
+      : !!oauthStatus?.signedIn || settings.apiKeySet;
+  const authTitle =
+    activeProvider === "openai"
+      ? openAIAuthStatus?.signedIn
+        ? "Signed in with ChatGPT"
+        : "Not signed in with ChatGPT"
+      : oauthStatus?.signedIn
+        ? "Signed in with Claude"
+        : settings.apiKeySet
+          ? "API key set"
+          : "Not authenticated";
 
   return (
     <aside

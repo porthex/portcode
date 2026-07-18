@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 
-import { Composer, PLAN_BANNER_AUTO_DISMISS_MS } from "./Composer";
+import { Composer } from "./Composer";
 import { useStore } from "../store/store";
 import { DEFAULT_SETTINGS, type ComposerPhase, type Session, type Usage } from "../types";
 
@@ -13,8 +13,9 @@ import { DEFAULT_SETTINGS, type ComposerPhase, type Session, type Usage } from "
 vi.mock("../lib/ipc", () => ({
   runAgent: vi.fn(),
   openFolder: vi.fn(),
-  // setSessionModel (via updateSettings) lands here; echo the patch so the
-  // store's updateSettings resolves and commits the new settings.model.
+  // setSessionModel persists the active chat, then updateSettings mirrors it as
+  // the default for future chats.
+  updateSessionModel: vi.fn(),
   saveSettings: vi.fn(),
   saveDraft: vi.fn(),
 }));
@@ -30,9 +31,7 @@ const initial = useStore.getState();
 const sendButton = () => screen.getByTitle("Send (Enter)");
 const stopButton = () => screen.getByTitle("Stop");
 const textarea = () =>
-  screen.getByPlaceholderText(
-    "Describe a task, ask a question, or give an instruction…",
-  ) as HTMLTextAreaElement;
+  screen.getByRole("textbox", { name: "Message Portcode" }) as HTMLTextAreaElement;
 
 // Seed an active session with a draft (drafts are keyed by activeId now).
 const seedDraft = (text: string, id = "a") =>
@@ -41,10 +40,14 @@ const seedDraft = (text: string, id = "a") =>
 beforeEach(() => {
   vi.clearAllMocks();
   useStore.setState(initial, true);
+  // Most composer tests exercise drafting/streaming, not auth. Seed the legacy
+  // Claude API-key path so Send stays available; auth-specific cases override it.
+  useStore.setState({ settings: { ...DEFAULT_SETTINGS, apiKeySet: true } });
   // Default: runAgent resolves to a cancellable handle so `send` starts a turn
   // without ever touching a real backend.
   m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}), dispose: vi.fn() });
   m.openFolder.mockResolvedValue(null);
+  m.updateSessionModel.mockResolvedValue(undefined);
   m.saveSettings.mockImplementation(async (s) => ({ ...DEFAULT_SETTINGS, ...s }));
   m.saveDraft.mockResolvedValue(undefined);
 });
@@ -94,20 +97,25 @@ describe("Composer textarea", () => {
     expect(textarea().value).toBe("pasted from explorer");
   });
 
-  it("is enabled when idle and disabled while a turn is streaming", () => {
+  it("stays editable while a turn streams so the next message can be drafted", () => {
     useStore.setState({ activeId: "a" });
     const { rerender } = render(<Composer />);
-    // Idle (with an active session): keystrokes accepted; not flagged busy to AT.
+    // Idle (with an active session): keystrokes are accepted.
     expect(textarea()).toBeEnabled();
-    expect(textarea()).not.toHaveAttribute("aria-busy", "true");
 
     act(() => {
       useStore.setState({ streaming: true });
     });
     rerender(<Composer />);
-    expect(textarea()).toBeDisabled();
-    // Streaming: AT sees the input as busy for the duration of the turn.
-    expect(textarea()).toHaveAttribute("aria-busy", "true");
+    expect(textarea()).toBeEnabled();
+    expect(textarea()).toHaveAttribute(
+      "placeholder",
+      "Draft your next message while Portcode works…",
+    );
+    // The shell owns the run state; the still-editable textbox is not mislabeled busy.
+    expect(textarea().closest(".pc-neon-frame")).toHaveAttribute("aria-busy", "true");
+    fireEvent.change(textarea(), { target: { value: "next thought" } });
+    expect(useStore.getState().drafts.a).toBe("next thought");
   });
 
   it("disables the input when there is no active session to draft into", () => {
@@ -115,15 +123,18 @@ describe("Composer textarea", () => {
     // field would silently eat keystrokes — disable it instead (honest dead-end).
     render(<Composer />);
     expect(textarea()).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Create or select a chat to start");
+    expect(screen.getByRole("button", { name: "New chat" })).toBeEnabled();
   });
 
-  it("carries the streaming dim on the input itself, not the frame", () => {
+  it("uses a dedicated full-width writing surface with a compliant placeholder", () => {
     render(<Composer />);
     const ta = textarea();
+    expect(ta.className).toContain("pc-composer-textarea");
     expect(ta.className).toContain("disabled:opacity-60");
-    expect(ta.className).toContain("disabled:saturate-[0.6]");
     expect(ta.className).toContain("transition-[height,opacity,filter]");
     expect(ta.className).toContain("motion-reduce:transition-none");
+    expect(ta.className).toContain("placeholder:text-muted");
   });
 
   it("exposes an explicit accessible name (not just the placeholder)", () => {
@@ -369,7 +380,13 @@ describe("Composer send↔stop crossfade", () => {
 
   it("cancels the run on Stop click and clears the streaming flags", async () => {
     const cancel = vi.fn(async () => {});
-    useStore.setState({ streaming: true, cancel });
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: { a: [] },
+      streaming: true,
+      cancel,
+    });
     render(<Composer />);
 
     fireEvent.click(stopButton());
@@ -425,7 +442,7 @@ describe("Composer neon frame (state-bearing)", () => {
 
 describe("Composer presence region", () => {
   const phaseText = (streaming: boolean, phase: ComposerPhase) => {
-    useStore.setState({ streaming, composerPhase: phase });
+    useStore.setState({ activeId: "a", streaming, composerPhase: phase });
     render(<Composer />);
     return screen.getByRole("status").textContent;
   };
@@ -453,20 +470,35 @@ describe("Composer presence region", () => {
     expect(phaseText(true, "stopping")).toContain("stopping…");
   });
 
-  it("names the running tool while a tool_use is active (running <tool>…)", () => {
-    useStore.setState({ streaming: true, composerPhase: "thinking", activeTool: "grep" });
+  it("names the running canonical tool while a tool_use is active", () => {
+    useStore.setState({
+      activeId: "a",
+      streaming: true,
+      composerPhase: "thinking",
+      activeTool: "search_text",
+    });
     render(<Composer />);
-    expect(screen.getByRole("status").textContent).toContain("searching the code…");
+    expect(screen.getByRole("status").textContent).toContain("searching the project…");
   });
 
   it("falls back to a generic 'running <name>…' for an unmapped tool", () => {
-    useStore.setState({ streaming: true, composerPhase: "thinking", activeTool: "mystery_tool" });
+    useStore.setState({
+      activeId: "a",
+      streaming: true,
+      composerPhase: "thinking",
+      activeTool: "mystery_tool",
+    });
     render(<Composer />);
-    expect(screen.getByRole("status").textContent).toContain("running mystery_tool…");
+    expect(screen.getByRole("status").textContent).toContain("running mystery tool…");
   });
 
   it("never shows a residual tool label once streaming ends (streaming-gated)", () => {
-    useStore.setState({ streaming: false, composerPhase: "idle", activeTool: "grep" });
+    useStore.setState({
+      activeId: "a",
+      streaming: false,
+      composerPhase: "idle",
+      activeTool: "grep",
+    });
     render(<Composer />);
     expect(screen.getByRole("status").textContent).toContain("ready when you are");
   });
@@ -474,65 +506,88 @@ describe("Composer presence region", () => {
   it("shows the generic 'thinking with you…' (not a tool) outside the thinking phase", () => {
     // An observed turn can be streaming with a stale activeTool while the phase is
     // still idle; the phase gate keeps the tool label from surfacing wrongly.
-    useStore.setState({ streaming: true, composerPhase: "idle", activeTool: "grep" });
+    useStore.setState({
+      activeId: "a",
+      streaming: true,
+      composerPhase: "idle",
+      activeTool: "grep",
+    });
     render(<Composer />);
     const status = screen.getByRole("status").textContent;
     expect(status).toContain("thinking with you…");
-    expect(status).not.toContain("searching the code…");
+    expect(status).not.toContain("searching the project…");
   });
 
-  it("shows the honest Shift+Enter hint only when the draft is multi-line", () => {
+  it("keeps the keyboard contract discoverable and switches to drafting guidance while busy", () => {
     seedDraft("one line");
     const { rerender } = render(<Composer />);
-    expect(screen.queryByText("Shift+Enter for a new line")).toBeNull();
+    expect(screen.getByText(/Enter to send · Shift\+Enter for a new line/)).toBeInTheDocument();
 
-    act(() => seedDraft("line one\nline two"));
+    act(() => useStore.setState({ streaming: true }));
     rerender(<Composer />);
-    expect(screen.getByText("Shift+Enter for a new line")).toBeInTheDocument();
+    expect(
+      screen.getByText("Keep drafting · send unlocks when this run finishes"),
+    ).toBeInTheDocument();
   });
 });
 
 describe("Composer UsageMeter", () => {
-  it("shows the active model and presence at rest, with no usage span", () => {
+  it("shows the selected model once and omits usage when the session has none", () => {
+    useStore.setState({ activeId: "a" });
     render(<Composer />);
-    // The static keycap hint is gone — the presence region carries the live status.
     expect(screen.getByRole("status").textContent).toContain("ready when you are");
-    // Default model from DEFAULT_SETTINGS.
-    expect(screen.getByText("claude-opus-4-8")).toBeInTheDocument();
-    // No activeId / no usage -> total is 0 -> token+cost span is omitted.
-    expect(screen.queryByText(/tok$/)).toBeNull();
+    // The model lives in its labeled picker and is no longer repeated in telemetry.
+    expect(screen.getAllByText("Claude Opus 4.8")).toHaveLength(1);
+    expect(screen.queryByRole("group", { name: /Session usage/i })).toBeNull();
   });
 
   it("omits the usage span when an active session has no recorded usage", () => {
     useStore.setState({ activeId: "a" });
     render(<Composer />);
-    expect(screen.queryByText(/tok$/)).toBeNull();
+    expect(screen.queryByRole("group", { name: /Session usage/i })).toBeNull();
   });
 
-  it("shows tokens and a 4-decimal cost for small Opus usage, with tabular-nums", () => {
+  it("labels cumulative session tokens and estimated Opus cost", () => {
     const usage: Usage = { input: 1200, output: 300 };
     useStore.setState({ activeId: "a", usage: { a: usage } });
     render(<Composer />);
 
     // fmtTokens(1500) -> "1.5k"; Opus cost = (1200*5 + 300*25)/1e6 = 0.0135 -> $0.01.
-    expect(screen.getByText("1.5k tok")).toBeInTheDocument();
-    expect(screen.getByText("$0.01")).toBeInTheDocument();
+    expect(screen.getByText("1.5k tokens")).toBeInTheDocument();
+    expect(screen.getByText("$0.01 estimated")).toBeInTheDocument();
+    expect(screen.getByText("Session")).toBeInTheDocument();
     expect(screen.getByTitle("1,200 in · 300 out")).toBeInTheDocument();
-    // tabular-nums (on the usage group span) keeps the counter from reflowing as
-    // digits change width.
-    expect(screen.getByText("1.5k tok").closest("[aria-hidden='true']")?.className).toContain(
-      "tabular-nums",
-    );
+    expect(
+      screen.getByRole("group", {
+        name: /Session usage: 1,500 tokens, 1,200 input and 300 output/i,
+      }),
+    ).toHaveClass("pc-composer-usage");
   });
 
-  it("keeps the per-tick token counter out of the live region (aria-hidden)", () => {
+  it("formats million-scale usage cleanly and names the ChatGPT plan", () => {
+    useStore.setState({
+      sessions: [session({ model: "gpt-5.6-sol" })],
+      activeId: "a",
+      usage: { a: { input: 2_000_000, output: 199_700 } },
+      openAIAuthStatus: { signedIn: true, expiresAt: null, account: null, tier: null },
+    });
+    render(<Composer />);
+
+    expect(screen.getByText("2.2M tokens")).toBeInTheDocument();
+    expect(screen.getByText("ChatGPT plan")).toBeInTheDocument();
+    expect(screen.queryByText("2199.7k tokens")).toBeNull();
+  });
+
+  it("keeps ticking visuals out of the live region but exposes a stable accessible summary", () => {
     useStore.setState({ activeId: "a", usage: { a: { input: 1200, output: 300 } } });
     render(<Composer />);
-    // The ticking numbers must not be announced on every streaming delta — they live
-    // OUTSIDE the role=status region and the number span is aria-hidden.
-    const usageSpan = screen.getByText("1.5k tok").closest("[aria-hidden='true']");
-    expect(usageSpan).not.toBeNull();
-    expect(screen.getByRole("status").textContent).not.toContain("tok");
+
+    const usageGroup = screen.getByRole("group", { name: /Session usage: 1,500 tokens/i });
+    expect(usageGroup.firstElementChild).toHaveAttribute("aria-hidden", "true");
+    expect(screen.getByRole("status").textContent).not.toContain("tokens");
+    expect(usageGroup).toHaveAccessibleName(
+      "Session usage: 1,500 tokens, 1,200 input and 300 output; $0.01 estimated; Claude Opus 4.8",
+    );
   });
 
   it("uses 4 decimals when the cost is below one cent", () => {
@@ -540,12 +595,12 @@ describe("Composer UsageMeter", () => {
     useStore.setState({ activeId: "a", usage: { a: usage } });
     render(<Composer />);
 
-    expect(screen.getByText("100 tok")).toBeInTheDocument();
-    expect(screen.getByText("$0.0005")).toBeInTheDocument();
+    expect(screen.getByText("100 tokens")).toBeInTheDocument();
+    expect(screen.getByText("$0.0005 estimated")).toBeInTheDocument();
     expect(screen.getByTitle("100 in · 0 out")).toBeInTheDocument();
   });
 
-  it("treats an unknown model as free", () => {
+  it("reports unavailable pricing honestly instead of treating an unknown model as free", () => {
     useStore.setState({
       activeId: "a",
       usage: { a: { input: 5000, output: 0 } },
@@ -553,115 +608,97 @@ describe("Composer UsageMeter", () => {
     });
     render(<Composer />);
 
-    expect(screen.getByText("5.0k tok")).toBeInTheDocument();
-    expect(screen.getByText("$0.0000")).toBeInTheDocument();
-    expect(screen.getByText("no-such-model")).toBeInTheDocument();
+    expect(screen.getByText("5.0k tokens")).toBeInTheDocument();
+    expect(screen.getByText("Cost unavailable")).toBeInTheDocument();
+    expect(screen.queryByText("$0.0000")).toBeNull();
+    expect(screen.getByRole("group", { name: /no-such-model/i })).toBeInTheDocument();
   });
 });
 
-describe("Composer permission-mode pill", () => {
-  it("renders the current mode and cycles it on click", async () => {
-    useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "default" } });
+describe("Composer permission dropdown", () => {
+  it("shows every permission mode in clearly separated groups", () => {
     render(<Composer />);
 
-    const pill = screen.getByRole("button", { name: /Permission mode: default/i });
-    expect(pill).toBeInTheDocument();
+    expect(screen.getByText("Access")).toBeInTheDocument();
+    const picker = screen.getByRole("combobox", { name: "Permission mode" });
+    expect(picker).toHaveValue("default");
+    expect(picker).toHaveTextContent("Ask");
 
-    await act(async () => {
-      fireEvent.click(pill);
-    });
-
-    // Cycles default → acceptEdits via updateSettings → saveSettings.
-    expect(m.saveSettings).toHaveBeenCalledWith({ permissionMode: "acceptEdits" });
+    fireEvent.click(picker);
+    expect(screen.getByRole("group", { name: "Standard access" })).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "Elevated access" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Ask" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Edits allowed" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Plan only" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Auto approve" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Bypass confirmations" })).toBeInTheDocument();
   });
 
-  it("is hidden on the phone (remote mode) — the mode is a desktop-side gate setting", () => {
+  it("persists any selected permission mode", async () => {
+    render(<Composer />);
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Permission mode" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("option", { name: "Bypass confirmations" }));
+    });
+
+    expect(m.saveSettings).toHaveBeenCalledWith({ permissionMode: "bypass" });
+    expect(useStore.getState().settings.permissionMode).toBe("bypass");
+  });
+
+  it("is hidden on the phone because permission policy is desktop-owned", () => {
     useStore.setState({ remoteMode: true, settings: { ...DEFAULT_SETTINGS } });
     render(<Composer />);
 
-    expect(screen.queryByRole("button", { name: /Permission mode/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Permission mode" })).not.toBeInTheDocument();
+  });
+
+  it("marks dangerous access and freezes policy changes during a run", () => {
+    useStore.setState({
+      streaming: true,
+      settings: { ...DEFAULT_SETTINGS, permissionMode: "bypass" },
+    });
+    render(<Composer />);
+
+    const picker = screen.getByRole("combobox", { name: "Permission mode" });
+    expect(picker).toHaveTextContent("Bypass confirmations");
+    expect(picker).toHaveAttribute("title", expect.stringContaining("no confirmations"));
+    expect(picker).toHaveClass("pc-permission-select--danger");
+    expect(picker).toBeDisabled();
+  });
+
+  it("removes the plan warning banner while keeping plan state clear in the composer", () => {
+    useStore.setState({
+      activeId: "a",
+      settings: { ...DEFAULT_SETTINGS, apiKeySet: true, permissionMode: "plan" },
+    });
+    render(<Composer />);
+
+    expect(screen.queryByRole("button", { name: /Exit plan mode/i })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Dismiss plan mode notice/i }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Permission mode" })).toHaveTextContent(
+      "Plan only",
+    );
+    expect(textarea()).toHaveAttribute(
+      "placeholder",
+      "Describe what you want planned — files will stay untouched…",
+    );
   });
 });
 
-describe("Composer plan-mode banner", () => {
-  it("shows the banner in plan mode and exits to default on click", async () => {
-    useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "plan" } });
+describe("Composer recovery", () => {
+  it("surfaces setting-save failures where they happened without hiding run status", () => {
+    useStore.setState({ activeId: "a", settingsError: "database is locked" });
     render(<Composer />);
 
-    expect(screen.getByText("Plan mode")).toBeInTheDocument();
-    const exit = screen.getByRole("button", { name: /Exit plan mode/i });
+    expect(screen.getByRole("status")).toHaveTextContent("ready when you are");
+    expect(screen.getByRole("alert")).toHaveTextContent("That setting wasn’t saved");
+    expect(screen.getByRole("alert")).toHaveAttribute("title", "database is locked");
 
-    await act(async () => {
-      fireEvent.click(exit);
-    });
-    expect(m.saveSettings).toHaveBeenCalledWith({ permissionMode: "default" });
-  });
-
-  it("is hidden when not in plan mode", () => {
-    useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "default" } });
-    render(<Composer />);
-
-    expect(screen.queryByRole("button", { name: /Exit plan mode/i })).not.toBeInTheDocument();
-  });
-
-  it("is hidden on the phone even in plan mode", () => {
-    useStore.setState({
-      remoteMode: true,
-      settings: { ...DEFAULT_SETTINGS, permissionMode: "plan" },
-    });
-    render(<Composer />);
-
-    expect(screen.queryByRole("button", { name: /Exit plan mode/i })).not.toBeInTheDocument();
-  });
-
-  it("auto-dismisses the banner after the dwell WITHOUT persisting a mode change", () => {
-    vi.useFakeTimers();
-    try {
-      useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "plan" } });
-      render(<Composer />);
-
-      // Reminder is up on entry.
-      expect(screen.getByText("Plan mode")).toBeInTheDocument();
-
-      // After the dwell it auto-closes — a LOCAL dismiss, so settings are untouched.
-      act(() => vi.advanceTimersByTime(PLAN_BANNER_AUTO_DISMISS_MS));
-      expect(screen.queryByText("Plan mode")).not.toBeInTheDocument();
-      // The persisted permission mode was never changed by the timer.
-      expect(m.saveSettings).not.toHaveBeenCalled();
-      expect(useStore.getState().settings.permissionMode).toBe("plan");
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("dismisses on the ✕ close button without persisting a mode change", () => {
-    useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "plan" } });
-    render(<Composer />);
-
-    expect(screen.getByText("Plan mode")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /Dismiss plan mode notice/i }));
-
-    // The notice is gone, but the persisted mode stays "plan" (no settings save).
-    expect(screen.queryByText("Plan mode")).not.toBeInTheDocument();
-    expect(m.saveSettings).not.toHaveBeenCalled();
-    expect(useStore.getState().settings.permissionMode).toBe("plan");
-  });
-
-  it("re-shows the banner when plan mode is re-entered after a dismiss", () => {
-    useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "plan" } });
-    const { rerender } = render(<Composer />);
-
-    // Dismiss via the ✕ button.
-    fireEvent.click(screen.getByRole("button", { name: /Dismiss plan mode notice/i }));
-    expect(screen.queryByText("Plan mode")).not.toBeInTheDocument();
-
-    // Leave plan mode, then re-enter it — the local dismiss must reset.
-    act(() => useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "default" } }));
-    rerender(<Composer />);
-    act(() => useStore.setState({ settings: { ...DEFAULT_SETTINGS, permissionMode: "plan" } }));
-    rerender(<Composer />);
-
-    expect(screen.getByText("Plan mode")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Review settings" }));
+    expect(useStore.getState().showSettings).toBe(true);
   });
 });
 
@@ -674,12 +711,16 @@ describe("Composer ModelPicker", () => {
     });
     render(<Composer />);
 
-    const picker = screen.getByRole("combobox", { name: "Model" }) as HTMLSelectElement;
-    expect(picker.value).toBe("claude-opus-4-8");
-    // Provider-grouped: the Anthropic <optgroup> wraps the model options.
-    const groups = picker.querySelectorAll("optgroup");
-    expect(groups).toHaveLength(1);
-    expect(groups[0].label).toBe("Anthropic");
+    const picker = screen.getByRole("combobox", { name: "Model" });
+    expect(screen.getByText("Chat model")).toBeInTheDocument();
+    expect(picker).toHaveAttribute("title", "Claude Opus 4.8");
+    expect(picker).toHaveValue("claude-opus-4-8");
+    fireEvent.click(picker);
+    // Provider-grouped inside Portcode's themed listbox (not a native OS popup).
+    expect(screen.getByRole("group", { name: "Anthropic · Claude" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("group", { name: "OpenAI · ChatGPT subscription" }),
+    ).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Claude Sonnet 4.6" })).toBeInTheDocument();
   });
 
@@ -691,9 +732,8 @@ describe("Composer ModelPicker", () => {
     });
     render(<Composer />);
 
-    fireEvent.change(screen.getByRole("combobox", { name: "Model" }), {
-      target: { value: "claude-sonnet-4-6" },
-    });
+    fireEvent.click(screen.getByRole("combobox", { name: "Model" }));
+    fireEvent.click(screen.getByRole("option", { name: "Claude Sonnet 4.6" }));
 
     // setSessionModel updates the session synchronously, then awaits the
     // last-used sync into settings.model (updateSettings -> ipc.saveSettings).
@@ -713,5 +753,124 @@ describe("Composer ModelPicker", () => {
     });
     render(<Composer />);
     expect(screen.getByRole("combobox", { name: "Model" })).toBeDisabled();
+  });
+});
+
+describe("Composer OpenAI auth and reasoning", () => {
+  const openAIModel = {
+    id: "gpt-live",
+    label: "GPT Live",
+    provider: "openai" as const,
+    reasoningEfforts: ["minimal", "high", "ultra"],
+    defaultReasoningEffort: "high",
+  };
+
+  it("blocks signed-out sends and offers a direct ChatGPT recovery action", () => {
+    useStore.setState({
+      sessions: [session({ model: "gpt-live" })],
+      activeId: "a",
+      drafts: { a: "ship it" },
+      openAIModels: [openAIModel],
+      settings: { ...DEFAULT_SETTINGS, provider: "openai", model: "gpt-live" },
+      openAIAuthStatus: null,
+    });
+    render(<Composer />);
+
+    expect(
+      screen.getByRole("button", { name: "Sign in with ChatGPT in Settings to send" }),
+    ).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Sign in with ChatGPT");
+    fireEvent.click(screen.getByRole("button", { name: "Connect ChatGPT" }));
+    expect(useStore.getState().showSettings).toBe(true);
+  });
+
+  it("fails closed and removes OpenAI choices when this build disables the capability", () => {
+    useStore.setState({
+      sessions: [session({ model: "gpt-live" })],
+      activeId: "a",
+      drafts: { a: "ship it" },
+      openAIModels: [],
+      settings: { ...DEFAULT_SETTINGS, provider: "openai", model: "gpt-live" },
+      openAIAuthStatus: {
+        signedIn: false,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: false,
+        unavailableReason: "Disabled in this build",
+      },
+    });
+    render(<Composer />);
+
+    expect(screen.getByRole("button", { name: "Disabled in this build" })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Disabled in this build");
+    expect(screen.getByRole("button", { name: "Open settings" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Model" }));
+    expect(screen.queryByRole("group", { name: /OpenAI/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("group", { name: /Anthropic/ })).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Reasoning level" })).not.toBeInTheDocument();
+  });
+
+  it("enables sends when signed in and renders only advertised reasoning levels", () => {
+    useStore.setState({
+      sessions: [session({ model: "gpt-live" })],
+      activeId: "a",
+      drafts: { a: "ship it" },
+      openAIModels: [openAIModel],
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: "gpt-live",
+        reasoningEffort: "high",
+      },
+      openAIAuthStatus: { signedIn: true, expiresAt: null, account: null, tier: null },
+    });
+    render(<Composer />);
+
+    expect(sendButton()).toBeEnabled();
+    const picker = screen.getByRole("combobox", { name: "Reasoning level" });
+    expect(screen.getByText("Thinking default")).toBeInTheDocument();
+    expect(picker).toHaveAttribute("title", "Default reasoning level across chats");
+    fireEvent.click(picker);
+    expect(screen.getAllByRole("option", { name: /Minimal|High|Ultra/ })).toHaveLength(3);
+    expect(picker).toHaveValue("high");
+  });
+
+  it("keeps remote sends available because subscription auth lives on the desktop", () => {
+    useStore.setState({
+      sessions: [session({ model: "gpt-live" })],
+      activeId: "a",
+      drafts: { a: "remote task" },
+      openAIModels: [openAIModel],
+      settings: { ...DEFAULT_SETTINGS, provider: "openai", model: "gpt-live" },
+      openAIAuthStatus: null,
+      remoteMode: true,
+      remoteConnected: true,
+    });
+    render(<Composer />);
+
+    expect(sendButton()).toBeEnabled();
+    expect(screen.queryByRole("combobox", { name: "Model" })).toBeNull();
+    expect(screen.queryByRole("combobox", { name: "Reasoning level" })).toBeNull();
+  });
+
+  it("does not bypass authentication while remote mode is disconnected", () => {
+    useStore.setState({
+      sessions: [session({ model: "gpt-live" })],
+      activeId: "a",
+      drafts: { a: "remote task" },
+      openAIModels: [openAIModel],
+      settings: { ...DEFAULT_SETTINGS, provider: "openai", model: "gpt-live" },
+      openAIAuthStatus: null,
+      remoteMode: true,
+      remoteConnected: false,
+    });
+    render(<Composer />);
+
+    expect(
+      screen.getByRole("button", { name: "Sign in with ChatGPT in Settings to send" }),
+    ).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Sign in with ChatGPT");
   });
 });

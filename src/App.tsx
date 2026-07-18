@@ -3,7 +3,9 @@ import { useStore } from "./store/store";
 import { Sidebar } from "./components/Sidebar";
 import { Chat } from "./components/Chat";
 import { FileExplorer } from "./components/FileExplorer";
+import { ReviewWorkspace } from "./components/review/ReviewWorkspace";
 import { SettingsPanel } from "./components/Settings";
+import { SettingsBoundary } from "./components/SettingsBoundary";
 import { CommandPalette } from "./components/CommandPalette";
 import { StatusHud } from "./components/StatusHud";
 import { NeonRain } from "./components/NeonRain";
@@ -15,6 +17,11 @@ import { InstallGate } from "./components/InstallGate";
 import { CrashConsentPrompt } from "./components/CrashConsentPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { ChannelBadge } from "./components/ChannelBadge";
+import {
+  EnvironmentPanelDock,
+  EnvironmentPanelProvider,
+  EnvironmentPanelTrigger,
+} from "./components/EnvironmentPanel";
 import { isTauri, isWebClientMode, onUpdaterEvent } from "./lib/ipc";
 import { isSelfDev } from "./lib/channel";
 import { getInstallState } from "./lib/installGate";
@@ -33,6 +40,13 @@ export default function App() {
   const remoteChatOpen = useStore((s) => s.remoteChatOpen);
   const online = useStore((s) => s.online);
   const crashReporting = useStore((s) => s.crashReporting);
+  const workspaceSurface = useStore((s) => s.workspaceSurface);
+  const filesVisible = showFiles && workspaceSurface === "chat";
+  const [environmentOpen, setEnvironmentOpen] = useState(false);
+
+  useEffect(() => {
+    if (workspaceSurface === "review") setEnvironmentOpen(false);
+  }, [workspaceSurface]);
 
   // A stable target for keyboard focus after the file rail collapses: the
   // TitleBar file-toggle button stays visible and tabbable, so it's where a
@@ -72,9 +86,12 @@ export default function App() {
     });
 
     void s.loadUpdateChannel();
-    void s.checkForUpdate();
+    void s.checkForUpdate({ background: true });
     const SIX_HOURS = 6 * 60 * 60 * 1000;
-    const interval = setInterval(() => void useStore.getState().checkForUpdate(), SIX_HOURS);
+    const interval = setInterval(
+      () => void useStore.getState().checkForUpdate({ background: true }),
+      SIX_HOURS,
+    );
 
     return () => {
       cancelled = true;
@@ -102,13 +119,13 @@ export default function App() {
   // the still-visible toggle so the user keeps their place instead of being
   // stranded on <body>. Gated on the transition so it never grabs focus on the
   // initial collapsed mount.
-  const wasFilesOpen = useRef(showFiles);
+  const wasFilesVisible = useRef(filesVisible);
   useEffect(() => {
-    if (wasFilesOpen.current && !showFiles && document.activeElement === document.body) {
+    if (wasFilesVisible.current && !filesVisible && document.activeElement === document.body) {
       fileToggleRef.current?.focus();
     }
-    wasFilesOpen.current = showFiles;
-  }, [showFiles]);
+    wasFilesVisible.current = filesVisible;
+  }, [filesVisible]);
 
   // Announce a successful remote pairing, mirroring the remoteDropped case. The
   // confirm-SAS path flips remoteVerified true and unmounts the pairing screen with
@@ -233,23 +250,58 @@ export default function App() {
             <div
               data-testid="file-rail"
               className="grid shrink-0 transition-[grid-template-columns] duration-200 ease-out motion-reduce:transition-none"
-              style={{ gridTemplateColumns: showFiles ? "1fr" : "0fr" }}
-              aria-hidden={!showFiles || undefined}
-              inert={!showFiles}
+              style={{
+                gridTemplateColumns: filesVisible ? "1fr" : "0fr",
+              }}
+              aria-hidden={!filesVisible || undefined}
+              inert={!filesVisible}
             >
               <div className="overflow-hidden">
                 <FileExplorer />
               </div>
             </div>
             <main className="flex min-w-0 flex-1 flex-col">
-              <TitleBar fileToggleRef={fileToggleRef} />
-              <Chat />
+              <EnvironmentPanelProvider open={environmentOpen} onOpenChange={setEnvironmentOpen}>
+                <TitleBar
+                  fileToggleRef={fileToggleRef}
+                  filesVisible={filesVisible}
+                  environmentOpen={environmentOpen}
+                  onEnvironmentOpenChange={setEnvironmentOpen}
+                />
+                <div
+                  data-testid="chat-surface"
+                  hidden={workspaceSurface !== "chat"}
+                  aria-hidden={workspaceSurface !== "chat" || undefined}
+                  inert={workspaceSurface !== "chat"}
+                  className="flex min-h-0 flex-1 flex-col"
+                >
+                  <Chat
+                    transcriptAsideOpen={environmentOpen}
+                    transcriptAside={
+                      <EnvironmentPanelDock onClose={() => setEnvironmentOpen(false)} />
+                    }
+                  />
+                </div>
+                <div
+                  data-testid="review-surface"
+                  hidden={workspaceSurface !== "review"}
+                  aria-hidden={workspaceSurface !== "review" || undefined}
+                  inert={workspaceSurface !== "review"}
+                  className="flex min-h-0 flex-1 flex-col"
+                >
+                  <ReviewWorkspace active={workspaceSurface === "review"} />
+                </div>
+              </EnvironmentPanelProvider>
             </main>
           </div>
 
           <StatusHud />
 
-          {showSettings && <SettingsPanel />}
+          {showSettings && (
+            <SettingsBoundary>
+              <SettingsPanel />
+            </SettingsBoundary>
+          )}
           <CommandPalette />
         </>
       )}
@@ -299,22 +351,33 @@ function RemoteShell({
   );
 }
 
-function TitleBar({ fileToggleRef }: { fileToggleRef?: React.Ref<HTMLButtonElement> }) {
+function TitleBar({
+  fileToggleRef,
+  filesVisible,
+  environmentOpen,
+  onEnvironmentOpenChange,
+}: {
+  fileToggleRef?: React.Ref<HTMLButtonElement>;
+  filesVisible: boolean;
+  environmentOpen: boolean;
+  onEnvironmentOpenChange: (open: boolean) => void;
+}) {
   const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
-  const showFiles = useStore((s) => s.showFiles);
   const toggleFiles = useStore((s) => s.toggleFiles);
   const setShowPalette = useStore((s) => s.setShowPalette);
+  const workspaceSurface = useStore((s) => s.workspaceSurface);
+  const setWorkspaceSurface = useStore((s) => s.setWorkspaceSurface);
   return (
-    <header className="flex h-[46px] shrink-0 items-center justify-between border-b border-border bg-panel/70 px-3.5 backdrop-blur-sm">
+    <header className="relative z-40 flex h-[46px] shrink-0 items-center justify-between border-b border-border bg-panel/70 px-3.5 backdrop-blur-sm">
       <div className="flex min-w-0 items-center gap-2.5">
         <button
           ref={fileToggleRef}
           onClick={toggleFiles}
           aria-label="Toggle file explorer (Ctrl+B)"
-          aria-pressed={showFiles}
+          aria-pressed={filesVisible}
           title="Toggle file explorer (Ctrl+B)"
           className={`flex h-[30px] w-[30px] items-center justify-center rounded-[7px] border transition-[background-color,border-color,box-shadow,color] duration-150 motion-reduce:transition-none ${
-            showFiles
+            filesVisible
               ? "border-accent-2/50 bg-accent-2/12 text-accent-2 shadow-[0_0_14px_rgba(33,230,255,0.25)]"
               : "border-border-2 bg-panel-2/60 text-muted hover:border-accent-2/30 hover:text-accent-2"
           }`}
@@ -330,7 +393,9 @@ function TitleBar({ fileToggleRef }: { fileToggleRef?: React.Ref<HTMLButtonEleme
         </button>
         <span className="truncate font-mono text-[12px] text-muted">
           portcode<span className="text-faint"> / </span>
-          <span className="text-fg">{session?.title ?? "New chat"}</span>
+          <span className="text-fg">
+            {workspaceSurface === "review" ? "Review changes" : (session?.title ?? "New chat")}
+          </span>
         </span>
       </div>
       <div className="flex shrink-0 items-center gap-2.5">
@@ -342,12 +407,31 @@ function TitleBar({ fileToggleRef }: { fileToggleRef?: React.Ref<HTMLButtonEleme
           </span>
         )}
         <button
+          type="button"
+          aria-label={workspaceSurface === "review" ? "Back to chat" : "Open review workspace"}
+          aria-pressed={workspaceSurface === "review"}
+          onClick={() => setWorkspaceSurface(workspaceSurface === "review" ? "chat" : "review")}
+          className={`flex h-[31px] items-center gap-1.5 rounded-[7px] border px-2.5 font-mono text-[10px] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-accent-2/20 ${
+            workspaceSurface === "review"
+              ? "border-accent-2/55 bg-accent-2/12 text-accent-2"
+              : "border-border-2 bg-panel-2/80 text-muted hover:border-accent-2/35 hover:text-fg"
+          }`}
+        >
+          <span aria-hidden="true">±</span>
+          <span className="hidden min-[980px]:inline">
+            {workspaceSurface === "review" ? "Chat" : "Review"}
+          </span>
+        </button>
+        {workspaceSurface === "chat" && (
+          <EnvironmentPanelTrigger open={environmentOpen} onOpenChange={onEnvironmentOpenChange} />
+        )}
+        <button
           onClick={() => setShowPalette(true)}
           aria-label="Open command palette (Ctrl+K)"
           title="Command palette (Ctrl+K)"
           className="flex items-center gap-1.5 rounded-md border border-border-2 bg-panel-2/80 px-2.5 py-1 font-mono text-[11px] text-muted transition-colors hover:border-accent/50 hover:text-accent"
         >
-          ⌘K <span className="text-faint">palette</span>
+          Ctrl K <span className="text-faint">palette</span>
         </button>
       </div>
     </header>

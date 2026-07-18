@@ -1,11 +1,20 @@
-import { useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useStore } from "../store/store";
-import { DANGER_MODES, estimateCost, MODELS, type Message } from "../types";
+import {
+  DANGER_MODES,
+  estimateCost,
+  modelInfo,
+  providerForModel,
+  type Message,
+  type ModelInfo,
+  type ProviderId,
+} from "../types";
+import { PlanUsagePopover } from "./PlanUsagePopover";
 
 /** "claude-opus-4-8" -> "OPUS 4.8" */
-function modelLabel(id: string): string {
-  const m = MODELS.find((x) => x.id === id);
+function modelLabel(id: string, openAIModels: ModelInfo[]): string {
+  const m = modelInfo(id, openAIModels);
   return (m?.label ?? id).replace(/^Claude\s+/, "").toUpperCase();
 }
 
@@ -17,13 +26,21 @@ function workspaceLabel(ws: string | null | undefined): string {
 }
 
 /** Number of distinct tool invocations across the active session's messages. */
+const toolUsesByMessage = new WeakMap<Message, number>();
+
 function countToolUses(messages: Message[] | undefined): number {
   if (!messages) return 0;
   let n = 0;
   for (const m of messages) {
-    for (const b of m.blocks) {
-      if (b.kind === "tool_use") n += 1;
+    let messageCount = toolUsesByMessage.get(m);
+    if (messageCount === undefined) {
+      messageCount = 0;
+      for (const block of m.blocks) {
+        if (block.kind === "tool_use") messageCount += 1;
+      }
+      toolUsesByMessage.set(m, messageCount);
     }
+    n += messageCount;
   }
   return n;
 }
@@ -38,6 +55,7 @@ function countToolUses(messages: Message[] | undefined): number {
  * tracks the live `streaming` flag.
  */
 export function StatusHud() {
+  const sessions = useStore((s) => s.sessions);
   const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
   const model = useStore((s) => {
     const sess = s.sessions.find((x) => x.id === s.activeId);
@@ -50,11 +68,45 @@ export function StatusHud() {
   const usageMap = useStore((s) => s.usage);
   const messages = useStore((s) => (s.activeId ? s.messages[s.activeId] : undefined));
   const remoteMode = useStore((s) => s.remoteMode);
+  const openAIModels = useStore((s) => s.openAIModels);
+  const claudeAuth = useStore((s) => s.oauthStatus);
+  const openAIAuth = useStore((s) => s.openAIAuthStatus);
+  const showSettings = useStore((s) => s.showSettings);
+  const showPalette = useStore((s) => s.showPalette);
+  const setShowSettings = useStore((s) => s.setShowSettings);
   const agents = useStore((s) => (s.activeId ? s.agents[s.activeId] : undefined));
   const runningAgents = agents ? agents.filter((a) => a.status === "running").length : 0;
   const bgTasks = useStore((s) => (s.activeId ? s.backgroundTasks[s.activeId] : undefined));
   const runningBg = bgTasks ? bgTasks.filter((t) => t.status === "running").length : 0;
   const tokens = usage ? usage.input + usage.output : 0;
+  const [showPlanUsage, setShowPlanUsage] = useState(false);
+  const planTriggerRef = useRef<HTMLButtonElement>(null);
+  const availableProviders = openAIAuth?.available === false ? 1 : 2;
+  const connectedProviders =
+    Number(Boolean(claudeAuth?.signedIn)) +
+    Number(openAIAuth?.available !== false && Boolean(openAIAuth?.signedIn));
+
+  const closePlanUsage = useCallback(() => setShowPlanUsage(false), []);
+  const openPlanSettings = useCallback(
+    (provider?: ProviderId) => {
+      setShowPlanUsage(false);
+      setShowSettings(true);
+      const target =
+        provider === "anthropic"
+          ? "pc-setting-claude"
+          : provider === "openai"
+            ? "pc-setting-openai"
+            : "pc-setting-usage";
+      window.setTimeout(() => {
+        document.getElementById(target)?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+      }, 0);
+    },
+    [setShowSettings],
+  );
+
+  useEffect(() => {
+    if (showSettings || showPalette || remoteMode) setShowPlanUsage(false);
+  }, [remoteMode, showPalette, showSettings]);
 
   const workspaceConnected = Boolean(session?.workspace);
   // Memoized so a token/usage-only re-render (messages array reference stable)
@@ -62,89 +114,121 @@ export function StatusHud() {
   // streaming text delta, since patchLast rebuilds the array — still recomputes.
   const toolUses = useMemo(() => countToolUses(messages), [messages]);
 
-  // Cumulative spend across every session, persisted in SQLite and rehydrated on
-  // startup (B2) so the running total survives a restart — a transparency/trust cue
-  // (Fogg credibility). An estimate: it prices the summed tokens at the CURRENT
-  // model (per-model splits aren't stored), matching the per-session UsageMeter.
+  // Cumulative Anthropic API spend across every session, persisted in SQLite and
+  // rehydrated on startup. Each usage row is priced with its owning session's model;
+  // OpenAI subscription usage has no API-price equivalent and is intentionally skipped.
   const totalCost = useMemo(() => {
-    let input = 0;
-    let output = 0;
-    for (const u of Object.values(usageMap)) {
-      input += u.input;
-      output += u.output;
+    let total = 0;
+    for (const item of sessions) {
+      const itemUsage = usageMap[item.id];
+      if (!itemUsage || providerForModel(item.model, openAIModels) === "openai") continue;
+      total += estimateCost(item.model, itemUsage);
     }
-    return estimateCost(model, { input, output });
-  }, [usageMap, model]);
+    return total;
+  }, [openAIModels, sessions, usageMap]);
 
   return (
-    <footer className="pc-hud">
-      <div className="pc-hud-seg pc-hud-seg--left text-accent">
-        <span className="pc-dot pc-dot--success" aria-hidden="true" />
-        <span aria-hidden="true">{"⎇"}</span>{" "}
-        <span className="pc-hud-trunc">{workspaceLabel(session?.workspace)}</span>
-      </div>
-      <div className="pc-hud-seg pc-hud-seg--left text-accent-2">
-        <span className="pc-hud-trunc">{modelLabel(model)}</span>
-      </div>
-      {/* The phone trims the HUD to essentials so the 7 desktop segments don't
+    <>
+      <footer className="pc-hud">
+        <div className="pc-hud-seg pc-hud-seg--left text-accent">
+          <span className="pc-dot pc-dot--success" aria-hidden="true" />
+          <span aria-hidden="true">{"⎇"}</span>{" "}
+          <span className="pc-hud-trunc">{workspaceLabel(session?.workspace)}</span>
+        </div>
+        <div className="pc-hud-seg pc-hud-seg--left text-accent-2">
+          <span className="pc-hud-trunc">{modelLabel(model, openAIModels)}</span>
+        </div>
+        {/* The phone trims the HUD to essentials so the 7 desktop segments don't
           overflow a narrow screen — policy and the redundant workspace segment
           (the ⎇ branch above already names the workspace) are desktop-only. */}
-      {/* In `default` mode the gate behaviour IS the legacy policy, so show that;
+        {/* In `default` mode the gate behaviour IS the legacy policy, so show that;
           otherwise show the active MODE, and flag the loosened auto/bypass modes
           in a danger colour with a warning glyph so a relaxed gate is never hidden. */}
-      {!remoteMode &&
-        (mode === "default" ? (
-          <div className="pc-hud-seg text-warn">POLICY: {policy.toUpperCase()}</div>
-        ) : (
-          <div
-            className={`pc-hud-seg ${DANGER_MODES.includes(mode) ? "text-danger" : "text-warn"}`}
-          >
-            {DANGER_MODES.includes(mode) ? "⚠ " : ""}MODE: {mode.toUpperCase()}
+        {!remoteMode &&
+          (mode === "default" ? (
+            <div className="pc-hud-seg text-warn">POLICY: {policy.toUpperCase()}</div>
+          ) : (
+            <div
+              className={`pc-hud-seg ${DANGER_MODES.includes(mode) ? "text-danger" : "text-warn"}`}
+            >
+              {DANGER_MODES.includes(mode) ? "⚠ " : ""}MODE: {mode.toUpperCase()}
+            </div>
+          ))}
+        {!remoteMode && (
+          <div className="pc-hud-seg text-violet">
+            <span aria-hidden="true">{"◆"}</span> WORKSPACE{" "}
+            {workspaceConnected ? "LINKED" : "LOCAL"}
           </div>
-        ))}
-      {!remoteMode && (
-        <div className="pc-hud-seg text-violet">
-          <span aria-hidden="true">{"◆"}</span> WORKSPACE {workspaceConnected ? "LINKED" : "LOCAL"}
-        </div>
-      )}
+        )}
 
-      <div className="pc-hud-spacer" />
+        <div className="pc-hud-spacer" />
 
-      {!remoteMode && (
-        <div className="pc-hud-seg pc-hud-seg--right text-faint">
-          {toolUses === 1 ? "1 TOOL CALL" : `${toolUses} TOOL CALLS`}
-        </div>
-      )}
-      {runningAgents > 0 && (
-        <div className="pc-hud-seg pc-hud-seg--right text-accent-2">
-          <span className="pc-dot pc-dot--ring" aria-hidden="true" />
-          {runningAgents === 1 ? "1 AGENT" : `${runningAgents} AGENTS`}
-        </div>
-      )}
-      {runningBg > 0 && (
-        <div className="pc-hud-seg pc-hud-seg--right text-accent-2">
-          <span className="pc-dot pc-dot--ring" aria-hidden="true" />
-          {runningBg === 1 ? "1 BG TASK" : `${runningBg} BG TASKS`}
-        </div>
-      )}
-      <div className="pc-hud-seg pc-hud-seg--right text-faint">{tokens.toLocaleString()} tok</div>
-      {/* Cumulative spend (all sessions), survives restarts. Phone trims the HUD to
+        {!remoteMode && (
+          <div
+            className="pc-hud-seg pc-hud-seg--right text-faint"
+            title={`${toolUses} agent tool ${toolUses === 1 ? "call" : "calls"}`}
+          >
+            {toolUses === 1 ? "1 ACTION" : `${toolUses} ACTIONS`}
+          </div>
+        )}
+        {runningAgents > 0 && (
+          <div className="pc-hud-seg pc-hud-seg--right text-accent-2">
+            <span className="pc-dot pc-dot--ring" aria-hidden="true" />
+            {runningAgents === 1 ? "1 AGENT" : `${runningAgents} AGENTS`}
+          </div>
+        )}
+        {runningBg > 0 && (
+          <div className="pc-hud-seg pc-hud-seg--right text-accent-2">
+            <span className="pc-dot pc-dot--ring" aria-hidden="true" />
+            {runningBg === 1 ? "1 BG TASK" : `${runningBg} BG TASKS`}
+          </div>
+        )}
+        {!remoteMode && (
+          <button
+            ref={planTriggerRef}
+            type="button"
+            className={`pc-hud-seg pc-hud-seg--right pc-hud-plan-trigger${showPlanUsage ? " pc-hud-plan-trigger--active" : ""}`}
+            aria-label={`Plan limits, ${connectedProviders} of ${availableProviders} providers connected`}
+            aria-haspopup="dialog"
+            aria-expanded={showPlanUsage}
+            aria-controls="pc-plan-usage-popover"
+            title="Check GPT and Claude plan limits"
+            onClick={() => setShowPlanUsage((open) => !open)}
+          >
+            <span
+              className={`pc-dot ${connectedProviders > 0 ? "pc-dot--success" : ""}`}
+              aria-hidden="true"
+            />
+            LIMITS
+          </button>
+        )}
+        <div className="pc-hud-seg pc-hud-seg--right text-faint">{tokens.toLocaleString()} tok</div>
+        {/* Cumulative spend (all sessions), survives restarts. Phone trims the HUD to
           essentials, so this desktop-only segment doesn't crowd a narrow screen. */}
-      {!remoteMode && totalCost > 0 && (
-        <div
-          className="pc-hud-seg pc-hud-seg--right tabular-nums text-success"
-          title="Total estimated spend across all sessions (priced at the current model)"
-        >
-          Σ ${totalCost.toFixed(totalCost < 0.01 ? 4 : 2)}
+        {!remoteMode && totalCost > 0 && (
+          <div
+            className="pc-hud-seg pc-hud-seg--right tabular-nums text-success"
+            title="Total estimated Anthropic API spend across all sessions"
+          >
+            Σ ${totalCost.toFixed(totalCost < 0.01 ? 4 : 2)}
+          </div>
+        )}
+        <div className="pc-hud-seg pc-hud-seg--right text-success">
+          <span
+            className={`pc-dot ${streaming ? "pc-dot--ring" : "pc-dot--success"}`}
+            aria-hidden="true"
+          />
+          NEURAL LINK · {streaming ? "LIVE" : "IDLE"}
         </div>
-      )}
-      <div className="pc-hud-seg pc-hud-seg--right text-success">
-        <span
-          className={`pc-dot ${streaming ? "pc-dot--ring" : "pc-dot--success"}`}
-          aria-hidden="true"
+      </footer>
+      {!remoteMode && (
+        <PlanUsagePopover
+          open={showPlanUsage}
+          triggerRef={planTriggerRef}
+          onClose={closePlanUsage}
+          onOpenSettings={openPlanSettings}
         />
-        NEURAL LINK · {streaming ? "LIVE" : "IDLE"}
-      </div>
-    </footer>
+      )}
+    </>
   );
 }

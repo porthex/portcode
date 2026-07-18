@@ -1,17 +1,21 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { useStore } from "../store/store";
 import { MessageView } from "./Message";
 import { Composer } from "./Composer";
 import { PermissionPrompt } from "./PermissionPrompt";
-import { AgentsPanel } from "./AgentsPanel";
 import { BackgroundTasksPanel } from "./BackgroundTasksPanel";
-import type { Message } from "../types";
+import { providerForModel, type Message } from "../types";
 
 // Stable reference so the selector never returns a fresh array (which would
 // trip useSyncExternalStore's infinite-loop guard).
 const EMPTY: Message[] = [];
 
-export function Chat() {
+type ChatProps = {
+  transcriptAside?: ReactNode;
+  transcriptAsideOpen?: boolean;
+};
+
+export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps = {}) {
   const activeId = useStore((s) => s.activeId);
   const messages = useStore((s) => (activeId && s.messages[activeId]) || EMPTY);
   const streaming = useStore((s) => s.streaming);
@@ -150,64 +154,97 @@ export function Chat() {
   };
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      {/* The relative context lives on the scroll region (not the whole panel) so the
-          scroll-to-latest FAB's `bottom-4` is measured from the transcript's bottom
-          edge — floating it 16px above the Composer instead of on top of it. */}
-      <div className="relative min-h-0 flex-1">
-        <div ref={scrollRef} className="absolute inset-0 overflow-y-auto [scrollbar-gutter:stable]">
+    <div data-testid="chat-shell" className="flex min-h-0 min-w-0 flex-1 flex-col">
+      {/* The scroller spans the transcript so its gutter stays at the far-right edge.
+          The dock overlays that surface while only message content makes room. */}
+      <div
+        data-testid="chat-transcript-layout"
+        className="@container relative min-h-0 flex-1 overflow-hidden"
+      >
+        <div className="absolute inset-0 min-w-0">
           <div
-            ref={contentRef}
-            className="w-full max-w-none px-6 py-6"
-            role="log"
-            aria-live="polite"
-            aria-relevant="additions text"
-            aria-busy={streaming}
-            // Programmatically focusable (not in the Tab order) so the
-            // PermissionPrompt can route focus back here when a gated turn clears
-            // mid-stream and its Deny button unmounts.
-            tabIndex={-1}
+            ref={scrollRef}
+            data-testid="chat-transcript-scroll"
+            className="absolute inset-0 overflow-y-auto [scrollbar-gutter:stable]"
           >
-            {initError ? (
-              <InitErrorPanel message={initError} onRetry={() => void retryInit()} />
-            ) : messages.length === 0 && loadError ? (
-              <LoadErrorPanel onRetry={() => activeId && void retryLoad(activeId)} />
-            ) : messages.length === 0 ? (
-              <EmptyState />
-            ) : (
-              messages.map((m, i) => (
-                <MessageView
-                  key={m.id}
-                  message={m}
-                  isActive={streaming && i === lastIndex && m.role === "assistant"}
-                />
-              ))
-            )}
+            <div
+              ref={contentRef}
+              data-testid="chat-transcript-content"
+              className={`w-full max-w-none px-6 py-6 transition-[padding-right] duration-300 ease-out motion-reduce:transition-none ${
+                transcriptAside && transcriptAsideOpen ? "@min-[734px]:pr-[390px]" : ""
+              }`}
+              role="log"
+              aria-live="polite"
+              aria-relevant="additions text"
+              aria-busy={streaming}
+              // Programmatically focusable (not in the Tab order) so the
+              // PermissionPrompt can route focus back here when a gated turn clears
+              // mid-stream and its Deny button unmounts.
+              tabIndex={-1}
+            >
+              {initError ? (
+                <InitErrorPanel message={initError} onRetry={() => void retryInit()} />
+              ) : messages.length === 0 && loadError ? (
+                <LoadErrorPanel onRetry={() => activeId && void retryLoad(activeId)} />
+              ) : messages.length === 0 ? (
+                <EmptyState />
+              ) : (
+                messages.map((m, i) => (
+                  <MessageView
+                    key={m.id}
+                    message={m}
+                    isActive={streaming && i === lastIndex && m.role === "assistant"}
+                  />
+                ))
+              )}
+            </div>
           </div>
+          {!pinned && messages.length > 0 && (
+            <button
+              type="button"
+              aria-label="Scroll to latest"
+              onClick={scrollToBottom}
+              className={`pc-fab-enter absolute bottom-4 right-4 z-20 flex h-9 w-9 items-center justify-center rounded-full border border-border bg-panel text-fg transition-[right,opacity] duration-300 ease-out hover:border-accent-2 hover:shadow-[var(--shadow-glow-cyan)] active:brightness-90 motion-reduce:transition-none ${
+                transcriptAside && transcriptAsideOpen ? "@min-[734px]:right-[382px]" : ""
+              }`}
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                <path
+                  d="M6 9l6 6 6-6"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </button>
+          )}
         </div>
-        {!pinned && messages.length > 0 && (
-          <button
-            type="button"
-            aria-label="Scroll to latest"
-            onClick={scrollToBottom}
-            className="pc-fab-enter absolute bottom-4 right-4 flex h-9 w-9 items-center justify-center rounded-full border border-border bg-panel text-fg transition-opacity hover:border-accent-2 hover:shadow-[var(--shadow-glow-cyan)] active:brightness-90 motion-reduce:transition-none"
+        {transcriptAside && (
+          <div
+            data-testid="chat-transcript-aside"
+            aria-hidden={!transcriptAsideOpen || undefined}
+            inert={!transcriptAsideOpen}
+            className="pointer-events-none absolute inset-y-0 right-3 z-10 flex w-[calc(100%-12px)] max-w-[354px] justify-end overflow-hidden"
           >
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-              <path
-                d="M6 9l6 6 6-6"
-                stroke="currentColor"
-                strokeWidth="1.8"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
-          </button>
+            <div
+              data-testid="chat-transcript-aside-frame"
+              className={`pointer-events-auto flex h-full w-full flex-none items-start justify-end py-3 pl-3 transition-[opacity,transform] duration-300 ease-out motion-reduce:transition-none ${
+                transcriptAsideOpen
+                  ? "translate-x-0 opacity-100 delay-75 motion-reduce:delay-0"
+                  : "pointer-events-none translate-x-3 opacity-0"
+              }`}
+            >
+              {transcriptAside}
+            </div>
+          </div>
         )}
       </div>
-      <AgentsPanel />
       <BackgroundTasksPanel />
       <PermissionPrompt />
-      <Composer />
+      <div data-testid="chat-composer-area" className="w-full shrink-0">
+        <Composer />
+      </div>
     </div>
   );
 }
@@ -254,11 +291,27 @@ function EmptyState() {
   // explorer is desktop-only), so the hint row is desktop-only.
   const remoteMode = useStore((s) => s.remoteMode);
   const oauthStatus = useStore((s) => s.oauthStatus);
+  const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
+  const openAIModels = useStore((s) => s.openAIModels);
   const settings = useStore((s) => s.settings);
+  const activeModel = useStore((s) => {
+    const session = s.activeId ? s.sessions.find((item) => item.id === s.activeId) : undefined;
+    return session?.model ?? s.settings.model;
+  });
   const setShowSettings = useStore((s) => s.setShowSettings);
   // oauthStatus is null until the first refresh resolves; treat unknown as not
   // signed in, so the sign-in nudge shows until auth is confirmed.
-  const authed = !!oauthStatus?.signedIn || settings.apiKeySet;
+  const provider = providerForModel(activeModel, openAIModels);
+  const openAIUnavailable = provider === "openai" && openAIAuthStatus?.available === false;
+  const authed =
+    provider === "openai"
+      ? !openAIUnavailable && !!openAIAuthStatus?.signedIn
+      : !!oauthStatus?.signedIn || settings.apiKeySet;
+  const authNudge = openAIUnavailable
+    ? `${openAIAuthStatus?.unavailableReason ?? "ChatGPT subscription access is unavailable in this build"}. Choose Claude in Settings to start`
+    : provider === "openai"
+      ? "Sign in with ChatGPT to start"
+      : "Sign in with Claude or add an API key to start";
   return (
     <div className="flex min-h-[60vh] flex-col items-center justify-center text-center">
       <div className="mb-4 rounded-2xl border border-border bg-panel p-4">
@@ -279,13 +332,13 @@ function EmptyState() {
       </p>
       {!remoteMode && !authed && (
         <div className="mt-4 flex items-center gap-2 text-xs text-muted">
-          <span>Sign in with Claude or add an API key to start</span>
+          <span>{authNudge}</span>
           <button
             type="button"
             onClick={() => setShowSettings(true)}
             className="rounded border border-border bg-panel px-2 py-0.5 text-fg hover:border-accent"
           >
-            Open settings
+            {openAIUnavailable ? "Choose Claude" : "Open settings"}
           </button>
         </div>
       )}

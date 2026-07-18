@@ -19,8 +19,8 @@
 ## Milestone 2 — Tools ✅ done
 
 - [x] Tool trait + registry, JSON schemas
-- [x] `fs_read`, `list`, `glob`, `grep` (read-only)
-- [x] `fs_write`, `fs_edit`, `shell` (gated, sandboxed to workspace)
+- [x] `read_file`, `list_directory`, `find_files`, `search_text` (read-only)
+- [x] `write_file`, `edit_file`, `run_command` (gated, sandboxed to workspace)
 - [x] Permission gate (allow / ask / deny + "always allow") — Rust gate + UI prompt
 - [x] Tool-call + result rendering in chat
 
@@ -47,7 +47,7 @@
 - [x] Provider abstraction and deterministic provider test seams
 - [x] Permission modes, rules, read-only plan mode, and pre-apply diffs
 - [x] Bounded parallel subagents with lifecycle UI and cancellation
-- [x] Background shell tasks with status and cancellation
+- [x] Background `run_command` tasks with status and cancellation
 - [x] Persisted drafts, cumulative usage, message search, and session rename
 
 ## Milestone 6 — Phone Sync foundation 🟡 implemented, acceptance pending

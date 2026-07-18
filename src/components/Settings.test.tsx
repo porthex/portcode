@@ -5,6 +5,7 @@ import { SettingsPanel } from "./Settings";
 import { useStore } from "../store/store";
 import * as ipc from "../lib/ipc";
 import {
+  ANTHROPIC_MODELS,
   DEFAULT_SETTINGS,
   MODELS,
   type PairedDevice,
@@ -23,6 +24,7 @@ vi.mock("../lib/ipc", () => ({
   saveSettings: vi.fn(async (s: Partial<Settings>) => ({ ...DEFAULT_SETTINGS, ...s })),
   // Reached by the store's checkForUpdate (manual "Check now" button); no update.
   checkForUpdate: vi.fn(async () => null),
+  setTelemetryConsent: vi.fn(async (_enabled: boolean) => {}),
   // Called directly by the component when saving the API key.
   setApiKey: vi.fn(async (_key: string) => {}),
   // Resolves a folder path; present for completeness of the store's surface.
@@ -33,6 +35,11 @@ vi.mock("../lib/ipc", () => ({
   startOauthLogin: vi.fn(),
   oauthLogout: vi.fn(),
   oauthStatus: vi.fn(),
+  startOpenaiOauthLogin: vi.fn(),
+  openaiOauthLogout: vi.fn(),
+  openaiOauthStatus: vi.fn(),
+  openaiModels: vi.fn(),
+  getPlanUsage: vi.fn(),
   // Phone sync: reached via the store's refreshPhoneSync/beginPairing/unpair.
   phoneSyncStatus: vi.fn(),
   phoneSyncBeginPairing: vi.fn(),
@@ -72,6 +79,33 @@ beforeEach(() => {
   });
   m.oauthLogout.mockResolvedValue(undefined);
   m.oauthStatus.mockResolvedValue({ signedIn: false, expiresAt: null, account: null, tier: null });
+  m.startOpenaiOauthLogin.mockResolvedValue({
+    signedIn: true,
+    expiresAt: 4102444800,
+    account: "you@openai.com",
+    tier: "ChatGPT Plus",
+  });
+  m.openaiOauthLogout.mockResolvedValue(undefined);
+  m.openaiOauthStatus.mockResolvedValue({
+    signedIn: false,
+    expiresAt: null,
+    account: null,
+    tier: null,
+  });
+  m.openaiModels.mockResolvedValue([
+    {
+      id: "gpt-live",
+      label: "GPT Live",
+      reasoningEfforts: ["minimal", "high", "ultra"],
+      defaultReasoningEffort: "high",
+    },
+  ]);
+  m.getPlanUsage.mockImplementation(async (provider) => ({
+    provider,
+    plan: provider === "openai" ? "Plus" : "Max",
+    updatedAt: 1_900_000_000,
+    windows: [],
+  }));
   m.phoneSyncStatus.mockResolvedValue({ devicePublicKey: "DEVICE==", paired: [] });
   m.phoneSyncBeginPairing.mockResolvedValue({
     version: 1,
@@ -92,20 +126,304 @@ describe("SettingsPanel — structure", () => {
     // The Neon-Noir header renders the title as a styled (font-display) span,
     // not a semantic heading; assert on its literal uppercase text instead.
     expect(screen.getByText("SETTINGS")).toBeInTheDocument();
-    expect(screen.getByText("Anthropic (Claude)")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Claude" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "GPT / Codex" })).toBeInTheDocument();
 
-    // Model select reflects the store's current model. Query by its accessible
-    // name (the visible "Default model" label is associated via htmlFor/id), which both
-    // locks in the accessible-name wiring and finds the same <select>.
-    const select = screen.getByLabelText("Default model (new sessions)") as HTMLSelectElement;
-    expect(select.value).toBe(DEFAULT_SETTINGS.model);
-    // Every model from the catalogue is offered as an option.
-    for (const model of MODELS) {
+    // The themed model picker reflects the store's current model. Query by its
+    // accessible name to lock in the visible label/combobox wiring.
+    const select = screen.getByLabelText("Claude model for new sessions");
+    expect(select).toHaveValue(DEFAULT_SETTINGS.model);
+    fireEvent.click(select);
+    // Claude's picker stays provider-scoped; GPT models live in their own section.
+    for (const model of ANTHROPIC_MODELS) {
       expect(screen.getByRole("option", { name: model.label })).toBeInTheDocument();
     }
+    expect(screen.queryByRole("option", { name: "GPT-5.6 Sol" })).not.toBeInTheDocument();
 
-    // The API-key field also has an accessible name from its associated label.
-    expect(screen.getByLabelText("API key")).toBeInTheDocument();
+    // The API-key field names its owner instead of presenting a generic credential.
+    expect(screen.getByLabelText("Anthropic API key")).toBeInTheDocument();
+  });
+
+  it("keeps each provider's models and authentication inside its own section", () => {
+    renderPanel();
+    const claude = document.getElementById("pc-settings-claude")!;
+    const openai = document.getElementById("pc-settings-openai")!;
+
+    expect(within(claude).getByLabelText("Claude model for new sessions")).toBeInTheDocument();
+    expect(within(claude).getByRole("button", { name: "Sign in with Claude" })).toBeInTheDocument();
+    expect(within(claude).getByLabelText("Anthropic API key")).toBeInTheDocument();
+    expect(within(claude).queryByRole("button", { name: "Sign in with ChatGPT" })).toBeNull();
+
+    expect(within(openai).getByLabelText("OpenAI model for new sessions")).toBeInTheDocument();
+    expect(
+      within(openai).getByRole("button", { name: "Sign in with ChatGPT" }),
+    ).toBeInTheDocument();
+    expect(within(openai).getByText(/OpenAI API keys are not used/i)).toBeInTheDocument();
+    expect(within(openai).queryByLabelText("Anthropic API key")).toBeNull();
+  });
+
+  it("removes unavailable OpenAI controls from the settings map and usage surface", () => {
+    useStore.setState({
+      openAIAuthStatus: {
+        signedIn: false,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: false,
+        unavailableReason: "Disabled in this build",
+      },
+    });
+
+    renderPanel();
+
+    const map = screen.getByRole("navigation", { name: "Settings map" });
+    expect(within(map).queryByRole("button", { name: "OpenAI / GPT" })).not.toBeInTheDocument();
+    expect(document.getElementById("pc-settings-openai")).toHaveClass("hidden");
+    expect(within(map).getByText("0 of 1 connected")).toBeInTheDocument();
+    expect(screen.queryByRole("article", { name: "GPT plan usage" })).not.toBeInTheDocument();
+  });
+
+  it("presents a categorized settings map with live configuration summaries", () => {
+    useStore.setState({ uiScale: 1.1, ambientRain: true });
+    renderPanel({ permissionMode: "plan", rules: [{ tool: "shell", decision: "ask" }] });
+
+    const map = screen.getByRole("navigation", { name: "Settings map" });
+    for (const name of [
+      "Claude",
+      "OpenAI / GPT",
+      "Plan usage",
+      "Permissions",
+      "Interface",
+      "Privacy & updates",
+      "Phone sync",
+    ]) {
+      expect(within(map).getByRole("button", { name })).toBeInTheDocument();
+    }
+    expect(within(map).getByText(/plan · 1 rule/i)).toBeInTheDocument();
+    expect(within(map).getByText(/110% · effects on/i)).toBeInTheDocument();
+  });
+
+  it("keeps the settings map and section headers free of numeric markers", () => {
+    const { container } = renderPanel();
+    const map = screen.getByRole("navigation", { name: "Settings map" });
+
+    for (const marker of ["01", "02", "03", "04", "05", "06"]) {
+      expect(within(map).queryByText(marker)).not.toBeInTheDocument();
+    }
+    expect(container.querySelector(".pc-settings-section-head__route")).toBeNull();
+  });
+
+  it("finds settings by their specific control names and narrows the content", () => {
+    renderPanel();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Find a setting" }), {
+      target: { value: "scanlines" },
+    });
+
+    expect(screen.getByText("1 category found")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Interface" })).not.toHaveAttribute("data-filtered");
+    expect(screen.getByRole("button", { name: "Claude" })).toHaveAttribute("data-filtered", "true");
+    expect(screen.getByRole("button", { name: "OpenAI / GPT" })).toHaveAttribute(
+      "data-filtered",
+      "true",
+    );
+    expect(document.getElementById("pc-settings-interface")).not.toHaveClass("hidden");
+    expect(document.getElementById("pc-settings-claude")).toHaveClass("hidden");
+    expect(document.getElementById("pc-settings-openai")).toHaveClass("hidden");
+    expect(document.getElementById("pc-setting-scanlines")).toHaveClass("pc-settings-target");
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear settings search" }));
+    expect(screen.getByRole("searchbox", { name: "Find a setting" })).toHaveValue("");
+  });
+
+  it("routes plan-limit searches to the combined usage panel", () => {
+    renderPanel();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Find a setting" }), {
+      target: { value: "weekly limit" },
+    });
+
+    expect(screen.getByText("1 category found")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Plan usage" })).not.toHaveAttribute("data-filtered");
+    expect(document.getElementById("pc-settings-usage")).not.toHaveClass("hidden");
+    expect(document.getElementById("pc-setting-plan-usage")).toHaveClass("pc-settings-target");
+  });
+
+  it("routes command-prefix searches to the tool-rule editor", () => {
+    renderPanel();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Find a setting" }), {
+      target: { value: "command prefix" },
+    });
+
+    expect(screen.getByText("1 category found")).toBeInTheDocument();
+    expect(document.getElementById("pc-settings-permissions")).not.toHaveClass("hidden");
+    expect(document.getElementById("pc-setting-tool-rules")).toHaveClass("pc-settings-target");
+  });
+
+  it("surfaces a useful empty state and clears an unsuccessful search", () => {
+    renderPanel();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Find a setting" }), {
+      target: { value: "warp capacitor" },
+    });
+    expect(screen.getByText("No setting found")).toBeInTheDocument();
+    expect(screen.getByText(/model.*command.*scanlines.*reports.*phone/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
+    expect(screen.getByRole("searchbox", { name: "Find a setting" })).toHaveValue("");
+    expect(screen.queryByText("No setting found")).not.toBeInTheDocument();
+  });
+
+  it("searches only settings that are currently available", () => {
+    const { unmount } = renderPanel();
+    const search = screen.getByRole("searchbox", { name: "Find a setting" });
+
+    fireEvent.change(search, { target: { value: "reasoning level" } });
+    expect(screen.getByText("No setting found")).toBeInTheDocument();
+
+    unmount();
+    useStore.setState({ remoteMode: true });
+    renderPanel();
+    fireEvent.change(screen.getByRole("searchbox", { name: "Find a setting" }), {
+      target: { value: "automatic updates" },
+    });
+    expect(screen.getByText("No setting found")).toBeInTheDocument();
+  });
+
+  it("changes the active route from the category rail", () => {
+    renderPanel();
+
+    const claude = screen.getByRole("button", { name: "Claude" });
+    const permissions = screen.getByRole("button", { name: "Permissions" });
+    expect(claude).toHaveAttribute("aria-current", "location");
+
+    fireEvent.click(permissions);
+    expect(permissions).toHaveAttribute("aria-current", "location");
+    expect(claude).not.toHaveAttribute("aria-current");
+
+    fireEvent.focus(screen.getByRole("button", { name: "ask" }));
+    expect(permissions).toHaveAttribute("aria-current", "location");
+
+    const interfaceRoute = screen.getByRole("button", { name: "Interface" });
+    fireEvent.focus(screen.getByRole("switch", { name: "Typing animation" }));
+    expect(interfaceRoute).toHaveAttribute("aria-current", "location");
+
+    const systemRoute = screen.getByRole("button", { name: "Privacy & updates" });
+    const reports = screen.getByRole("switch", { name: "Crash & performance reports" });
+    fireEvent.focus(reports);
+    expect(systemRoute).toHaveAttribute("aria-current", "location");
+    fireEvent.click(reports);
+    expect(useStore.getState().crashReporting).toBe(true);
+  });
+
+  it("keeps the active route synchronized while the settings content scrolls", () => {
+    const { container } = renderPanel();
+    const content = container.querySelector<HTMLElement>(".pc-settings-content")!;
+    const openAISection = document.getElementById("pc-settings-openai")!;
+    const permissionsSection = document.getElementById("pc-settings-permissions")!;
+    const interfaceSection = document.getElementById("pc-settings-interface")!;
+    const systemSection = document.getElementById("pc-settings-system")!;
+    const devicesSection = document.getElementById("pc-settings-devices")!;
+
+    Object.defineProperty(content, "scrollTop", { configurable: true, value: 420 });
+    Object.defineProperty(openAISection, "offsetTop", { configurable: true, value: 120 });
+    Object.defineProperty(permissionsSection, "offsetTop", { configurable: true, value: 240 });
+    Object.defineProperty(interfaceSection, "offsetTop", { configurable: true, value: 390 });
+    Object.defineProperty(systemSection, "offsetTop", { configurable: true, value: 620 });
+    Object.defineProperty(devicesSection, "offsetTop", { configurable: true, value: 840 });
+    fireEvent.scroll(content);
+
+    expect(screen.getByRole("button", { name: "Interface" })).toHaveAttribute(
+      "aria-current",
+      "location",
+    );
+  });
+
+  it("removes desktop-only destinations from the map in remote mode", () => {
+    useStore.setState({ remoteMode: true });
+    renderPanel();
+
+    const map = screen.getByRole("navigation", { name: "Settings map" });
+    expect(within(map).getByRole("button", { name: "Interface" })).toBeInTheDocument();
+    expect(within(map).getByRole("button", { name: "Privacy" })).toBeInTheDocument();
+    expect(within(map).queryByRole("button", { name: "Claude" })).not.toBeInTheDocument();
+    expect(within(map).queryByRole("button", { name: "OpenAI / GPT" })).not.toBeInTheDocument();
+    expect(within(map).queryByRole("button", { name: "Plan usage" })).not.toBeInTheDocument();
+    expect(within(map).queryByRole("button", { name: "Permissions" })).not.toBeInTheDocument();
+    expect(within(map).queryByRole("button", { name: "Phone sync" })).not.toBeInTheDocument();
+  });
+});
+
+describe("SettingsPanel — OpenAI subscription", () => {
+  it("switches the default provider only from the provider-scoped GPT picker", async () => {
+    renderPanel({ provider: "anthropic", model: ANTHROPIC_MODELS[0].id });
+
+    const picker = screen.getByLabelText("OpenAI model for new sessions");
+    expect(picker).toHaveValue("choose-openai");
+    fireEvent.click(picker);
+    expect(screen.queryByRole("option", { name: "Claude Opus 4.8" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "GPT-5.6 Sol" }));
+
+    expect(m.saveSettings).toHaveBeenCalledWith({ model: "gpt-5.6-sol", provider: "openai" });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(useStore.getState().settings).toMatchObject({
+      model: "gpt-5.6-sol",
+      provider: "openai",
+    });
+  });
+
+  it("signs in with ChatGPT and refreshes the live model catalogue", async () => {
+    renderPanel();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with ChatGPT" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(m.startOpenaiOauthLogin).toHaveBeenCalledTimes(1);
+    expect(m.openaiModels).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().openAIAuthStatus).toMatchObject({
+      signedIn: true,
+      account: "you@openai.com",
+    });
+    expect(useStore.getState().openAIModels.map((model) => model.id)).toEqual(["gpt-live"]);
+  });
+
+  it("shows and persists only supported reasoning levels for the selected OpenAI model", async () => {
+    useStore.setState({
+      openAIModels: [
+        {
+          id: "gpt-live",
+          label: "GPT Live",
+          provider: "openai",
+          reasoningEfforts: ["minimal", "ultra"],
+          defaultReasoningEffort: "ultra",
+        },
+      ],
+    });
+    renderPanel({ provider: "openai", model: "gpt-live", reasoningEffort: "ultra" });
+
+    expect(screen.getByRole("heading", { name: "GPT / Codex" })).toBeInTheDocument();
+    const reasoning = screen.getByLabelText("Reasoning level");
+    expect(reasoning).toHaveValue("ultra");
+    fireEvent.click(reasoning);
+    const reasoningList = screen.getByRole("listbox", { name: "Reasoning level" });
+    expect(
+      within(reasoningList)
+        .getAllByRole("option")
+        .map((option) => option.textContent?.replace("✓", "").trim()),
+    ).toEqual(["Minimal", "Ultra"]);
+
+    fireEvent.click(screen.getByRole("option", { name: "Minimal" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(m.saveSettings).toHaveBeenCalledWith({ reasoningEffort: "minimal" });
   });
 });
 
@@ -137,11 +455,11 @@ describe("SettingsPanel — Claude subscription sign-in", () => {
     renderPanel();
 
     expect(screen.getByText(/Signed in as you@claude\.ai/)).toBeInTheDocument();
-    expect(screen.getByText("Max").className).toContain("amber"); // "Claude " stripped; Max gradient
+    expect(screen.getByTitle("Claude Max").className).toContain("amber"); // "Claude " stripped; Max gradient
     expect(screen.getByText(/Access expires/)).toBeInTheDocument();
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Log out" }));
+      fireEvent.click(screen.getByRole("button", { name: "Log out of Claude" }));
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -153,7 +471,7 @@ describe("SettingsPanel — Claude subscription sign-in", () => {
   it("uses the non-Max badge styling for a Pro tier", () => {
     useStore.setState({ oauthStatus: signedInStatus({ tier: "Claude Pro" }) });
     renderPanel();
-    expect(screen.getByText("Pro").className).toContain("violet");
+    expect(screen.getByTitle("Claude Pro").className).toContain("violet");
   });
 
   it("surfaces a sign-in error from the store as an assertive live region", () => {
@@ -188,6 +506,23 @@ describe("SettingsPanel — close affordances", () => {
     fireEvent.keyDown(window, { key: "Escape" });
 
     expect(useStore.getState().showSettings).toBe(false);
+  });
+
+  it("lets an open settings picker consume Escape before the modal", () => {
+    renderPanel();
+    useStore.setState({ showSettings: true });
+    const model = screen.getByRole("combobox", { name: "Claude model for new sessions" });
+
+    fireEvent.click(model);
+    expect(
+      screen.getByRole("listbox", { name: "Claude model for new sessions" }),
+    ).toBeInTheDocument();
+    fireEvent.keyDown(model, { key: "Escape" });
+
+    expect(
+      screen.queryByRole("listbox", { name: "Claude model for new sessions" }),
+    ).not.toBeInTheDocument();
+    expect(useStore.getState().showSettings).toBe(true);
   });
 
   it("closes when the backdrop is clicked but not when the inner card is", () => {
@@ -312,8 +647,9 @@ describe("SettingsPanel — model picker", () => {
   it("persists a model change through ipc.saveSettings and updates the store", async () => {
     renderPanel();
 
-    const select = screen.getByLabelText("Default model (new sessions)");
-    fireEvent.change(select, { target: { value: "claude-haiku-4-5-20251001" } });
+    const select = screen.getByLabelText("Claude model for new sessions");
+    fireEvent.click(select);
+    fireEvent.click(screen.getByRole("option", { name: "Claude Haiku 4.5" }));
 
     // updateSettings -> ipc.saveSettings; flush the microtask the action awaits.
     expect(m.saveSettings).toHaveBeenCalledWith({ model: "claude-haiku-4-5-20251001" });
@@ -326,22 +662,25 @@ describe("SettingsPanel — model picker", () => {
     m.saveSettings.mockRejectedValueOnce(new Error("disk full"));
     renderPanel({ model: MODELS[0].id });
 
-    const select = screen.getByLabelText("Default model (new sessions)") as HTMLSelectElement;
+    const select = screen.getByLabelText("Claude model for new sessions");
+    fireEvent.click(select);
     await act(async () => {
-      fireEvent.change(select, { target: { value: "claude-haiku-4-5-20251001" } });
+      fireEvent.click(screen.getByRole("option", { name: "Claude Haiku 4.5" }));
       await Promise.resolve();
       await Promise.resolve();
     });
 
     // The store's updateSettings catches the reject into settingsError; the panel
-    // surfaces it adjacent to the Model select (in the CONNECTION section, not the
-    // far-away PERMISSIONS banner) and the persisted model is unchanged.
-    const conn = screen.getByText("CONNECTION").closest("section")!;
-    const settingsAlert = within(conn).getByText(/Couldn't save settings: disk full/);
+    // keeps a global sticky alert visible even when the failing category is filtered.
+    const settingsAlert = screen.getByRole("alert");
     expect(settingsAlert).toBeInTheDocument();
-    // Announced to screen readers (matches the pairingError pattern): the error
-    // appears asynchronously after the change while focus stays on the select.
-    expect(settingsAlert).toHaveAttribute("role", "alert");
+    expect(within(settingsAlert).getByText("Couldn't save settings")).toBeInTheDocument();
+    expect(within(settingsAlert).getByText("disk full")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Find a setting" }), {
+      target: { value: "scanlines" },
+    });
+    expect(screen.getByRole("alert")).toBeInTheDocument();
     expect(useStore.getState().settings.model).toBe(MODELS[0].id);
     expect(useStore.getState().settingsError).toBe("disk full");
   });
@@ -351,7 +690,7 @@ describe("SettingsPanel — API key", () => {
   it("shows the input placeholder and unsaved hint when no key is stored", () => {
     renderPanel({ apiKeySet: false });
 
-    expect(screen.getByText(/Stored securely in Windows Credential Manager/)).toBeInTheDocument();
+    expect(screen.getByText(/used only for Claude requests/i)).toBeInTheDocument();
     const input = screen.getByPlaceholderText("sk-ant-…");
     expect(input).toBeInTheDocument();
   });
@@ -363,14 +702,16 @@ describe("SettingsPanel — API key", () => {
     // input; the global `input:focus { box-shadow: none }` rule zeroes any ring,
     // so the focus indicator must be a border change (focus:border-accent/50),
     // mirroring the RemotePairing textarea. WCAG 2.4.7 (Focus Visible).
-    const input = screen.getByLabelText("API key");
+    const input = screen.getByLabelText("Anthropic API key");
     expect(input.className).toContain("focus:border-accent/50");
   });
 
   it("shows the 'key stored' hint and replace placeholder when a key exists", () => {
     renderPanel({ apiKeySet: true });
 
-    expect(screen.getByText("A key is stored in Windows Credential Manager.")).toBeInTheDocument();
+    expect(
+      screen.getByText("An Anthropic key is stored in Windows Credential Manager."),
+    ).toBeInTheDocument();
     // Source placeholder has two spaces before "(replace)"; getByPlaceholderText
     // normalizes whitespace, so match loosely on the distinctive bullet+label.
     expect(screen.getByPlaceholderText(/\(replace\)/)).toBeInTheDocument();
@@ -496,7 +837,7 @@ describe("SettingsPanel — API key", () => {
     // The error is shown and the typed value is kept so the user can retry.
     const keyAlert = screen.getByText(/Couldn't save key: keyring locked/);
     expect(keyAlert).toBeInTheDocument();
-    // Announced like its success counterpart (the role="status" "API key saved").
+    // Announced like its success counterpart (the role="status" save message).
     expect(keyAlert).toHaveAttribute("role", "alert");
     expect(input.value).toBe("sk-ant-secret");
     // apiKeySet was never flipped, so the resting label is still "Save".
@@ -559,7 +900,7 @@ describe("SettingsPanel — API key", () => {
       await Promise.resolve();
     });
 
-    expect(screen.getByRole("status")).toHaveTextContent("API key saved");
+    expect(screen.getByRole("status")).toHaveTextContent("Anthropic API key saved");
   });
 
   it("clears the Saved-flash timer on unmount so it can't update state after close", async () => {
@@ -608,10 +949,25 @@ describe("SettingsPanel — default tool permission", () => {
     expect(allow.className).not.toContain("bg-accent-2/10");
 
     fireEvent.click(allow);
+    expect(m.saveSettings).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(/every unmatched tool.*including commands.*without asking/i),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Enable default Allow" }));
     expect(m.saveSettings).toHaveBeenCalledWith({ defaultPolicy: "allow" });
     await Promise.resolve();
     await Promise.resolve();
     expect(useStore.getState().settings.defaultPolicy).toBe("allow");
+  });
+
+  it("cancels the default Allow confirmation without saving", () => {
+    renderPanel({ defaultPolicy: "ask" });
+
+    fireEvent.click(screen.getByRole("button", { name: "allow" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(m.saveSettings).not.toHaveBeenCalled();
+    expect(useStore.getState().settings.defaultPolicy).toBe("ask");
   });
 
   it("offers every policy button", () => {
@@ -665,24 +1021,30 @@ describe("SettingsPanel — permission modes & rules", () => {
   });
 
   it("adds a per-tool rule through ipc.saveSettings", async () => {
-    renderPanel(); // form defaults: shell + ask
+    renderPanel(); // form defaults: Run command + ask
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
     });
 
-    expect(m.saveSettings).toHaveBeenCalledWith({ rules: [{ tool: "shell", decision: "ask" }] });
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      rules: [{ tool: "run_command", decision: "ask" }],
+    });
   });
 
-  it("warns when an allow rule would match every shell command (over-broad)", () => {
-    renderPanel(); // tool=shell, command empty
-    fireEvent.change(screen.getByLabelText("Rule decision"), { target: { value: "allow" } });
+  it("warns when an allow rule would match every command (over-broad)", () => {
+    renderPanel(); // tool=Run command, command empty
+    fireEvent.click(screen.getByLabelText("Rule decision"));
+    fireEvent.click(screen.getByRole("option", { name: "allow" }));
 
-    expect(screen.getByText(/matches every shell command/i)).toBeInTheDocument();
+    expect(screen.getByText(/matches every command/i)).toBeInTheDocument();
   });
 
-  it("removes an existing rule through ipc.saveSettings", async () => {
+  it("renders a historical rule with a friendly label and removes it", async () => {
     renderPanel({ rules: [{ tool: "fs_edit", decision: "allow" }] });
+
+    expect(screen.getByText("Edit file")).toBeInTheDocument();
+    expect(screen.queryByText("fs_edit")).not.toBeInTheDocument();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Remove rule 1" }));
@@ -692,7 +1054,7 @@ describe("SettingsPanel — permission modes & rules", () => {
   });
 
   it("does not add a duplicate rule", async () => {
-    // The default form (shell + ask) matches the seeded rule, so adding is a no-op.
+    // The canonical default matches this historical alias, so adding is a no-op.
     renderPanel({ rules: [{ tool: "shell", decision: "ask" }] });
 
     await act(async () => {
@@ -700,6 +1062,91 @@ describe("SettingsPanel — permission modes & rules", () => {
     });
 
     expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("replaces a conflicting legacy rule instead of appending an inert duplicate", async () => {
+    // The form defaults to Run command + ask; the stored equivalent says allow.
+    renderPanel({ rules: [{ tool: "shell", decision: "allow" }] });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    });
+
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      rules: [{ tool: "run_command", decision: "ask" }],
+    });
+  });
+
+  it("puts a newly added rule before a broader rule so first-match evaluation honors it", async () => {
+    renderPanel({ rules: [{ tool: "*", decision: "deny" }] });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    });
+
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      rules: [
+        { tool: "run_command", decision: "ask" },
+        { tool: "*", decision: "deny" },
+      ],
+    });
+  });
+
+  it("keeps an existing command exception before a newly added tool-wide rule", async () => {
+    renderPanel({
+      rules: [{ tool: "run_command", command: "git push", decision: "deny" }],
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    });
+
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      rules: [
+        { tool: "run_command", command: "git push", decision: "deny" },
+        { tool: "run_command", decision: "ask" },
+      ],
+    });
+  });
+
+  it("inserts a command exception before an existing tool-wide rule", async () => {
+    renderPanel({ rules: [{ tool: "shell", decision: "deny" }] });
+    fireEvent.change(screen.getByLabelText("Command prefix"), {
+      target: { value: "git push" },
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    });
+
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      rules: [
+        { tool: "run_command", command: "git push", decision: "ask" },
+        { tool: "shell", decision: "deny" },
+      ],
+    });
+  });
+
+  it("offers friendly names only for tools that can reach the permission gate", () => {
+    renderPanel();
+
+    fireEvent.click(screen.getByLabelText("Rule tool"));
+
+    for (const name of ["Write file", "Edit file", "Run command", "Any tool"]) {
+      expect(screen.getByRole("option", { name })).toBeInTheDocument();
+    }
+    for (const name of [
+      "Read file",
+      "Browse folder",
+      "Find files",
+      "Search project",
+      "Delegate task",
+    ]) {
+      expect(screen.queryByRole("option", { name })).not.toBeInTheDocument();
+    }
+    expect(
+      screen.getByText(/read-only browsing and delegated tasks never require permission rules/i),
+    ).toBeInTheDocument();
   });
 });
 
@@ -885,6 +1332,13 @@ describe("SettingsPanel — appearance toggles", () => {
     u2();
 
     useStore.setState({ update: { phase: "error", info: null, progress: null, error: "x" } });
+    const { unmount: u3 } = renderPanel();
+    expect(screen.getByText(/last check failed/i)).toBeInTheDocument();
+    u3();
+
+    // Quiet startup/periodic failures stay in the idle phase so they do not raise
+    // the global banner, but Settings still tells the user the last check failed.
+    useStore.setState({ update: { phase: "idle", info: null, progress: null, error: "offline" } });
     renderPanel();
     expect(screen.getByText(/last check failed/i)).toBeInTheDocument();
   });
@@ -1127,7 +1581,9 @@ describe("SettingsPanel — Phone Sync section", () => {
     useStore.setState({ remoteMode: true });
     renderPanel();
 
-    expect(screen.getByText("CONNECTION").closest("section")).toHaveClass("hidden");
+    expect(document.getElementById("pc-settings-claude")).toHaveClass("hidden");
+    expect(document.getElementById("pc-settings-openai")).toHaveClass("hidden");
+    expect(document.getElementById("pc-settings-usage")).toHaveClass("hidden");
     expect(screen.getByText("PERMISSIONS").closest("section")).toHaveClass("hidden");
     expect(screen.getByText("PHONE SYNC").closest("section")).toHaveClass("hidden");
     // Appearance (purely client-side UI prefs) stays available.

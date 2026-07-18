@@ -151,13 +151,15 @@ auth, choose one:
 ## Features
 
 - **Streaming agent loop** over the Anthropic Messages API, with a live token + cost meter.
-- **8 tools** — `fs_read`, `list`, `glob`, `grep` (workspace-sandboxed, read-only),
-  `fs_write`, `fs_edit`, and `shell` (mutating and permission-gated), plus `task` for
-  bounded subagent work. Shell commands start in the workspace but are not an OS-level sandbox.
+- **8 clearly named tools** — `read_file`, `list_directory`, `find_files`, and `search_text`
+  (workspace-sandboxed, read-only); `write_file`, `edit_file`, and `run_command` (mutating and
+  permission-gated); plus `delegate_task` for bounded subagent work. Legacy tool names remain
+  accepted when old chats or permission rules are loaded. Commands start in the workspace but
+  are not an OS-level sandbox.
 - **Permission modes and rules** — including a read-only plan mode and pre-apply diffs for file
   changes.
 - **Subagents and background tasks** — parallel bounded subagent execution and non-blocking
-  long-running shell jobs, with live status and cancellation.
+  long-running command jobs, with live status and cancellation.
 - **Permission gate** — `allow` / `ask` / `deny` (+ "always allow") for every mutating tool,
   enforced in the Rust core, not just the UI.
 - **Reviewable diffs** — edits render as colorized unified diffs before they touch disk;
@@ -166,7 +168,7 @@ auth, choose one:
 - **File explorer** — a lazy, `.gitignore`-aware tree; click a file to reference it.
 - **Command palette** (`Ctrl+K`) and keyboard shortcuts (`Ctrl+N` new chat, `Ctrl+B` toggle
   explorer, `Ctrl+,` settings).
-- **PowerShell-aware `shell`** — defaults to Windows PowerShell, with `cmd`/`pwsh` opt-in.
+- **PowerShell-aware `run_command`** — defaults to Windows PowerShell, with `cmd`/`pwsh` opt-in.
 
 ---
 
@@ -188,7 +190,7 @@ portcode/
 │  └─ src/
 │     ├─ agent.rs       # the agent loop
 │     ├─ llm.rs         # Anthropic streaming client
-│     ├─ tools.rs       # the 7-tool registry
+│     ├─ tools.rs       # the 8-tool registry
 │     ├─ permissions.rs # permission gate for mutating tools
 │     ├─ db.rs          # SQLite session persistence
 │     └─ secrets.rs     # Credential Manager wrapper
@@ -203,7 +205,7 @@ Portcode keeps your work on your machine:
 
 - **Keys never hit disk in plaintext** — they live in the Windows Credential Manager.
 - **Workspace sandbox** — file tools cannot read or write outside the folder you open.
-- **Everything destructive is gated** — `fs_write`, `fs_edit`, and `shell` pass through the
+- **Everything destructive is gated** — `write_file`, `edit_file`, and `run_command` pass through the
   permission gate every time (until you choose "always allow").
 - **No telemetry by default** — out of the box Portcode makes no network calls except to the LLM
   provider you configured. No analytics, no tracking, no phone-home.
@@ -215,7 +217,7 @@ Portcode keeps your work on your machine:
   Desktop native-crash reports additionally include an **unscrubbable memory snapshot** — see
   [SECURITY.md](SECURITY.md) for exactly what is and isn't sent. Turn it back off anytime.
 
-Found a vulnerability? Portcode runs `shell` and holds API keys — please disclose privately
+Found a vulnerability? Portcode runs `run_command` and holds API keys — please disclose privately
 via [GitHub Private Vulnerability Reporting](https://github.com/porthex/portcode/security/advisories/new),
 not a public issue. See [SECURITY.md](SECURITY.md).
 

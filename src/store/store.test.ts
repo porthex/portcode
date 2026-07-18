@@ -27,6 +27,7 @@ vi.mock("../lib/ipc", () => ({
   getMessages: vi.fn(),
   deleteSession: vi.fn(),
   renameSession: vi.fn(),
+  updateSessionModel: vi.fn(),
   saveDraft: vi.fn(),
   getDraft: vi.fn(),
   getDrafts: vi.fn(),
@@ -43,6 +44,10 @@ vi.mock("../lib/ipc", () => ({
   oauthStatus: vi.fn(),
   startOauthLogin: vi.fn(),
   oauthLogout: vi.fn(),
+  openaiOauthStatus: vi.fn(),
+  startOpenaiOauthLogin: vi.fn(),
+  openaiOauthLogout: vi.fn(),
+  openaiModels: vi.fn(),
   phoneSyncStatus: vi.fn(),
   phoneSyncBeginPairing: vi.fn(),
   phoneSyncUnpair: vi.fn(),
@@ -92,6 +97,7 @@ beforeEach(() => {
   m.createSession.mockResolvedValue(undefined);
   m.deleteSession.mockResolvedValue(undefined);
   m.renameSession.mockResolvedValue(undefined);
+  m.updateSessionModel.mockResolvedValue(undefined);
   m.saveDraft.mockResolvedValue(undefined);
   m.getDraft.mockResolvedValue(null);
   m.getDrafts.mockResolvedValue([]);
@@ -108,6 +114,10 @@ beforeEach(() => {
   m.oauthStatus.mockResolvedValue(signedOut);
   m.startOauthLogin.mockResolvedValue(signedOut);
   m.oauthLogout.mockResolvedValue(undefined);
+  m.openaiOauthStatus.mockResolvedValue(signedOut);
+  m.startOpenaiOauthLogin.mockResolvedValue(signedOut);
+  m.openaiOauthLogout.mockResolvedValue(undefined);
+  m.openaiModels.mockResolvedValue([]);
   m.phoneSyncStatus.mockResolvedValue(noPhoneSync);
   m.phoneSyncBeginPairing.mockResolvedValue({
     version: 1,
@@ -336,6 +346,24 @@ describe("newSession", () => {
 });
 
 describe("setSessionModel", () => {
+  it.each([
+    ["a streaming turn", { streaming: true }],
+    ["remote mode", { remoteMode: true }],
+    ["a connected remote chat", { remoteConnected: true }],
+  ])("ignores palette model changes during %s", async (_label, guardedState) => {
+    useStore.setState({
+      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      activeId: "a",
+      ...guardedState,
+    });
+
+    await useStore.getState().setSessionModel("gpt-5.6-sol");
+
+    expect(useStore.getState().sessions[0].model).toBe("claude-opus-4-8");
+    expect(m.updateSessionModel).not.toHaveBeenCalled();
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
   it("updates the active session's model and tracks it as the last-used default", async () => {
     useStore.setState({
       sessions: [session({ id: "a", model: "claude-opus-4-8" })],
@@ -346,9 +374,95 @@ describe("setSessionModel", () => {
 
     const st = useStore.getState();
     expect(st.sessions[0].model).toBe("claude-sonnet-4-6");
+    expect(m.updateSessionModel).toHaveBeenCalledWith("a", "claude-sonnet-4-6");
     // Last-used sync: settings.model is updated through ipc.saveSettings.
     expect(m.saveSettings).toHaveBeenCalledWith({ model: "claude-sonnet-4-6" });
     expect(st.settings.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("reverts the optimistic session model when durable persistence fails", async () => {
+    m.updateSessionModel.mockRejectedValueOnce(new Error("database is locked"));
+    useStore.setState({
+      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      activeId: "a",
+    });
+
+    await expect(useStore.getState().setSessionModel("gpt-5.6-sol")).resolves.toBeUndefined();
+
+    const st = useStore.getState();
+    expect(st.sessions[0].model).toBe("claude-opus-4-8");
+    expect(st.settingsError).toBe("database is locked");
+    // The global default must not claim a selection that the active chat rejected.
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("does not let a slower earlier selection overwrite the latest global default", async () => {
+    let resolveFirst!: () => void;
+    m.updateSessionModel
+      .mockImplementationOnce(
+        async () =>
+          new Promise<void>((resolve) => {
+            resolveFirst = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(undefined);
+    useStore.setState({
+      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      activeId: "a",
+    });
+
+    const first = useStore.getState().setSessionModel("claude-sonnet-4-6");
+    const second = useStore.getState().setSessionModel("gpt-5.6-sol");
+    // Per-session writes are serialized: the second invoke cannot overtake the
+    // unresolved first and become vulnerable to the old value finishing last.
+    expect(m.updateSessionModel).toHaveBeenCalledTimes(1);
+    resolveFirst();
+    await Promise.all([first, second]);
+
+    expect(useStore.getState().sessions[0].model).toBe("gpt-5.6-sol");
+    expect(useStore.getState().settings.model).toBe("gpt-5.6-sol");
+    expect(m.saveSettings).toHaveBeenCalledTimes(1);
+    expect(m.saveSettings).toHaveBeenCalledWith(expect.objectContaining({ model: "gpt-5.6-sol" }));
+    expect(m.updateSessionModel.mock.calls).toEqual([
+      ["a", "claude-sonnet-4-6"],
+      ["a", "gpt-5.6-sol"],
+    ]);
+  });
+
+  it("does not surface a stale first-write error after the queued latest choice succeeds", async () => {
+    m.updateSessionModel
+      .mockRejectedValueOnce(new Error("old write failed"))
+      .mockResolvedValueOnce(undefined);
+    useStore.setState({
+      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      activeId: "a",
+    });
+
+    const first = useStore.getState().setSessionModel("claude-sonnet-4-6");
+    const second = useStore.getState().setSessionModel("gpt-5.6-sol");
+    await Promise.all([first, second]);
+
+    expect(useStore.getState().sessions[0].model).toBe("gpt-5.6-sol");
+    expect(useStore.getState().settings.model).toBe("gpt-5.6-sol");
+    expect(useStore.getState().settingsError).toBeNull();
+  });
+
+  it("returns consecutive rejected model writes to the last persisted model", async () => {
+    m.updateSessionModel
+      .mockRejectedValueOnce(new Error("first write failed"))
+      .mockRejectedValueOnce(new Error("latest write failed"));
+    useStore.setState({
+      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      activeId: "a",
+    });
+
+    const first = useStore.getState().setSessionModel("claude-sonnet-4-6");
+    const second = useStore.getState().setSessionModel("gpt-5.6-sol");
+    await Promise.all([first, second]);
+
+    expect(useStore.getState().sessions[0].model).toBe("claude-opus-4-8");
+    expect(useStore.getState().settingsError).toBe("latest write failed");
+    expect(m.saveSettings).not.toHaveBeenCalled();
   });
 
   it("still updates the last-used default when no session is active (palette safety)", async () => {
@@ -357,6 +471,7 @@ describe("setSessionModel", () => {
     await useStore.getState().setSessionModel("claude-haiku-4-5-20251001");
 
     expect(m.saveSettings).toHaveBeenCalledWith({ model: "claude-haiku-4-5-20251001" });
+    expect(m.updateSessionModel).not.toHaveBeenCalled();
     expect(useStore.getState().settings.model).toBe("claude-haiku-4-5-20251001");
   });
 });
@@ -928,6 +1043,35 @@ describe("send", () => {
     }
   });
 
+  it("keeps a timed-out run locked when watchdog cancellation is not acknowledged", async () => {
+    vi.useFakeTimers();
+    try {
+      const cancel = vi.fn(async () => {
+        throw new Error("cancel transport down");
+      });
+      m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+        onEvent({ type: "text_delta", text: "thinking" });
+        return { cancel, dispose: vi.fn() };
+      });
+      useStore.setState({ sessions: [session({ id: "a" })], activeId: "a", messages: { a: [] } });
+
+      await useStore.getState().send("hello?");
+      await vi.advanceTimersByTimeAsync(152_000);
+
+      const st = useStore.getState();
+      expect(cancel).toHaveBeenCalled();
+      expect(st.streaming).toBe(true);
+      expect(st.composerPhase).toBe("thinking");
+      const text = st.messages.a[1].blocks
+        .map((block) => (block.kind === "text" ? block.text : ""))
+        .join("");
+      expect(text).toContain("cancellation could not be confirmed");
+      expect(text).toContain("may still be running");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("recovers a hung REMOTE turn via the idle watchdog so the phone composer isn't stranded", async () => {
     // Symmetric with the local watchdog: in remote mode only a desktop live frame can
     // clear `streaming`. If the channel stays up but the desktop's agent dies without
@@ -1062,7 +1206,8 @@ describe("send", () => {
 
     // User presses Stop mid-await — there's no cancel handle to invoke yet.
     await useStore.getState().stop();
-    expect(useStore.getState().streaming).toBe(false);
+    expect(useStore.getState().streaming).toBe(true);
+    expect(useStore.getState().composerPhase).toBe("stopping");
 
     // Now the backend handle resolves. The post-await block must cancel it
     // (cancel_agent + unlisten), since Stop couldn't reach it earlier.
@@ -1070,6 +1215,7 @@ describe("send", () => {
     await sending;
 
     expect(cancel).toHaveBeenCalledTimes(1); // backend turn actually aborted
+    expect(useStore.getState().streaming).toBe(false);
     expect(useStore.getState().cancel).toBeNull(); // no stale Stop re-armed
   });
 });
@@ -1078,6 +1224,21 @@ describe("stop", () => {
   it("cancels the active run and clears streaming flags", async () => {
     const cancel = vi.fn(async () => {});
     useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: {
+        a: [
+          {
+            id: "assistant",
+            role: "assistant",
+            blocks: [{ kind: "tool_use", id: "t1", name: "shell", input: {} }],
+            createdAt: 1,
+          },
+        ],
+      },
+      agents: {
+        a: [{ id: "child", description: "check", status: "running", step: 1 }],
+      },
       streaming: true,
       cancel,
       pendingPermission: { id: "p", tool: "t", summary: "s", input: {} },
@@ -1090,16 +1251,36 @@ describe("stop", () => {
     expect(st.streaming).toBe(false);
     expect(st.cancel).toBeNull();
     expect(st.pendingPermission).toBeNull();
+    expect(st.messages.a[0].blocks).toContainEqual(
+      expect.objectContaining({
+        kind: "tool_result",
+        toolUseId: "t1",
+        isError: true,
+        output: expect.stringContaining("Interrupted:"),
+      }),
+    );
+    expect(st.agents.a[0].status).toBe("cancelled");
   });
 
-  it("clears the composer even when the cancel_agent IPC rejects (never bricks the UI)", async () => {
-    // A rejecting cancel (core busy/locked/dead) must not strand the composer: stop()
-    // wraps the cancel call so streaming/cancel/pendingPermission are always cleared
-    // and the rejection never escapes as an unhandled promise rejection.
+  it("keeps the run locked and surfaces uncertainty when cancel_agent rejects", async () => {
+    // A rejected cancel is not proof the backend stopped. Keep the listener/run lock
+    // alive so the user cannot start a conflicting second turn, and state uncertainty.
     const cancel = vi.fn(async () => {
       throw new Error("cancel failed");
     });
     useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: {
+        a: [
+          {
+            id: "assistant",
+            role: "assistant",
+            blocks: [{ kind: "tool_use", id: "t1", name: "shell", input: {} }],
+            createdAt: 1,
+          },
+        ],
+      },
       streaming: true,
       cancel,
       pendingPermission: { id: "p", tool: "t", summary: "s", input: {} },
@@ -1109,9 +1290,19 @@ describe("stop", () => {
 
     expect(cancel).toHaveBeenCalledTimes(1);
     const st = useStore.getState();
-    expect(st.streaming).toBe(false);
-    expect(st.cancel).toBeNull();
-    expect(st.pendingPermission).toBeNull();
+    expect(st.streaming).toBe(true);
+    expect(st.cancel).toBe(cancel);
+    expect(st.pendingPermission).not.toBeNull();
+    expect(st.composerPhase).toBe("thinking");
+    expect(st.messages.a[0].blocks).not.toContainEqual(
+      expect.objectContaining({ kind: "tool_result", toolUseId: "t1" }),
+    );
+    expect(st.messages.a[0].blocks).toContainEqual(
+      expect.objectContaining({
+        kind: "text",
+        text: expect.stringContaining("Stop could not be confirmed"),
+      }),
+    );
   });
 
   it("stops a remote turn with a Cancel command, not the (absent) local cancel", async () => {
@@ -1146,21 +1337,21 @@ describe("resolvePermission", () => {
     expect(useStore.getState().pendingPermission).toBeNull();
   });
 
-  it("allow-always adds a SCOPED allow-rule for the tool (not a global policy flip)", async () => {
+  it("allow-always canonicalizes a legacy file-tool rule", async () => {
     useStore.setState({
       pendingPermission: { id: "p1", tool: "fs_edit", summary: "x", input: {} },
     });
 
     await useStore.getState().resolvePermission("allow", true);
 
-    // A non-shell tool scopes to the tool itself, not allow-everything.
+    // A file tool scopes to its canonical ID, not allow-everything.
     expect(m.saveSettings).toHaveBeenCalledWith({
-      rules: [{ tool: "fs_edit", decision: "allow" }],
+      rules: [{ tool: "edit_file", decision: "allow" }],
     });
     expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
   });
 
-  it("allow-always for a shell call scopes the rule to that command", async () => {
+  it("allow-always canonicalizes a legacy command tool and scopes it to that command", async () => {
     useStore.setState({
       pendingPermission: {
         id: "p2",
@@ -1173,20 +1364,80 @@ describe("resolvePermission", () => {
     await useStore.getState().resolvePermission("allow", true);
 
     expect(m.saveSettings).toHaveBeenCalledWith({
-      rules: [{ tool: "shell", command: "git status", decision: "allow" }],
+      rules: [{ tool: "run_command", command: "git status", decision: "allow" }],
     });
   });
 
   it("allow-always does not add a duplicate rule if an equivalent one exists", async () => {
     useStore.setState({
       settings: { ...DEFAULT_SETTINGS, rules: [{ tool: "fs_edit", decision: "allow" }] },
-      pendingPermission: { id: "p3", tool: "fs_edit", summary: "x", input: {} },
+      pendingPermission: { id: "p3", tool: "edit_file", summary: "x", input: {} },
     });
 
     await useStore.getState().resolvePermission("allow", true);
 
     // The gate is still answered, but no redundant settings save is made.
     expect(m.resolvePermission).toHaveBeenCalledWith("p3", "allow");
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("allow-always replaces a conflicting rule for the same scope", async () => {
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS, rules: [{ tool: "fs_edit", decision: "ask" }] },
+      pendingPermission: { id: "p-conflict", tool: "edit_file", summary: "x", input: {} },
+    });
+
+    await useStore.getState().resolvePermission("allow", true);
+
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      rules: [{ tool: "edit_file", decision: "allow" }],
+    });
+  });
+
+  it("allow-always moves a scoped command allow ahead of a broader shadowing rule", async () => {
+    useStore.setState({
+      settings: {
+        ...DEFAULT_SETTINGS,
+        rules: [
+          { tool: "run_command", decision: "ask" },
+          { tool: "shell", command: "git status", decision: "allow" },
+        ],
+      },
+      pendingPermission: {
+        id: "p-shadowed",
+        tool: "run_command",
+        summary: "git status",
+        input: { command: "git status" },
+      },
+    });
+
+    await useStore.getState().resolvePermission("allow", true);
+
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      rules: [
+        { tool: "run_command", command: "git status", decision: "allow" },
+        { tool: "run_command", decision: "ask" },
+      ],
+    });
+  });
+
+  it("treats a saved legacy command rule as equivalent to a canonical request", async () => {
+    useStore.setState({
+      settings: {
+        ...DEFAULT_SETTINGS,
+        rules: [{ tool: "shell", command: "git status", decision: "allow" }],
+      },
+      pendingPermission: {
+        id: "p4",
+        tool: "run_command",
+        summary: "git status",
+        input: { command: "git status" },
+      },
+    });
+
+    await useStore.getState().resolvePermission("allow", true);
+
+    expect(m.resolvePermission).toHaveBeenCalledWith("p4", "allow");
     expect(m.saveSettings).not.toHaveBeenCalled();
   });
 
@@ -1560,13 +1811,17 @@ describe("composer presence phase", () => {
     expect(useStore.getState().streaming).toBe(false);
   });
 
-  it("names the running tool on tool_use and clears it on tool_result", async () => {
+  it("keeps the remaining parallel tool visible until its own result arrives", async () => {
     const emit = await startTurn();
     emit({ type: "tool_use", id: "t1", name: "grep", input: { pattern: "x" } });
     expect(useStore.getState().activeTool).toBe("grep");
     // A tool is a real first event, so the phase also settles to thinking.
     expect(useStore.getState().composerPhase).toBe("thinking");
+    emit({ type: "tool_use", id: "t2", name: "shell", input: { command: "pwd" } });
+    expect(useStore.getState().activeTool).toBe("shell");
     emit({ type: "tool_result", id: "t1", output: "ok", isError: false });
+    expect(useStore.getState().activeTool).toBe("shell");
+    emit({ type: "tool_result", id: "t2", output: "ok", isError: false });
     expect(useStore.getState().activeTool).toBeNull();
     emit({ type: "turn_end", stopReason: "end_turn" });
   });
@@ -1575,9 +1830,18 @@ describe("composer presence phase", () => {
     const emit = await startTurn();
     emit({ type: "tool_use", id: "t1", name: "shell", input: {} });
     expect(useStore.getState().activeTool).toBe("shell");
-    // The turn ends mid-tool (no tool_result); send() must reset the label up front
-    // so it can't leak into the next turn's presence.
-    emit({ type: "turn_end", stopReason: "end_turn" });
+    // The turn ends mid-tool (no tool_result): terminalize the card immediately so
+    // it cannot pulse forever, and reset the presence label.
+    emit({ type: "turn_end", stopReason: "cancelled" });
+    const toolResult = useStore
+      .getState()
+      .messages.a[1].blocks.find((block) => block.kind === "tool_result");
+    expect(toolResult).toMatchObject({
+      kind: "tool_result",
+      toolUseId: "t1",
+      isError: true,
+      output: expect.stringContaining("Interrupted:"),
+    });
     const emit2 = await startTurn();
     expect(useStore.getState().activeTool).toBeNull();
     emit2({ type: "turn_end", stopReason: "end_turn" });
@@ -1696,8 +1960,10 @@ describe("UI setters", () => {
 
     useStore.getState().setShowSettings(true);
     useStore.getState().setShowPalette(true);
+    useStore.getState().setWorkspaceSurface("review");
     expect(useStore.getState().showSettings).toBe(true);
     expect(useStore.getState().showPalette).toBe(true);
+    expect(useStore.getState().workspaceSurface).toBe("review");
   });
 
   it("toggleSidebar flips the mobile drawer and setShowSidebar sets it", () => {
@@ -1876,6 +2142,196 @@ describe("oauth (Claude subscription sign-in)", () => {
     m.oauthLogout.mockRejectedValue(new Error("logout failed"));
     await useStore.getState().logoutClaude();
     expect(useStore.getState().oauthError).toBe("logout failed");
+  });
+});
+
+describe("OpenAI subscription auth and live catalogue", () => {
+  const signedIn = {
+    signedIn: true,
+    expiresAt: 9999,
+    account: "me@openai.com",
+    tier: "ChatGPT Plus",
+  };
+  const liveRows = [
+    {
+      id: "gpt-live",
+      label: "GPT Live",
+      reasoningEfforts: ["low", "high"],
+      defaultReasoningEffort: "high",
+    },
+  ];
+
+  it("hydrates OpenAI status and replaces fallback models with a non-empty live catalogue", async () => {
+    m.openaiOauthStatus.mockResolvedValue(signedIn);
+    m.openaiModels.mockResolvedValue(liveRows);
+
+    await useStore.getState().init();
+
+    expect(useStore.getState().openAIAuthStatus).toEqual(signedIn);
+    expect(useStore.getState().openAIModels).toEqual([
+      {
+        ...liveRows[0],
+        provider: "openai",
+      },
+    ]);
+  });
+
+  it("refreshes OpenAI auth and capabilities after startup", async () => {
+    m.openaiOauthStatus.mockResolvedValue(signedIn);
+    m.openaiModels.mockResolvedValue(liveRows);
+
+    await useStore.getState().refreshOpenAIStatus();
+
+    expect(useStore.getState().openAIAuthStatus).toEqual(signedIn);
+    expect(useStore.getState().openAIModels.map((model) => model.id)).toEqual(["gpt-live"]);
+  });
+
+  it("fails closed at startup when this build disables OpenAI subscription access", async () => {
+    m.getSettings.mockResolvedValue({
+      ...DEFAULT_SETTINGS,
+      provider: "openai",
+      model: "gpt-5.6-sol",
+    });
+    m.openaiOauthStatus.mockResolvedValue({
+      signedIn: false,
+      expiresAt: null,
+      account: null,
+      tier: null,
+      available: false,
+      unavailableReason: "Disabled in this build",
+    });
+
+    await useStore.getState().init();
+
+    const state = useStore.getState();
+    expect(state.openAIModels).toEqual([]);
+    expect(state.settings).toMatchObject({
+      provider: "anthropic",
+      model: DEFAULT_SETTINGS.model,
+    });
+    expect(m.openaiModels).not.toHaveBeenCalled();
+    expect(m.createSession).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(String),
+      null,
+      DEFAULT_SETTINGS.model,
+    );
+  });
+
+  it("clears the OpenAI catalogue when a capability refresh reports unavailable", async () => {
+    const unavailable = {
+      signedIn: false,
+      expiresAt: null,
+      account: null,
+      tier: null,
+      available: false,
+      unavailableReason: "Disabled in this build",
+    };
+    useStore.setState({
+      openAIModels: [{ ...liveRows[0], provider: "openai" }],
+    });
+    m.openaiOauthStatus.mockResolvedValue(unavailable);
+
+    await useStore.getState().refreshOpenAIStatus();
+
+    expect(useStore.getState().openAIAuthStatus).toEqual(unavailable);
+    expect(useStore.getState().openAIModels).toEqual([]);
+    expect(m.openaiModels).not.toHaveBeenCalled();
+  });
+
+  it("keeps startup resilient when both OpenAI discovery calls fail", async () => {
+    m.openaiOauthStatus.mockRejectedValue(new Error("auth unavailable"));
+    m.openaiModels.mockRejectedValue(new Error("catalog unavailable"));
+
+    await useStore.getState().init();
+
+    expect(useStore.getState().openAIAuthStatus).toBeNull();
+    expect(useStore.getState().openAIModels.length).toBeGreaterThan(0);
+  });
+
+  it("login refreshes capabilities and persists the advertised default when needed", async () => {
+    useStore.setState({
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: "gpt-live",
+        reasoningEffort: "medium",
+      },
+      openAIAuthError: "old error",
+    });
+    m.startOpenaiOauthLogin.mockResolvedValue(signedIn);
+    m.openaiModels.mockResolvedValue(liveRows);
+    m.saveSettings.mockImplementation(async (patch) => ({
+      ...useStore.getState().settings,
+      ...patch,
+    }));
+
+    await useStore.getState().loginWithOpenAI();
+
+    expect(useStore.getState().openAIAuthStatus).toEqual(signedIn);
+    expect(useStore.getState().openAIAuthError).toBeNull();
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      provider: "openai",
+      reasoningEffort: "high",
+    });
+    expect(useStore.getState().settings.reasoningEffort).toBe("high");
+  });
+
+  it("selecting an OpenAI model persists its provider and supported reasoning level", async () => {
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      openAIModels: [
+        {
+          id: "gpt-live",
+          label: "GPT Live",
+          provider: "openai",
+          reasoningEfforts: ["high"],
+          defaultReasoningEffort: "high",
+        },
+      ],
+    });
+
+    await useStore.getState().setSessionModel("gpt-live");
+
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      model: "gpt-live",
+      provider: "openai",
+      reasoningEffort: "high",
+    });
+    expect(useStore.getState().sessions[0].model).toBe("gpt-live");
+  });
+
+  it("records login failures and clears status on logout", async () => {
+    m.startOpenaiOauthLogin.mockRejectedValueOnce(new Error("denied"));
+    await useStore.getState().loginWithOpenAI();
+    expect(useStore.getState().openAIAuthError).toBe("denied");
+
+    useStore.setState({ openAIAuthStatus: signedIn });
+    await useStore.getState().logoutOpenAI();
+    expect(m.openaiOauthLogout).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().openAIAuthStatus?.signedIn).toBe(false);
+  });
+
+  it("surfaces a disabled login capability and preserves it across logout", async () => {
+    const unavailable = {
+      signedIn: false,
+      expiresAt: null,
+      account: null,
+      tier: null,
+      available: false,
+      unavailableReason: "Disabled in this build",
+    };
+    m.startOpenaiOauthLogin.mockResolvedValue(unavailable);
+
+    await useStore.getState().loginWithOpenAI();
+
+    expect(useStore.getState().openAIModels).toEqual([]);
+    expect(useStore.getState().openAIAuthError).toBe("Disabled in this build");
+    expect(m.openaiModels).not.toHaveBeenCalled();
+
+    await useStore.getState().logoutOpenAI();
+    expect(useStore.getState().openAIAuthStatus).toEqual(unavailable);
   });
 });
 
@@ -2190,6 +2646,25 @@ describe("remote client", () => {
       const msgs = useStore.getState().messages.s1;
       expect(msgs).toEqual([
         { id: "r1", role: "assistant", blocks: [{ kind: "text", text: "ok" }], createdAt: 7 },
+      ]);
+    });
+
+    it("drops encrypted OpenAI reasoning metadata before messages reach rendering", () => {
+      useStore.getState().applyFrame({
+        t: "message_delta",
+        session_id: "s1",
+        messages: [
+          row({
+            content: [
+              { type: "reasoning", id: "r", encrypted_content: "secret", summary: [] },
+              { kind: "text", text: "safe answer" },
+            ],
+          }),
+        ],
+      });
+
+      expect(useStore.getState().messages.s1[0].blocks).toEqual([
+        { kind: "text", text: "safe answer" },
       ]);
     });
 
@@ -3828,6 +4303,30 @@ describe("auto-update", () => {
       const st = useStore.getState();
       expect(st.update.phase).toBe("error");
       expect(st.update.error).toBe("no updater here");
+    });
+
+    it("records a background check failure without raising the global banner", async () => {
+      m.checkForUpdate.mockRejectedValue(new Error("offline"));
+
+      await useStore.getState().checkForUpdate({ background: true });
+
+      expect(useStore.getState().update).toEqual({
+        phase: "idle",
+        info: null,
+        progress: null,
+        error: "offline",
+      });
+    });
+
+    it("does not let a background poll displace a staged update", async () => {
+      useStore.setState({
+        update: { phase: "ready", info: info(), progress: 100, error: null },
+      });
+
+      await useStore.getState().checkForUpdate({ background: true });
+
+      expect(m.checkForUpdate).not.toHaveBeenCalled();
+      expect(useStore.getState().update.phase).toBe("ready");
     });
   });
 

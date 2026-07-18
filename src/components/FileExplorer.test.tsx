@@ -314,6 +314,113 @@ describe("FileExplorer tree", () => {
   });
 });
 
+describe("FileExplorer generated-directory view", () => {
+  it("hides known generated roots by default but keeps source dotfolders visible", async () => {
+    m.listDir.mockResolvedValueOnce([
+      entry({ name: "src", path: "src", isDir: true }),
+      entry({ name: ".agents", path: ".agents", isDir: true }),
+      entry({ name: ".cargo", path: ".cargo", isDir: true }),
+      entry({ name: ".claude", path: ".claude", isDir: true }),
+      entry({ name: ".codex", path: ".codex", isDir: true }),
+      entry({ name: ".pnpm-store", path: ".pnpm-store", isDir: true }),
+      entry({ name: "coverage", path: "coverage", isDir: true }),
+      entry({ name: "graphify-out", path: "graphify-out", isDir: true }),
+      entry({ name: "target", path: "target", isDir: true }),
+      entry({ name: "web-dist", path: "web-dist", isDir: true }),
+    ]);
+
+    render(<FileExplorer />);
+
+    expect(await screen.findByRole("treeitem", { name: "src folder" })).toBeInTheDocument();
+    expect(screen.getByRole("treeitem", { name: ".agents folder" })).toBeInTheDocument();
+    expect(screen.getByRole("treeitem", { name: ".cargo folder" })).toBeInTheDocument();
+    expect(screen.getByRole("treeitem", { name: ".claude folder" })).toBeInTheDocument();
+    expect(screen.getByRole("treeitem", { name: ".codex folder" })).toBeInTheDocument();
+    expect(screen.queryByRole("treeitem", { name: /coverage folder/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("treeitem", { name: /target folder/ })).not.toBeInTheDocument();
+    expect(screen.getByText("5 generated hidden")).toBeInTheDocument();
+  });
+
+  it("reveals generated roots on demand and visually labels them", async () => {
+    m.listDir.mockResolvedValueOnce([
+      entry({ name: "src", path: "src", isDir: true }),
+      entry({ name: "node_modules", path: "node_modules", isDir: true }),
+      entry({ name: "coverage", path: "coverage", isDir: true }),
+    ]);
+
+    render(<FileExplorer />);
+    await screen.findByRole("treeitem", { name: "src folder" });
+
+    const show = screen.getByRole("button", { name: "Show generated and internal folders" });
+    expect(show).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(show);
+
+    expect(
+      screen.getByRole("treeitem", { name: "node_modules folder, generated" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("treeitem", { name: "coverage folder, generated" }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("generated")).toHaveLength(2);
+    expect(
+      screen.getByRole("button", { name: "Hide generated and internal folders" }),
+    ).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("applies the generated filter inside expanded source folders", async () => {
+    m.listDir
+      .mockResolvedValueOnce([entry({ name: "src-tauri", path: "src-tauri", isDir: true })])
+      .mockResolvedValueOnce([
+        entry({ name: "src", path: "src-tauri/src", isDir: true }),
+        entry({ name: "target", path: "src-tauri/target", isDir: true }),
+      ]);
+
+    render(<FileExplorer />);
+    const parent = await screen.findByRole("treeitem", { name: "src-tauri folder" });
+    fireEvent.click(parent);
+
+    expect(await screen.findByRole("treeitem", { name: "src folder" })).toBeInTheDocument();
+    expect(screen.queryByRole("treeitem", { name: /target folder/ })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show generated and internal folders" }));
+    expect(screen.getByRole("treeitem", { name: "target folder, generated" })).toBeInTheDocument();
+    expect(m.listDir).toHaveBeenCalledTimes(2);
+  });
+
+  it("offers an inline reveal when every root is generated", async () => {
+    m.listDir.mockResolvedValueOnce([
+      entry({ name: "node_modules", path: "node_modules", isDir: true }),
+      entry({ name: "target", path: "target", isDir: true }),
+    ]);
+
+    render(<FileExplorer />);
+
+    expect(await screen.findByText("Only generated folders are hidden.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show generated folders" }));
+    expect(
+      screen.getByRole("treeitem", { name: "node_modules folder, generated" }),
+    ).toBeInTheDocument();
+  });
+
+  it("restores the roving tab stop to source when generated rows are hidden again", async () => {
+    m.listDir.mockResolvedValueOnce([
+      entry({ name: "target", path: "target", isDir: true }),
+      entry({ name: "src", path: "src", isDir: true }),
+    ]);
+
+    render(<FileExplorer />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Show generated and internal folders" }),
+    );
+    const generated = screen.getByRole("treeitem", { name: "target folder, generated" });
+    generated.focus();
+    expect(generated).toHaveAttribute("tabindex", "0");
+
+    fireEvent.click(screen.getByRole("button", { name: "Hide generated and internal folders" }));
+    expect(screen.getByRole("treeitem", { name: "src folder" })).toHaveAttribute("tabindex", "0");
+  });
+});
+
 describe("FileExplorer accessibility", () => {
   it("labels the <aside> landmark so it is a named complementary region", async () => {
     render(<FileExplorer />);
@@ -633,6 +740,19 @@ describe("FileExplorer right-click context menu", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Copy path" }));
 
     expect(writeText).toHaveBeenCalledWith("docs/notes.md");
+  });
+
+  it("treats a rejected clipboard write as a harmless best-effort failure", async () => {
+    writeText.mockRejectedValueOnce(new Error("clipboard blocked"));
+    m.listDir.mockResolvedValueOnce([entry({ name: "notes.md", path: "docs/notes.md" })]);
+    render(<FileExplorer />);
+
+    const fileRow = await screen.findByRole("treeitem", { name: /notes\.md/ });
+    fireEvent.contextMenu(fileRow);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy path" }));
+
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("docs/notes.md"));
+    expect(fileRow).toBeInTheDocument();
   });
 
   it("offers Expand on a closed directory and toggles it open", async () => {

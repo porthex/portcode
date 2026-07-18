@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, act } from "@testing-library/react";
 
 import { Chat } from "./Chat";
 import { useStore } from "../store/store";
@@ -144,6 +144,96 @@ describe("Chat transcript", () => {
     expect(screen.getByText("in-flight prompt")).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: EMPTY_HEADING })).not.toBeInTheDocument();
   });
+
+  it("passes the streaming lifecycle through to live Markdown and activity wording", () => {
+    const assistantMessage: Message = {
+      id: "m2",
+      role: "assistant",
+      blocks: [
+        { kind: "tool_use", id: "read-1", name: "fs_read", input: { path: "src/App.tsx" } },
+        {
+          kind: "tool_result",
+          toolUseId: "read-1",
+          output: "contents",
+          isError: false,
+        },
+        { kind: "text", text: "## Project summary\n\n**Ready**" },
+      ],
+      createdAt: 2,
+    };
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "inspect it"), assistantMessage] },
+      streaming: true,
+      settings: { ...initial.settings, typingAnimation: false },
+    });
+
+    render(<Chat />);
+
+    expect(screen.getByText("Reading file")).toBeInTheDocument();
+    expect(screen.queryByText("Read file")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 2, name: "Project summary" })).toBeInTheDocument();
+    expect(screen.getByText("Ready").tagName).toBe("STRONG");
+
+    act(() => useStore.setState({ streaming: false }));
+
+    expect(screen.getByText("Read file")).toBeInTheDocument();
+    expect(screen.queryByText("Reading file")).not.toBeInTheDocument();
+  });
+
+  it("keeps a 220-message / 880-tool transcript structurally compact", () => {
+    const messages: Message[] = Array.from({ length: 220 }, (_, messageIndex) => {
+      const blocks: ContentBlock[] = [];
+      const specs = [
+        { name: "fs_read", input: { path: `src/file-${messageIndex}-a.ts` } },
+        { name: "fs_read", input: { path: `src/file-${messageIndex}-b.ts` } },
+        { name: "grep", input: { pattern: `needle-${messageIndex}` } },
+        { name: "list", input: { path: `src/feature-${messageIndex}` } },
+      ];
+      specs.forEach((spec, toolIndex) => {
+        const id = `tool-${messageIndex}-${toolIndex}`;
+        blocks.push({ kind: "tool_use", id, name: spec.name, input: spec.input });
+        blocks.push({
+          kind: "tool_result",
+          toolUseId: id,
+          output: `result-${messageIndex}-${toolIndex}`,
+          isError: false,
+        });
+      });
+      return {
+        id: `bulk-${messageIndex}`,
+        role: "assistant",
+        blocks,
+        createdAt: messageIndex,
+      };
+    });
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: messages },
+      streaming: false,
+    });
+
+    const { container } = render(<Chat />);
+
+    // All transcript anchors remain present for search jumps/pagination, while
+    // each four-call exploration phase contributes only one compact DOM card.
+    const rows = container.querySelectorAll('[id^="pc-msg-bulk-"]');
+    expect(rows).toHaveLength(220);
+    expect(container.querySelectorAll(".pc-toolcall")).toHaveLength(220);
+    expect(screen.getAllByText("Explored project")).toHaveLength(220);
+    expect(screen.getAllByText("2 files read · 1 search · 1 folder listed")).toHaveLength(220);
+
+    // 880 raw cards and their result payloads must not exist until a specific
+    // group is expanded. Settled rows opt into browser offscreen containment.
+    expect(screen.queryByText("fs_read")).not.toBeInTheDocument();
+    expect(screen.queryByText("result-219-3")).not.toBeInTheDocument();
+    expect(
+      Array.from(rows).every((row) => (row as HTMLElement).style.contentVisibility === "auto"),
+    ).toBe(true);
+    expect(container.querySelector("#pc-msg-bulk-219")).toBeInTheDocument();
+  });
 });
 
 describe("Chat children", () => {
@@ -164,6 +254,66 @@ describe("Chat children", () => {
     ).toBeInTheDocument();
     // PermissionPrompt returns null when nothing is pending.
     expect(screen.queryByText(/wants to run/i)).not.toBeInTheDocument();
+  });
+
+  it("does not render the legacy Subagents dropdown above the composer", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "delegate this work")] },
+      agents: {
+        s1: [
+          {
+            id: "agent-1",
+            description: "Audit the workspace",
+            status: "running",
+            step: 2,
+          },
+        ],
+      },
+      streaming: true,
+    });
+
+    render(<Chat />);
+
+    expect(screen.queryByRole("region", { name: "Subagents" })).not.toBeInTheDocument();
+    expect(screen.queryByText("1 subagent running")).not.toBeInTheDocument();
+    expect(screen.getByTestId("chat-composer-area")).toBeInTheDocument();
+  });
+
+  it("compacts only the transcript while the full-width composer stays fixed", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "keep the input wide")] },
+      streaming: false,
+    });
+
+    const panel = <aside data-testid="test-environment-panel">Environment</aside>;
+    const { rerender } = render(<Chat transcriptAside={panel} transcriptAsideOpen={false} />);
+    const layout = screen.getByTestId("chat-transcript-layout");
+    const scrollArea = screen.getByTestId("chat-transcript-scroll");
+    const content = screen.getByTestId("chat-transcript-content");
+    const aside = screen.getByTestId("chat-transcript-aside");
+    const asideFrame = screen.getByTestId("chat-transcript-aside-frame");
+    const composerArea = screen.getByTestId("chat-composer-area");
+
+    expect(layout).toHaveClass("@container", "relative", "overflow-hidden");
+    expect(scrollArea).toHaveClass("absolute", "inset-0", "overflow-y-auto");
+    expect(content).not.toHaveClass("@min-[734px]:pr-[390px]");
+    expect(aside).toHaveAttribute("inert");
+    expect(aside).toHaveClass("absolute", "right-3", "max-w-[354px]");
+    expect(asideFrame).toHaveClass("w-full", "py-3", "pl-3");
+    expect(layout).not.toContainElement(composerArea);
+    expect(composerArea).toHaveClass("w-full");
+    expect(layout.parentElement).toBe(composerArea.parentElement);
+
+    rerender(<Chat transcriptAside={panel} transcriptAsideOpen />);
+
+    expect(content).toHaveClass("@min-[734px]:pr-[390px]");
+    expect(scrollArea).toHaveClass("absolute", "inset-0");
+    expect(aside).not.toHaveAttribute("inert");
+    expect(composerArea).toHaveClass("w-full");
   });
 });
 
@@ -445,6 +595,26 @@ describe("Chat scroll-to-latest affordance", () => {
     expect(screen.queryByRole("button", { name: "Scroll to latest" })).not.toBeInTheDocument();
   });
 
+  it("only shifts the button for an open aside at the transcript container breakpoint", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "hi")] },
+      streaming: false,
+    });
+
+    const { container } = render(
+      <Chat transcriptAside={<aside>Environment</aside>} transcriptAsideOpen />,
+    );
+    const scroller = container.querySelector(".overflow-y-auto") as HTMLElement;
+    stubScrolledUp(scroller);
+    fireEvent.scroll(scroller);
+
+    const button = screen.getByRole("button", { name: "Scroll to latest" });
+    expect(button).toHaveClass("right-4", "@min-[734px]:right-[382px]");
+    expect(button).not.toHaveStyle({ right: "382px" });
+  });
+
   it("never shows the button when there are no messages", () => {
     useStore.setState({
       activeId: "s1",
@@ -607,6 +777,66 @@ describe("Chat EmptyState auth affordance", () => {
     expect(
       screen.queryByText("Sign in with Claude or add an API key to start"),
     ).not.toBeInTheDocument();
+  });
+
+  it("gates an OpenAI model on ChatGPT subscription auth, not the Anthropic key", () => {
+    useStore.setState({
+      activeId: null,
+      messages: {},
+      streaming: false,
+      remoteMode: false,
+      openAIAuthStatus: null,
+      settings: {
+        ...initial.settings,
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        apiKeySet: true,
+      },
+    });
+
+    const { rerender } = render(<Chat />);
+    expect(screen.getByText("Sign in with ChatGPT to start")).toBeInTheDocument();
+
+    act(() =>
+      useStore.setState({
+        openAIAuthStatus: { signedIn: true, expiresAt: null, account: null, tier: null },
+      }),
+    );
+    rerender(<Chat />);
+    expect(screen.queryByText("Sign in with ChatGPT to start")).toBeNull();
+  });
+
+  it("directs unavailable OpenAI builds to Claude instead of asking for ChatGPT sign-in", () => {
+    const setShowSettings = vi.fn();
+    useStore.setState({
+      activeId: null,
+      messages: {},
+      streaming: false,
+      remoteMode: false,
+      openAIAuthStatus: {
+        signedIn: false,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: false,
+        unavailableReason: "Disabled in this build",
+      },
+      settings: {
+        ...initial.settings,
+        provider: "openai",
+        model: "gpt-5.6-sol",
+      },
+      setShowSettings,
+    });
+
+    render(<Chat />);
+
+    expect(
+      screen.getByText("Disabled in this build. Choose Claude in Settings to start"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Sign in with ChatGPT to start")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Choose Claude" }));
+    expect(setShowSettings).toHaveBeenCalledWith(true);
   });
 
   it("suppresses the nudge in remote mode even when unauthenticated", () => {

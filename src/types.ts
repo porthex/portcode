@@ -1,12 +1,27 @@
 // Shared types. These mirror the Rust core's serde models so the IPC boundary
 // stays a single source of truth.
 
+import type { ToolName } from "./lib/toolNames";
+
 export type Role = "user" | "assistant" | "system";
 
 export type ContentBlock =
   | { kind: "text"; text: string }
-  | { kind: "tool_use"; id: string; name: string; input: unknown }
+  | { kind: "tool_use"; id: string; name: ToolName; input: unknown }
   | { kind: "tool_result"; toolUseId: string; output: string; isError: boolean };
+
+/**
+ * Defensive compatibility shape for opaque OpenAI continuation metadata from
+ * an older/raw sync peer. Current desktop builds filter it before Phone Sync;
+ * it is never a renderable ContentBlock.
+ */
+export interface ReasoningWireBlock {
+  type: "reasoning";
+  model?: string | null;
+  id?: string | null;
+  encrypted_content?: string | null;
+  summary?: unknown[];
+}
 
 export interface Message {
   id: string;
@@ -73,32 +88,32 @@ export interface SessionFolder {
 export type StreamEvent =
   | { type: "turn_start"; messageId: string }
   | { type: "text_delta"; text: string }
-  | { type: "tool_use"; id: string; name: string; input: unknown }
+  | { type: "tool_use"; id: string; name: ToolName; input: unknown }
   | { type: "tool_result"; id: string; output: string; isError: boolean }
   | {
       type: "permission_request";
       id: string;
-      tool: string;
+      tool: ToolName;
       summary: string;
       input: unknown;
-      /** Pre-apply unified diff for file tools; absent for shell/other. */
+      /** Pre-apply unified diff for file tools; absent for commands/other. */
       diff?: string;
     }
   | { type: "usage"; inputTokens: number; outputTokens: number }
   | { type: "turn_end"; stopReason: string }
   | { type: "error"; message: string }
-  // ── subagents (the `task` tool) — see AgentInfo / the live agents panel ──
+  // ── subagents (`delegate_task`; historical `task`) ─────────────────────
   /** A subagent started. `parentId` is the launching subagent, absent at top level. */
   | { type: "agent_started"; agentId: string; description: string; parentId?: string }
   /** A subagent completed a model turn — `step` is its 1-based turn count. */
   | { type: "agent_progress"; agentId: string; step: number }
   /** A subagent finished. `status` is "ok" | "cancelled" | "error". */
   | { type: "agent_finished"; agentId: string; status: string }
-  // ── background shell tasks (the `shell` tool's background mode) ──────────────
-  /** A `shell` command was launched in the background. Emitted on the SESSION
+  // ── background command tasks (`run_command`; historical `shell`) ─────────────
+  /** A command was launched in the background. Emitted on the SESSION
    *  channel, so the persistent session listener (not the per-turn one) tracks it. */
   | { type: "background_task_started"; id: string; command: string }
-  /** A background `shell` command finished. Can arrive AFTER the launching turn
+  /** A background command finished. Can arrive AFTER the launching turn
    *  ended, which is why it rides the persistent session listener. */
   | {
       type: "background_task_finished";
@@ -111,11 +126,11 @@ export type StreamEvent =
 /** Terminal/live state of a subagent in the agents panel. */
 export type AgentStatus = "running" | "ok" | "cancelled" | "error";
 
-/** Live/terminal state of a background shell task. `running` until it finishes,
+/** Live/terminal state of a background command task. `running` until it finishes,
  *  then `ok` (exit 0) or `error` (any non-zero / failed-to-run exit). */
 export type BackgroundTaskStatus = "running" | "ok" | "error";
 
-/** A background shell task (the `shell` tool's background mode) tracked per session
+/** A background command task (`run_command` background mode) tracked per session
  *  for the background-tasks panel. Outlives the turn that launched it. */
 export interface BackgroundTaskInfo {
   id: string;
@@ -127,7 +142,7 @@ export interface BackgroundTaskInfo {
   output?: string;
 }
 
-/** A subagent (the `task` tool) tracked for the live agents panel. */
+/** A subagent (`delegate_task`) tracked for the live agents panel. */
 export interface AgentInfo {
   id: string;
   description: string;
@@ -141,10 +156,10 @@ export interface AgentInfo {
 
 export interface PendingPermission {
   id: string;
-  tool: string;
+  tool: ToolName;
   summary: string;
   input: unknown;
-  /** Pre-apply unified diff for file tools; absent for shell/other. */
+  /** Pre-apply unified diff for file tools; absent for commands/other. */
   diff?: string;
 }
 
@@ -152,6 +167,98 @@ export interface DirEntry {
   name: string;
   path: string;
   isDir: boolean;
+}
+
+export type WorkspaceGitSummary =
+  | {
+      kind: "repository";
+      branch: string | null;
+      detachedHead: string | null;
+      upstream: string | null;
+      ahead: number;
+      behind: number;
+      changedFiles: number;
+      untrackedFiles: number;
+      additions: number;
+      deletions: number;
+    }
+  | { kind: "notRepository" }
+  | { kind: "unavailable"; reason: "missing" | "timeout" | "failed" };
+
+/** Read-only facts for the workspace actually used by native agent runs. */
+export interface WorkspaceSummary {
+  path: string;
+  /** False when the native core fell back to its process working directory. */
+  configured: boolean;
+  git: WorkspaceGitSummary;
+}
+
+/** The main desktop work surface. Review is workspace-scoped, not session history. */
+export type WorkspaceSurface = "chat" | "review";
+
+export type GitReviewScope =
+  | { kind: "workingTree" }
+  | { kind: "staged" }
+  | { kind: "unstaged" }
+  | { kind: "branch"; base: string }
+  | { kind: "commit"; revision: string };
+
+export type GitChangeArea = "staged" | "unstaged" | "untracked" | "committed";
+export type GitChangeStatus = "added" | "modified" | "deleted" | "renamed" | "copied" | "unmerged";
+
+export interface GitChangedFile {
+  path: string;
+  oldPath: string | null;
+  status: GitChangeStatus;
+  /** A working-tree file can be present in both the staged and unstaged groups. */
+  areas: GitChangeArea[];
+  additions: number | null;
+  deletions: number | null;
+  binary: boolean;
+}
+
+export interface GitReviewManifest {
+  snapshotId: string;
+  repositoryRoot: string;
+  scope: GitReviewScope;
+  baseLabel: string;
+  targetLabel: string;
+  headOid: string | null;
+  files: GitChangedFile[];
+  additions: number;
+  deletions: number;
+  /** Metadata or snapshot fingerprinting reached a native safety cap. */
+  truncated: boolean;
+}
+
+export type GitDiffLineKind = "context" | "addition" | "deletion" | "meta";
+
+export interface GitDiffLine {
+  kind: GitDiffLineKind;
+  /** Line content without the unified-diff +/-/space prefix. */
+  content: string;
+  oldLine: number | null;
+  newLine: number | null;
+}
+
+export interface GitDiffHunk {
+  header: string;
+  oldStart: number;
+  oldLines: number;
+  newStart: number;
+  newLines: number;
+  lines: GitDiffLine[];
+}
+
+export interface GitFilePatch {
+  snapshotId: string;
+  path: string;
+  oldPath: string | null;
+  status: GitChangeStatus;
+  binary: boolean;
+  filePatchHash: string;
+  hunks: GitDiffHunk[];
+  truncated: boolean;
 }
 
 export type ToolPolicy = "allow" | "ask" | "deny";
@@ -173,19 +280,21 @@ export const DANGER_MODES: PermissionMode[] = ["auto", "bypass"];
 
 /**
  * A per-tool / per-command permission rule. Mirrors the Rust `Rule`. Evaluated
- * before the mode default, first match wins. `command` is a literal shell
+ * before the mode default, first match wins. `command` is a literal terminal
  * command PREFIX (an allow-list convenience, never a guarantee — anything
  * chained after the prefix matches too).
  */
 export interface Rule {
-  tool: string;
+  tool: ToolName | "*";
   command?: string;
   decision: ToolPolicy;
 }
 
 export interface Settings {
-  provider: "anthropic";
+  provider: ProviderId;
   model: string;
+  /** Default/current reasoning level for OpenAI subscription models. */
+  reasoningEffort: ReasoningEffort;
   apiKeySet: boolean;
   /** Legacy global policy; the `default` mode's fallthrough (back-compat). */
   defaultPolicy: ToolPolicy;
@@ -203,10 +312,14 @@ export interface Settings {
 export const DEFAULT_SETTINGS: Settings = {
   provider: "anthropic",
   model: "claude-opus-4-8",
+  reasoningEffort: "medium",
   apiKeySet: false,
   defaultPolicy: "ask",
   workspace: null,
-  typingAnimation: true,
+  // Keep the core chat path immediate by default. The decode effect remains an
+  // opt-in visual preference for people who enjoy it, but should never be the
+  // reason a healthy stream feels behind the model.
+  typingAnimation: false,
   permissionMode: "default",
   rules: [],
   autoUpdate: true,
@@ -226,37 +339,155 @@ export interface OAuthStatus {
   tier: string | null;
 }
 
+/** Providers backed by Portcode's native agent runtimes. */
+export type ProviderId = "anthropic" | "openai";
+
+/** One provider-reported subscription quota window. `usedPercent` is normalized
+ * to 0..100 by the native core. `resetsAt` may be RFC 3339 or unix seconds because
+ * the providers currently use different wire formats. */
+export interface PlanUsageWindow {
+  id: string;
+  label: string;
+  usedPercent: number;
+  resetsAt: string | null;
+  windowMinutes: number | null;
+}
+
+/** Display-safe plan quota snapshot; never contains OAuth tokens or raw headers. */
+export interface PlanUsageSnapshot {
+  provider: ProviderId;
+  plan: string | null;
+  windows: PlanUsageWindow[];
+  /** Unix timestamp in seconds when the native core completed the fetch. */
+  updatedAt: number;
+}
+
+/** Known reasoning levels plus a forward-compatible live-catalogue escape hatch. */
+export type KnownReasoningEffort =
+  "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "custom";
+export type ReasoningEffort = KnownReasoningEffort | (string & {});
+
+export const REASONING_EFFORT_LABELS: Record<KnownReasoningEffort, string> = {
+  none: "None",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra high",
+  max: "Max",
+  ultra: "Ultra",
+  custom: "Custom",
+};
+
+export function reasoningEffortLabel(effort: ReasoningEffort): string {
+  return (
+    REASONING_EFFORT_LABELS[effort as KnownReasoningEffort] ??
+    effort.replace(/[_-]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
+  );
+}
+
+/** ChatGPT subscription auth state, intentionally distinct from Claude OAuth. */
+export interface OpenAIAuthStatus {
+  signedIn: boolean;
+  expiresAt: number | null;
+  account: string | null;
+  tier: string | null;
+  /** False when this build deliberately excludes direct ChatGPT subscription access. */
+  available?: boolean;
+  /** User-facing reason supplied by the native capability gate. */
+  unavailableReason?: string | null;
+}
+
+/** Row returned by the native `openai_models` catalogue command. */
+export interface OpenAIModelCatalogRow {
+  id: string;
+  label: string;
+  reasoningEfforts: ReasoningEffort[];
+  defaultReasoningEffort: ReasoningEffort;
+}
+
 /** A single selectable model, tagged with the provider that serves it. */
 export interface ModelInfo {
   id: string;
   label: string;
-  provider: string;
+  provider: ProviderId;
+  reasoningEfforts?: ReasoningEffort[];
+  defaultReasoningEffort?: ReasoningEffort;
 }
 
 /** A provider and the models it offers — the unit the picker groups by. */
 export interface ProviderGroup {
-  id: string;
+  id: ProviderId;
   label: string;
   models: ModelInfo[];
 }
 
-/**
- * Provider-grouped model catalogue. Only Anthropic is wired up and working
- * today, so it is the only provider listed — we never surface providers that
- * don't actually run (that would be dishonest UI). Adding a real provider later
- * is a data change here, not a structural rewrite.
- */
-export const PROVIDERS: ProviderGroup[] = [
+/** Provider-grouped catalogue: static Claude models plus OpenAI live/fallback rows. */
+export const ANTHROPIC_MODELS: ModelInfo[] = [
+  { id: "claude-opus-4-8", label: "Claude Opus 4.8", provider: "anthropic" },
+  { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: "anthropic" },
+  { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5", provider: "anthropic" },
+];
+
+const OPENAI_FALLBACK_REASONING: ReasoningEffort[] = [
+  "none",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+/** Offline-safe choices used until the signed-in Codex catalogue arrives. */
+export const OPENAI_FALLBACK_MODELS: ModelInfo[] = [
   {
-    id: "anthropic",
-    label: "Anthropic",
-    models: [
-      { id: "claude-opus-4-8", label: "Claude Opus 4.8", provider: "anthropic" },
-      { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: "anthropic" },
-      { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5", provider: "anthropic" },
-    ],
+    id: "gpt-5.6-sol",
+    label: "GPT-5.6 Sol",
+    provider: "openai",
+    reasoningEfforts: OPENAI_FALLBACK_REASONING,
+    defaultReasoningEffort: "medium",
+  },
+  {
+    id: "gpt-5.6-terra",
+    label: "GPT-5.6 Terra",
+    provider: "openai",
+    reasoningEfforts: OPENAI_FALLBACK_REASONING,
+    defaultReasoningEffort: "medium",
+  },
+  {
+    id: "gpt-5.6-luna",
+    label: "GPT-5.6 Luna",
+    provider: "openai",
+    reasoningEfforts: OPENAI_FALLBACK_REASONING,
+    defaultReasoningEffort: "medium",
   },
 ];
+
+/** Prefer a non-empty live subscription catalogue; use fallbacks only offline. */
+export function mergeOpenAIModels(rows: OpenAIModelCatalogRow[] = []): ModelInfo[] {
+  const normalized = rows
+    .filter((row) => row.id.trim() !== "")
+    .map<ModelInfo>((row) => ({
+      id: row.id,
+      label: row.label || row.id,
+      provider: "openai",
+      reasoningEfforts: [...new Set(row.reasoningEfforts ?? [])],
+      defaultReasoningEffort: row.defaultReasoningEffort || "medium",
+    }));
+  const live = [...new Map(normalized.map((model) => [model.id, model])).values()];
+  return live.length > 0 ? live : OPENAI_FALLBACK_MODELS;
+}
+
+export function providerGroups(
+  openAIModels: ModelInfo[] = OPENAI_FALLBACK_MODELS,
+): ProviderGroup[] {
+  return [
+    { id: "anthropic", label: "Anthropic · Claude", models: ANTHROPIC_MODELS },
+    { id: "openai", label: "OpenAI · ChatGPT subscription", models: openAIModels },
+  ];
+}
+
+export const PROVIDERS: ProviderGroup[] = providerGroups();
 
 /**
  * Flat list of every model across all providers. Derived from PROVIDERS so the
@@ -264,6 +495,43 @@ export const PROVIDERS: ProviderGroup[] = [
  * extra `provider` field, which is backward-compatible with `{id,label}` uses.
  */
 export const MODELS: ModelInfo[] = PROVIDERS.flatMap((p) => p.models);
+
+export function modelCatalog(openAIModels: ModelInfo[] = OPENAI_FALLBACK_MODELS): ModelInfo[] {
+  return [...ANTHROPIC_MODELS, ...openAIModels];
+}
+
+export function modelInfo(
+  id: string,
+  openAIModels: ModelInfo[] = OPENAI_FALLBACK_MODELS,
+): ModelInfo | undefined {
+  return modelCatalog(openAIModels).find((model) => model.id === id);
+}
+
+/** Resolve provider from catalogue first, with a conservative unknown-slug fallback. */
+export function providerForModel(
+  id: string,
+  openAIModels: ModelInfo[] = OPENAI_FALLBACK_MODELS,
+): ProviderId {
+  const known = modelInfo(id, openAIModels);
+  if (known) return known.provider;
+  if (/^(gpt-|o\d|codex-|openai-)/i.test(id)) return "openai";
+  return "anthropic";
+}
+
+/** Pick a supported effort, preferring the model's advertised default. */
+export function reasoningEffortForModel(
+  id: string,
+  current: ReasoningEffort,
+  openAIModels: ModelInfo[] = OPENAI_FALLBACK_MODELS,
+): ReasoningEffort {
+  const model = modelInfo(id, openAIModels);
+  const supported = model?.reasoningEfforts ?? [];
+  if (supported.length === 0 || supported.includes(current)) return current;
+  if (model?.defaultReasoningEffort && supported.includes(model.defaultReasoningEffort)) {
+    return model.defaultReasoningEffort;
+  }
+  return supported[0] ?? current;
+}
 
 export interface Usage {
   input: number;
@@ -454,7 +722,7 @@ export interface MessageRow {
   sessionId: string;
   seq: number;
   role: Role;
-  content: ContentBlock[];
+  content: Array<ContentBlock | ReasoningWireBlock>;
   createdAt: number;
 }
 

@@ -18,10 +18,62 @@ vi.mock("./components/Sidebar", () => ({
   Sidebar: () => <div data-testid="sidebar" />,
 }));
 vi.mock("./components/Chat", () => ({
-  Chat: () => <div data-testid="chat" />,
+  Chat: ({
+    transcriptAside,
+    transcriptAsideOpen,
+  }: {
+    transcriptAside?: React.ReactNode;
+    transcriptAsideOpen?: boolean;
+  }) => (
+    <div data-testid="chat" data-transcript-aside-open={String(!!transcriptAsideOpen)}>
+      {transcriptAside}
+    </div>
+  ),
 }));
 vi.mock("./components/FileExplorer", () => ({
   FileExplorer: () => <div data-testid="file-explorer" />,
+}));
+vi.mock("./components/review/ReviewWorkspace", async () => {
+  const { useState } = await vi.importActual<typeof import("react")>("react");
+  return {
+    ReviewWorkspace: ({ active }: { active?: boolean }) => {
+      const [controllerState, setControllerState] = useState("initial");
+      return (
+        <div data-testid="review-workspace" data-active={String(!!active)}>
+          <output aria-label="Review controller state">{controllerState}</output>
+          <button type="button" onClick={() => setControllerState("preserved")}>
+            Change review controller state
+          </button>
+        </div>
+      );
+    },
+  };
+});
+vi.mock("./components/EnvironmentPanel", () => ({
+  EnvironmentPanelProvider: ({ children }: React.PropsWithChildren) => <>{children}</>,
+  EnvironmentPanelTrigger: ({
+    open,
+    onOpenChange,
+  }: {
+    open: boolean;
+    onOpenChange: (open: boolean) => void;
+  }) => (
+    <button
+      type="button"
+      aria-label="Environment and agents"
+      aria-expanded={open}
+      onClick={() => onOpenChange(!open)}
+    >
+      Environment
+    </button>
+  ),
+  EnvironmentPanelDock: ({ onClose }: { onClose: () => void }) => (
+    <div data-testid="environment-panel">
+      <button type="button" onClick={onClose}>
+        Close environment
+      </button>
+    </div>
+  ),
 }));
 vi.mock("./components/Settings", () => ({
   SettingsPanel: () => <div data-testid="settings-panel" />,
@@ -93,6 +145,10 @@ vi.mock("./lib/ipc", () => ({
   oauthStatus: vi.fn(),
   startOauthLogin: vi.fn(),
   oauthLogout: vi.fn(),
+  openaiOauthStatus: vi.fn(),
+  startOpenaiOauthLogin: vi.fn(),
+  openaiOauthLogout: vi.fn(),
+  openaiModels: vi.fn(),
   // store.init() also fetches phone sync status.
   phoneSyncStatus: vi.fn(),
   phoneSyncBeginPairing: vi.fn(),
@@ -125,6 +181,13 @@ beforeEach(() => {
   m.getDrafts.mockResolvedValue([]);
   m.getAllUsage.mockResolvedValue([]);
   m.oauthStatus.mockResolvedValue({ signedIn: false, expiresAt: null, account: null, tier: null });
+  m.openaiOauthStatus.mockResolvedValue({
+    signedIn: false,
+    expiresAt: null,
+    account: null,
+    tier: null,
+  });
+  m.openaiModels.mockResolvedValue([]);
   m.phoneSyncStatus.mockResolvedValue({ devicePublicKey: "DEVICE==", paired: [] });
   m.phoneSyncDisconnect.mockResolvedValue(undefined);
   m.onPhoneSyncPairingRequest.mockResolvedValue(() => {});
@@ -158,6 +221,17 @@ describe("App layout", () => {
     });
   });
 
+  it("keeps a background update-check failure out of the workspace chrome", async () => {
+    m.isTauri.mockReturnValue(true);
+    m.checkForUpdate.mockRejectedValue(new Error("offline"));
+
+    render(<App />);
+
+    await waitFor(() => expect(useStore.getState().update.error).toBe("offline"));
+    expect(useStore.getState().update.phase).toBe("idle");
+    expect(screen.queryByTestId("update-banner")).not.toBeInTheDocument();
+  });
+
   it("keeps self-dev builds isolated from the production updater", async () => {
     vi.stubEnv("VITE_PORTCODE_CHANNEL", "dev");
     m.isTauri.mockReturnValue(true);
@@ -183,6 +257,71 @@ describe("App layout", () => {
     expect(screen.getByTestId("chat")).toBeInTheDocument();
     // CommandPalette is always mounted (it self-gates on showPalette internally).
     expect(screen.getByTestId("command-palette")).toBeInTheDocument();
+  });
+
+  it("routes the environment dock into Chat without resizing the shell", () => {
+    render(<App />);
+
+    const chat = screen.getByTestId("chat");
+    const trigger = screen.getByRole("button", { name: "Environment and agents" });
+
+    expect(chat).toHaveAttribute("data-transcript-aside-open", "false");
+    expect(chat).toContainElement(screen.getByTestId("environment-panel"));
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(trigger);
+
+    expect(chat).toHaveAttribute("data-transcript-aside-open", "true");
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Close environment" }));
+    expect(chat).toHaveAttribute("data-transcript-aside-open", "false");
+  });
+
+  it("routes the center surface to Review and collapses the unrelated file rail", () => {
+    useStore.setState({ workspaceSurface: "review", showFiles: true });
+    render(<App />);
+
+    expect(screen.getByTestId("review-surface")).toBeVisible();
+    expect(screen.getByTestId("review-workspace")).toHaveAttribute("data-active", "true");
+    expect(screen.getByTestId("chat-surface")).not.toBeVisible();
+    expect(screen.getByTestId("chat-surface")).toHaveAttribute("inert");
+    expect(screen.getByTestId("file-rail")).toHaveStyle({ gridTemplateColumns: "0fr" });
+    expect(screen.getByTestId("file-rail")).toHaveAttribute("aria-hidden", "true");
+    expect(screen.getByText("Review changes")).toBeInTheDocument();
+    const fileToggle = screen.getByRole("button", { name: "Toggle file explorer (Ctrl+B)" });
+    expect(fileToggle).toHaveAttribute("aria-pressed", "false");
+    expect(useStore.getState().showFiles).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Back to chat" }));
+    expect(useStore.getState().workspaceSurface).toBe("chat");
+    expect(screen.getByTestId("chat-surface")).toBeVisible();
+    expect(screen.getByTestId("review-surface")).not.toBeVisible();
+    expect(screen.getByTestId("review-surface")).toHaveAttribute("inert");
+    expect(screen.getByTestId("review-workspace")).toHaveAttribute("data-active", "false");
+    expect(screen.getByTestId("file-rail")).toHaveStyle({ gridTemplateColumns: "1fr" });
+    expect(screen.getByTestId("file-rail")).not.toHaveAttribute("aria-hidden");
+    expect(fileToggle).toHaveAttribute("aria-pressed", "true");
+    expect(useStore.getState().showFiles).toBe(true);
+  });
+
+  it("preserves review controller state when leaving and reopening the surface", () => {
+    useStore.setState({ workspaceSurface: "review" });
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Change review controller state" }));
+    expect(screen.getByRole("status", { name: "Review controller state" })).toHaveTextContent(
+      "preserved",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Back to chat" }));
+    expect(screen.getByTestId("review-surface")).not.toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open review workspace" }));
+    expect(screen.getByTestId("review-surface")).toBeVisible();
+    expect(screen.getByRole("status", { name: "Review controller state" })).toHaveTextContent(
+      "preserved",
+    );
   });
 
   it("releases the remote frame subscription when the app unmounts", async () => {
@@ -411,6 +550,12 @@ describe("remote mode shell", () => {
 });
 
 describe("TitleBar", () => {
+  it("mounts the compact environment overview in the desktop title bar", () => {
+    render(<App />);
+
+    expect(screen.getByTestId("environment-panel")).toBeInTheDocument();
+  });
+
   it("falls back to 'New chat' when there is no active session", () => {
     useStore.setState({ sessions: [], activeId: null });
 
@@ -511,9 +656,10 @@ describe("TitleBar", () => {
   it("exposes an accessible name on the command-palette button", () => {
     render(<App />);
 
-    expect(
-      screen.getByRole("button", { name: "Open command palette (Ctrl+K)" }),
-    ).toBeInTheDocument();
+    const palette = screen.getByRole("button", { name: "Open command palette (Ctrl+K)" });
+    expect(palette).toBeInTheDocument();
+    expect(palette).toHaveTextContent("Ctrl K palette");
+    expect(palette).not.toHaveTextContent("⌘");
   });
 });
 
@@ -580,6 +726,22 @@ describe("global keyboard shortcuts", () => {
     const toggle = screen.getByRole("button", { name: "Toggle file explorer (Ctrl+B)" });
     expect(document.activeElement).toBe(toggle);
     expect(document.activeElement).not.toBe(document.body);
+  });
+
+  it("rescues focus when Review hides an otherwise-open file rail", () => {
+    useStore.setState({ showFiles: true, workspaceSurface: "chat" });
+    render(<App />);
+    const toggle = screen.getByRole("button", { name: "Toggle file explorer (Ctrl+B)" });
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+
+    act(() => (document.body as HTMLElement).focus());
+    expect(document.activeElement).toBe(document.body);
+    act(() => useStore.setState({ workspaceSurface: "review" }));
+
+    expect(useStore.getState().showFiles).toBe(true);
+    expect(screen.getByTestId("file-rail")).toHaveAttribute("inert");
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    expect(toggle).toHaveFocus();
   });
 
   it("Ctrl+, opens settings", () => {
