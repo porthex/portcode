@@ -72,6 +72,29 @@ describe("SelectMenu", () => {
     expect(onChange).toHaveBeenCalledWith("two");
   });
 
+  it("scrolls keyboard-highlighted options into the visible listbox viewport", () => {
+    render(<SelectMenu label="Model" value="one" groups={groups} onChange={() => {}} />);
+    const trigger = screen.getByRole("combobox", { name: "Model" });
+
+    fireEvent.click(trigger);
+    const one = screen.getByRole("option", { name: "One" });
+    const two = screen.getByRole("option", { name: "Two" });
+    const three = screen.getByRole("option", { name: "Three" });
+    const scrollOne = vi.fn();
+    const scrollTwo = vi.fn();
+    const scrollThree = vi.fn();
+    Object.defineProperty(one, "scrollIntoView", { configurable: true, value: scrollOne });
+    Object.defineProperty(two, "scrollIntoView", { configurable: true, value: scrollTwo });
+    Object.defineProperty(three, "scrollIntoView", { configurable: true, value: scrollThree });
+
+    fireEvent.keyDown(trigger, { key: "End" });
+    expect(scrollThree).toHaveBeenLastCalledWith({ block: "nearest" });
+    fireEvent.keyDown(trigger, { key: "Home" });
+    expect(scrollOne).toHaveBeenLastCalledWith({ block: "nearest" });
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    expect(scrollTwo).toHaveBeenLastCalledWith({ block: "nearest" });
+  });
+
   it("closes on outside press and cannot open while disabled", () => {
     const { rerender } = render(
       <SelectMenu label="Model" value="one" groups={groups} onChange={() => {}} />,

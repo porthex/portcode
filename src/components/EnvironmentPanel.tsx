@@ -96,7 +96,6 @@ export function EnvironmentPanelProvider({
   }, []);
 
   const refresh = useCallback(async () => {
-    requestVersionRef.current += 1;
     if (requestBusyRef.current) {
       requestQueuedRef.current = true;
       return;
@@ -104,23 +103,26 @@ export function EnvironmentPanelProvider({
 
     requestBusyRef.current = true;
     if (mountedRef.current) setRefreshing(true);
-    do {
-      requestQueuedRef.current = false;
-      const requestVersion = requestVersionRef.current;
-      try {
-        const next = await getWorkspaceSummary();
-        if (mountedRef.current && requestVersion === requestVersionRef.current) {
-          setSummary(next);
-          setLoadFailed(false);
+    try {
+      do {
+        requestQueuedRef.current = false;
+        const requestVersion = requestVersionRef.current;
+        try {
+          const next = await getWorkspaceSummary();
+          if (mountedRef.current && requestVersion === requestVersionRef.current) {
+            setSummary(next);
+            setLoadFailed(false);
+          }
+        } catch {
+          if (mountedRef.current && requestVersion === requestVersionRef.current) {
+            setLoadFailed(true);
+          }
         }
-      } catch {
-        if (mountedRef.current && requestVersion === requestVersionRef.current) {
-          setLoadFailed(true);
-        }
-      }
-    } while (requestQueuedRef.current && mountedRef.current);
-    requestBusyRef.current = false;
-    if (mountedRef.current) setRefreshing(false);
+      } while (requestQueuedRef.current && mountedRef.current);
+    } finally {
+      requestBusyRef.current = false;
+      if (mountedRef.current) setRefreshing(false);
+    }
   }, []);
 
   useEffect(() => {
@@ -130,11 +132,16 @@ export function EnvironmentPanelProvider({
     return () => {
       mountedRef.current = false;
       requestVersionRef.current += 1;
+      requestQueuedRef.current = false;
     };
   }, []);
 
   // Keep the trigger useful before the first open and whenever workspace changes.
   useEffect(() => {
+    // A workspace switch changes the meaning of the response already in flight.
+    // Ordinary focus/interval/turn-end refreshes intentionally do not invalidate
+    // it; they merely queue one follow-up behind the single active request.
+    requestVersionRef.current += 1;
     setSummary(null);
     setLoadFailed(false);
     void refresh();

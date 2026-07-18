@@ -5,6 +5,13 @@ import { ErrorBoundary } from "./ErrorBoundary";
 /** Keeps a Settings-only render failure from replacing the entire agent workspace. */
 export function SettingsBoundary({ children }: { children: ReactNode }) {
   const setShowSettings = useStore((state) => state.setShowSettings);
+  const openerRef = useRef<HTMLElement | null>(null);
+  const openerCapturedRef = useRef(false);
+  if (!openerCapturedRef.current) {
+    openerCapturedRef.current = true;
+    const active = document.activeElement;
+    openerRef.current = active instanceof HTMLElement && active !== document.body ? active : null;
+  }
   const returnToChat = (reset: () => void) => {
     setShowSettings(false);
     reset();
@@ -13,7 +20,12 @@ export function SettingsBoundary({ children }: { children: ReactNode }) {
   return (
     <ErrorBoundary
       fallback={(error, reset) => (
-        <SettingsRecovery error={error} onReturn={() => returnToChat(reset)} onRetry={reset} />
+        <SettingsRecovery
+          error={error}
+          opener={openerRef.current}
+          onReturn={() => returnToChat(reset)}
+          onRetry={reset}
+        />
       )}
     >
       {children}
@@ -23,16 +35,19 @@ export function SettingsBoundary({ children }: { children: ReactNode }) {
 
 function SettingsRecovery({
   error,
+  opener,
   onReturn,
   onRetry,
 }: {
   error: Error;
+  opener: HTMLElement | null;
   onReturn: () => void;
   onRetry: () => void;
 }) {
   const overlayRef = useRef<HTMLDivElement>(null);
   const returnRef = useRef<HTMLButtonElement>(null);
   const retryRef = useRef<HTMLButtonElement>(null);
+  const restoreFocusRef = useRef(false);
 
   useEffect(() => {
     returnRef.current?.focus();
@@ -55,13 +70,19 @@ function SettingsRecovery({
         if (ariaHidden === null) node.removeAttribute("aria-hidden");
         else node.setAttribute("aria-hidden", ariaHidden);
       }
+      if (restoreFocusRef.current && opener?.isConnected) opener.focus();
     };
-  }, []);
+  }, [opener]);
+
+  const returnAndRestoreFocus = () => {
+    restoreFocusRef.current = true;
+    onReturn();
+  };
 
   const trapFocus = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key === "Escape") {
       event.preventDefault();
-      onReturn();
+      returnAndRestoreFocus();
       return;
     }
     if (event.key !== "Tab") return;
@@ -107,7 +128,7 @@ function SettingsRecovery({
           <button
             ref={returnRef}
             type="button"
-            onClick={onReturn}
+            onClick={returnAndRestoreFocus}
             className="rounded-lg border border-border-2 bg-panel-2 px-3 py-2 text-[12px] text-muted hover:text-fg"
           >
             Return to chat

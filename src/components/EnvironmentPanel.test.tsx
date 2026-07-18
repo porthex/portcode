@@ -328,6 +328,70 @@ describe("EnvironmentPanel", () => {
     expect(within(panel).queryByText("stale")).toBeNull();
   });
 
+  it("keeps the active poll valid and coalesces repeated ticks into one follow-up", async () => {
+    let resolveFirst!: (summary: WorkspaceSummary) => void;
+    let resolveSecond!: (summary: WorkspaceSummary) => void;
+    m.getWorkspaceSummary
+      .mockReturnValueOnce(
+        new Promise<WorkspaceSummary>((resolve) => {
+          resolveFirst = resolve;
+        }),
+      )
+      .mockReturnValueOnce(
+        new Promise<WorkspaceSummary>((resolve) => {
+          resolveSecond = resolve;
+        }),
+      );
+
+    render(<EnvironmentPanel />);
+    await waitFor(() => expect(m.getWorkspaceSummary).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: /Environment and agents/ }));
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new Event("focus"));
+    });
+    expect(m.getWorkspaceSummary).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveFirst(repositorySummary({ branch: "first-result" }));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(m.getWorkspaceSummary).toHaveBeenCalledTimes(2));
+    expect(
+      screen.getByRole("button", { name: /Environment and agents, first-result/ }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      resolveSecond(repositorySummary({ branch: "follow-up" }));
+      await Promise.resolve();
+    });
+    expect(
+      await screen.findByRole("button", { name: /Environment and agents, follow-up/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("invalidates an active poll on unmount without starting its queued follow-up", async () => {
+    let resolveRequest!: (summary: WorkspaceSummary) => void;
+    m.getWorkspaceSummary.mockReturnValueOnce(
+      new Promise<WorkspaceSummary>((resolve) => {
+        resolveRequest = resolve;
+      }),
+    );
+
+    const view = render(<EnvironmentPanel />);
+    await waitFor(() => expect(m.getWorkspaceSummary).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: /Environment and agents/ }));
+    view.unmount();
+
+    await act(async () => {
+      resolveRequest(repositorySummary({ branch: "too-late" }));
+      await Promise.resolve();
+    });
+    expect(m.getWorkspaceSummary).toHaveBeenCalledTimes(1);
+  });
+
   it("refreshes on focus, turn completion, and the open-panel interval", async () => {
     vi.useFakeTimers();
     render(<EnvironmentPanel />);

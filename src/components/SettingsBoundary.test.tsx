@@ -11,9 +11,12 @@ function FragileSettings() {
 
 function ControlledHost() {
   const showSettings = useStore((state) => state.showSettings);
+  const setShowSettings = useStore((state) => state.setShowSettings);
   return (
     <div>
-      <button type="button">Workspace control</button>
+      <button type="button" onClick={() => setShowSettings(true)}>
+        Workspace control
+      </button>
       {showSettings && (
         <SettingsBoundary>
           <FragileSettings />
@@ -60,6 +63,21 @@ describe("SettingsBoundary", () => {
     shouldThrow = false;
     fireEvent.click(screen.getByRole("button", { name: "Try settings again" }));
     expect(screen.getByText("Settings recovered")).toBeInTheDocument();
+  });
+
+  it("returns focus to the connected control that opened Settings", () => {
+    useStore.setState({ showSettings: false });
+    render(<ControlledHost />);
+    const opener = screen.getByRole("button", { name: "Workspace control" });
+
+    opener.focus();
+    fireEvent.click(opener);
+    const returnToChat = screen.getByRole("button", { name: "Return to chat" });
+    expect(returnToChat).toHaveFocus();
+
+    fireEvent.click(returnToChat);
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(opener).toHaveFocus();
   });
 
   it("traps focus between recovery actions and lets Escape return to chat", () => {

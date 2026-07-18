@@ -392,19 +392,25 @@ describe("StatusHud", () => {
     expect(screen.queryByText(/BG TASK/)).not.toBeInTheDocument();
   });
 
-  it("surfaces cumulative spend summed across ALL sessions (survives restart)", () => {
-    // The kind of usage map init() rehydrates from SQLite — two sessions' spend.
+  it("prices each Anthropic session with its own model and excludes GPT usage", () => {
     useStore.setState({
-      sessions: [session({ id: "s1" }), session({ id: "s2" })],
+      sessions: [
+        session({ id: "s1", model: "gpt-5.6-sol" }),
+        session({ id: "s2", model: "claude-opus-4-8" }),
+        session({ id: "s3", model: "claude-sonnet-4-6" }),
+      ],
       activeId: "s1",
-      usage: { s1: { input: 1000, output: 200 }, s2: { input: 3000, output: 600 } },
+      usage: {
+        s1: { input: 1_000_000, output: 0 },
+        s2: { input: 1_000_000, output: 0 },
+        s3: { input: 1_000_000, output: 0 },
+      },
     });
 
     render(<StatusHud />);
 
-    // Σ sums every session and prices at the current (opus) model:
-    // (4000*5 + 800*25)/1e6 = 0.04 -> $0.04.
-    expect(screen.getByText("Σ $0.04")).toBeInTheDocument();
+    // GPT subscription usage is excluded; Opus input is $5/M and Sonnet is $3/M.
+    expect(screen.getByText("Σ $8.00")).toBeInTheDocument();
   });
 
   it("omits the spend segment when nothing has been spent", () => {

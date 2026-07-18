@@ -432,10 +432,13 @@ impl Db {
     /// not rewrite every existing conversation's provider/model identity.
     pub fn update_session_model(&self, id: &str, model: &str) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let updated = conn.execute(
             "UPDATE sessions SET model = ?2 WHERE id = ?1",
             params![id, model],
         )?;
+        if updated == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         Ok(())
     }
 
@@ -1070,6 +1073,23 @@ mod tests {
         db.update_session_model("legacy", "gpt-5.6-sol").unwrap();
         let after = db.list_sessions().unwrap();
         assert_eq!(after[0].model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn update_session_model_errors_when_session_is_missing_or_deleted() {
+        let db = mem_db();
+        assert!(matches!(
+            db.update_session_model("missing", "gpt-5.6-sol"),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        ));
+
+        db.create_session("deleted", "Deleted", None, None, 1)
+            .unwrap();
+        db.delete_session("deleted").unwrap();
+        assert!(matches!(
+            db.update_session_model("deleted", "gpt-5.6-sol"),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        ));
     }
 
     #[test]

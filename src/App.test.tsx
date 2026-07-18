@@ -289,6 +289,9 @@ describe("App layout", () => {
     expect(screen.getByTestId("file-rail")).toHaveStyle({ gridTemplateColumns: "0fr" });
     expect(screen.getByTestId("file-rail")).toHaveAttribute("aria-hidden", "true");
     expect(screen.getByText("Review changes")).toBeInTheDocument();
+    const fileToggle = screen.getByRole("button", { name: "Toggle file explorer (Ctrl+B)" });
+    expect(fileToggle).toHaveAttribute("aria-pressed", "false");
+    expect(useStore.getState().showFiles).toBe(true);
 
     fireEvent.click(screen.getByRole("button", { name: "Back to chat" }));
     expect(useStore.getState().workspaceSurface).toBe("chat");
@@ -296,6 +299,10 @@ describe("App layout", () => {
     expect(screen.getByTestId("review-surface")).not.toBeVisible();
     expect(screen.getByTestId("review-surface")).toHaveAttribute("inert");
     expect(screen.getByTestId("review-workspace")).toHaveAttribute("data-active", "false");
+    expect(screen.getByTestId("file-rail")).toHaveStyle({ gridTemplateColumns: "1fr" });
+    expect(screen.getByTestId("file-rail")).not.toHaveAttribute("aria-hidden");
+    expect(fileToggle).toHaveAttribute("aria-pressed", "true");
+    expect(useStore.getState().showFiles).toBe(true);
   });
 
   it("preserves review controller state when leaving and reopening the surface", () => {
@@ -719,6 +726,22 @@ describe("global keyboard shortcuts", () => {
     const toggle = screen.getByRole("button", { name: "Toggle file explorer (Ctrl+B)" });
     expect(document.activeElement).toBe(toggle);
     expect(document.activeElement).not.toBe(document.body);
+  });
+
+  it("rescues focus when Review hides an otherwise-open file rail", () => {
+    useStore.setState({ showFiles: true, workspaceSurface: "chat" });
+    render(<App />);
+    const toggle = screen.getByRole("button", { name: "Toggle file explorer (Ctrl+B)" });
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+
+    act(() => (document.body as HTMLElement).focus());
+    expect(document.activeElement).toBe(document.body);
+    act(() => useStore.setState({ workspaceSurface: "review" }));
+
+    expect(useStore.getState().showFiles).toBe(true);
+    expect(screen.getByTestId("file-rail")).toHaveAttribute("inert");
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    expect(toggle).toHaveFocus();
   });
 
   it("Ctrl+, opens settings", () => {

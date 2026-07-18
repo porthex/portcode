@@ -189,6 +189,21 @@ fn is_terminal_auth_error(err: &str) -> bool {
         || err.contains("invalid_grant")
 }
 
+fn ensure_openai_account_unchanged(
+    original_account_id: Option<&str>,
+    current_account_id: Option<&str>,
+) -> Result<(), String> {
+    if original_account_id.is_some()
+        && current_account_id.is_some()
+        && original_account_id != current_account_id
+    {
+        return Err(
+            "The signed-in ChatGPT account changed during this turn. Start the turn again.".into(),
+        );
+    }
+    Ok(())
+}
+
 /// Return the credential to authenticate the next request with, refreshing an
 /// OAuth token that is at/near expiry. Refreshes are single-flight: the shared
 /// `refresh_lock` serializes concurrent turns, and the stored token is re-read
@@ -212,6 +227,10 @@ pub(crate) async fn ensure_fresh(
             // persisting a refresh of that stale value would resurrect logout.
             let current = secrets::get_openai_oauth()
                 .ok_or("Your ChatGPT subscription session was removed. Sign in again.")?;
+            ensure_openai_account_unchanged(
+                tokens.account_id.as_deref(),
+                current.account_id.as_deref(),
+            )?;
             if current.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS {
                 return Ok(Credential::OpenAiOAuth(current));
             }
@@ -288,14 +307,7 @@ async fn recover_openai_unauthorized(
     let _guard = refresh_lock.lock().await;
     let current = secrets::get_openai_oauth()
         .ok_or("Your ChatGPT subscription session was removed. Sign in again.")?;
-    if failed.account_id.is_some()
-        && current.account_id.is_some()
-        && failed.account_id != current.account_id
-    {
-        return Err(
-            "The signed-in ChatGPT account changed during this turn. Start the turn again.".into(),
-        );
-    }
+    ensure_openai_account_unchanged(failed.account_id.as_deref(), current.account_id.as_deref())?;
     // Another turn may already have recovered and persisted a rotated token.
     if current.access_token != failed.access_token {
         return Ok(Credential::OpenAiOAuth(current));
@@ -1446,12 +1458,12 @@ impl tools::BackgroundRunner for BackgroundLauncher {
 mod tests {
     use super::{
         assistant_text, background, batch_cancelled, canonicalize_tool_history, child_can_spawn,
-        derive_title, finish_status, is_terminal_auth_error, precheck_outcome, reassemble_results,
-        resolve_system_prompt, session_of, spawn_background_task, spawn_status,
-        step_limit_exceeded, subagent_answer, subagent_label, tool_result_block, tool_result_event,
-        AgentConfig, Block, ChatMessage, Db, Decision, LoopOutcome, Persist, StreamEvent,
-        CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS, MAX_PARALLEL_AGENTS, MAX_SUBAGENT_DEPTH,
-        SUBAGENT_STEER,
+        derive_title, ensure_openai_account_unchanged, finish_status, is_terminal_auth_error,
+        precheck_outcome, reassemble_results, resolve_system_prompt, session_of,
+        spawn_background_task, spawn_status, step_limit_exceeded, subagent_answer, subagent_label,
+        tool_result_block, tool_result_event, AgentConfig, Block, ChatMessage, Db, Decision,
+        LoopOutcome, Persist, StreamEvent, CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS,
+        MAX_PARALLEL_AGENTS, MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
     };
     use crate::tool_names;
     use std::path::Path;
@@ -1972,6 +1984,16 @@ mod tests {
         assert!(!is_terminal_auth_error(
             "OAuth token request failed (500 Internal Server Error): oops"
         ));
+    }
+
+    #[test]
+    fn rejects_an_openai_account_change_during_a_turn() {
+        assert_eq!(
+            ensure_openai_account_unchanged(Some("account-a"), Some("account-b")).unwrap_err(),
+            "The signed-in ChatGPT account changed during this turn. Start the turn again."
+        );
+        assert!(ensure_openai_account_unchanged(Some("account-a"), Some("account-a")).is_ok());
+        assert!(ensure_openai_account_unchanged(None, Some("account-a")).is_ok());
     }
 
     #[test]

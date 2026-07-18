@@ -203,7 +203,7 @@ fn merge_token_response(
 ) -> Result<OpenAiOAuthTokens, String> {
     let access_token = response
         .access_token
-        .or_else(|| previous.map(|p| p.access_token.clone()))
+        .filter(|token| !token.trim().is_empty())
         .ok_or("OpenAI token response did not include an access token.")?;
     let refresh_token = response
         .refresh_token
@@ -284,9 +284,9 @@ async fn exchange_code(
     // Re-check immediately before the token endpoint so a runtime kill switch
     // applied while the browser was open stops the exchange as well.
     ensure_direct_subscription_enabled()?;
-    let response = tokio::time::timeout(
-        Duration::from_secs(30),
-        http.post(TOKEN_URL)
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let response = http
+            .post(TOKEN_URL)
             .form(&[
                 ("grant_type", "authorization_code"),
                 ("code", code),
@@ -294,12 +294,13 @@ async fn exchange_code(
                 ("client_id", CLIENT_ID),
                 ("code_verifier", verifier),
             ])
-            .send(),
-    )
+            .send()
+            .await
+            .map_err(|e| format!("OpenAI token exchange failed: {e}"))?;
+        parse_token_response(response, None, true).await
+    })
     .await
     .map_err(|_| "OpenAI token exchange timed out.".to_string())?
-    .map_err(|e| format!("OpenAI token exchange failed: {e}"))?;
-    parse_token_response(response, None, true).await
 }
 
 pub async fn refresh(
@@ -307,20 +308,21 @@ pub async fn refresh(
     current: &OpenAiOAuthTokens,
 ) -> Result<OpenAiOAuthTokens, String> {
     ensure_direct_subscription_enabled()?;
-    let response = tokio::time::timeout(
-        Duration::from_secs(30),
-        http.post(TOKEN_URL)
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let response = http
+            .post(TOKEN_URL)
             .json(&json!({
                 "client_id": CLIENT_ID,
                 "grant_type": "refresh_token",
                 "refresh_token": current.refresh_token,
             }))
-            .send(),
-    )
+            .send()
+            .await
+            .map_err(|e| format!("OpenAI token refresh failed: {e}"))?;
+        parse_token_response(response, Some(current), false).await
+    })
     .await
     .map_err(|_| "OpenAI token refresh timed out.".to_string())?
-    .map_err(|e| format!("OpenAI token refresh failed: {e}"))?;
-    parse_token_response(response, Some(current), false).await
 }
 
 pub fn is_terminal_auth_error(error: &str) -> bool {
@@ -423,7 +425,7 @@ async fn await_callback(listener: &TcpListener, expected_state: &str) -> Result<
         .await
         .ok();
         if !state_ok {
-            return Err("OpenAI OAuth state did not match; sign-in was aborted.".into());
+            continue;
         }
         if let Some(error) = oauth_error {
             if error.contains("missing_codex_entitlement") {
@@ -584,6 +586,17 @@ pub async fn models(
 mod tests {
     use super::*;
 
+    async fn callback_response(address: std::net::SocketAddr, path: &str) -> String {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
     #[test]
     fn authorize_url_has_pkce_state_originator_and_fixed_callback() {
         let redirect = "http://localhost:1455/auth/callback";
@@ -604,6 +617,30 @@ mod tests {
             pairs.get("originator").map(String::as_str),
             Some("portcode")
         );
+    }
+
+    #[tokio::test]
+    async fn mismatched_callback_state_fails_request_but_keeps_listener_alive() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let callback = tokio::spawn(async move { await_callback(&listener, "expected").await });
+
+        let rejected =
+            callback_response(address, "/auth/callback?code=forged&state=unexpected").await;
+        assert!(rejected.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(rejected.contains(FAILURE_HTML));
+        assert!(!callback.is_finished());
+
+        let accepted =
+            callback_response(address, "/auth/callback?code=valid-code&state=expected").await;
+        assert!(accepted.starts_with("HTTP/1.1 200 OK"));
+        assert!(accepted.contains(SUCCESS_HTML));
+        let code = tokio::time::timeout(Duration::from_secs(1), callback)
+            .await
+            .expect("valid callback should complete promptly")
+            .expect("callback task should not panic")
+            .expect("valid callback should succeed");
+        assert_eq!(code, "valid-code");
     }
 
     #[test]
@@ -659,17 +696,48 @@ mod tests {
         };
         let merged = merge_token_response(
             TokenResponse {
+                access_token: Some("new-access".into()),
                 refresh_token: Some("rotated-refresh".into()),
                 ..TokenResponse::default()
             },
             Some(&previous),
         )
         .unwrap();
-        assert_eq!(merged.access_token, "old-access");
+        assert_eq!(merged.access_token, "new-access");
         assert_eq!(merged.refresh_token, "rotated-refresh");
         assert_eq!(merged.id_token.as_deref(), Some("old-id"));
         assert_eq!(merged.account_id.as_deref(), Some("acct"));
         assert!(merged.is_fedramp);
+    }
+
+    #[test]
+    fn refresh_merge_rejects_missing_or_empty_access_token() {
+        let previous = OpenAiOAuthTokens {
+            access_token: "old-access".into(),
+            refresh_token: "old-refresh".into(),
+            id_token: None,
+            expires_at: 123,
+            account_id: None,
+            email: None,
+            plan: None,
+            is_fedramp: false,
+        };
+        for access_token in [None, Some(String::new()), Some("  \t".into())] {
+            let result = merge_token_response(
+                TokenResponse {
+                    access_token,
+                    ..TokenResponse::default()
+                },
+                Some(&previous),
+            );
+            let Err(error) = result else {
+                panic!("refresh must not reuse the previous access token");
+            };
+            assert_eq!(
+                error,
+                "OpenAI token response did not include an access token."
+            );
+        }
     }
 
     #[test]

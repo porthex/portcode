@@ -57,6 +57,7 @@ export function Composer() {
   const newSession = useStore((s) => s.newSession);
   const setShowSettings = useStore((s) => s.setShowSettings);
   const remoteMode = useStore((s) => s.remoteMode);
+  const remoteConnected = useStore((s) => s.remoteConnected);
   const activeModel = useActiveModel();
   const openAIModels = useStore((s) => s.openAIModels);
   const settings = useStore((s) => s.settings);
@@ -74,7 +75,7 @@ export function Composer() {
   const activeProvider = providerForModel(activeModel, openAIModels);
   const openAIUnavailable = activeProvider === "openai" && openAIAuthStatus?.available === false;
   const authenticated =
-    remoteMode ||
+    (remoteMode && remoteConnected) ||
     (activeProvider === "openai"
       ? !openAIUnavailable && !!openAIAuthStatus?.signedIn
       : !!oauthStatus?.signedIn || settings.apiKeySet);

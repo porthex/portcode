@@ -249,6 +249,18 @@ describe("SettingsPanel — structure", () => {
     expect(document.getElementById("pc-setting-plan-usage")).toHaveClass("pc-settings-target");
   });
 
+  it("routes command-prefix searches to the tool-rule editor", () => {
+    renderPanel();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Find a setting" }), {
+      target: { value: "command prefix" },
+    });
+
+    expect(screen.getByText("1 category found")).toBeInTheDocument();
+    expect(document.getElementById("pc-settings-permissions")).not.toHaveClass("hidden");
+    expect(document.getElementById("pc-setting-tool-rules")).toHaveClass("pc-settings-target");
+  });
+
   it("surfaces a useful empty state and clears an unsuccessful search", () => {
     renderPanel();
 
@@ -1076,6 +1088,41 @@ describe("SettingsPanel — permission modes & rules", () => {
       rules: [
         { tool: "run_command", decision: "ask" },
         { tool: "*", decision: "deny" },
+      ],
+    });
+  });
+
+  it("keeps an existing command exception before a newly added tool-wide rule", async () => {
+    renderPanel({
+      rules: [{ tool: "run_command", command: "git push", decision: "deny" }],
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    });
+
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      rules: [
+        { tool: "run_command", command: "git push", decision: "deny" },
+        { tool: "run_command", decision: "ask" },
+      ],
+    });
+  });
+
+  it("inserts a command exception before an existing tool-wide rule", async () => {
+    renderPanel({ rules: [{ tool: "shell", decision: "deny" }] });
+    fireEvent.change(screen.getByLabelText("Command prefix"), {
+      target: { value: "git push" },
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    });
+
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      rules: [
+        { tool: "run_command", command: "git push", decision: "ask" },
+        { tool: "shell", decision: "deny" },
       ],
     });
   });

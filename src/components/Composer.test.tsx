@@ -846,11 +846,31 @@ describe("Composer OpenAI auth and reasoning", () => {
       settings: { ...DEFAULT_SETTINGS, provider: "openai", model: "gpt-live" },
       openAIAuthStatus: null,
       remoteMode: true,
+      remoteConnected: true,
     });
     render(<Composer />);
 
     expect(sendButton()).toBeEnabled();
     expect(screen.queryByRole("combobox", { name: "Model" })).toBeNull();
     expect(screen.queryByRole("combobox", { name: "Reasoning level" })).toBeNull();
+  });
+
+  it("does not bypass authentication while remote mode is disconnected", () => {
+    useStore.setState({
+      sessions: [session({ model: "gpt-live" })],
+      activeId: "a",
+      drafts: { a: "remote task" },
+      openAIModels: [openAIModel],
+      settings: { ...DEFAULT_SETTINGS, provider: "openai", model: "gpt-live" },
+      openAIAuthStatus: null,
+      remoteMode: true,
+      remoteConnected: false,
+    });
+    render(<Composer />);
+
+    expect(
+      screen.getByRole("button", { name: "Sign in with ChatGPT in Settings to send" }),
+    ).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Sign in with ChatGPT");
   });
 });

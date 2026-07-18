@@ -184,20 +184,24 @@ fn parse_openai(value: &Value, fallback_plan: Option<&str>, updated_at: i64) -> 
 }
 
 async fn json_response(request: reqwest::RequestBuilder, provider: &str) -> Result<Value, String> {
-    let response = tokio::time::timeout(Duration::from_secs(20), request.send())
-        .await
-        .map_err(|_| format!("{provider} usage request timed out."))?
-        .map_err(|error| format!("{provider} usage request failed: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "{provider} usage is temporarily unavailable ({}).",
-            response.status()
-        ));
-    }
-    response
-        .json::<Value>()
-        .await
-        .map_err(|_| format!("{provider} returned usage data Portcode could not read."))
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let response = request
+            .send()
+            .await
+            .map_err(|error| format!("{provider} usage request failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "{provider} usage is temporarily unavailable ({}).",
+                response.status()
+            ));
+        }
+        response
+            .json::<Value>()
+            .await
+            .map_err(|_| format!("{provider} returned usage data Portcode could not read."))
+    })
+    .await
+    .map_err(|_| format!("{provider} usage request timed out."))?
 }
 
 pub async fn anthropic(

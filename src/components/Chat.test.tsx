@@ -595,6 +595,26 @@ describe("Chat scroll-to-latest affordance", () => {
     expect(screen.queryByRole("button", { name: "Scroll to latest" })).not.toBeInTheDocument();
   });
 
+  it("only shifts the button for an open aside at the transcript container breakpoint", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "hi")] },
+      streaming: false,
+    });
+
+    const { container } = render(
+      <Chat transcriptAside={<aside>Environment</aside>} transcriptAsideOpen />,
+    );
+    const scroller = container.querySelector(".overflow-y-auto") as HTMLElement;
+    stubScrolledUp(scroller);
+    fireEvent.scroll(scroller);
+
+    const button = screen.getByRole("button", { name: "Scroll to latest" });
+    expect(button).toHaveClass("right-4", "@min-[734px]:right-[382px]");
+    expect(button).not.toHaveStyle({ right: "382px" });
+  });
+
   it("never shows the button when there are no messages", () => {
     useStore.setState({
       activeId: "s1",
@@ -784,6 +804,39 @@ describe("Chat EmptyState auth affordance", () => {
     );
     rerender(<Chat />);
     expect(screen.queryByText("Sign in with ChatGPT to start")).toBeNull();
+  });
+
+  it("directs unavailable OpenAI builds to Claude instead of asking for ChatGPT sign-in", () => {
+    const setShowSettings = vi.fn();
+    useStore.setState({
+      activeId: null,
+      messages: {},
+      streaming: false,
+      remoteMode: false,
+      openAIAuthStatus: {
+        signedIn: false,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: false,
+        unavailableReason: "Disabled in this build",
+      },
+      settings: {
+        ...initial.settings,
+        provider: "openai",
+        model: "gpt-5.6-sol",
+      },
+      setShowSettings,
+    });
+
+    render(<Chat />);
+
+    expect(
+      screen.getByText("Disabled in this build. Choose Claude in Settings to start"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Sign in with ChatGPT to start")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Choose Claude" }));
+    expect(setShowSettings).toHaveBeenCalledWith(true);
   });
 
   it("suppresses the nudge in remote mode even when unauthenticated", () => {

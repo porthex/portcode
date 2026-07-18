@@ -349,6 +349,20 @@ describe("ReviewWorkspace", () => {
     );
   });
 
+  it("clears an unfinished comment when switching files", async () => {
+    await renderLoaded();
+    fireEvent.click(screen.getByRole("button", { name: "Comment on src/App.tsx head line 13" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Comment for src/App.tsx line 13" }), {
+      target: { value: "This belongs to App only." },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /src\/new\.ts/ }));
+    await screen.findByRole("table", { name: "src/new.ts" });
+    fireEvent.click(screen.getByRole("button", { name: "Comment on src/new.ts head line 13" }));
+
+    expect(screen.getByRole("textbox", { name: "Comment for src/new.ts line 13" })).toHaveValue("");
+  });
+
   it("retains old comments but marks them outdated after the snapshot changes", async () => {
     let current = manifest();
     m.getGitReviewManifest.mockImplementation(async () => current);
@@ -423,6 +437,112 @@ describe("ReviewWorkspace", () => {
       ),
     );
     expect(screen.getByRole("table", { name: "src/App.tsx" })).toBeInTheDocument();
+  });
+
+  it("serializes refresh ticks, commits the active result, and queues one follow-up", async () => {
+    let resolveFirst!: (value: GitReviewManifest) => void;
+    let resolveSecond!: (value: GitReviewManifest) => void;
+    m.getGitReviewManifest
+      .mockReturnValueOnce(
+        new Promise<GitReviewManifest>((resolve) => {
+          resolveFirst = resolve;
+        }),
+      )
+      .mockReturnValueOnce(
+        new Promise<GitReviewManifest>((resolve) => {
+          resolveSecond = resolve;
+        }),
+      );
+
+    render(<ReviewWorkspace />);
+    await waitFor(() => expect(m.getGitReviewManifest).toHaveBeenCalledTimes(1));
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new Event("focus"));
+    });
+    expect(m.getGitReviewManifest).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveFirst(manifest(undefined, { snapshotId: "first", baseLabel: "first result" }));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(m.getGitReviewManifest).toHaveBeenCalledTimes(2));
+    expect(screen.getByText(/first result →/)).toBeInTheDocument();
+
+    await act(async () => {
+      resolveSecond(manifest(undefined, { snapshotId: "follow-up", baseLabel: "follow-up" }));
+      await Promise.resolve();
+    });
+    expect(await screen.findByText(/follow-up →/)).toBeInTheDocument();
+    expect(m.getGitReviewManifest).toHaveBeenCalledTimes(2);
+  });
+
+  it("invalidates an in-flight manifest when the scope and workspace change", async () => {
+    let resolveOld!: (value: GitReviewManifest) => void;
+    m.getGitReviewManifest
+      .mockReturnValueOnce(
+        new Promise<GitReviewManifest>((resolve) => {
+          resolveOld = resolve;
+        }),
+      )
+      .mockImplementationOnce(async (nextScope) =>
+        manifest(nextScope, {
+          repositoryRoot: "D:/Projects/next",
+          baseLabel: "fresh scope",
+        }),
+      );
+
+    render(<ReviewWorkspace />);
+    await waitFor(() => expect(m.getGitReviewManifest).toHaveBeenCalledTimes(1));
+    fireEvent.change(screen.getByRole("combobox", { name: "Review scope" }), {
+      target: { value: "staged" },
+    });
+    act(() => {
+      useStore.setState({
+        settings: { ...useStore.getState().settings, workspace: "D:/Projects/next" },
+      });
+    });
+    expect(m.getGitReviewManifest).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveOld(manifest(undefined, { baseLabel: "stale scope" }));
+      await Promise.resolve();
+    });
+
+    await waitFor(() =>
+      expect(m.getGitReviewManifest).toHaveBeenLastCalledWith({ kind: "staged" }),
+    );
+    expect(await screen.findByText(/fresh scope →/)).toBeInTheDocument();
+    expect(screen.queryByText(/stale scope →/)).toBeNull();
+    expect(screen.getByTitle("D:/Projects/next")).toBeInTheDocument();
+    expect(m.getGitReviewManifest).toHaveBeenCalledTimes(2);
+  });
+
+  it("invalidates an in-flight manifest while inactive and refreshes once on resume", async () => {
+    let resolveHidden!: (value: GitReviewManifest) => void;
+    m.getGitReviewManifest
+      .mockReturnValueOnce(
+        new Promise<GitReviewManifest>((resolve) => {
+          resolveHidden = resolve;
+        }),
+      )
+      .mockImplementationOnce(async (nextScope) => manifest(nextScope, { baseLabel: "resumed" }));
+
+    const view = render(<ReviewWorkspace active />);
+    await waitFor(() => expect(m.getGitReviewManifest).toHaveBeenCalledTimes(1));
+    view.rerender(<ReviewWorkspace active={false} />);
+
+    await act(async () => {
+      resolveHidden(manifest(undefined, { baseLabel: "hidden stale" }));
+      await Promise.resolve();
+    });
+    expect(screen.queryByText(/hidden stale →/)).toBeNull();
+    expect(m.getGitReviewManifest).toHaveBeenCalledTimes(1);
+
+    view.rerender(<ReviewWorkspace active />);
+    expect(await screen.findByText(/resumed →/)).toBeInTheDocument();
+    expect(m.getGitReviewManifest).toHaveBeenCalledTimes(2);
   });
 
   it("refreshes on focus, turn completion, and the visible-surface interval", async () => {

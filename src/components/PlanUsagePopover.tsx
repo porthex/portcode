@@ -1,4 +1,4 @@
-import { useEffect, useRef, type RefObject } from "react";
+import { useCallback, useEffect, useRef, type RefObject } from "react";
 import { createPortal } from "react-dom";
 
 import type { ProviderId } from "../types";
@@ -20,6 +20,10 @@ export function PlanUsagePopover({
 }: PlanUsagePopoverProps) {
   const panelRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const closeAndRestoreFocus = useCallback(() => {
+    onClose();
+    triggerRef.current?.focus();
+  }, [onClose, triggerRef]);
 
   useEffect(() => {
     if (!open) return;
@@ -34,8 +38,7 @@ export function PlanUsagePopover({
       if (event.key !== "Escape" || event.defaultPrevented) return;
       event.preventDefault();
       event.stopPropagation();
-      onClose();
-      triggerRef.current?.focus();
+      closeAndRestoreFocus();
     };
 
     document.addEventListener("mousedown", onMouseDown, true);
@@ -44,7 +47,7 @@ export function PlanUsagePopover({
       document.removeEventListener("mousedown", onMouseDown, true);
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [open, onClose, triggerRef]);
+  }, [closeAndRestoreFocus, open, onClose, triggerRef]);
 
   if (!open) return null;
 
@@ -61,7 +64,12 @@ export function PlanUsagePopover({
           <span>GPT + CLAUDE</span>
           <strong>Plan limits</strong>
         </div>
-        <button ref={closeRef} type="button" onClick={onClose} aria-label="Close plan usage">
+        <button
+          ref={closeRef}
+          type="button"
+          onClick={closeAndRestoreFocus}
+          aria-label="Close plan usage"
+        >
           ×
         </button>
       </header>

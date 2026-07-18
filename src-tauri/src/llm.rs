@@ -678,6 +678,15 @@ impl OpenAiTurnBuilder {
     }
 }
 
+/// `AtomicBool` has no wake mechanism, so poll it briefly while network I/O is
+/// pending. This keeps Stop responsive without changing the shared cancellation
+/// type used by the agent loop.
+async fn wait_for_cancellation(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 pub struct OpenAiProvider;
 
 #[async_trait]
@@ -735,18 +744,34 @@ impl LlmProvider for OpenAiProvider {
         if tokens.is_fedramp {
             request = request.header("X-OpenAI-Fedramp", "true");
         }
-        let response = tokio::time::timeout(Duration::from_secs(30), request.json(&body).send())
-            .await
-            .map_err(|_| "OpenAI request timed out before streaming began.".to_string())?
-            .map_err(|e| format!("OpenAI request failed: {e}"))?;
+        let mut builder = OpenAiTurnBuilder::new(model);
+        let response = tokio::select! {
+            biased;
+            _ = wait_for_cancellation(cancel) => {
+                builder.cancelled = true;
+                return builder.finish();
+            }
+            response = tokio::time::timeout(
+                Duration::from_secs(30),
+                request.json(&body).send(),
+            ) => response
+                .map_err(|_| "OpenAI request timed out before streaming began.".to_string())?
+                .map_err(|e| format!("OpenAI request failed: {e}"))?,
+        };
         if !response.status().is_success() {
             let status = response.status();
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 return Err("OpenAI response authentication failed (401).".into());
             }
-            let message = response
-                .json::<Value>()
-                .await
+            let error = tokio::select! {
+                biased;
+                _ = wait_for_cancellation(cancel) => {
+                    builder.cancelled = true;
+                    return builder.finish();
+                }
+                error = response.json::<Value>() => error,
+            };
+            let message = error
                 .ok()
                 .and_then(|value| value["error"]["message"].as_str().map(str::to_string))
                 .unwrap_or_else(|| "request rejected".into());
@@ -755,17 +780,23 @@ impl LlmProvider for OpenAiProvider {
 
         let mut stream = response.bytes_stream();
         let mut buffer = Vec::new();
-        let mut builder = OpenAiTurnBuilder::new(model);
         loop {
             if cancel.load(Ordering::Relaxed) {
                 builder.cancelled = true;
                 break;
             }
-            let next = tokio::time::timeout(Duration::from_secs(120), stream.next())
-                .await
-                .map_err(|_| {
-                    "OpenAI stream stalled for 120 seconds. Please try again.".to_string()
-                })?;
+            let next = tokio::select! {
+                biased;
+                _ = wait_for_cancellation(cancel) => {
+                    builder.cancelled = true;
+                    break;
+                }
+                next = tokio::time::timeout(Duration::from_secs(120), stream.next()) => {
+                    next.map_err(|_| {
+                        "OpenAI stream stalled for 120 seconds. Please try again.".to_string()
+                    })?
+                }
+            };
             let Some(chunk) = next else { break };
             buffer.extend_from_slice(&chunk.map_err(|e| format!("OpenAI stream error: {e}"))?);
             if buffer.len() > 1024 * 1024 {
@@ -843,6 +874,20 @@ mod tests {
             email: None,
             plan: None,
         })
+    }
+
+    #[tokio::test]
+    async fn cancellation_wait_observes_a_later_stop_signal() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&cancel);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            trigger.store(true, Ordering::Relaxed);
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), wait_for_cancellation(&cancel))
+            .await
+            .expect("cancellation polling should release pending OpenAI I/O");
     }
 
     #[test]

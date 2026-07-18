@@ -55,6 +55,7 @@ function countToolUses(messages: Message[] | undefined): number {
  * tracks the live `streaming` flag.
  */
 export function StatusHud() {
+  const sessions = useStore((s) => s.sessions);
   const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
   const model = useStore((s) => {
     const sess = s.sessions.find((x) => x.id === s.activeId);
@@ -113,21 +114,18 @@ export function StatusHud() {
   // streaming text delta, since patchLast rebuilds the array — still recomputes.
   const toolUses = useMemo(() => countToolUses(messages), [messages]);
 
-  // Cumulative spend across every session, persisted in SQLite and rehydrated on
-  // startup (B2) so the running total survives a restart — a transparency/trust cue
-  // (Fogg credibility). An estimate: it prices the summed tokens at the CURRENT
-  // model (per-model splits aren't stored), matching the per-session UsageMeter.
+  // Cumulative Anthropic API spend across every session, persisted in SQLite and
+  // rehydrated on startup. Each usage row is priced with its owning session's model;
+  // OpenAI subscription usage has no API-price equivalent and is intentionally skipped.
   const totalCost = useMemo(() => {
-    let input = 0;
-    let output = 0;
-    for (const u of Object.values(usageMap)) {
-      input += u.input;
-      output += u.output;
+    let total = 0;
+    for (const item of sessions) {
+      const itemUsage = usageMap[item.id];
+      if (!itemUsage || providerForModel(item.model, openAIModels) === "openai") continue;
+      total += estimateCost(item.model, itemUsage);
     }
-    return providerForModel(model, openAIModels) === "openai"
-      ? 0
-      : estimateCost(model, { input, output });
-  }, [usageMap, model, openAIModels]);
+    return total;
+  }, [openAIModels, sessions, usageMap]);
 
   return (
     <>
@@ -210,7 +208,7 @@ export function StatusHud() {
         {!remoteMode && totalCost > 0 && (
           <div
             className="pc-hud-seg pc-hud-seg--right tabular-nums text-success"
-            title="Total estimated spend across all sessions (priced at the current model)"
+            title="Total estimated Anthropic API spend across all sessions"
           >
             Σ ${totalCost.toFixed(totalCost < 0.01 ? 4 : 2)}
           </div>

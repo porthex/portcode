@@ -281,16 +281,8 @@ pub async fn get_git_review_file(
     } else {
         patch_for_file(&context.root, &resolved, &file.path).await?
     };
-    let mut binary = file.binary || std::str::from_utf8(&patch).is_err();
-    if patch
-        .windows(b"GIT binary patch".len())
-        .any(|w| w == b"GIT binary patch")
-        || patch
-            .windows(b"Binary files".len())
-            .any(|w| w == b"Binary files")
-    {
-        binary = true;
-    }
+    let binary =
+        file.binary || std::str::from_utf8(&patch).is_err() || patch_has_binary_marker(&patch);
 
     let file_patch_hash = digest_hex(&patch);
     let (hunks, line_truncated) = if binary {
@@ -869,6 +861,58 @@ fn commit_patch_args(oid: &str, pathspec: &str) -> Vec<OsString> {
     ]
 }
 
+fn patch_has_binary_marker(patch: &[u8]) -> bool {
+    patch.split(|byte| *byte == b'\n').any(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        line == b"GIT binary patch"
+            || (line.starts_with(b"Binary files ") && line.ends_with(b" differ"))
+    })
+}
+
+fn synthetic_untracked_patch_headers(path: &str) -> String {
+    let old_path = quote_patch_header_path("a/", path);
+    let new_path = quote_patch_header_path("b/", path);
+    format!(
+        "diff --git {old_path} {new_path}\nnew file mode 100644\n--- /dev/null\n+++ {new_path}\n"
+    )
+}
+
+/// Quote path text that could break or impersonate a unified-diff header. This
+/// follows Git's double-quoted, backslash-escaped shape while leaving ordinary
+/// paths unchanged for readability.
+fn quote_patch_header_path(prefix: &str, path: &str) -> String {
+    let mut raw = String::with_capacity(prefix.len() + path.len());
+    raw.push_str(prefix);
+    raw.push_str(path);
+    if !raw.chars().any(|ch| {
+        ch == '"' || ch == '\\' || ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}')
+    }) {
+        return raw;
+    }
+
+    let mut quoted = String::with_capacity(raw.len() + 2);
+    quoted.push('"');
+    for ch in raw.chars() {
+        match ch {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            ch if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') => {
+                use std::fmt::Write as _;
+                let mut encoded = [0_u8; 4];
+                for byte in ch.encode_utf8(&mut encoded).as_bytes() {
+                    let _ = write!(quoted, "\\{byte:03o}");
+                }
+            }
+            ch => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 async fn untracked_patch(root: &Path, path: &str) -> Result<Vec<u8>, String> {
     let (full, metadata) = safe_untracked_file(root, path).await?;
     if !metadata.is_file() || metadata.len() > UNTRACKED_TEXT_CAP {
@@ -886,10 +930,9 @@ async fn untracked_patch(root: &Path, path: &str) -> Result<Vec<u8>, String> {
     let mut unified = diff.unified_diff();
     unified.context_radius(3);
     let body = unified.to_string();
-    Ok(format!(
-        "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n{body}"
-    )
-    .into_bytes())
+    let mut patch = synthetic_untracked_patch_headers(path);
+    patch.push_str(&body);
+    Ok(patch.into_bytes())
 }
 
 async fn untracked_numstat(root: &Path, path: &str) -> Numstat {
@@ -1395,6 +1438,35 @@ u UU N... 100644 100644 100644 100644 a a a src/conflict.rs\0\
         assert_eq!(hunks[0].lines[2].new_line, Some(5));
         assert_eq!(hunks[0].lines[4].old_line, Some(6));
         assert_eq!(hunks[0].lines[5].kind, GitDiffLineKind::Meta);
+    }
+
+    #[test]
+    fn binary_markers_must_occupy_a_complete_patch_line() {
+        assert!(patch_has_binary_marker(
+            b"diff --git a/image b/image\nGIT binary patch\nliteral 1\n"
+        ));
+        assert!(patch_has_binary_marker(
+            b"diff --git a/image b/image\r\nBinary files a/image and b/image differ\r\n"
+        ));
+        assert!(!patch_has_binary_marker(
+            b"@@ -1 +1,2 @@\n+GIT binary patch\n+Binary files a/image and b/image differ\n"
+        ));
+        assert!(!patch_has_binary_marker(
+            b"ordinary text mentioning GIT binary patch in a sentence\n"
+        ));
+    }
+
+    #[test]
+    fn synthetic_patch_headers_escape_filename_line_injection() {
+        let path = "safe\n+++ b/injected\n@@ -1 +1 @@\r\n\"quote\\tail.rs";
+        let headers = synthetic_untracked_patch_headers(path);
+
+        assert_eq!(headers.lines().count(), 4);
+        assert!(!headers.contains("\n@@"));
+        assert!(!headers.contains("\n+++ b/injected"));
+        assert!(headers.contains("\\n"));
+        assert!(headers.contains("\\r"));
+        assert!(headers.contains("\\\"quote\\\\tail.rs"));
     }
 
     #[test]

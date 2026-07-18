@@ -447,6 +447,24 @@ describe("setSessionModel", () => {
     expect(useStore.getState().settingsError).toBeNull();
   });
 
+  it("returns consecutive rejected model writes to the last persisted model", async () => {
+    m.updateSessionModel
+      .mockRejectedValueOnce(new Error("first write failed"))
+      .mockRejectedValueOnce(new Error("latest write failed"));
+    useStore.setState({
+      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      activeId: "a",
+    });
+
+    const first = useStore.getState().setSessionModel("claude-sonnet-4-6");
+    const second = useStore.getState().setSessionModel("gpt-5.6-sol");
+    await Promise.all([first, second]);
+
+    expect(useStore.getState().sessions[0].model).toBe("claude-opus-4-8");
+    expect(useStore.getState().settingsError).toBe("latest write failed");
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
   it("still updates the last-used default when no session is active (palette safety)", async () => {
     useStore.setState({ sessions: [], activeId: null });
 

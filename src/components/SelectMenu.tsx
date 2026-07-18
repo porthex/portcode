@@ -46,6 +46,7 @@ export function SelectMenu({
   const listboxId = `${id ?? `pc-select-${generatedId}`}-listbox`;
   const rootRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
+  const optionRefs = useRef(new Map<string, HTMLButtonElement>());
   const [open, setOpen] = useState(false);
   const [highlighted, setHighlighted] = useState(value);
   const catalogOptions = useMemo(() => groups.flatMap((group) => group.options), [groups]);
@@ -79,6 +80,11 @@ export function SelectMenu({
   useEffect(() => {
     if (disabled) setOpen(false);
   }, [disabled]);
+
+  useEffect(() => {
+    if (!open) return;
+    optionRefs.current.get(highlighted)?.scrollIntoView?.({ block: "nearest" });
+  }, [open, highlighted]);
 
   const close = (restoreFocus = false) => {
     setOpen(false);
@@ -225,6 +231,10 @@ export function SelectMenu({
                 return (
                   <button
                     key={option.value}
+                    ref={(node) => {
+                      if (node) optionRefs.current.set(option.value, node);
+                      else optionRefs.current.delete(option.value);
+                    }}
                     id={optionIds.get(option.value)}
                     type="button"
                     role="option"

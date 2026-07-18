@@ -165,7 +165,7 @@ const SETTINGS_TARGET_IDS: Record<string, string> = {
   "Auto mode": "pc-setting-permission-mode",
   "Bypass mode": "pc-setting-permission-mode",
   "Tool rules": "pc-setting-tool-rules",
-  "Shell command prefix": "pc-setting-tool-rules",
+  "Command prefix": "pc-setting-tool-rules",
   "Typing animation": "pc-setting-typing",
   "Neon rain": "pc-setting-rain",
   Scanlines: "pc-setting-scanlines",
@@ -1698,13 +1698,32 @@ function PermissionSettings() {
       : { tool: ruleTool, decision: ruleDecision };
     const sameScope = (candidate: Rule) =>
       toolNamesEquivalent(candidate.tool, rule.tool) && candidate.command === rule.command;
-    const first = rules[0];
-    if (first && sameScope(first) && first.decision === rule.decision) return;
+    const existing = rules.find(sameScope);
+    if (existing?.decision === rule.decision) return;
+
+    const retained = rules.filter((candidate) => !sameScope(candidate));
+    const shadows = (candidate: Rule) => {
+      if (candidate.command !== undefined) {
+        return (
+          rule.command !== undefined &&
+          (candidate.tool === "*" || toolNamesEquivalent(candidate.tool, rule.tool)) &&
+          rule.command.startsWith(candidate.command)
+        );
+      }
+      return candidate.tool === "*" || toolNamesEquivalent(candidate.tool, rule.tool);
+    };
+    const shadowingIndex = retained.findIndex(shadows);
+    const insertionIndex = shadowingIndex === -1 ? retained.length : shadowingIndex;
+    const nextRules = [
+      ...retained.slice(0, insertionIndex),
+      rule,
+      ...retained.slice(insertionIndex),
+    ];
 
     // Rules are first-match. A newly added rule must precede a broad wildcard or
-    // tool rule that would otherwise shadow it; replace the same scope at the
-    // same time so the editor never creates a convincing-but-inert conflict.
-    void updateSettings({ rules: [rule, ...rules.filter((candidate) => !sameScope(candidate))] });
+    // tool/prefix rule that would otherwise shadow it. Broad rules stay after
+    // existing exceptions, and replacing a scope never leaves an inert duplicate.
+    void updateSettings({ rules: nextRules });
     setRuleCommand("");
   };
 

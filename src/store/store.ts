@@ -633,6 +633,7 @@ const TURN_IDLE_TIMEOUT_MS = 150_000;
 // Serialize model writes per session so two quick selections cannot reach SQLite
 // out of order (a slower first invoke completing last would otherwise survive reload).
 const sessionModelWriteQueues = new Map<string, Promise<void>>();
+const persistedSessionModels = new Map<string, string>();
 const enqueueSessionModelWrite = (sessionId: string, model: string): Promise<void> => {
   const prior = sessionModelWriteQueues.get(sessionId);
   const write = prior
@@ -1388,23 +1389,31 @@ export const useStore = create<AppState>((set, get) => ({
     const activeId = get().activeId;
     const activeSession = activeId ? get().sessions.find((s) => s.id === activeId) : undefined;
     if (activeId && activeSession) {
-      const previous = activeSession.model;
+      // With no queued optimistic write, the visible value is the durable baseline.
+      // Keep that baseline stable across a burst so every rejection returns to the
+      // last model SQLite actually accepted, never to another optimistic choice.
+      if (!sessionModelWriteQueues.has(activeId)) {
+        persistedSessionModels.set(activeId, activeSession.model);
+      }
+      const persistedBeforeWrite = persistedSessionModels.get(activeId) ?? activeSession.model;
       set((st) => ({
         sessions: st.sessions.map((s) => (s.id === activeId ? { ...s, model } : s)),
         settingsError: null,
       }));
       try {
         await enqueueSessionModelWrite(activeId, model);
+        persistedSessionModels.set(activeId, model);
       } catch (err) {
         // Revert only our still-current optimistic value. A faster second selection
         // may already have landed while this write was in flight; never clobber it.
+        const persistedModel = persistedSessionModels.get(activeId) ?? persistedBeforeWrite;
         set((st) => {
           const failedChoiceIsCurrent =
             st.activeId === activeId &&
             st.sessions.find((session) => session.id === activeId)?.model === model;
           return {
             sessions: st.sessions.map((s) =>
-              s.id === activeId && s.model === model ? { ...s, model: previous } : s,
+              s.id === activeId && s.model === model ? { ...s, model: persistedModel } : s,
             ),
             ...(failedChoiceIsCurrent ? { settingsError: errMessage(err) } : {}),
           };

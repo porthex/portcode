@@ -33,12 +33,8 @@ pub async fn run<S: AsRef<OsStr>>(
     duration: Duration,
     max_stdout: usize,
 ) -> Result<Output, Failure> {
-    let args = hardened_args(args);
-    let mut command = Command::new("git");
+    let mut command = git_command(workspace, args);
     command
-        .arg("--no-pager")
-        .args(args)
-        .current_dir(workspace)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("LC_ALL", "C")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -82,6 +78,21 @@ pub async fn run<S: AsRef<OsStr>>(
             Err(Failure::Timeout)
         }
     }
+}
+
+/// Construct every Git process with repository fsmonitor integration disabled.
+/// A configured fsmonitor hook can launch another process even for read-only
+/// commands, so override it process-locally before the subcommand is parsed.
+fn git_command<S: AsRef<OsStr>>(workspace: &Path, args: &[S]) -> Command {
+    let args = hardened_args(args);
+    let mut command = Command::new("git");
+    command
+        .arg("--no-pager")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .args(args)
+        .current_dir(workspace);
+    command
 }
 
 /// Keep repository-configured diff drivers and text conversion from spawning
@@ -183,6 +194,21 @@ mod tests {
                 OsStr::new("status"),
                 OsStr::new("--porcelain=v2"),
                 OsStr::new("--branch"),
+            ]
+        );
+    }
+
+    #[test]
+    fn disables_fsmonitor_before_every_git_subcommand() {
+        let command = git_command(Path::new("repo"), &["status", "--porcelain=v2"]);
+        assert_eq!(
+            command.as_std().get_args().collect::<Vec<_>>(),
+            [
+                OsStr::new("--no-pager"),
+                OsStr::new("-c"),
+                OsStr::new("core.fsmonitor=false"),
+                OsStr::new("status"),
+                OsStr::new("--porcelain=v2"),
             ]
         );
     }

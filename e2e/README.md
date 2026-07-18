@@ -11,8 +11,8 @@ server, browser-version matching, or test API is compiled into Portcode.
 interaction shell rather than stopping after first paint. It asserts that the
 real desktop window:
 
-1. the `Portcode` document title,
-2. a non-empty React root (`#root`), and
+1. has the `Portcode` document title,
+2. has a non-empty React root (`#root`),
 3. renders the visible application shell and title bar (`header`),
 4. opens Settings without replacing the workspace with an error fallback,
 5. opens Portcode's themed model listbox and exposes model options,

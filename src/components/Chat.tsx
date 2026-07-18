@@ -204,8 +204,9 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
               type="button"
               aria-label="Scroll to latest"
               onClick={scrollToBottom}
-              style={{ right: transcriptAside && transcriptAsideOpen ? "382px" : "16px" }}
-              className="pc-fab-enter absolute bottom-4 z-20 flex h-9 w-9 items-center justify-center rounded-full border border-border bg-panel text-fg transition-[right,opacity] duration-300 ease-out hover:border-accent-2 hover:shadow-[var(--shadow-glow-cyan)] active:brightness-90 motion-reduce:transition-none"
+              className={`pc-fab-enter absolute bottom-4 right-4 z-20 flex h-9 w-9 items-center justify-center rounded-full border border-border bg-panel text-fg transition-[right,opacity] duration-300 ease-out hover:border-accent-2 hover:shadow-[var(--shadow-glow-cyan)] active:brightness-90 motion-reduce:transition-none ${
+                transcriptAside && transcriptAsideOpen ? "@min-[734px]:right-[382px]" : ""
+              }`}
             >
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
                 <path
@@ -301,12 +302,14 @@ function EmptyState() {
   // oauthStatus is null until the first refresh resolves; treat unknown as not
   // signed in, so the sign-in nudge shows until auth is confirmed.
   const provider = providerForModel(activeModel, openAIModels);
+  const openAIUnavailable = provider === "openai" && openAIAuthStatus?.available === false;
   const authed =
     provider === "openai"
-      ? !!openAIAuthStatus?.signedIn
+      ? !openAIUnavailable && !!openAIAuthStatus?.signedIn
       : !!oauthStatus?.signedIn || settings.apiKeySet;
-  const authNudge =
-    provider === "openai"
+  const authNudge = openAIUnavailable
+    ? `${openAIAuthStatus?.unavailableReason ?? "ChatGPT subscription access is unavailable in this build"}. Choose Claude in Settings to start`
+    : provider === "openai"
       ? "Sign in with ChatGPT to start"
       : "Sign in with Claude or add an API key to start";
   return (
@@ -335,7 +338,7 @@ function EmptyState() {
             onClick={() => setShowSettings(true)}
             className="rounded border border-border bg-panel px-2 py-0.5 text-fg hover:border-accent"
           >
-            Open settings
+            {openAIUnavailable ? "Choose Claude" : "Open settings"}
           </button>
         </div>
       )}

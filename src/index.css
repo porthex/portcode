@@ -1521,7 +1521,7 @@ input[type="radio"]:not(:disabled) {
   width: 20px;
   height: 20px;
   flex: 0 0 auto;
-  border: 1px solid currentColor;
+  border: 1px solid currentcolor;
   border-radius: 50%;
   font-family: var(--font-mono);
   font-size: 11px;
@@ -1910,7 +1910,7 @@ input[type="radio"]:not(:disabled) {
   width: 36px;
   height: 36px;
   place-items: center;
-  border: 1px solid currentColor;
+  border: 1px solid currentcolor;
   border-radius: 11px;
   background: rgba(7, 9, 15, 0.64);
   font-family: var(--font-display);
@@ -3160,10 +3160,10 @@ input[type="radio"]:not(:disabled) {
     rgba(35, 42, 61, 0.98) 48%,
     rgba(33, 230, 255, 0.34)
   );
-  animation: pcComposerBreathe 2.8s ease-in-out infinite;
+  animation: pc-composer-breathe 2.8s ease-in-out infinite;
 }
 
-@keyframes pcComposerBreathe {
+@keyframes pc-composer-breathe {
   0%,
   100% {
     box-shadow:
@@ -3416,7 +3416,7 @@ input[type="radio"]:not(:disabled) {
 
 /* Armed cue: a brief light response when Send becomes fireable, without scaling the
    control or pulling the eye away from the draft. */
-@keyframes pcArm {
+@keyframes pc-arm {
   0% {
     box-shadow: 0 0 16px rgba(255, 46, 126, 0.45);
   }
@@ -3428,7 +3428,7 @@ input[type="radio"]:not(:disabled) {
   }
 }
 .pc-armed {
-  animation: pcArm 0.3s ease-out;
+  animation: pc-arm 0.3s ease-out;
 }
 
 .pc-stop {

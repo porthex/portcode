@@ -41,6 +41,7 @@ export default function App() {
   const online = useStore((s) => s.online);
   const crashReporting = useStore((s) => s.crashReporting);
   const workspaceSurface = useStore((s) => s.workspaceSurface);
+  const filesVisible = showFiles && workspaceSurface === "chat";
   const [environmentOpen, setEnvironmentOpen] = useState(false);
 
   useEffect(() => {
@@ -118,13 +119,13 @@ export default function App() {
   // the still-visible toggle so the user keeps their place instead of being
   // stranded on <body>. Gated on the transition so it never grabs focus on the
   // initial collapsed mount.
-  const wasFilesOpen = useRef(showFiles);
+  const wasFilesVisible = useRef(filesVisible);
   useEffect(() => {
-    if (wasFilesOpen.current && !showFiles && document.activeElement === document.body) {
+    if (wasFilesVisible.current && !filesVisible && document.activeElement === document.body) {
       fileToggleRef.current?.focus();
     }
-    wasFilesOpen.current = showFiles;
-  }, [showFiles]);
+    wasFilesVisible.current = filesVisible;
+  }, [filesVisible]);
 
   // Announce a successful remote pairing, mirroring the remoteDropped case. The
   // confirm-SAS path flips remoteVerified true and unmounts the pairing screen with
@@ -250,10 +251,10 @@ export default function App() {
               data-testid="file-rail"
               className="grid shrink-0 transition-[grid-template-columns] duration-200 ease-out motion-reduce:transition-none"
               style={{
-                gridTemplateColumns: showFiles && workspaceSurface === "chat" ? "1fr" : "0fr",
+                gridTemplateColumns: filesVisible ? "1fr" : "0fr",
               }}
-              aria-hidden={!showFiles || workspaceSurface === "review" || undefined}
-              inert={!showFiles || workspaceSurface === "review"}
+              aria-hidden={!filesVisible || undefined}
+              inert={!filesVisible}
             >
               <div className="overflow-hidden">
                 <FileExplorer />
@@ -263,6 +264,7 @@ export default function App() {
               <EnvironmentPanelProvider open={environmentOpen} onOpenChange={setEnvironmentOpen}>
                 <TitleBar
                   fileToggleRef={fileToggleRef}
+                  filesVisible={filesVisible}
                   environmentOpen={environmentOpen}
                   onEnvironmentOpenChange={setEnvironmentOpen}
                 />
@@ -351,15 +353,16 @@ function RemoteShell({
 
 function TitleBar({
   fileToggleRef,
+  filesVisible,
   environmentOpen,
   onEnvironmentOpenChange,
 }: {
   fileToggleRef?: React.Ref<HTMLButtonElement>;
+  filesVisible: boolean;
   environmentOpen: boolean;
   onEnvironmentOpenChange: (open: boolean) => void;
 }) {
   const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
-  const showFiles = useStore((s) => s.showFiles);
   const toggleFiles = useStore((s) => s.toggleFiles);
   const setShowPalette = useStore((s) => s.setShowPalette);
   const workspaceSurface = useStore((s) => s.workspaceSurface);
@@ -371,10 +374,10 @@ function TitleBar({
           ref={fileToggleRef}
           onClick={toggleFiles}
           aria-label="Toggle file explorer (Ctrl+B)"
-          aria-pressed={showFiles}
+          aria-pressed={filesVisible}
           title="Toggle file explorer (Ctrl+B)"
           className={`flex h-[30px] w-[30px] items-center justify-center rounded-[7px] border transition-[background-color,border-color,box-shadow,color] duration-150 motion-reduce:transition-none ${
-            showFiles
+            filesVisible
               ? "border-accent-2/50 bg-accent-2/12 text-accent-2 shadow-[0_0_14px_rgba(33,230,255,0.25)]"
               : "border-border-2 bg-panel-2/60 text-muted hover:border-accent-2/30 hover:text-accent-2"
           }`}

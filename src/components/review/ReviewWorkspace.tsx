@@ -67,55 +67,97 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
   const [draftAnchor, setDraftAnchor] = useState<DraftAnchor | null>(null);
   const [commentBody, setCommentBody] = useState("");
 
+  const mountedRef = useRef(true);
+  const manifestRef = useRef<GitReviewManifest | null>(null);
   const manifestRequest = useRef(0);
+  const manifestBusy = useRef(false);
+  const manifestQueued = useRef(false);
   const patchRequest = useRef(0);
   const previousStreaming = useRef(streaming);
   const previousActive = useRef(active);
   const activeRef = useRef(active);
   activeRef.current = active;
+  const scopeRef = useRef(scope);
+  scopeRef.current = scope;
 
   const refresh = useCallback(async () => {
-    const request = ++manifestRequest.current;
+    if (!mountedRef.current || !activeRef.current) return;
+    if (manifestBusy.current) {
+      manifestQueued.current = true;
+      setRefreshing(true);
+      setManifestLoading(true);
+      return;
+    }
+
+    manifestBusy.current = true;
     setRefreshing(true);
     setManifestLoading(true);
     try {
-      const next = await ipc.getGitReviewManifest(scope);
-      if (request !== manifestRequest.current) return;
-      setManifest((current) => {
-        if (current?.snapshotId !== next.snapshotId) {
-          patchRequest.current += 1;
-          setPatch(null);
-          setDraftAnchor(null);
+      do {
+        manifestQueued.current = false;
+        const request = manifestRequest.current;
+        const requestScope = scopeRef.current;
+        try {
+          const next = await ipc.getGitReviewManifest(requestScope);
+          if (!mountedRef.current || !activeRef.current || request !== manifestRequest.current) {
+            continue;
+          }
+          if (manifestRef.current?.snapshotId !== next.snapshotId) {
+            patchRequest.current += 1;
+            setPatch(null);
+            setDraftAnchor(null);
+            setCommentBody("");
+          }
+          manifestRef.current = next;
+          setManifest(next);
+          setSelectedPath((current) =>
+            current && next.files.some((file) => file.path === current)
+              ? current
+              : (next.files[0]?.path ?? null),
+          );
+          setManifestError(null);
+        } catch (error) {
+          if (mountedRef.current && activeRef.current && request === manifestRequest.current) {
+            setManifestError(errorMessage(error));
+          }
         }
-        return next;
-      });
-      setSelectedPath((current) =>
-        current && next.files.some((file) => file.path === current)
-          ? current
-          : (next.files[0]?.path ?? null),
-      );
-      setManifestError(null);
-    } catch (error) {
-      if (request === manifestRequest.current) setManifestError(errorMessage(error));
+      } while (manifestQueued.current && mountedRef.current && activeRef.current);
     } finally {
-      if (request === manifestRequest.current) {
+      manifestBusy.current = false;
+      if (mountedRef.current && activeRef.current) {
         setManifestLoading(false);
         setRefreshing(false);
       }
     }
-  }, [scope]);
+  }, []);
 
   useEffect(() => {
+    // React Strict Mode replays setup/cleanup in development. Restore the mount
+    // guard before the replayed scope effect queues its replacement request.
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      manifestRequest.current += 1;
+      manifestQueued.current = false;
+      patchRequest.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
+    // Scope/workspace changes are semantic invalidations: an older response must
+    // not populate this view. Ordinary polling merely queues behind the in-flight
+    // request and is deliberately excluded from this generation counter.
+    manifestRequest.current += 1;
+    patchRequest.current += 1;
+    manifestRef.current = null;
     setManifest(null);
     setSelectedPath(null);
     setPatch(null);
+    setDraftAnchor(null);
+    setCommentBody("");
     setManifestError(null);
     if (activeRef.current) void refresh();
-    return () => {
-      manifestRequest.current += 1;
-      patchRequest.current += 1;
-    };
-  }, [refresh, workspace]);
+  }, [refresh, scope, workspace]);
 
   useEffect(() => {
     if (!active) return;
@@ -133,6 +175,7 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
       void refresh();
     } else if (!active && previousActive.current) {
       manifestRequest.current += 1;
+      manifestQueued.current = false;
       patchRequest.current += 1;
       setManifestLoading(false);
       setPatchLoading(false);
@@ -367,6 +410,7 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
                   onSelect={(path) => {
                     setSelectedPath(path);
                     setDraftAnchor(null);
+                    setCommentBody("");
                   }}
                 />
               ))}
