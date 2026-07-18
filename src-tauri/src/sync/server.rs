@@ -168,6 +168,13 @@ impl CommandHandler for DesktopCommandHandler {
                 }
                 Ok(())
             }
+            // Push delivery is not wired yet, but the web client already sends its
+            // subscription over this channel. Accept the command without logging
+            // its endpoint or encryption keys, which are sensitive credentials.
+            RemoteCommand::RegisterPush { .. } => {
+                eprintln!("phone-sync: register_push received (push send not yet wired)");
+                Ok(())
+            }
             // Scroll-up pagination: fetch an OLDER page of a session's history and
             // publish it back as a `MessagePage`. The initial catch-up ships only the
             // recent window (`messages_tail`), so a client scrolling up past it asks

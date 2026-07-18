@@ -56,6 +56,14 @@ pub enum RemoteCommand {
     Permission { id: String, decision: String },
     /// Open a new session — proxies to `create_session`.
     CreateSession { title: Option<String> },
+    /// Register the web client's Web Push subscription. The desktop currently
+    /// accepts this command so the encrypted command channel remains compatible;
+    /// persisting the subscription and sending pushes are separate features.
+    RegisterPush {
+        endpoint: String,
+        p256dh: String,
+        auth: String,
+    },
     /// Request an older page of a session's history for scroll-up pagination. The
     /// initial catch-up ships only the most-recent `SYNC_CACHE_WINDOW` rows
     /// (`Db::messages_tail`), so scrolling up past them asks the desktop for the
@@ -276,6 +284,9 @@ mod tests {
             RemoteCommand::Cancel {
                 session_id: "s1".into(),
             },
+            RemoteCommand::CancelAgent {
+                agent_id: "a1".into(),
+            },
             RemoteCommand::Permission {
                 id: "p1".into(),
                 decision: "allow".into(),
@@ -284,8 +295,42 @@ mod tests {
                 title: Some("New".into()),
             },
             RemoteCommand::CreateSession { title: None },
+            RemoteCommand::RegisterPush {
+                endpoint: "https://push.example/abc".into(),
+                p256dh: "public-key".into(),
+                auth: "auth-secret".into(),
+            },
         ] {
             round_trips(&SyncFrame::Command { command });
         }
+    }
+
+    #[test]
+    fn register_push_uses_the_web_clients_snake_case_command_tag() {
+        let frame = SyncFrame::Command {
+            command: RemoteCommand::RegisterPush {
+                endpoint: "https://push.example/xyz".into(),
+                p256dh: "key".into(),
+                auth: "secret".into(),
+            },
+        };
+        let json = serde_json::to_string(&frame).expect("encode register_push frame");
+        assert!(json.contains("\"cmd\":\"register_push\""), "{json}");
+        round_trips(&frame);
+
+        let from_web = r#"{"t":"command","command":{"cmd":"register_push","endpoint":"https://push.example/xyz","p256dh":"key","auth":"secret"}}"#;
+        let decoded: SyncFrame = serde_json::from_str(from_web).expect("decode web payload");
+        assert!(matches!(
+            decoded,
+            SyncFrame::Command {
+                command: RemoteCommand::RegisterPush {
+                    endpoint,
+                    p256dh,
+                    auth,
+                },
+            } if endpoint == "https://push.example/xyz"
+                && p256dh == "key"
+                && auth == "secret"
+        ));
     }
 }
