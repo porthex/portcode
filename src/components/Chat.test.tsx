@@ -165,6 +165,66 @@ describe("Chat children", () => {
     // PermissionPrompt returns null when nothing is pending.
     expect(screen.queryByText(/wants to run/i)).not.toBeInTheDocument();
   });
+
+  it("does not render the legacy Subagents dropdown above the composer", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "delegate this work")] },
+      agents: {
+        s1: [
+          {
+            id: "agent-1",
+            description: "Audit the workspace",
+            status: "running",
+            step: 2,
+          },
+        ],
+      },
+      streaming: true,
+    });
+
+    render(<Chat />);
+
+    expect(screen.queryByRole("region", { name: "Subagents" })).not.toBeInTheDocument();
+    expect(screen.queryByText("1 subagent running")).not.toBeInTheDocument();
+    expect(screen.getByTestId("chat-composer-area")).toBeInTheDocument();
+  });
+
+  it("compacts only the transcript while the full-width composer stays fixed", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "keep the input wide")] },
+      streaming: false,
+    });
+
+    const panel = <aside data-testid="test-environment-panel">Environment</aside>;
+    const { rerender } = render(<Chat transcriptAside={panel} transcriptAsideOpen={false} />);
+    const layout = screen.getByTestId("chat-transcript-layout");
+    const scrollArea = screen.getByTestId("chat-transcript-scroll");
+    const content = screen.getByTestId("chat-transcript-content");
+    const aside = screen.getByTestId("chat-transcript-aside");
+    const asideFrame = screen.getByTestId("chat-transcript-aside-frame");
+    const composerArea = screen.getByTestId("chat-composer-area");
+
+    expect(layout).toHaveClass("@container", "relative", "overflow-hidden");
+    expect(scrollArea).toHaveClass("absolute", "inset-0", "overflow-y-auto");
+    expect(content).not.toHaveClass("@min-[734px]:pr-[390px]");
+    expect(aside).toHaveAttribute("inert");
+    expect(aside).toHaveClass("absolute", "right-3", "max-w-[354px]");
+    expect(asideFrame).toHaveClass("w-full", "py-3", "pl-3");
+    expect(layout).not.toContainElement(composerArea);
+    expect(composerArea).toHaveClass("w-full");
+    expect(layout.parentElement).toBe(composerArea.parentElement);
+
+    rerender(<Chat transcriptAside={panel} transcriptAsideOpen />);
+
+    expect(content).toHaveClass("@min-[734px]:pr-[390px]");
+    expect(scrollArea).toHaveClass("absolute", "inset-0");
+    expect(aside).not.toHaveAttribute("inert");
+    expect(composerArea).toHaveClass("w-full");
+  });
 });
 
 describe("Chat scroll-to-search-result", () => {

@@ -154,6 +154,30 @@ export interface DirEntry {
   isDir: boolean;
 }
 
+export type WorkspaceGitSummary =
+  | {
+      kind: "repository";
+      branch: string | null;
+      detachedHead: string | null;
+      upstream: string | null;
+      ahead: number;
+      behind: number;
+      changedFiles: number;
+      untrackedFiles: number;
+      additions: number;
+      deletions: number;
+    }
+  | { kind: "notRepository" }
+  | { kind: "unavailable"; reason: "missing" | "timeout" | "failed" };
+
+/** Read-only facts for the workspace actually used by native agent runs. */
+export interface WorkspaceSummary {
+  path: string;
+  /** False when the native core fell back to its process working directory. */
+  configured: boolean;
+  git: WorkspaceGitSummary;
+}
+
 export type ToolPolicy = "allow" | "ask" | "deny";
 
 /**

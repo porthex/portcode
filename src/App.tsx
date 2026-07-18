@@ -15,6 +15,11 @@ import { InstallGate } from "./components/InstallGate";
 import { CrashConsentPrompt } from "./components/CrashConsentPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { ChannelBadge } from "./components/ChannelBadge";
+import {
+  EnvironmentPanelDock,
+  EnvironmentPanelProvider,
+  EnvironmentPanelTrigger,
+} from "./components/EnvironmentPanel";
 import { isTauri, isWebClientMode, onUpdaterEvent } from "./lib/ipc";
 import { isSelfDev } from "./lib/channel";
 import { getInstallState } from "./lib/installGate";
@@ -33,6 +38,7 @@ export default function App() {
   const remoteChatOpen = useStore((s) => s.remoteChatOpen);
   const online = useStore((s) => s.online);
   const crashReporting = useStore((s) => s.crashReporting);
+  const [environmentOpen, setEnvironmentOpen] = useState(false);
 
   // A stable target for keyboard focus after the file rail collapses: the
   // TitleBar file-toggle button stays visible and tabbable, so it's where a
@@ -242,8 +248,19 @@ export default function App() {
               </div>
             </div>
             <main className="flex min-w-0 flex-1 flex-col">
-              <TitleBar fileToggleRef={fileToggleRef} />
-              <Chat />
+              <EnvironmentPanelProvider open={environmentOpen} onOpenChange={setEnvironmentOpen}>
+                <TitleBar
+                  fileToggleRef={fileToggleRef}
+                  environmentOpen={environmentOpen}
+                  onEnvironmentOpenChange={setEnvironmentOpen}
+                />
+                <Chat
+                  transcriptAsideOpen={environmentOpen}
+                  transcriptAside={
+                    <EnvironmentPanelDock onClose={() => setEnvironmentOpen(false)} />
+                  }
+                />
+              </EnvironmentPanelProvider>
             </main>
           </div>
 
@@ -299,13 +316,21 @@ function RemoteShell({
   );
 }
 
-function TitleBar({ fileToggleRef }: { fileToggleRef?: React.Ref<HTMLButtonElement> }) {
+function TitleBar({
+  fileToggleRef,
+  environmentOpen,
+  onEnvironmentOpenChange,
+}: {
+  fileToggleRef?: React.Ref<HTMLButtonElement>;
+  environmentOpen: boolean;
+  onEnvironmentOpenChange: (open: boolean) => void;
+}) {
   const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
   const showFiles = useStore((s) => s.showFiles);
   const toggleFiles = useStore((s) => s.toggleFiles);
   const setShowPalette = useStore((s) => s.setShowPalette);
   return (
-    <header className="flex h-[46px] shrink-0 items-center justify-between border-b border-border bg-panel/70 px-3.5 backdrop-blur-sm">
+    <header className="relative z-40 flex h-[46px] shrink-0 items-center justify-between border-b border-border bg-panel/70 px-3.5 backdrop-blur-sm">
       <div className="flex min-w-0 items-center gap-2.5">
         <button
           ref={fileToggleRef}
@@ -341,6 +366,7 @@ function TitleBar({ fileToggleRef }: { fileToggleRef?: React.Ref<HTMLButtonEleme
             PREVIEW MODE
           </span>
         )}
+        <EnvironmentPanelTrigger open={environmentOpen} onOpenChange={onEnvironmentOpenChange} />
         <button
           onClick={() => setShowPalette(true)}
           aria-label="Open command palette (Ctrl+K)"

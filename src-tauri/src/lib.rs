@@ -36,6 +36,8 @@ mod tools;
 // never self-updates). The whole module is `#![cfg(desktop)]` internally too.
 #[cfg(desktop)]
 mod update;
+#[cfg(desktop)]
+mod workspace;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1355,6 +1357,7 @@ pub fn run() {
         get_usage,
         get_all_usage,
         search_messages,
+        workspace::get_workspace_summary,
         list_dir,
         run_agent,
         cancel_agent,

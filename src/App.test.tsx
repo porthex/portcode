@@ -18,10 +18,46 @@ vi.mock("./components/Sidebar", () => ({
   Sidebar: () => <div data-testid="sidebar" />,
 }));
 vi.mock("./components/Chat", () => ({
-  Chat: () => <div data-testid="chat" />,
+  Chat: ({
+    transcriptAside,
+    transcriptAsideOpen,
+  }: {
+    transcriptAside?: React.ReactNode;
+    transcriptAsideOpen?: boolean;
+  }) => (
+    <div data-testid="chat" data-transcript-aside-open={String(!!transcriptAsideOpen)}>
+      {transcriptAside}
+    </div>
+  ),
 }));
 vi.mock("./components/FileExplorer", () => ({
   FileExplorer: () => <div data-testid="file-explorer" />,
+}));
+vi.mock("./components/EnvironmentPanel", () => ({
+  EnvironmentPanelProvider: ({ children }: React.PropsWithChildren) => <>{children}</>,
+  EnvironmentPanelTrigger: ({
+    open,
+    onOpenChange,
+  }: {
+    open: boolean;
+    onOpenChange: (open: boolean) => void;
+  }) => (
+    <button
+      type="button"
+      aria-label="Environment and agents"
+      aria-expanded={open}
+      onClick={() => onOpenChange(!open)}
+    >
+      Environment
+    </button>
+  ),
+  EnvironmentPanelDock: ({ onClose }: { onClose: () => void }) => (
+    <div data-testid="environment-panel">
+      <button type="button" onClick={onClose}>
+        Close environment
+      </button>
+    </div>
+  ),
 }));
 vi.mock("./components/Settings", () => ({
   SettingsPanel: () => <div data-testid="settings-panel" />,
@@ -235,6 +271,25 @@ describe("App layout", () => {
     expect(screen.getByTestId("settings-panel")).toBeInTheDocument();
     // The file rail is mounted but collapsed when showFiles is false.
     expect(screen.getByTestId("file-rail")).toHaveStyle({ gridTemplateColumns: "0fr" });
+  });
+
+  it("routes the environment dock into Chat without resizing the shell", () => {
+    render(<App />);
+
+    const chat = screen.getByTestId("chat");
+    const trigger = screen.getByRole("button", { name: "Environment and agents" });
+
+    expect(chat).toHaveAttribute("data-transcript-aside-open", "false");
+    expect(chat).toContainElement(screen.getByTestId("environment-panel"));
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(trigger);
+
+    expect(chat).toHaveAttribute("data-transcript-aside-open", "true");
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Close environment" }));
+    expect(chat).toHaveAttribute("data-transcript-aside-open", "false");
   });
 });
 

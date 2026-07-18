@@ -19,6 +19,7 @@ import type {
   SyncFrame,
   UpdateChannel,
   UpdateInfo,
+  WorkspaceSummary,
 } from "../types";
 import {
   webOnPhoneSyncDisconnected,
@@ -486,6 +487,15 @@ export async function searchMessages(query: string): Promise<SearchHit[]> {
 
 // ── workspace / files ─────────────────────────────────────────────────────────
 
+/** Read-only Git/workspace facts for the directory native agent runs currently use. */
+export async function getWorkspaceSummary(): Promise<WorkspaceSummary> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<WorkspaceSummary>("get_workspace_summary");
+  }
+  return mock.getWorkspaceSummary();
+}
+
 export async function listDir(sub?: string): Promise<DirEntry[]> {
   if (isTauri()) {
     const { core } = await tauri();
@@ -736,6 +746,24 @@ const mock = (() => {
         docs: [{ name: "ROADMAP.md", path: "docs/ROADMAP.md", isDir: false }],
       };
       return tree[sub ?? ""] ?? [];
+    },
+    async getWorkspaceSummary(): Promise<WorkspaceSummary> {
+      return {
+        path: settings.workspace ?? "C:/dev/portcode",
+        configured: settings.workspace !== null,
+        git: {
+          kind: "repository",
+          branch: "main",
+          detachedHead: null,
+          upstream: "origin/main",
+          ahead: 0,
+          behind: 0,
+          changedFiles: 6,
+          untrackedFiles: 1,
+          additions: 342,
+          deletions: 28,
+        },
+      };
     },
     async runAgent(
       _sessionId: string,

@@ -185,6 +185,19 @@ describe("Tauri command serialization", () => {
     expect(invoke).toHaveBeenCalledWith("list_dir", { sub: "src/components" });
   });
 
+  it("get_workspace_summary is invoked without a frontend-supplied path", async () => {
+    const { ipc, invoke } = await load();
+    const summary = {
+      path: "C:/workspace",
+      configured: true,
+      git: { kind: "notRepository" },
+    } as const;
+    invoke.mockResolvedValue(summary);
+
+    await expect(ipc.getWorkspaceSummary()).resolves.toBe(summary);
+    expect(invoke).toHaveBeenCalledWith("get_workspace_summary");
+  });
+
   it("list_sessions is invoked with no arguments", async () => {
     const { ipc, invoke } = await load();
     const sessions = [{ id: "s1" }];
@@ -517,6 +530,24 @@ describe("browser fallback (no Tauri core)", () => {
       expect.arrayContaining([expect.objectContaining({ name: "App.tsx", isDir: false })]),
     );
     expect(await ipc.listDir("does/not/exist")).toEqual([]);
+  });
+
+  it("returns deterministic workspace facts in the browser preview", async () => {
+    const { ipc, invoke } = await load();
+
+    const summary = await ipc.getWorkspaceSummary();
+    expect(summary).toMatchObject({
+      path: "C:/dev/portcode",
+      configured: false,
+      git: {
+        kind: "repository",
+        branch: "main",
+        changedFiles: 6,
+        additions: 342,
+        deletions: 28,
+      },
+    });
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it("openFolder returns the canned preview path", async () => {
