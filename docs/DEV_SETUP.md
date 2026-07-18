@@ -121,7 +121,7 @@ Save the file and the update appears in under a second. No restart needed.
 
 **Rust core (`src-tauri/`)**
 There is no Rust hot-reload. A change requires a full `cargo` rebuild + app
-relaunch, which takes several minutes on a low-RAM machine. Use
+relaunch, which can take several minutes. Use
 `pnpm watch:rust` in a separate terminal for type / borrow / clippy feedback
 in seconds while editing; trigger the full rebuild only when you want to run
 the change.
@@ -206,7 +206,7 @@ Then re-run `pnpm watch:rust`.
 
 ### Rust builds are slow / machine runs out of memory
 
-Full Tauri builds are heavy on an 8 GB machine. Workflow:
+Full Tauri builds can be resource-intensive. Workflow:
 
 1. Use `pnpm watch:rust` for fast type/borrow/clippy feedback while editing.
 2. Let CI (`cargo clippy` / `cargo test`) run the Rust verification leg on PRs

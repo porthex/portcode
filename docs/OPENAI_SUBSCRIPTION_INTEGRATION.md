@@ -446,7 +446,7 @@ Do not depend on:
 | Regression      | Existing provider           | Anthropic login, picker, streaming, tool use, persistence, and cancellation remain unchanged.                                                  |
 | Compatibility   | Unknown protocol data       | Unknown SSE events, JSON fields, plan/model/effort values, and missing optional usage do not break an otherwise valid turn.                    |
 
-Per repository policy, Rust tests should run in CI rather than on a low-memory local machine. Any frontend changes must include matching tests and pass `pnpm test:coverage` before merge.
+Rust tests run in CI on every pull request. Any frontend changes must include matching tests and pass `pnpm test:coverage` before merge.
 
 ## Primary sources
 

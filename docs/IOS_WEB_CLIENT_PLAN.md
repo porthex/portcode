@@ -522,8 +522,7 @@ New frontend code **must** ship with tests in the same change (per `CLAUDE.md`).
 - **Rust (`portcode-sync`):** unit tests move with the code (the existing
   `protocol`/`noise`/`session` tests). Add wasm-target build verification in CI
   (`cargo build --target wasm32-unknown-unknown` + `wasm-pack test --headless`
-  for the Noise round-trip). Rust tests run in CI (the crate is too heavy to
-  build on low-RAM dev machines — **verify via CI**).
+  for the Noise round-trip). Rust tests run in CI.
 - **Frontend:** the reused store/components and the WASM adapter, scanner,
   install gate, storage, and reconnect/visibility wiring have matching Vitest
   coverage. Keep those tests hermetic and extend them with each behavior change.
