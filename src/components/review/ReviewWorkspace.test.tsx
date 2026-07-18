@@ -586,8 +586,8 @@ describe("ReviewWorkspace", () => {
     await waitFor(() =>
       expect(m.getGitReviewManifest.mock.calls.length).toBeGreaterThan(callsWhileHidden),
     );
-    expect(screen.getByText("Keep this review state.")).toBeInTheDocument();
     expect(screen.getByText("1 comment")).toBeInTheDocument();
+    expect(await screen.findByText("Keep this review state.")).toBeInTheDocument();
   });
 
   it("returns to chat directly from the workspace header", async () => {
