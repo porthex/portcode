@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import * as ipc from "../lib/ipc";
 import { useStore } from "../store/store";
 import {
   DANGER_MODES,
@@ -11,6 +12,7 @@ import {
   type ProviderId,
 } from "../types";
 import { PlanUsagePopover } from "./PlanUsagePopover";
+import { lowestPlanRemaining } from "./PlanUsagePanel";
 
 /** "claude-opus-4-8" -> "OPUS 4.8" */
 function modelLabel(id: string, openAIModels: ModelInfo[]): string {
@@ -80,11 +82,13 @@ export function StatusHud() {
   const runningBg = bgTasks ? bgTasks.filter((t) => t.status === "running").length : 0;
   const tokens = usage ? usage.input + usage.output : 0;
   const [showPlanUsage, setShowPlanUsage] = useState(false);
+  const [planRemaining, setPlanRemaining] = useState<number | null>(null);
   const planTriggerRef = useRef<HTMLButtonElement>(null);
-  const availableProviders = openAIAuth?.available === false ? 1 : 2;
-  const connectedProviders =
-    Number(Boolean(claudeAuth?.signedIn)) +
-    Number(openAIAuth?.available !== false && Boolean(openAIAuth?.signedIn));
+  const activeProvider = providerForModel(model, openAIModels);
+  const providerConnected =
+    activeProvider === "openai"
+      ? openAIAuth?.available !== false && Boolean(openAIAuth?.signedIn)
+      : Boolean(claudeAuth?.signedIn);
 
   const closePlanUsage = useCallback(() => setShowPlanUsage(false), []);
   const openPlanSettings = useCallback(
@@ -107,6 +111,24 @@ export function StatusHud() {
   useEffect(() => {
     if (showSettings || showPalette || remoteMode) setShowPlanUsage(false);
   }, [remoteMode, showPalette, showSettings]);
+
+  useEffect(() => {
+    setPlanRemaining(null);
+    if (remoteMode || !providerConnected) return;
+
+    let cancelled = false;
+    void ipc
+      .getPlanUsage(activeProvider)
+      .then((snapshot) => {
+        if (!cancelled) setPlanRemaining(lowestPlanRemaining([snapshot]));
+      })
+      .catch(() => {
+        if (!cancelled) setPlanRemaining(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProvider, providerConnected, remoteMode]);
 
   const workspaceConnected = Boolean(session?.workspace);
   // Memoized so a token/usage-only re-render (messages array reference stable)
@@ -188,18 +210,29 @@ export function StatusHud() {
             ref={planTriggerRef}
             type="button"
             className={`pc-hud-seg pc-hud-seg--right pc-hud-plan-trigger${showPlanUsage ? " pc-hud-plan-trigger--active" : ""}`}
-            aria-label={`Plan limits, ${connectedProviders} of ${availableProviders} providers connected`}
+            aria-label={`Plan usage, ${planRemaining === null ? "percentage unavailable" : `${planRemaining}% remaining`}, ${providerConnected ? "connected" : "not connected"} for this ${activeProvider === "openai" ? "GPT" : "Claude"} chat`}
             aria-haspopup="dialog"
             aria-expanded={showPlanUsage}
             aria-controls="pc-plan-usage-popover"
-            title="Check GPT and Claude plan limits"
+            title={`Lowest remaining percentage for this ${activeProvider === "openai" ? "GPT" : "Claude"} chat`}
             onClick={() => setShowPlanUsage((open) => !open)}
           >
             <span
-              className={`pc-dot ${connectedProviders > 0 ? "pc-dot--success" : ""}`}
+              className={`pc-dot ${providerConnected ? "pc-dot--success" : ""}`}
               aria-hidden="true"
             />
-            LIMITS
+            USAGE
+            <span
+              className={`pc-hud-plan-value${
+                planRemaining !== null && planRemaining <= 10
+                  ? " pc-hud-plan-value--danger"
+                  : planRemaining !== null && planRemaining <= 25
+                    ? " pc-hud-plan-value--warn"
+                    : ""
+              }`}
+            >
+              {planRemaining === null ? "--" : planRemaining}%
+            </span>
           </button>
         )}
         <div className="pc-hud-seg pc-hud-seg--right text-faint">{tokens.toLocaleString()} tok</div>
@@ -224,9 +257,11 @@ export function StatusHud() {
       {!remoteMode && (
         <PlanUsagePopover
           open={showPlanUsage}
+          provider={activeProvider}
           triggerRef={planTriggerRef}
           onClose={closePlanUsage}
           onOpenSettings={openPlanSettings}
+          onRemainingChange={setPlanRemaining}
         />
       )}
     </>

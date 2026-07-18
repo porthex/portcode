@@ -699,6 +699,9 @@ describe("MessageView — right-click context menu", () => {
       configurable: true,
     });
   });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
 
   it("copies the user message text from the context menu", () => {
     const { container } = render(
@@ -727,6 +730,47 @@ describe("MessageView — right-click context menu", () => {
 
     // Only the text blocks are joined (tool_use is skipped).
     expect(writeText).toHaveBeenCalledWith("part one part two");
+  });
+
+  it("does not open the custom menu when text in that message is selected", () => {
+    vi.spyOn(window, "getSelection").mockReturnValue({
+      isCollapsed: false,
+      rangeCount: 1,
+      getRangeAt: () => ({ intersectsNode: () => true }) as unknown as Range,
+    } as unknown as Selection);
+    const { container } = render(
+      <MessageView message={message("user", [{ kind: "text", text: "Hello there" }])} />,
+    );
+
+    fireEvent.contextMenu(container.firstElementChild as HTMLElement);
+
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("opens the custom menu when the active selection is outside that message", () => {
+    vi.spyOn(window, "getSelection").mockReturnValue({
+      isCollapsed: false,
+      rangeCount: 1,
+      getRangeAt: () => ({ intersectsNode: () => false }) as unknown as Range,
+    } as unknown as Selection);
+    const { container } = render(
+      <MessageView message={message("user", [{ kind: "text", text: "Hello there" }])} />,
+    );
+
+    fireEvent.contextMenu(container.firstElementChild as HTMLElement);
+
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+  });
+
+  it("opens the custom menu when there is no active selection", () => {
+    vi.spyOn(window, "getSelection").mockReturnValue({ isCollapsed: true } as Selection);
+    const { container } = render(
+      <MessageView message={message("user", [{ kind: "text", text: "Hello there" }])} />,
+    );
+
+    fireEvent.contextMenu(container.firstElementChild as HTMLElement);
+
+    expect(screen.getByRole("menu")).toBeInTheDocument();
   });
 
   it("disables Copy message text when the message has no text", () => {

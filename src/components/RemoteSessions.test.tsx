@@ -107,16 +107,21 @@ describe("RemoteSessions — list", () => {
     useStore.setState({ sessions: [session()], activeId: "s1", creatingSession: true });
     render(<RemoteSessions />);
 
-    expect(screen.getByRole("button", { name: /New session on desktop/ })).toBeDisabled();
+    const button = screen.getByRole("button", { name: /New session on desktop/ });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("title", "Creating a session…");
   });
 
-  it("keeps the new-session footer enabled while merely streaming (create not in flight)", () => {
+  it("disables the new-session footer while streaming", () => {
     useStore.setState({ sessions: [session()], activeId: "s1", streaming: true });
     render(<RemoteSessions />);
 
-    // The create CTA is gated on creatingSession, not streaming — a streaming turn
-    // alone doesn't block creating another desktop session.
-    expect(screen.getByRole("button", { name: /New session on desktop/ })).not.toBeDisabled();
+    const button = screen.getByRole("button", { name: /New session on desktop/ });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute(
+      "title",
+      "Finish the current response before creating a session.",
+    );
   });
 
   it("does not open a different session when tapped mid-stream", () => {
@@ -165,6 +170,19 @@ describe("RemoteSessions — empty", () => {
   it("disables the empty-state CTA while a create is in flight (creatingSession)", () => {
     useStore.setState({ sessions: [], activeId: null, creatingSession: true });
     render(<RemoteSessions />);
-    expect(screen.getByRole("button", { name: /New session/ })).toBeDisabled();
+    const button = screen.getByRole("button", { name: /New session/ });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("title", "Creating a session…");
+  });
+
+  it("disables the empty-state CTA while streaming", () => {
+    useStore.setState({ sessions: [], activeId: null, streaming: true });
+    render(<RemoteSessions />);
+    const button = screen.getByRole("button", { name: /New session/ });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute(
+      "title",
+      "Finish the current response before creating a session.",
+    );
   });
 });

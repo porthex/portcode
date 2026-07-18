@@ -23,12 +23,25 @@ export function RemoteSessions() {
     void openRemoteSession(id);
   };
 
+  // newSession() no-ops while streaming (switching activeId mid-turn would strand
+  // the live run). Disable the CTAs so the guard is visible, not silent.
+  const createDisabled = creatingSession || streaming;
+  const createDisabledTitle = creatingSession
+    ? "Creating a session…"
+    : streaming
+      ? "Finish the current response before creating a session."
+      : undefined;
+
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-bg text-fg">
       <ConnectedBanner />
 
       {sessions.length === 0 ? (
-        <EmptyState onNew={() => void newSession()} creating={creatingSession} />
+        <EmptyState
+          onNew={() => void newSession()}
+          disabled={createDisabled}
+          disabledTitle={createDisabledTitle}
+        />
       ) : (
         <>
           <div className="px-5 pb-2 pt-[18px]">
@@ -53,8 +66,8 @@ export function RemoteSessions() {
           <div className="border-t border-[#141a29] px-4 py-3">
             <button
               onClick={() => void newSession()}
-              disabled={creatingSession}
-              title={creatingSession ? "Creating a session…" : undefined}
+              disabled={createDisabled}
+              title={createDisabledTitle}
               className="flex h-[50px] w-full items-center justify-center gap-2 rounded-[13px] border border-accent-2/30 bg-accent-2/[0.07] font-display text-[14px] font-semibold tracking-[0.4px] text-accent-2 transition hover:bg-accent-2/[0.14] hover:shadow-glow-cyan disabled:opacity-40"
             >
               <span className="-mt-0.5 text-[17px] leading-none">+</span> New session on desktop
@@ -140,7 +153,15 @@ function SessionCard({
 }
 
 /** Connected, but the desktop has no sessions yet. */
-function EmptyState({ onNew, creating }: { onNew: () => void; creating: boolean }) {
+function EmptyState({
+  onNew,
+  disabled,
+  disabledTitle,
+}: {
+  onNew: () => void;
+  disabled: boolean;
+  disabledTitle?: string;
+}) {
   return (
     <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-1 px-[34px] py-6 text-center">
       <div className="mb-3.5 flex h-[74px] w-[74px] items-center justify-center rounded-[20px] border border-border bg-accent-2/[0.05]">
@@ -163,7 +184,8 @@ function EmptyState({ onNew, creating }: { onNew: () => void; creating: boolean 
       </p>
       <button
         onClick={onNew}
-        disabled={creating}
+        disabled={disabled}
+        title={disabledTitle}
         className="mt-5 flex h-[52px] w-full items-center justify-center gap-2 rounded-[13px] border border-accent bg-accent font-display text-[14.5px] font-bold tracking-[0.6px] text-bg shadow-glow-accent transition hover:shadow-[0_0_34px_rgba(255,46,126,.7)] hover:brightness-110 disabled:opacity-40 disabled:shadow-none"
       >
         <span className="-mt-0.5 text-[18px] leading-none">+</span> New session

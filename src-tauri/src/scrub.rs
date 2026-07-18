@@ -15,11 +15,10 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-/// Hard cap on a string before regex work. Two jobs: (1) bounds any regex so a
-/// giant crash string can't stall (defense-in-depth alongside Rust's regex crate,
-/// which is already non-backtracking / linear by construction, so ReDoS is not a
-/// concern), and (2) prevents an accidental full-file/full-prompt dump from riding
-/// out inside an exception message.
+/// Hard cap on the redacted output so an accidental full-file/full-prompt dump
+/// cannot ride out inside an exception message. The regex crate is linear and
+/// non-backtracking; privacy requires matching the complete input before this cap
+/// is applied so a boundary-spanning secret cannot leak a partial value.
 const MAX_REDACT_LEN: usize = 2048;
 
 /// One ordered redaction pass: a compiled pattern + its replacement template.
@@ -90,22 +89,19 @@ fn redactors() -> &'static [Redactor] {
     })
 }
 
-/// Run every redaction pass over a string. Caps length first (dump guard), then
-/// applies each pass in order. Safe on any string.
+/// Run every redaction pass over the complete string, then apply the dump guard.
+/// Redacting first prevents a secret that crosses the cap from leaking its
+/// unmatched prefix in the retained head.
 pub fn redact_secrets(value: &str) -> String {
-    // Cap by CHARS (not bytes) so we never split a UTF-8 codepoint. This mirrors the
-    // JS `slice(0, MAX_REDACT_LEN)` which is also codepoint(-ish)-aware.
-    let capped = value.chars().count() > MAX_REDACT_LEN;
-    let mut out: String = if capped {
-        value.chars().take(MAX_REDACT_LEN).collect()
-    } else {
-        value.to_string()
-    };
+    let mut out = value.to_string();
     for r in redactors() {
         // `replace_all` returns Cow; only allocate when something actually matched.
         out = r.re.replace_all(&out, r.repl).into_owned();
     }
-    if capped {
+    // Cap by CHARS (not bytes) so a UTF-8 codepoint is never split. This happens
+    // only after every secret in the original input has been replaced.
+    if out.chars().count() > MAX_REDACT_LEN {
+        out = out.chars().take(MAX_REDACT_LEN).collect();
         out.push_str("…[truncated]");
     }
     out
@@ -210,9 +206,35 @@ mod tests {
 
     #[test]
     fn caps_very_long_strings_so_a_giant_dump_cant_ride_out() {
-        let huge = format!("noreply@{}", "a".repeat(50_000));
+        // Keep this fixture ordinary: a single 50k-character alphanumeric run is
+        // intentionally classified as a key-shaped secret and safely collapses to
+        // `[redacted-key]` before the output cap is evaluated.
+        let huge = "ordinary diagnostic text ".repeat(5_000);
         let out = redact_secrets(&huge);
         assert!(out.chars().count() < 3000);
+        assert!(out.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn redacts_a_secret_that_straddles_the_length_cap_before_truncating() {
+        let key = "sk-ant-STRADDLINGSECRET0123456789ABCDEF";
+        // Only `sk-ant-STR` lands before the original cap. That fragment is too
+        // short for the API-key regex, so truncate-first behavior would leak it.
+        let visible_fragment = "sk-ant-STR";
+        let prefix_len = MAX_REDACT_LEN - visible_fragment.chars().count();
+        let mut prefix = "x ".repeat(prefix_len / 2);
+        if prefix.chars().count() < prefix_len {
+            prefix.push('x');
+        }
+        let input = format!("{prefix}{key}{}", " y".repeat(200));
+
+        let out = redact_secrets(&input);
+
+        assert!(!out.contains(key));
+        assert!(
+            !out.contains(visible_fragment),
+            "no boundary-spanning secret prefix may survive: {out}"
+        );
         assert!(out.ends_with("…[truncated]"));
     }
 

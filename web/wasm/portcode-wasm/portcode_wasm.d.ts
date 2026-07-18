@@ -13,7 +13,7 @@ export type ReadableStreamType = "bytes";
  * / `create_session`) — the phone never runs tools or touches the workspace
  * itself.
  */
-export type RemoteCommand = { cmd: "run"; session_id: string; text: string } | { cmd: "cancel"; session_id: string } | { cmd: "cancel_agent"; agent_id: string } | { cmd: "permission"; id: string; decision: string } | { cmd: "create_session"; title: string | null } | { cmd: "fetch_messages"; session_id: string; before_seq: number; limit: number };
+export type RemoteCommand = { cmd: "run"; session_id: string; text: string } | { cmd: "cancel"; session_id: string } | { cmd: "cancel_agent"; agent_id: string } | { cmd: "permission"; id: string; decision: string } | { cmd: "create_session"; title: string | null } | { cmd: "register_push"; endpoint: string; p256dh: string; auth: string } | { cmd: "fetch_messages"; session_id: string; before_seq: number; limit: number };
 
 /**
  * A session header row. (Was `crate::db::SessionRow`.)

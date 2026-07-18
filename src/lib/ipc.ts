@@ -7,6 +7,7 @@ import type {
   DraftEntry,
   GitChangedFile,
   GitFilePatch,
+  GitReviewBranch,
   GitReviewManifest,
   GitReviewScope,
   Message,
@@ -565,6 +566,15 @@ export async function getGitReviewManifest(scope: GitReviewScope): Promise<GitRe
   return mock.getGitReviewManifest(scope);
 }
 
+/** Branches from the repository that owns the native settings workspace. */
+export async function getGitReviewBranches(): Promise<GitReviewBranch[]> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<GitReviewBranch[]>("get_git_review_branches");
+  }
+  return mock.getGitReviewBranches();
+}
+
 /** Lazily load one typed patch, guarded by the manifest snapshot id. */
 export async function getGitReviewFile(
   scope: GitReviewScope,
@@ -713,6 +723,17 @@ const PREVIEW_REVIEW_FILES: GitChangedFile[] = [
   },
 ];
 
+const PREVIEW_REVIEW_BRANCHES: GitReviewBranch[] = [
+  { name: "main", revision: "refs/heads/main", kind: "local", current: true },
+  { name: "release", revision: "refs/heads/release", kind: "local", current: false },
+  {
+    name: "origin/main",
+    revision: "refs/remotes/origin/main",
+    kind: "remote",
+    current: false,
+  },
+];
+
 function previewReviewManifest(scope: GitReviewScope): GitReviewManifest {
   let files: GitChangedFile[];
   let baseLabel: string;
@@ -738,7 +759,7 @@ function previewReviewManifest(scope: GitReviewScope): GitReviewManifest {
       ...file,
       areas: ["committed"],
     }));
-    baseLabel = `merge-base(${scope.base}) · 17a19ee0`;
+    baseLabel = `merge-base(${scope.base.replace(/^refs\/(?:heads|remotes)\//, "")}) · 17a19ee0`;
     targetLabel = "HEAD";
   } else if (scope.kind === "commit") {
     files = PREVIEW_REVIEW_FILES.slice(0, 2).map((file) => ({
@@ -1034,6 +1055,9 @@ const mock = (() => {
     },
     async getGitReviewManifest(scope: GitReviewScope): Promise<GitReviewManifest> {
       return previewReviewManifest(scope);
+    },
+    async getGitReviewBranches(): Promise<GitReviewBranch[]> {
+      return PREVIEW_REVIEW_BRANCHES.map((branch) => ({ ...branch }));
     },
     async getGitReviewFile(
       scope: GitReviewScope,

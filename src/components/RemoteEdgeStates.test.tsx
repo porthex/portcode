@@ -56,6 +56,31 @@ describe("DisconnectedState", () => {
     fireEvent.click(screen.getByRole("button", { name: "Pair a different desktop" }));
     expect(forgetRemotePairing).toHaveBeenCalledTimes(1);
   });
+
+  it("disables pairing a different desktop while reconnecting", async () => {
+    let resolveReconnect!: () => void;
+    reconnectRemote.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        resolveReconnect = resolve;
+      }),
+    );
+    useStore.setState({ lastPairingQr: "QR-REMEMBERED" });
+    render(<DisconnectedState />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Reconnect/ }));
+    await act(async () => Promise.resolve());
+
+    const pairButton = screen.getByRole("button", { name: "Pair a different desktop" });
+    expect(pairButton).toBeDisabled();
+    fireEvent.click(pairButton);
+    expect(forgetRemotePairing).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveReconnect();
+      await Promise.resolve();
+    });
+    expect(pairButton).toBeEnabled();
+  });
 });
 
 describe("OfflineState", () => {

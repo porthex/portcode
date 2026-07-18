@@ -274,9 +274,9 @@ describe("StatusHud", () => {
     expect(screen.getByText(`${(1540).toLocaleString()} tok`)).toBeInTheDocument();
   });
 
-  it("opens a one-click plan-limits popover and restores focus on Escape", async () => {
+  it("opens a one-click plan-usage popover and restores focus on Escape", async () => {
     useStore.setState({
-      sessions: [session()],
+      sessions: [session({ model: "gpt-5.6-sol" })],
       activeId: "s1",
       oauthStatus: {
         signedIn: true,
@@ -307,9 +307,10 @@ describe("StatusHud", () => {
     }));
 
     render(<StatusHud />);
-    const trigger = screen.getByRole("button", {
-      name: "Plan limits, 2 of 2 providers connected",
+    const trigger = await screen.findByRole("button", {
+      name: "Plan usage, 80% remaining, connected for this GPT chat",
     });
+    expect(trigger).toHaveTextContent(/USAGE\s*80%/);
     expect(trigger).toHaveAttribute("aria-expanded", "false");
 
     fireEvent.click(trigger);
@@ -317,9 +318,12 @@ describe("StatusHud", () => {
     expect(screen.getByRole("dialog", { name: "Plan usage quick view" })).toBeInTheDocument();
     expect(trigger).toHaveAttribute("aria-expanded", "true");
     const gptCard = screen.getByRole("article", { name: "GPT plan usage" });
+    expect(screen.queryByRole("article", { name: "Claude plan usage" })).not.toBeInTheDocument();
+    expect(screen.getByText("OPENAI · GPT")).toBeInTheDocument();
     expect(
       await within(gptCard).findByRole("progressbar", { name: "Current session remaining" }),
     ).toHaveAttribute("aria-valuenow", "80");
+    expect(getPlanUsage.mock.calls.every(([provider]) => provider === "openai")).toBe(true);
 
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "Plan usage quick view" })).not.toBeInTheDocument();
@@ -330,7 +334,7 @@ describe("StatusHud", () => {
     useStore.setState({ sessions: [session()], activeId: "s1", showSettings: false });
     render(<StatusHud />);
 
-    fireEvent.click(screen.getByRole("button", { name: /Plan limits,/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Plan usage,/ }));
     fireEvent.click(screen.getByRole("button", { name: "Open detailed usage in Settings →" }));
 
     expect(useStore.getState().showSettings).toBe(true);
@@ -450,6 +454,6 @@ describe("StatusHud", () => {
     });
     render(<StatusHud />);
     expect(screen.queryByText(/^Σ /)).toBeNull();
-    expect(screen.queryByRole("button", { name: /Plan limits,/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Plan usage,/ })).not.toBeInTheDocument();
   });
 });

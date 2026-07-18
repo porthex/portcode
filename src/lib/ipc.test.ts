@@ -260,6 +260,13 @@ describe("Tauri command serialization", () => {
       snapshotId: "snap-1",
       path: "src/App.tsx",
     });
+
+    const branches = [
+      { name: "main", revision: "refs/heads/main", kind: "local", current: true },
+    ] as const;
+    invoke.mockResolvedValueOnce(branches);
+    await expect(ipc.getGitReviewBranches()).resolves.toBe(branches);
+    expect(invoke).toHaveBeenCalledWith("get_git_review_branches");
   });
 
   it("list_sessions is invoked with no arguments", async () => {
@@ -637,6 +644,16 @@ describe("browser fallback (no Tauri core)", () => {
       "addition",
       "addition",
       "context",
+    ]);
+    await expect(ipc.getGitReviewBranches()).resolves.toEqual([
+      { name: "main", revision: "refs/heads/main", kind: "local", current: true },
+      { name: "release", revision: "refs/heads/release", kind: "local", current: false },
+      {
+        name: "origin/main",
+        revision: "refs/remotes/origin/main",
+        kind: "remote",
+        current: false,
+      },
     ]);
     expect(invoke).not.toHaveBeenCalled();
   });

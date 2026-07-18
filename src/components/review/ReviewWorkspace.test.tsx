@@ -8,12 +8,24 @@ import type { GitChangedFile, GitFilePatch, GitReviewManifest, GitReviewScope } 
 import { ReviewWorkspace } from "./ReviewWorkspace";
 
 vi.mock("../../lib/ipc", () => ({
+  getGitReviewBranches: vi.fn(),
   getGitReviewManifest: vi.fn(),
   getGitReviewFile: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
 const initialState = useStore.getState();
+
+const branches = [
+  { name: "main", revision: "refs/heads/main", kind: "local", current: true },
+  { name: "release", revision: "refs/heads/release", kind: "local", current: false },
+  {
+    name: "origin/main",
+    revision: "refs/remotes/origin/main",
+    kind: "remote",
+    current: false,
+  },
+] as const;
 
 const files: GitChangedFile[] = [
   {
@@ -179,6 +191,7 @@ beforeEach(() => {
     settings: { ...DEFAULT_SETTINGS, workspace: "D:/Projects/portcode" },
   });
   m.getGitReviewManifest.mockImplementation(async (scope) => manifest(scope));
+  m.getGitReviewBranches.mockResolvedValue([...branches]);
   m.getGitReviewFile.mockImplementation(async (_scope, snapshotId, path) => {
     const file = files.find((candidate) => candidate.path === path);
     if (file?.binary) {
@@ -200,6 +213,11 @@ afterEach(() => {
 async function renderLoaded() {
   render(<ReviewWorkspace />);
   await screen.findByRole("table", { name: "src/App.tsx" });
+}
+
+function chooseMenuOption(label: string, option: string) {
+  fireEvent.click(screen.getByRole("combobox", { name: label }));
+  fireEvent.click(screen.getByRole("option", { name: option }));
 }
 
 describe("ReviewWorkspace", () => {
@@ -233,27 +251,43 @@ describe("ReviewWorkspace", () => {
     expect(screen.getByLabelText("unmerged")).toHaveTextContent("U");
   });
 
-  it("switches basic scopes and applies branch and commit references", async () => {
+  it("switches scopes and refreshes branch comparison immediately on selection", async () => {
     await renderLoaded();
     const scope = screen.getByRole("combobox", { name: "Review scope" });
+    expect(scope.tagName).toBe("BUTTON");
+    expect(screen.getByRole("banner")).toHaveClass("flex-nowrap", "overflow-x-auto");
+    expect(screen.getByTestId("review-scope-control")).toHaveClass("min-w-[240px]");
 
-    fireEvent.change(scope, { target: { value: "staged" } });
+    chooseMenuOption("Review scope", "Staged");
     await waitFor(() => expect(m.getGitReviewManifest).toHaveBeenCalledWith({ kind: "staged" }));
     expect(await screen.findByRole("list", { name: "Staged files" })).toBeInTheDocument();
 
-    fireEvent.change(scope, { target: { value: "unstaged" } });
+    chooseMenuOption("Review scope", "Unstaged");
     await waitFor(() => expect(m.getGitReviewManifest).toHaveBeenCalledWith({ kind: "unstaged" }));
 
-    fireEvent.change(scope, { target: { value: "branch" } });
-    const branch = screen.getByRole("textbox", { name: "Base branch or revision" });
-    fireEvent.change(branch, { target: { value: "release" } });
-    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    chooseMenuOption("Review scope", "Branch…");
+    await waitFor(() => expect(m.getGitReviewBranches).toHaveBeenCalledTimes(1));
     await waitFor(() =>
-      expect(m.getGitReviewManifest).toHaveBeenCalledWith({ kind: "branch", base: "release" }),
+      expect(m.getGitReviewManifest).toHaveBeenCalledWith({
+        kind: "branch",
+        base: "refs/remotes/origin/main",
+      }),
     );
+    const branch = screen.getByRole("combobox", { name: "Base branch" });
+    expect(branch.tagName).toBe("BUTTON");
+    expect(branch).toHaveTextContent("origin/main");
+    expect(screen.queryByRole("textbox", { name: /Base branch/ })).not.toBeInTheDocument();
+    chooseMenuOption("Base branch", "release");
+    await waitFor(() =>
+      expect(m.getGitReviewManifest).toHaveBeenCalledWith({
+        kind: "branch",
+        base: "refs/heads/release",
+      }),
+    );
+    expect(screen.queryByRole("button", { name: "Apply" })).not.toBeInTheDocument();
     expect(await screen.findByRole("list", { name: "Changed files" })).toBeInTheDocument();
 
-    fireEvent.change(scope, { target: { value: "commit" } });
+    chooseMenuOption("Review scope", "Commit…");
     const commit = screen.getByRole("textbox", { name: "Commit revision" });
     fireEvent.change(commit, { target: { value: "abc123" } });
     fireEvent.submit(commit.closest("form")!);
@@ -265,23 +299,35 @@ describe("ReviewWorkspace", () => {
     );
   });
 
-  it("does not apply an empty branch or commit reference", async () => {
+  it("disables branch review when the workspace has no branches", async () => {
+    m.getGitReviewBranches.mockResolvedValue([]);
     await renderLoaded();
-    const scope = screen.getByRole("combobox", { name: "Review scope" });
     const calls = m.getGitReviewManifest.mock.calls.length;
 
-    fireEvent.change(scope, { target: { value: "branch" } });
-    const input = screen.getByRole("textbox", { name: "Base branch or revision" });
-    fireEvent.change(input, { target: { value: "   " } });
-    fireEvent.submit(input.closest("form")!);
+    chooseMenuOption("Review scope", "Branch…");
+    const branch = await screen.findByRole("combobox", { name: "Base branch" });
+    await waitFor(() => expect(branch).toHaveTextContent("No branches found"));
+    expect(branch).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Apply" })).not.toBeInTheDocument();
     expect(m.getGitReviewManifest).toHaveBeenCalledTimes(calls);
 
-    fireEvent.change(scope, { target: { value: "commit" } });
+    chooseMenuOption("Review scope", "Commit…");
     fireEvent.change(screen.getByRole("textbox", { name: "Commit revision" }), {
       target: { value: " " },
     });
     fireEvent.click(screen.getByRole("button", { name: "Apply" }));
     expect(m.getGitReviewManifest).toHaveBeenCalledTimes(calls);
+  });
+
+  it("reports a workspace branch-list failure without restoring free-form input", async () => {
+    m.getGitReviewBranches.mockRejectedValue(new Error("cannot enumerate refs"));
+    await renderLoaded();
+
+    chooseMenuOption("Review scope", "Branch…");
+    const branch = await screen.findByRole("combobox", { name: "Base branch" });
+    await waitFor(() => expect(branch).toHaveTextContent("Branches unavailable"));
+    expect(branch).toHaveAttribute("title", "cannot enumerate refs");
+    expect(screen.queryByRole("textbox", { name: /Base branch/ })).not.toBeInTheDocument();
   });
 
   it("loads selected files lazily and renders rename, binary, and metadata-only states", async () => {
@@ -495,9 +541,7 @@ describe("ReviewWorkspace", () => {
 
     render(<ReviewWorkspace />);
     await waitFor(() => expect(m.getGitReviewManifest).toHaveBeenCalledTimes(1));
-    fireEvent.change(screen.getByRole("combobox", { name: "Review scope" }), {
-      target: { value: "staged" },
-    });
+    chooseMenuOption("Review scope", "Staged");
     act(() => {
       useStore.setState({
         settings: { ...useStore.getState().settings, workspace: "D:/Projects/next" },

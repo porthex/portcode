@@ -283,6 +283,19 @@ describe("startWebClientLifecycle — reconnect on resume", () => {
     set({}); // touch to ensure no crash on a no-op notify
     stop();
   });
+
+  it("swallows a pinned-peer hydration failure", async () => {
+    const { store, hydrateRememberedQr } = makeFakeStore({ lastPairingQr: null });
+    const storage = makeFakeStorage();
+    vi.mocked(storage.loadPinnedPeer).mockRejectedValue(new Error("IDB unavailable"));
+
+    const stop = startWebClientLifecycle({ store, storage, watch: makeWatchStub().watch });
+    await flush();
+    await flush();
+
+    expect(hydrateRememberedQr).not.toHaveBeenCalled();
+    stop();
+  });
 });
 
 describe("startWebClientLifecycle — durable pinned-peer persistence", () => {
@@ -312,6 +325,25 @@ describe("startWebClientLifecycle — durable pinned-peer persistence", () => {
     expect(saved.deviceId).toBe("device-abc");
     expect(saved.qr).toBe("QR-CONN");
     expect(typeof saved.pairedAt).toBe("number");
+    stop();
+  });
+
+  it("continues pinning when the persistence request rejects", async () => {
+    const { store, set } = makeFakeStore({ lastPairingQr: null });
+    const storage = makeFakeStorage();
+    vi.mocked(storage.requestPersistentStorage).mockRejectedValue(new Error("not allowed"));
+    const stop = startWebClientLifecycle({ store, storage, watch: makeWatchStub().watch });
+
+    set({
+      remoteConnected: true,
+      remoteVerified: true,
+      remotePeerKey: "DESKTOP-KEY",
+      lastPairingQr: "QR-CONN",
+    });
+    await flush();
+    await flush();
+
+    expect(storage.savePinnedPeer).toHaveBeenCalledTimes(1);
     stop();
   });
 
@@ -599,6 +631,52 @@ describe("startWebClientLifecycle — teardown", () => {
     set({ remoteConnected: true, remoteVerified: true, remoteSas: "S", lastPairingQr: "Q" });
     await flush();
     expect(storage.savePinnedPeer).not.toHaveBeenCalled();
+  });
+
+  it("stop() is idempotent", () => {
+    const { store } = makeFakeStore({ lastPairingQr: null });
+    const w = makeWatchStub();
+    const stop = startWebClientLifecycle({
+      store,
+      storage: makeFakeStorage(),
+      watch: w.watch,
+    });
+
+    stop();
+    stop();
+    stop();
+
+    expect(w.unwatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("swallows pinned-peer persistence failures", async () => {
+    const { store, set } = makeFakeStore({ lastPairingQr: null });
+    const storage = makeFakeStorage();
+    vi.mocked(storage.getOrCreateDeviceId).mockRejectedValue(new Error("IDB unavailable"));
+    const stop = startWebClientLifecycle({ store, storage, watch: makeWatchStub().watch });
+
+    set({
+      remoteConnected: true,
+      remoteVerified: true,
+      remotePeerKey: "KEY",
+      lastPairingQr: "QR",
+    });
+    await flush();
+    await flush();
+
+    stop();
+  });
+
+  it("swallows durable pin cleanup failures", async () => {
+    const { store, set } = makeFakeStore({ lastPairingQr: "QR-OLD" });
+    const storage = makeFakeStorage();
+    vi.mocked(storage.clearPinnedPeer).mockRejectedValue(new Error("IDB unavailable"));
+    const stop = startWebClientLifecycle({ store, storage, watch: makeWatchStub().watch });
+
+    set({ lastPairingQr: null });
+    await flush();
+
+    stop();
   });
 });
 

@@ -3598,6 +3598,28 @@ describe("remote client", () => {
       expect(localStorage.getItem("pc.lastPairingQr")).toBeNull();
     });
 
+    it("forgetRemotePairing also clears remote identity metadata", () => {
+      useStore.setState({
+        lastPairingQr: "QR",
+        remotePeerKey: "PEER==",
+        remoteVapidKey: "VAPID==",
+        remoteDropped: true,
+        remoteRejected: true,
+        remoteRejectReason: "mismatch",
+      });
+
+      useStore.getState().forgetRemotePairing();
+
+      expect(useStore.getState()).toMatchObject({
+        lastPairingQr: null,
+        remotePeerKey: null,
+        remoteVapidKey: null,
+        remoteDropped: false,
+        remoteRejected: false,
+        remoteRejectReason: null,
+      });
+    });
+
     it("setOnline reflects network presence", () => {
       useStore.getState().setOnline(false);
       expect(useStore.getState().online).toBe(false);
@@ -3801,6 +3823,17 @@ describe("remote client", () => {
       expect(st.archivedIds).toEqual(["s2"]);
       expect(st.manualOrder).toEqual(["s3", "s1"]);
       expect(st.sidebarCollapsed).toBe(true);
+    });
+
+    it("hydrates sortBy=manual and groupBy=branch", async () => {
+      localStorage.setItem("pc.sortBy", "manual");
+      localStorage.setItem("pc.groupBy", "branch");
+
+      vi.resetModules();
+      const fresh = await import("./store");
+
+      expect(fresh.useStore.getState().sortBy).toBe("manual");
+      expect(fresh.useStore.getState().groupBy).toBe("branch");
     });
 
     it("falls back to defaults when localStorage throws on init read", async () => {

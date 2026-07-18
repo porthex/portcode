@@ -257,6 +257,8 @@ export function SettingsPanel() {
   const saveBtnRef = useRef<HTMLButtonElement | null>(null);
   const sectionRefs = useRef<Partial<Record<SettingsSectionId, HTMLElement | null>>>({});
   const searchTargetRef = useRef<HTMLElement | null>(null);
+  const navigatingRef = useRef(false);
+  const navigationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [activeSection, setActiveSection] = useState<SettingsSectionId>(
     remoteMode ? "interface" : "claude",
@@ -326,13 +328,22 @@ export function SettingsPanel() {
   };
 
   const navigateToSection = (id: SettingsSectionId) => {
+    // A smooth programmatic scroll crosses the sections between the current and
+    // requested destinations. Do not let those intermediate scroll positions
+    // steal the active marker from the route the user just selected.
+    navigatingRef.current = true;
+    if (navigationTimerRef.current !== null) clearTimeout(navigationTimerRef.current);
+    navigationTimerRef.current = setTimeout(() => {
+      navigatingRef.current = false;
+      navigationTimerRef.current = null;
+    }, 700);
     setActiveSection(id);
     sectionRefs.current[id]?.scrollIntoView?.({ behavior: "smooth", block: "start" });
   };
 
   const onContentScroll = () => {
     const content = contentRef.current;
-    if (!content || searchQuery) return;
+    if (!content || searchQuery || navigatingRef.current) return;
     const threshold = content.scrollTop + 120;
     let current = availableSections[0]?.id;
     for (const section of availableSections) {
@@ -389,6 +400,7 @@ export function SettingsPanel() {
   useEffect(() => {
     return () => {
       if (savedTimer.current !== null) clearTimeout(savedTimer.current);
+      if (navigationTimerRef.current !== null) clearTimeout(navigationTimerRef.current);
     };
   }, []);
 

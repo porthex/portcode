@@ -321,6 +321,9 @@ fn compute_edit(
     replace_all: bool,
     p: &str,
 ) -> Result<(String, usize), String> {
+    if old.is_empty() {
+        return Err(format!("'old_string' must not be empty when editing {p}"));
+    }
     let count = content.matches(old).count();
     if count == 0 {
         return Err(format!("'old_string' not found in {p}"));
@@ -588,7 +591,9 @@ impl Tool for FsWrite {
         let content = str_arg(input, "content").ok()?;
         let full = resolve_for_write(&base, p).ok()?;
         let old = if full.exists() {
-            tokio::fs::read_to_string(&full).await.unwrap_or_default()
+            // Never present an unreadable existing file as an empty new file: that
+            // would hide a destructive overwrite in the permission preview.
+            tokio::fs::read_to_string(&full).await.ok()?
         } else {
             String::new()
         };
@@ -1097,6 +1102,9 @@ mod tests {
         assert_eq!((out.as_str(), n), ("X X", 2));
         assert!(compute_edit("abc", "z", "X", false, "f").is_err()); // not found
         assert!(compute_edit("a a", "a", "X", false, "f").is_err()); // ambiguous
+        let err = compute_edit("abc", "", "X", true, "f").unwrap_err();
+        assert!(err.contains("must not be empty"), "got: {err}");
+        assert!(compute_edit("abc", "", "X", false, "f").is_err());
     }
 
     #[tokio::test]
@@ -1114,6 +1122,23 @@ mod tests {
         assert!(diff.contains("+new line"));
         // The preview must NOT touch the file.
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "old line\n");
+
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_write_preview_returns_none_for_an_unreadable_existing_file() {
+        let workspace = unique_temp_dir("preview_unreadable");
+        let ctx = ToolCtx::new(workspace.clone());
+        std::fs::write(workspace.join("blob.bin"), [0xFF, 0xFE, 0x00, 0x80]).unwrap();
+
+        let preview = FsWrite
+            .preview(&json!({ "path": "blob.bin", "content": "new text" }), &ctx)
+            .await;
+        assert!(
+            preview.is_none(),
+            "an unreadable existing file must not preview as empty: {preview:?}"
+        );
 
         std::fs::remove_dir_all(&workspace).ok();
     }

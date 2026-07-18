@@ -60,8 +60,11 @@ export function DisconnectedState() {
           {reconnecting ? "Reconnecting…" : "↻ Reconnect"}
         </button>
         <button
-          onClick={forgetRemotePairing}
-          className="h-12 w-full rounded-[13px] border border-border-2 bg-panel-2/60 font-display text-[14px] font-semibold tracking-[0.5px] text-[#a9b2c4] transition hover:border-accent-2/40 hover:text-accent-2"
+          onClick={() => {
+            if (!reconnecting) forgetRemotePairing();
+          }}
+          disabled={reconnecting}
+          className="h-12 w-full rounded-[13px] border border-border-2 bg-panel-2/60 font-display text-[14px] font-semibold tracking-[0.5px] text-[#a9b2c4] transition hover:border-accent-2/40 hover:text-accent-2 disabled:opacity-40"
         >
           Pair a different desktop
         </button>
