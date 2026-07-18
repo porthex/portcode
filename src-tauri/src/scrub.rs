@@ -206,7 +206,10 @@ mod tests {
 
     #[test]
     fn caps_very_long_strings_so_a_giant_dump_cant_ride_out() {
-        let huge = format!("noreply@{}", "a".repeat(50_000));
+        // Keep this fixture ordinary: a single 50k-character alphanumeric run is
+        // intentionally classified as a key-shaped secret and safely collapses to
+        // `[redacted-key]` before the output cap is evaluated.
+        let huge = "ordinary diagnostic text ".repeat(5_000);
         let out = redact_secrets(&huge);
         assert!(out.chars().count() < 3000);
         assert!(out.ends_with("…[truncated]"));
