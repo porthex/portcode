@@ -1,12 +1,17 @@
 #![cfg(desktop)]
 
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use serde::Serialize;
 use tauri::State;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
+use tokio::time::timeout;
 
-use crate::{git, AppState};
+use crate::AppState;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 const SUMMARY_OUTPUT_CAP: usize = 2 * 1024 * 1024;
@@ -48,6 +53,19 @@ enum GitUnavailableReason {
     Missing,
     Timeout,
     Failed,
+}
+
+#[derive(Clone, Copy)]
+enum GitFailure {
+    Missing,
+    Timeout,
+    Failed,
+}
+
+struct GitOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -97,7 +115,7 @@ async fn inspect_git(workspace: &Path) -> GitSummary {
 
     let status = match run_git(
         workspace,
-        [
+        &[
             "status",
             "--porcelain=v2",
             "--branch",
@@ -175,15 +193,76 @@ fn numstat_args(scope: NumstatScope) -> &'static [&'static str] {
     }
 }
 
-async fn run_git(workspace: &Path, args: &[&str]) -> Result<git::Output, git::Failure> {
-    git::run(workspace, args, GIT_TIMEOUT, SUMMARY_OUTPUT_CAP).await
+async fn run_git(workspace: &Path, args: &[&str]) -> Result<GitOutput, GitFailure> {
+    let mut command = Command::new("git");
+    command
+        .arg("--no-pager")
+        .args(args)
+        .current_dir(workspace)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("LC_ALL", "C")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            GitFailure::Missing
+        } else {
+            GitFailure::Failed
+        }
+    })?;
+    let stdout = child.stdout.take().ok_or(GitFailure::Failed)?;
+    let stderr = child.stderr.take().ok_or(GitFailure::Failed)?;
+
+    let result = timeout(GIT_TIMEOUT, async {
+        let (status, stdout, stderr) = tokio::join!(
+            child.wait(),
+            read_bounded(stdout, SUMMARY_OUTPUT_CAP),
+            read_bounded(stderr, 64 * 1024),
+        );
+        Ok::<GitOutput, GitFailure>(GitOutput {
+            status: status.map_err(|_| GitFailure::Failed)?,
+            stdout: stdout.map_err(|_| GitFailure::Failed)?,
+            stderr: stderr.map_err(|_| GitFailure::Failed)?,
+        })
+    })
+    .await;
+
+    match result {
+        Ok(output) => output,
+        Err(_) => {
+            let _ = child.kill().await;
+            Err(GitFailure::Timeout)
+        }
+    }
 }
 
-fn unavailable(failure: git::Failure) -> GitSummary {
+/// Keep draining the child pipe after reaching the storage cap so a large Git
+/// response cannot fill the OS pipe and deadlock the process while it exits.
+async fn read_bounded<R: AsyncRead + Unpin>(mut reader: R, max: usize) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(max.min(64 * 1024));
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let keep = max.saturating_sub(output.len()).min(read);
+        output.extend_from_slice(&buffer[..keep]);
+    }
+
+    Ok(output)
+}
+
+fn unavailable(failure: GitFailure) -> GitSummary {
     let reason = match failure {
-        git::Failure::Missing => GitUnavailableReason::Missing,
-        git::Failure::Timeout => GitUnavailableReason::Timeout,
-        git::Failure::Failed => GitUnavailableReason::Failed,
+        GitFailure::Missing => GitUnavailableReason::Missing,
+        GitFailure::Timeout => GitUnavailableReason::Timeout,
+        GitFailure::Failed => GitUnavailableReason::Failed,
     };
     GitSummary::Unavailable { reason }
 }
@@ -263,7 +342,7 @@ mod tests {
 
     #[test]
     fn parses_porcelain_v2_branch_and_change_records() {
-        let output = b"# branch.oid 0123456789abcdef\0# branch.head main\0# branch.upstream origin/main\0# branch.ab +3 -2\01 .M details file.rs\02 R. details new.rs\0old.rs\0u UU details merge.rs\0? new.txt\0! ignored.txt\0";
+        let output = b"# branch.oid 0123456789abcdef\0# branch.head main\0# branch.upstream origin/main\0# branch.ab +3 -2\x001 .M details file.rs\x002 R. details new.rs\0old.rs\0u UU details merge.rs\0? new.txt\0! ignored.txt\0";
         let facts = parse_status(output);
 
         assert_eq!(facts.branch.as_deref(), Some("main"));
@@ -331,5 +410,17 @@ mod tests {
             numstat_args(NumstatScope::Unstaged),
             ["diff", "--no-ext-diff", "--no-textconv", "--numstat", "--",]
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_keeps_only_the_configured_prefix() {
+        let output = read_bounded(&b"abcdefgh"[..], 5).await.unwrap();
+        assert_eq!(output, b"abcde");
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_accepts_output_below_the_cap() {
+        let output = read_bounded(&b"abc"[..], 5).await.unwrap();
+        assert_eq!(output, b"abc");
     }
 }
