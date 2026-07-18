@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a docked environment/Git summary.
 - A first-class Git review workspace for inspecting changed files and diffs,
   tracking snapshot-safe inline comments, and handing review context to agents.
+- A native repository-backed branch picker for Git review, plus the preserved
+  cross-surface Repo Mode design for future desktop and remote work.
 - Provider-aware settings, model and reasoning controls, included-plan usage,
   and an experimental direct ChatGPT subscription provider that is enabled for
   self-development but release-gated pending an approved production boundary.
@@ -42,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tool details are quieter and lazy by default, generated folders are hidden
   until requested, Settings is organized as a searchable control deck, and the
   sidebar toolbar stays bounded at narrow desktop widths.
+- The status HUD now reports the active provider's most constrained included
+  plan allowance, while Settings navigation remains pinned to the chosen route
+  during smooth scrolling.
 
 ### Fixed
 
@@ -49,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wording, and interrupted tools or agents no longer remain visibly running.
 - Hardened run cancellation, credential refresh, permission-rule ordering,
   session model persistence, remote teardown, and workspace Git inspection.
+- Aligned remote push-registration protocol handling and hardened partial-turn
+  cancellation, secret scrubbing, file-edit previews, telemetry consent,
+  pairing/reconnect controls, and remote-client lifecycle cleanup.
 
 ## [0.1.0] - 2026-06-19
 
