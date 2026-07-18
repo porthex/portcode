@@ -3,7 +3,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, parse, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { scrub } from "../../.claude/scripts/scrub-memory.mjs";
+import { gitCommandCouldStageProjectMemory, scrub } from "../../.claude/scripts/scrub-memory.mjs";
 
 const MEMORY_PATH = ".claude/memory/project-memory.md";
 const GRAPH_PATH = "graphify-out/graph.json";
@@ -82,14 +82,9 @@ export function handleHook(payload, projectRoot = findProjectRoot(payload?.cwd |
   const eventName = String(payload?.hook_event_name ?? "");
   const memoryFile = join(projectRoot, MEMORY_PATH);
 
-  if (eventName === "SessionStart") {
-    if (!existsSync(memoryFile)) return null;
-    const body = readFileSync(memoryFile, "utf8");
-    return hookContext(
-      "SessionStart",
-      `Portcode project memory (${MEMORY_PATH}) — durable, PII-free facts:\n\n${body}`,
-    );
-  }
+  // Project memory stays on the local device. Do not inject its contents into
+  // agent context, which may be processed by a remote model provider.
+  if (eventName === "SessionStart") return null;
 
   if (eventName !== "PreToolUse") return null;
 
@@ -103,14 +98,11 @@ export function handleHook(payload, projectRoot = findProjectRoot(payload?.cwd |
 
   const command = shellCommand(toolName, toolInput);
   if (command) {
-    const stagesMemory =
-      /\bgit\s+(?:add|commit)\b/i.test(command) &&
-      (/\.claude[\\/]memory[\\/]/i.test(command) ||
-        /\bgit\s+add\s+(?:-A\b|--all\b|\.(?=\s|$))/i.test(command) ||
-        /\bgit\s+commit\b[^|;&]*\s-a\b/i.test(command));
-    if (stagesMemory && existsSync(memoryFile)) {
-      const reason = piiReason(readFileSync(memoryFile, "utf8"), MEMORY_PATH);
-      if (reason) return hookDeny(reason);
+    const commandCwd = resolve(payload?.cwd || projectRoot);
+    if (gitCommandCouldStageProjectMemory(command, projectRoot, commandCwd)) {
+      return hookDeny(
+        `Blocked: ${MEMORY_PATH} is local-only and must never be staged or committed, including with force-add or blanket Git commands.`,
+      );
     }
 
     const graphExists = existsSync(join(projectRoot, GRAPH_PATH));

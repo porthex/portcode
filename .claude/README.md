@@ -8,8 +8,9 @@ start from a fresh clone with no access to your local machine or your user-level
 ## What's here
 
 - `memory/project-memory.md` — local-only, durable, project-scoped, **PII-free** knowledge store (Git-ignored).
-- `scripts/session-start.sh` — SessionStart hook: loads project memory into context and
-  does best-effort env-prep (`pnpm install`, optional graphify refresh) in cloud sessions.
+- `scripts/session-start.sh` — SessionStart hook: keeps local memory out of automatic
+  context and does best-effort env-prep (`pnpm install`, optional graphify refresh) in
+  cloud sessions.
 - `scripts/scrub-memory.mjs` (+ `scrub-memory.test.mjs`) — zero-dependency PII scrubber.
 - `commands/memory.md` — the `/memory` slash command (distill + append to memory).
 - `settings.json` — hooks config: the SessionStart hook above, the existing graphify
@@ -21,8 +22,9 @@ start from a fresh clone with no access to your local machine or your user-level
 
 Durable knowledge lives at **`.claude/memory/project-memory.md`**. It is local-only and
 Git-ignored, so it survives sessions on the same machine but does not travel with clones.
-The SessionStart hook (`scripts/session-start.sh`) injects it as `additionalContext` when
-the file exists and otherwise no-ops cleanly.
+The SessionStart hook (`scripts/session-start.sh`) deliberately does not inject it into
+automatic context. The file is read only through an explicit local-memory workflow such as
+`/memory`, when the user asks to inspect or update it.
 
 To record a new durable fact, run **`/memory`**. The command creates the local file when
 needed, distills durable project-scoped facts, and appends them **through the scrubber**.
@@ -34,7 +36,9 @@ home paths (`/home/<u>`, `/Users/<u>`, `C:\Users\<u>`), IPs, hostnames, tokens/k
 and machine specifics out of it anyway so deliberate copies remain safe.**
 
 The PreToolUse PII guard (`scripts/scrub-memory.mjs --hook`) checks writes to the memory
-file and attempts to stage it, and `/memory` routes additions through the scrubber.
+file and blocks common direct, broad, dynamic-pathspec, and delegated Git staging forms.
+CI independently rejects every tracked `.claude/memory/**` path, regardless of which Git
+command created it, and `/memory` routes additions through the scrubber.
 **Treat both as a backstop, not a license to be careless** — keep entries about
 the PROJECT, not about who is working on it.
 
@@ -47,7 +51,7 @@ node .claude/scripts/scrub-memory.mjs --check <file...>  # exit 0 clean, exit 2 
 node .claude/scripts/scrub-memory.mjs --write <file...>  # redact in place, print counts, exit 0
 node .claude/scripts/scrub-memory.mjs                    # stdin -> scrubbed stdout (pipe mode)
 node .claude/scripts/scrub-memory.mjs --hook             # PreToolUse guard: emit deny JSON for
-                                                         # PII-bearing memory writes/commits; exit 0
+                                                         # unsafe writes or memory staging; exit 0
 ```
 
 Run the self-test:
@@ -62,7 +66,7 @@ frontend coverage gate.)
 ## Hooks
 
 - **SessionStart** (`startup|resume`) → `scripts/session-start.sh`:
-  - Injects `memory/project-memory.md` as context (no-ops cleanly if the file is absent).
+  - Keeps `memory/project-memory.md` local and out of automatic SessionStart context.
   - In cloud sessions only (`CLAUDE_CODE_REMOTE=true`): best-effort `pnpm install`
     (only when `node_modules` is missing and a lockfile exists) and an **optional**
     graphify refresh **only if a `graphify` CLI binary exists** (it normally does not —
@@ -72,7 +76,7 @@ frontend coverage gate.)
 - **PreToolUse** (existing graphify hooks): steer the agent to `graphify query/explain/path`
   before grepping or reading source files.
 - **PreToolUse** PII guard (`Write|Edit|Bash`): runs `scrub-memory.mjs --hook` to protect
-  the local memory and block attempts to stage unsafe content.
+  local memory and block staging attempts early; the CI tracked-path gate is authoritative.
 
 ## Web / iOS notes
 

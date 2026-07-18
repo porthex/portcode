@@ -17,12 +17,354 @@
 // quantifiers over overlapping classes) to avoid catastrophic backtracking. Input is
 // capped (see MAX_INPUT) as a belt-and-suspenders DoS guard.
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, parse, resolve } from "node:path";
 
 // Cap any single input we scrub. Large enough for any sane memory file / tool input,
 // small enough that even a pathological regex can't run away. Oversized input is
 // truncated for matching (the tail is left untouched / passed through).
 const MAX_INPUT = 1_000_000; // 1 MB
+const PROJECT_MEMORY_PATH = ".claude/memory/project-memory.md";
+
+function shellTokens(command) {
+  const tokens = [];
+  let current = "";
+  let quote = null;
+
+  const pushCurrent = () => {
+    if (current) tokens.push(current);
+    current = "";
+  };
+
+  for (const char of String(command ?? "")) {
+    if (quote) {
+      if (char === quote) quote = null;
+      else current += char;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      pushCurrent();
+      continue;
+    }
+    if (";&|()".includes(char)) {
+      pushCurrent();
+      tokens.push(char);
+      continue;
+    }
+    current += char;
+  }
+  pushCurrent();
+  return tokens;
+}
+
+function isShellSeparator(token) {
+  return token === ";" || token === "&" || token === "|" || token === "(" || token === ")";
+}
+
+function isGitExecutable(token) {
+  const normalized = String(token).replace(/\\/g, "/").toLowerCase();
+  const basename = normalized.slice(normalized.lastIndexOf("/") + 1);
+  return basename === "git" || basename === "git.exe";
+}
+
+function normalizedAbsolute(path) {
+  return resolve(path).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+function parsePathspec(token) {
+  let path = String(token).replace(/\\/g, "/");
+  let exclude = false;
+  let top = false;
+  let literal = false;
+
+  const longMagic = path.match(/^:\(([^)]*)\)(.*)$/);
+  if (longMagic) {
+    const magic = longMagic[1]
+      .split(",")
+      .map((part) => part.trim().toLowerCase())
+      .filter(Boolean);
+    exclude = magic.includes("exclude") || magic.includes("!") || magic.includes("^");
+    top = magic.includes("top");
+    literal = magic.includes("literal");
+    path = longMagic[2];
+  } else if (path.startsWith(":!") || path.startsWith(":^")) {
+    exclude = true;
+    path = path.slice(2);
+  } else if (path.startsWith(":/")) {
+    top = true;
+    path = path.slice(2);
+  }
+
+  return { path, exclude, top, literal };
+}
+
+function pathspecCouldSelectProjectMemory(token, gitCwd, projectRoot) {
+  const parsed = parsePathspec(token);
+  if (parsed.exclude) return { exclude: true, matches: false };
+
+  const base = parsed.top ? projectRoot : gitCwd;
+  const target = normalizedAbsolute(resolve(projectRoot, PROJECT_MEMORY_PATH));
+  const wildcardIndex = parsed.literal ? -1 : parsed.path.search(/[?*[]/);
+  if (wildcardIndex >= 0) {
+    const staticPrefix = parsed.path.slice(0, wildcardIndex);
+    if (!staticPrefix) return { exclude: false, matches: true };
+    const prefix = normalizedAbsolute(resolve(base, staticPrefix));
+    return { exclude: false, matches: target.startsWith(prefix) };
+  }
+
+  const candidate = normalizedAbsolute(resolve(base, parsed.path || "."));
+  return {
+    exclude: false,
+    matches: target === candidate || target.startsWith(`${candidate}/`),
+  };
+}
+
+function findProjectRoot(start) {
+  let current = resolve(start);
+  const filesystemRoot = parse(current).root;
+  while (true) {
+    if (existsSync(resolve(current, ".git"))) return current;
+    if (current === filesystemRoot) return resolve(start);
+    current = dirname(current);
+  }
+}
+
+function gitSubcommand(tokens, gitIndex, commandCwd) {
+  let index = gitIndex + 1;
+  let gitCwd = resolve(commandCwd);
+  let inlineAlias = false;
+  while (index < tokens.length && !isShellSeparator(tokens[index])) {
+    const token = tokens[index];
+    const lower = token.toLowerCase();
+
+    if (token === "-C") {
+      if (tokens[index + 1]) gitCwd = resolve(gitCwd, tokens[index + 1]);
+      index += 2;
+      continue;
+    }
+    if (token.startsWith("-C") && token.length > 2) {
+      gitCwd = resolve(gitCwd, token.slice(2));
+      index += 1;
+      continue;
+    }
+    if (token === "-c") {
+      inlineAlias ||= /^alias\./i.test(tokens[index + 1] ?? "");
+      index += 2;
+      continue;
+    }
+    if (lower.startsWith("-c") && token.length > 2) {
+      inlineAlias ||= /^alias\./i.test(token.slice(2));
+      index += 1;
+      continue;
+    }
+    if (lower === "--work-tree") {
+      if (tokens[index + 1]) gitCwd = resolve(gitCwd, tokens[index + 1]);
+      index += 2;
+      continue;
+    }
+    if (lower.startsWith("--work-tree=")) {
+      gitCwd = resolve(gitCwd, token.slice(token.indexOf("=") + 1));
+      index += 1;
+      continue;
+    }
+    if (["--git-dir", "--namespace"].includes(lower)) {
+      index += 2;
+      continue;
+    }
+    if (lower.startsWith("--git-dir=") || lower.startsWith("--namespace=")) {
+      index += 1;
+      continue;
+    }
+    if (token.startsWith("-")) {
+      index += 1;
+      continue;
+    }
+    return { name: lower, argsStart: index + 1, gitCwd, inlineAlias };
+  }
+  return null;
+}
+
+function gitAddCouldStageMemory(tokens, start, gitCwd, projectRoot) {
+  let blanket = false;
+  const pathspecs = [];
+  let options = true;
+
+  for (let index = start; index < tokens.length && !isShellSeparator(tokens[index]); index++) {
+    const token = tokens[index];
+    const lower = token.toLowerCase();
+    if (options && token === "--") {
+      options = false;
+      continue;
+    }
+    if (options && token.startsWith("-")) {
+      if (lower === "--pathspec-from-file" || lower.startsWith("--pathspec-from-file=")) {
+        return true;
+      }
+      if (
+        lower === "-a" ||
+        lower === "--all" ||
+        lower === "-u" ||
+        lower === "--update" ||
+        lower === "-p" ||
+        lower === "--patch" ||
+        lower === "-i" ||
+        lower === "--interactive" ||
+        lower === "-e" ||
+        lower === "--edit" ||
+        lower === "--renormalize"
+      ) {
+        blanket = true;
+      }
+      continue;
+    }
+    pathspecs.push(token);
+  }
+
+  const analyzed = pathspecs.map((pathspec) =>
+    pathspecCouldSelectProjectMemory(pathspec, gitCwd, projectRoot),
+  );
+  if (analyzed.some((pathspec) => !pathspec.exclude && pathspec.matches)) return true;
+  const positiveCount = analyzed.filter((pathspec) => !pathspec.exclude).length;
+  if (positiveCount === 0 && analyzed.some((pathspec) => pathspec.exclude)) return true;
+  return blanket && pathspecs.length === 0;
+}
+
+function gitCommitCouldStageMemory(tokens, start, gitCwd, projectRoot) {
+  const valueOptions = new Set([
+    "-m",
+    "--message",
+    "-f",
+    "--file",
+    "-c",
+    "-C",
+    "--reuse-message",
+    "--reedit-message",
+    "--fixup",
+    "--squash",
+    "--author",
+    "--date",
+    "-t",
+    "--template",
+    "--cleanup",
+    "--trailer",
+    "-S",
+  ]);
+  let options = true;
+  const pathspecs = [];
+
+  for (let index = start; index < tokens.length && !isShellSeparator(tokens[index]); index++) {
+    const token = tokens[index];
+    const lower = token.toLowerCase();
+    if (options && token === "--") {
+      options = false;
+      continue;
+    }
+    if (options && token.startsWith("-")) {
+      if (lower === "--pathspec-from-file" || lower.startsWith("--pathspec-from-file=")) {
+        return true;
+      }
+      if (lower === "--all" || (/^-[^-]+/.test(token) && token.slice(1).includes("a"))) {
+        return true;
+      }
+      const shortClusterNeedsValue = /^-[^-]+/.test(token) && token.endsWith("m");
+      if ((valueOptions.has(token) || shortClusterNeedsValue) && !token.includes("=")) index += 1;
+      continue;
+    }
+    pathspecs.push(token);
+  }
+
+  const analyzed = pathspecs.map((pathspec) =>
+    pathspecCouldSelectProjectMemory(pathspec, gitCwd, projectRoot),
+  );
+  if (analyzed.some((pathspec) => !pathspec.exclude && pathspec.matches)) return true;
+  const positiveCount = analyzed.filter((pathspec) => !pathspec.exclude).length;
+  return positiveCount === 0 && analyzed.some((pathspec) => pathspec.exclude);
+}
+
+function delegatedCommand(tokens, index) {
+  if (index === 0 || !tokens[index].includes(" ")) return null;
+  const launcherFlag = tokens[index - 1].toLowerCase();
+  return ["-c", "-lc", "/c", "-command", "--command"].includes(launcherFlag)
+    ? tokens[index]
+    : null;
+}
+
+function changedShellCwd(tokens, index, currentCwd) {
+  const command = tokens[index].toLowerCase();
+  if (!["cd", "chdir", "set-location", "pushd", "push-location"].includes(command)) {
+    return null;
+  }
+
+  for (let cursor = index + 1; cursor < tokens.length; cursor++) {
+    const token = tokens[cursor];
+    if (isShellSeparator(token)) break;
+    const lower = token.toLowerCase();
+    if (["/d", "--", "-path", "-literalpath"].includes(lower)) continue;
+    if (token.startsWith("-")) continue;
+    return resolve(currentCwd, token);
+  }
+  return null;
+}
+
+function commandCouldStageProjectMemory(command, projectRoot, commandCwd, depth) {
+  if (depth > 3) return true;
+  const tokens = shellTokens(command);
+  let shellCwd = resolve(commandCwd);
+  for (let index = 0; index < tokens.length; index++) {
+    const changedCwd = changedShellCwd(tokens, index, shellCwd);
+    if (changedCwd) shellCwd = changedCwd;
+    const nested = delegatedCommand(tokens, index);
+    if (nested && commandCouldStageProjectMemory(nested, projectRoot, shellCwd, depth + 1)) {
+      return true;
+    }
+    if (!isGitExecutable(tokens[index])) continue;
+    const subcommand = gitSubcommand(tokens, index, shellCwd);
+    if (!subcommand) continue;
+    if (subcommand.inlineAlias) return true;
+    if (
+      ["add", "stage"].includes(subcommand.name) &&
+      gitAddCouldStageMemory(tokens, subcommand.argsStart, subcommand.gitCwd, projectRoot)
+    ) {
+      return true;
+    }
+    if (
+      subcommand.name === "commit" &&
+      gitCommitCouldStageMemory(tokens, subcommand.argsStart, subcommand.gitCwd, projectRoot)
+    ) {
+      return true;
+    }
+    if (["update-index", "am"].includes(subcommand.name)) return true;
+    if (
+      subcommand.name === "apply" &&
+      tokens
+        .slice(subcommand.argsStart)
+        .some((token) => token === "--cached" || token === "--index")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Return true when a shell command contains a Git add/commit form that could
+ * stage the local-only project-memory path. This intentionally understands Git
+ * global options, working-directory changes, pathspec magic, and common index
+ * writers while paths such as `git -C src add .` and `.github/...` remain valid.
+ * CI independently rejects any tracked `.claude/memory/**` path, so this hook
+ * is an early local backstop rather than the sole repository boundary.
+ */
+export function gitCommandCouldStageProjectMemory(
+  command,
+  projectRoot = findProjectRoot(process.cwd()),
+  commandCwd = process.cwd(),
+) {
+  return commandCouldStageProjectMemory(command, resolve(projectRoot), resolve(commandCwd), 0);
+}
 
 // Ordering matters: most specific first so a value isn't partially eaten by a
 // broader rule before its precise rule runs. Each entry: { name, re, replace }.
@@ -235,20 +577,20 @@ function runHook() {
     label = fp;
   } else if (toolName === "Bash") {
     const cmd = String(toolInput.command || "");
-    // Only police git add/commit that could stage the memory file.
-    const isGitStage = /\bgit\s+(add|commit)\b/.test(cmd);
-    const touchesMemory = MEMORY_RE.test(cmd.replace(/\\/g, "/"));
-    // A `git commit -a`/`git add .` could stage the memory file even without naming it.
-    const isBlanketStage = /\bgit\s+add\s+(-A|--all|\.)/.test(cmd) || /\bgit\s+commit\b[^|;&]*\s-a\b/.test(cmd);
-    if (!isGitStage) process.exit(0);
-    if (!touchesMemory && !isBlanketStage) process.exit(0);
-    // For commits, re-read the committed memory file from disk and check it.
-    try {
-      candidateText = readFileSync(".claude/memory/project-memory.md", "utf8");
-    } catch {
-      process.exit(0); // nothing to police
-    }
-    label = ".claude/memory/project-memory.md";
+    const commandCwd = resolve(payload.cwd || process.cwd());
+    const projectRoot = findProjectRoot(commandCwd);
+    if (!gitCommandCouldStageProjectMemory(cmd, projectRoot, commandCwd)) process.exit(0);
+    process.stdout.write(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason:
+            "Blocked: .claude/memory/project-memory.md is local-only and must never be staged or committed, including with force-add or blanket Git commands.",
+        },
+      }) + "\n",
+    );
+    process.exit(0);
   } else {
     process.exit(0);
   }

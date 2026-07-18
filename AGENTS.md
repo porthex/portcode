@@ -19,7 +19,7 @@ When you add or change **frontend** code (`src/`):
 - **New code must come with tests.** If you add an export/store action/component, extend the matching `*.test.ts(x)` in the same change. (This exact gap — OAuth shipping without test updates — once reddened `main`.)
 - If `test:coverage` reports a shortfall, cover the new lines rather than lowering the threshold.
 
-For the **Rust** core (`src-tauri/`): `cargo test` runs in CI on every PR; `cargo llvm-cov` coverage is computed on `main`/`release` only. The crate is too heavy to build on low-RAM dev machines — **verify Rust tests via CI**, not locally.
+For the **Rust** core (`src-tauri/`): `cargo test` runs in CI on every PR; `cargo llvm-cov` coverage is computed on `main`/`release` only.
 
 ## Self-dev mode
 
@@ -27,7 +27,7 @@ You can build Portcode while running it, dogfood-style. `pnpm app:dev:self` runs
 
 ## Project memory
 
-Durable, project-scoped knowledge lives locally in `.claude/memory/project-memory.md`. It is shared by Claude Code and Codex on this machine and auto-loaded by their respective SessionStart hooks. The file is ignored by Git and does not travel with clones.
+Durable, project-scoped knowledge lives locally in `.claude/memory/project-memory.md`. The file is ignored by Git, is not automatically injected at SessionStart, and does not travel with clones.
 
 - In Claude Code, run `/memory`. In Codex, use the `project-memory` skill. Both initialize the local file when needed and pass additions through the same PII scrubber.
 - HARD RULE: never commit or force-add `.claude/memory/project-memory.md`. Keep personal data, credentials, machine details, and other sensitive information out of it anyway so the file remains safe to copy deliberately.
