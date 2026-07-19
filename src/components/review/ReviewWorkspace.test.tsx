@@ -317,15 +317,24 @@ describe("ReviewWorkspace", () => {
     await renderLoaded();
     const scope = screen.getByRole("combobox", { name: "Review scope" });
     expect(scope.tagName).toBe("BUTTON");
-    expect(screen.getByRole("banner")).toHaveClass("flex-nowrap", "overflow-x-auto");
-    expect(screen.getByTestId("review-scope-control")).toHaveClass("min-w-[240px]");
+    expect(screen.getByRole("banner")).toHaveClass("shrink-0");
+    expect(screen.getByRole("banner")).not.toHaveClass("flex-nowrap", "overflow-x-auto");
+    expect(screen.getByTestId("review-header-primary")).toHaveClass("h-[46px]");
+    expect(screen.getByTestId("review-header-title")).toHaveClass("flex-1", "min-w-0");
+    expect(screen.getByTestId("review-header-controls")).toHaveClass("grid", "min-h-[44px]");
+    expect(screen.getByTestId("review-scope-control")).toHaveClass("min-w-0");
+    expect(screen.getByTestId("review-header-summary")).toBeInTheDocument();
+    expect(screen.getByText("All local changes")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Back to chat" })).not.toBeInTheDocument();
 
     chooseMenuOption("Review scope", "Staged");
     await waitFor(() => expect(m.getGitReviewManifest).toHaveBeenCalledWith({ kind: "staged" }));
+    expect(screen.getByText("Changes ready to commit")).toBeInTheDocument();
     expect(await screen.findByRole("list", { name: "Staged files" })).toBeInTheDocument();
 
     chooseMenuOption("Review scope", "Unstaged");
     await waitFor(() => expect(m.getGitReviewManifest).toHaveBeenCalledWith({ kind: "unstaged" }));
+    expect(screen.getByText("Changes not yet staged")).toBeInTheDocument();
 
     chooseMenuOption("Review scope", "Branch…");
     await waitFor(() => expect(m.getGitReviewBranches).toHaveBeenCalledTimes(1));
@@ -694,11 +703,5 @@ describe("ReviewWorkspace", () => {
     );
     expect(screen.getByText("1 comment")).toBeInTheDocument();
     expect(await screen.findByText("Keep this review state.")).toBeInTheDocument();
-  });
-
-  it("returns to chat directly from the workspace header", async () => {
-    await renderLoaded();
-    fireEvent.click(screen.getByRole("button", { name: "Back to chat" }));
-    expect(useStore.getState().workspaceSurface).toBe("chat");
   });
 });
