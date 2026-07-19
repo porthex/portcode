@@ -41,6 +41,8 @@ mod telemetry;
 mod tool_names;
 #[cfg(desktop)]
 mod tools;
+#[cfg(desktop)]
+mod turn_receipt;
 // Auto-updater command surface (desktop only — the phone is a remote client and
 // never self-updates). The whole module is `#![cfg(desktop)]` internally too.
 #[cfg(desktop)]
@@ -1579,6 +1581,8 @@ pub fn run() {
         git_review::get_git_review_branches,
         git_review::get_git_review_manifest,
         git_review::get_git_review_file,
+        git_review::get_turn_review_manifest,
+        git_review::get_turn_review_file,
         list_dir,
         run_agent,
         cancel_agent,

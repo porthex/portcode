@@ -11,6 +11,7 @@ import type {
   GitReviewBranch,
   GitReviewManifest,
   GitReviewScope,
+  TurnReviewManifest,
 } from "../../types";
 import { SelectMenu, type SelectMenuGroup } from "../SelectMenu";
 
@@ -65,6 +66,8 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
   const setDraft = useStore((state) => state.setDraft);
   const setWorkspaceSurface = useStore((state) => state.setWorkspaceSurface);
   const streaming = useStore((state) => state.streaming);
+  const reviewTarget = useStore((state) => state.reviewTarget);
+  const isTurnReview = reviewTarget.kind === "turn";
 
   const [scope, setScope] = useState<GitReviewScope>({ kind: "workingTree" });
   const [scopeKind, setScopeKind] = useState<ScopeKind>("workingTree");
@@ -73,6 +76,7 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
   const [branchesLoading, setBranchesLoading] = useState(false);
   const [branchesError, setBranchesError] = useState<string | null>(null);
   const [manifest, setManifest] = useState<GitReviewManifest | null>(null);
+  const [turnPatchesAvailable, setTurnPatchesAvailable] = useState(true);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [patch, setPatch] = useState<GitFilePatch | null>(null);
   const [manifestLoading, setManifestLoading] = useState(true);
@@ -98,6 +102,8 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
   activeRef.current = active;
   const scopeRef = useRef(scope);
   scopeRef.current = scope;
+  const reviewTargetRef = useRef(reviewTarget);
+  reviewTargetRef.current = reviewTarget;
 
   const refresh = useCallback(async () => {
     if (!mountedRef.current || !activeRef.current) return;
@@ -116,11 +122,27 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
         manifestQueued.current = false;
         const request = manifestRequest.current;
         const requestScope = scopeRef.current;
+        const requestTarget = reviewTargetRef.current;
         try {
-          const next = await ipc.getGitReviewManifest(requestScope);
+          const turnManifest =
+            requestTarget.kind === "turn"
+              ? await ipc.getTurnReviewManifest(requestTarget.turnId)
+              : null;
+          const next = turnManifest
+            ? normalizeTurnManifest(turnManifest)
+            : await ipc.getGitReviewManifest(requestScope);
           if (!mountedRef.current || !activeRef.current || request !== manifestRequest.current) {
             continue;
           }
+          if (reviewTargetRef.current.kind !== requestTarget.kind) continue;
+          if (
+            requestTarget.kind === "turn" &&
+            (reviewTargetRef.current.kind !== "turn" ||
+              reviewTargetRef.current.turnId !== requestTarget.turnId)
+          ) {
+            continue;
+          }
+          setTurnPatchesAvailable(turnManifest?.patchesAvailable ?? true);
           if (manifestRef.current?.snapshotId !== next.snapshotId) {
             patchRequest.current += 1;
             setPatch(null);
@@ -198,8 +220,9 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
     setDraftAnchor(null);
     setCommentBody("");
     setManifestError(null);
+    setTurnPatchesAvailable(true);
     if (activeRef.current) void refresh();
-  }, [refresh, scope, workspace]);
+  }, [refresh, reviewTarget, scope, workspace]);
 
   useEffect(() => {
     branchRequest.current += 1;
@@ -210,15 +233,15 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
   }, [workspace]);
 
   useEffect(() => {
-    if (!active || scopeKind !== "branch") return;
+    if (!active || isTurnReview || scopeKind !== "branch") return;
     void loadBranches();
     return () => {
       branchRequest.current += 1;
     };
-  }, [active, loadBranches, scopeKind, workspace]);
+  }, [active, isTurnReview, loadBranches, scopeKind, workspace]);
 
   useEffect(() => {
-    if (!active) return;
+    if (!active || isTurnReview) return;
     const onFocus = () => {
       void refresh();
       if (scopeKind === "branch") void loadBranches();
@@ -229,7 +252,7 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
       window.removeEventListener("focus", onFocus);
       window.clearInterval(interval);
     };
-  }, [active, loadBranches, refresh, scopeKind]);
+  }, [active, isTurnReview, loadBranches, refresh, scopeKind]);
 
   useEffect(() => {
     if (active && !previousActive.current) {
@@ -246,9 +269,9 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
   }, [active, refresh]);
 
   useEffect(() => {
-    if (active && previousStreaming.current && !streaming) void refresh();
+    if (active && !isTurnReview && previousStreaming.current && !streaming) void refresh();
     previousStreaming.current = streaming;
-  }, [active, streaming, refresh]);
+  }, [active, isTurnReview, streaming, refresh]);
 
   useEffect(() => {
     if (!active) return;
@@ -259,8 +282,18 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
     const request = ++patchRequest.current;
     setPatchLoading(true);
     setPatchError(null);
-    void ipc
-      .getGitReviewFile(scope, manifest.snapshotId, selectedPath)
+    const target = reviewTarget;
+    const patchPromise =
+      target.kind === "turn"
+        ? turnPatchesAvailable
+          ? ipc.getTurnReviewFile(target.turnId, selectedPath)
+          : Promise.reject(
+              new Error(
+                "The changed-file summary is available, but this turn did not retain an immutable line patch.",
+              ),
+            )
+        : ipc.getGitReviewFile(scope, manifest.snapshotId, selectedPath);
+    void patchPromise
       .then((next) => {
         if (request === patchRequest.current) {
           setFilePatchHashes((current) => {
@@ -280,7 +313,7 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
     return () => {
       patchRequest.current += 1;
     };
-  }, [active, manifest, scope, selectedPath]);
+  }, [active, manifest, reviewTarget, scope, selectedPath, turnPatchesAvailable]);
 
   const groups = useMemo(() => groupFiles(manifest), [manifest]);
   const branchGroups = useMemo(
@@ -357,59 +390,63 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
 
   return (
     <section
-      aria-label="Review workspace"
+      aria-label={isTurnReview ? "Turn changes" : "Review workspace"}
       className="flex min-h-0 flex-1 flex-col overflow-hidden bg-bg/80"
     >
       <header className="flex min-h-[54px] shrink-0 flex-nowrap items-center gap-2 overflow-x-auto border-b border-border bg-panel/75 px-3 py-2">
         <div className="mr-1 min-w-[150px] flex-1">
           <div className="font-mono text-[9px] uppercase tracking-[0.18em] text-accent-2">
-            Review workspace
+            {isTurnReview ? "Turn changes" : "Review workspace"}
           </div>
           <div className="truncate text-[11px] text-faint" title={manifest?.repositoryRoot}>
             {manifest?.repositoryRoot ?? workspace ?? "Current directory"}
           </div>
         </div>
-        <SelectMenu
-          id="review-scope"
-          label="Review scope"
-          value={scopeKind}
-          groups={REVIEW_SCOPE_GROUPS}
-          onChange={(value) => chooseScopeKind(value as ScopeKind)}
-          className="w-[142px] shrink-0"
-          buttonClassName="rounded-md px-2.5 py-1.5 text-[11px]"
-        />
-        <div data-testid="review-scope-control" className="min-w-[240px] flex-1">
-          {scopeKind === "branch" ? (
+        {!isTurnReview && (
+          <>
             <SelectMenu
-              label="Base branch"
-              value={reference}
-              groups={branchGroups}
-              onChange={chooseBranch}
-              disabled={branchesLoading || branches.length === 0}
-              title={branchesError ?? "Choose a branch from the current workspace"}
-              className="w-full"
-              buttonClassName="rounded-md px-2.5 py-1.5 font-mono text-[11px]"
+              id="review-scope"
+              label="Review scope"
+              value={scopeKind}
+              groups={REVIEW_SCOPE_GROUPS}
+              onChange={(value) => chooseScopeKind(value as ScopeKind)}
+              className="w-[142px] shrink-0"
+              buttonClassName="rounded-md px-2.5 py-1.5 text-[11px]"
             />
-          ) : scopeKind === "commit" ? (
-            <form
-              className="flex items-center gap-1.5"
-              onSubmit={(event) => {
-                event.preventDefault();
-                applyScope();
-              }}
-            >
-              <input
-                aria-label="Commit revision"
-                value={reference}
-                onChange={(event) => setReference(event.target.value)}
-                className="min-w-0 flex-1 rounded-md border border-border-2 bg-bg px-2.5 py-1.5 font-mono text-[11px] text-fg outline-none focus:border-accent-2"
-              />
-              <button type="submit" className="pc-btn-deny px-2.5 py-1.5 text-[11px]">
-                Apply
-              </button>
-            </form>
-          ) : null}
-        </div>
+            <div data-testid="review-scope-control" className="min-w-[240px] flex-1">
+              {scopeKind === "branch" ? (
+                <SelectMenu
+                  label="Base branch"
+                  value={reference}
+                  groups={branchGroups}
+                  onChange={chooseBranch}
+                  disabled={branchesLoading || branches.length === 0}
+                  title={branchesError ?? "Choose a branch from the current workspace"}
+                  className="w-full"
+                  buttonClassName="rounded-md px-2.5 py-1.5 font-mono text-[11px]"
+                />
+              ) : scopeKind === "commit" ? (
+                <form
+                  className="flex items-center gap-1.5"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    applyScope();
+                  }}
+                >
+                  <input
+                    aria-label="Commit revision"
+                    value={reference}
+                    onChange={(event) => setReference(event.target.value)}
+                    className="min-w-0 flex-1 rounded-md border border-border-2 bg-bg px-2.5 py-1.5 font-mono text-[11px] text-fg outline-none focus:border-accent-2"
+                  />
+                  <button type="submit" className="pc-btn-deny px-2.5 py-1.5 text-[11px]">
+                    Apply
+                  </button>
+                </form>
+              ) : null}
+            </div>
+          </>
+        )}
         {manifest && (
           <div className="flex shrink-0 items-center gap-2 font-mono text-[10px]">
             <span className="hidden max-w-[250px] truncate text-faint min-[900px]:inline">
@@ -419,18 +456,20 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
             <span className="text-danger">−{manifest.deletions}</span>
           </div>
         )}
-        <button
-          type="button"
-          aria-label="Refresh review"
-          onClick={() => {
-            void refresh();
-            if (scopeKind === "branch") void loadBranches();
-          }}
-          disabled={refreshing}
-          className="shrink-0 rounded-md border border-border-2 px-2.5 py-1.5 text-[11px] text-muted outline-none hover:border-accent-2/50 hover:text-fg focus-visible:ring-2 focus-visible:ring-accent-2/25 disabled:opacity-50"
-        >
-          {refreshing ? "Refreshing…" : "Refresh"}
-        </button>
+        {!isTurnReview && (
+          <button
+            type="button"
+            aria-label="Refresh review"
+            onClick={() => {
+              void refresh();
+              if (scopeKind === "branch") void loadBranches();
+            }}
+            disabled={refreshing}
+            className="shrink-0 rounded-md border border-border-2 px-2.5 py-1.5 text-[11px] text-muted outline-none hover:border-accent-2/50 hover:text-fg focus-visible:ring-2 focus-visible:ring-accent-2/25 disabled:opacity-50"
+          >
+            {refreshing ? "Refreshing…" : "Refresh"}
+          </button>
+        )}
         <button
           type="button"
           onClick={() => setWorkspaceSurface("chat")}
@@ -564,6 +603,29 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
       )}
     </section>
   );
+}
+
+function normalizeTurnManifest(turn: TurnReviewManifest): GitReviewManifest {
+  return {
+    snapshotId: turn.snapshotId,
+    repositoryRoot: turn.repositoryRoot,
+    scope: { kind: "workingTree" },
+    baseLabel: "Turn start",
+    targetLabel: "Turn end",
+    headOid: null,
+    files: turn.files.map((file) => ({
+      path: file.path,
+      oldPath: file.oldPath ?? null,
+      status: file.status,
+      areas: ["committed"],
+      additions: file.additions ?? null,
+      deletions: file.deletions ?? null,
+      binary: file.binary,
+    })),
+    additions: turn.additions,
+    deletions: turn.deletions,
+    truncated: turn.truncated,
+  };
 }
 
 function FileGroup({

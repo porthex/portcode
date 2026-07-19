@@ -4,7 +4,7 @@ import { render, screen, fireEvent, act } from "@testing-library/react";
 import { MessageView } from "./Message";
 import { STEP_MS } from "../lib/useScramble";
 import { useStore } from "../store/store";
-import type { ContentBlock, Message, Role } from "../types";
+import type { ContentBlock, Message, Role, TurnReceipt as TurnReceiptData } from "../types";
 
 // MessageView is a pure, props-driven presentational component: it folds a
 // Message's content blocks into rendered output (markdown for text, a ToolCall
@@ -19,6 +19,22 @@ const message = (role: Role, blocks: ContentBlock[]): Message => ({
   role,
   blocks,
   createdAt: 1,
+});
+
+const receipt = (over: Partial<TurnReceiptData> = {}): TurnReceiptData => ({
+  turnId: "turn-1",
+  status: "completed",
+  startedAt: 1_000,
+  completedAt: 5_200,
+  durationMs: 4_200,
+  changedFiles: [],
+  changedFileCount: 0,
+  additions: 0,
+  deletions: 0,
+  filesTruncated: false,
+  changeCertainty: "exact",
+  backgroundTasksRunning: false,
+  ...over,
 });
 
 describe("MessageView — user role", () => {
@@ -461,6 +477,157 @@ describe("MessageView — assistant role", () => {
   });
 });
 
+describe("MessageView — turn receipt presentation", () => {
+  it("replaces the empty-turn thinking dots with the fixed live lifecycle strip", () => {
+    const { container, rerender } = render(
+      <MessageView
+        message={{ ...message("assistant", []), turnId: "turn-1" }}
+        isActive
+        turnPresentation={{ active: true, startedAt: null, waiting: false, finalizing: false }}
+      />,
+    );
+
+    const strip = container.querySelector(".pc-turn-receipt__strip");
+    expect(strip).toHaveTextContent("Starting");
+    expect(screen.queryByText("Agent is thinking")).toBeNull();
+
+    rerender(
+      <MessageView
+        message={{ ...message("assistant", []), turnId: "turn-1" }}
+        isActive
+        turnPresentation={{ active: true, startedAt: 1_000, waiting: true, finalizing: false }}
+      />,
+    );
+    expect(strip).toHaveTextContent("Waiting for approval");
+
+    rerender(
+      <MessageView
+        message={{ ...message("assistant", []), turnId: "turn-1" }}
+        isActive
+        turnPresentation={{ active: false, startedAt: 1_000, waiting: false, finalizing: true }}
+      />,
+    );
+    expect(strip).toHaveTextContent("Finalizing");
+  });
+
+  it("keeps observable activity in the manual disclosure and the Markdown summary visible", () => {
+    const turnMessage: Message = {
+      ...message("assistant", [
+        { kind: "tool_use", id: "read-1", name: "fs_read", input: { path: "src/App.tsx" } },
+        { kind: "tool_result", toolUseId: "read-1", output: "contents", isError: false },
+        { kind: "text", text: "## Result\n\nThe review is ready." },
+      ]),
+      turnId: "turn-1",
+      receipt: receipt(),
+    };
+    const { container } = render(<MessageView message={turnMessage} />);
+
+    expect(screen.getByRole("heading", { level: 2, name: "Result" })).toBeInTheDocument();
+    const details = container.querySelector(".pc-turn-receipt__details-grid");
+    expect(details).toHaveAttribute("aria-hidden", "true");
+    expect(details).toHaveAttribute("inert");
+
+    fireEvent.click(screen.getByRole("button", { name: /expand work activity/i }));
+    expect(details).toHaveAttribute("aria-hidden", "false");
+    expect(details).not.toHaveAttribute("inert");
+    expect(screen.getByText("Read file")).toBeInTheDocument();
+  });
+
+  it("shows subagent activity as observable work without exposing a reasoning surface", () => {
+    const { container } = render(
+      <MessageView
+        message={{
+          ...message("assistant", [{ kind: "text", text: "Delegation complete." }]),
+          turnId: "turn-1",
+        }}
+        turnPresentation={{ active: true, startedAt: 1_000, waiting: false, finalizing: false }}
+        agents={[
+          {
+            id: "agent-1",
+            description: "Audit accessibility",
+            status: "running",
+            step: 2,
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: /expand work activity/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /expand work activity/i }));
+    expect(screen.getByRole("region", { name: "Subagent activity" })).toBeInTheDocument();
+    expect(screen.getByText("Audit accessibility")).toBeInTheDocument();
+    expect(screen.queryByText(/reasoning/i)).not.toBeInTheDocument();
+    expect(container.querySelector(".pc-turn-agents__status")).toHaveTextContent("step 2");
+  });
+
+  it("appends the compact change card after the assistant result and wires Review", () => {
+    const onReview = vi.fn();
+    const turnReceipt = receipt({
+      changedFiles: [
+        {
+          path: "src/new-feature.ts",
+          status: "modified",
+          additions: 8,
+          deletions: 3,
+          binary: false,
+          certainty: "exact",
+        },
+      ],
+      changedFileCount: 1,
+      additions: 8,
+      deletions: 3,
+    });
+    const { container } = render(
+      <MessageView
+        message={{
+          ...message("assistant", [{ kind: "text", text: "Implementation complete." }]),
+          turnId: "turn-1",
+          receipt: turnReceipt,
+        }}
+        onReviewChanges={onReview}
+      />,
+    );
+
+    const strip = container.querySelector(".pc-turn-receipt") as HTMLElement;
+    const summary = screen.getByText("Implementation complete.");
+    const card = container.querySelector(".pc-turn-changes") as HTMLElement;
+    expect(strip.compareDocumentPosition(summary) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(summary.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Review 1 changed file" }));
+    expect(onReview).toHaveBeenCalledWith(turnReceipt);
+  });
+
+  it("makes the Review seam explicitly desktop-only in remote mode", () => {
+    render(
+      <MessageView
+        message={{
+          ...message("assistant", [{ kind: "text", text: "Done." }]),
+          receipt: receipt({
+            changedFiles: [
+              {
+                path: "src/mobile.ts",
+                status: "added",
+                additions: 1,
+                deletions: 0,
+                binary: false,
+                certainty: "observed",
+              },
+            ],
+            changedFileCount: 1,
+            additions: 1,
+            changeCertainty: "observed",
+          }),
+        }}
+        reviewAvailable={false}
+      />,
+    );
+
+    expect(screen.getByText("Review on desktop")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /review 1 changed file/i })).toBeNull();
+  });
+});
+
 describe("MessageView — typing animation", () => {
   // Freeze requestAnimationFrame so the reveal never advances during the test:
   // assertions stay deterministic and no setState escapes React's act().
@@ -730,6 +897,38 @@ describe("MessageView — right-click context menu", () => {
 
     // Only the text blocks are joined (tool_use is skipped).
     expect(writeText).toHaveBeenCalledWith("part one part two");
+  });
+
+  it("excludes lifecycle and changed-file receipt chrome from copied message text", () => {
+    const { container } = render(
+      <MessageView
+        message={{
+          ...message("assistant", [{ kind: "text", text: "Only this summary is copied." }]),
+          receipt: receipt({
+            changedFiles: [
+              {
+                path: "src/private-receipt-path.ts",
+                status: "modified",
+                additions: 4,
+                deletions: 1,
+                binary: false,
+                certainty: "exact",
+              },
+            ],
+            changedFileCount: 1,
+            additions: 4,
+            deletions: 1,
+          }),
+        }}
+      />,
+    );
+
+    fireEvent.contextMenu(container.firstElementChild as HTMLElement);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy message text" }));
+
+    expect(writeText).toHaveBeenCalledWith("Only this summary is copied.");
+    expect(writeText).not.toHaveBeenCalledWith(expect.stringContaining("Worked for"));
+    expect(writeText).not.toHaveBeenCalledWith(expect.stringContaining("private-receipt-path"));
   });
 
   it("does not open the custom menu when text in that message is selected", () => {

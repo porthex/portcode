@@ -992,6 +992,329 @@ input[type="radio"]:not(:disabled) {
   overflow-x: auto;
 }
 
+/* =========================================================================
+   TURN RECEIPT
+   Provider-neutral turn state sits above the assistant result. Observable
+   activity is disclosed in place; durable Git facts append below the result.
+   ========================================================================= */
+.pc-turn-receipt {
+  min-width: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: rgba(10, 12, 18, 0.62);
+  overflow: hidden;
+}
+.pc-turn-receipt__strip {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) minmax(7ch, auto) 12px;
+  align-items: center;
+  column-gap: 8px;
+  width: 100%;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 0;
+  background: transparent;
+  color: var(--color-faint);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1;
+  text-align: left;
+}
+button.pc-turn-receipt__strip {
+  cursor: pointer;
+}
+button.pc-turn-receipt__strip:hover {
+  background: rgba(33, 230, 255, 0.035);
+  color: var(--color-fg);
+}
+button.pc-turn-receipt__strip:focus-visible {
+  outline: 2px solid var(--color-accent-2);
+  outline-offset: -2px;
+}
+.pc-turn-receipt__state-mark {
+  color: var(--color-accent-2);
+  text-align: center;
+}
+.pc-turn-receipt--starting .pc-turn-receipt__state-mark,
+.pc-turn-receipt--working .pc-turn-receipt__state-mark,
+.pc-turn-receipt--waiting .pc-turn-receipt__state-mark,
+.pc-turn-receipt--finalizing .pc-turn-receipt__state-mark {
+  animation: pc-turn-state-pulse 1.25s ease-in-out infinite;
+}
+.pc-turn-receipt--waiting .pc-turn-receipt__state-mark,
+.pc-turn-receipt--cancelled .pc-turn-receipt__state-mark {
+  color: var(--color-warn);
+}
+.pc-turn-receipt--completed .pc-turn-receipt__state-mark {
+  color: var(--color-success);
+}
+.pc-turn-receipt--error .pc-turn-receipt__state-mark,
+.pc-turn-receipt--interrupted .pc-turn-receipt__state-mark {
+  color: var(--color-danger);
+}
+.pc-turn-receipt__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pc-turn-receipt__time {
+  min-width: 7ch;
+  color: #8d96a8;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+.pc-turn-receipt__chevron {
+  color: #778196;
+  text-align: center;
+}
+.pc-turn-receipt__details-grid {
+  display: grid;
+  grid-template-rows: 0fr;
+  border-top: 1px solid transparent;
+  transition:
+    grid-template-rows 0.16s ease,
+    border-color 0.16s ease;
+}
+.pc-turn-receipt__details-grid[data-open="true"] {
+  grid-template-rows: 1fr;
+  border-top-color: var(--color-border);
+}
+.pc-turn-receipt__details {
+  max-height: 14rem;
+  padding: 8px;
+  overflow: auto;
+  background: rgba(5, 6, 9, 0.5);
+}
+.pc-turn-agents {
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+  border-radius: 7px;
+  background: rgba(10, 12, 18, 0.76);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.pc-turn-agents__head,
+.pc-turn-agents__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 0 10px;
+}
+.pc-turn-agents__head {
+  justify-content: space-between;
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-faint);
+}
+.pc-turn-agents__row + .pc-turn-agents__row {
+  border-top: 1px solid rgba(42, 48, 65, 0.62);
+}
+.pc-turn-agents__status {
+  flex: none;
+  color: var(--color-faint);
+}
+
+.pc-turn-changes {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+  border-radius: 9px;
+  background: rgba(10, 12, 18, 0.78);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.pc-turn-changes[data-certainty="ambiguous"],
+.pc-turn-changes[data-certainty="unavailable"] {
+  border-color: color-mix(in srgb, var(--color-warn) 34%, var(--color-border));
+}
+.pc-turn-changes__head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 48px;
+  padding: 8px 10px 8px 12px;
+}
+.pc-turn-changes__title {
+  overflow: hidden;
+  color: #c4cad6;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pc-turn-changes__provenance {
+  margin-top: 3px;
+  color: var(--color-faint);
+  font-size: 10px;
+  line-height: 1.35;
+}
+.pc-turn-changes__totals,
+.pc-turn-changes__file-counts {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 8ch;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.pc-turn-changes__review {
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--color-border-2);
+  border-radius: 6px;
+  background: rgba(33, 230, 255, 0.04);
+  color: var(--color-accent-2);
+  font: inherit;
+  cursor: pointer;
+}
+.pc-turn-changes__review:hover {
+  border-color: rgba(33, 230, 255, 0.45);
+  background: rgba(33, 230, 255, 0.08);
+  color: var(--color-fg);
+}
+.pc-turn-changes__review:focus-visible,
+.pc-turn-changes__more:focus-visible {
+  outline: 2px solid var(--color-accent-2);
+  outline-offset: 2px;
+}
+.pc-turn-changes__review-note {
+  max-width: 18ch;
+  color: var(--color-faint);
+  font-size: 10px;
+  line-height: 1.25;
+  text-align: right;
+}
+.pc-turn-changes__files {
+  border-top: 1px solid var(--color-border);
+}
+.pc-turn-changes__file {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto minmax(8ch, auto);
+  align-items: center;
+  gap: 8px;
+  min-height: 31px;
+  padding: 0 12px;
+}
+.pc-turn-changes__file + .pc-turn-changes__file {
+  border-top: 1px solid rgba(42, 48, 65, 0.55);
+}
+.pc-turn-changes__status {
+  color: #95a0b4;
+  font-weight: 700;
+}
+.pc-turn-changes__status--added,
+.pc-turn-changes__status--copied {
+  color: var(--color-success);
+}
+.pc-turn-changes__status--deleted,
+.pc-turn-changes__status--unmerged {
+  color: var(--color-danger);
+}
+.pc-turn-changes__status--renamed {
+  color: var(--color-accent-2);
+}
+.pc-turn-changes__path {
+  min-width: 0;
+  overflow: hidden;
+  color: #aeb6c5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pc-turn-changes__certainty,
+.pc-turn-changes__binary {
+  padding: 2px 5px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  color: var(--color-faint);
+  font-size: 9px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.pc-turn-changes__certainty--ambiguous,
+.pc-turn-changes__certainty--unavailable {
+  border-color: color-mix(in srgb, var(--color-warn) 32%, var(--color-border));
+  color: var(--color-warn);
+}
+.pc-turn-changes__foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 32px;
+  padding: 5px 12px;
+  border-top: 1px solid var(--color-border);
+  color: var(--color-faint);
+  font-size: 10px;
+}
+.pc-turn-changes__more {
+  flex: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-accent-2);
+  font: inherit;
+  cursor: pointer;
+}
+.pc-turn-changes__more:hover {
+  color: var(--color-fg);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+@keyframes pc-turn-state-pulse {
+  0%,
+  100% {
+    opacity: 0.42;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (max-width: 600px) {
+  .pc-turn-changes__head {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "summary totals"
+      "review review";
+    gap: 7px 10px;
+  }
+  .pc-turn-changes__head > :first-child {
+    grid-area: summary;
+  }
+  .pc-turn-changes__totals {
+    grid-area: totals;
+  }
+  .pc-turn-changes__review,
+  .pc-turn-changes__review-note {
+    grid-area: review;
+  }
+  .pc-turn-changes__review {
+    min-height: 44px;
+  }
+  .pc-turn-changes__review-note {
+    max-width: none;
+    padding: 6px 0;
+    text-align: left;
+  }
+  .pc-turn-changes__file {
+    grid-template-columns: 18px minmax(0, 1fr) auto auto;
+    gap: 6px;
+    padding-inline: 8px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pc-turn-receipt__details-grid {
+    transition: none;
+  }
+  .pc-turn-receipt__state-mark {
+    animation: none !important;
+  }
+}
+
 /* Unified diff lines */
 .pc-diff {
   font-family: var(--font-mono);

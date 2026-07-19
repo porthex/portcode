@@ -14,6 +14,9 @@ use crate::tool_names;
 
 pub struct ToolCtx {
     pub workspace: PathBuf,
+    /// Root-turn provenance shared by the top-level agent and every subagent.
+    /// Read-only/legacy contexts leave it absent.
+    pub receipt: Option<Arc<crate::turn_receipt::TurnReceiptTracker>>,
     /// Launches subagents for the [`Task`] tool. `None` when this run can't spawn
     /// (plan mode, or a subagent already at the nesting cap) — in which case
     /// `delegate_task` isn't in the registry at all, so this is the runtime backstop rather than
@@ -32,6 +35,7 @@ impl ToolCtx {
     pub fn new(workspace: PathBuf) -> Self {
         Self {
             workspace,
+            receipt: None,
             spawner: None,
             background: None,
         }
@@ -604,6 +608,7 @@ impl Tool for FsWrite {
         let p = str_arg(&input, "path")?;
         let content = str_arg(&input, "content")?;
         let full = resolve_for_write(&base, p)?;
+        let mutation = ctx.receipt.as_ref().map(|tracker| tracker.begin_exact());
         let existed = full.exists();
         let old = if existed {
             tokio::fs::read_to_string(&full).await.unwrap_or_default()
@@ -618,6 +623,9 @@ impl Tool for FsWrite {
         tokio::fs::write(&full, content)
             .await
             .map_err(|e| format!("failed to write '{p}': {e}"))?;
+        if let Some(mutation) = mutation {
+            mutation.finish_exact(&full, content.as_bytes());
+        }
         if existed && old != content {
             Ok(format!(
                 "Updated {p} ({} bytes)\n\n{}",
@@ -684,6 +692,7 @@ impl Tool for FsEdit {
             .unwrap_or(false);
 
         let full = resolve_existing(&base, p)?;
+        let mutation = ctx.receipt.as_ref().map(|tracker| tracker.begin_exact());
         let content = tokio::fs::read_to_string(&full)
             .await
             .map_err(|e| format!("failed to read '{p}': {e}"))?;
@@ -692,6 +701,9 @@ impl Tool for FsEdit {
         tokio::fs::write(&full, &updated)
             .await
             .map_err(|e| format!("failed to write '{p}': {e}"))?;
+        if let Some(mutation) = mutation {
+            mutation.finish_exact(&full, updated.as_bytes());
+        }
         Ok(format!(
             "Edited {p} ({count} replacement(s))\n\n{}",
             truncate_chars(unified_diff(&content, &updated), 8000)
@@ -828,6 +840,11 @@ impl Tool for Shell {
         } else {
             None
         };
+        let mutation = if background {
+            None
+        } else {
+            ctx.receipt.as_ref().map(|tracker| tracker.begin_opaque())
+        };
 
         let mut cmd = build_shell_command(command, shell, &ctx.workspace)?;
         let child = cmd
@@ -847,6 +864,9 @@ impl Tool for Shell {
             .await
             .map_err(|_| "command timed out after 120s".to_string())?
             .map_err(|e| format!("command failed: {e}"))?;
+        if let Some(mutation) = mutation {
+            mutation.finish_observed();
+        }
         Ok(format_shell_output(&out))
     }
 }
@@ -1440,6 +1460,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(None));
         let ctx = ToolCtx {
             workspace: base(),
+            receipt: None,
             spawner: Some(Arc::new(RecordingSpawner { seen: seen.clone() })),
             background: None,
         };
@@ -1477,6 +1498,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(None));
         let ctx = ToolCtx {
             workspace: base(),
+            receipt: None,
             spawner: Some(Arc::new(RecordingSpawner { seen: seen.clone() })),
             background: None,
         };

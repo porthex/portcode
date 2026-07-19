@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use portcode_sync::wire::{TurnChangedFile, TurnReceipt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use similar::TextDiff;
@@ -18,6 +19,7 @@ const PATCH_CAP: usize = 2 * 1024 * 1024;
 const UNTRACKED_TEXT_CAP: u64 = 512 * 1024;
 const SNAPSHOT_FILE_CAP: u64 = 8 * 1024 * 1024;
 const SNAPSHOT_TOTAL_CAP: u64 = 32 * 1024 * 1024;
+const TURN_SNAPSHOT_ENTRY_CAP: usize = 1_000;
 const MAX_DIFF_LINES: usize = 4_000;
 const STALE_REVIEW_ERROR: &str =
     "The working tree changed. Refresh the review before opening this file.";
@@ -141,6 +143,39 @@ pub struct GitFilePatch {
     pub file_patch_hash: String,
     pub hunks: Vec<GitDiffHunk>,
     pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnReviewManifest {
+    pub turn_id: String,
+    pub snapshot_id: String,
+    pub repository_root: String,
+    pub receipt: TurnReceipt,
+    pub files: Vec<TurnChangedFile>,
+    pub additions: u64,
+    pub deletions: u64,
+    pub truncated: bool,
+    pub patches_available: bool,
+}
+
+/// Bounded workspace identity captured at a root-turn boundary. Entry content is
+/// retained only in memory and only under the existing snapshot caps; the durable
+/// receipt stores the immutable changed-file manifest, not source bytes.
+#[derive(Clone, Debug)]
+pub(crate) struct TurnWorkspaceSnapshot {
+    pub repository_root: String,
+    pub snapshot_id: String,
+    pub head_oid: Option<String>,
+    pub entries: BTreeMap<String, TurnWorkspaceEntry>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TurnWorkspaceEntry {
+    pub file: GitChangedFile,
+    pub fingerprint: String,
+    pub content: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -357,6 +392,60 @@ pub async fn get_git_review_file(
     Ok(response)
 }
 
+/// Immutable manifest persisted with a completed root turn. Unlike workspace
+/// Review, this never recomputes file membership from the current working tree.
+#[tauri::command]
+pub async fn get_turn_review_manifest(
+    state: State<'_, AppState>,
+    turn_id: String,
+) -> Result<TurnReviewManifest, String> {
+    turn_review_manifest(&state.db, turn_id)
+}
+
+fn turn_review_manifest(db: &crate::db::Db, turn_id: String) -> Result<TurnReviewManifest, String> {
+    let record = db
+        .get_turn_receipt(&turn_id)
+        .ok_or_else(|| "Turn receipt was not found.".to_string())?;
+    Ok(TurnReviewManifest {
+        turn_id,
+        snapshot_id: record
+            .terminal_snapshot_id
+            .unwrap_or_else(|| "unavailable".into()),
+        repository_root: record.repository_root.unwrap_or_default(),
+        files: record.receipt.changed_files.clone(),
+        additions: record.receipt.additions,
+        deletions: record.receipt.deletions,
+        truncated: record.receipt.files_truncated,
+        receipt: record.receipt,
+        // Baseline source bytes are intentionally not persisted in this pass.
+        patches_available: false,
+    })
+}
+
+/// Historical patch bytes are not persisted yet. Validate both the receipt and
+/// path so callers get a deterministic expiration error rather than accidentally
+/// falling back to a similarly named file in the current workspace.
+#[tauri::command]
+pub async fn get_turn_review_file(
+    state: State<'_, AppState>,
+    turn_id: String,
+    path: String,
+) -> Result<GitFilePatch, String> {
+    let record = state
+        .db
+        .get_turn_receipt(&turn_id)
+        .ok_or_else(|| "Turn receipt was not found.".to_string())?;
+    if !record
+        .receipt
+        .changed_files
+        .iter()
+        .any(|file| file.path == path)
+    {
+        return Err("The requested path is not part of this turn receipt.".into());
+    }
+    Err("Historical patch unavailable: this receipt retained the immutable file manifest but not source contents.".into())
+}
+
 fn ensure_snapshot_current(expected: &str, current: &str) -> Result<(), String> {
     if expected == current {
         Ok(())
@@ -422,6 +511,114 @@ async fn build_manifest(
         deletions,
         truncated: metadata_truncated,
     })
+}
+
+/// Capture the current working-tree identity for turn attribution. A path entry
+/// includes Git/index metadata plus a bounded, symlink-safe worktree fingerprint,
+/// so an untouched pre-existing dirty path compares equal at terminal time.
+pub(crate) async fn capture_turn_workspace(
+    workspace: &Path,
+) -> Result<TurnWorkspaceSnapshot, String> {
+    // Commands start in the configured workspace but can `cd` within its enclosing
+    // repository. Capture the full worktree, not merely the configured subdirectory.
+    let context = repository_context(workspace).await?;
+    let manifest = build_manifest(&context.root, GitReviewScope::WorkingTree).await?;
+    let root = PathBuf::from(&manifest.repository_root);
+    let mut entries = BTreeMap::new();
+    let mut total = 0_u64;
+    let mut truncated = manifest.truncated || manifest.files.len() > TURN_SNAPSHOT_ENTRY_CAP;
+
+    for file in manifest.files.iter().take(TURN_SNAPSHOT_ENTRY_CAP) {
+        let (fingerprint, content, entry_truncated) =
+            turn_entry_identity(&root, file, &mut total).await;
+        truncated |= entry_truncated;
+        entries.insert(
+            file.path.clone(),
+            TurnWorkspaceEntry {
+                file: file.clone(),
+                fingerprint,
+                content,
+            },
+        );
+    }
+
+    // Entry hashing spans multiple filesystem reads. Detect an editor/agent race
+    // across that window and degrade provenance instead of blessing a mixed image.
+    match build_manifest(&context.root, GitReviewScope::WorkingTree).await {
+        Ok(current) if current.snapshot_id == manifest.snapshot_id => {}
+        _ => truncated = true,
+    }
+
+    Ok(TurnWorkspaceSnapshot {
+        repository_root: manifest.repository_root,
+        snapshot_id: manifest.snapshot_id,
+        head_oid: manifest.head_oid,
+        entries,
+        truncated,
+    })
+}
+
+async fn turn_entry_identity(
+    root: &Path,
+    file: &GitChangedFile,
+    total: &mut u64,
+) -> (String, Option<Vec<u8>>, bool) {
+    let mut material = serde_json::to_vec(file).unwrap_or_default();
+    let mut truncated = false;
+
+    // The index identity is needed even when worktree bytes are unchanged (for
+    // example, `git add`/`git reset` during an opaque command).
+    let index = run_ok(
+        root,
+        vec![
+            OsString::from("ls-files"),
+            OsString::from("--stage"),
+            OsString::from("-z"),
+            OsString::from("--"),
+            OsString::from(&file.path),
+        ],
+        64 * 1024,
+    )
+    .await;
+    match index {
+        Ok(output) => {
+            material.extend_from_slice(&output.stdout);
+            truncated |= output.truncated;
+        }
+        Err(_) => truncated = true,
+    }
+
+    let full = root.join(&file.path);
+    let Ok(metadata) = tokio::fs::symlink_metadata(&full).await else {
+        material.extend_from_slice(b"(missing)");
+        return (digest_hex(&material), None, truncated);
+    };
+    material.extend_from_slice(&metadata.len().to_le_bytes());
+    if metadata.file_type().is_symlink() {
+        match tokio::fs::read_link(&full).await {
+            Ok(target) => material.extend_from_slice(target.as_os_str().as_encoded_bytes()),
+            Err(_) => truncated = true,
+        }
+        return (digest_hex(&material), None, truncated);
+    }
+    if !metadata.is_file()
+        || metadata.len() > SNAPSHOT_FILE_CAP
+        || total.saturating_add(metadata.len()) > SNAPSHOT_TOTAL_CAP
+    {
+        truncated = true;
+        return (digest_hex(&material), None, truncated);
+    }
+    match tokio::fs::read(&full).await {
+        Ok(bytes) => {
+            material.extend_from_slice(&Sha256::digest(&bytes));
+            *total = total.saturating_add(metadata.len());
+            (digest_hex(&material), Some(bytes), truncated)
+        }
+        Err(_) => {
+            truncated = true;
+            (digest_hex(&material), None, truncated)
+        }
+    }
 }
 
 async fn append_worktree_fingerprints(
@@ -1456,6 +1653,7 @@ fn digest_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use portcode_sync::wire::{TurnChangeCertainty, TurnStatus};
 
     #[test]
     fn parses_porcelain_areas_renames_untracked_and_conflicts() {
@@ -1724,5 +1922,33 @@ u UU N... 100644 100644 100644 100644 a a a src/conflict.rs\0\
             serde_json::to_value(scope).unwrap(),
             serde_json::json!({ "kind": "branch", "base": "origin/main" })
         );
+    }
+
+    #[test]
+    fn historical_review_rejects_pending_receipt_until_terminal_save() {
+        let db = crate::db::Db::open(Path::new(":memory:")).unwrap();
+        db.create_session("s", "S", None, None, 1).unwrap();
+        let receipt = TurnReceipt {
+            turn_id: "pending-review".into(),
+            status: TurnStatus::Interrupted,
+            stop_reason: None,
+            started_at: 1,
+            completed_at: 1,
+            duration_ms: None,
+            changed_files: Vec::new(),
+            changed_file_count: 0,
+            additions: 0,
+            deletions: 0,
+            files_truncated: false,
+            change_certainty: TurnChangeCertainty::Unavailable,
+            background_tasks_running: false,
+        };
+        db.save_pending_turn_receipt("s", "pending-review", &receipt)
+            .unwrap();
+        assert!(turn_review_manifest(&db, "pending-review".into()).is_err());
+
+        db.save_turn_receipt("s", "pending-review", &receipt, None, None)
+            .unwrap();
+        assert!(turn_review_manifest(&db, "pending-review".into()).is_ok());
     }
 }

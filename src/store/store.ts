@@ -17,6 +17,7 @@ import type {
   PendingPermission,
   PermissionMode,
   PhoneSyncStatus,
+  ReviewTarget,
   RemoteCommand,
   Rule,
   SearchHit,
@@ -31,6 +32,8 @@ import type {
   UpdateChannel,
   UpdateInfo,
   Usage,
+  TurnReceipt,
+  TurnStatus,
   WorkspaceSurface,
 } from "../types";
 import {
@@ -60,9 +63,27 @@ interface RunState {
   // belongs to the desktop-local agent run; the phone stops via a remote command).
   cancel: (() => Promise<void>) | null;
   pendingPermission: PendingPermission | null;
+  /** Provisional until turn_start reconciles it to the native identity. */
+  turnId: string | null;
+  /** Native start time when known; optimistic/client-observed before turn_start. */
+  startedAt: number | null;
+  /** True only while Stop/watchdog is awaiting a terminal acknowledgement. */
+  finalizing: boolean;
+  /** Last terminal receipt for this session's run, retained after streaming ends. */
+  receipt: TurnReceipt | null;
+  outcome: TurnStatus | null;
 }
 
-const EMPTY_RUN: RunState = { streaming: false, cancel: null, pendingPermission: null };
+const EMPTY_RUN: RunState = {
+  streaming: false,
+  cancel: null,
+  pendingPermission: null,
+  turnId: null,
+  startedAt: null,
+  finalizing: false,
+  receipt: null,
+  outcome: null,
+};
 
 // Single source of truth for the run-map key. The identity of a session id today;
 // the one place to change when a future subagent run needs a composite id (e.g.
@@ -161,6 +182,7 @@ interface AppState {
   sidebarCollapsed: boolean; // desktop: the inline rail is collapsed to a 52px strip
   showPalette: boolean;
   workspaceSurface: WorkspaceSurface; // desktop center route; review is workspace-scoped
+  reviewTarget: ReviewTarget; // workspace-wide review or one receipt's persisted turn snapshot
 
   // ── Sessions sidebar organization (frontend-only overlay, persisted) ─────────
   // The Rust `Session` model is unchanged; folders/membership/archived/sort/group
@@ -253,6 +275,8 @@ interface AppState {
   setShowSettings: (v: boolean) => void;
   setShowPalette: (v: boolean) => void;
   setWorkspaceSurface: (v: WorkspaceSurface) => void;
+  openWorkspaceReview: () => void;
+  openTurnReview: (turnId: string) => void;
   // ── message search (⌘K jump to a past turn) ──
   searchMessages: (query: string) => Promise<SearchHit[]>;
   jumpToMessage: (sessionId: string, messageId: string) => Promise<void>;
@@ -438,6 +462,63 @@ const TOOL_INTERRUPTED_CANCELLED =
   "Interrupted: the run was stopped before this tool returned a result.";
 const TOOL_INTERRUPTED_ERROR = "Interrupted: the run ended before this tool returned a result.";
 
+/** Patch exactly one assistant turn. A missing/legacy turn id is a no-op. */
+function patchTurnMessage(
+  messages: Record<string, Message[]>,
+  sessionId: string,
+  turnId: string | null | undefined,
+  fn: (message: Message) => Message,
+): Record<string, Message[]> {
+  if (!turnId) return messages;
+  const current = messages[sessionId];
+  if (!current) return messages;
+  const index = current.findIndex(
+    (message) =>
+      message.role === "assistant" && (message.turnId === turnId || message.id === turnId),
+  );
+  if (index < 0) return messages;
+  const updated = [...current];
+  updated[index] = fn(current[index]);
+  return { ...messages, [sessionId]: updated };
+}
+
+function findTurnMessage(
+  messages: Record<string, Message[]>,
+  sessionId: string,
+  turnId: string | null | undefined,
+): Message | undefined {
+  if (!turnId) return undefined;
+  return messages[sessionId]?.find(
+    (message) =>
+      message.role === "assistant" && (message.turnId === turnId || message.id === turnId),
+  );
+}
+
+/** Replace a provisional/local identity with the native turn_start identity. */
+function reconcileTurnMessage(
+  messages: Record<string, Message[]>,
+  sessionId: string,
+  previousTurnId: string | null | undefined,
+  turnId: string,
+  messageId: string,
+  startedAt: number,
+): Record<string, Message[]> {
+  const current = messages[sessionId];
+  if (!current) return messages;
+  const index = current.findIndex(
+    (message) =>
+      message.role === "assistant" &&
+      (message.turnId === previousTurnId ||
+        message.id === previousTurnId ||
+        message.turnId === turnId ||
+        message.id === messageId),
+  );
+  if (index < 0) return messages;
+  const updated = [...current];
+  updated[index] = { ...current[index], id: messageId, turnId, createdAt: startedAt };
+  return { ...messages, [sessionId]: updated };
+}
+
 // ToolCall derives `running` solely from an absent matching tool_result. Append one
 // explicit terminal result per unmatched use at every turn boundary so a cancelled
 // stream can never leave a permanently pulsing card. The existing block schema also
@@ -472,34 +553,138 @@ function latestPendingToolName(blocks: ContentBlock[]): string | null {
   return null;
 }
 
+const fallbackReceipt = (
+  st: AppState,
+  sessionId: string,
+  status: TurnStatus,
+  stopReason?: string,
+): TurnReceipt | null => {
+  const run = st.runs[runKey(sessionId)];
+  // Never fabricate metadata for historical/legacy rows. A fallback is valid only
+  // for a turn this client actually observed from optimistic send or turn_start.
+  if (!run?.turnId || run.startedAt === null) return null;
+  const completedAt = now();
+  return {
+    turnId: run.turnId,
+    status,
+    ...(stopReason ? { stopReason } : {}),
+    startedAt: run.startedAt,
+    completedAt,
+    durationMs: Math.max(0, completedAt - run.startedAt),
+    changedFiles: [],
+    changedFileCount: 0,
+    additions: 0,
+    deletions: 0,
+    filesTruncated: false,
+    changeCertainty: "unavailable",
+    backgroundTasksRunning: (st.backgroundTasks[sessionId] ?? []).some(
+      (task) => task.status === "running",
+    ),
+  };
+};
+
+const patchTerminalTurnMessage = (
+  messages: Record<string, Message[]>,
+  sessionId: string,
+  previousTurnId: string | null,
+  toolOutput: string,
+  receipt?: TurnReceipt,
+  terminalText?: string,
+): Record<string, Message[]> => {
+  let next = messages;
+  if (receipt && previousTurnId && receipt.turnId !== previousTurnId) {
+    next = reconcileTurnMessage(
+      next,
+      sessionId,
+      previousTurnId,
+      receipt.turnId,
+      receipt.turnId,
+      receipt.startedAt,
+    );
+  }
+  const turnId = receipt?.turnId ?? previousTurnId;
+  return patchTurnMessage(next, sessionId, turnId, (message) => {
+    const finalized = finalizePendingTools(message.blocks, toolOutput);
+    const blocks = terminalText ? appendText(finalized, terminalText) : finalized;
+    return {
+      ...message,
+      turnId: turnId ?? message.turnId,
+      blocks,
+      ...(receipt ? { receipt } : {}),
+    };
+  });
+};
+
 const terminalizeTurnState = (
   st: AppState,
   sessionId: string,
   toolOutput: string,
-  agentStatus: TerminalAgentStatus,
-): Pick<AppState, "messages" | "agents"> => ({
-  messages: patchLast(st.messages, sessionId, (blocks) => finalizePendingTools(blocks, toolOutput)),
-  agents: terminalizeRunningAgents(st.agents, sessionId, agentStatus),
-});
+  status: TurnStatus,
+  stopReason?: string,
+  nativeReceipt?: TurnReceipt,
+  terminalText?: string,
+): Pick<
+  AppState,
+  "messages" | "agents" | "runs" | "streaming" | "cancel" | "pendingPermission"
+> => {
+  const currentRun = st.runs[runKey(sessionId)] ?? EMPTY_RUN;
+  // A native terminal can race with the cancel invoke resolving. Never let the
+  // caller's subsequent optimistic fallback overwrite the authoritative receipt
+  // that already landed during that acknowledgement window.
+  const receipt =
+    nativeReceipt ?? currentRun.receipt ?? fallbackReceipt(st, sessionId, status, stopReason);
+  const turnId = receipt?.turnId ?? currentRun.turnId;
+  const messages = patchTerminalTurnMessage(
+    st.messages,
+    sessionId,
+    currentRun.turnId,
+    toolOutput,
+    receipt ?? undefined,
+    terminalText,
+  );
+  const agentStatus: TerminalAgentStatus =
+    status === "completed" ? "ok" : status === "cancelled" ? "cancelled" : "error";
+  return {
+    messages,
+    agents: terminalizeRunningAgents(st.agents, sessionId, agentStatus),
+    ...runPatch(st, sessionId, {
+      streaming: false,
+      cancel: null,
+      pendingPermission: null,
+      turnId,
+      startedAt: receipt?.startedAt ?? currentRun.startedAt,
+      finalizing: false,
+      receipt,
+      outcome: receipt?.status ?? status,
+    }),
+  };
+};
 
 const terminalizeAllRunningTurns = (
   st: AppState,
   toolOutput: string,
-  agentStatus: TerminalAgentStatus,
-): Pick<AppState, "messages" | "agents"> => {
+  status: TurnStatus,
+): Pick<
+  AppState,
+  "messages" | "agents" | "runs" | "streaming" | "cancel" | "pendingPermission"
+> => {
   const sessionIds = new Set(
     Object.entries(st.runs)
       .filter(([, run]) => run.streaming)
       .map(([sessionId]) => sessionId),
   );
   if (st.streaming && st.activeId) sessionIds.add(st.activeId);
-  let messages = st.messages;
-  let agents = st.agents;
+  let cursor = st;
   for (const sessionId of sessionIds) {
-    messages = patchLast(messages, sessionId, (blocks) => finalizePendingTools(blocks, toolOutput));
-    agents = terminalizeRunningAgents(agents, sessionId, agentStatus);
+    const terminal = terminalizeTurnState(cursor, sessionId, toolOutput, status);
+    cursor = { ...cursor, ...terminal };
   }
-  return { messages, agents };
+  return {
+    messages: cursor.messages,
+    agents: cursor.agents,
+    runs: cursor.runs,
+    ...projectActiveRun(cursor),
+  };
 };
 
 const bgStatus = (exitCode: number): BackgroundTaskStatus => (exitCode === 0 ? "ok" : "error");
@@ -629,6 +814,10 @@ export const teardownAllBackgroundListeners = (): void => {
 // otherwise silently no-op every later send). Kept above the backend's own idle
 // timeout so the backend's specific error wins in the normal stalled-network case.
 const TURN_IDLE_TIMEOUT_MS = 150_000;
+// cancel_agent acknowledges the abort request before the run has captured and
+// emitted its durable terminal receipt. Keep listening long enough for native
+// finalization, but bound the wait for legacy/mocked cores with no terminal event.
+const CANCEL_TERMINAL_GRACE_MS = 30_000;
 
 // Serialize model writes per session so two quick selections cannot reach SQLite
 // out of order (a slower first invoke completing last would otherwise survive reload).
@@ -651,6 +840,10 @@ const enqueueSessionModelWrite = (sessionId: string, model: string): Promise<voi
 // separate from `streaming` so the composer remains blocked until cancellation is
 // actually acknowledged (or fails visibly) instead of claiming the run stopped.
 const stopRequestedSessions = new Set<string>();
+// Marks production local cancel wrappers that retain their event listener for a
+// later native receipt. Restored/legacy callbacks are not in this set and keep the
+// old immediate fallback behavior.
+const receiptAwareCancels = new WeakSet<() => Promise<void>>();
 
 // Remote-turn idle watchdog (symmetric with the local one in send()). In remote
 // mode the turn runs on the desktop and only a desktop-originated live frame can
@@ -661,11 +854,19 @@ const stopRequestedSessions = new Set<string>();
 // frame handler, drop listener, stop(), and disconnect can all reset/clear it.
 let remoteWatchdog: ReturnType<typeof setInterval> | null = null;
 let remoteLastActivity = 0;
+let remoteCancelTerminalTimer: ReturnType<typeof setTimeout> | null = null;
 
 const clearRemoteWatchdog = (): void => {
   if (remoteWatchdog !== null) {
     clearInterval(remoteWatchdog);
     remoteWatchdog = null;
+  }
+};
+
+const clearRemoteCancelTerminalTimer = (): void => {
+  if (remoteCancelTerminalTimer !== null) {
+    clearTimeout(remoteCancelTerminalTimer);
+    remoteCancelTerminalTimer = null;
   }
 };
 
@@ -957,6 +1158,7 @@ export const useStore = create<AppState>((set, get) => ({
   sidebarCollapsed: readPref("pc.sidebarCollapsed"),
   showPalette: false,
   workspaceSurface: "chat",
+  reviewTarget: { kind: "workspace" },
   sortBy: readSort(),
   groupBy: readGroup(),
   folders: readJSON<SessionFolder[]>("pc.folders", []),
@@ -1461,19 +1663,29 @@ export const useStore = create<AppState>((set, get) => ({
     // turn's last tool before its first real event arrives.
     set({ composerPhase: "received", activeTool: null });
     armSettleTimer();
+    const provisionalTurnId = uid();
+    const optimisticStartedAt = now();
 
     // Remote mode: this device is the phone driving a paired desktop. Forward the
     // turn as a `run` command instead of running the local agent — the desktop is
-    // authoritative and its reply streams back as live frames (which build the
-    // assistant message). sendRemoteCommand already appends the optimistic user
-    // message, so we don't pre-create messages. We DO flip `streaming` optimistically
+    // authoritative and its reply streams back as live frames. sendRemoteCommand
+    // appends both the optimistic user row and a provisional assistant turn, so a
+    // terminal timeout/error has an exact target even before turn_start arrives.
+    // We DO flip `streaming` optimistically
     // (rather than waiting for the desktop's turn_start frame) to close the
     // double-submit window: the round-trip can be slow or dropped, and an enabled
     // composer would let a second Enter fire a duplicate `run`. Every terminal/drop
     // path (turn_end/error, the drop listener, the send catch, disconnectRemote)
     // already clears streaming:false, so the composer can't get stranded.
     if (get().remoteConnected) {
-      setRun(set, activeId, { streaming: true });
+      setRun(set, activeId, {
+        streaming: true,
+        turnId: provisionalTurnId,
+        startedAt: optimisticStartedAt,
+        finalizing: false,
+        receipt: null,
+        outcome: null,
+      });
       // Remote idle watchdog (symmetric with the local one below). The desktop is
       // authoritative, but if its agent dies/hangs without ever emitting
       // turn_end/error AND the channel stays up (no drop fires), nothing would clear
@@ -1500,22 +1712,18 @@ export const useStore = create<AppState>((set, get) => ({
         const sid = get().activeId;
         set((st) => ({
           ...(sid !== null
-            ? runPatch(st, sid, { streaming: false, pendingPermission: null })
+            ? terminalizeTurnState(
+                st,
+                sid,
+                TOOL_INTERRUPTED_ERROR,
+                "interrupted",
+                undefined,
+                undefined,
+                "\n\n**The desktop stopped responding (timed out).**",
+              )
             : projectActiveRun(st)),
-          ...(sid !== null
-            ? terminalizeTurnState(st, sid, TOOL_INTERRUPTED_ERROR, "error")
-            : { messages: st.messages, agents: st.agents }),
           composerPhase: "idle",
           activeTool: null,
-          messages:
-            sid !== null
-              ? patchLast(st.messages, sid, (b) =>
-                  appendText(
-                    finalizePendingTools(b, TOOL_INTERRUPTED_ERROR),
-                    "\n\n**The desktop stopped responding (timed out).**",
-                  ),
-                )
-              : st.messages,
         }));
       }, 1000);
       await get().sendRemoteCommand({ cmd: "run", session_id: activeId, text: body });
@@ -1529,10 +1737,11 @@ export const useStore = create<AppState>((set, get) => ({
       createdAt: now(),
     };
     const assistant: Message = {
-      id: uid(),
+      id: provisionalTurnId,
       role: "assistant",
       blocks: [],
-      createdAt: now(),
+      createdAt: optimisticStartedAt,
+      turnId: provisionalTurnId,
     };
 
     set((st) => {
@@ -1548,7 +1757,14 @@ export const useStore = create<AppState>((set, get) => ({
       );
       return {
         sessions,
-        ...runPatch(st, activeId, { streaming: true }),
+        ...runPatch(st, activeId, {
+          streaming: true,
+          turnId: provisionalTurnId,
+          startedAt: optimisticStartedAt,
+          finalizing: false,
+          receipt: null,
+          outcome: null,
+        }),
         messages: {
           ...st.messages,
           [activeId]: [...msgs, userMsg, assistant],
@@ -1559,13 +1775,14 @@ export const useStore = create<AppState>((set, get) => ({
     });
 
     const apply = (fn: (blocks: ContentBlock[]) => ContentBlock[]) =>
-      set((st) => {
-        const msgs = st.messages[activeId] ?? [];
-        const updated = msgs.map((m) =>
-          m.id === assistant.id ? { ...m, blocks: fn(m.blocks) } : m,
-        );
-        return { messages: { ...st.messages, [activeId]: updated } };
-      });
+      set((st) => ({
+        messages: patchTurnMessage(
+          st.messages,
+          activeId,
+          st.runs[runKey(activeId)]?.turnId ?? provisionalTurnId,
+          (message) => ({ ...message, blocks: fn(message.blocks) }),
+        ),
+      }));
 
     // A turn must ALWAYS reach a terminal state. The Rust core emits turn_end/error,
     // but if it ever hangs or dies silently nothing would clear `streaming` — and
@@ -1583,7 +1800,11 @@ export const useStore = create<AppState>((set, get) => ({
     let settled = false;
     let lastActivity = now();
     let watchdog: ReturnType<typeof setInterval> | null = null;
+    let cancelTerminalTimer: ReturnType<typeof setTimeout> | null = null;
     let watchdogCancelInFlight = false;
+    let awaitingCancelTerminal = false;
+    let observedTurnId = provisionalTurnId;
+    let nativeTurnIdKnown = false;
     // More than one tool_use can arrive in a single model turn. Track all live ids
     // so one fast result does not clear the presence label while a sibling tool is
     // still outstanding; the most recently announced pending tool wins the label.
@@ -1596,6 +1817,11 @@ export const useStore = create<AppState>((set, get) => ({
         clearInterval(watchdog);
         watchdog = null;
       }
+      if (cancelTerminalTimer !== null) {
+        clearTimeout(cancelTerminalTimer);
+        cancelTerminalTimer = null;
+      }
+      awaitingCancelTerminal = false;
       return true;
     };
 
@@ -1605,9 +1831,133 @@ export const useStore = create<AppState>((set, get) => ({
       run?.dispose();
     };
 
+    // cancel_agent returning means the abort was accepted, not that native has
+    // finished its Git snapshot and emitted TurnEnd/Error. Stop the idle watchdog
+    // while retaining the event listener for that authoritative receipt. Legacy
+    // cores and simple test mocks may emit nothing, so dispose after a bounded wait.
+    const awaitCancelledTerminal = (onGraceExpired: () => void) => {
+      if (settled) return;
+      awaitingCancelTerminal = true;
+      if (watchdog !== null) {
+        clearInterval(watchdog);
+        watchdog = null;
+      }
+      if (cancelTerminalTimer !== null) clearTimeout(cancelTerminalTimer);
+      cancelTerminalTimer = setTimeout(() => {
+        cancelTerminalTimer = null;
+        onGraceExpired();
+        settle();
+      }, CANCEL_TERMINAL_GRACE_MS);
+    };
+
+    const applyTerminalEvent = (
+      toolOutput: string,
+      status: TurnStatus,
+      stopReason: string | undefined,
+      receipt: TurnReceipt | undefined,
+      terminalText?: string,
+    ) => {
+      const eventTurnId = receipt?.turnId ?? observedTurnId;
+      const current = get().runs[myKey];
+      const supersededByNewTurn =
+        awaitingCancelTerminal &&
+        current?.streaming === true &&
+        current.turnId !== null &&
+        current.turnId !== eventTurnId;
+      stopRequestedSessions.delete(activeId);
+      pendingTools.clear();
+      settle();
+      if (supersededByNewTurn) {
+        // A quick follow-up turn started during the receipt grace window. Attach
+        // this terminal receipt to the cancelled turn only; never stop or relabel
+        // the newer run that now owns the session-level UI mirror.
+        set((st) => ({
+          messages: patchTerminalTurnMessage(
+            st.messages,
+            activeId,
+            observedTurnId,
+            toolOutput,
+            receipt,
+            terminalText,
+          ),
+        }));
+        return;
+      }
+      clearSettleTimer();
+      set((st) => ({
+        ...terminalizeTurnState(
+          st,
+          activeId,
+          toolOutput,
+          status,
+          stopReason,
+          receipt,
+          terminalText,
+        ),
+        composerPhase: "idle",
+        activeTool: null,
+      }));
+    };
+
+    const applyCancelGraceFallback = (
+      toolOutput: string,
+      status: "cancelled" | "interrupted",
+      stopReason?: string,
+      terminalText?: string,
+    ) => {
+      pendingTools.clear();
+      stopRequestedSessions.delete(activeId);
+      clearSettleTimer();
+      set((st) => ({
+        ...terminalizeTurnState(
+          st,
+          activeId,
+          toolOutput,
+          status,
+          stopReason,
+          undefined,
+          terminalText,
+        ),
+        composerPhase: "idle",
+        activeTool: null,
+      }));
+    };
+
     const onEvent = (e: StreamEvent) => {
+      // Once cancellation is acknowledged, only this turn's terminal receipt is
+      // relevant. Ignoring late deltas/turn_start also prevents this listener from
+      // touching a fast follow-up turn during the bounded receipt grace window.
+      if (awaitingCancelTerminal) {
+        if (e.type !== "turn_end" && e.type !== "error") return;
+        if (nativeTurnIdKnown && e.receipt && e.receipt.turnId !== observedTurnId) return;
+      }
       lastActivity = now();
       switch (e.type) {
+        case "turn_start": {
+          const currentRun = get().runs[runKey(activeId)] ?? EMPTY_RUN;
+          const turnId = e.turnId ?? e.messageId;
+          observedTurnId = turnId;
+          nativeTurnIdKnown = true;
+          const startedAt = e.startedAt ?? currentRun.startedAt ?? optimisticStartedAt;
+          set((st) => ({
+            ...runPatch(st, activeId, {
+              turnId,
+              startedAt,
+              finalizing: false,
+              receipt: null,
+              outcome: null,
+            }),
+            messages: reconcileTurnMessage(
+              st.messages,
+              activeId,
+              currentRun.turnId ?? provisionalTurnId,
+              turnId,
+              e.messageId,
+              startedAt,
+            ),
+          }));
+          break;
+        }
         case "text_delta":
           // First real byte settles the receipt into "thinking with you…" (and
           // cancels the fallback timer). Only advance from "received" so a Stop
@@ -1671,44 +2021,21 @@ export const useStore = create<AppState>((set, get) => ({
           });
           break;
         case "error":
-          stopRequestedSessions.delete(activeId);
-          apply((blocks) =>
-            appendText(
-              finalizePendingTools(blocks, TOOL_INTERRUPTED_ERROR),
-              `\n\n**Error:** ${e.message}`,
-            ),
+          applyTerminalEvent(
+            TOOL_INTERRUPTED_ERROR,
+            e.receipt?.status ?? "error",
+            e.receipt?.stopReason,
+            e.receipt,
+            `\n\n**Error:** ${e.message}`,
           );
-          pendingTools.clear();
-          settle();
-          clearSettleTimer();
-          setRun(set, activeId, { streaming: false, cancel: null, pendingPermission: null });
-          set((st) => ({
-            composerPhase: "idle",
-            activeTool: null,
-            agents: terminalizeRunningAgents(st.agents, activeId, "error"),
-          }));
           break;
         case "turn_end":
-          stopRequestedSessions.delete(activeId);
-          apply((blocks) =>
-            finalizePendingTools(
-              blocks,
-              e.stopReason === "cancelled" ? TOOL_INTERRUPTED_CANCELLED : TOOL_INTERRUPTED_ERROR,
-            ),
+          applyTerminalEvent(
+            e.stopReason === "cancelled" ? TOOL_INTERRUPTED_CANCELLED : TOOL_INTERRUPTED_ERROR,
+            e.receipt?.status ?? (e.stopReason === "cancelled" ? "cancelled" : "completed"),
+            e.stopReason,
+            e.receipt,
           );
-          pendingTools.clear();
-          settle();
-          clearSettleTimer();
-          setRun(set, activeId, { streaming: false, cancel: null, pendingPermission: null });
-          set((st) => ({
-            composerPhase: "idle",
-            activeTool: null,
-            agents: terminalizeRunningAgents(
-              st.agents,
-              activeId,
-              e.stopReason === "cancelled" ? "cancelled" : "ok",
-            ),
-          }));
           break;
         case "agent_started":
         case "agent_progress":
@@ -1732,22 +2059,28 @@ export const useStore = create<AppState>((set, get) => ({
       // timed-out run stopped. A rejected invoke keeps streaming locked and visible.
       if (run === null) {
         stopRequestedSessions.add(activeId);
+        setRun(set, activeId, { finalizing: true });
         set({ composerPhase: "stopping" });
         return;
       }
       watchdogCancelInFlight = true;
+      setRun(set, activeId, { finalizing: true });
       void run
         .cancel()
         .then(() => {
-          markSettled(); // run.cancel disposed the listener after acknowledgement
-          onEvent({
-            type: "error",
-            message: "The agent stopped responding (timed out). Please try again.",
-          });
+          awaitCancelledTerminal(() =>
+            applyCancelGraceFallback(
+              TOOL_INTERRUPTED_ERROR,
+              "interrupted",
+              undefined,
+              "\n\n**Error:** The agent stopped responding (timed out). Please try again.",
+            ),
+          );
         })
         .catch((err) => {
           watchdogCancelInFlight = false;
           lastActivity = now();
+          setRun(set, activeId, { finalizing: false });
           apply((blocks) =>
             appendText(
               blocks,
@@ -1766,9 +2099,11 @@ export const useStore = create<AppState>((set, get) => ({
       run = handle;
       const cancelRun = async () => {
         await handle.cancel();
-        // handle.cancel unsubscribes only after cancel_agent is acknowledged.
-        markSettled();
+        awaitCancelledTerminal(() =>
+          applyCancelGraceFallback(TOOL_INTERRUPTED_CANCELLED, "cancelled", "cancelled"),
+        );
       };
+      receiptAwareCancels.add(cancelRun);
       if (settled) {
         // A terminal event (or the watchdog) settled the turn before the handle
         // resolved. settle() already ran with run===null (a no-op), so the now-resolved
@@ -1776,12 +2111,9 @@ export const useStore = create<AppState>((set, get) => ({
         // any backend cancel it needed, so just dispose — no spurious cancel_agent.
         handle.dispose();
       } else if (stopRequestedSessions.has(activeId)) {
-        // The turn isn't settled, but streaming already flipped false — the user
-        // pressed Stop DURING the await window, when the cancel handle was still null
-        // so stop() couldn't abort the backend. Honor that Stop authoritatively now:
-        // settle(true) cancels the still-pending backend turn (cancel_agent) AND
-        // disposes the listener, so no further deltas can fold in and no stale Stop is
-        // re-armed.
+        // The user pressed Stop while runAgent was still awaiting its handle, so
+        // stop() could mark finalization but could not yet reach the backend. Send
+        // the deferred cancel now and keep the listener until the terminal receipt.
         try {
           await cancelRun();
         } catch (err) {
@@ -1789,7 +2121,7 @@ export const useStore = create<AppState>((set, get) => ({
           lastActivity = now();
           // Cancellation was not acknowledged. Keep streaming + listener + watchdog
           // live, arm Stop for a retry, and state the uncertainty in the transcript.
-          setRun(set, activeId, { cancel: cancelRun });
+          setRun(set, activeId, { cancel: cancelRun, finalizing: false });
           apply((blocks) =>
             appendText(
               blocks,
@@ -1799,22 +2131,9 @@ export const useStore = create<AppState>((set, get) => ({
           set({ composerPhase: "thinking" });
           return;
         }
-        stopRequestedSessions.delete(activeId);
-        // Stop may have landed while runAgent was still awaiting its cancel handle.
-        // The listener stayed alive during that gap, so close any tool/agent state
-        // that arrived after stop()'s first terminalization pass.
-        apply((blocks) => finalizePendingTools(blocks, TOOL_INTERRUPTED_CANCELLED));
-        pendingTools.clear();
-        set((st) => ({
-          ...runPatch(st, activeId, {
-            streaming: false,
-            cancel: null,
-            pendingPermission: null,
-          }),
-          activeTool: null,
-          composerPhase: "idle",
-          agents: terminalizeRunningAgents(st.agents, activeId, "cancelled"),
-        }));
+        // Cancellation is acknowledged, but native still has to capture and emit
+        // the durable terminal receipt. Keep streaming/finalizing locked until that
+        // event arrives or the bounded grace fallback above expires.
       } else {
         // Stop aborts the run AND clears this turn's watchdog (owned by this closure).
         setRun(set, activeId, {
@@ -1836,20 +2155,57 @@ export const useStore = create<AppState>((set, get) => ({
       set({ composerPhase: "idle" });
       return;
     }
+    // A prior Stop is already acknowledged and waiting for its native terminal
+    // receipt. Do not send duplicate cancel commands or reset the grace handshake.
+    if (get().runs[runKey(activeId)]?.finalizing) return;
     stopRequestedSessions.add(activeId);
+    // Older restored/test state may have only the active-run mirror populated. Seed
+    // the per-session source of truth from the observed assistant before patching it,
+    // so Stop never clears its own cancel handle while marking finalization.
+    set((st) => {
+      const existing = st.runs[runKey(activeId)];
+      if (existing) return runPatch(st, activeId, { finalizing: true });
+      const assistant = [...(st.messages[activeId] ?? [])]
+        .reverse()
+        .find((message) => message.role === "assistant");
+      return runPatch(st, activeId, {
+        streaming: st.streaming,
+        cancel: st.cancel,
+        pendingPermission: st.pendingPermission,
+        turnId: assistant?.turnId ?? assistant?.id ?? null,
+        startedAt: assistant?.createdAt ?? null,
+        finalizing: true,
+      });
+    });
     // Remote mode: the turn runs on the desktop, so stop it with a Cancel command
     // over the link (there is no local `cancel` handle on the phone).
     if (get().remoteConnected) {
       clearRemoteWatchdog(); // the turn is over — stop the idle watchdog
+      const cancelledTurnId = get().runs[runKey(activeId)]?.turnId ?? null;
       if (activeId) await get().sendRemoteCommand({ cmd: "cancel", session_id: activeId });
       stopRequestedSessions.delete(activeId);
       if (get().remoteDropped) return;
-      set((st) => ({
-        ...terminalizeTurnState(st, activeId, TOOL_INTERRUPTED_CANCELLED, "cancelled"),
-        activeTool: null,
-      }));
-      patchActiveRun(set, get, { streaming: false, pendingPermission: null });
-      set({ composerPhase: "idle" });
+      const current = get().runs[runKey(activeId)];
+      if (!current?.streaming || current.turnId !== cancelledTurnId) return;
+      clearRemoteCancelTerminalTimer();
+      remoteCancelTerminalTimer = setTimeout(() => {
+        remoteCancelTerminalTimer = null;
+        set((st) => {
+          const run = st.runs[runKey(activeId)];
+          if (!run?.streaming || run.turnId !== cancelledTurnId) return {};
+          return {
+            ...terminalizeTurnState(
+              st,
+              activeId,
+              TOOL_INTERRUPTED_CANCELLED,
+              "cancelled",
+              "cancelled",
+            ),
+            activeTool: null,
+            composerPhase: "idle" as const,
+          };
+        });
+      }, CANCEL_TERMINAL_GRACE_MS);
       return;
     }
     const c = get().cancel;
@@ -1859,22 +2215,33 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       await c();
       stopRequestedSessions.delete(activeId);
+      // Production local runs retain their listener for the native receipt and
+      // keep the composer locked until it arrives (or their grace timer expires).
+      // The fallback below is only for restored/legacy state with an opaque cancel
+      // callback that cannot participate in that handshake.
+      if (receiptAwareCancels.has(c)) return;
       set((st) => ({
-        ...terminalizeTurnState(st, activeId, TOOL_INTERRUPTED_CANCELLED, "cancelled"),
+        ...terminalizeTurnState(st, activeId, TOOL_INTERRUPTED_CANCELLED, "cancelled", "cancelled"),
         activeTool: null,
       }));
-      patchActiveRun(set, get, { streaming: false, cancel: null, pendingPermission: null });
       set({ composerPhase: "idle" });
     } catch (err) {
       stopRequestedSessions.delete(activeId);
+      setRun(set, activeId, { finalizing: false });
       // The backend may still be executing. Retain the cancel handle + streaming
       // lock, keep listening for a real terminal event, and make uncertainty visible.
       set((st) => ({
-        messages: patchLast(st.messages, activeId, (blocks) =>
-          appendText(
-            blocks,
-            `\n\n**Stop could not be confirmed:** ${errMessage(err)}. The agent may still be running.`,
-          ),
+        messages: patchTurnMessage(
+          st.messages,
+          activeId,
+          st.runs[runKey(activeId)]?.turnId,
+          (message) => ({
+            ...message,
+            blocks: appendText(
+              message.blocks,
+              `\n\n**Stop could not be confirmed:** ${errMessage(err)}. The agent may still be running.`,
+            ),
+          }),
         ),
         composerPhase: "thinking",
       }));
@@ -1948,6 +2315,14 @@ export const useStore = create<AppState>((set, get) => ({
 
   setWorkspaceSurface(v) {
     set({ workspaceSurface: v });
+  },
+
+  openWorkspaceReview() {
+    set({ reviewTarget: { kind: "workspace" }, workspaceSurface: "review" });
+  },
+
+  openTurnReview(turnId) {
+    set({ reviewTarget: { kind: "turn", turnId }, workspaceSurface: "review" });
   },
 
   setAmbientRain(v) {
@@ -2378,6 +2753,7 @@ export const useStore = create<AppState>((set, get) => ({
   // tear the session down exactly like disconnectRemote and mark the pairing rejected
   // so the UI shows a distinct "rejected" notice rather than the generic pair screen.
   async rejectRemoteSas() {
+    clearRemoteCancelTerminalTimer();
     clearRemoteWatchdog(); // user-initiated teardown — the turn is over
     const wasConnected = get().remoteConnected;
     const unlisten = get().remoteUnlisten;
@@ -2449,7 +2825,7 @@ export const useStore = create<AppState>((set, get) => ({
           return {
             // Catch-up is authoritative for this session: REPLACE its message list.
             // This is what reconciles any optimistic user message we appended.
-            messages: { ...st.messages, [frame.session_id]: frame.messages.map(rowToMessage) },
+            messages: { ...st.messages, [frame.session_id]: rowsToMessages(frame.messages) },
             messagePaging: { ...st.messagePaging, [frame.session_id]: paging },
             activeId,
             ...projectActiveRun({ activeId, runs: st.runs }),
@@ -2490,6 +2866,7 @@ export const useStore = create<AppState>((set, get) => ({
         applyRemoteEvent(set, frame.session_id, frame.event);
         break;
       case "pairing_reject": {
+        clearRemoteCancelTerminalTimer();
         // The desktop declined the pairing (the REACT direction: the desktop user
         // rejected the SAS). The phone must stop — drop the session and show the
         // "rejected on the other device" notice. Tear down like a disconnect: clear
@@ -2605,6 +2982,7 @@ export const useStore = create<AppState>((set, get) => ({
       // the UI can leave the dead session and offer a reconnect. A user-initiated
       // disconnect tears this listener down first, so it can't misfire as a drop.
       unlistenDrop = await ipc.onPhoneSyncDisconnected(() => {
+        clearRemoteCancelTerminalTimer();
         // The turn is dead when the channel drops — clear turn state too, not just
         // connection flags, so neither the interim nor the reconnected session is
         // stuck on a stale `streaming`/`pendingPermission`.
@@ -2673,10 +3051,11 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async sendRemoteCommand(command) {
-    // Optimistic echo for `run`: show the user's message immediately. The
-    // desktop's authoritative message_delta catch-up later REPLACES this
-    // session's list, reconciling the optimistic row (no duplicate). Other
-    // commands have nothing to echo locally.
+    // Optimistic echo for `run`: show the user's message immediately and, when
+    // send() has already seeded a provisional run identity, create its assistant
+    // row too. That row gives pre-turn_start terminal paths (watchdog/link drop) an
+    // exact message to receipt. Authoritative turn_start reconciles the provisional
+    // identity; message_delta catch-up later replaces the whole list.
     if (command.cmd === "run") {
       const { session_id, text } = command;
       const userMsg: Message = {
@@ -2685,12 +3064,29 @@ export const useStore = create<AppState>((set, get) => ({
         blocks: [{ kind: "text", text }],
         createdAt: now(),
       };
-      set((st) => ({
-        messages: {
-          ...st.messages,
-          [session_id]: [...(st.messages[session_id] ?? []), userMsg],
-        },
-      }));
+      set((st) => {
+        const run = st.runs[runKey(session_id)];
+        const assistant: Message | null =
+          run?.streaming && run.turnId
+            ? {
+                id: run.turnId,
+                role: "assistant",
+                blocks: [],
+                createdAt: run.startedAt ?? now(),
+                turnId: run.turnId,
+              }
+            : null;
+        return {
+          messages: {
+            ...st.messages,
+            [session_id]: [
+              ...(st.messages[session_id] ?? []),
+              userMsg,
+              ...(assistant ? [assistant] : []),
+            ],
+          },
+        };
+      });
     }
     // The channel often drops between frames (Android kills backgrounded apps).
     // Callers swallow the rejection (`void send`/`stop`), so a dropped link would
@@ -2708,6 +3104,7 @@ export const useStore = create<AppState>((set, get) => ({
         }));
       }
       clearRemoteWatchdog(); // the turn can't proceed on a dropped link
+      clearRemoteCancelTerminalTimer();
       clearSettleTimer();
       set((st) => ({
         ...terminalizeAllRunningTurns(st, TOOL_INTERRUPTED_ERROR, "error"),
@@ -2762,6 +3159,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async disconnectRemote() {
+    clearRemoteCancelTerminalTimer();
     clearRemoteWatchdog(); // user-initiated teardown — the turn is over
     clearSettleTimer();
     const unlisten = get().remoteUnlisten;
@@ -3000,19 +3398,119 @@ function rowToMessage(r: MessageRow): Message {
   const blocks = r.content.filter(
     (block): block is ContentBlock => !("type" in block && block.type === "reasoning"),
   );
-  return { id: r.id, role: r.role, blocks, createdAt: r.createdAt };
+  return {
+    id: r.id,
+    role: r.role,
+    blocks,
+    createdAt: r.createdAt,
+    ...(r.turnId ? { turnId: r.turnId } : {}),
+    ...(r.receipt ? { receipt: r.receipt } : {}),
+  };
 }
 
 // Prepend an OLDER page of catch-up rows ahead of the held messages, deduping by id
 // (so a page that overlaps what we already hold can't double a message) and keeping
 // the result in ascending order — the page is older, so it goes in front. Used by
 // the `message_page` (scroll-up pagination) path; never replaces, only extends back.
+/** Fold flat Phone Sync rows into the desktop's turn-shaped message view. */
+function rowsToMessages(rows: MessageRow[]): Message[] {
+  const out: Message[] = [];
+  const turnAssistants = new Map<string, number>();
+  const ensureTurnAssistant = (row: MessageRow): Message => {
+    const turnId = row.turnId!;
+    const existing = turnAssistants.get(turnId);
+    if (existing !== undefined) {
+      if (!out[existing].receipt && row.receipt) {
+        out[existing] = { ...out[existing], receipt: row.receipt };
+      }
+      return out[existing];
+    }
+    const index = out.length;
+    const assistant: Message = {
+      id: turnId,
+      role: "assistant",
+      blocks: [],
+      createdAt: row.receipt?.startedAt ?? row.createdAt,
+      turnId,
+      ...(row.receipt ? { receipt: row.receipt } : {}),
+    };
+    out.push(assistant);
+    turnAssistants.set(turnId, index);
+    return assistant;
+  };
+
+  for (const row of rows) {
+    if (!row.turnId) {
+      out.push(rowToMessage(row));
+      continue;
+    }
+    const blocks = row.content.filter(
+      (block): block is ContentBlock => !("type" in block && block.type === "reasoning"),
+    );
+    if (row.role === "assistant") {
+      ensureTurnAssistant(row).blocks.push(...blocks);
+      continue;
+    }
+
+    const texts = blocks.filter((block) => block.kind === "text");
+    if (texts.length > 0) {
+      out.push({
+        id: row.id,
+        role: "user",
+        blocks: texts,
+        createdAt: row.createdAt,
+        turnId: row.turnId,
+      });
+    }
+    const toolResults = blocks.filter((block) => block.kind === "tool_result");
+    if (toolResults.length > 0 || row.receipt) {
+      ensureTurnAssistant(row).blocks.push(...toolResults);
+    }
+  }
+  return finalizeReceiptedTurns(out);
+}
+
+const finalizeReceiptedTurns = (messages: Message[]): Message[] =>
+  messages.map((message) =>
+    message.role === "assistant" && message.receipt
+      ? { ...message, blocks: finalizePendingTools(message.blocks, TOOL_INTERRUPTED_ERROR) }
+      : message,
+  );
+
 function prependMessages(existing: Message[], older: MessageRow[]): Message[] {
   if (older.length === 0) return existing;
-  const held = new Set(existing.map((m) => m.id));
-  const prefix = older.filter((r) => !held.has(r.id)).map(rowToMessage);
-  if (prefix.length === 0) return existing;
-  return [...prefix, ...existing];
+  const merged = rowsToMessages(older);
+  const heldIds = new Set(merged.map((message) => message.id));
+  const turnIndices = new Map<string, number>();
+  merged.forEach((message, index) => {
+    if (message.role === "assistant" && message.turnId) turnIndices.set(message.turnId, index);
+  });
+
+  for (const message of existing) {
+    const turnIndex =
+      message.role === "assistant" && message.turnId ? turnIndices.get(message.turnId) : undefined;
+    if (turnIndex !== undefined) {
+      const olderTurn = merged[turnIndex];
+      merged[turnIndex] = {
+        ...olderTurn,
+        blocks: [...olderTurn.blocks, ...message.blocks],
+        createdAt: Math.min(olderTurn.createdAt, message.createdAt),
+        ...(message.receipt
+          ? { receipt: message.receipt }
+          : olderTurn.receipt
+            ? { receipt: olderTurn.receipt }
+            : {}),
+      };
+      continue;
+    }
+    if (heldIds.has(message.id)) continue;
+    heldIds.add(message.id);
+    if (message.role === "assistant" && message.turnId) {
+      turnIndices.set(message.turnId, merged.length);
+    }
+    merged.push(message);
+  }
+  return finalizeReceiptedTurns(merged);
 }
 
 // Apply fn to the LAST message of a session, immutably. No-op when the session
@@ -3055,22 +3553,56 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       set(() => ({ composerPhase: "thinking" }));
     }
   };
+  const supersededTerminal = (receipt: TurnReceipt | undefined): boolean => {
+    if (!receipt) return false;
+    const st = useStore.getState();
+    const current = st.runs[runKey(sessionId)];
+    return Boolean(
+      current?.turnId &&
+      current.turnId !== receipt.turnId &&
+      findTurnMessage(st.messages, sessionId, receipt.turnId),
+    );
+  };
   switch (e.type) {
     case "turn_start":
       set((st) => {
-        const msgs = st.messages[sessionId] ?? [];
-        const assistant: Message = {
-          id: e.messageId,
-          role: "assistant",
-          blocks: [],
-          createdAt: now(),
-        };
+        const previous = st.runs[runKey(sessionId)] ?? EMPTY_RUN;
+        const turnId = e.turnId ?? e.messageId;
+        const startedAt = e.startedAt ?? previous.startedAt ?? now();
+        let messages = reconcileTurnMessage(
+          st.messages,
+          sessionId,
+          previous.turnId,
+          turnId,
+          e.messageId,
+          startedAt,
+        );
+        if (!findTurnMessage(messages, sessionId, turnId)) {
+          const assistant: Message = {
+            id: e.messageId,
+            role: "assistant",
+            blocks: [],
+            createdAt: startedAt,
+            turnId,
+          };
+          messages = {
+            ...messages,
+            [sessionId]: [...(messages[sessionId] ?? []), assistant],
+          };
+        }
         return {
           // Mark this session's run streaming; the mirror surfaces it only when the
           // session is active (runPatch re-projects), so a background run is now
           // representable without flipping the visible composer.
-          ...runPatch(st, sessionId, { streaming: true }),
-          messages: { ...st.messages, [sessionId]: [...msgs, assistant] },
+          ...runPatch(st, sessionId, {
+            streaming: true,
+            turnId,
+            startedAt,
+            finalizing: false,
+            receipt: null,
+            outcome: null,
+          }),
+          messages,
           // Each turn's agents panel starts empty. The desktop clears it in send();
           // the phone has no local send() for the turn (the desktop drives it), so
           // turn_start — the per-turn boundary where the assistant bubble is created
@@ -3083,7 +3615,12 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
     case "text_delta":
       settleActivePresence();
       set((st) => ({
-        messages: patchLast(st.messages, sessionId, (b) => appendText(b, e.text)),
+        messages: patchTurnMessage(
+          st.messages,
+          sessionId,
+          st.runs[runKey(sessionId)]?.turnId,
+          (message) => ({ ...message, blocks: appendText(message.blocks, e.text) }),
+        ),
       }));
       break;
     case "tool_use":
@@ -3092,23 +3629,34 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       // session's tool must not show on screen (mirrors the presence settle).
       if (useStore.getState().activeId === sessionId) set(() => ({ activeTool: e.name }));
       set((st) => ({
-        messages: patchLast(st.messages, sessionId, (b) => [
-          ...b,
-          { kind: "tool_use", id: e.id, name: e.name, input: e.input },
-        ]),
+        messages: patchTurnMessage(
+          st.messages,
+          sessionId,
+          st.runs[runKey(sessionId)]?.turnId,
+          (message) => ({
+            ...message,
+            blocks: [
+              ...message.blocks,
+              { kind: "tool_use", id: e.id, name: e.name, input: e.input },
+            ],
+          }),
+        ),
       }));
       break;
     case "tool_result":
       set((st) => {
-        const messages = patchLast(st.messages, sessionId, (b) => [
-          ...b,
-          { kind: "tool_result", toolUseId: e.id, output: e.output, isError: e.isError },
-        ]);
-        const sessionMessages = messages[sessionId] ?? [];
-        const lastBlocks = sessionMessages[sessionMessages.length - 1]?.blocks ?? [];
+        const turnId = st.runs[runKey(sessionId)]?.turnId;
+        const messages = patchTurnMessage(st.messages, sessionId, turnId, (message) => ({
+          ...message,
+          blocks: [
+            ...message.blocks,
+            { kind: "tool_result", toolUseId: e.id, output: e.output, isError: e.isError },
+          ],
+        }));
+        const turnBlocks = findTurnMessage(messages, sessionId, turnId)?.blocks ?? [];
         return {
           messages,
-          ...(st.activeId === sessionId ? { activeTool: latestPendingToolName(lastBlocks) } : {}),
+          ...(st.activeId === sessionId ? { activeTool: latestPendingToolName(turnBlocks) } : {}),
         };
       });
       break;
@@ -3140,44 +3688,73 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
         };
       });
       break;
-    case "error":
+    case "error": {
+      if (supersededTerminal(e.receipt)) {
+        set((st) => ({
+          messages: patchTerminalTurnMessage(
+            st.messages,
+            sessionId,
+            e.receipt!.turnId,
+            TOOL_INTERRUPTED_ERROR,
+            e.receipt,
+            `\n\n**Error:** ${e.message}`,
+          ),
+        }));
+        break;
+      }
       // A terminal frame for the active session ends the turn — stop the remote idle
       // watchdog (it self-clears on its next tick once streaming is false, but clear
       // it eagerly so it can't fire a spurious timeout in the meantime).
       if (useStore.getState().activeId === sessionId) {
         clearRemoteWatchdog();
+        clearRemoteCancelTerminalTimer();
         clearSettleTimer();
       }
       set((st) => ({
-        messages: patchLast(st.messages, sessionId, (b) =>
-          appendText(
-            finalizePendingTools(b, TOOL_INTERRUPTED_ERROR),
-            `\n\n**Error:** ${e.message}`,
-          ),
+        ...terminalizeTurnState(
+          st,
+          sessionId,
+          TOOL_INTERRUPTED_ERROR,
+          e.receipt?.status ?? "error",
+          e.receipt?.stopReason,
+          e.receipt,
+          `\n\n**Error:** ${e.message}`,
         ),
-        agents: terminalizeRunningAgents(st.agents, sessionId, "error"),
-        // End this session's run (per-run state + the active-session mirror). Reset
-        // the composer presence only when this is the active session.
-        ...runPatch(st, sessionId, { streaming: false, pendingPermission: null }),
         ...(st.activeId === sessionId ? { composerPhase: "idle" as const, activeTool: null } : {}),
       }));
       break;
-    case "turn_end":
+    }
+    case "turn_end": {
+      if (supersededTerminal(e.receipt)) {
+        set((st) => ({
+          messages: patchTerminalTurnMessage(
+            st.messages,
+            sessionId,
+            e.receipt!.turnId,
+            e.stopReason === "cancelled" ? TOOL_INTERRUPTED_CANCELLED : TOOL_INTERRUPTED_ERROR,
+            e.receipt,
+          ),
+        }));
+        break;
+      }
       if (useStore.getState().activeId === sessionId) {
         clearRemoteWatchdog();
+        clearRemoteCancelTerminalTimer();
         clearSettleTimer();
       }
       set((st) => ({
-        ...runPatch(st, sessionId, { streaming: false, pendingPermission: null }),
         ...terminalizeTurnState(
           st,
           sessionId,
           e.stopReason === "cancelled" ? TOOL_INTERRUPTED_CANCELLED : TOOL_INTERRUPTED_ERROR,
-          e.stopReason === "cancelled" ? "cancelled" : "ok",
+          e.receipt?.status ?? (e.stopReason === "cancelled" ? "cancelled" : "completed"),
+          e.stopReason,
+          e.receipt,
         ),
         ...(st.activeId === sessionId ? { composerPhase: "idle" as const, activeTool: null } : {}),
       }));
       break;
+    }
     case "agent_started":
     case "agent_progress":
     case "agent_finished":

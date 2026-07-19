@@ -4,6 +4,7 @@
 //! `ui_messages` reconstructs the frontend's *grouped* view, where tool results
 //! are folded back under the assistant message that requested them.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::llm::{Block, ChatMessage};
+use portcode_sync::wire::{TurnChangeCertainty, TurnReceipt, TurnStatus};
 
 /// How many of the most-recent messages per session the desktop ships in a single
 /// catch-up [`SyncFrame::MessageDelta`](crate::sync::protocol::SyncFrame). Bounds
@@ -147,6 +149,22 @@ pub struct UiMessage {
     role: String,
     blocks: Vec<UiBlock>,
     created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<TurnReceipt>,
+}
+
+/// Durable receipt plus the terminal Git identity used by the historical Review
+/// commands. The changed-file manifest lives inside `receipt`; patches are never
+/// regenerated from a different workspace state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnReceiptRecord {
+    pub session_id: String,
+    pub message_id: String,
+    pub receipt: TurnReceipt,
+    pub repository_root: Option<String>,
+    pub terminal_snapshot_id: Option<String>,
 }
 
 fn to_ui_block(b: &Block) -> Option<UiBlock> {
@@ -202,6 +220,32 @@ fn finalize_unmatched_ui_tools(blocks: &mut Vec<UiBlock>) {
                 is_error: true,
             }),
     );
+}
+
+fn ensure_turn_assistant(
+    out: &mut Vec<UiMessage>,
+    indices: &mut HashMap<String, usize>,
+    turn_id: &str,
+    created_at: i64,
+    receipt: Option<&TurnReceipt>,
+) -> usize {
+    if let Some(index) = indices.get(turn_id) {
+        if out[*index].receipt.is_none() {
+            out[*index].receipt = receipt.cloned();
+        }
+        return *index;
+    }
+    let index = out.len();
+    out.push(UiMessage {
+        id: turn_id.to_string(),
+        role: "assistant".into(),
+        blocks: Vec::new(),
+        created_at,
+        turn_id: Some(turn_id.to_string()),
+        receipt: receipt.cloned(),
+    });
+    indices.insert(turn_id.to_string(), index);
+    index
 }
 
 /// Escape LIKE wildcards so a literal query matches literally under
@@ -267,6 +311,10 @@ fn row_to_message(r: &rusqlite::Row) -> rusqlite::Result<MessageRow> {
         role: r.get(3)?,
         content: blocks,
         created_at: r.get(5)?,
+        turn_id: r.get(6)?,
+        receipt: r
+            .get::<_, Option<String>>(7)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
     })
 }
 
@@ -297,7 +345,8 @@ impl Db {
                 seq INTEGER NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                turn_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
             CREATE TABLE IF NOT EXISTS paired_devices (
@@ -325,6 +374,17 @@ impl Db {
                 input INTEGER NOT NULL DEFAULT 0,
                 output INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS turn_receipts (
+                turn_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                receipt_json TEXT NOT NULL,
+                repository_root TEXT,
+                terminal_snapshot_id TEXT,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER NOT NULL,
+                terminal INTEGER NOT NULL DEFAULT 0
             );",
         )?;
         // Migrate pre-existing databases: the CREATE-IF-NOT-EXISTS above won't add
@@ -343,6 +403,14 @@ impl Db {
         // probe `PRAGMA table_info` first and only add when missing (keeping
         // startup idempotent across launches).
         Self::migrate_add_confirmed(&conn)?;
+        Self::migrate_add_turn_id(&conn)?;
+        Self::migrate_add_receipt_terminal(&conn)?;
+        Self::recover_pending_turn_receipts(&conn, now_ms())?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_turn_receipts_session
+             ON turn_receipts(session_id, started_at)",
+            [],
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -375,6 +443,84 @@ impl Db {
             conn.execute(
                 "ALTER TABLE paired_devices ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0",
                 [],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Additive receipt migration. NULL identifies legacy rows and deliberately
+    /// preserves their historical grouping behavior.
+    fn migrate_add_turn_id(conn: &Connection) -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
+        let has_turn_id = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(|column| column.ok())
+            .any(|name| name == "turn_id");
+        if !has_turn_id {
+            conn.execute("ALTER TABLE messages ADD COLUMN turn_id TEXT", [])?;
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_turn ON messages(turn_id, seq)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Earlier receipt builds had no explicit pending state and every stored row
+    /// was terminal. Preserve those rows as terminal during the additive migration;
+    /// new pending writes always set `terminal = 0` explicitly.
+    fn migrate_add_receipt_terminal(conn: &Connection) -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(turn_receipts)")?;
+        let has_terminal = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|column| column.ok())
+            .any(|name| name == "terminal");
+        if !has_terminal {
+            conn.execute(
+                "ALTER TABLE turn_receipts
+                 ADD COLUMN terminal INTEGER NOT NULL DEFAULT 1",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Terminalize rows left pending by a prior process. The interruption instant
+    /// is unknowable, so duration remains omitted; `completed_at` records recovery
+    /// time, not a fabricated crash time.
+    fn recover_pending_turn_receipts(conn: &Connection, recovered_at: i64) -> rusqlite::Result<()> {
+        let pending: Vec<(String, String)> = {
+            let mut stmt =
+                conn.prepare("SELECT turn_id, receipt_json FROM turn_receipts WHERE terminal = 0")?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|row| row.ok())
+                .collect();
+            rows
+        };
+        for (turn_id, json) in pending {
+            let Ok(mut receipt) = serde_json::from_str::<TurnReceipt>(&json) else {
+                // A corrupt pending row must not retry forever or leak through a
+                // future join. Mark it terminal; typed reads will continue to hide it.
+                conn.execute(
+                    "UPDATE turn_receipts SET terminal = 1 WHERE turn_id = ?1",
+                    params![turn_id],
+                )?;
+                continue;
+            };
+            receipt.status = TurnStatus::Interrupted;
+            receipt.stop_reason = Some("process_interrupted".into());
+            receipt.completed_at = recovered_at.max(receipt.started_at);
+            receipt.duration_ms = None;
+            receipt.change_certainty = TurnChangeCertainty::Unavailable;
+            receipt.background_tasks_running = false;
+            let recovered_json = serde_json::to_string(&receipt)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            conn.execute(
+                "UPDATE turn_receipts
+                 SET receipt_json = ?2, completed_at = ?3, terminal = 1
+                 WHERE turn_id = ?1",
+                params![turn_id, recovered_json, receipt.completed_at],
             )?;
         }
         Ok(())
@@ -473,6 +619,10 @@ impl Db {
     pub fn delete_session(&self, id: &str) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
+        conn.execute(
+            "DELETE FROM turn_receipts WHERE session_id = ?1",
+            params![id],
+        )?;
         // Drop the session's draft + cumulative usage too, so a deleted session
         // leaves no orphaned rows that would skew the workspace-total spend.
         conn.execute("DELETE FROM drafts WHERE session_id = ?1", params![id])?;
@@ -611,16 +761,130 @@ impl Db {
         msg: &ChatMessage,
         ts: i64,
     ) -> rusqlite::Result<String> {
+        self.try_append_message_for_turn(session_id, None, msg, ts)
+    }
+
+    /// Append one canonical message associated with a root turn. The row keeps its
+    /// own UUID for append-only replication; `turn_id` is the authoritative display
+    /// message id used to fold all assistant/tool rounds into one bubble on reload.
+    pub fn try_append_message_for_turn(
+        &self,
+        session_id: &str,
+        turn_id: Option<&str>,
+        msg: &ChatMessage,
+        ts: i64,
+    ) -> rusqlite::Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let content = serde_json::to_string(&msg.content).unwrap_or_else(|_| "[]".into());
         let conn = self.conn.lock().unwrap();
         let seq = Self::next_seq(&conn, session_id);
         conn.execute(
-            "INSERT INTO messages (id, session_id, seq, role, content, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, session_id, seq, msg.role, content, ts],
+            "INSERT INTO messages (id, session_id, seq, role, content, created_at, turn_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, session_id, seq, msg.role, content, ts, turn_id],
         )?;
         Ok(id)
+    }
+
+    /// Persist an in-flight placeholder. Pending rows are durable for crash
+    /// recovery but intentionally invisible to UI, Phone Sync, and Review reads.
+    pub fn save_pending_turn_receipt(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        receipt: &TurnReceipt,
+    ) -> rusqlite::Result<()> {
+        self.save_turn_receipt_state(session_id, message_id, receipt, None, None, false)
+    }
+
+    /// Insert or replace the immutable terminal receipt and make it visible to all
+    /// reload surfaces.
+    pub fn save_turn_receipt(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        receipt: &TurnReceipt,
+        repository_root: Option<&str>,
+        terminal_snapshot_id: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        self.save_turn_receipt_state(
+            session_id,
+            message_id,
+            receipt,
+            repository_root,
+            terminal_snapshot_id,
+            true,
+        )
+    }
+
+    fn save_turn_receipt_state(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        receipt: &TurnReceipt,
+        repository_root: Option<&str>,
+        terminal_snapshot_id: Option<&str>,
+        terminal: bool,
+    ) -> rusqlite::Result<()> {
+        let json = serde_json::to_string(receipt)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO turn_receipts (
+                 turn_id, session_id, message_id, receipt_json,
+                 repository_root, terminal_snapshot_id, started_at, completed_at, terminal
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(turn_id) DO UPDATE SET
+                 session_id = excluded.session_id,
+                 message_id = excluded.message_id,
+                 receipt_json = excluded.receipt_json,
+                 repository_root = excluded.repository_root,
+                 terminal_snapshot_id = excluded.terminal_snapshot_id,
+                 started_at = excluded.started_at,
+                 completed_at = excluded.completed_at,
+                 terminal = excluded.terminal
+             WHERE turn_receipts.terminal = 0 OR excluded.terminal = 1",
+            params![
+                receipt.turn_id,
+                session_id,
+                message_id,
+                json,
+                repository_root,
+                terminal_snapshot_id,
+                receipt.started_at,
+                receipt.completed_at,
+                if terminal { 1_i64 } else { 0_i64 },
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_turn_receipt(&self, turn_id: &str) -> Option<TurnReceiptRecord> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT session_id, message_id, receipt_json, repository_root,
+                    terminal_snapshot_id
+             FROM turn_receipts WHERE turn_id = ?1 AND terminal = 1",
+            params![turn_id],
+            |row| {
+                let json: String = row.get(2)?;
+                let receipt = serde_json::from_str(&json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(TurnReceiptRecord {
+                    session_id: row.get(0)?,
+                    message_id: row.get(1)?,
+                    receipt,
+                    repository_root: row.get(3)?,
+                    terminal_snapshot_id: row.get(4)?,
+                })
+            },
+        )
+        .ok()
     }
 
     /// Test-only convenience wrapper that panics on failure. Production code calls
@@ -663,8 +927,14 @@ impl Db {
     pub fn messages_since(&self, session_id: &str, after_seq: i64) -> Vec<MessageRow> {
         let conn = self.conn.lock().unwrap();
         let Ok(mut stmt) = conn.prepare(
-            "SELECT id, session_id, seq, role, content, created_at
-             FROM messages WHERE session_id = ?1 AND seq > ?2 ORDER BY seq",
+            "SELECT m.id, m.session_id, m.seq, m.role, m.content, m.created_at,
+                    m.turn_id,
+                    CASE WHEN m.turn_id IS NOT NULL AND m.seq = (
+                        SELECT MAX(mx.seq) FROM messages mx WHERE mx.turn_id = m.turn_id
+                    ) THEN tr.receipt_json END
+             FROM messages m
+             LEFT JOIN turn_receipts tr ON tr.turn_id = m.turn_id AND tr.terminal = 1
+             WHERE m.session_id = ?1 AND m.seq > ?2 ORDER BY m.seq",
         ) else {
             return Vec::new();
         };
@@ -695,8 +965,14 @@ impl Db {
         }
         let conn = self.conn.lock().unwrap();
         let Ok(mut stmt) = conn.prepare(
-            "SELECT id, session_id, seq, role, content, created_at
-             FROM messages WHERE session_id = ?1 AND seq > ?2 ORDER BY seq DESC LIMIT ?3",
+            "SELECT m.id, m.session_id, m.seq, m.role, m.content, m.created_at,
+                    m.turn_id,
+                    CASE WHEN m.turn_id IS NOT NULL AND m.seq = (
+                        SELECT MAX(mx.seq) FROM messages mx WHERE mx.turn_id = m.turn_id
+                    ) THEN tr.receipt_json END
+             FROM messages m
+             LEFT JOIN turn_receipts tr ON tr.turn_id = m.turn_id AND tr.terminal = 1
+             WHERE m.session_id = ?1 AND m.seq > ?2 ORDER BY m.seq DESC LIMIT ?3",
         ) else {
             return Vec::new();
         };
@@ -732,8 +1008,14 @@ impl Db {
         }
         let conn = self.conn.lock().unwrap();
         let Ok(mut stmt) = conn.prepare(
-            "SELECT id, session_id, seq, role, content, created_at
-             FROM messages WHERE session_id = ?1 AND seq < ?2 ORDER BY seq DESC LIMIT ?3",
+            "SELECT m.id, m.session_id, m.seq, m.role, m.content, m.created_at,
+                    m.turn_id,
+                    CASE WHEN m.turn_id IS NOT NULL AND m.seq = (
+                        SELECT MAX(mx.seq) FROM messages mx WHERE mx.turn_id = m.turn_id
+                    ) THEN tr.receipt_json END
+             FROM messages m
+             LEFT JOIN turn_receipts tr ON tr.turn_id = m.turn_id AND tr.terminal = 1
+             WHERE m.session_id = ?1 AND m.seq < ?2 ORDER BY m.seq DESC LIMIT ?3",
         ) else {
             return (Vec::new(), false);
         };
@@ -911,7 +1193,10 @@ impl Db {
     pub fn ui_messages(&self, session_id: &str) -> Vec<UiMessage> {
         let conn = self.conn.lock().unwrap();
         let Ok(mut stmt) = conn.prepare(
-            "SELECT id, role, content, created_at FROM messages WHERE session_id = ?1 ORDER BY seq",
+            "SELECT m.id, m.role, m.content, m.created_at, m.turn_id, tr.receipt_json
+             FROM messages m
+             LEFT JOIN turn_receipts tr ON tr.turn_id = m.turn_id AND tr.terminal = 1
+             WHERE m.session_id = ?1 ORDER BY m.seq",
         ) else {
             return Vec::new();
         };
@@ -920,19 +1205,74 @@ impl Db {
             let role: String = r.get(1)?;
             let content: String = r.get(2)?;
             let ts: i64 = r.get(3)?;
-            Ok((id, role, content, ts))
+            let turn_id: Option<String> = r.get(4)?;
+            let receipt = r
+                .get::<_, Option<String>>(5)?
+                .and_then(|json| serde_json::from_str::<TurnReceipt>(&json).ok());
+            Ok((id, role, content, ts, turn_id, receipt))
         });
         let Ok(rows) = rows else { return Vec::new() };
 
         let mut out: Vec<UiMessage> = Vec::new();
-        for (id, role, content, ts) in rows.filter_map(|r| r.ok()) {
+        let mut turn_assistants = HashMap::new();
+        for (id, role, content, ts, turn_id, receipt) in rows.filter_map(|r| r.ok()) {
             let blocks: Vec<Block> = serde_json::from_str(&content).unwrap_or_default();
+            if let Some(turn_id) = turn_id {
+                let tool_results: Vec<UiBlock> = blocks
+                    .iter()
+                    .filter(|block| matches!(block, Block::ToolResult { .. }))
+                    .filter_map(to_ui_block)
+                    .collect();
+                let texts: Vec<UiBlock> = blocks
+                    .iter()
+                    .filter(|block| matches!(block, Block::Text { .. }))
+                    .filter_map(to_ui_block)
+                    .collect();
+
+                if role == "assistant" {
+                    let index = ensure_turn_assistant(
+                        &mut out,
+                        &mut turn_assistants,
+                        &turn_id,
+                        ts,
+                        receipt.as_ref(),
+                    );
+                    out[index]
+                        .blocks
+                        .extend(blocks.iter().filter_map(to_ui_block));
+                } else {
+                    if !texts.is_empty() {
+                        out.push(UiMessage {
+                            id,
+                            role: "user".into(),
+                            blocks: texts,
+                            created_at: ts,
+                            turn_id: Some(turn_id.clone()),
+                            receipt: None,
+                        });
+                    }
+                    if !tool_results.is_empty() || receipt.is_some() {
+                        let index = ensure_turn_assistant(
+                            &mut out,
+                            &mut turn_assistants,
+                            &turn_id,
+                            receipt.as_ref().map_or(ts, |value| value.started_at),
+                            receipt.as_ref(),
+                        );
+                        out[index].blocks.extend(tool_results);
+                    }
+                }
+                continue;
+            }
+
             if role == "assistant" {
                 out.push(UiMessage {
                     id,
                     role,
                     blocks: blocks.iter().filter_map(to_ui_block).collect(),
                     created_at: ts,
+                    turn_id: None,
+                    receipt: None,
                 });
             } else {
                 let tool_results: Vec<UiBlock> = blocks
@@ -956,7 +1296,43 @@ impl Db {
                         role: "user".into(),
                         blocks: texts,
                         created_at: ts,
+                        turn_id: None,
+                        receipt: None,
                     });
+                }
+            }
+        }
+
+        // A provider/config failure can terminalize after the durable TurnStart but
+        // before any canonical chat row is appended. Keep that receipt reloadable by
+        // synthesizing the same empty assistant bubble live TurnStart created.
+        if let Ok(mut receipts) = conn.prepare(
+            "SELECT receipt_json FROM turn_receipts
+             WHERE session_id = ?1 AND terminal = 1 ORDER BY started_at",
+        ) {
+            if let Ok(records) = receipts.query_map(params![session_id], |row| {
+                let json: String = row.get(0)?;
+                Ok(serde_json::from_str::<TurnReceipt>(&json).ok())
+            }) {
+                for receipt in records.filter_map(|row| row.ok().flatten()) {
+                    if turn_assistants.contains_key(&receipt.turn_id) {
+                        continue;
+                    }
+                    let index = out
+                        .iter()
+                        .position(|message| message.created_at > receipt.started_at)
+                        .unwrap_or(out.len());
+                    out.insert(
+                        index,
+                        UiMessage {
+                            id: receipt.turn_id.clone(),
+                            role: "assistant".into(),
+                            blocks: Vec::new(),
+                            created_at: receipt.started_at,
+                            turn_id: Some(receipt.turn_id.clone()),
+                            receipt: Some(receipt),
+                        },
+                    );
                 }
             }
         }
@@ -970,7 +1346,9 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use portcode_sync::wire::{TurnChangeCertainty, TurnStatus};
     use serde_json::json;
+    use std::path::PathBuf;
 
     fn mem_db() -> Db {
         Db::open(Path::new(":memory:")).expect("in-memory db")
@@ -987,6 +1365,24 @@ mod tests {
         ChatMessage {
             role: "assistant".into(),
             content: vec![Block::Text { text: t.into() }],
+        }
+    }
+
+    fn receipt(turn_id: &str) -> TurnReceipt {
+        TurnReceipt {
+            turn_id: turn_id.into(),
+            status: TurnStatus::Completed,
+            stop_reason: Some("end_turn".into()),
+            started_at: 2,
+            completed_at: 9,
+            duration_ms: Some(7),
+            changed_files: Vec::new(),
+            changed_file_count: 0,
+            additions: 0,
+            deletions: 0,
+            files_truncated: false,
+            change_certainty: TurnChangeCertainty::Exact,
+            background_tasks_running: false,
         }
     }
 
@@ -1084,6 +1480,71 @@ mod tests {
         db.update_session_model("legacy", "gpt-5.6-sol").unwrap();
         let after = db.list_sessions().unwrap();
         assert_eq!(after[0].model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn legacy_messages_gain_nullable_turn_id_without_rewriting_rows() {
+        let conn = Connection::open(Path::new(":memory:")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO messages (id, session_id, seq, role, content, created_at)
+            VALUES ('legacy-message', 'legacy-session', 0, 'user', '[]', 1);",
+        )
+        .unwrap();
+
+        Db::migrate_add_turn_id(&conn).unwrap();
+        Db::migrate_add_turn_id(&conn).unwrap();
+        let turn_id: Option<String> = conn
+            .query_row(
+                "SELECT turn_id FROM messages WHERE id = 'legacy-message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(turn_id.is_none());
+    }
+
+    #[test]
+    fn legacy_receipts_without_pending_column_migrate_as_terminal() {
+        let conn = Connection::open(Path::new(":memory:")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE turn_receipts (
+                turn_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                receipt_json TEXT NOT NULL,
+                repository_root TEXT,
+                terminal_snapshot_id TEXT,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO turn_receipts (
+                turn_id, session_id, message_id, receipt_json, started_at, completed_at
+             ) VALUES ('legacy-turn', 's', 'legacy-turn', ?1, 1, 2)",
+            params![serde_json::to_string(&receipt("legacy-turn")).unwrap()],
+        )
+        .unwrap();
+
+        Db::migrate_add_receipt_terminal(&conn).unwrap();
+        Db::migrate_add_receipt_terminal(&conn).unwrap();
+        let terminal: i64 = conn
+            .query_row(
+                "SELECT terminal FROM turn_receipts WHERE turn_id = 'legacy-turn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal, 1);
     }
 
     #[test]
@@ -1298,6 +1759,159 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0]["kind"], "tool_use");
         assert_eq!(blocks[1]["kind"], "tool_result");
+    }
+
+    #[test]
+    fn turn_rows_reload_as_one_live_shaped_assistant_and_replicate_receipt_once() {
+        let db = mem_db();
+        db.create_session("a", "A", None, None, 1).unwrap();
+        let turn_id = "turn-1";
+        db.try_append_message_for_turn("a", Some(turn_id), &text("do it"), 2)
+            .unwrap();
+        db.try_append_message_for_turn(
+            "a",
+            Some(turn_id),
+            &ChatMessage {
+                role: "assistant".into(),
+                content: vec![Block::ToolUse {
+                    id: "tool-1".into(),
+                    name: "write_file".into(),
+                    input: json!({ "path": "a.txt" }),
+                }],
+            },
+            3,
+        )
+        .unwrap();
+        db.try_append_message_for_turn(
+            "a",
+            Some(turn_id),
+            &ChatMessage {
+                role: "user".into(),
+                content: vec![Block::ToolResult {
+                    tool_use_id: "tool-1".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                }],
+            },
+            4,
+        )
+        .unwrap();
+        db.try_append_message_for_turn("a", Some(turn_id), &assistant("done"), 5)
+            .unwrap();
+        let receipt = receipt(turn_id);
+        db.save_turn_receipt("a", turn_id, &receipt, Some("repo"), Some("snap"))
+            .unwrap();
+
+        let ui = db.ui_messages("a");
+        assert_eq!(ui.len(), 2);
+        assert_eq!(ui[1].id, turn_id);
+        assert_eq!(ui[1].turn_id.as_deref(), Some(turn_id));
+        assert_eq!(ui[1].blocks.len(), 3);
+        assert_eq!(ui[1].receipt.as_ref(), Some(&receipt));
+
+        let replicated = db.messages_since("a", -1);
+        assert!(replicated
+            .iter()
+            .all(|message| message.turn_id.as_deref() == Some(turn_id)));
+        assert_eq!(
+            replicated
+                .iter()
+                .filter(|message| message.receipt.is_some())
+                .count(),
+            1
+        );
+        assert_eq!(replicated.last().unwrap().receipt.as_ref(), Some(&receipt));
+    }
+
+    #[test]
+    fn deleting_session_removes_its_turn_receipts() {
+        let db = mem_db();
+        db.create_session("a", "A", None, None, 1).unwrap();
+        let receipt = receipt("turn-delete");
+        db.save_turn_receipt("a", "turn-delete", &receipt, None, None)
+            .unwrap();
+        assert!(db.get_turn_receipt("turn-delete").is_some());
+        db.delete_session("a").unwrap();
+        assert!(db.get_turn_receipt("turn-delete").is_none());
+    }
+
+    #[test]
+    fn receipt_without_canonical_messages_still_reloads_as_assistant_bubble() {
+        let db = mem_db();
+        db.create_session("a", "A", None, None, 1).unwrap();
+        let receipt = receipt("preflight-turn");
+        db.save_turn_receipt("a", "preflight-turn", &receipt, None, None)
+            .unwrap();
+
+        let ui = db.ui_messages("a");
+        assert_eq!(ui.len(), 1);
+        assert_eq!(ui[0].id, "preflight-turn");
+        assert_eq!(ui[0].role, "assistant");
+        assert_eq!(ui[0].receipt.as_ref(), Some(&receipt));
+    }
+
+    #[test]
+    fn pending_receipt_is_hidden_from_reload_phone_and_review_lookup() {
+        let db = mem_db();
+        db.create_session("a", "A", None, None, 1).unwrap();
+        db.try_append_message_for_turn("a", Some("pending-turn"), &text("working"), 2)
+            .unwrap();
+        db.save_pending_turn_receipt("a", "pending-turn", &receipt("pending-turn"))
+            .unwrap();
+
+        assert!(db.get_turn_receipt("pending-turn").is_none());
+        let ui = db.ui_messages("a");
+        assert_eq!(ui.len(), 1);
+        assert_eq!(ui[0].role, "user");
+        assert!(ui.iter().all(|message| message.receipt.is_none()));
+        assert!(db
+            .messages_since("a", -1)
+            .iter()
+            .all(|message| message.receipt.is_none()));
+    }
+
+    #[test]
+    fn startup_recovers_pending_receipt_as_unknown_duration_interruption() {
+        let path = std::env::temp_dir().join(format!(
+            "portcode_pending_receipt_{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let db = Db::open(&path).unwrap();
+            db.create_session("a", "A", None, None, 1).unwrap();
+            db.try_append_message_for_turn("a", Some("crashed-turn"), &text("working"), 2)
+                .unwrap();
+            db.save_pending_turn_receipt("a", "crashed-turn", &receipt("crashed-turn"))
+                .unwrap();
+            assert!(db.get_turn_receipt("crashed-turn").is_none());
+        }
+
+        let recovered = Db::open(&path).unwrap();
+        let record = recovered
+            .get_turn_receipt("crashed-turn")
+            .expect("startup terminalizes the pending row");
+        assert_eq!(record.receipt.status, TurnStatus::Interrupted);
+        assert_eq!(
+            record.receipt.stop_reason.as_deref(),
+            Some("process_interrupted")
+        );
+        assert_eq!(record.receipt.duration_ms, None);
+        assert_eq!(
+            record.receipt.change_certainty,
+            TurnChangeCertainty::Unavailable
+        );
+        assert!(recovered
+            .ui_messages("a")
+            .iter()
+            .any(|message| message.receipt.as_ref() == Some(&record.receipt)));
+        drop(recovered);
+        for candidate in [
+            path.clone(),
+            PathBuf::from(format!("{}-wal", path.display())),
+            PathBuf::from(format!("{}-shm", path.display())),
+        ] {
+            let _ = std::fs::remove_file(candidate);
+        }
     }
 
     // ── messages_since: the Phone Sync catch-up delta ────────────────────────

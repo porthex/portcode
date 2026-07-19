@@ -28,6 +28,66 @@ export interface Message {
   role: Role;
   blocks: ContentBlock[];
   createdAt: number;
+  /** Stable native turn identity. Absent on legacy persisted messages. */
+  turnId?: string;
+  /** Durable completion metadata. Present only after this assistant turn settles. */
+  receipt?: TurnReceipt;
+}
+
+/** Durable terminal state for one top-level agent turn. */
+export type TurnStatus = "completed" | "cancelled" | "error" | "interrupted";
+
+/**
+ * How confidently a changed-file entry can be attributed to this turn. `exact`
+ * is tool-observed, `observed` is a before/after workspace delta, `ambiguous`
+ * may include concurrent/background changes, and `unavailable` means no reliable
+ * workspace comparison was possible.
+ */
+export type TurnChangeCertainty = "exact" | "observed" | "ambiguous" | "unavailable";
+
+/** One compact changed-file row persisted with a turn receipt. */
+export interface TurnChangedFile {
+  path: string;
+  oldPath?: string;
+  status: GitChangeStatus;
+  additions?: number;
+  deletions?: number;
+  binary: boolean;
+  certainty: TurnChangeCertainty;
+}
+
+/** Persisted, reload-safe completion metadata for an assistant turn. */
+export interface TurnReceipt {
+  turnId: string;
+  status: TurnStatus;
+  /** Provider/native stop reason; omitted when the turn failed before one existed. */
+  stopReason?: string;
+  startedAt: number;
+  completedAt: number;
+  /** Omitted for startup-recovered interruptions whose actual end time is unknown. */
+  durationMs?: number;
+  changedFiles: TurnChangedFile[];
+  changedFileCount: number;
+  additions: number;
+  deletions: number;
+  filesTruncated: boolean;
+  changeCertainty: TurnChangeCertainty;
+  /** True when commands launched by this turn were still alive at completion. */
+  backgroundTasksRunning: boolean;
+}
+
+/** Read-only review manifest captured for one completed turn. */
+export interface TurnReviewManifest {
+  turnId: string;
+  snapshotId: string;
+  repositoryRoot: string;
+  receipt: TurnReceipt;
+  files: TurnChangedFile[];
+  additions: number;
+  deletions: number;
+  truncated: boolean;
+  /** False when the receipt is durable but historical patch bodies are unavailable. */
+  patchesAvailable: boolean;
 }
 
 export interface Session {
@@ -86,7 +146,14 @@ export interface SessionFolder {
 
 /** Events streamed from the core during an agent run. */
 export type StreamEvent =
-  | { type: "turn_start"; messageId: string }
+  | {
+      type: "turn_start";
+      messageId: string;
+      /** Optional only so an older desktop/phone peer degrades safely. */
+      turnId?: string;
+      /** Native wall-clock start. Optional only for legacy peers. */
+      startedAt?: number;
+    }
   | { type: "text_delta"; text: string }
   | { type: "tool_use"; id: string; name: ToolName; input: unknown }
   | { type: "tool_result"; id: string; output: string; isError: boolean }
@@ -100,8 +167,8 @@ export type StreamEvent =
       diff?: string;
     }
   | { type: "usage"; inputTokens: number; outputTokens: number }
-  | { type: "turn_end"; stopReason: string }
-  | { type: "error"; message: string }
+  | { type: "turn_end"; stopReason: string; receipt?: TurnReceipt }
+  | { type: "error"; message: string; receipt?: TurnReceipt }
   // ── subagents (`delegate_task`; historical `task`) ─────────────────────
   /** A subagent started. `parentId` is the launching subagent, absent at top level. */
   | { type: "agent_started"; agentId: string; description: string; parentId?: string }
@@ -195,6 +262,9 @@ export interface WorkspaceSummary {
 
 /** The main desktop work surface. Review is workspace-scoped, not session history. */
 export type WorkspaceSurface = "chat" | "review";
+
+/** Which review context the workspace surface should present. */
+export type ReviewTarget = { kind: "workspace" } | { kind: "turn"; turnId: string };
 
 export type GitReviewScope =
   | { kind: "workingTree" }
@@ -733,6 +803,9 @@ export interface MessageRow {
   role: Role;
   content: Array<ContentBlock | ReasoningWireBlock>;
   createdAt: number;
+  /** Stable turn identity and receipt are absent on legacy catch-up rows. */
+  turnId?: string;
+  receipt?: TurnReceipt;
 }
 
 /**

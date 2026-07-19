@@ -4,13 +4,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as ipc from "../../lib/ipc";
 import { useStore } from "../../store/store";
 import { DEFAULT_SETTINGS } from "../../types";
-import type { GitChangedFile, GitFilePatch, GitReviewManifest, GitReviewScope } from "../../types";
+import type {
+  GitChangedFile,
+  GitFilePatch,
+  GitReviewManifest,
+  GitReviewScope,
+  TurnReceipt,
+  TurnReviewManifest,
+} from "../../types";
 import { ReviewWorkspace } from "./ReviewWorkspace";
 
 vi.mock("../../lib/ipc", () => ({
   getGitReviewBranches: vi.fn(),
   getGitReviewManifest: vi.fn(),
   getGitReviewFile: vi.fn(),
+  getTurnReviewManifest: vi.fn(),
+  getTurnReviewFile: vi.fn(),
 }));
 
 const m = vi.mocked(ipc);
@@ -171,6 +180,43 @@ function patch(path: string, overrides: Partial<GitFilePatch> = {}): GitFilePatc
   };
 }
 
+const turnReceipt: TurnReceipt = {
+  turnId: "turn-1",
+  status: "completed",
+  stopReason: "end_turn",
+  startedAt: 1_000,
+  completedAt: 3_000,
+  durationMs: 2_000,
+  changedFiles: [
+    {
+      path: "src/App.tsx",
+      status: "modified",
+      additions: 2,
+      deletions: 1,
+      binary: false,
+      certainty: "exact",
+    },
+  ],
+  changedFileCount: 1,
+  additions: 2,
+  deletions: 1,
+  filesTruncated: false,
+  changeCertainty: "exact",
+  backgroundTasksRunning: false,
+};
+
+const turnManifest: TurnReviewManifest = {
+  turnId: "turn-1",
+  snapshotId: "turn-snapshot-1",
+  repositoryRoot: "D:/Projects/portcode",
+  receipt: turnReceipt,
+  files: turnReceipt.changedFiles,
+  additions: 2,
+  deletions: 1,
+  truncated: false,
+  patchesAvailable: false,
+};
+
 beforeEach(() => {
   vi.clearAllMocks();
   useStore.setState(initialState, true);
@@ -192,6 +238,8 @@ beforeEach(() => {
   });
   m.getGitReviewManifest.mockImplementation(async (scope) => manifest(scope));
   m.getGitReviewBranches.mockResolvedValue([...branches]);
+  m.getTurnReviewManifest.mockResolvedValue(turnManifest);
+  m.getTurnReviewFile.mockRejectedValue(new Error("Historical patch unavailable"));
   m.getGitReviewFile.mockImplementation(async (_scope, snapshotId, path) => {
     const file = files.find((candidate) => candidate.path === path);
     if (file?.binary) {
@@ -221,6 +269,20 @@ function chooseMenuOption(label: string, option: string) {
 }
 
 describe("ReviewWorkspace", () => {
+  it("opens a receipt-backed turn manifest without falling back to the live workspace", async () => {
+    useStore.setState({ reviewTarget: { kind: "turn", turnId: "turn-1" } });
+
+    render(<ReviewWorkspace />);
+
+    expect(await screen.findByText("Turn changes")).toBeInTheDocument();
+    expect(m.getTurnReviewManifest).toHaveBeenCalledWith("turn-1");
+    expect(m.getGitReviewManifest).not.toHaveBeenCalled();
+    expect(screen.queryByRole("combobox", { name: "Review scope" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Refresh review" })).not.toBeInTheDocument();
+    expect(await screen.findByText(/did not retain an immutable line patch/i)).toBeInTheDocument();
+    expect(m.getTurnReviewFile).not.toHaveBeenCalled();
+  });
+
   it("loads the working-tree manifest, groups files, and lazily opens the first patch", async () => {
     m.getGitReviewManifest.mockImplementation(async (scope) =>
       manifest(scope, { truncated: true }),
