@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useStore } from "./store/store";
 import { Sidebar } from "./components/Sidebar";
 import { Chat } from "./components/Chat";
@@ -368,7 +369,10 @@ function TitleBar({
   const workspaceSurface = useStore((s) => s.workspaceSurface);
   const setWorkspaceSurface = useStore((s) => s.setWorkspaceSurface);
   return (
-    <header className="relative z-40 flex h-[46px] shrink-0 items-center justify-between border-b border-border bg-panel/70 px-3.5 backdrop-blur-sm">
+    <header
+      data-tauri-drag-region={isTauri() ? "deep" : undefined}
+      className="relative z-40 flex h-[46px] shrink-0 items-center justify-between border-b border-border bg-panel/70 px-3.5 backdrop-blur-sm"
+    >
       <div className="flex min-w-0 items-center gap-2.5">
         <button
           ref={fileToggleRef}
@@ -433,7 +437,67 @@ function TitleBar({
         >
           Ctrl K <span className="text-faint">palette</span>
         </button>
+        {isTauri() && <WindowControls />}
       </div>
     </header>
+  );
+}
+
+/** Native-style window actions, rendered inside the Portcode toolbar so Windows
+ * chrome never visually interrupts the app surface. Errors are intentionally
+ * ignored: these actions can race teardown while the window is closing. */
+function WindowControls() {
+  const run = (action: "minimize" | "toggleMaximize" | "close") => {
+    void getCurrentWindow()
+      [action]()
+      .catch(() => undefined);
+  };
+
+  return (
+    <div className="-mr-3.5 -my-2.5 ml-1 flex h-[46px] self-center border-l border-border-2/70">
+      <button
+        type="button"
+        data-tauri-drag-region={false}
+        aria-label="Minimize window"
+        title="Minimize"
+        onClick={() => run("minimize")}
+        className="flex h-full w-11 items-center justify-center text-muted transition-colors hover:bg-panel-2 hover:text-fg"
+      >
+        <svg aria-hidden="true" width="11" height="11" viewBox="0 0 11 11" fill="none">
+          <path d="M1 5.5h9" stroke="currentColor" strokeWidth="1.2" />
+        </svg>
+      </button>
+      <button
+        type="button"
+        data-tauri-drag-region={false}
+        aria-label="Maximize or restore window"
+        title="Maximize or restore"
+        onClick={() => run("toggleMaximize")}
+        className="flex h-full w-11 items-center justify-center text-muted transition-colors hover:bg-panel-2 hover:text-fg"
+      >
+        <svg aria-hidden="true" width="11" height="11" viewBox="0 0 11 11" fill="none">
+          <rect
+            x="1.25"
+            y="1.25"
+            width="8.5"
+            height="8.5"
+            stroke="currentColor"
+            strokeWidth="1.1"
+          />
+        </svg>
+      </button>
+      <button
+        type="button"
+        data-tauri-drag-region={false}
+        aria-label="Close window"
+        title="Close"
+        onClick={() => run("close")}
+        className="flex h-full w-11 items-center justify-center text-muted transition-colors hover:bg-danger/85 hover:text-white"
+      >
+        <svg aria-hidden="true" width="11" height="11" viewBox="0 0 11 11" fill="none">
+          <path d="m1.5 1.5 8 8m0-8-8 8" stroke="currentColor" strokeWidth="1.2" />
+        </svg>
+      </button>
+    </div>
   );
 }

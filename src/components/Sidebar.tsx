@@ -654,7 +654,11 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   return (
     <aside aria-label="Sessions" className="pc-fade-in flex h-full w-[248px] flex-col">
       {/* Header */}
-      <div className="flex items-center gap-2.5 px-4 py-4">
+      <div
+        data-testid="sidebar-titlebar"
+        data-tauri-drag-region={isTauri() ? "deep" : undefined}
+        className="flex h-[46px] shrink-0 items-center gap-2.5 px-4"
+      >
         <div className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-lg border border-accent/60 bg-gradient-to-br from-accent/30 to-accent-2/25 shadow-[0_0_14px_rgba(255,46,126,0.4)]">
           <Logo />
         </div>
@@ -664,6 +668,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         </div>
         {collapsible && (
           <button
+            data-tauri-drag-region={false}
             onClick={() => {
               setMenu(null);
               setSidebarCollapsed(true);
@@ -870,10 +875,16 @@ function SessionRail() {
   return (
     <aside
       aria-label="Sessions"
-      className="pc-fade-in flex h-full w-[52px] flex-col items-center gap-2 py-3"
+      className="pc-fade-in flex h-full w-[52px] flex-col items-center gap-2 pb-3"
     >
-      <div className="flex h-[30px] w-[30px] items-center justify-center rounded-lg border border-accent/60 bg-gradient-to-br from-accent/30 to-accent-2/25 shadow-[0_0_14px_rgba(255,46,126,0.4)]">
-        <Logo />
+      <div
+        data-testid="sidebar-titlebar"
+        data-tauri-drag-region={isTauri() ? "deep" : undefined}
+        className="flex h-[46px] w-full shrink-0 items-center justify-center"
+      >
+        <div className="flex h-[30px] w-[30px] items-center justify-center rounded-lg border border-accent/60 bg-gradient-to-br from-accent/30 to-accent-2/25 shadow-[0_0_14px_rgba(255,46,126,0.4)]">
+          <Logo />
+        </div>
       </div>
       <button
         onClick={() => setSidebarCollapsed(false)}

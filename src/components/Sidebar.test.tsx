@@ -76,6 +76,21 @@ describe("Sidebar", () => {
     expect(screen.getByRole("button", { name: /Settings/ })).toBeInTheDocument();
   });
 
+  it("makes the desktop brand header draggable without swallowing its control", () => {
+    m.isTauri.mockReturnValue(true);
+
+    render(<Sidebar />);
+
+    expect(screen.getByTestId("sidebar-titlebar")).toHaveAttribute(
+      "data-tauri-drag-region",
+      "deep",
+    );
+    expect(screen.getByRole("button", { name: "Collapse sidebar" })).toHaveAttribute(
+      "data-tauri-drag-region",
+      "false",
+    );
+  });
+
   it("renders no session rows when there are zero sessions", () => {
     useStore.setState({ sessions: [], activeId: null });
 
