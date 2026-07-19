@@ -374,6 +374,8 @@ export interface Settings {
   model: string;
   /** Default/current reasoning level for OpenAI subscription models. */
   reasoningEffort: ReasoningEffort;
+  /** OpenAI response processing tier. Fast requests priority processing. */
+  responseSpeed: ResponseSpeed;
   apiKeySet: boolean;
   /** Legacy global policy; the `default` mode's fallthrough (back-compat). */
   defaultPolicy: ToolPolicy;
@@ -392,6 +394,7 @@ export const DEFAULT_SETTINGS: Settings = {
   provider: "anthropic",
   model: "claude-opus-4-8",
   reasoningEffort: "medium",
+  responseSpeed: "standard",
   apiKeySet: false,
   defaultPolicy: "ask",
   workspace: null,
@@ -445,6 +448,8 @@ export interface PlanUsageSnapshot {
 export type KnownReasoningEffort =
   "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "custom";
 export type ReasoningEffort = KnownReasoningEffort | (string & {});
+
+export type ResponseSpeed = "standard" | "fast";
 
 export const REASONING_EFFORT_LABELS: Record<KnownReasoningEffort, string> = {
   none: "None",

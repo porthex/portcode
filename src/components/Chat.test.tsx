@@ -406,10 +406,11 @@ describe("Chat children", () => {
 
     render(<Chat />);
 
-    // Composer renders its textarea regardless of transcript state.
-    expect(
-      screen.getByPlaceholderText("Describe a task, ask a question, or give an instruction…"),
-    ).toBeInTheDocument();
+    // Composer renders its rich textbox regardless of transcript state.
+    expect(screen.getByRole("textbox", { name: "Message Portcode" })).toHaveAttribute(
+      "aria-placeholder",
+      "Describe a task, ask a question, or give an instruction…",
+    );
     // PermissionPrompt returns null when nothing is pending.
     expect(screen.queryByText(/wants to run/i)).not.toBeInTheDocument();
   });

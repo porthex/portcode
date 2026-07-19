@@ -384,6 +384,7 @@ pub trait LlmProvider: Send + Sync {
         cred: &Credential,
         model: &str,
         reasoning_effort: &str,
+        response_speed: &str,
         system: &str,
         messages: &[ChatMessage],
         tools: &[Value],
@@ -409,6 +410,7 @@ impl LlmProvider for AnthropicProvider {
         cred: &Credential,
         model: &str,
         _reasoning_effort: &str,
+        _response_speed: &str,
         system: &str,
         messages: &[ChatMessage],
         tools: &[Value],
@@ -709,6 +711,7 @@ impl LlmProvider for OpenAiProvider {
         cred: &Credential,
         model: &str,
         reasoning_effort: &str,
+        response_speed: &str,
         system: &str,
         messages: &[ChatMessage],
         tools: &[Value],
@@ -727,7 +730,7 @@ impl LlmProvider for OpenAiProvider {
         } else {
             reasoning_effort
         };
-        let body = json!({
+        let mut body = json!({
             "model": model,
             "instructions": system,
             "input": openai_input(messages, model),
@@ -739,6 +742,7 @@ impl LlmProvider for OpenAiProvider {
             "stream": true,
             "include": ["reasoning.encrypted_content"],
         });
+        apply_openai_response_speed(&mut body, response_speed);
         let mut request = http
             .post("https://chatgpt.com/backend-api/codex/responses")
             .header("authorization", format!("Bearer {}", tokens.access_token))
@@ -834,6 +838,14 @@ impl LlmProvider for OpenAiProvider {
             }
         }
         builder.finish()
+    }
+}
+
+fn apply_openai_response_speed(body: &mut Value, response_speed: &str) {
+    // Standard intentionally leaves the field absent so the subscription backend
+    // keeps its native default. Fast opts into Responses priority processing.
+    if response_speed == "fast" {
+        body["service_tier"] = json!("priority");
     }
 }
 
@@ -1041,6 +1053,17 @@ mod tests {
             switched.is_empty(),
             "model-specific reasoning is not replayed after a switch"
         );
+    }
+
+    #[test]
+    fn openai_fast_speed_requests_priority_processing() {
+        let mut standard = json!({ "model": "gpt-5.6-sol" });
+        apply_openai_response_speed(&mut standard, "standard");
+        assert!(standard.get("service_tier").is_none());
+
+        let mut fast = json!({ "model": "gpt-5.6-sol" });
+        apply_openai_response_speed(&mut fast, "fast");
+        assert_eq!(fast["service_tier"], "priority");
     }
 
     #[test]

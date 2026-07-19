@@ -10,8 +10,10 @@ import {
   providerGroups,
   reasoningEffortLabel,
   type PermissionMode,
+  type ResponseSpeed,
 } from "../types";
 import { SelectMenu } from "./SelectMenu";
+import { ComposerEditor } from "./ComposerEditor";
 
 /** Read the active session's model, falling back to the global default. */
 function useActiveModel(): string {
@@ -21,8 +23,8 @@ function useActiveModel(): string {
   });
 }
 
-// Auto-grow cap; kept in sync with the textarea's inline maxHeight so the JS
-// target and the CSS clip agree (otherwise the grow stops short at the smaller).
+// Auto-grow cap; kept in sync with the editor's inline maxHeight so the JS
+// target and the CSS clip agree (otherwise growth stops short at the smaller).
 const MAX_TEXTAREA_H = 220;
 
 // The live presence phrases, derived from REAL turn/stream state (never padded
@@ -64,9 +66,9 @@ export function Composer() {
   const oauthStatus = useStore((s) => s.oauthStatus);
   const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
   const settingsError = useStore((s) => s.settingsError);
-  const ref = useRef<HTMLTextAreaElement>(null);
+  const ref = useRef<HTMLDivElement>(null);
   // The pixel height of a single, empty row. Captured lazily from a collapsed
-  // textarea so the post-submit collapse has a concrete target to ease toward —
+  // editor so the post-submit collapse has a concrete target to ease toward —
   // CSS height transitions can't interpolate to/from "auto" (the browser
   // resolves it instantly), which otherwise kills the collapse animation.
   const rowHeightRef = useRef<number | null>(null);
@@ -132,7 +134,7 @@ export function Composer() {
         ? "Describe what you want planned — files will stay untouched…"
         : "Describe a task, ask a question, or give an instruction…";
 
-  // Keep the textarea height in sync when the draft changes externally
+  // Keep the editor height in sync when the draft changes externally
   // (e.g. a file path inserted from the explorer, or switching sessions).
   useEffect(() => {
     const el = ref.current;
@@ -142,7 +144,7 @@ export function Composer() {
     }
     el.style.height = "auto";
     const next = Math.min(el.scrollHeight, MAX_TEXTAREA_H);
-    // Memoize the single-row height the first time we see a collapsed textarea,
+    // Memoize the single-row height the first time we see a collapsed editor,
     // so submit() can animate down to a px value instead of snapping via "auto".
     if (rowHeightRef.current == null && !text) rowHeightRef.current = el.scrollHeight;
     el.style.height = next + "px";
@@ -154,7 +156,7 @@ export function Composer() {
   useEffect(() => {
     if (streaming || remoteMode) return;
     const el = ref.current;
-    if (el && !el.disabled && document.activeElement === document.body) el.focus();
+    if (el?.isContentEditable && document.activeElement === document.body) el.focus();
   }, [streaming, remoteMode]);
 
   const submit = async () => {
@@ -170,23 +172,6 @@ export function Composer() {
     await send(t);
   };
 
-  const onKeyDown = (e: React.KeyboardEvent) => {
-    // Don't submit on the Enter that COMMITS an IME composition (CJK/accent): the
-    // native isComposing flag is still set for that keydown. A real post-commit
-    // Enter has it cleared and still submits.
-    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-      e.preventDefault();
-      void submit();
-    }
-  };
-
-  const autoGrow = () => {
-    const el = ref.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = Math.min(el.scrollHeight, MAX_TEXTAREA_H) + "px";
-  };
-
   return (
     <div className="pc-composer-dock">
       {/* The perimeter is deliberately quiet at rest. Focus, a sendable draft, and a
@@ -199,31 +184,23 @@ export function Composer() {
       >
         <div className="pc-composer-surface">
           <div className="pc-composer-input-zone">
-            <textarea
-              ref={ref}
+            <FormattingHelp />
+            <ComposerEditor
+              key={activeId ?? "no-session"}
+              editableRef={ref}
               value={text}
-              onChange={(e) => {
-                setText(e.target.value);
-                autoGrow();
-              }}
-              onKeyDown={onKeyDown}
-              // Per-session drafts are durable, so the writing surface stays available
-              // while Portcode works. Send remains gated until the current turn ends.
+              onChange={setText}
+              onSubmit={() => void submit()}
               disabled={!activeId}
-              aria-describedby="pc-composer-status"
-              aria-label="Message Portcode"
-              rows={2}
               placeholder={placeholder}
-              style={{ maxHeight: `min(${MAX_TEXTAREA_H}px, 30dvh)` }}
-              className="pc-composer-textarea resize-none bg-transparent text-fg outline-none transition-[height,opacity,filter] duration-150 ease-out motion-reduce:transition-none placeholder:text-muted select-text disabled:cursor-not-allowed disabled:opacity-60"
+              maxHeight={MAX_TEXTAREA_H}
             />
           </div>
 
           <div className="pc-composer-toolbar">
             <div className="pc-composer-controls" aria-label="Turn controls">
               <PermissionPicker />
-              <ModelPicker />
-              <ReasoningPicker />
+              <ModelSetupPicker />
             </div>
 
             <div className="pc-composer-state">
@@ -310,11 +287,21 @@ export function Composer() {
 
       <div className="pc-composer-meta">
         <span className="pc-composer-shortcuts" aria-hidden="true">
-          {activeId
-            ? streaming
-              ? "Keep drafting · send unlocks when this run finishes"
-              : "Enter to send · Shift+Enter for a new line"
-            : "Your drafts are saved per chat"}
+          {activeId ? (
+            streaming ? (
+              "Keep drafting · send unlocks when this run finishes"
+            ) : (
+              <>
+                <kbd>Enter</kbd>
+                <span>Send</span>
+                <span className="pc-composer-shortcut-separator">·</span>
+                <kbd>Shift+Enter</kbd>
+                <span>New line</span>
+              </>
+            )
+          ) : (
+            "Your drafts are saved per chat"
+          )}
         </span>
         <UsageMeter />
       </div>
@@ -341,9 +328,6 @@ function PermissionPicker() {
   const presentation = MODE_PRESENTATION[mode];
   return (
     <div className="pc-composer-field pc-composer-field--permission">
-      <span className="pc-composer-field__label" aria-hidden="true">
-        Access
-      </span>
       <SelectMenu
         label="Permission mode"
         title={`${presentation.label} — ${presentation.detail}`}
@@ -376,82 +360,333 @@ function PermissionPicker() {
   );
 }
 
-/** Compact, provider-grouped picker for the ACTIVE session's model. */
-function ModelPicker() {
+type SetupPanel = "main" | "model" | "effort" | "speed";
+
+const SPEED_PRESENTATION: Record<ResponseSpeed, { label: string; detail: string }> = {
+  standard: { label: "Standard", detail: "Default speed" },
+  fast: { label: "Fast", detail: "1.5x speed, more usage" },
+};
+
+/** One compact surface for the active run's model, reasoning, and processing speed. */
+function ModelSetupPicker() {
   const model = useActiveModel();
   const setSessionModel = useStore((s) => s.setSessionModel);
   const activeId = useStore((s) => s.activeId);
   const streaming = useStore((s) => s.streaming);
   const remoteMode = useStore((s) => s.remoteMode);
   const openAIModels = useStore((s) => s.openAIModels);
+  const effort = useStore((s) => s.settings.reasoningEffort);
+  const speed = useStore((s) => s.settings.responseSpeed);
+  const updateSettings = useStore((s) => s.updateSettings);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const [open, setOpen] = useState(false);
+  const [panel, setPanel] = useState<SetupPanel>("main");
   const groups = providerGroups(openAIModels).filter((provider) => provider.models.length > 0);
+  const current = modelInfo(model, openAIModels);
+  const openAI = providerForModel(model, openAIModels) === "openai";
+  const supported = current?.reasoningEfforts ?? [];
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOnOutsidePress = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+        setPanel("main");
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (panel !== "main") setPanel("main");
+      else {
+        setOpen(false);
+        triggerRef.current?.focus();
+      }
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePress);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePress);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open, panel]);
+
+  useEffect(() => {
+    if (streaming) setOpen(false);
+  }, [streaming]);
+
   // The desktop owns session models and provider credentials. Until the remote
   // protocol has an authoritative set-model command, showing a phone-side picker
   // would promise a change that the next desktop session snapshot simply reverts.
   if (remoteMode) return null;
+
+  const commitModel = (next: string) => {
+    void setSessionModel(next);
+    setPanel("main");
+  };
+  const commitEffort = (next: string) => {
+    void updateSettings({ reasoningEffort: next });
+    setPanel("main");
+  };
+  const commitSpeed = (next: ResponseSpeed) => {
+    void updateSettings({ responseSpeed: next });
+    setPanel("main");
+  };
+  const compactModelLabel = (current?.label ?? model)
+    .replace(/^GPT[-\s]*/i, "")
+    .replace(/^Claude\s+/i, "");
+
   return (
-    <div className="pc-composer-field pc-composer-field--model">
-      <span className="pc-composer-field__label" aria-hidden="true">
-        Chat model
-      </span>
-      <SelectMenu
-        label="Model"
-        title={modelInfo(model, openAIModels)?.label ?? model}
-        value={model}
-        onChange={(next) => void setSessionModel(next)}
+    <div ref={rootRef} className="pc-run-setup">
+      <button
+        ref={triggerRef}
+        type="button"
+        className="pc-run-setup__trigger"
+        aria-label="Model, effort, and speed"
+        aria-haspopup="dialog"
+        aria-expanded={open}
         disabled={streaming || !activeId}
-        placement="top"
-        className="min-w-0"
-        buttonClassName="pc-composer-select-button"
-        groups={groups.map((provider) => ({
-          id: provider.id,
-          label: provider.label,
-          options: provider.models.map((candidate) => ({
-            value: candidate.id,
-            label: candidate.label,
-          })),
-        }))}
-      />
+        title="Configure model, effort, and speed"
+        onClick={() => {
+          setPanel("main");
+          setOpen((currentOpen) => !currentOpen);
+        }}
+      >
+        <span className="pc-run-setup__model">{compactModelLabel}</span>
+        {openAI && supported.length > 0 && (
+          <span className="pc-run-setup__effort">{reasoningEffortLabel(effort)}</span>
+        )}
+        {openAI && speed === "fast" && (
+          <svg className="pc-run-setup__bolt" viewBox="0 0 12 14" aria-hidden="true">
+            <path d="M7.3.8 1.7 8h3.5l-.6 5.2L10.3 6H6.8z" fill="currentColor" />
+          </svg>
+        )}
+        <svg
+          className={`pc-run-setup__chevron${open ? " pc-run-setup__chevron--open" : ""}`}
+          viewBox="0 0 12 12"
+          aria-hidden="true"
+        >
+          <path d="m2.25 4.25 3.75 3.5 3.75-3.5" fill="none" stroke="currentColor" />
+        </svg>
+      </button>
+
+      {open && (
+        <>
+          <div className="pc-run-setup__popover" role="dialog" aria-label="Run setup">
+            <div className="pc-run-setup__rows">
+              <SetupRow
+                label="Model"
+                value={compactModelLabel}
+                onClick={() => setPanel(panel === "model" ? "main" : "model")}
+              />
+              {openAI && supported.length > 0 && (
+                <SetupRow
+                  label="Effort"
+                  value={reasoningEffortLabel(effort)}
+                  onClick={() => setPanel(panel === "effort" ? "main" : "effort")}
+                />
+              )}
+              {openAI && (
+                <SetupRow
+                  label="Speed"
+                  value={SPEED_PRESENTATION[speed].label}
+                  onClick={() => setPanel(panel === "speed" ? "main" : "speed")}
+                  accent={speed === "fast"}
+                />
+              )}
+            </div>
+          </div>
+
+          {panel !== "main" && (
+            <div className={`pc-run-setup__sidecar pc-run-setup__sidecar--${panel}`}>
+              <div className="pc-run-setup__sidecar-label">
+                {panel === "model" ? "Model" : panel === "effort" ? "Effort" : "Speed"}
+              </div>
+              {panel === "model" && (
+                <div role="listbox" aria-label="Model" className="pc-run-setup__options">
+                  {groups.map((provider) => (
+                    <div key={provider.id} role="group" aria-label={provider.label}>
+                      <div className="pc-run-setup__group-label">{provider.label}</div>
+                      {provider.models.map((candidate) => (
+                        <SetupOption
+                          key={candidate.id}
+                          label={candidate.label}
+                          selected={candidate.id === model}
+                          onClick={() => commitModel(candidate.id)}
+                        />
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {panel === "effort" && (
+                <div role="listbox" aria-label="Reasoning level" className="pc-run-setup__options">
+                  {supported.map((level) => (
+                    <SetupOption
+                      key={level}
+                      label={reasoningEffortLabel(level)}
+                      selected={level === effort}
+                      onClick={() => commitEffort(level)}
+                    />
+                  ))}
+                </div>
+              )}
+              {panel === "speed" && (
+                <div role="listbox" aria-label="Response speed" className="pc-run-setup__options">
+                  {(Object.keys(SPEED_PRESENTATION) as ResponseSpeed[]).map((value) => (
+                    <SetupOption
+                      key={value}
+                      label={SPEED_PRESENTATION[value].label}
+                      detail={SPEED_PRESENTATION[value].detail}
+                      selected={value === speed}
+                      icon={value === "fast" ? "bolt" : undefined}
+                      onClick={() => commitSpeed(value)}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }
 
-/** Compact reasoning control, shown only for OpenAI models that advertise it. */
-function ReasoningPicker() {
-  const model = useActiveModel();
-  const openAIModels = useStore((s) => s.openAIModels);
-  const effort = useStore((s) => s.settings.reasoningEffort);
-  const updateSettings = useStore((s) => s.updateSettings);
-  const streaming = useStore((s) => s.streaming);
-  const remoteMode = useStore((s) => s.remoteMode);
-  const supported = modelInfo(model, openAIModels)?.reasoningEfforts ?? [];
-  if (remoteMode || providerForModel(model, openAIModels) !== "openai" || supported.length === 0) {
-    return null;
-  }
+function SetupRow({
+  label,
+  value,
+  onClick,
+  accent = false,
+}: {
+  label: string;
+  value: string;
+  onClick: () => void;
+  accent?: boolean;
+}) {
   return (
-    <div className="pc-composer-field pc-composer-field--reasoning">
-      <span className="pc-composer-field__label" aria-hidden="true">
-        Thinking default
+    <button
+      type="button"
+      className="pc-run-setup__row"
+      aria-label={`${label}: ${value}`}
+      onClick={onClick}
+    >
+      <span>{label}</span>
+      <span className={accent ? "pc-run-setup__row-value--accent" : undefined}>{value}</span>
+      <svg viewBox="0 0 12 12" aria-hidden="true">
+        <path d="m4.25 2.25 3.5 3.75-3.5 3.75" fill="none" stroke="currentColor" />
+      </svg>
+    </button>
+  );
+}
+
+function SetupOption({
+  label,
+  detail,
+  selected,
+  onClick,
+  icon,
+}: {
+  label: string;
+  detail?: string;
+  selected: boolean;
+  onClick: () => void;
+  icon?: "bolt";
+}) {
+  return (
+    <button
+      type="button"
+      role="option"
+      aria-selected={selected}
+      className={`pc-run-setup__option${selected ? " pc-run-setup__option--selected" : ""}`}
+      onClick={onClick}
+    >
+      <span className="pc-run-setup__option-copy">
+        <span>
+          {icon === "bolt" && (
+            <svg className="pc-run-setup__option-bolt" viewBox="0 0 12 14" aria-hidden="true">
+              <path d="M7.3.8 1.7 8h3.5l-.6 5.2L10.3 6H6.8z" fill="currentColor" />
+            </svg>
+          )}
+          {label}
+        </span>
+        {detail && <span>{detail}</span>}
       </span>
-      <SelectMenu
-        label="Reasoning level"
-        title="Default reasoning level across chats"
-        value={effort}
-        onChange={(next) => void updateSettings({ reasoningEffort: next })}
-        disabled={streaming}
-        placement="top"
-        className="min-w-0"
-        buttonClassName="pc-composer-select-button"
-        groups={[
-          {
-            id: "reasoning",
-            options: supported.map((level) => ({
-              value: level,
-              label: reasoningEffortLabel(level),
-            })),
-          },
-        ]}
-      />
+      <span className="pc-run-setup__check" aria-hidden="true">
+        {selected && (
+          <svg viewBox="0 0 12 12">
+            <path d="m2 6.2 2.5 2.4L10 3" fill="none" stroke="currentColor" strokeWidth="1.5" />
+          </svg>
+        )}
+      </span>
+    </button>
+  );
+}
+
+function FormattingHelp() {
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", close);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("pointerdown", close);
+      document.removeEventListener("keydown", escape);
+    };
+  }, [open]);
+
+  return (
+    <div ref={rootRef} className="pc-format-help">
+      <button
+        type="button"
+        className="pc-format-help__trigger"
+        aria-label="Formatting help"
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        title="Formatting help"
+        onClick={() => setOpen((current) => !current)}
+      >
+        ?
+      </button>
+      {open && (
+        <div className="pc-format-help__popover" role="dialog" aria-label="Message formatting">
+          <div className="pc-format-help__heading">
+            <span>Message formatting</span>
+            <span>Use these shortcuts to structure your draft.</span>
+          </div>
+          <div className="pc-format-help__grid">
+            <code>- item</code>
+            <span>Bulleted list</span>
+            <code>1. item</code>
+            <span>Numbered list</span>
+            <code>- [ ] task</code>
+            <span>To-do</span>
+            <kbd>Tab</kbd>
+            <span>Nest list item</span>
+            <kbd>Shift+Tab</kbd>
+            <span>Outdent list item</span>
+            <code>**bold**</code>
+            <span>Bold</span>
+            <code>`code`</code>
+            <span>Inline code</span>
+            <code>&gt; note</code>
+            <span>Quote</span>
+          </div>
+          <div className="pc-format-help__tip">
+            In a list, <kbd>Enter</kbd> or <kbd>Shift+Enter</kbd> adds the next item. On an empty
+            nested item it outdents; on an empty top-level item it exits. Outside lists,
+            <kbd>Enter</kbd> sends.
+          </div>
+        </div>
+      )}
     </div>
   );
 }

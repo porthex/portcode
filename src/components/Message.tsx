@@ -213,8 +213,8 @@ export const MessageView = memo(function MessageView({
       {!isUser && <Avatar />}
       <div className={`min-w-0 ${isUser ? "max-w-[82%]" : "flex-1"}`}>
         {isUser ? (
-          <div className="pc-bubble-user whitespace-pre-wrap break-words select-text">
-            {textOf(message)}
+          <div className="pc-bubble-user break-words select-text">
+            <MarkdownBody text={text} variant="user" rehypePlugins={REHYPE_PLUGINS} />
           </div>
         ) : (
           <div className="space-y-2">
@@ -408,22 +408,37 @@ const TextBlock = memo(function TextBlock({
   // accumulated response on every provider delta is disproportionately costly;
   // fenced and inline code are still code-shaped while the turn is in flight.
   return (
-    <div className="prose-pc">
-      <ReactMarkdown
-        remarkPlugins={REMARK_PLUGINS}
-        rehypePlugins={
-          active
-            ? animate && caret
-              ? ACTIVE_CARET_REHYPE_PLUGINS
-              : ACTIVE_REHYPE_PLUGINS
-            : REHYPE_PLUGINS
-        }
-      >
+    <MarkdownBody
+      text={text}
+      rehypePlugins={
+        active
+          ? animate && caret
+            ? ACTIVE_CARET_REHYPE_PLUGINS
+            : ACTIVE_REHYPE_PLUGINS
+          : REHYPE_PLUGINS
+      }
+    />
+  );
+});
+
+/** The shared, raw-HTML-safe GFM surface used by sent prompts and replies. */
+function MarkdownBody({
+  text,
+  variant = "assistant",
+  rehypePlugins,
+}: {
+  text: string;
+  variant?: "assistant" | "user";
+  rehypePlugins: MarkdownPlugins;
+}) {
+  return (
+    <div className={`prose-pc${variant === "user" ? " prose-pc--user" : ""}`}>
+      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={rehypePlugins}>
         {text}
       </ReactMarkdown>
     </div>
   );
-});
+}
 
 /**
  * The streaming assistant turn rendered as a per-word decode (see useScramble):

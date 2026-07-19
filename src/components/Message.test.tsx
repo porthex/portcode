@@ -50,6 +50,93 @@ describe("MessageView — user role", () => {
     expect(container.querySelector("svg")).toBeNull();
   });
 
+  it("keeps GFM formatting rendered after the user message is sent", () => {
+    const source = [
+      "- first bullet",
+      "- second bullet",
+      "",
+      "1. first step",
+      "2. second step",
+      "",
+      "- [ ] pending task",
+      "- [x] completed task",
+      "",
+      "**important** and `inline code`",
+      "",
+      "> quoted note",
+    ].join("\n");
+    const { container } = render(
+      <MessageView message={message("user", [{ kind: "text", text: source }])} />,
+    );
+
+    const bubble = container.querySelector(".pc-bubble-user");
+    expect(bubble?.querySelector(".prose-pc--user")).not.toBeNull();
+    expect(bubble?.querySelector("ul:not(.contains-task-list)")).not.toBeNull();
+    expect(bubble?.querySelector("ol")).not.toBeNull();
+    expect(screen.getAllByRole("listitem")).toHaveLength(6);
+
+    const tasks = screen.getAllByRole("checkbox");
+    expect(tasks).toHaveLength(2);
+    expect(tasks[0]).toBeDisabled();
+    expect(tasks[0]).not.toBeChecked();
+    expect(tasks[1]).toBeDisabled();
+    expect(tasks[1]).toBeChecked();
+
+    expect(bubble?.querySelector("strong")?.textContent).toBe("important");
+    expect(bubble?.querySelector("code")?.textContent).toBe("inline code");
+    expect(bubble?.querySelector("blockquote")?.textContent).toContain("quoted note");
+    expect(bubble?.textContent).not.toContain("- [x]");
+  });
+
+  it("renders nested mixed lists and tasks semantically in a sent user message", () => {
+    const source = [
+      "- parent",
+      "    1. first child",
+      "    2. second child",
+      "        - [x] nested task",
+    ].join("\n");
+    const { container } = render(
+      <MessageView message={message("user", [{ kind: "text", text: source }])} />,
+    );
+
+    const bubble = container.querySelector(".pc-bubble-user");
+    const topList = bubble?.querySelector(":scope .prose-pc--user > ul");
+    const nestedOrdered = topList?.querySelector(":scope > li > ol");
+    const nestedTasks = nestedOrdered?.querySelector("ul.contains-task-list");
+    expect(topList).not.toBeNull();
+    expect(nestedOrdered).not.toBeNull();
+    expect(nestedTasks).not.toBeNull();
+    expect(screen.getAllByRole("listitem")).toHaveLength(4);
+    expect(screen.getByRole("checkbox")).toBeChecked();
+    expect(screen.getByRole("checkbox")).toBeDisabled();
+    expect(bubble?.textContent).not.toContain("- [x]");
+  });
+
+  it("keeps raw HTML inert in sent user Markdown", () => {
+    const { container } = render(
+      <MessageView
+        message={message("user", [
+          { kind: "text", text: "<script>alert('nope')</script>\n\n**safe**" },
+        ])}
+      />,
+    );
+
+    expect(container.querySelector("script")).toBeNull();
+    expect(container.textContent).toContain("<script>alert('nope')</script>");
+    expect(container.querySelector("strong")?.textContent).toBe("safe");
+  });
+
+  it("preserves an intentional single line break in user prose", () => {
+    const { container } = render(
+      <MessageView
+        message={message("user", [{ kind: "text", text: "first line\nsecond line" }])}
+      />,
+    );
+
+    const paragraph = container.querySelector(".prose-pc--user p");
+    expect(paragraph?.textContent).toBe("first line\nsecond line");
+  });
+
   it("joins only the text blocks and ignores non-text blocks in the user bubble", () => {
     // Mixing a non-text block forces textOf's false ternary arm (returns "").
     const { container } = render(
@@ -76,7 +163,7 @@ describe("MessageView — user role", () => {
     const row = container.firstElementChild as HTMLElement;
     expect(row.className).toContain("justify-end");
     // The bubble exists but carries no text content.
-    const bubble = row.querySelector(".whitespace-pre-wrap") as HTMLElement;
+    const bubble = row.querySelector(".pc-bubble-user") as HTMLElement;
     expect(bubble).not.toBeNull();
     expect(bubble.textContent).toBe("");
   });

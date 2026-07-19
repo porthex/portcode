@@ -13,6 +13,10 @@ pub struct Settings {
     /// can add new levels without requiring a Portcode release.
     #[serde(default = "default_reasoning_effort")]
     pub reasoning_effort: String,
+    /// OpenAI processing tier. Kept as a narrow string for forward-compatible
+    /// settings files while the UI currently exposes standard and fast.
+    #[serde(default = "default_response_speed")]
+    pub response_speed: String,
     /// Derived from the OS credential store at read time; never the source of truth.
     #[serde(default)]
     pub api_key_set: bool,
@@ -53,6 +57,10 @@ fn default_reasoning_effort() -> String {
     "medium".into()
 }
 
+fn default_response_speed() -> String {
+    "standard".into()
+}
+
 fn default_auto_update() -> bool {
     true
 }
@@ -63,6 +71,7 @@ impl Default for Settings {
             provider: "anthropic".into(),
             model: "claude-opus-4-8".into(),
             reasoning_effort: default_reasoning_effort(),
+            response_speed: default_response_speed(),
             api_key_set: false,
             default_policy: "ask".into(),
             workspace: None,
@@ -115,6 +124,7 @@ mod tests {
         let s: Settings = serde_json::from_str(json).expect("legacy settings should deserialize");
         assert_eq!(s.default_policy, "allow");
         assert_eq!(s.reasoning_effort, "medium");
+        assert_eq!(s.response_speed, "standard");
         assert!(
             !s.typing_animation,
             "missing typingAnimation defaults to lag-free false"
@@ -136,6 +146,18 @@ mod tests {
         assert!(json.contains("\"reasoningEffort\":\"high\""));
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.reasoning_effort, "high");
+    }
+
+    #[test]
+    fn response_speed_is_camel_case_and_legacy_safe() {
+        let s = Settings {
+            response_speed: "fast".into(),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"responseSpeed\":\"fast\""));
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.response_speed, "fast");
     }
 
     #[test]

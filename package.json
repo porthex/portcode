@@ -31,11 +31,17 @@
     "prepare": "husky"
   },
   "dependencies": {
+    "@lexical/list": "^0.48.0",
+    "@lexical/markdown": "^0.48.0",
+    "@lexical/react": "^0.48.0",
+    "@lexical/rich-text": "^0.48.0",
+    "@lexical/utils": "^0.48.0",
     "@sentry/react": "^10.65.0",
     "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/plugin-barcode-scanner": "^2.4.5",
     "@tauri-apps/plugin-dialog": "^2.2.0",
     "@tauri-apps/plugin-opener": "^2.2.5",
+    "lexical": "^0.48.0",
     "qrcode.react": "^4.2.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
