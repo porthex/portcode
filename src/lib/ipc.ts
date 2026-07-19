@@ -839,6 +839,7 @@ const mock = (() => {
     provider: "anthropic",
     model: "claude-opus-4-8",
     reasoningEffort: "medium",
+    responseSpeed: "standard",
     apiKeySet: false,
     defaultPolicy: "ask",
     workspace: null,

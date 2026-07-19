@@ -132,6 +132,11 @@ fn save_settings(state: State<AppState>, settings: Value) -> Settings {
         if let Some(effort) = settings.get("reasoningEffort").and_then(|v| v.as_str()) {
             s.reasoning_effort = effort.to_string();
         }
+        if let Some(speed) = settings.get("responseSpeed").and_then(|v| v.as_str()) {
+            if matches!(speed, "standard" | "fast") {
+                s.response_speed = speed.to_string();
+            }
+        }
         if let Some(p) = settings.get("defaultPolicy").and_then(|v| v.as_str()) {
             s.default_policy = p.to_string();
         }

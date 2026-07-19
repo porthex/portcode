@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, act } from "@testing-library/react";
+import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
 
 import { Composer } from "./Composer";
 import { useStore } from "../store/store";
@@ -45,8 +45,7 @@ const run = (over: Partial<(typeof initial.runs)[string]> = {}): (typeof initial
 
 const sendButton = () => screen.getByTitle("Send (Enter)");
 const stopButton = () => screen.getByTitle("Stop");
-const textarea = () =>
-  screen.getByRole("textbox", { name: "Message Portcode" }) as HTMLTextAreaElement;
+const textarea = () => screen.getByRole("textbox", { name: "Message Portcode" });
 
 // Seed an active session with a draft (drafts are keyed by activeId now).
 const seedDraft = (text: string, id = "a") =>
@@ -77,17 +76,12 @@ const session = (over: Partial<Session> = {}): Session => ({
   ...over,
 });
 
-describe("Composer textarea", () => {
-  it("reflects the active session's draft and updates it on typing", () => {
+describe("Composer rich editor", () => {
+  it("reflects the active session's Markdown draft", () => {
     seedDraft("seed");
     render(<Composer />);
 
-    expect(textarea().value).toBe("seed");
-
-    // Typing routes through onChange -> setDraft (+ autoGrow), keyed by activeId.
-    fireEvent.change(textarea(), { target: { value: "hello world" } });
-    expect(useStore.getState().drafts.a).toBe("hello world");
-    expect(textarea().value).toBe("hello world");
+    expect(textarea()).toHaveTextContent("seed");
   });
 
   it("shows only the ACTIVE session's draft (no cross-session bleed)", () => {
@@ -95,24 +89,24 @@ describe("Composer textarea", () => {
     // appear in another. Two sessions hold distinct drafts; only the active shows.
     useStore.setState({ activeId: "a", drafts: { a: "draft A", b: "draft B" } });
     const { rerender } = render(<Composer />);
-    expect(textarea().value).toBe("draft A");
+    expect(textarea()).toHaveTextContent("draft A");
 
     act(() => useStore.setState({ activeId: "b" }));
     rerender(<Composer />);
-    expect(textarea().value).toBe("draft B");
+    expect(textarea()).toHaveTextContent("draft B");
   });
 
-  it("syncs the textarea height when the draft changes externally", () => {
+  it("syncs the editor when the draft changes externally", async () => {
     useStore.setState({ activeId: "a" });
     render(<Composer />);
     // Drives the [text] effect (height-sync) without going through onChange.
     act(() => {
       useStore.setState({ drafts: { a: "pasted from explorer" } });
     });
-    expect(textarea().value).toBe("pasted from explorer");
+    await waitFor(() => expect(textarea()).toHaveTextContent("pasted from explorer"));
   });
 
-  it("stays editable while a turn streams so the next message can be drafted", () => {
+  it("stays editable while a turn streams so the next message can be drafted", async () => {
     useStore.setState({ activeId: "a" });
     const { rerender } = render(<Composer />);
     // Idle (with an active session): keystrokes are accepted.
@@ -124,37 +118,56 @@ describe("Composer textarea", () => {
     rerender(<Composer />);
     expect(textarea()).toBeEnabled();
     expect(textarea()).toHaveAttribute(
-      "placeholder",
+      "aria-placeholder",
       "Draft your next message while Portcode works…",
     );
     // The shell owns the run state; the still-editable textbox is not mislabeled busy.
     expect(textarea().closest(".pc-neon-frame")).toHaveAttribute("aria-busy", "true");
-    fireEvent.change(textarea(), { target: { value: "next thought" } });
-    expect(useStore.getState().drafts.a).toBe("next thought");
+    act(() => useStore.setState({ drafts: { a: "next thought" } }));
+    await waitFor(() => expect(textarea()).toHaveTextContent("next thought"));
   });
 
   it("disables the input when there is no active session to draft into", () => {
     // Without an activeId, setDraft has nowhere to key the draft, so an enabled
     // field would silently eat keystrokes — disable it instead (honest dead-end).
     render(<Composer />);
-    expect(textarea()).toBeDisabled();
+    expect(textarea()).toHaveAttribute("contenteditable", "false");
+    expect(textarea()).toHaveAttribute("aria-readonly", "true");
     expect(screen.getByRole("status")).toHaveTextContent("Create or select a chat to start");
     expect(screen.getByRole("button", { name: "New chat" })).toBeEnabled();
   });
 
   it("uses a dedicated full-width writing surface with a compliant placeholder", () => {
     render(<Composer />);
-    const ta = textarea();
-    expect(ta.className).toContain("pc-composer-textarea");
-    expect(ta.className).toContain("disabled:opacity-60");
-    expect(ta.className).toContain("transition-[height,opacity,filter]");
-    expect(ta.className).toContain("motion-reduce:transition-none");
-    expect(ta.className).toContain("placeholder:text-muted");
+    const editor = textarea();
+    expect(editor).toHaveAttribute("contenteditable", "false");
+    expect(editor.className).toContain("pc-composer-editor");
+    expect(editor).toHaveAttribute("aria-placeholder", "Create or select a chat to begin…");
   });
 
   it("exposes an explicit accessible name (not just the placeholder)", () => {
     render(<Composer />);
     expect(screen.getByRole("textbox", { name: "Message Portcode" })).toBe(textarea());
+  });
+
+  it("teaches the supported formatting from a compact help button", () => {
+    render(<Composer />);
+    const help = screen.getByRole("button", { name: "Formatting help" });
+    fireEvent.click(help);
+
+    const guide = screen.getByRole("dialog", { name: "Message formatting" });
+    expect(guide).toHaveTextContent("- [ ] task");
+    expect(guide).toHaveTextContent("Tab");
+    expect(guide).toHaveTextContent("Shift+Tab");
+    expect(guide).toHaveTextContent("Shift+Enter");
+    expect(guide).toHaveTextContent("empty nested item it outdents");
+
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole("dialog", { name: "Message formatting" })).toBeNull();
+
+    fireEvent.click(help);
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Message formatting" })).toBeNull();
   });
 });
 
@@ -581,7 +594,10 @@ describe("Composer presence region", () => {
   it("keeps the keyboard contract discoverable and switches to drafting guidance while busy", () => {
     seedDraft("one line");
     const { rerender } = render(<Composer />);
-    expect(screen.getByText(/Enter to send · Shift\+Enter for a new line/)).toBeInTheDocument();
+    expect(screen.getByText("Enter").tagName).toBe("KBD");
+    expect(screen.getByText("Send")).toBeInTheDocument();
+    expect(screen.getByText("Shift+Enter").tagName).toBe("KBD");
+    expect(screen.getByText("New line")).toBeInTheDocument();
 
     act(() => useStore.setState({ streaming: true }));
     rerender(<Composer />);
@@ -597,7 +613,7 @@ describe("Composer UsageMeter", () => {
     render(<Composer />);
     expect(screen.getByRole("status").textContent).toContain("ready when you are");
     // The model lives in its labeled picker and is no longer repeated in telemetry.
-    expect(screen.getAllByText("Claude Opus 4.8")).toHaveLength(1);
+    expect(screen.getAllByText("Opus 4.8")).toHaveLength(1);
     expect(screen.queryByRole("group", { name: /Session usage/i })).toBeNull();
   });
 
@@ -679,7 +695,7 @@ describe("Composer permission dropdown", () => {
   it("shows every permission mode in clearly separated groups", () => {
     render(<Composer />);
 
-    expect(screen.getByText("Access")).toBeInTheDocument();
+    expect(screen.queryByText("Access")).not.toBeInTheDocument();
     const picker = screen.getByRole("combobox", { name: "Permission mode" });
     expect(picker).toHaveValue("default");
     expect(picker).toHaveTextContent("Ask");
@@ -753,7 +769,7 @@ describe("Composer permission dropdown", () => {
       "Plan only",
     );
     expect(textarea()).toHaveAttribute(
-      "placeholder",
+      "aria-placeholder",
       "Describe what you want planned — files will stay untouched…",
     );
   });
@@ -773,7 +789,7 @@ describe("Composer recovery", () => {
   });
 });
 
-describe("Composer ModelPicker", () => {
+describe("Composer run setup", () => {
   it("reflects the active session's model and groups options by provider", () => {
     useStore.setState({
       sessions: [session({ id: "a", model: "claude-opus-4-8" })],
@@ -782,17 +798,21 @@ describe("Composer ModelPicker", () => {
     });
     render(<Composer />);
 
-    const picker = screen.getByRole("combobox", { name: "Model" });
-    expect(screen.getByText("Chat model")).toBeInTheDocument();
-    expect(picker).toHaveAttribute("title", "Claude Opus 4.8");
-    expect(picker).toHaveValue("claude-opus-4-8");
+    const picker = screen.getByRole("button", { name: "Model, effort, and speed" });
+    expect(screen.queryByText("Chat model")).not.toBeInTheDocument();
+    expect(picker).toHaveTextContent("Opus 4.8");
     fireEvent.click(picker);
+    fireEvent.click(screen.getByRole("button", { name: /^Model:/ }));
     // Provider-grouped inside Portcode's themed listbox (not a native OS popup).
     expect(screen.getByRole("group", { name: "Anthropic · Claude" })).toBeInTheDocument();
     expect(
       screen.getByRole("group", { name: "OpenAI · ChatGPT subscription" }),
     ).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Claude Sonnet 4.6" })).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("listbox", { name: "Model" })).toBeNull();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(picker).toHaveAttribute("aria-expanded", "false");
   });
 
   it("changing the model updates the active session AND the last-used default", async () => {
@@ -803,7 +823,8 @@ describe("Composer ModelPicker", () => {
     });
     render(<Composer />);
 
-    fireEvent.click(screen.getByRole("combobox", { name: "Model" }));
+    fireEvent.click(screen.getByRole("button", { name: "Model, effort, and speed" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Model:/ }));
     fireEvent.click(screen.getByRole("option", { name: "Claude Sonnet 4.6" }));
 
     // setSessionModel updates the session synchronously, then awaits the
@@ -823,7 +844,7 @@ describe("Composer ModelPicker", () => {
       streaming: true,
     });
     render(<Composer />);
-    expect(screen.getByRole("combobox", { name: "Model" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Model, effort, and speed" })).toBeDisabled();
   });
 });
 
@@ -877,10 +898,11 @@ describe("Composer OpenAI auth and reasoning", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Disabled in this build");
     expect(screen.getByRole("button", { name: "Open settings" })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("combobox", { name: "Model" }));
+    fireEvent.click(screen.getByRole("button", { name: "Model, effort, and speed" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Model:/ }));
     expect(screen.queryByRole("group", { name: /OpenAI/ })).not.toBeInTheDocument();
     expect(screen.getByRole("group", { name: /Anthropic/ })).toBeInTheDocument();
-    expect(screen.queryByRole("combobox", { name: "Reasoning level" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("listbox", { name: "Reasoning level" })).not.toBeInTheDocument();
   });
 
   it("enables sends when signed in and renders only advertised reasoning levels", () => {
@@ -900,12 +922,43 @@ describe("Composer OpenAI auth and reasoning", () => {
     render(<Composer />);
 
     expect(sendButton()).toBeEnabled();
-    const picker = screen.getByRole("combobox", { name: "Reasoning level" });
-    expect(screen.getByText("Thinking default")).toBeInTheDocument();
-    expect(picker).toHaveAttribute("title", "Default reasoning level across chats");
+    const picker = screen.getByRole("button", { name: "Model, effort, and speed" });
+    expect(screen.queryByText("Thinking default")).not.toBeInTheDocument();
+    expect(picker).toHaveTextContent("Live");
+    expect(picker).toHaveTextContent("High");
     fireEvent.click(picker);
+    fireEvent.click(screen.getByRole("button", { name: /^Effort:/ }));
     expect(screen.getAllByRole("option", { name: /Minimal|High|Ultra/ })).toHaveLength(3);
-    expect(picker).toHaveValue("high");
+    expect(screen.getByRole("option", { name: "High" })).toHaveAttribute("aria-selected", "true");
+    fireEvent.click(screen.getByRole("option", { name: "Minimal" }));
+    expect(m.saveSettings).toHaveBeenCalledWith({ reasoningEffort: "minimal" });
+  });
+
+  it("offers Fast with an explicit speed and usage tradeoff", async () => {
+    useStore.setState({
+      sessions: [session({ model: "gpt-live" })],
+      activeId: "a",
+      openAIModels: [openAIModel],
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: "gpt-live",
+        reasoningEffort: "high",
+      },
+    });
+    render(<Composer />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Model, effort, and speed" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Speed:/ }));
+    expect(screen.getByRole("option", { name: /Fast/ })).toHaveTextContent(
+      "1.5x speed, more usage",
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("option", { name: /Fast/ }));
+    });
+    expect(m.saveSettings).toHaveBeenCalledWith({ responseSpeed: "fast" });
+    expect(useStore.getState().settings.responseSpeed).toBe("fast");
+    expect(screen.queryByText("Advanced")).not.toBeInTheDocument();
   });
 
   it("keeps remote sends available because subscription auth lives on the desktop", () => {
@@ -922,8 +975,8 @@ describe("Composer OpenAI auth and reasoning", () => {
     render(<Composer />);
 
     expect(sendButton()).toBeEnabled();
-    expect(screen.queryByRole("combobox", { name: "Model" })).toBeNull();
-    expect(screen.queryByRole("combobox", { name: "Reasoning level" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Model, effort, and speed" })).toBeNull();
+    expect(screen.queryByRole("listbox", { name: "Reasoning level" })).toBeNull();
   });
 
   it("does not bypass authentication while remote mode is disconnected", () => {

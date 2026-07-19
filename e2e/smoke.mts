@@ -20,6 +20,8 @@ type JourneyState = {
   modelMenuOpened: boolean;
   settingsClosed: boolean;
   composerAcceptedDraft: boolean;
+  composerNestedList: boolean;
+  composerTabEscaped: boolean;
   fatalFallbackVisible: boolean;
 };
 
@@ -30,7 +32,14 @@ type CdpResponse = {
 };
 
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const application = path.join(projectRoot, "src-tauri", "target", "debug", "portcode.exe");
+const skipBuild = process.env.PORTCODE_E2E_SKIP_BUILD === "1";
+// Keep the smoke binary separate from the user's normal debug build. Windows
+// cannot replace a running executable, and dogfooding commonly leaves the
+// stable `target/debug/portcode.exe` open while this journey runs. CI prebuilds
+// that standard target and opts out of the script-owned build, so reuse it when
+// PORTCODE_E2E_SKIP_BUILD=1 instead of looking for a binary CI never produced.
+const cargoTarget = path.join(projectRoot, "src-tauri", "target", ...(skipBuild ? [] : ["e2e"]));
+const application = path.join(cargoTarget, "debug", "portcode.exe");
 const logs: string[] = [];
 let appProcess: ChildProcess | undefined;
 let appPid: number | undefined;
@@ -197,6 +206,93 @@ const inspectUi = async (socket: WebSocket) => {
     throw new Error(`${label} did not become ready: ${JSON.stringify(value)}`);
   };
 
+  const exitEmptyComposerLists = async () => {
+    for (let depth = 0; depth < 7; depth += 1) {
+      const hasList = await evaluate<boolean>(
+        `!!document.querySelector('[contenteditable="true"][aria-label="Message Portcode"] li')`,
+      );
+      if (!hasList) break;
+      await send("Input.dispatchKeyEvent", {
+        type: "keyDown",
+        key: "Enter",
+        code: "Enter",
+        modifiers: 8,
+        windowsVirtualKeyCode: 13,
+        nativeVirtualKeyCode: 13,
+      });
+      await send("Input.dispatchKeyEvent", {
+        type: "keyUp",
+        key: "Enter",
+        code: "Enter",
+        modifiers: 8,
+        windowsVirtualKeyCode: 13,
+        nativeVirtualKeyCode: 13,
+      });
+    }
+    await waitForValue<boolean>(
+      "Composer paragraph reset",
+      `(() => {
+        const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+        return !!composer && composer.textContent === '' && !composer.querySelector('li');
+      })()`,
+      Boolean,
+    );
+  };
+
+  const selectAllComposer = async () => {
+    const focused = await evaluate<boolean>(`(() => {
+      const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+      if (!(composer instanceof HTMLElement)) return false;
+      composer.focus();
+      return true;
+    })()`);
+    if (!focused) throw new Error("Could not focus the composer for selection.");
+    await send("Input.dispatchKeyEvent", {
+      type: "rawKeyDown",
+      key: "a",
+      code: "KeyA",
+      modifiers: 2,
+      windowsVirtualKeyCode: 65,
+      nativeVirtualKeyCode: 65,
+    });
+    await send("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key: "a",
+      code: "KeyA",
+      modifiers: 2,
+      windowsVirtualKeyCode: 65,
+      nativeVirtualKeyCode: 65,
+    });
+    await waitForValue<boolean>(
+      "Composer select all",
+      `(() => {
+        const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+        const selection = getSelection();
+        return !!composer && !!selection && selection.toString().replace(/[\\r\\n]/g, '') === composer.textContent;
+      })()`,
+      Boolean,
+    );
+  };
+
+  const typeComposerKey = async (key: string, code: string, windowsVirtualKeyCode: number) => {
+    await send("Input.dispatchKeyEvent", {
+      type: "keyDown",
+      key,
+      code,
+      text: key,
+      unmodifiedText: key,
+      windowsVirtualKeyCode,
+      nativeVirtualKeyCode: windowsVirtualKeyCode,
+    });
+    await send("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key,
+      code,
+      windowsVirtualKeyCode,
+      nativeVirtualKeyCode: windowsVirtualKeyCode,
+    });
+  };
+
   const deadline = Date.now() + 30000;
   let state: RenderState | undefined;
   while (Date.now() < deadline) {
@@ -270,33 +366,42 @@ const inspectUi = async (socket: WebSocket) => {
   await waitForValue<boolean>(
     "Composer readiness",
     `(() => {
-      const composer = document.querySelector('textarea[aria-label="Message Portcode"]');
-      return composer instanceof HTMLTextAreaElement && !composer.disabled;
+      const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+      return composer instanceof HTMLElement && composer.isContentEditable;
     })()`,
     Boolean,
     30000,
   );
   const composerFocused = await evaluate<boolean>(`(() => {
-      const composer = document.querySelector('textarea[aria-label="Message Portcode"]');
-      if (!(composer instanceof HTMLTextAreaElement)) return false;
+      const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+      if (!(composer instanceof HTMLElement)) return false;
       composer.focus();
-      composer.select();
+      const selection = getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(composer);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
       return true;
     })()`);
   if (!composerFocused) throw new Error("Could not find the controlled composer.");
   await send("Input.insertText", { text: "Portcode E2E draft — never sent" });
   const composerAcceptedDraft = await waitForValue<boolean>(
     "Composer draft",
-    `document.querySelector('textarea[aria-label="Message Portcode"]')?.value === 'Portcode E2E draft — never sent'`,
+    `document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]')?.textContent === 'Portcode E2E draft — never sent'`,
     Boolean,
   );
   await evaluate(`(() => {
-      const composer = document.querySelector('textarea[aria-label="Message Portcode"]');
-      if (!(composer instanceof HTMLTextAreaElement)) return false;
+      const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+      if (!(composer instanceof HTMLElement)) return false;
       composer.focus();
-      composer.select();
+      const selection = getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(composer);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
       return true;
     })()`);
+  await selectAllComposer();
   await send("Input.dispatchKeyEvent", {
     type: "keyDown",
     key: "Backspace",
@@ -313,9 +418,189 @@ const inspectUi = async (socket: WebSocket) => {
   });
   await waitForValue<boolean>(
     "Composer clear",
-    `document.querySelector('textarea[aria-label="Message Portcode"]')?.value === ''`,
+    `document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]')?.textContent === ''`,
     Boolean,
   );
+  await exitEmptyComposerLists();
+
+  // Exercise the real contenteditable keyboard path: live Markdown shortcut,
+  // list continuation, Tab indentation, and normal focus escape outside lists.
+  await typeComposerKey("-", "Minus", 189);
+  await typeComposerKey(" ", "Space", 32);
+  await waitForValue<boolean>(
+    "Composer bullet shortcut",
+    `(() => {
+      const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+      return !!composer && document.activeElement === composer && !!composer.querySelector('ul > li');
+    })()`,
+    Boolean,
+  );
+  await send("Input.insertText", { text: "parent" });
+  await waitForValue<boolean>(
+    "Composer first list item",
+    `(() => {
+      const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+      const item = composer?.querySelector('ul > li');
+      return !!composer && document.activeElement === composer && item?.textContent === 'parent';
+    })()`,
+    Boolean,
+  );
+  await send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "Enter",
+    code: "Enter",
+    modifiers: 8,
+    windowsVirtualKeyCode: 13,
+    nativeVirtualKeyCode: 13,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Enter",
+    code: "Enter",
+    modifiers: 8,
+    windowsVirtualKeyCode: 13,
+    nativeVirtualKeyCode: 13,
+  });
+  await waitForValue<boolean>(
+    "Composer continued list",
+    `(() => {
+      const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+      const items = composer?.querySelectorAll('ul > li');
+      return !!composer && document.activeElement === composer && items?.length === 2;
+    })()`,
+    Boolean,
+  );
+  await send("Input.insertText", { text: "child" });
+  await waitForValue<boolean>(
+    "Composer second list item",
+    `(() => {
+      const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+      const items = composer?.querySelectorAll('ul > li');
+      return !!composer && document.activeElement === composer && items?.length === 2 && items[1]?.textContent === 'child';
+    })()`,
+    Boolean,
+  );
+  await send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "Tab",
+    code: "Tab",
+    windowsVirtualKeyCode: 9,
+    nativeVirtualKeyCode: 9,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Tab",
+    code: "Tab",
+    windowsVirtualKeyCode: 9,
+    nativeVirtualKeyCode: 9,
+  });
+  const nestedState = await waitForValue<{
+    focused: boolean;
+    html: string;
+    nested: boolean;
+    text: string;
+  }>(
+    "Composer nested list",
+    `(() => {
+      const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+      return {
+        focused: document.activeElement === composer,
+        html: composer?.innerHTML ?? '',
+        nested: !!composer?.querySelector('ul ul'),
+        text: composer?.textContent ?? '',
+      };
+    })()`,
+    (value) => !!value?.focused && !!value.nested && value.text === "parentchild",
+  );
+  const composerNestedList = nestedState.nested;
+
+  await evaluate(`(() => {
+      const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+      if (!(composer instanceof HTMLElement)) return false;
+      composer.focus();
+      const selection = getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(composer);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      return true;
+    })()`);
+  await selectAllComposer();
+  await send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "Backspace",
+    code: "Backspace",
+    windowsVirtualKeyCode: 8,
+    nativeVirtualKeyCode: 8,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Backspace",
+    code: "Backspace",
+    windowsVirtualKeyCode: 8,
+    nativeVirtualKeyCode: 8,
+  });
+  await waitForValue<boolean>(
+    "Composer nested-list clear",
+    `document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]')?.textContent === ''`,
+    Boolean,
+  );
+  await exitEmptyComposerLists();
+  await send("Input.insertText", { text: "plain" });
+  await send("Input.dispatchKeyEvent", {
+    type: "rawKeyDown",
+    key: "Tab",
+    code: "Tab",
+    windowsVirtualKeyCode: 9,
+    nativeVirtualKeyCode: 9,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Tab",
+    code: "Tab",
+    windowsVirtualKeyCode: 9,
+    nativeVirtualKeyCode: 9,
+  });
+  const composerTabEscaped = await waitForValue<boolean>(
+    "Composer Tab focus escape",
+    `(() => {
+      const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+      return !!composer && document.activeElement !== composer && composer.textContent === 'plain';
+    })()`,
+    Boolean,
+  );
+  await evaluate(`(() => {
+      const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+      if (!(composer instanceof HTMLElement)) return false;
+      composer.focus();
+      const selection = getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(composer);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      return true;
+    })()`);
+  await selectAllComposer();
+  await send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "Backspace",
+    code: "Backspace",
+    windowsVirtualKeyCode: 8,
+    nativeVirtualKeyCode: 8,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Backspace",
+    code: "Backspace",
+    windowsVirtualKeyCode: 8,
+    nativeVirtualKeyCode: 8,
+  });
+  await waitForValue<boolean>(
+    "Composer final clear",
+    `document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]')?.textContent === ''`,
+    Boolean,
+  );
+  await exitEmptyComposerLists();
 
   const fatalFallbackVisible = Boolean(
     await evaluate<boolean>(`(() => {
@@ -331,6 +616,8 @@ const inspectUi = async (socket: WebSocket) => {
     modelMenuOpened,
     settingsClosed,
     composerAcceptedDraft,
+    composerNestedList,
+    composerTabEscaped,
     fatalFallbackVisible,
   } satisfies RenderState & JourneyState;
 };
@@ -339,7 +626,7 @@ const main = async () => {
   if (process.platform !== "win32") {
     throw new Error("The desktop smoke test currently supports Windows only.");
   }
-  if (!process.env.PORTCODE_E2E_SKIP_BUILD) {
+  if (!skipBuild) {
     const pnpmCli = process.env.npm_execpath;
     if (!pnpmCli) throw new Error("pnpm did not provide npm_execpath.");
     const build = spawnSync(
@@ -353,7 +640,11 @@ const main = async () => {
         "--debug",
         "--no-bundle",
       ],
-      { cwd: projectRoot, stdio: "inherit" },
+      {
+        cwd: projectRoot,
+        env: { ...process.env, CARGO_TARGET_DIR: cargoTarget },
+        stdio: "inherit",
+      },
     );
     if (build.status !== 0) {
       throw new Error(`Debug app build failed (exit ${build.status ?? "unknown"}).`);
