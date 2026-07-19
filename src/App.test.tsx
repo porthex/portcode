@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import App from "./App";
 import { useStore } from "./store/store";
@@ -125,6 +126,10 @@ vi.mock("./lib/telemetry", () => ({
   telemetryConfigured: vi.fn(() => false),
 }));
 
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: vi.fn(),
+}));
+
 // `isTauri` is consumed by App's TitleBar; the rest of the surface is what the
 // store's `init()` path invokes. A single mock of this module covers both the
 // component import and the store's `import * as ipc`. The factory is hoisted, so
@@ -165,6 +170,7 @@ vi.mock("./lib/ipc", () => ({
 }));
 
 const m = vi.mocked(ipc);
+const currentWindow = vi.mocked(getCurrentWindow);
 const initialState = useStore.getState();
 
 beforeEach(() => {
@@ -206,6 +212,11 @@ beforeEach(() => {
   m.onUpdaterEvent.mockResolvedValue(() => {});
   m.getUpdateChannel.mockResolvedValue("stable");
   m.checkForUpdate.mockResolvedValue(null);
+  currentWindow.mockReturnValue({
+    minimize: vi.fn().mockResolvedValue(undefined),
+    toggleMaximize: vi.fn().mockResolvedValue(undefined),
+    close: vi.fn().mockResolvedValue(undefined),
+  } as never);
 });
 
 describe("App layout", () => {
@@ -636,6 +647,52 @@ describe("TitleBar", () => {
     render(<App />);
 
     expect(screen.queryByText("PREVIEW MODE")).not.toBeInTheDocument();
+  });
+
+  it("uses inline Portcode window controls in the desktop title bar", () => {
+    m.isTauri.mockReturnValue(true);
+
+    render(<App />);
+
+    expect(screen.getByRole("button", { name: "Minimize window" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Maximize or restore window" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Close window" })).toBeInTheDocument();
+  });
+
+  it("runs inline window controls and makes the non-interactive title bar draggable", () => {
+    m.isTauri.mockReturnValue(true);
+    const nativeWindow = {
+      minimize: vi.fn().mockResolvedValue(undefined),
+      toggleMaximize: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    currentWindow.mockReturnValue(nativeWindow as never);
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Minimize window" }));
+    fireEvent.click(screen.getByRole("button", { name: "Maximize or restore window" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close window" }));
+
+    expect(nativeWindow.minimize).toHaveBeenCalledOnce();
+    expect(nativeWindow.toggleMaximize).toHaveBeenCalledOnce();
+    expect(nativeWindow.close).toHaveBeenCalledOnce();
+    expect(screen.getByText("New chat").closest("header")).toHaveAttribute(
+      "data-tauri-drag-region",
+      "deep",
+    );
+    expect(screen.getByRole("button", { name: "Minimize window" })).toHaveAttribute(
+      "data-tauri-drag-region",
+      "false",
+    );
+  });
+
+  it("keeps desktop window controls out of the browser preview", () => {
+    m.isTauri.mockReturnValue(false);
+
+    render(<App />);
+
+    expect(screen.queryByRole("button", { name: "Minimize window" })).not.toBeInTheDocument();
   });
 
   it("toggles the file explorer via the TitleBar button", () => {
