@@ -49,12 +49,48 @@ export type Block = { type: "text"; text: string } | { type: "tool_use"; id: str
  * (it is forwarded verbatim inside `protocol::SyncFrame::Live`).
  * (Was `crate::llm::StreamEvent`.)
  */
-export type StreamEvent = { type: "turn_start"; messageId: string } | { type: "text_delta"; text: string } | { type: "tool_use"; id: string; name: string; input: Value } | { type: "tool_result"; id: string; output: string; isError: boolean } | { type: "permission_request"; id: string; tool: string; summary: string; input: Value; diff?: string } | { type: "usage"; inputTokens: number; outputTokens: number } | { type: "turn_end"; stopReason: string } | { type: "error"; message: string } | { type: "agent_started"; agentId: string; description: string; parentId?: string } | { type: "agent_progress"; agentId: string; step: number } | { type: "agent_finished"; agentId: string; status: string } | { type: "background_task_started"; id: string; command: string } | { type: "background_task_finished"; id: string; command: string; exitCode: number; output: string };
+export type StreamEvent = { type: "turn_start"; messageId: string; turnId?: string; startedAt?: number } | { type: "text_delta"; text: string } | { type: "tool_use"; id: string; name: string; input: Value } | { type: "tool_result"; id: string; output: string; isError: boolean } | { type: "permission_request"; id: string; tool: string; summary: string; input: Value; diff?: string } | { type: "usage"; inputTokens: number; outputTokens: number } | { type: "turn_end"; stopReason: string; receipt?: TurnReceipt } | { type: "error"; message: string; receipt?: TurnReceipt } | { type: "agent_started"; agentId: string; description: string; parentId?: string } | { type: "agent_progress"; agentId: string; step: number } | { type: "agent_finished"; agentId: string; status: string } | { type: "background_task_started"; id: string; command: string } | { type: "background_task_finished"; id: string; command: string; exitCode: number; output: string };
 
 /**
  * Everything that crosses the encrypted channel, in both directions.
  */
 export type SyncFrame = { t: "hello"; device_id: string; cursors: Cursor[] } | { t: "session_list"; sessions: SessionRow[] } | { t: "message_delta"; session_id: string; messages: MessageRow[] } | { t: "message_page"; session_id: string; messages: MessageRow[]; has_more: boolean } | { t: "live"; session_id: string; event: StreamEvent } | { t: "command"; command: RemoteCommand } | { t: "ack"; session_id: string; seq: number } | { t: "pairing_reject"; reason: string | null };
+
+/**
+ * Git-shaped status used by the immutable, bounded changed-file summary.
+ */
+export type TurnFileStatus = "added" | "modified" | "deleted" | "renamed" | "copied" | "unmerged";
+
+/**
+ * How confidently a receipt can attribute an observed file delta to the turn.
+ */
+export type TurnChangeCertainty = "exact" | "observed" | "ambiguous" | "unavailable";
+
+/**
+ * Immutable terminal summary attached to the assistant bubble both live and
+ * after a database reload. Changed files are deliberately bounded; counts and
+ * totals describe the complete observed delta when capture succeeded.
+ */
+export interface TurnReceipt {
+    turnId: string;
+    status: TurnStatus;
+    stopReason?: string;
+    startedAt: number;
+    completedAt: number;
+    /**
+     * Monotonic elapsed time for a normally terminalized turn. Omitted when a
+     * pending row is recovered after process restart because the crash instant is
+     * unknowable and fabricating a near-zero duration would be misleading.
+     */
+    durationMs?: number;
+    changedFiles: TurnChangedFile[];
+    changedFileCount: number;
+    additions: number;
+    deletions: number;
+    filesTruncated: boolean;
+    changeCertainty: TurnChangeCertainty;
+    backgroundTasksRunning: boolean;
+}
 
 /**
  * One end\'s high-water mark for a session: \"I already hold every message up to
@@ -64,6 +100,19 @@ export type SyncFrame = { t: "hello"; device_id: string; cursors: Cursor[] } | {
 export interface Cursor {
     sessionId: string;
     seq: number;
+}
+
+/**
+ * One path whose terminal workspace identity differed from the turn baseline.
+ */
+export interface TurnChangedFile {
+    path: string;
+    oldPath?: string;
+    status: TurnFileStatus;
+    additions?: number;
+    deletions?: number;
+    binary: boolean;
+    certainty: TurnChangeCertainty;
 }
 
 /**
@@ -79,7 +128,24 @@ export interface MessageRow {
     role: string;
     content: Block[];
     createdAt: number;
+    /**
+     * NULL/omitted on legacy rows. New rows use this to rebuild the same single
+     * assistant bubble that live `TurnStart` created.
+     */
+    turnId?: string;
+    /**
+     * Attached to the terminal row of a replicated turn. Desktop `UiMessage`
+     * carries the same receipt directly on the grouped assistant bubble.
+     */
+    receipt?: TurnReceipt;
 }
+
+/**
+ * Terminal state of one root agent turn. `Interrupted` is persisted when a
+ * process dies after the durable turn row was created but before a terminal
+ * event could be emitted.
+ */
+export type TurnStatus = "completed" | "cancelled" | "error" | "interrupted";
 
 
 export class IntoUnderlyingByteSource {
