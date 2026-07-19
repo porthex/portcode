@@ -274,6 +274,25 @@ const inspectUi = async (socket: WebSocket) => {
     );
   };
 
+  const typeComposerKey = async (key: string, code: string, windowsVirtualKeyCode: number) => {
+    await send("Input.dispatchKeyEvent", {
+      type: "keyDown",
+      key,
+      code,
+      text: key,
+      unmodifiedText: key,
+      windowsVirtualKeyCode,
+      nativeVirtualKeyCode: windowsVirtualKeyCode,
+    });
+    await send("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key,
+      code,
+      windowsVirtualKeyCode,
+      nativeVirtualKeyCode: windowsVirtualKeyCode,
+    });
+  };
+
   const deadline = Date.now() + 30000;
   let state: RenderState | undefined;
   while (Date.now() < deadline) {
@@ -406,8 +425,8 @@ const inspectUi = async (socket: WebSocket) => {
 
   // Exercise the real contenteditable keyboard path: live Markdown shortcut,
   // list continuation, Tab indentation, and normal focus escape outside lists.
-  await send("Input.insertText", { text: "-" });
-  await send("Input.insertText", { text: " " });
+  await typeComposerKey("-", "Minus", 189);
+  await typeComposerKey(" ", "Space", 32);
   await waitForValue<boolean>(
     "Composer bullet shortcut",
     `(() => {
