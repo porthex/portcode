@@ -57,6 +57,12 @@ const REVIEW_SCOPE_GROUPS: SelectMenuGroup[] = [
   },
 ];
 
+const REVIEW_SCOPE_HINTS: Partial<Record<ScopeKind, string>> = {
+  workingTree: "All local changes",
+  staged: "Changes ready to commit",
+  unstaged: "Changes not yet staged",
+};
+
 export function ReviewWorkspace({ active = true }: { active?: boolean }) {
   const workspace = useStore((state) => state.settings.workspace);
   const activeId = useStore((state) => state.activeId);
@@ -65,7 +71,16 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
   );
   const setDraft = useStore((state) => state.setDraft);
   const setWorkspaceSurface = useStore((state) => state.setWorkspaceSurface);
-  const streaming = useStore((state) => state.streaming);
+  const terminalReceiptKey = useStore((state) =>
+    Object.entries(state.runs)
+      .flatMap(([sessionId, run]) =>
+        run.receipt
+          ? [`${sessionId}:${run.receipt.turnId}:${run.receipt.status}:${run.receipt.stopReason}`]
+          : [],
+      )
+      .sort()
+      .join("|"),
+  );
   const reviewTarget = useStore((state) => state.reviewTarget);
   const isTurnReview = reviewTarget.kind === "turn";
 
@@ -96,7 +111,7 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
   const manifestQueued = useRef(false);
   const patchRequest = useRef(0);
   const branchRequest = useRef(0);
-  const previousStreaming = useRef(streaming);
+  const previousTerminalReceiptKey = useRef(terminalReceiptKey);
   const previousActive = useRef(active);
   const activeRef = useRef(active);
   activeRef.current = active;
@@ -269,9 +284,11 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
   }, [active, refresh]);
 
   useEffect(() => {
-    if (active && !isTurnReview && previousStreaming.current && !streaming) void refresh();
-    previousStreaming.current = streaming;
-  }, [active, isTurnReview, streaming, refresh]);
+    if (active && !isTurnReview && previousTerminalReceiptKey.current !== terminalReceiptKey) {
+      void refresh();
+    }
+    previousTerminalReceiptKey.current = terminalReceiptKey;
+  }, [active, isTurnReview, terminalReceiptKey, refresh]);
 
   useEffect(() => {
     if (!active) return;
@@ -393,27 +410,48 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
       aria-label={isTurnReview ? "Turn changes" : "Review workspace"}
       className="flex min-h-0 flex-1 flex-col overflow-hidden bg-bg/80"
     >
-      <header className="flex min-h-[54px] shrink-0 flex-nowrap items-center gap-2 overflow-x-auto border-b border-border bg-panel/75 px-3 py-2">
-        <div className="mr-1 min-w-[150px] flex-1">
-          <div className="font-mono text-[9px] uppercase tracking-[0.18em] text-accent-2">
-            {isTurnReview ? "Turn changes" : "Review workspace"}
+      <header className="shrink-0 border-b border-border bg-panel/75">
+        <div data-testid="review-header-primary" className="flex h-[46px] items-center gap-3 px-3">
+          <div data-testid="review-header-title" className="min-w-0 flex-1">
+            <div className="font-mono text-[9px] uppercase tracking-[0.18em] text-accent-2">
+              {isTurnReview ? "Turn changes" : "Review workspace"}
+            </div>
+            <div className="truncate text-[11px] text-faint" title={manifest?.repositoryRoot}>
+              {manifest?.repositoryRoot ?? workspace ?? "Current directory"}
+            </div>
           </div>
-          <div className="truncate text-[11px] text-faint" title={manifest?.repositoryRoot}>
-            {manifest?.repositoryRoot ?? workspace ?? "Current directory"}
-          </div>
+          {isTurnReview ? (
+            <ReviewSummary manifest={manifest} className="w-[min(420px,50%)]" />
+          ) : (
+            <button
+              type="button"
+              aria-label="Refresh review"
+              onClick={() => {
+                void refresh();
+                if (scopeKind === "branch") void loadBranches();
+              }}
+              disabled={refreshing}
+              className="shrink-0 rounded-md border border-border-2 px-2.5 py-1.5 text-[11px] text-muted outline-none hover:border-accent-2/50 hover:text-fg focus-visible:ring-2 focus-visible:ring-accent-2/25 disabled:opacity-50"
+            >
+              {refreshing ? "Refreshing…" : "Refresh"}
+            </button>
+          )}
         </div>
         {!isTurnReview && (
-          <>
+          <div
+            data-testid="review-header-controls"
+            className="grid min-h-[44px] grid-cols-[142px_minmax(240px,1fr)_minmax(210px,0.8fr)] items-center gap-2 border-t border-border/60 px-3 py-1.5"
+          >
             <SelectMenu
               id="review-scope"
               label="Review scope"
               value={scopeKind}
               groups={REVIEW_SCOPE_GROUPS}
               onChange={(value) => chooseScopeKind(value as ScopeKind)}
-              className="w-[142px] shrink-0"
+              className="w-full"
               buttonClassName="rounded-md px-2.5 py-1.5 text-[11px]"
             />
-            <div data-testid="review-scope-control" className="min-w-[240px] flex-1">
+            <div data-testid="review-scope-control" className="min-w-0">
               {scopeKind === "branch" ? (
                 <SelectMenu
                   label="Base branch"
@@ -443,40 +481,15 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
                     Apply
                   </button>
                 </form>
-              ) : null}
+              ) : (
+                <div className="flex h-[30px] items-center px-2.5 font-mono text-[10px] text-faint">
+                  {REVIEW_SCOPE_HINTS[scopeKind]}
+                </div>
+              )}
             </div>
-          </>
-        )}
-        {manifest && (
-          <div className="flex shrink-0 items-center gap-2 font-mono text-[10px]">
-            <span className="hidden max-w-[250px] truncate text-faint min-[900px]:inline">
-              {manifest.baseLabel} → {manifest.targetLabel}
-            </span>
-            <span className="text-success">+{manifest.additions}</span>
-            <span className="text-danger">−{manifest.deletions}</span>
+            <ReviewSummary manifest={manifest} />
           </div>
         )}
-        {!isTurnReview && (
-          <button
-            type="button"
-            aria-label="Refresh review"
-            onClick={() => {
-              void refresh();
-              if (scopeKind === "branch") void loadBranches();
-            }}
-            disabled={refreshing}
-            className="shrink-0 rounded-md border border-border-2 px-2.5 py-1.5 text-[11px] text-muted outline-none hover:border-accent-2/50 hover:text-fg focus-visible:ring-2 focus-visible:ring-accent-2/25 disabled:opacity-50"
-          >
-            {refreshing ? "Refreshing…" : "Refresh"}
-          </button>
-        )}
-        <button
-          type="button"
-          onClick={() => setWorkspaceSurface("chat")}
-          className="shrink-0 rounded-md px-2 py-1.5 text-[11px] text-faint outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-accent-2/25"
-        >
-          Back to chat
-        </button>
       </header>
 
       <span className="sr-only" role="status" aria-live="polite">
@@ -602,6 +615,34 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
         </div>
       )}
     </section>
+  );
+}
+
+function ReviewSummary({
+  manifest,
+  className = "",
+}: {
+  manifest: GitReviewManifest | null;
+  className?: string;
+}) {
+  return (
+    <div
+      data-testid="review-header-summary"
+      className={`flex h-[30px] min-w-0 items-center justify-end gap-2 rounded-md border border-border/60 bg-bg/35 px-2.5 font-mono text-[10px] ${className}`}
+    >
+      {manifest && (
+        <>
+          <span
+            className="min-w-0 flex-1 truncate text-right text-faint"
+            title={`${manifest.baseLabel} → ${manifest.targetLabel}`}
+          >
+            {manifest.baseLabel} → {manifest.targetLabel}
+          </span>
+          <span className="shrink-0 text-success">+{manifest.additions}</span>
+          <span className="shrink-0 text-danger">−{manifest.deletions}</span>
+        </>
+      )}
+    </div>
   );
 }
 
