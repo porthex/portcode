@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { useStore } from "../store/store";
 import { MessageView } from "./Message";
 import { Composer } from "./Composer";
@@ -19,6 +19,10 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
   const activeId = useStore((s) => s.activeId);
   const messages = useStore((s) => (activeId && s.messages[activeId]) || EMPTY);
   const streaming = useStore((s) => s.streaming);
+  const activeRun = useStore((s) => (s.activeId ? s.runs[s.activeId] : undefined));
+  const activeAgents = useStore((s) => (s.activeId ? s.agents[s.activeId] : undefined));
+  const remoteMode = useStore((s) => s.remoteMode);
+  const openTurnReview = useStore((s) => s.openTurnReview);
   const initError = useStore((s) => s.initError);
   const loadError = useStore((s) => (activeId ? s.loadErrors[activeId] : false));
   const retryInit = useStore((s) => s.retryInit);
@@ -144,6 +148,10 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
   }, [streaming]);
 
   const lastIndex = messages.length - 1;
+  const reviewTurn = useCallback(
+    (receipt: NonNullable<Message["receipt"]>) => openTurnReview(receipt.turnId),
+    [openTurnReview],
+  );
 
   const scrollToBottom = () => {
     const el = scrollRef.current;
@@ -189,13 +197,36 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
               ) : messages.length === 0 ? (
                 <EmptyState />
               ) : (
-                messages.map((m, i) => (
-                  <MessageView
-                    key={m.id}
-                    message={m}
-                    isActive={streaming && i === lastIndex && m.role === "assistant"}
-                  />
-                ))
+                messages.map((m, i) => {
+                  const isActiveAssistant = streaming && i === lastIndex && m.role === "assistant";
+                  const isRunMessage =
+                    m.role === "assistant" &&
+                    Boolean(
+                      activeRun?.turnId &&
+                      (m.turnId === activeRun.turnId || m.id === activeRun.turnId),
+                    );
+                  const run = isRunMessage ? activeRun : undefined;
+                  const turnPresentation =
+                    run && (run.streaming || run.finalizing)
+                      ? {
+                          active: run.streaming,
+                          startedAt: run.startedAt,
+                          waiting: run.pendingPermission !== null,
+                          finalizing: run.finalizing,
+                        }
+                      : undefined;
+                  return (
+                    <MessageView
+                      key={m.id}
+                      message={m}
+                      isActive={isActiveAssistant}
+                      turnPresentation={turnPresentation}
+                      agents={isRunMessage ? activeAgents : undefined}
+                      onReviewChanges={reviewTurn}
+                      reviewAvailable={!remoteMode}
+                    />
+                  );
+                })
               )}
             </div>
           </div>

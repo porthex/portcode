@@ -26,6 +26,8 @@ import type {
   Settings,
   StreamEvent,
   SyncFrame,
+  TurnReceipt,
+  TurnReviewManifest,
   UpdateChannel,
   UpdateInfo,
   WorkspaceSummary,
@@ -588,6 +590,24 @@ export async function getGitReviewFile(
   return mock.getGitReviewFile(scope, snapshotId, path);
 }
 
+/** Load the durable changed-file manifest captured for one completed turn. */
+export async function getTurnReviewManifest(turnId: string): Promise<TurnReviewManifest> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<TurnReviewManifest>("get_turn_review_manifest", { turnId });
+  }
+  return mock.getTurnReviewManifest(turnId);
+}
+
+/** Load a historical patch for one file from a turn receipt, when retained. */
+export async function getTurnReviewFile(turnId: string, path: string): Promise<GitFilePatch> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<GitFilePatch>("get_turn_review_file", { turnId, path });
+  }
+  return mock.getTurnReviewFile(turnId, path);
+}
+
 export async function listDir(sub?: string): Promise<DirEntry[]> {
   if (isTauri()) {
     const { core } = await tauri();
@@ -614,8 +634,9 @@ export async function openFolder(): Promise<string | null> {
  * per-turn listener can't leak. A leaked listener keeps folding the NEXT turn's
  * deltas into this turn's message (the "second reply edits the first" bug).
  *
- * `cancel()` additionally tells the Rust core to abort an in-flight turn, then
- * stops listening — used by Stop and the client-side idle watchdog.
+ * `cancel()` tells the Rust core to abort an in-flight turn but keeps listening:
+ * native emits the authoritative receipt after cancellation. The owner calls
+ * `dispose()` after that terminal event or a bounded grace timeout.
  */
 export interface AgentRunHandle {
   cancel: () => Promise<void>;
@@ -641,10 +662,9 @@ export async function runAgent(
     );
     await core.invoke("run_agent", { sessionId, text, model });
     return {
-      cancel: async () => {
-        await core.invoke("cancel_agent", { sessionId });
-        unlisten();
-      },
+      // cancel_agent acknowledges the abort request before the native turn has
+      // captured/emitted its terminal receipt. The store owns bounded disposal.
+      cancel: async () => core.invoke("cancel_agent", { sessionId }),
       dispose: unlisten,
     };
   }
@@ -1102,6 +1122,52 @@ const mock = (() => {
             ],
       };
     },
+    async getTurnReviewManifest(turnId: string): Promise<TurnReviewManifest> {
+      const startedAt = Date.now() - 18_000;
+      const changedFiles = [
+        {
+          path: "src/App.tsx",
+          status: "modified",
+          additions: 8,
+          deletions: 2,
+          binary: false,
+          certainty: "exact",
+        },
+      ] satisfies TurnReviewManifest["files"];
+      const receipt: TurnReceipt = {
+        turnId,
+        status: "completed",
+        stopReason: "end_turn",
+        startedAt,
+        completedAt: startedAt + 18_000,
+        durationMs: 18_000,
+        changedFiles,
+        changedFileCount: changedFiles.length,
+        additions: 8,
+        deletions: 2,
+        filesTruncated: false,
+        changeCertainty: "exact",
+        backgroundTasksRunning: false,
+      };
+      return {
+        turnId,
+        snapshotId: `preview-turn-${turnId}`,
+        repositoryRoot: settings.workspace ?? "C:/dev/portcode",
+        receipt,
+        files: changedFiles,
+        additions: receipt.additions,
+        deletions: receipt.deletions,
+        truncated: receipt.filesTruncated,
+        patchesAvailable: false,
+      };
+    },
+    async getTurnReviewFile(turnId: string, path: string): Promise<GitFilePatch> {
+      const manifest = await this.getTurnReviewManifest(turnId);
+      if (!manifest.files.some((file) => file.path === path)) {
+        throw new Error("File is not part of this turn review.");
+      }
+      throw new Error("Historical turn patches are unavailable in preview mode.");
+    },
     async runAgent(
       _sessionId: string,
       text: string,
@@ -1112,7 +1178,9 @@ const mock = (() => {
       (async () => {
         await delay(120);
         if (cancelled) return;
-        onEvent({ type: "turn_start", messageId: crypto.randomUUID() });
+        const turnId = crypto.randomUUID();
+        const startedAt = Date.now();
+        onEvent({ type: "turn_start", messageId: turnId, turnId, startedAt });
 
         const reply =
           "Running in **preview mode** (browser, no Rust core yet).\n\n" +
@@ -1183,7 +1251,34 @@ const mock = (() => {
 
         await delay(120);
         onEvent({ type: "usage", inputTokens: 1840, outputTokens: 720 });
-        onEvent({ type: "turn_end", stopReason: "end_turn" });
+        const completedAt = Date.now();
+        const receipt: TurnReceipt = {
+          turnId,
+          status: "completed",
+          stopReason: "end_turn",
+          startedAt,
+          completedAt,
+          durationMs: Math.max(0, completedAt - startedAt),
+          changedFiles: approved
+            ? [
+                {
+                  path: "src/App.tsx",
+                  status: "modified",
+                  additions: 1,
+                  deletions: 1,
+                  binary: false,
+                  certainty: "exact",
+                },
+              ]
+            : [],
+          changedFileCount: approved ? 1 : 0,
+          additions: approved ? 1 : 0,
+          deletions: approved ? 1 : 0,
+          filesTruncated: false,
+          changeCertainty: "exact",
+          backgroundTasksRunning: false,
+        };
+        onEvent({ type: "turn_end", stopReason: "end_turn", receipt });
       })();
 
       return {

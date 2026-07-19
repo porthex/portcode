@@ -6,8 +6,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use futures_util::stream::StreamExt;
+use portcode_sync::wire::TurnStatus;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -367,17 +369,59 @@ pub async fn run(
             &channel,
             StreamEvent::Error {
                 message: "A turn is already running for this session.".to_string(),
+                receipt: None,
             },
         );
         return;
     }
 
+    let turn_id = Uuid::new_v4().to_string();
+    let started_at = db::now_ms();
+    let started = Instant::now();
+    let initial_receipt =
+        crate::turn_receipt::unavailable_interrupted_receipt(&turn_id, started_at);
+    if let Err(error) = db.save_pending_turn_receipt(&session_id, &turn_id, &initial_receipt) {
+        cancels.lock().unwrap().remove(&session_id);
+        sink.emit(
+            &channel,
+            StreamEvent::Error {
+                message: format!("Failed to start a durable turn: {error}"),
+                receipt: None,
+            },
+        );
+        return;
+    }
+    // The UI only learns about a turn after its interrupted fallback is durable.
     sink.emit(
         &channel,
         StreamEvent::TurnStart {
-            message_id: Uuid::new_v4().to_string(),
+            message_id: turn_id.clone(),
+            turn_id: Some(turn_id.clone()),
+            started_at: Some(started_at),
         },
     );
+
+    let workspace = settings
+        .lock()
+        .unwrap()
+        .workspace
+        .clone()
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    let receipt_tracker = crate::turn_receipt::TurnReceiptTracker::new(
+        turn_id.clone(),
+        started_at,
+        started,
+        workspace,
+    )
+    .await;
+    let placeholder = receipt_tracker.interrupted_placeholder();
+    if let Err(error) = db.save_pending_turn_receipt(&session_id, &turn_id, &placeholder) {
+        // The pre-capture unavailable row is already durable; retain it rather than
+        // aborting an otherwise safe turn because the richer placeholder lost a race.
+        eprintln!("turn-receipt: failed to update captured placeholder: {error}");
+    }
 
     // Plan mode swaps in the read-only registry + plan steer; every other mode
     // uses the default run. Both the desktop `run_agent` command and the phone's
@@ -407,6 +451,8 @@ pub async fn run(
         &ask_lock,
         &channel,
         &session_id,
+        &turn_id,
+        receipt_tracker.clone(),
         user_text,
         config,
         model,
@@ -418,9 +464,37 @@ pub async fn run(
         map.remove(&session_id);
     }
 
+    let (status, stop_reason) = match &result {
+        Ok(reason) if reason == "cancelled" => (TurnStatus::Cancelled, Some(reason.clone())),
+        Ok(reason) => (TurnStatus::Completed, Some(reason.clone())),
+        Err(_) => (TurnStatus::Error, None),
+    };
+    let completed = receipt_tracker.complete(status, stop_reason).await;
+    if let Err(error) = db.save_turn_receipt(
+        &session_id,
+        &turn_id,
+        &completed.receipt,
+        completed.repository_root.as_deref(),
+        completed.terminal_snapshot_id.as_deref(),
+    ) {
+        eprintln!("turn-receipt: failed to persist terminal receipt: {error}");
+    }
+
     match result {
-        Ok(stop_reason) => sink.emit(&channel, StreamEvent::TurnEnd { stop_reason }),
-        Err(message) => sink.emit(&channel, StreamEvent::Error { message }),
+        Ok(stop_reason) => sink.emit(
+            &channel,
+            StreamEvent::TurnEnd {
+                stop_reason,
+                receipt: Some(completed.receipt),
+            },
+        ),
+        Err(message) => sink.emit(
+            &channel,
+            StreamEvent::Error {
+                message,
+                receipt: Some(completed.receipt),
+            },
+        ),
     }
 }
 
@@ -438,6 +512,8 @@ async fn run_inner(
     ask_lock: &Arc<tokio::sync::Mutex<()>>,
     channel: &str,
     session_id: &str,
+    turn_id: &str,
+    receipt_tracker: Arc<crate::turn_receipt::TurnReceiptTracker>,
     user_text: String,
     config: AgentConfig,
     model: Option<String>,
@@ -510,6 +586,7 @@ async fn run_inner(
                 cancel: cancel.clone(),
                 refresh_lock: refresh_lock.clone(),
                 ask_lock: ask_lock.clone(),
+                receipt_tracker: receipt_tracker.clone(),
                 parent_channel: channel.to_string(),
                 workspace: workspace.clone(),
                 // The top-level run is not itself a registered subagent, so the
@@ -521,6 +598,7 @@ async fn run_inner(
             None
         };
     let mut ctx = ToolCtx::new(workspace);
+    ctx.receipt = Some(receipt_tracker.clone());
     ctx.spawner = spawner;
     // Attach a background runner only when this run exposes `run_command` (plan mode's
     // read-only registry has none, so it can't background). Subagents don't get one
@@ -531,6 +609,7 @@ async fn run_inner(
             background: background.clone(),
             session_channel: channel.to_string(),
             session_id: session_id.to_string(),
+            receipt_tracker: receipt_tracker.clone(),
         }));
     }
 
@@ -548,7 +627,7 @@ async fn run_inner(
             text: user_text.clone(),
         }],
     };
-    db.try_append_message(session_id, &user_msg, db::now_ms())
+    db.try_append_message_for_turn(session_id, Some(turn_id), &user_msg, db::now_ms())
         .map_err(|e| format!("Failed to save your message: {e}"))?;
     messages.push(user_msg);
     if is_first {
@@ -576,7 +655,11 @@ async fn run_inner(
         &system,
         &ctx,
         messages,
-        &Persist::Session { db, session_id },
+        &Persist::Session {
+            db,
+            session_id,
+            turn_id,
+        },
     )
     .await?;
     Ok(outcome.stop_reason)
@@ -586,7 +669,11 @@ async fn run_inner(
 /// its SQLite session; a subagent is **ephemeral** — it keeps the transcript only
 /// in memory, so it never pollutes the parent thread or the database.
 enum Persist<'a> {
-    Session { db: &'a Db, session_id: &'a str },
+    Session {
+        db: &'a Db,
+        session_id: &'a str,
+        turn_id: &'a str,
+    },
     Ephemeral,
 }
 
@@ -595,8 +682,12 @@ impl Persist<'_> {
     /// names the message for the error path ("the reply" / "tool results").
     fn append(&self, msg: &ChatMessage, what: &str) -> Result<(), String> {
         match self {
-            Persist::Session { db, session_id } => db
-                .try_append_message(session_id, msg, db::now_ms())
+            Persist::Session {
+                db,
+                session_id,
+                turn_id,
+            } => db
+                .try_append_message_for_turn(session_id, Some(turn_id), msg, db::now_ms())
                 .map(|_| ())
                 .map_err(|e| format!("Failed to save {what}: {e}")),
             Persist::Ephemeral => Ok(()),
@@ -605,7 +696,7 @@ impl Persist<'_> {
 
     /// Bump the session's last-activity timestamp (no-op for an ephemeral run).
     fn touch(&self) {
-        if let Persist::Session { db, session_id } = self {
+        if let Persist::Session { db, session_id, .. } = self {
             db.touch_session(session_id, db::now_ms());
         }
     }
@@ -614,7 +705,7 @@ impl Persist<'_> {
     /// an ephemeral subagent run — its cost already rolls up to the parent session
     /// via the `Usage` event emitted on the session channel.
     fn add_usage(&self, input_tokens: u32, output_tokens: u32) {
-        if let Persist::Session { db, session_id } = self {
+        if let Persist::Session { db, session_id, .. } = self {
             // Best-effort: a failed usage write must not abort the turn — the live
             // in-memory counter already reflected this event.
             let _ = db.add_usage(
@@ -1220,6 +1311,7 @@ struct AgentSpawner {
     /// siblings, so parallel subagents queue their prompts instead of clobbering the
     /// single UI prompt slot.
     ask_lock: Arc<tokio::sync::Mutex<()>>,
+    receipt_tracker: Arc<crate::turn_receipt::TurnReceiptTracker>,
     /// The parent's `agent://{session}` channel — where a subagent's permission
     /// prompts and lifecycle/usage events surface, and the base for the child's own
     /// stream channel.
@@ -1298,6 +1390,7 @@ impl tools::Spawner for AgentSpawner {
         };
         let ctx = ToolCtx {
             workspace: self.workspace.clone(),
+            receipt: Some(self.receipt_tracker.clone()),
             spawner: child_spawner,
             // Subagents run `run_command` in the foreground (no background runner) in this
             // version, so a subagent can't spawn its own background tasks yet.
@@ -1370,6 +1463,7 @@ struct BackgroundLauncher {
     /// the launching turn ended.)
     session_channel: String,
     session_id: String,
+    receipt_tracker: Arc<crate::turn_receipt::TurnReceiptTracker>,
 }
 
 /// Spawn a background task's off-thread waiter and register it (so a session-wide
@@ -1406,6 +1500,7 @@ fn spawn_background_task<F>(
 impl tools::BackgroundRunner for BackgroundLauncher {
     fn launch(&self, command: String, child: tokio::process::Child) -> String {
         let id = Uuid::new_v4().to_string();
+        self.receipt_tracker.background_started();
         // Announce the launch right away so the UI can show it as running.
         self.sink.emit(
             &self.session_channel,
@@ -1420,6 +1515,7 @@ impl tools::BackgroundRunner for BackgroundLauncher {
         let channel = self.session_channel.clone();
         let task_id = id.clone();
         let task_command = command.clone();
+        let receipt_tracker = self.receipt_tracker.clone();
         // The waiter owns the child (kill_on_drop), so aborting this task kills the
         // process — which is exactly what `background::cancel_session` does on Stop.
         // `spawn_background_task` registers the entry BEFORE this body can run, so a
@@ -1447,6 +1543,7 @@ impl tools::BackgroundRunner for BackgroundLauncher {
                         output,
                     },
                 );
+                receipt_tracker.background_finished();
                 background::finish(&bg, &task_id);
             },
         );
@@ -1861,6 +1958,7 @@ mod tests {
         let p = Persist::Session {
             db: &db,
             session_id: "s1",
+            turn_id: "turn-1",
         };
         p.append(
             &ChatMessage {

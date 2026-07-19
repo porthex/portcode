@@ -324,6 +324,19 @@ describe("App layout", () => {
     );
   });
 
+  it("opens the title-bar Review action on the live workspace instead of a stale turn target", () => {
+    useStore.setState({
+      workspaceSurface: "chat",
+      reviewTarget: { kind: "turn", turnId: "turn-old" },
+    });
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open review workspace" }));
+
+    expect(useStore.getState().workspaceSurface).toBe("review");
+    expect(useStore.getState().reviewTarget).toEqual({ kind: "workspace" });
+  });
+
   it("releases the remote frame subscription when the app unmounts", async () => {
     const unlisten = vi.fn();
     const { unmount } = render(<App />);

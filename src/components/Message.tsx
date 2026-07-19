@@ -2,12 +2,13 @@ import { memo, useMemo, type ComponentProps } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
-import type { ContentBlock, Message } from "../types";
+import type { AgentInfo, ContentBlock, Message, TurnReceipt as TurnReceiptData } from "../types";
 import { useStore } from "../store/store";
 import { usePrefersReducedMotion, useScramble } from "../lib/useScramble";
 import { useContextMenu, type ContextMenuItem } from "./ContextMenu";
 import { ToolCall } from "./ToolCall";
 import { isRoutineToolName, ToolActivityGroup, type ActivityCall } from "./ToolActivityGroup";
+import { TurnChangesCard, TurnReceipt } from "./TurnReceipt";
 
 // Hoisted to module scope so they're referentially stable across renders —
 // otherwise a fresh array each render defeats React.memo on TextBlock and makes
@@ -119,9 +120,22 @@ const HISTORICAL_TOOL_INTERRUPTED =
 export const MessageView = memo(function MessageView({
   message,
   isActive = false,
+  turnPresentation,
+  agents,
+  onReviewChanges,
+  reviewAvailable = true,
 }: {
   message: Message;
   isActive?: boolean;
+  turnPresentation?: {
+    active: boolean;
+    startedAt: number | null;
+    waiting: boolean;
+    finalizing: boolean;
+  };
+  agents?: AgentInfo[];
+  onReviewChanges?: (receipt: TurnReceiptData) => void;
+  reviewAvailable?: boolean;
 }) {
   const isUser = message.role === "user";
   const typingAnimation = useStore((s) => s.settings.typingAnimation);
@@ -151,6 +165,16 @@ export const MessageView = memo(function MessageView({
     () => buildRenderItems(message.blocks, resultByUseId, isActive),
     [message.blocks, resultByUseId, isActive],
   );
+  const showReceipt =
+    !isUser && Boolean(message.receipt || turnPresentation?.active || turnPresentation?.finalizing);
+  const textItems = showReceipt
+    ? renderItems.filter(
+        (item): item is Extract<RenderItem, { kind: "text" }> => item.kind === "text",
+      )
+    : [];
+  const activityItems = showReceipt ? renderItems.filter((item) => item.kind !== "text") : [];
+  const observableAgents = showReceipt ? (agents ?? []) : [];
+  const activityCount = activityItems.length + observableAgents.length;
 
   // Right-click → copy the message's text. Disabled when the message has no text
   // (e.g. a tool-only assistant turn). Plain text inside the bubble keeps its own
@@ -194,9 +218,27 @@ export const MessageView = memo(function MessageView({
           </div>
         ) : (
           <div className="space-y-2">
-            {renderItems.map((item) => {
-              if (item.kind === "text") {
-                return (
+            {showReceipt ? (
+              <>
+                <TurnReceipt
+                  receipt={message.receipt}
+                  active={turnPresentation?.active}
+                  startedAt={turnPresentation?.startedAt}
+                  waiting={turnPresentation?.waiting}
+                  finalizing={turnPresentation?.finalizing}
+                  activityCount={activityCount}
+                  activity={
+                    activityCount > 0 ? (
+                      <div className="space-y-1.5">
+                        {activityItems.map((item) => renderActivityItem(item, isActive))}
+                        {observableAgents.length > 0 && (
+                          <SubagentReceiptActivity agents={observableAgents} />
+                        )}
+                      </div>
+                    ) : null
+                  }
+                />
+                {textItems.map((item) => (
                   <TextBlock
                     key={`text-${item.index}`}
                     text={item.block.text}
@@ -204,27 +246,21 @@ export const MessageView = memo(function MessageView({
                     active={isActive}
                     caret={animate && item.index === lastTextIndex}
                   />
-                );
-              }
-              if (item.kind === "activity") {
-                return (
-                  <ToolActivityGroup
-                    key={`activity-${item.calls[0].tool.id}`}
-                    calls={item.calls}
-                    active={isActive}
+                ))}
+                {message.receipt && (
+                  <TurnChangesCard
+                    receipt={message.receipt}
+                    onReview={onReviewChanges}
+                    reviewAvailable={reviewAvailable}
                   />
-                );
-              }
-              return (
-                <ToolCall
-                  key={item.block.id}
-                  name={item.block.name}
-                  input={item.block.input}
-                  result={item.result}
-                />
-              );
-            })}
-            {message.blocks.length === 0 && <Thinking />}
+                )}
+              </>
+            ) : (
+              <>
+                {renderItems.map((item) => renderItem(item, isActive, animate, lastTextIndex))}
+                {message.blocks.length === 0 && <Thinking />}
+              </>
+            )}
           </div>
         )}
       </div>
@@ -232,6 +268,79 @@ export const MessageView = memo(function MessageView({
     </div>
   );
 });
+
+function renderItem(item: RenderItem, active: boolean, animate: boolean, lastTextIndex: number) {
+  if (item.kind === "text") {
+    return (
+      <TextBlock
+        key={`text-${item.index}`}
+        text={item.block.text}
+        animate={animate}
+        active={active}
+        caret={animate && item.index === lastTextIndex}
+      />
+    );
+  }
+  return renderActivityItem(item, active);
+}
+
+function renderActivityItem(item: Exclude<RenderItem, { kind: "text" }>, active: boolean) {
+  if (item.kind === "activity") {
+    return (
+      <ToolActivityGroup
+        key={`activity-${item.calls[0].tool.id}`}
+        calls={item.calls}
+        active={active}
+      />
+    );
+  }
+  return (
+    <ToolCall
+      key={item.block.id}
+      name={item.block.name}
+      input={item.block.input}
+      result={item.result}
+    />
+  );
+}
+
+function SubagentReceiptActivity({ agents }: { agents: AgentInfo[] }) {
+  return (
+    <section className="pc-turn-agents" aria-label="Subagent activity">
+      <div className="pc-turn-agents__head">
+        <span>Subagents</span>
+        <span>{agents.length}</span>
+      </div>
+      <ul>
+        {agents.map((agent) => (
+          <li key={agent.id} className="pc-turn-agents__row">
+            <span
+              className={`pc-dot ${
+                agent.status === "running"
+                  ? "pc-dot--ring"
+                  : agent.status === "error"
+                    ? "pc-dot--danger"
+                    : "pc-dot--success"
+              }`}
+              aria-hidden="true"
+            />
+            <span className="min-w-0 flex-1 truncate" title={agent.description}>
+              {agent.description}
+            </span>
+            <span className="pc-turn-agents__status">{subagentStatus(agent)}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function subagentStatus(agent: AgentInfo) {
+  if (agent.status === "running") return agent.step > 0 ? `step ${agent.step}` : "starting";
+  if (agent.status === "ok") return "completed";
+  if (agent.status === "cancelled") return "stopped";
+  return "failed";
+}
 
 function buildRenderItems(
   blocks: ContentBlock[],

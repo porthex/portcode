@@ -6,11 +6,14 @@ import {
   type MessageRow,
   type PairedDevice,
   type PairingPayload,
+  type PendingPermission,
   type PhoneSyncStatus,
   type RemoteCommand,
   type Session,
   type StreamEvent,
   type SyncFrame,
+  type TurnReceipt,
+  type TurnStatus,
   type UpdateInfo,
 } from "../types";
 import * as ipc from "../lib/ipc";
@@ -83,6 +86,46 @@ const session = (over: Partial<Session> = {}): Session => ({
   model: "claude-opus-4-8",
   createdAt: 1,
   updatedAt: 1,
+  ...over,
+});
+
+const runState = (
+  over: Partial<{
+    streaming: boolean;
+    cancel: (() => Promise<void>) | null;
+    pendingPermission: PendingPermission | null;
+    turnId: string | null;
+    startedAt: number | null;
+    finalizing: boolean;
+    receipt: TurnReceipt | null;
+    outcome: TurnStatus | null;
+  }> = {},
+) => ({
+  streaming: false,
+  cancel: null,
+  pendingPermission: null,
+  turnId: null,
+  startedAt: null,
+  finalizing: false,
+  receipt: null,
+  outcome: null,
+  ...over,
+});
+
+const turnReceipt = (over: Partial<TurnReceipt> = {}): TurnReceipt => ({
+  turnId: "turn-1",
+  status: "completed",
+  stopReason: "end_turn",
+  startedAt: 100,
+  completedAt: 350,
+  durationMs: 250,
+  changedFiles: [],
+  changedFileCount: 0,
+  additions: 0,
+  deletions: 0,
+  filesTruncated: false,
+  changeCertainty: "exact",
+  backgroundTasksRunning: false,
   ...over,
 });
 
@@ -171,6 +214,24 @@ describe("init", () => {
     expect(st.activeId).toBe("a");
     expect(st.sessions).toEqual([s1, s2]);
     expect(st.messages["a"]).toEqual([msg]);
+  });
+
+  it("preserves durable turn identity and receipts when hydrating history", async () => {
+    const receipt = turnReceipt({ turnId: "persisted-turn" });
+    const msg: Message = {
+      id: "persisted-turn",
+      role: "assistant",
+      blocks: [{ kind: "text", text: "done" }],
+      createdAt: receipt.startedAt,
+      turnId: receipt.turnId,
+      receipt,
+    };
+    m.listSessions.mockResolvedValue([session({ id: "a" })]);
+    m.getMessages.mockResolvedValue([msg]);
+
+    await useStore.getState().init();
+
+    expect(useStore.getState().messages.a).toEqual([msg]);
   });
 
   it("coerces a loaded session with no model to the last-used default", async () => {
@@ -667,8 +728,8 @@ describe("deleteSession", () => {
       messages: { a: [], b: [] },
       // Both sessions are idle but each has an entry in the run map.
       runs: {
-        a: { streaming: false, cancel: null, pendingPermission: null },
-        b: { streaming: false, cancel: null, pendingPermission: null },
+        a: runState(),
+        b: runState(),
       },
     });
 
@@ -836,6 +897,149 @@ describe("send", () => {
     expect(st.pendingPermission).toBeNull();
   });
 
+  it("reconciles the optimistic assistant to native turn identity and attaches its receipt", async () => {
+    const dispose = vi.fn();
+    let emit!: (e: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose };
+    });
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: { a: [] },
+    });
+
+    await useStore.getState().send("review this");
+    const provisionalId = useStore.getState().messages.a[1].id;
+    emit({
+      type: "turn_start",
+      messageId: "native-message",
+      turnId: "native-turn",
+      startedAt: 100,
+    });
+    const receipt = turnReceipt({
+      turnId: "native-turn",
+      changedFiles: [
+        {
+          path: "src/App.tsx",
+          status: "modified",
+          additions: 3,
+          deletions: 1,
+          binary: false,
+          certainty: "exact",
+        },
+      ],
+      changedFileCount: 1,
+      additions: 3,
+      deletions: 1,
+    });
+    emit({ type: "turn_end", stopReason: "end_turn", receipt });
+
+    const st = useStore.getState();
+    expect(provisionalId).not.toBe("native-message");
+    expect(st.messages.a).toHaveLength(2);
+    expect(st.messages.a[1]).toMatchObject({
+      id: "native-message",
+      turnId: "native-turn",
+      createdAt: 100,
+      receipt,
+    });
+    expect(st.runs.a).toMatchObject({
+      streaming: false,
+      turnId: "native-turn",
+      startedAt: 100,
+      receipt,
+      outcome: "completed",
+    });
+    expect(dispose).toHaveBeenCalledOnce();
+  });
+
+  it("keeps listening and locked after Stop until the native cancellation receipt arrives", async () => {
+    vi.useFakeTimers();
+    try {
+      const cancel = vi.fn(async () => {});
+      const dispose = vi.fn();
+      let emit!: (e: StreamEvent) => void;
+      m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+        emit = onEvent;
+        return { cancel, dispose };
+      });
+      useStore.setState({
+        sessions: [session({ id: "a" })],
+        activeId: "a",
+        messages: { a: [] },
+      });
+
+      await useStore.getState().send("make a change");
+      emit({ type: "turn_start", messageId: "native-turn", startedAt: 100 });
+      await useStore.getState().stop();
+
+      let st = useStore.getState();
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(dispose).not.toHaveBeenCalled();
+      expect(st.streaming).toBe(true);
+      expect(st.runs.a.finalizing).toBe(true);
+      expect(st.messages.a[1].receipt).toBeUndefined();
+
+      const receipt = turnReceipt({
+        turnId: "native-turn",
+        status: "cancelled",
+        stopReason: "cancelled",
+        changedFiles: [
+          {
+            path: "src/cancelled-change.ts",
+            status: "modified",
+            additions: 2,
+            deletions: 1,
+            binary: false,
+            certainty: "exact",
+          },
+        ],
+        changedFileCount: 1,
+        additions: 2,
+        deletions: 1,
+      });
+      emit({ type: "turn_end", stopReason: "cancelled", receipt });
+
+      st = useStore.getState();
+      expect(st.messages.a[1]).toMatchObject({ turnId: "native-turn", receipt });
+      expect(st.runs.a).toMatchObject({ receipt, outcome: "cancelled", streaming: false });
+      expect(dispose).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect(dispose).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("disposes a cancelled turn after the receipt grace window when a legacy core stays silent", async () => {
+    vi.useFakeTimers();
+    try {
+      const dispose = vi.fn();
+      m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}), dispose });
+      useStore.setState({
+        sessions: [session({ id: "a" })],
+        activeId: "a",
+        messages: { a: [] },
+      });
+
+      await useStore.getState().send("stop this");
+      await useStore.getState().stop();
+      expect(useStore.getState().streaming).toBe(true);
+      expect(useStore.getState().messages.a[1].receipt).toBeUndefined();
+      expect(dispose).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(useStore.getState().streaming).toBe(false);
+      expect(useStore.getState().messages.a[1].receipt).toMatchObject({ status: "cancelled" });
+      expect(dispose).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("trims surrounding whitespace from the stored user bubble and derived title", async () => {
     let emit!: (e: StreamEvent) => void;
     m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
@@ -920,9 +1124,8 @@ describe("send", () => {
     await useStore.getState().send("do it remotely");
 
     // The desktop is authoritative: we forward a `run` command and DON'T run the
-    // local agent or pre-create an assistant message. We DO flip streaming
-    // optimistically (closing the double-submit window) rather than waiting for the
-    // desktop's turn_start frame.
+    // local agent. A provisional assistant identity gives pre-turn_start failures
+    // an exact receipt target and is reconciled when native turn_start arrives.
     expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({
       cmd: "run",
       session_id: "a",
@@ -933,9 +1136,14 @@ describe("send", () => {
     const st = useStore.getState();
     expect(st.streaming).toBe(true);
     // Only the optimistic user echo from sendRemoteCommand — no assistant stub.
-    expect(st.messages.a).toHaveLength(1);
+    expect(st.messages.a).toHaveLength(2);
     expect(st.messages.a[0].role).toBe("user");
     expect(st.messages.a[0].blocks).toEqual([{ kind: "text", text: "do it remotely" }]);
+    expect(st.messages.a[1]).toMatchObject({
+      role: "assistant",
+      turnId: expect.any(String),
+      blocks: [],
+    });
   });
 
   it("remote send flips streaming optimistically so a second send can't double-dispatch", async () => {
@@ -963,7 +1171,7 @@ describe("send", () => {
       text: "first",
     });
     // Only the first optimistic user echo — no duplicate user bubble.
-    expect(useStore.getState().messages.a).toHaveLength(1);
+    expect(useStore.getState().messages.a).toHaveLength(2);
   });
 
   it("tears down the turn's listener on turn_end so a later turn can't edit this message", async () => {
@@ -1027,6 +1235,10 @@ describe("send", () => {
 
       // Idle past the watchdog window → the turn is force-ended and the hung run cancelled.
       await vi.advanceTimersByTimeAsync(152_000);
+
+      expect(useStore.getState().streaming).toBe(true);
+      expect(useStore.getState().runs.a.finalizing).toBe(true);
+      await vi.advanceTimersByTimeAsync(30_000);
 
       const st = useStore.getState();
       expect(st.streaming).toBe(false);
@@ -1104,6 +1316,11 @@ describe("send", () => {
         .map((b) => (b.kind === "text" ? b.text : ""))
         .join("");
       expect(text).toContain("timed out");
+      expect(st.messages.a[st.messages.a.length - 1].receipt).toMatchObject({
+        status: "interrupted",
+        changeCertainty: "unavailable",
+      });
+      expect(st.runs.a.outcome).toBe("interrupted");
     } finally {
       vi.useRealTimers();
     }
@@ -1182,7 +1399,7 @@ describe("send", () => {
     }
   });
 
-  it("Stop pressed during the runAgent await window aborts the backend and disposes the listener", async () => {
+  it("Stop during runAgent await cancels once, then disposes on the terminal event", async () => {
     // The cancel handle is only armed AFTER runAgent resolves. If the user presses
     // Stop in that window, stop() can't invoke a (null) cancel — so the post-await
     // block must honor the already-flipped streaming:false by cancelling the
@@ -1191,12 +1408,13 @@ describe("send", () => {
     const cancel = vi.fn(async () => {});
     const dispose = vi.fn();
     let resolveRun!: (h: { cancel: typeof cancel; dispose: typeof dispose }) => void;
-    m.runAgent.mockImplementation(
-      async () =>
-        new Promise((res) => {
-          resolveRun = res;
-        }),
-    );
+    let emit!: (event: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+      emit = onEvent;
+      return new Promise((res) => {
+        resolveRun = res;
+      });
+    });
     useStore.setState({ sessions: [session({ id: "a" })], activeId: "a", messages: { a: [] } });
 
     // Kick off the turn; runAgent stays pending (cancel handle not yet armed).
@@ -1215,8 +1433,12 @@ describe("send", () => {
     await sending;
 
     expect(cancel).toHaveBeenCalledTimes(1); // backend turn actually aborted
+    expect(useStore.getState().streaming).toBe(true);
+    expect(useStore.getState().runs.a.finalizing).toBe(true);
+    emit({ type: "turn_end", stopReason: "cancelled" });
     expect(useStore.getState().streaming).toBe(false);
     expect(useStore.getState().cancel).toBeNull(); // no stale Stop re-armed
+    expect(dispose).toHaveBeenCalledOnce();
   });
 });
 
@@ -1260,6 +1482,11 @@ describe("stop", () => {
       }),
     );
     expect(st.agents.a[0].status).toBe("cancelled");
+    expect(st.messages.a[0].receipt).toMatchObject({
+      turnId: "assistant",
+      status: "cancelled",
+      changeCertainty: "unavailable",
+    });
   });
 
   it("keeps the run locked and surfaces uncertainty when cancel_agent rejects", async () => {
@@ -1307,13 +1534,116 @@ describe("stop", () => {
 
   it("stops a remote turn with a Cancel command, not the (absent) local cancel", async () => {
     const cancel = vi.fn(async () => {});
-    useStore.setState({ remoteConnected: true, activeId: "s1", streaming: true, cancel });
+    useStore.setState({
+      remoteConnected: true,
+      activeId: "s1",
+      streaming: true,
+      cancel,
+      messages: {
+        s1: [
+          {
+            id: "remote-turn",
+            role: "assistant",
+            blocks: [],
+            createdAt: 1,
+            turnId: "remote-turn",
+          },
+        ],
+      },
+      runs: { s1: runState({ streaming: true, turnId: "remote-turn", startedAt: 1 }) },
+    });
 
     await useStore.getState().stop();
 
     expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({ cmd: "cancel", session_id: "s1" });
     expect(cancel).not.toHaveBeenCalled();
+    expect(useStore.getState().streaming).toBe(true);
+    expect(useStore.getState().runs.s1.finalizing).toBe(true);
+    useStore.getState().applyFrame({
+      t: "live",
+      session_id: "s1",
+      event: {
+        type: "turn_end",
+        stopReason: "cancelled",
+        receipt: turnReceipt({ turnId: "remote-turn", status: "cancelled" }),
+      },
+    });
     expect(useStore.getState().streaming).toBe(false);
+  });
+
+  it("a delayed remote cancellation receipt patches the old turn without stopping its successor", async () => {
+    vi.useFakeTimers();
+    try {
+      useStore.setState({
+        sessions: [session({ id: "s1" })],
+        activeId: "s1",
+        messages: { s1: [] },
+        remoteConnected: true,
+      });
+      await useStore.getState().send("old turn");
+      useStore.getState().applyFrame({
+        t: "live",
+        session_id: "s1",
+        event: { type: "turn_start", messageId: "old-turn", startedAt: 100 },
+      });
+
+      await useStore.getState().stop();
+      expect(useStore.getState().streaming).toBe(true);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(useStore.getState().streaming).toBe(false);
+
+      await useStore.getState().send("new turn");
+      useStore.getState().applyFrame({
+        t: "live",
+        session_id: "s1",
+        event: { type: "turn_start", messageId: "new-turn", startedAt: 500 },
+      });
+      const oldReceipt = turnReceipt({
+        turnId: "old-turn",
+        status: "cancelled",
+        stopReason: "cancelled",
+        changedFiles: [
+          {
+            path: "src/old.ts",
+            status: "modified",
+            additions: 1,
+            deletions: 0,
+            binary: false,
+            certainty: "exact",
+          },
+        ],
+        changedFileCount: 1,
+        additions: 1,
+      });
+      useStore.getState().applyFrame({
+        t: "live",
+        session_id: "s1",
+        event: { type: "turn_end", stopReason: "cancelled", receipt: oldReceipt },
+      });
+
+      let st = useStore.getState();
+      expect(st.runs.s1).toMatchObject({ streaming: true, turnId: "new-turn" });
+      expect(st.messages.s1.find((message) => message.turnId === "old-turn")?.receipt).toEqual(
+        oldReceipt,
+      );
+      expect(
+        st.messages.s1.find((message) => message.turnId === "new-turn")?.receipt,
+      ).toBeUndefined();
+
+      const newReceipt = turnReceipt({ turnId: "new-turn" });
+      useStore.getState().applyFrame({
+        t: "live",
+        session_id: "s1",
+        event: { type: "turn_end", stopReason: "end_turn", receipt: newReceipt },
+      });
+      st = useStore.getState();
+      expect(st.streaming).toBe(false);
+      expect(st.messages.s1.find((message) => message.turnId === "new-turn")?.receipt).toEqual(
+        newReceipt,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -1549,8 +1879,8 @@ describe("multi-run model (runs collection)", () => {
       sessions: [session({ id: "a" }), session({ id: "b" })],
       activeId: "a",
       runs: {
-        a: { streaming: false, cancel: null, pendingPermission: null },
-        b: { streaming: true, cancel: null, pendingPermission: null },
+        a: runState(),
+        b: runState({ streaming: true }),
       },
       streaming: false,
     });
@@ -1586,8 +1916,8 @@ describe("multi-run model (runs collection)", () => {
       sessions: [session({ id: "a" }), session({ id: "b" })],
       activeId: "a",
       runs: {
-        a: { streaming: true, cancel, pendingPermission: null },
-        b: { streaming: true, cancel: null, pendingPermission: null },
+        a: runState({ streaming: true, cancel, turnId: "a-turn", startedAt: 1 }),
+        b: runState({ streaming: true, turnId: "b-turn", startedAt: 1 }),
       },
       streaming: true,
       cancel,
@@ -1597,11 +1927,15 @@ describe("multi-run model (runs collection)", () => {
 
     const st = useStore.getState();
     expect(cancel).toHaveBeenCalledOnce(); // the active run's handle was aborted
-    expect(st.runs.a).toEqual({ streaming: false, cancel: null, pendingPermission: null });
+    expect(st.runs.a).toEqual(
+      expect.objectContaining({ streaming: false, cancel: null, pendingPermission: null }),
+    );
     expect(st.streaming).toBe(false); // mirror re-projected from "a"
     expect(st.cancel).toBeNull();
     // The concurrent background run is undisturbed.
-    expect(st.runs.b).toEqual({ streaming: true, cancel: null, pendingPermission: null });
+    expect(st.runs.b).toEqual(
+      expect.objectContaining({ streaming: true, cancel: null, pendingPermission: null }),
+    );
   });
 });
 
@@ -1807,6 +2141,9 @@ describe("composer presence phase", () => {
     const stopping = useStore.getState().stop();
     expect(useStore.getState().composerPhase).toBe("stopping");
     await stopping;
+    expect(useStore.getState().composerPhase).toBe("stopping");
+    expect(useStore.getState().streaming).toBe(true);
+    emit({ type: "turn_end", stopReason: "cancelled" });
     expect(useStore.getState().composerPhase).toBe("idle");
     expect(useStore.getState().streaming).toBe(false);
   });
@@ -1964,6 +2301,23 @@ describe("UI setters", () => {
     expect(useStore.getState().showSettings).toBe(true);
     expect(useStore.getState().showPalette).toBe(true);
     expect(useStore.getState().workspaceSurface).toBe("review");
+  });
+
+  it("opens workspace or turn-scoped review without surface changes resetting the target", () => {
+    useStore.getState().openTurnReview("turn-42");
+    expect(useStore.getState()).toMatchObject({
+      workspaceSurface: "review",
+      reviewTarget: { kind: "turn", turnId: "turn-42" },
+    });
+
+    useStore.getState().setWorkspaceSurface("chat");
+    expect(useStore.getState().reviewTarget).toEqual({ kind: "turn", turnId: "turn-42" });
+
+    useStore.getState().openWorkspaceReview();
+    expect(useStore.getState()).toMatchObject({
+      workspaceSurface: "review",
+      reviewTarget: { kind: "workspace" },
+    });
   });
 
   it("toggleSidebar flips the mobile drawer and setShowSidebar sets it", () => {
@@ -2649,6 +3003,78 @@ describe("remote client", () => {
       ]);
     });
 
+    it("message_delta preserves optional turn identity and receipts while legacy rows stay bare", () => {
+      const receipt = turnReceipt({ turnId: "remote-turn" });
+      useStore.getState().applyFrame({
+        t: "message_delta",
+        session_id: "s1",
+        messages: [
+          row({ id: "legacy", seq: 0 }),
+          row({
+            id: "remote-turn",
+            seq: 1,
+            role: "assistant",
+            turnId: "remote-turn",
+            receipt,
+          }),
+        ],
+      });
+
+      const [legacy, completed] = useStore.getState().messages.s1;
+      expect(legacy).not.toHaveProperty("turnId");
+      expect(legacy).not.toHaveProperty("receipt");
+      expect(completed).toMatchObject({ turnId: "remote-turn", receipt });
+    });
+
+    it("groups raw catch-up rows into one receipt-bearing assistant turn", () => {
+      const receipt = turnReceipt({ turnId: "grouped-turn" });
+      useStore.getState().applyFrame({
+        t: "message_delta",
+        session_id: "s1",
+        messages: [
+          row({
+            id: "user-row",
+            seq: 0,
+            turnId: "grouped-turn",
+            content: [{ kind: "text", text: "inspect this" }],
+          }),
+          row({
+            id: "assistant-row",
+            seq: 1,
+            role: "assistant",
+            turnId: "grouped-turn",
+            content: [
+              { kind: "text", text: "Checking." },
+              { kind: "tool_use", id: "tool-1", name: "fs_read", input: { path: "x" } },
+            ],
+          }),
+          row({
+            id: "tool-row",
+            seq: 2,
+            turnId: "grouped-turn",
+            content: [{ kind: "tool_result", toolUseId: "tool-1", output: "ok", isError: false }],
+            receipt,
+          }),
+        ],
+      });
+
+      const messages = useStore.getState().messages.s1;
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toMatchObject({ id: "user-row", role: "user" });
+      expect(messages[1]).toEqual({
+        id: "grouped-turn",
+        role: "assistant",
+        blocks: [
+          { kind: "text", text: "Checking." },
+          { kind: "tool_use", id: "tool-1", name: "fs_read", input: { path: "x" } },
+          { kind: "tool_result", toolUseId: "tool-1", output: "ok", isError: false },
+        ],
+        createdAt: 7,
+        turnId: "grouped-turn",
+        receipt,
+      });
+    });
+
     it("drops encrypted OpenAI reasoning metadata before messages reach rendering", () => {
       useStore.getState().applyFrame({
         t: "message_delta",
@@ -2782,6 +3208,60 @@ describe("remote client", () => {
       expect(paging.oldestSeq).toBe(3); // cursor advanced to the new oldest
     });
 
+    it("merges one turn split across the message_page boundary", () => {
+      const receipt = turnReceipt({ turnId: "split-turn" });
+      // The bounded tail begins with the terminal tool-result row, so catch-up can
+      // only synthesize the assistant fragment carrying that result + receipt.
+      useStore.getState().applyFrame({
+        t: "message_delta",
+        session_id: "s1",
+        messages: [
+          row({
+            id: "result-row",
+            seq: 2,
+            turnId: "split-turn",
+            content: [{ kind: "tool_result", toolUseId: "tool-1", output: "done", isError: false }],
+            receipt,
+          }),
+        ],
+      });
+
+      useStore.getState().applyFrame({
+        t: "message_page",
+        session_id: "s1",
+        messages: [
+          row({
+            id: "prompt-row",
+            seq: 0,
+            turnId: "split-turn",
+            content: [{ kind: "text", text: "do it" }],
+          }),
+          row({
+            id: "assistant-row",
+            seq: 1,
+            role: "assistant",
+            turnId: "split-turn",
+            content: [
+              { kind: "text", text: "Working." },
+              { kind: "tool_use", id: "tool-1", name: "fs_read", input: {} },
+            ],
+          }),
+        ],
+        has_more: false,
+      });
+
+      const messages = useStore.getState().messages.s1;
+      expect(messages.map((message) => message.id)).toEqual(["prompt-row", "split-turn"]);
+      expect(messages[1]).toMatchObject({
+        receipt,
+        blocks: [
+          { kind: "text", text: "Working." },
+          { kind: "tool_use", id: "tool-1", name: "fs_read", input: {} },
+          { kind: "tool_result", toolUseId: "tool-1", output: "done", isError: false },
+        ],
+      });
+    });
+
     it("message_page dedupes rows already held (no duplicates) and sets hasMore false at the start", () => {
       useStore.setState({
         messages: {
@@ -2877,7 +3357,13 @@ describe("remote client", () => {
       const st = useStore.getState();
       expect(st.streaming).toBe(true);
       expect(st.messages.s1).toEqual([
-        { id: "a1", role: "assistant", blocks: [], createdAt: expect.any(Number) },
+        {
+          id: "a1",
+          role: "assistant",
+          blocks: [],
+          createdAt: expect.any(Number),
+          turnId: "a1",
+        },
       ]);
     });
 
@@ -2980,6 +3466,25 @@ describe("remote client", () => {
       expect(text).toContain("boom");
     });
 
+    it("attaches an authoritative error receipt to its exact remote turn", () => {
+      seedTurn("s1", "a1");
+      const receipt = turnReceipt({
+        turnId: "a1",
+        status: "error",
+        stopReason: "provider_error",
+      });
+
+      useStore.getState().applyFrame({
+        t: "live",
+        session_id: "s1",
+        event: { type: "error", message: "boom", receipt },
+      });
+
+      const st = useStore.getState();
+      expect(st.messages.s1[0].receipt).toEqual(receipt);
+      expect(st.runs.s1).toMatchObject({ outcome: "error", receipt, streaming: false });
+    });
+
     describe("background-session frames don't hijack the visible UI", () => {
       // The user is looking at "active"; frames for a different (background)
       // session must still build that session's history, but must NOT flip the
@@ -2998,7 +3503,13 @@ describe("remote client", () => {
         // point of the multi-run model: N runs are independently representable.
         expect(st.runs.bg.streaming).toBe(true);
         expect(st.messages.bg).toEqual([
-          { id: "b1", role: "assistant", blocks: [], createdAt: expect.any(Number) },
+          {
+            id: "b1",
+            role: "assistant",
+            blocks: [],
+            createdAt: expect.any(Number),
+            turnId: "b1",
+          },
         ]);
       });
 
@@ -3027,11 +3538,12 @@ describe("remote client", () => {
         useStore.setState({
           activeId: "active",
           runs: {
-            active: {
+            active: runState({
               streaming: true,
-              cancel: null,
+              turnId: "active-turn",
+              startedAt: 1,
               pendingPermission: { id: "p", tool: "t", summary: "s", input: {} },
-            },
+            }),
           },
           streaming: true,
           pendingPermission: { id: "p", tool: "t", summary: "s", input: {} },
@@ -3054,6 +3566,37 @@ describe("remote client", () => {
         st = useStore.getState();
         expect(st.streaming).toBe(true);
         expect(st.pendingPermission).not.toBeNull();
+      });
+
+      it("attaches a background turn receipt without changing the active session's run", () => {
+        useStore.setState({
+          activeId: "active",
+          messages: {
+            active: [
+              {
+                id: "active-turn",
+                role: "assistant",
+                blocks: [{ kind: "text", text: "still running" }],
+                createdAt: 1,
+                turnId: "active-turn",
+              },
+            ],
+          },
+          runs: {
+            active: runState({ streaming: true, turnId: "active-turn", startedAt: 1 }),
+          },
+          streaming: true,
+        });
+        bgLive({ type: "turn_start", messageId: "bg-turn", startedAt: 100 });
+        const receipt = turnReceipt({ turnId: "bg-turn" });
+        bgLive({ type: "turn_end", stopReason: "end_turn", receipt });
+
+        const st = useStore.getState();
+        expect(st.streaming).toBe(true);
+        expect(st.runs.active).toMatchObject({ streaming: true, turnId: "active-turn" });
+        expect(st.messages.active[0]).not.toHaveProperty("receipt");
+        expect(st.messages.bg[0]).toMatchObject({ turnId: "bg-turn", receipt });
+        expect(st.runs.bg).toMatchObject({ streaming: false, outcome: "completed", receipt });
       });
     });
   });

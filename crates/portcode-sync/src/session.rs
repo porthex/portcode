@@ -367,6 +367,8 @@ mod tests {
                         role: "user".into(),
                         content: vec![],
                         created_at: 3,
+                        turn_id: None,
+                        receipt: None,
                     }],
                 })
                 .await

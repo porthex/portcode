@@ -70,6 +70,87 @@ pub struct ChatMessage {
     pub content: Vec<Block>,
 }
 
+/// Terminal state of one root agent turn. `Interrupted` is persisted when a
+/// process dies after the durable turn row was created but before a terminal
+/// event could be emitted.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStatus {
+    Completed,
+    Cancelled,
+    Error,
+    Interrupted,
+}
+
+/// How confidently a receipt can attribute an observed file delta to the turn.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(rename_all = "snake_case")]
+pub enum TurnChangeCertainty {
+    Exact,
+    Observed,
+    Ambiguous,
+    Unavailable,
+}
+
+/// Git-shaped status used by the immutable, bounded changed-file summary.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(rename_all = "snake_case")]
+pub enum TurnFileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    Unmerged,
+}
+
+/// One path whose terminal workspace identity differed from the turn baseline.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(rename_all = "camelCase")]
+pub struct TurnChangedFile {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    pub status: TurnFileStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<u64>,
+    pub binary: bool,
+    pub certainty: TurnChangeCertainty,
+}
+
+/// Immutable terminal summary attached to the assistant bubble both live and
+/// after a database reload. Changed files are deliberately bounded; counts and
+/// totals describe the complete observed delta when capture succeeded.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(rename_all = "camelCase")]
+pub struct TurnReceipt {
+    pub turn_id: String,
+    pub status: TurnStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    pub started_at: i64,
+    pub completed_at: i64,
+    /// Monotonic elapsed time for a normally terminalized turn. Omitted when a
+    /// pending row is recovered after process restart because the crash instant is
+    /// unknowable and fabricating a near-zero duration would be misleading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    pub changed_files: Vec<TurnChangedFile>,
+    pub changed_file_count: u64,
+    pub additions: u64,
+    pub deletions: u64,
+    pub files_truncated: bool,
+    pub change_certainty: TurnChangeCertainty,
+    pub background_tasks_running: bool,
+}
+
 /// Events streamed to the frontend. Tagged + camelCased to match `StreamEvent`
 /// in `src/types.ts`. `Deserialize` lets Phone Sync decode it on the phone side
 /// (it is forwarded verbatim inside `protocol::SyncFrame::Live`).
@@ -81,6 +162,12 @@ pub enum StreamEvent {
     TurnStart {
         #[serde(rename = "messageId")]
         message_id: String,
+        /// Stable root-turn identity. Optional only on decode so old Phone Sync
+        /// peers that sent `messageId` alone remain readable.
+        #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        #[serde(rename = "startedAt", default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<i64>,
     },
     TextDelta {
         text: String,
@@ -116,9 +203,17 @@ pub enum StreamEvent {
     TurnEnd {
         #[serde(rename = "stopReason")]
         stop_reason: String,
+        /// New native runs always emit a receipt. `Option` is retained solely so
+        /// frames produced by older desktop versions still deserialize.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<TurnReceipt>,
     },
     Error {
         message: String,
+        /// Duplicate-run and early preflight failures may occur before a durable
+        /// turn exists; legacy frames also omit this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<TurnReceipt>,
     },
     /// A subagent (the `task` tool) started. Emitted on the SESSION channel so the
     /// live agents panel sees it even though the subagent's own deltas stream on a
@@ -196,4 +291,89 @@ pub struct MessageRow {
     pub role: String,
     pub content: Vec<Block>,
     pub created_at: i64,
+    /// NULL/omitted on legacy rows. New rows use this to rebuild the same single
+    /// assistant bubble that live `TurnStart` created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    /// Attached to the terminal row of a replicated turn. Desktop `UiMessage`
+    /// carries the same receipt directly on the grouped assistant bubble.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<TurnReceipt>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_turn_events_decode_without_receipt_fields() {
+        assert_eq!(
+            serde_json::from_value::<StreamEvent>(json!({
+                "type": "turn_start",
+                "messageId": "legacy-message"
+            }))
+            .unwrap(),
+            StreamEvent::TurnStart {
+                message_id: "legacy-message".into(),
+                turn_id: None,
+                started_at: None,
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<StreamEvent>(json!({
+                "type": "turn_end",
+                "stopReason": "end_turn"
+            }))
+            .unwrap(),
+            StreamEvent::TurnEnd {
+                stop_reason: "end_turn".into(),
+                receipt: None,
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<StreamEvent>(json!({
+                "type": "error",
+                "message": "old error"
+            }))
+            .unwrap(),
+            StreamEvent::Error {
+                message: "old error".into(),
+                receipt: None,
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_message_row_decodes_nullable_turn_metadata() {
+        let row: MessageRow = serde_json::from_value(json!({
+            "id": "m1",
+            "sessionId": "s1",
+            "seq": 0,
+            "role": "user",
+            "content": [],
+            "createdAt": 1
+        }))
+        .unwrap();
+        assert!(row.turn_id.is_none());
+        assert!(row.receipt.is_none());
+    }
+
+    #[test]
+    fn new_turn_start_uses_one_authoritative_display_id() {
+        let event = StreamEvent::TurnStart {
+            message_id: "turn-1".into(),
+            turn_id: Some("turn-1".into()),
+            started_at: Some(42),
+        };
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            json!({
+                "type": "turn_start",
+                "messageId": "turn-1",
+                "turnId": "turn-1",
+                "startedAt": 42
+            })
+        );
+    }
 }

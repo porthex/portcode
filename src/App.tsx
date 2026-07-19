@@ -367,6 +367,7 @@ function TitleBar({
   const setShowPalette = useStore((s) => s.setShowPalette);
   const workspaceSurface = useStore((s) => s.workspaceSurface);
   const setWorkspaceSurface = useStore((s) => s.setWorkspaceSurface);
+  const openWorkspaceReview = useStore((s) => s.openWorkspaceReview);
   return (
     <header className="relative z-40 flex h-[46px] shrink-0 items-center justify-between border-b border-border bg-panel/70 px-3.5 backdrop-blur-sm">
       <div className="flex min-w-0 items-center gap-2.5">
@@ -410,7 +411,10 @@ function TitleBar({
           type="button"
           aria-label={workspaceSurface === "review" ? "Back to chat" : "Open review workspace"}
           aria-pressed={workspaceSurface === "review"}
-          onClick={() => setWorkspaceSurface(workspaceSurface === "review" ? "chat" : "review")}
+          onClick={() => {
+            if (workspaceSurface === "review") setWorkspaceSurface("chat");
+            else openWorkspaceReview();
+          }}
           className={`flex h-[31px] items-center gap-1.5 rounded-[7px] border px-2.5 font-mono text-[10px] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-accent-2/20 ${
             workspaceSurface === "review"
               ? "border-accent-2/55 bg-accent-2/12 text-accent-2"

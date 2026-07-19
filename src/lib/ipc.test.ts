@@ -269,6 +269,23 @@ describe("Tauri command serialization", () => {
     expect(invoke).toHaveBeenCalledWith("get_git_review_branches");
   });
 
+  it("loads turn review manifests and files by stable turn identity", async () => {
+    const { ipc, invoke } = await load();
+    const manifest = { turnId: "turn-7", snapshotId: "turn-snapshot", files: [] };
+    invoke.mockResolvedValueOnce(manifest);
+
+    await expect(ipc.getTurnReviewManifest("turn-7")).resolves.toBe(manifest);
+    expect(invoke).toHaveBeenCalledWith("get_turn_review_manifest", { turnId: "turn-7" });
+
+    const patch = { snapshotId: "turn-snapshot", path: "src/App.tsx", hunks: [] };
+    invoke.mockResolvedValueOnce(patch);
+    await expect(ipc.getTurnReviewFile("turn-7", "src/App.tsx")).resolves.toBe(patch);
+    expect(invoke).toHaveBeenCalledWith("get_turn_review_file", {
+      turnId: "turn-7",
+      path: "src/App.tsx",
+    });
+  });
+
   it("list_sessions is invoked with no arguments", async () => {
     const { ipc, invoke } = await load();
     const sessions = [{ id: "s1" }];
@@ -433,6 +450,10 @@ describe("Tauri command serialization", () => {
 
     await handle.cancel();
     expect(invoke).toHaveBeenCalledWith("cancel_agent", { sessionId: "sess-1" });
+    expect(unlisten).not.toHaveBeenCalled();
+    registered({ payload: { type: "turn_end", stopReason: "cancelled" } });
+    expect(onEvent).toHaveBeenLastCalledWith({ type: "turn_end", stopReason: "cancelled" });
+    handle.dispose();
     expect(unlisten).toHaveBeenCalledTimes(1);
   });
 
@@ -663,6 +684,24 @@ describe("browser fallback (no Tauri core)", () => {
     await expect(
       ipc.getGitReviewFile({ kind: "staged" }, "old-snapshot", "src/App.tsx"),
     ).rejects.toThrow("stale");
+  });
+
+  it("returns a receipt-backed browser turn manifest without inventing historical patches", async () => {
+    const { ipc, invoke } = await load();
+    const manifest = await ipc.getTurnReviewManifest("turn-preview");
+
+    expect(manifest).toMatchObject({
+      turnId: "turn-preview",
+      snapshotId: "preview-turn-turn-preview",
+      patchesAvailable: false,
+      receipt: { turnId: "turn-preview", status: "completed" },
+    });
+    expect(manifest.files).toEqual(manifest.receipt.changedFiles);
+    await expect(ipc.getTurnReviewFile("turn-preview", "src/App.tsx")).rejects.toThrow(
+      "unavailable",
+    );
+    await expect(ipc.getTurnReviewFile("turn-preview", "missing.ts")).rejects.toThrow("not part");
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it("openFolder returns the canned preview path", async () => {

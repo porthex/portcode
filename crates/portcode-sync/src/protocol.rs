@@ -210,6 +210,8 @@ mod tests {
                 role: "assistant".into(),
                 content: vec![Block::Text { text: "hi".into() }],
                 created_at: 12345,
+                turn_id: None,
+                receipt: None,
             }],
         });
     }
@@ -265,6 +267,8 @@ mod tests {
                     text: "older".into(),
                 }],
                 created_at: 999,
+                turn_id: None,
+                receipt: None,
             }],
             has_more: true,
         };

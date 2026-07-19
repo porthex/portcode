@@ -3,7 +3,7 @@ import { render, screen, fireEvent, act } from "@testing-library/react";
 
 import { Chat } from "./Chat";
 import { useStore } from "../store/store";
-import type { Message, ContentBlock, Session } from "../types";
+import type { Message, ContentBlock, Session, TurnReceipt as TurnReceiptData } from "../types";
 
 // Chat is the transcript for the active session. It is display-only: it reads
 // `activeId`, `messages[activeId]`, and `streaming` from the real store, renders
@@ -28,6 +28,22 @@ const userMessage = (id: string, text: string): Message => ({
   role: "user",
   blocks: [{ kind: "text", text } as ContentBlock],
   createdAt: 1,
+});
+
+const receipt = (over: Partial<TurnReceiptData> = {}): TurnReceiptData => ({
+  turnId: "turn-1",
+  status: "completed",
+  startedAt: 1_000,
+  completedAt: 4_000,
+  durationMs: 3_000,
+  changedFiles: [],
+  changedFileCount: 0,
+  additions: 0,
+  deletions: 0,
+  filesTruncated: false,
+  changeCertainty: "exact",
+  backgroundTasksRunning: false,
+  ...over,
 });
 
 // Marker text that only the EmptyState renders, so its presence/absence cleanly
@@ -180,6 +196,148 @@ describe("Chat transcript", () => {
 
     expect(screen.getByText("Read file")).toBeInTheDocument();
     expect(screen.queryByText("Reading file")).not.toBeInTheDocument();
+  });
+
+  it("binds the provider-neutral live run to its matching assistant turn", () => {
+    const assistantMessage: Message = {
+      id: "assistant-1",
+      turnId: "turn-1",
+      role: "assistant",
+      blocks: [{ kind: "text", text: "I need approval to continue." }],
+      createdAt: 2,
+    };
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "make the change"), assistantMessage] },
+      streaming: true,
+      runs: {
+        s1: {
+          streaming: true,
+          cancel: null,
+          pendingPermission: {
+            id: "permission-1",
+            tool: "shell",
+            summary: "Run the focused tests",
+            input: {},
+          },
+          turnId: "turn-1",
+          startedAt: Date.now() - 2_000,
+          finalizing: false,
+          receipt: null,
+          outcome: null,
+        },
+      },
+    });
+
+    const { container } = render(<Chat />);
+
+    expect(screen.getByText("Waiting for approval")).toBeInTheDocument();
+    expect(container.querySelectorAll(".pc-turn-receipt")).toHaveLength(1);
+
+    act(() => {
+      useStore.setState({
+        streaming: false,
+        runs: {
+          s1: {
+            streaming: false,
+            cancel: null,
+            pendingPermission: null,
+            turnId: "turn-1",
+            startedAt: Date.now() - 2_500,
+            finalizing: true,
+            receipt: null,
+            outcome: null,
+          },
+        },
+      });
+    });
+
+    expect(screen.getByText("Finalizing")).toBeInTheDocument();
+    expect(screen.queryByText("Waiting for approval")).toBeNull();
+  });
+
+  it("opens the persisted turn review from a completed receipt", () => {
+    const turnReceipt = receipt({
+      changedFiles: [
+        {
+          path: "src/review-me.ts",
+          status: "modified",
+          additions: 6,
+          deletions: 2,
+          binary: false,
+          certainty: "exact",
+        },
+      ],
+      changedFileCount: 1,
+      additions: 6,
+      deletions: 2,
+    });
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: {
+        s1: [
+          {
+            id: "assistant-1",
+            turnId: "turn-1",
+            role: "assistant",
+            blocks: [{ kind: "text", text: "The implementation is complete." }],
+            receipt: turnReceipt,
+            createdAt: 2,
+          },
+        ],
+      },
+      streaming: false,
+      workspaceSurface: "chat",
+      reviewTarget: { kind: "workspace" },
+    });
+
+    render(<Chat />);
+    fireEvent.click(screen.getByRole("button", { name: "Review 1 changed file" }));
+
+    expect(useStore.getState().workspaceSurface).toBe("review");
+    expect(useStore.getState().reviewTarget).toEqual({ kind: "turn", turnId: "turn-1" });
+  });
+
+  it("keeps receipt facts readable on the phone while deferring Review to desktop", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: {
+        s1: [
+          {
+            id: "assistant-1",
+            role: "assistant",
+            blocks: [{ kind: "text", text: "Remote summary." }],
+            receipt: receipt({
+              changedFiles: [
+                {
+                  path: "src/phone-visible.ts",
+                  status: "added",
+                  additions: 2,
+                  deletions: 0,
+                  binary: false,
+                  certainty: "observed",
+                },
+              ],
+              changedFileCount: 1,
+              additions: 2,
+              changeCertainty: "observed",
+            }),
+            createdAt: 2,
+          },
+        ],
+      },
+      streaming: false,
+      remoteMode: true,
+    });
+
+    render(<Chat />);
+
+    expect(screen.getByText("src/phone-visible.ts")).toBeInTheDocument();
+    expect(screen.getByText("Review on desktop")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /review 1 changed file/i })).toBeNull();
   });
 
   it("keeps a 220-message / 880-tool transcript structurally compact", () => {
