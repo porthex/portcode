@@ -22,6 +22,7 @@ import type {
   RemoteCommand,
   SearchHit,
   Session,
+  SessionArchiveWarning,
   SessionUsage,
   Settings,
   StreamEvent,
@@ -469,6 +470,23 @@ export async function deleteSession(id: string): Promise<void> {
     const { core } = await tauri();
     await core.invoke("delete_session", { id });
   }
+}
+
+/**
+ * Inspect the persisted workspace for one session before archiving it. `null`
+ * means there is no uncommitted Git work to warn about. Native failures reject
+ * so the UI fails closed instead of archiving when cleanliness is unknown.
+ */
+export async function getSessionArchiveWarning(
+  sessionId: string,
+): Promise<SessionArchiveWarning | null> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<SessionArchiveWarning | null>("get_session_archive_warning", {
+      sessionId,
+    });
+  }
+  return null;
 }
 
 export async function getMessages(sessionId: string): Promise<Message[]> {

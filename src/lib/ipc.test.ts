@@ -248,6 +248,23 @@ describe("Tauri command serialization", () => {
     expect(invoke).toHaveBeenCalledWith("get_workspace_summary");
   });
 
+  it("get_session_archive_warning forwards only the persisted session id", async () => {
+    const { ipc, invoke } = await load();
+    const warning = {
+      workspace: "C:/workspace/chat",
+      branch: "feature/sidebar",
+      detachedHead: null,
+      changedFiles: 2,
+      untrackedFiles: 1,
+      additions: 8,
+      deletions: 3,
+    };
+    invoke.mockResolvedValue(warning);
+
+    await expect(ipc.getSessionArchiveWarning("s1")).resolves.toBe(warning);
+    expect(invoke).toHaveBeenCalledWith("get_session_archive_warning", { sessionId: "s1" });
+  });
+
   it("serializes typed Git review scopes and snapshot-guarded file requests", async () => {
     const { ipc, invoke } = await load();
     const scope = { kind: "branch", base: "origin/main" } as const;
@@ -617,6 +634,7 @@ describe("browser fallback (no Tauri core)", () => {
     await expect(ipc.createSession("id", "title", null)).resolves.toBeUndefined();
     await expect(ipc.renameSession("id", "new")).resolves.toBeUndefined();
     await expect(ipc.deleteSession("id")).resolves.toBeUndefined();
+    await expect(ipc.getSessionArchiveWarning("id")).resolves.toBeNull();
     expect(invoke).not.toHaveBeenCalled();
   });
 

@@ -130,6 +130,25 @@ export interface Session {
 }
 
 /**
+ * Uncommitted work found in the workspace owned by one session when the user
+ * asks to archive it. The native core resolves the workspace from the persisted
+ * session id, so the frontend never supplies an arbitrary filesystem path.
+ */
+export interface SessionArchiveWarning {
+  workspace: string;
+  branch: string | null;
+  detachedHead: string | null;
+  changedFiles: number;
+  untrackedFiles: number;
+  additions: number;
+  deletions: number;
+}
+
+export type ArchiveSessionResult =
+  | { outcome: "archived" | "unarchived" }
+  | { outcome: "needsConfirmation"; warning: SessionArchiveWarning };
+
+/**
  * Derived lifecycle state of a session row in the sidebar.
  * - `running`  — the open session while a turn streams (the only honest "live"
  *   signal: the store tracks a single global `streaming`, owned by the active run).

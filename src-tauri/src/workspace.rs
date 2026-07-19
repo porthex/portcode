@@ -19,6 +19,22 @@ pub struct WorkspaceSummary {
     git: GitSummary,
 }
 
+/// Dirty-worktree facts shown before archiving a session. This is deliberately
+/// smaller than `WorkspaceSummary`: clean workspaces return `None`, while Git
+/// inspection failures reject so the UI cannot silently archive an unknown
+/// worktree state.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionArchiveWarning {
+    workspace: String,
+    branch: Option<String>,
+    detached_head: Option<String>,
+    changed_files: u64,
+    untracked_files: u64,
+    additions: u64,
+    deletions: u64,
+}
+
 #[derive(Serialize)]
 #[serde(
     tag = "kind",
@@ -87,6 +103,64 @@ pub async fn get_workspace_summary(state: State<'_, AppState>) -> Result<Workspa
         configured,
         git,
     })
+}
+
+/// Inspect the workspace persisted for one session before archiving it. The
+/// caller supplies only a session id; the path is resolved from SQLite so this
+/// command cannot become an arbitrary filesystem probe.
+#[tauri::command]
+pub async fn get_session_archive_warning(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<SessionArchiveWarning>, String> {
+    let workspace = state
+        .db
+        .workspace_for_session(&session_id)
+        .map_err(|error| format!("Could not read session workspace: {error}"))?
+        .ok_or_else(|| "Session not found".to_string())?;
+    let Some(workspace) = workspace else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(&workspace);
+    archive_warning_from_git(workspace, inspect_git(&path).await)
+}
+
+fn archive_warning_from_git(
+    workspace: String,
+    git: GitSummary,
+) -> Result<Option<SessionArchiveWarning>, String> {
+    match git {
+        GitSummary::Repository {
+            branch,
+            detached_head,
+            changed_files,
+            untracked_files,
+            additions,
+            deletions,
+            ..
+        } if changed_files > 0 => Ok(Some(SessionArchiveWarning {
+            workspace,
+            branch,
+            detached_head,
+            changed_files,
+            untracked_files,
+            additions,
+            deletions,
+        })),
+        GitSummary::Repository { .. } | GitSummary::NotRepository => Ok(None),
+        GitSummary::Unavailable { reason } => Err(format!(
+            "Could not inspect the session workspace ({})",
+            unavailable_reason_label(reason)
+        )),
+    }
+}
+
+fn unavailable_reason_label(reason: GitUnavailableReason) -> &'static str {
+    match reason {
+        GitUnavailableReason::Missing => "Git is unavailable",
+        GitUnavailableReason::Timeout => "Git status timed out",
+        GitUnavailableReason::Failed => "Git status failed",
+    }
 }
 
 async fn inspect_git(workspace: &Path) -> GitSummary {
@@ -332,5 +406,56 @@ mod tests {
             numstat_args(NumstatScope::Unstaged),
             ["diff", "--no-ext-diff", "--no-textconv", "--numstat", "--",]
         );
+    }
+
+    #[test]
+    fn archive_warning_only_reports_dirty_repositories() {
+        let dirty = archive_warning_from_git(
+            "C:/work/chat".into(),
+            GitSummary::Repository {
+                branch: Some("feature/sessions".into()),
+                detached_head: None,
+                upstream: Some("origin/feature/sessions".into()),
+                ahead: 1,
+                behind: 0,
+                changed_files: 3,
+                untracked_files: 1,
+                additions: 24,
+                deletions: 7,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dirty.branch.as_deref(), Some("feature/sessions"));
+        assert_eq!(dirty.changed_files, 3);
+        assert_eq!(dirty.untracked_files, 1);
+
+        let clean = archive_warning_from_git(
+            "C:/work/chat".into(),
+            GitSummary::Repository {
+                branch: Some("main".into()),
+                detached_head: None,
+                upstream: None,
+                ahead: 0,
+                behind: 0,
+                changed_files: 0,
+                untracked_files: 0,
+                additions: 0,
+                deletions: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(clean, None);
+    }
+
+    #[test]
+    fn archive_warning_fails_closed_when_git_state_is_unknown() {
+        let result = archive_warning_from_git(
+            "C:/work/chat".into(),
+            GitSummary::Unavailable {
+                reason: GitUnavailableReason::Timeout,
+            },
+        );
+        assert!(result.unwrap_err().contains("timed out"));
     }
 }

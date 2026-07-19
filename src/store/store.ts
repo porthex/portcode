@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type {
   AgentInfo,
   AgentStatus,
+  ArchiveSessionResult,
   BackgroundTaskInfo,
   BackgroundTaskStatus,
   ComposerPhase,
@@ -272,7 +273,7 @@ interface AppState {
   renameFolder: (id: string, name: string) => void;
   deleteFolder: (id: string) => void; // members fall back to loose
   moveSessionToFolder: (sessionId: string, folderId: string | null) => void;
-  toggleArchived: (sessionId: string) => void;
+  toggleArchived: (sessionId: string, force?: boolean) => Promise<ArchiveSessionResult>;
   setDraft: (v: string) => void;
   appendDraft: (v: string) => void;
   openWorkspace: () => Promise<void>;
@@ -1748,6 +1749,7 @@ export const useStore = create<AppState>((set, get) => ({
     const state = get();
     const targetRun = state.runs[runKey(id)];
     if (
+      !state.archivedIds.includes(id) ||
       targetRun?.streaming ||
       targetRun?.finalizing ||
       targetRun?.pendingPermission ||
@@ -2764,14 +2766,34 @@ export const useStore = create<AppState>((set, get) => ({
     });
   },
 
-  toggleArchived(sessionId) {
+  async toggleArchived(sessionId, force = false) {
+    const alreadyArchived = get().archivedIds.includes(sessionId);
+    if (alreadyArchived) {
+      set((st) => {
+        const archivedIds = st.archivedIds.filter((id) => id !== sessionId);
+        writeJSON("pc.archivedIds", archivedIds);
+        return { archivedIds };
+      });
+      return { outcome: "unarchived" };
+    }
+
+    if (!force) {
+      const warning = await ipc.getSessionArchiveWarning(sessionId);
+      // A session could disappear while Git status was in flight. Do not retain a
+      // stale archived id or open a warning for an object that no longer exists.
+      if (!get().sessions.some((session) => session.id === sessionId)) {
+        return { outcome: "archived" };
+      }
+      if (warning) return { outcome: "needsConfirmation", warning };
+    }
+
     set((st) => {
-      const archivedIds = st.archivedIds.includes(sessionId)
-        ? st.archivedIds.filter((x) => x !== sessionId)
-        : [...st.archivedIds, sessionId];
+      if (st.archivedIds.includes(sessionId)) return {};
+      const archivedIds = [...st.archivedIds, sessionId];
       writeJSON("pc.archivedIds", archivedIds);
       return { archivedIds };
     });
+    return { outcome: "archived" };
   },
 
   setDraft(v) {
