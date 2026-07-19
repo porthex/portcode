@@ -452,9 +452,8 @@ function TitleBar({
  * ignored: these actions can race teardown while the window is closing. */
 function WindowControls() {
   const run = (action: "minimize" | "toggleMaximize" | "close") => {
-    void getCurrentWindow()
-      [action]()
-      .catch(() => undefined);
+    const titleWindow = getCurrentWindow();
+    void titleWindow[action]().catch(() => undefined);
   };
 
   return (
