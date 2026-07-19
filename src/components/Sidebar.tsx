@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent } from "react";
 
 import { useContextMenu, type ContextMenuItem } from "./ContextMenu";
+import { SessionActionDialog, type SessionDialogState } from "./SessionActionDialog";
 import { isTauri } from "../lib/ipc";
 import {
   buildSidebarRows,
@@ -38,6 +39,10 @@ type DropHint = { id: string; place: "before" | "after" };
 function dropPlace(clientY: number, el: HTMLElement): "before" | "after" {
   const rect = el.getBoundingClientRect();
   return clientY < rect.top + rect.height / 2 ? "before" : "after";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** The sessions sidebar. A width-animated shell morphs between the full 248px
@@ -146,6 +151,18 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
   // Where a drag-reorder would drop, for the insertion-line indicator.
   const [dropHint, setDropHint] = useState<DropHint | null>(null);
+  // Drag identity drives a stable lifted-row treatment and prevents the source
+  // row from advertising itself as its own destination.
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  // Pointer reordering has an equivalent keyboard route on the grip. Announce
+  // each completed move so the new position is perceivable without sight.
+  const [reorderAnnouncement, setReorderAnnouncement] = useState("");
+  // Lifecycle dialogs are local transient UI; the archive/delete invariants and
+  // the worktree inspection remain in the store/native core respectively.
+  const [sessionDialog, setSessionDialog] = useState<SessionDialogState | null>(null);
+  const [sessionActionBusy, setSessionActionBusy] = useState(false);
+  const [inspectingSessionId, setInspectingSessionId] = useState<string | null>(null);
+  const dialogOpenerRef = useRef<HTMLElement | null>(null);
 
   // Right-click context menus for session + folder rows (and the empty list area).
   const { onContextMenu, menu: ctxMenu } = useContextMenu();
@@ -306,6 +323,19 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   // rides in a custom MIME so unrelated drags can't hijack the list.
   const draggedSessionId = (e: DragEvent): string => e.dataTransfer.getData("text/pc-session");
 
+  const beginDrag = (e: DragEvent, sessionId: string) => {
+    e.dataTransfer.setData("text/pc-session", sessionId);
+    e.dataTransfer.effectAllowed = "move";
+    setDraggingId(sessionId);
+    setDropHint(null);
+  };
+
+  const finishDrag = () => {
+    setDraggingId(null);
+    setDropHint(null);
+    setDragOverFolderId(null);
+  };
+
   // Drop a dragged chat next to `target`: it joins the target's folder/loose AND
   // the list switches to manual order with the chat spliced in beside the target.
   // This is the "reorder (sort by goes off) / move to other group" gesture.
@@ -324,11 +354,86 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
     setManualOrder(next);
   };
 
+  const reorderFromKeyboard = (session: Session, direction: -1 | 1): void => {
+    const index = visible.findIndex((candidate) => candidate.id === session.id);
+    const target = visible[index + direction];
+    if (index < 0 || !target) {
+      setReorderAnnouncement(
+        `${session.title} is already at the ${direction < 0 ? "top" : "bottom"}.`,
+      );
+      return;
+    }
+    reorder(session.id, target, direction < 0 ? "before" : "after");
+    setReorderAnnouncement(
+      `${session.title} moved ${direction < 0 ? "before" : "after"} ${target.title}.`,
+    );
+  };
+
+  const requestArchive = async (session: Session): Promise<void> => {
+    if (inspectingSessionId === session.id) return;
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setInspectingSessionId(session.id);
+    try {
+      const result = await toggleArchived(session.id);
+      if (result.outcome === "needsConfirmation") {
+        dialogOpenerRef.current = opener;
+        setSessionDialog({ kind: "archive", session, warning: result.warning });
+      }
+    } catch (error) {
+      dialogOpenerRef.current = opener;
+      setSessionDialog({
+        kind: "archiveError",
+        session,
+        message: errorMessage(error),
+      });
+    } finally {
+      setInspectingSessionId((current) => (current === session.id ? null : current));
+    }
+  };
+
+  const requestDelete = (session: Session): void => {
+    if (!archived.has(session.id)) return;
+    dialogOpenerRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setSessionDialog({ kind: "delete", session });
+  };
+
+  const closeSessionDialog = (): void => {
+    const opener = dialogOpenerRef.current;
+    dialogOpenerRef.current = null;
+    setSessionDialog(null);
+    queueMicrotask(() => {
+      if (opener?.isConnected) opener.focus();
+      else rowRefs.current.find((element) => element?.isConnected)?.focus();
+    });
+  };
+
+  const confirmSessionDialog = async (): Promise<void> => {
+    const action = sessionDialog;
+    if (!action || sessionActionBusy) return;
+    if (action.kind === "archiveError") {
+      setSessionDialog(null);
+      await requestArchive(action.session);
+      return;
+    }
+    setSessionActionBusy(true);
+    try {
+      if (action.kind === "archive") {
+        await toggleArchived(action.session.id, true);
+      } else {
+        await deleteSession(action.session.id);
+      }
+      closeSessionDialog();
+    } finally {
+      setSessionActionBusy(false);
+    }
+  };
+
   // Right-click items for a session row. Mutating actions are disabled while a turn
   // streams (mirrors the per-row button guards). "Move to folder" is a flat section
   // (a heading + one item per folder) so there's no submenu risk; "Remove from
   // folder" only appears when the chat is in one.
-  const sessionMenuItems = (s: Session, status: SessionActivityStatus): ContextMenuItem[] => {
+  const sessionMenuItems = (s: Session): ContextMenuItem[] => {
     const busy = targetBusy(s.id);
     const inFolder = folderOf[s.id] ?? null;
     const items: ContextMenuItem[] = [
@@ -339,9 +444,10 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         disabled: creatingSession,
       },
       {
-        label: status === "archived" ? "Unarchive" : "Archive",
+        label: archived.has(s.id) ? "Unarchive" : "Archive",
         icon: <ArchiveIcon />,
-        onSelect: () => toggleArchived(s.id),
+        onSelect: () => void requestArchive(s),
+        disabled: inspectingSessionId === s.id,
       },
     ];
     // Move-to-folder section: only meaningful in the manual (folder) mode.
@@ -367,12 +473,13 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
       }
     }
     items.push({
-      label: "Delete",
+      label: archived.has(s.id) ? "Delete permanently" : "Delete (archive first)",
       icon: <TrashGlyph />,
       danger: true,
       separatorBefore: true,
-      onSelect: () => void deleteSession(s.id),
-      disabled: busy,
+      shortcut: archived.has(s.id) ? undefined : "Archive first",
+      onSelect: () => requestDelete(s),
+      disabled: busy || !archived.has(s.id),
     });
     return items;
   };
@@ -441,15 +548,21 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         onContextMenu={onContextMenu(folderMenuItems(folder))}
         onDragOver={(e) => {
           e.preventDefault();
+          e.dataTransfer.dropEffect = "move";
           setDragOverFolderId(folder.id);
+          setDropHint(null);
         }}
-        onDragLeave={() => setDragOverFolderId((cur) => (cur === folder.id ? null : cur))}
+        onDragLeave={(e) => {
+          const next = e.relatedTarget;
+          if (next instanceof Node && e.currentTarget.contains(next)) return;
+          setDragOverFolderId((cur) => (cur === folder.id ? null : cur));
+        }}
         onDrop={(e) => {
           e.preventDefault();
           e.stopPropagation(); // don't also bubble to the loose-root drop handler
           const id = draggedSessionId(e);
           if (id) moveSessionToFolder(id, folder.id);
-          setDragOverFolderId(null);
+          finishDrag();
         }}
       >
         <div className="flex items-center gap-1.5">
@@ -514,7 +627,8 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
     const active = s.id === activeId;
     const busy = targetBusy(s.id);
     const isTabStop = s.id === tabStopId;
-    const isArchived = status === "archived" && !active;
+    const isArchived = archived.has(s.id);
+    const isDragging = draggingId === s.id;
     // Reorder + folder DnD only applies in the manual ("none") mode; the auto
     // groupings derive their order, so rows aren't draggable there.
     const reorderable = groupBy === "none";
@@ -527,26 +641,28 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
     const rowEl = (
       <div
         key={s.id}
-        draggable={reorderable}
-        onContextMenu={onContextMenu(sessionMenuItems(s, status))}
-        onDragStart={(e) => {
-          e.dataTransfer.setData("text/pc-session", s.id);
-          e.dataTransfer.effectAllowed = "move";
+        data-session-row={s.id}
+        onClick={(event) => {
+          const target = event.target as HTMLElement;
+          if (target.closest("button, input")) return;
+          void selectSession(s.id);
         }}
-        onDragEnd={() => {
-          setDropHint(null);
-          setDragOverFolderId(null);
-        }}
+        onContextMenu={onContextMenu(sessionMenuItems(s))}
+        onDragStart={(e) => beginDrag(e, s.id)}
+        onDragEnd={finishDrag}
         onDragOver={
           reorderable
             ? (e) => {
                 e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
+                const source = draggedSessionId(e) || draggingId;
+                if (source === s.id) {
+                  setDropHint(null);
+                  return;
+                }
                 setDropHint({ id: s.id, place: dropPlace(e.clientY, e.currentTarget) });
               }
             : undefined
-        }
-        onDragLeave={
-          reorderable ? () => setDropHint((cur) => (cur?.id === s.id ? null : cur)) : undefined
         }
         onDrop={
           reorderable
@@ -554,15 +670,15 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
                 e.preventDefault();
                 e.stopPropagation(); // reorder wins over the loose-root drop
                 reorder(draggedSessionId(e), s, dropPlace(e.clientY, e.currentTarget));
-                setDropHint(null);
+                finishDrag();
               }
             : undefined
         }
         className={
-          (active
-            ? "group rounded-lg border border-accent/30 bg-accent/10 px-3 py-2 shadow-[inset_0_0_14px_rgba(255,46,126,0.12)] transition-[background-color,border-color,box-shadow,color] duration-150 ease-out motion-reduce:transition-none"
-            : "pc-row group rounded-lg px-3 py-2") +
+          "pc-session-row group relative rounded-lg " +
+          (active ? "pc-session-row--selected" : "pc-row") +
           (isArchived ? " pc-row--archived" : "") +
+          (isDragging ? " pc-session-row--dragging" : "") +
           (dropHint?.id === s.id ? ` pc-drop-line pc-drop-line--${dropHint.place}` : "")
         }
       >
@@ -573,26 +689,37 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
             // Chromium/WebView2 won't reliably start the parent row's native
             // drag when the press lands on a nested interactive <button> — so
             // grabbing a chat by its title (the obvious target) did nothing.
-            // This non-button grip is an unambiguous drag surface: it carries
-            // its own draggable/onDragStart so the gesture always initiates,
-            // and stops the event bubbling so the row's handler doesn't re-fire.
-            <span
+            // This explicit grip is an unambiguous drag surface. It is also a
+            // real keyboard control: Alt+Up/Down performs the same reorder and
+            // reports the result through the list's polite live region.
+            <button
+              type="button"
               draggable
               onDragStart={(e) => {
                 e.stopPropagation();
-                e.dataTransfer.setData("text/pc-session", s.id);
-                e.dataTransfer.effectAllowed = "move";
+                beginDrag(e, s.id);
               }}
-              onDragEnd={() => {
-                setDropHint(null);
-                setDragOverFolderId(null);
+              onDragEnd={finishDrag}
+              onClick={() =>
+                setReorderAnnouncement(
+                  `Drag ${s.title} to move it, or press Alt plus Up or Down arrow.`,
+                )
+              }
+              onKeyDown={(event) => {
+                if (!event.altKey || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) {
+                  return;
+                }
+                event.preventDefault();
+                event.stopPropagation();
+                reorderFromKeyboard(s, event.key === "ArrowUp" ? -1 : 1);
               }}
-              aria-hidden="true"
-              title="Drag to reorder or move into a folder"
-              className="pc-drag-handle -ml-1 mr-0.5 flex h-6 w-3.5 shrink-0 items-center justify-center text-faint opacity-0 transition-opacity group-hover:opacity-100"
+              tabIndex={isTabStop ? 0 : -1}
+              aria-label={`Reorder session: ${s.title}`}
+              title="Drag to move · Alt+↑/↓ to reorder"
+              className="pc-drag-handle -ml-1 mr-0.5 flex h-7 w-5 shrink-0 items-center justify-center rounded text-faint"
             >
               ⠿
-            </span>
+            </button>
           )}
           {editingSessionId === s.id ? (
             <input
@@ -609,6 +736,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
               ref={(el) => {
                 rowRefs.current[navIndex] = el;
               }}
+              draggable={reorderable}
               onClick={() => selectSession(s.id)}
               onDoubleClick={() => beginEdit(s)}
               onMouseEnter={() => schedulePrefetch(s.id)}
@@ -616,7 +744,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
               onFocus={() => schedulePrefetch(s.id)}
               onBlur={cancelPrefetch}
               tabIndex={isTabStop ? 0 : -1}
-              aria-current={active ? "true" : undefined}
+              aria-current={active ? "page" : undefined}
               className="flex min-w-0 flex-1 flex-col text-left"
               title={s.title}
             >
@@ -658,26 +786,38 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
           {editingSessionId !== s.id && (
             <>
               <button
-                onClick={() => toggleArchived(s.id)}
+                onClick={() => void requestArchive(s)}
+                disabled={inspectingSessionId === s.id}
                 tabIndex={isTabStop ? 0 : -1}
-                className="ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-accent-2/10 hover:text-accent-2 group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none"
-                aria-label={`${status === "archived" ? "Unarchive" : "Archive"} session: ${s.title}`}
-                title={status === "archived" ? "Unarchive" : "Archive"}
+                className={`ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-accent-2/10 hover:text-accent-2 group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none ${
+                  inspectingSessionId === s.id ? "cursor-wait opacity-50" : ""
+                }`}
+                aria-label={`${isArchived ? "Unarchive" : "Archive"} session: ${s.title}`}
+                aria-busy={inspectingSessionId === s.id || undefined}
+                title={
+                  inspectingSessionId === s.id
+                    ? "Checking worktree"
+                    : isArchived
+                      ? "Unarchive"
+                      : "Archive"
+                }
               >
                 <ArchiveIcon />
               </button>
-              <button
-                onClick={() => deleteSession(s.id)}
-                disabled={busy}
-                tabIndex={isTabStop ? 0 : -1}
-                className={`ml-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-danger/10 hover:text-danger group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none ${
-                  busy ? "cursor-not-allowed opacity-50" : ""
-                }`}
-                aria-label={`Delete session: ${s.title}`}
-                title={busy ? "Finish or stop this session's work first" : "Delete session"}
-              >
-                ✕
-              </button>
+              {isArchived && (
+                <button
+                  onClick={() => requestDelete(s)}
+                  disabled={busy}
+                  tabIndex={isTabStop ? 0 : -1}
+                  className={`ml-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-danger/10 hover:text-danger group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none ${
+                    busy ? "cursor-not-allowed opacity-50" : ""
+                  }`}
+                  aria-label={`Delete session: ${s.title}`}
+                  title={busy ? "Finish or stop this session's work first" : "Delete permanently"}
+                >
+                  ✕
+                </button>
+              )}
             </>
           )}
         </div>
@@ -837,7 +977,18 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         aria-label="Session list"
         onKeyDown={onListKeyDown}
         onContextMenu={onContextMenu(listMenuItems())}
-        onDragOver={groupBy === "none" ? (e) => e.preventDefault() : undefined}
+        onDragOver={
+          groupBy === "none"
+            ? (e) => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
+                const rect = e.currentTarget.getBoundingClientRect();
+                const edge = Math.min(44, rect.height / 4);
+                if (e.clientY < rect.top + edge) e.currentTarget.scrollTop -= 12;
+                else if (e.clientY > rect.bottom - edge) e.currentTarget.scrollTop += 12;
+              }
+            : undefined
+        }
         onDrop={
           groupBy === "none"
             ? (e) => {
@@ -845,11 +996,15 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
                 // moves the chat back to the loose root.
                 const id = draggedSessionId(e);
                 if (id) moveSessionToFolder(id, null);
+                finishDrag();
               }
             : undefined
         }
-        className="min-h-0 flex-1 space-y-1 overflow-y-auto px-2 pb-2"
+        className="min-h-0 flex-1 space-y-1 overflow-y-auto px-1 pb-2"
       >
+        <span className="sr-only" role="status" aria-live="polite">
+          {reorderAnnouncement}
+        </span>
         {rows.map(renderRow)}
       </nav>
 
@@ -885,6 +1040,14 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         </div>
       </div>
       {ctxMenu}
+      {sessionDialog && (
+        <SessionActionDialog
+          state={sessionDialog}
+          busy={sessionActionBusy}
+          onCancel={() => !sessionActionBusy && closeSessionDialog()}
+          onConfirm={() => void confirmSessionDialog()}
+        />
+      )}
     </aside>
   );
 }

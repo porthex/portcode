@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -646,6 +646,20 @@ impl Db {
                 session
             })
             .collect())
+    }
+
+    /// Resolve the workspace persisted for exactly one session. The nested
+    /// option distinguishes an unknown session (`None`) from a known session
+    /// that intentionally has no workspace (`Some(None)`). Archive safety uses
+    /// this rather than accepting an arbitrary path from the frontend.
+    pub fn workspace_for_session(&self, id: &str) -> rusqlite::Result<Option<Option<String>>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT workspace FROM sessions WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
     }
 
     pub fn create_session(
@@ -1955,6 +1969,22 @@ mod tests {
             db.update_session_model("deleted", "gpt-5.6-sol"),
             Err(rusqlite::Error::QueryReturnedNoRows)
         ));
+    }
+
+    #[test]
+    fn workspace_lookup_distinguishes_unknown_unset_and_configured_sessions() {
+        let db = mem_db();
+        assert_eq!(db.workspace_for_session("missing").unwrap(), None);
+
+        db.create_session("local", "Local", None, None, 1).unwrap();
+        assert_eq!(db.workspace_for_session("local").unwrap(), Some(None));
+
+        db.create_session("work", "Work", Some("C:/work/portcode"), None, 2)
+            .unwrap();
+        assert_eq!(
+            db.workspace_for_session("work").unwrap(),
+            Some(Some("C:/work/portcode".into()))
+        );
     }
 
     #[test]

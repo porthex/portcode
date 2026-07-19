@@ -1616,6 +1616,7 @@ pub fn run() {
         get_all_usage,
         search_messages,
         workspace::get_workspace_summary,
+        workspace::get_session_archive_warning,
         git_review::get_git_review_branches,
         git_review::get_git_review_manifest,
         git_review::get_git_review_file,

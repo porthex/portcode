@@ -29,6 +29,7 @@ vi.mock("../lib/ipc", () => ({
   createSession: vi.fn(),
   getMessages: vi.fn(),
   getMessagePage: vi.fn(),
+  getSessionArchiveWarning: vi.fn(),
   deleteSession: vi.fn(),
   renameSession: vi.fn(),
   updateSessionModel: vi.fn(),
@@ -148,6 +149,7 @@ beforeEach(() => {
     messages: await m.getMessages(sessionId),
     nextCursor: null,
   }));
+  m.getSessionArchiveWarning.mockResolvedValue(null);
   m.createSession.mockResolvedValue(undefined);
   m.deleteSession.mockResolvedValue(undefined);
   m.renameSession.mockResolvedValue(undefined);
@@ -829,11 +831,25 @@ describe("selectSession", () => {
 });
 
 describe("deleteSession", () => {
+  it("refuses to delete a session until it has been archived", async () => {
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      archivedIds: [],
+    });
+
+    await useStore.getState().deleteSession("a");
+
+    expect(m.deleteSession).not.toHaveBeenCalled();
+    expect(useStore.getState().sessions.map((row) => row.id)).toEqual(["a"]);
+  });
+
   it("removes the session and re-points activeId at the survivor", async () => {
     useStore.setState({
       sessions: [session({ id: "a" }), session({ id: "b" })],
       activeId: "a",
       messages: { a: [], b: [] },
+      archivedIds: ["a"],
     });
 
     await useStore.getState().deleteSession("a");
@@ -856,6 +872,7 @@ describe("deleteSession", () => {
       messages: { a: [], b: [] },
       drafts: { a: "unsent a", b: "unsent b" },
       usage: { a: { input: 1000, output: 200 }, b: { input: 50, output: 5 } },
+      archivedIds: ["a"],
     });
 
     return useStore
@@ -871,7 +888,12 @@ describe("deleteSession", () => {
   });
 
   it("spawns a fresh session when the last one is deleted", async () => {
-    useStore.setState({ sessions: [session({ id: "a" })], activeId: "a", messages: { a: [] } });
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: { a: [] },
+      archivedIds: ["a"],
+    });
 
     await useStore.getState().deleteSession("a");
 
@@ -890,6 +912,7 @@ describe("deleteSession", () => {
       sessions: [session({ id: "a" }), session({ id: "b" })],
       activeId: "a",
       messages: {},
+      archivedIds: ["b"],
     });
 
     await useStore.getState().deleteSession("b");
@@ -904,6 +927,7 @@ describe("deleteSession", () => {
       sessions: [session({ id: "a" })],
       activeId: "a",
       streaming: true,
+      archivedIds: ["a"],
     });
 
     await useStore.getState().deleteSession("a");
@@ -918,6 +942,7 @@ describe("deleteSession", () => {
       sessions: [session({ id: "a" }), session({ id: "b" })],
       activeId: "a",
       messages: {},
+      archivedIds: ["b"],
     });
 
     await useStore.getState().deleteSession("b");
@@ -937,6 +962,7 @@ describe("deleteSession", () => {
       sessions: [session({ id: "a" }), session({ id: "b" })],
       activeId: "a",
       messages: { a: [], b: [] },
+      archivedIds: ["a"],
     });
 
     await expect(useStore.getState().deleteSession("a")).resolves.toBeUndefined();
@@ -958,6 +984,7 @@ describe("deleteSession", () => {
         a: runState(),
         b: runState(),
       },
+      archivedIds: ["b"],
     });
 
     await useStore.getState().deleteSession("b");
@@ -4562,13 +4589,74 @@ describe("remote client", () => {
       expect(JSON.parse(localStorage.getItem("pc.folderOf")!)).toEqual({});
     });
 
-    it("toggleArchived adds then removes a session id, persisting each time", () => {
-      useStore.getState().toggleArchived("a");
+    it("toggleArchived checks the worktree, then adds and removes the id", async () => {
+      useStore.setState({ sessions: [session({ id: "a" })] });
+
+      await useStore.getState().toggleArchived("a");
+      expect(m.getSessionArchiveWarning).toHaveBeenCalledWith("a");
       expect(useStore.getState().archivedIds).toEqual(["a"]);
       expect(JSON.parse(localStorage.getItem("pc.archivedIds")!)).toEqual(["a"]);
 
-      useStore.getState().toggleArchived("a");
+      await useStore.getState().toggleArchived("a");
       expect(useStore.getState().archivedIds).toEqual([]);
+    });
+
+    it("returns a confirmation requirement without archiving a dirty session", async () => {
+      const warning = {
+        workspace: "C:/work/portcode",
+        branch: "feature/sidebar",
+        detachedHead: null,
+        changedFiles: 3,
+        untrackedFiles: 1,
+        additions: 18,
+        deletions: 4,
+      };
+      useStore.setState({ sessions: [session({ id: "a" })] });
+      m.getSessionArchiveWarning.mockResolvedValueOnce(warning);
+
+      await expect(useStore.getState().toggleArchived("a")).resolves.toEqual({
+        outcome: "needsConfirmation",
+        warning,
+      });
+      expect(useStore.getState().archivedIds).toEqual([]);
+
+      await expect(useStore.getState().toggleArchived("a", true)).resolves.toEqual({
+        outcome: "archived",
+      });
+      expect(useStore.getState().archivedIds).toEqual(["a"]);
+      expect(m.getSessionArchiveWarning).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not archive a session removed while its worktree check is in flight", async () => {
+      let resolveWarning!: (warning: null) => void;
+      m.getSessionArchiveWarning.mockImplementationOnce(
+        () => new Promise((resolve) => (resolveWarning = resolve)),
+      );
+      useStore.setState({ sessions: [session({ id: "a" })] });
+
+      const pending = useStore.getState().toggleArchived("a");
+      await vi.waitFor(() => expect(m.getSessionArchiveWarning).toHaveBeenCalledWith("a"));
+      useStore.setState({ sessions: [] });
+      resolveWarning(null);
+
+      await expect(pending).resolves.toEqual({ outcome: "archived" });
+      expect(useStore.getState().archivedIds).toEqual([]);
+    });
+
+    it("keeps a concurrent forced archive when a prior clean check completes", async () => {
+      let resolveWarning!: (warning: null) => void;
+      m.getSessionArchiveWarning.mockImplementationOnce(
+        () => new Promise((resolve) => (resolveWarning = resolve)),
+      );
+      useStore.setState({ sessions: [session({ id: "a" })] });
+
+      const checkedArchive = useStore.getState().toggleArchived("a");
+      await vi.waitFor(() => expect(m.getSessionArchiveWarning).toHaveBeenCalledWith("a"));
+      await useStore.getState().toggleArchived("a", true);
+      resolveWarning(null);
+
+      await expect(checkedArchive).resolves.toEqual({ outcome: "archived" });
+      expect(useStore.getState().archivedIds).toEqual(["a"]);
     });
 
     it("setSidebarCollapsed toggles the rail flag and persists it", () => {
@@ -4969,6 +5057,7 @@ describe("background shell tasks (background-tasks panel)", () => {
       activeId: "bgt-del",
       messages: { "bgt-del": [], "bgt-keep": [] },
       backgroundTasks: { "bgt-del": [{ id: "t1", command: "x", status: "running" }] },
+      archivedIds: ["bgt-del"],
     });
     await useStore.getState().selectSession("bgt-del"); // installs the listener
     await flush(); // let the fire-and-forget subscription finish installing
@@ -5046,6 +5135,7 @@ describe("background shell tasks (background-tasks panel)", () => {
       sessions: [session({ id: "bgt-race" }), session({ id: "bgt-keep" })],
       activeId: "bgt-race",
       messages: { "bgt-race": [], "bgt-keep": [] },
+      archivedIds: ["bgt-race"],
     });
     void useStore.getState().selectSession("bgt-race"); // starts the (pending) subscribe
     await flush();
