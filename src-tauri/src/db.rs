@@ -1563,8 +1563,7 @@ impl Db {
             }
         }
 
-        let data_sql = format!(
-            "WITH timeline(kind, anchor_seq, rank, tie, id, role, content, created_at,
+        let data_sql = "WITH timeline(kind, anchor_seq, rank, tie, id, role, content, created_at,
                             turn_id, receipt_json) AS (
                  SELECT 'message', m.seq, 1, m.id, m.id, m.role, m.content,
                         m.created_at, m.turn_id, tr.receipt_json
@@ -1586,9 +1585,8 @@ impl Db {
                     OR (anchor_seq = ?3 AND rank < ?4)
                     OR (anchor_seq = ?3 AND rank = ?4 AND tie < ?5)
              )
-             ORDER BY anchor_seq, rank, tie"
-        );
-        let mut data_stmt = conn.prepare(&data_sql)?;
+             ORDER BY anchor_seq, rank, tie";
+        let mut data_stmt = conn.prepare(data_sql)?;
         let rows = data_stmt.query_map(
             params![
                 session_id,
