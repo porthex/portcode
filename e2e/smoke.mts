@@ -408,7 +408,24 @@ const inspectUi = async (socket: WebSocket) => {
   // list continuation, Tab indentation, and normal focus escape outside lists.
   await send("Input.insertText", { text: "-" });
   await send("Input.insertText", { text: " " });
+  await waitForValue<boolean>(
+    "Composer bullet shortcut",
+    `(() => {
+      const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+      return !!composer && document.activeElement === composer && !!composer.querySelector('ul > li');
+    })()`,
+    Boolean,
+  );
   await send("Input.insertText", { text: "parent" });
+  await waitForValue<boolean>(
+    "Composer first list item",
+    `(() => {
+      const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+      const item = composer?.querySelector('ul > li');
+      return !!composer && document.activeElement === composer && item?.textContent === 'parent';
+    })()`,
+    Boolean,
+  );
   await send("Input.dispatchKeyEvent", {
     type: "keyDown",
     key: "Enter",
@@ -425,7 +442,25 @@ const inspectUi = async (socket: WebSocket) => {
     windowsVirtualKeyCode: 13,
     nativeVirtualKeyCode: 13,
   });
+  await waitForValue<boolean>(
+    "Composer continued list",
+    `(() => {
+      const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+      const items = composer?.querySelectorAll('ul > li');
+      return !!composer && document.activeElement === composer && items?.length === 2;
+    })()`,
+    Boolean,
+  );
   await send("Input.insertText", { text: "child" });
+  await waitForValue<boolean>(
+    "Composer second list item",
+    `(() => {
+      const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+      const items = composer?.querySelectorAll('ul > li');
+      return !!composer && document.activeElement === composer && items?.length === 2 && items[1]?.textContent === 'child';
+    })()`,
+    Boolean,
+  );
   await send("Input.dispatchKeyEvent", {
     type: "keyDown",
     key: "Tab",
