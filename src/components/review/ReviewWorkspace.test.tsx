@@ -205,6 +205,20 @@ const turnReceipt: TurnReceipt = {
   backgroundTasksRunning: false,
 };
 
+const completedRun = (receipt: TurnReceipt) => ({
+  streaming: false,
+  cancel: null,
+  pendingPermission: null,
+  turnId: receipt.turnId,
+  startedAt: receipt.startedAt,
+  finalizing: false,
+  receipt,
+  outcome: receipt.status,
+  composerPhase: "idle" as const,
+  activeTool: null,
+  unseenOutcome: null,
+});
+
 const turnManifest: TurnReviewManifest = {
   turnId: "turn-1",
   snapshotId: "turn-snapshot-1",
@@ -660,7 +674,7 @@ describe("ReviewWorkspace", () => {
     expect(m.getGitReviewManifest).toHaveBeenCalledTimes(2);
   });
 
-  it("refreshes on focus, turn completion, and the visible-surface interval", async () => {
+  it("refreshes on focus, any session receipt, and the visible-surface interval", async () => {
     vi.useFakeTimers();
     render(<ReviewWorkspace />);
     await act(async () => Promise.resolve());
@@ -670,8 +684,13 @@ describe("ReviewWorkspace", () => {
     await act(async () => Promise.resolve());
     expect(m.getGitReviewManifest.mock.calls.length).toBeGreaterThan(initialCalls);
 
-    act(() => useStore.setState({ streaming: true }));
-    act(() => useStore.setState({ streaming: false }));
+    act(() =>
+      useStore.setState({
+        runs: {
+          background: completedRun({ ...turnReceipt, turnId: "turn-background" }),
+        },
+      }),
+    );
     await act(async () => Promise.resolve());
     const afterTurn = m.getGitReviewManifest.mock.calls.length;
 
@@ -692,8 +711,13 @@ describe("ReviewWorkspace", () => {
     view.rerender(<ReviewWorkspace active={false} />);
     const callsWhileHidden = m.getGitReviewManifest.mock.calls.length;
     act(() => window.dispatchEvent(new Event("focus")));
-    act(() => useStore.setState({ streaming: true }));
-    act(() => useStore.setState({ streaming: false }));
+    act(() =>
+      useStore.setState({
+        runs: {
+          background: completedRun({ ...turnReceipt, turnId: "turn-hidden" }),
+        },
+      }),
+    );
     await act(async () => Promise.resolve());
     expect(m.getGitReviewManifest).toHaveBeenCalledTimes(callsWhileHidden);
 

@@ -8,6 +8,7 @@ import type {
   ContentBlock,
   DraftEntry,
   Message,
+  MessageLoadState,
   MessageRow,
   ModelInfo,
   OAuthStatus,
@@ -72,6 +73,11 @@ interface RunState {
   /** Last terminal receipt for this session's run, retained after streaming ends. */
   receipt: TurnReceipt | null;
   outcome: TurnStatus | null;
+  /** Presence belongs to this run even while another session is selected. */
+  composerPhase?: ComposerPhase;
+  activeTool?: string | null;
+  /** Terminal problem completed off-screen; cleared when the session is viewed. */
+  unseenOutcome?: TurnStatus | null;
 }
 
 const EMPTY_RUN: RunState = {
@@ -83,6 +89,9 @@ const EMPTY_RUN: RunState = {
   finalizing: false,
   receipt: null,
   outcome: null,
+  composerPhase: "idle",
+  activeTool: null,
+  unseenOutcome: null,
 };
 
 // Single source of truth for the run-map key. The identity of a session id today;
@@ -142,6 +151,7 @@ interface AppState {
   sessions: Session[];
   activeId: string | null;
   messages: Record<string, Message[]>; // sessionId -> messages
+  messageLoads: Record<string, MessageLoadState>;
   // Per-session scroll-up pagination state (remote mode). `hasMore` is whether the
   // desktop holds older history beyond what we hold (seeded from each message_page
   // frame; undefined entry = unknown, treated as "might have more"); `loading` guards
@@ -246,6 +256,8 @@ interface AppState {
   init: () => Promise<void>;
   retryInit: () => Promise<void>;
   retryLoad: (id: string) => Promise<void>;
+  hydrateMessages: (id: string, options?: { force?: boolean; prefetch?: boolean }) => Promise<void>;
+  prefetchSession: (id: string) => Promise<void>;
   toggleFiles: () => void;
   toggleSidebar: () => void;
   setShowSidebar: (v: boolean) => void;
@@ -271,6 +283,7 @@ interface AppState {
   setSessionModel: (model: string) => Promise<void>;
   send: (text: string) => Promise<void>;
   stop: () => Promise<void>;
+  stopSession: (sessionId: string) => Promise<void>;
   cancelAgent: (agentId: string) => Promise<void>;
   setShowSettings: (v: boolean) => void;
   setShowPalette: (v: boolean) => void;
@@ -300,7 +313,15 @@ interface AppState {
   listenForPairingRequests: () => Promise<void>;
   confirmPairingRequest: () => Promise<void>;
   rejectPairingRequest: () => Promise<void>;
-  resolvePermission: (decision: "allow" | "deny", always?: boolean) => Promise<void>;
+  resolvePermission: {
+    (
+      sessionId: string,
+      permissionId: string,
+      decision: "allow" | "deny",
+      always?: boolean,
+    ): Promise<void>;
+    (decision: "allow" | "deny", always?: boolean): Promise<void>;
+  };
   setRemoteMode: (v: boolean) => void;
   confirmRemoteSas: () => void;
   rejectRemoteSas: () => Promise<void>;
@@ -334,9 +355,18 @@ interface AppState {
 // no active session) reads as the empty run, i.e. idle.
 const projectActiveRun = (
   st: Pick<AppState, "activeId" | "runs">,
-): Pick<AppState, "streaming" | "cancel" | "pendingPermission"> => {
+): Pick<
+  AppState,
+  "streaming" | "cancel" | "pendingPermission" | "composerPhase" | "activeTool"
+> => {
   const r = (st.activeId ? st.runs[runKey(st.activeId)] : undefined) ?? EMPTY_RUN;
-  return { streaming: r.streaming, cancel: r.cancel, pendingPermission: r.pendingPermission };
+  return {
+    streaming: r.streaming,
+    cancel: r.cancel,
+    pendingPermission: r.pendingPermission,
+    composerPhase: r.composerPhase ?? "idle",
+    activeTool: r.activeTool ?? null,
+  };
 };
 
 // Build the state patch that applies `patch` to `sessionId`'s run and re-projects
@@ -347,7 +377,10 @@ const runPatch = (
   st: Pick<AppState, "activeId" | "runs">,
   sessionId: string,
   patch: Partial<RunState>,
-): Pick<AppState, "runs" | "streaming" | "cancel" | "pendingPermission"> => {
+): Pick<
+  AppState,
+  "runs" | "streaming" | "cancel" | "pendingPermission" | "composerPhase" | "activeTool"
+> => {
   const key = runKey(sessionId);
   const runs = { ...st.runs, [key]: { ...(st.runs[key] ?? EMPTY_RUN), ...patch } };
   return { runs, ...projectActiveRun({ activeId: st.activeId, runs }) };
@@ -365,15 +398,6 @@ const setRun = (
 // `runPatch` (run + mirror stay in lockstep); with no active session it clears
 // just the named mirror fields, so the visible flags always clear regardless.
 // (`Partial<RunState>`'s keys are all mirror fields, so it doubles as the patch.)
-const patchActiveRun = (
-  set: (fn: (st: AppState) => Partial<AppState>) => void,
-  get: () => AppState,
-  patch: Partial<RunState>,
-): void => {
-  const activeId = get().activeId;
-  set((st) => (activeId ? runPatch(st, activeId, patch) : patch));
-};
-
 const now = () => Date.now();
 
 // ── Live subagents (the agents panel) ────────────────────────────────────────
@@ -625,7 +649,14 @@ const terminalizeTurnState = (
   terminalText?: string,
 ): Pick<
   AppState,
-  "messages" | "agents" | "runs" | "streaming" | "cancel" | "pendingPermission"
+  | "messages"
+  | "agents"
+  | "runs"
+  | "streaming"
+  | "cancel"
+  | "pendingPermission"
+  | "composerPhase"
+  | "activeTool"
 > => {
   const currentRun = st.runs[runKey(sessionId)] ?? EMPTY_RUN;
   // A native terminal can race with the cancel invoke resolving. Never let the
@@ -656,6 +687,10 @@ const terminalizeTurnState = (
       finalizing: false,
       receipt,
       outcome: receipt?.status ?? status,
+      composerPhase: "idle",
+      activeTool: null,
+      unseenOutcome:
+        st.activeId !== sessionId && status !== "completed" ? (receipt?.status ?? status) : null,
     }),
   };
 };
@@ -840,6 +875,13 @@ const enqueueSessionModelWrite = (sessionId: string, model: string): Promise<voi
 // separate from `streaming` so the composer remains blocked until cancellation is
 // actually acknowledged (or fails visibly) instead of claiming the run stopped.
 const stopRequestedSessions = new Set<string>();
+let pendingRemoteCreateRequestId: string | null = null;
+let pendingRemoteCreateTimer: ReturnType<typeof setTimeout> | null = null;
+const clearPendingRemoteCreate = (): void => {
+  pendingRemoteCreateRequestId = null;
+  if (pendingRemoteCreateTimer !== null) clearTimeout(pendingRemoteCreateTimer);
+  pendingRemoteCreateTimer = null;
+};
 // Marks production local cancel wrappers that retain their event listener for a
 // later native receipt. Restored/legacy callbacks are not in this set and keep the
 // old immediate fallback behavior.
@@ -852,22 +894,55 @@ const receiptAwareCancels = new WeakSet<() => Promise<void>>();
 // with a disabled composer forever. This module-scoped handle drives a force-end on
 // idle. Module-scoped (not closure-scoped like the local watchdog) so the remote
 // frame handler, drop listener, stop(), and disconnect can all reset/clear it.
-let remoteWatchdog: ReturnType<typeof setInterval> | null = null;
-let remoteLastActivity = 0;
-let remoteCancelTerminalTimer: ReturnType<typeof setTimeout> | null = null;
+const remoteWatchdogs = new Map<string, ReturnType<typeof setInterval>>();
+const remoteLastActivity = new Map<string, number>();
+const remoteCancelTerminalTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-const clearRemoteWatchdog = (): void => {
-  if (remoteWatchdog !== null) {
-    clearInterval(remoteWatchdog);
-    remoteWatchdog = null;
+const clearRemoteWatchdog = (sessionId?: string): void => {
+  const ids = sessionId === undefined ? [...remoteWatchdogs.keys()] : [sessionId];
+  for (const id of ids) {
+    const timer = remoteWatchdogs.get(id);
+    if (timer !== undefined) clearInterval(timer);
+    remoteWatchdogs.delete(id);
+    remoteLastActivity.delete(id);
   }
 };
 
-const clearRemoteCancelTerminalTimer = (): void => {
-  if (remoteCancelTerminalTimer !== null) {
-    clearTimeout(remoteCancelTerminalTimer);
-    remoteCancelTerminalTimer = null;
+const clearRemoteCancelTerminalTimer = (sessionId?: string): void => {
+  const ids = sessionId === undefined ? [...remoteCancelTerminalTimers.keys()] : [sessionId];
+  for (const id of ids) {
+    const timer = remoteCancelTerminalTimers.get(id);
+    if (timer !== undefined) clearTimeout(timer);
+    remoteCancelTerminalTimers.delete(id);
   }
+};
+
+const armRemoteWatchdog = (sessionId: string, turnId: string): void => {
+  clearRemoteWatchdog(sessionId);
+  remoteLastActivity.set(sessionId, now());
+  const timer = setInterval(() => {
+    const st = useStore.getState();
+    const run = st.runs[runKey(sessionId)];
+    if (remoteWatchdogs.get(sessionId) !== timer || !run?.streaming || run.turnId !== turnId) {
+      clearRemoteWatchdog(sessionId);
+      return;
+    }
+    if (now() - (remoteLastActivity.get(sessionId) ?? 0) < TURN_IDLE_TIMEOUT_MS) return;
+    clearRemoteWatchdog(sessionId);
+    clearSettleTimer(sessionId);
+    useStore.setState((current) =>
+      terminalizeTurnState(
+        current,
+        sessionId,
+        TOOL_INTERRUPTED_ERROR,
+        "interrupted",
+        undefined,
+        undefined,
+        "\n\n**The desktop stopped responding (timed out).**",
+      ),
+    );
+  }, 1000);
+  remoteWatchdogs.set(sessionId, timer);
 };
 
 // ── Draft persistence ─────────────────────────────────────────────────────────
@@ -942,32 +1017,98 @@ const usageFromRows = (rows: SessionUsage[]): Record<string, Usage> => {
 // event (text_delta/tool_use), when it arrives first, settles the phase and cancels
 // this timer (see onEvent / applyRemoteEvent).
 const COMPOSER_SETTLE_MS = 900;
-let settleTimer: ReturnType<typeof setTimeout> | null = null;
+const settleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 // How many older messages one scroll-up pagination request fetches (the desktop
 // clamps it to its own max). Comfortably under the catch-up window so a page is a
 // modest, send-safe increment.
 const PAGE_SIZE = 100;
 
-const clearSettleTimer = (): void => {
-  if (settleTimer !== null) {
-    clearTimeout(settleTimer);
-    settleTimer = null;
+const clearSettleTimer = (sessionId?: string): void => {
+  const ids = sessionId === undefined ? [...settleTimers.keys()] : [sessionId];
+  for (const id of ids) {
+    const timer = settleTimers.get(id);
+    if (timer !== undefined) clearTimeout(timer);
+    settleTimers.delete(id);
   }
 };
 
 // Arm the received→thinking settle fallback. Re-reads live state when it fires so it
 // only advances a turn that is still streaming and still in the "received" phase.
-const armSettleTimer = (): void => {
-  clearSettleTimer();
-  settleTimer = setTimeout(() => {
-    settleTimer = null;
-    const st = useStore.getState();
-    if (st.streaming && st.composerPhase === "received") {
-      useStore.setState({ composerPhase: "thinking" });
-    }
-  }, COMPOSER_SETTLE_MS);
+const armSettleTimer = (sessionId: string, turnId: string): void => {
+  clearSettleTimer(sessionId);
+  settleTimers.set(
+    sessionId,
+    setTimeout(() => {
+      settleTimers.delete(sessionId);
+      const st = useStore.getState();
+      const run = st.runs[runKey(sessionId)];
+      if (run?.streaming && run.turnId === turnId && run.composerPhase === "received") {
+        useStore.setState((current) => runPatch(current, sessionId, { composerPhase: "thinking" }));
+      }
+    }, COMPOSER_SETTLE_MS),
+  );
 };
+
+const MESSAGE_CACHE_TTL_MS = 60_000;
+const MESSAGE_CACHE_INACTIVE_LIMIT = 20;
+const messageLoadPromises = new Map<string, Promise<void>>();
+
+const idleMessageLoad = (at = now()): MessageLoadState => ({
+  phase: "idle",
+  loadedAt: null,
+  lastAccessedAt: at,
+  requestId: 0,
+  error: null,
+  nextCursor: null,
+  loadingOlder: false,
+});
+
+const messageIdentity = (message: Message): string =>
+  message.turnId ? `${message.role}:turn:${message.turnId}` : `${message.role}:id:${message.id}`;
+
+/** Persisted rows lead, while messages created/streamed during the request are
+ * retained and win on identity collisions. */
+const mergeHydratedMessages = (persisted: Message[], current: Message[]): Message[] => {
+  const currentByKey = new Map(current.map((message) => [messageIdentity(message), message]));
+  const seen = new Set<string>();
+  const merged = persisted.map((message) => {
+    const key = messageIdentity(message);
+    seen.add(key);
+    return currentByKey.get(key) ?? message;
+  });
+  for (const message of current) {
+    const key = messageIdentity(message);
+    if (!seen.has(key)) merged.push(message);
+  }
+  return merged;
+};
+
+const evictMessageCache = (st: AppState): Partial<AppState> => {
+  const candidates = Object.entries(st.messageLoads)
+    .filter(([id, load]) => {
+      if (id === st.activeId || load.phase === "loading" || load.phase === "refreshing")
+        return false;
+      const run = st.runs[runKey(id)];
+      if (run?.streaming || run?.finalizing || run?.pendingPermission) return false;
+      if ((st.backgroundTasks[id] ?? []).some((task) => task.status === "running")) return false;
+      return id in st.messages;
+    })
+    .sort(([, left], [, right]) => right.lastAccessedAt - left.lastAccessedAt);
+  if (candidates.length <= MESSAGE_CACHE_INACTIVE_LIMIT) return {};
+  const messages = { ...st.messages };
+  const messageLoads = { ...st.messageLoads };
+  for (const [id] of candidates.slice(MESSAGE_CACHE_INACTIVE_LIMIT)) {
+    delete messages[id];
+    messageLoads[id] = idleMessageLoad(messageLoads[id]?.lastAccessedAt);
+  }
+  return { messages, messageLoads };
+};
+
+const anyRunBusy = (st: AppState): boolean =>
+  Object.values(st.runs).some((run) => run.streaming || run.finalizing || run.pendingPermission) ||
+  st.streaming ||
+  st.pendingPermission !== null;
 
 // ── message search (web/preview fallback) ─────────────────────────────────────
 // In Tauri the SQLite-backed `search_messages` command searches the FULL history.
@@ -1134,6 +1275,7 @@ export const useStore = create<AppState>((set, get) => ({
   sessions: [],
   activeId: null,
   messages: {},
+  messageLoads: {},
   messagePaging: {},
   usage: {},
   agents: {},
@@ -1295,6 +1437,10 @@ export const useStore = create<AppState>((set, get) => ({
           sessions: [s],
           activeId: s.id,
           messages: { [s.id]: [] },
+          messageLoads: {
+            ...st.messageLoads,
+            [s.id]: { ...idleMessageLoad(), phase: "ready", loadedAt: now() },
+          },
           initError: null,
           // Keep the active-run mirror consistent with the newly active session
           // (idle here — a fresh session has no run).
@@ -1309,7 +1455,6 @@ export const useStore = create<AppState>((set, get) => ({
       // last-used default so Session.model stays a non-null string.
       const sessions = loaded.map((row) => ({ ...row, model: row.model ?? settings.model }));
       const activeId = sessions[0].id;
-      const msgs = await ipc.getMessages(activeId);
       set((st) => ({
         settings,
         oauthStatus,
@@ -1320,11 +1465,11 @@ export const useStore = create<AppState>((set, get) => ({
         usage,
         sessions,
         activeId,
-        messages: { [activeId]: msgs },
         initError: null,
         // Keep the active-run mirror consistent with the activated session.
         ...projectActiveRun({ activeId, runs: st.runs }),
       }));
+      await get().hydrateMessages(activeId);
       // One persistent background-task listener per known session (idempotent), so
       // a finish that lands while a different session is on screen is still tracked.
       sessions.forEach((s) => void ensureBackgroundListener(s.id));
@@ -1339,26 +1484,139 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async retryLoad(id) {
-    try {
-      const msgs = await ipc.getMessages(id);
+    await get().hydrateMessages(id, { force: true });
+  },
+
+  async hydrateMessages(id, options) {
+    const existingPromise = messageLoadPromises.get(id);
+    if (existingPromise) return existingPromise;
+
+    const snapshot = get();
+    const existing = snapshot.messages[id];
+    const previous = snapshot.messageLoads[id] ?? idleMessageLoad();
+    const at = now();
+
+    // Remote transcripts are seeded authoritatively by message_delta. Selection
+    // merely exposes the loading state until that frame (including an empty one).
+    if (snapshot.remoteMode || snapshot.remoteConnected) {
       set((st) => ({
-        messages: { ...st.messages, [id]: msgs },
-        loadErrors: { ...st.loadErrors, [id]: false },
+        messageLoads: {
+          ...st.messageLoads,
+          [id]: {
+            ...(st.messageLoads[id] ?? idleMessageLoad(at)),
+            phase: id in st.messages ? "ready" : "loading",
+            lastAccessedAt: at,
+            error: null,
+          },
+        },
       }));
-    } catch {
-      set((st) => ({ loadErrors: { ...st.loadErrors, [id]: true } }));
+      return;
+    }
+
+    const fresh =
+      existing !== undefined &&
+      previous.loadedAt !== null &&
+      at - previous.loadedAt < MESSAGE_CACHE_TTL_MS;
+    if (fresh && !options?.force) {
+      set((st) => ({
+        messageLoads: {
+          ...st.messageLoads,
+          [id]: { ...previous, phase: "ready", lastAccessedAt: at, error: null },
+        },
+        ...evictMessageCache(st),
+      }));
+      return;
+    }
+
+    const requestId = previous.requestId + 1;
+    set((st) => ({
+      messageLoads: {
+        ...st.messageLoads,
+        [id]: {
+          ...previous,
+          phase: existing === undefined ? "loading" : "refreshing",
+          lastAccessedAt: at,
+          requestId,
+          error: null,
+          loadingOlder: false,
+        },
+      },
+      loadErrors: { ...st.loadErrors, [id]: false },
+    }));
+
+    const request = (async () => {
+      try {
+        const page =
+          typeof ipc.getMessagePage === "function"
+            ? await ipc.getMessagePage(id, null)
+            : { messages: await ipc.getMessages(id), nextCursor: null };
+        set((st) => {
+          const load = st.messageLoads[id];
+          if (load?.requestId !== requestId) {
+            return {};
+          }
+          const messages = {
+            ...st.messages,
+            [id]: mergeHydratedMessages(page.messages, st.messages[id] ?? []),
+          };
+          const messageLoads = {
+            ...st.messageLoads,
+            [id]: {
+              ...load,
+              phase: "ready" as const,
+              loadedAt: now(),
+              lastAccessedAt: now(),
+              error: null,
+              nextCursor: page.nextCursor,
+              loadingOlder: false,
+            },
+          };
+          const next = { ...st, messages, messageLoads };
+          return {
+            messages,
+            messageLoads,
+            loadErrors: { ...st.loadErrors, [id]: false },
+            ...evictMessageCache(next),
+          };
+        });
+      } catch (error) {
+        set((st) => {
+          const load = st.messageLoads[id];
+          if (load?.requestId !== requestId) return {};
+          return {
+            messageLoads: {
+              ...st.messageLoads,
+              [id]: {
+                ...load,
+                phase: "error" as const,
+                error: errMessage(error),
+                loadingOlder: false,
+              },
+            },
+            loadErrors: { ...st.loadErrors, [id]: true },
+          };
+        });
+      }
+    })();
+    messageLoadPromises.set(id, request);
+    try {
+      await request;
+    } finally {
+      if (messageLoadPromises.get(id) === request) messageLoadPromises.delete(id);
     }
   },
 
+  async prefetchSession(id) {
+    if (id === get().activeId || get().remoteMode || get().remoteConnected) return;
+    await get().hydrateMessages(id);
+  },
+
   async newSession() {
-    // Don't strand a live turn: switching activeId mid-stream would leave the old
-    // session's run folding events into a session the user can no longer see while
-    // the new one shows a disabled composer. Mirrors selectSession/deleteSession.
     // Re-entry guard (mirrors connectRemote's remoteConnecting): createSession is
     // async, so two fast clicks would both pass the streaming check and each create
     // a distinct empty session. The synchronous set() below makes the second
     // same-tick call bail, so only one create runs.
-    if (get().streaming || get().creatingSession) return;
+    if (get().creatingSession) return;
     set({ creatingSession: true });
     // Remote mode: the agent-side `create_session` command is desktop-only (the
     // local Tauri invoke isn't registered on the phone and would reject as an
@@ -1367,11 +1625,23 @@ export const useStore = create<AppState>((set, get) => ({
     // rather than optimistically inserting a phantom local one the desktop never
     // knows about (and that send() couldn't run a turn in).
     if (get().remoteConnected) {
-      try {
-        await get().sendRemoteCommand({ cmd: "create_session" });
-      } finally {
-        set({ creatingSession: false, showSidebar: false });
+      const requestId = uid();
+      pendingRemoteCreateRequestId = requestId;
+      if (pendingRemoteCreateTimer !== null) clearTimeout(pendingRemoteCreateTimer);
+      pendingRemoteCreateTimer = setTimeout(() => {
+        if (pendingRemoteCreateRequestId !== requestId) return;
+        clearPendingRemoteCreate();
+        useStore.setState({
+          creatingSession: false,
+          remoteError: "Creating the conversation timed out. Please try again.",
+        });
+      }, 15_000);
+      await get().sendRemoteCommand({ cmd: "create_session", request_id: requestId });
+      if (get().remoteDropped) {
+        if (pendingRemoteCreateRequestId === requestId) clearPendingRemoteCreate();
+        set({ creatingSession: false });
       }
+      set({ showSidebar: false });
       return;
     }
     try {
@@ -1381,6 +1651,10 @@ export const useStore = create<AppState>((set, get) => ({
         sessions: [s, ...st.sessions],
         activeId: s.id,
         messages: { ...st.messages, [s.id]: [] },
+        messageLoads: {
+          ...st.messageLoads,
+          [s.id]: { ...idleMessageLoad(), phase: "ready", loadedAt: now() },
+        },
         showSidebar: false, // close the mobile drawer on navigation
         // A brand-new session has no run yet → the mirror projects to idle.
         ...projectActiveRun({ activeId: s.id, runs: st.runs }),
@@ -1398,31 +1672,22 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async selectSession(id) {
-    if (get().streaming) return;
-    // Switch the active session and re-project the mirror onto its run (idle today,
-    // since you can't switch while the active session streams; a background run on
-    // the target session would surface here once concurrent runs exist).
-    set((st) => ({
-      activeId: id,
-      showSidebar: false, // close the mobile drawer on navigation
-      ...projectActiveRun({ activeId: id, runs: st.runs }),
-    }));
+    // Switch immediately and project the target's independent run before history I/O.
+    set((st) => {
+      const runs = st.runs[runKey(id)]?.unseenOutcome
+        ? { ...st.runs, [runKey(id)]: { ...st.runs[runKey(id)], unseenOutcome: null } }
+        : st.runs;
+      return {
+        activeId: id,
+        showSidebar: false, // close the mobile drawer on navigation
+        runs,
+        ...projectActiveRun({ activeId: id, runs }),
+      };
+    });
     // Belt-and-suspenders: ensure the session being viewed has a background-task
     // listener (idempotent — a no-op if init/newSession already subscribed it).
     void ensureBackgroundListener(id);
-    if (!get().messages[id]) {
-      // Guard the load: a getMessages reject must not leave messages[id] undefined
-      // (the welcome EmptyState would then win for a session with real history).
-      try {
-        const msgs = await ipc.getMessages(id);
-        set((st) => ({
-          messages: { ...st.messages, [id]: msgs },
-          loadErrors: { ...st.loadErrors, [id]: false },
-        }));
-      } catch {
-        set((st) => ({ loadErrors: { ...st.loadErrors, [id]: true } }));
-      }
-    }
+    await get().hydrateMessages(id);
   },
 
   // ── message search (⌘K jump to a past turn) ──────────────────────────────────
@@ -1444,6 +1709,32 @@ export const useStore = create<AppState>((set, get) => ({
     // navigation to that session.
     await get().selectSession(sessionId);
     if (get().activeId !== sessionId) return;
+    if (!(get().messages[sessionId] ?? []).some((message) => message.id === messageId)) {
+      try {
+        const messages = await ipc.getMessages(sessionId);
+        set((st) => ({
+          messages: {
+            ...st.messages,
+            [sessionId]: mergeHydratedMessages(messages, st.messages[sessionId] ?? []),
+          },
+          messageLoads: {
+            ...st.messageLoads,
+            [sessionId]: {
+              ...(st.messageLoads[sessionId] ?? idleMessageLoad()),
+              phase: "ready",
+              loadedAt: now(),
+              lastAccessedAt: now(),
+              error: null,
+              nextCursor: null,
+            },
+          },
+        }));
+      } catch {
+        // The selected transcript retains its page/error state; the search target
+        // simply cannot be revealed until a later retry succeeds.
+        return;
+      }
+    }
     // Ask the transcript to reveal the matched turn; Chat scrolls + clears it once
     // the (possibly just-loaded) message is in the DOM.
     set({ scrollTargetId: messageId });
@@ -1454,7 +1745,16 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async deleteSession(id) {
-    if (get().streaming) return;
+    const state = get();
+    const targetRun = state.runs[runKey(id)];
+    if (
+      targetRun?.streaming ||
+      targetRun?.finalizing ||
+      targetRun?.pendingPermission ||
+      (!targetRun && state.activeId === id && (state.streaming || state.pendingPermission)) ||
+      (state.backgroundTasks[id] ?? []).some((task) => task.status === "running")
+    )
+      return;
     try {
       await ipc.deleteSession(id);
     } catch (err) {
@@ -1471,6 +1771,8 @@ export const useStore = create<AppState>((set, get) => ({
       delete messages[id];
       const runs = { ...st.runs };
       delete runs[runKey(id)]; // drop the deleted session's run
+      const messageLoads = { ...st.messageLoads };
+      delete messageLoads[id];
       const backgroundTasks = { ...st.backgroundTasks };
       delete backgroundTasks[id]; // drop its background tasks
       const activeId = st.activeId === id ? (sessions[0]?.id ?? null) : st.activeId;
@@ -1512,6 +1814,7 @@ export const useStore = create<AppState>((set, get) => ({
       return {
         sessions,
         messages,
+        messageLoads,
         runs,
         backgroundTasks,
         activeId,
@@ -1528,17 +1831,7 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
     const aid = get().activeId;
-    if (aid && !get().messages[aid]) {
-      try {
-        const msgs = await ipc.getMessages(aid);
-        set((st) => ({
-          messages: { ...st.messages, [aid]: msgs },
-          loadErrors: { ...st.loadErrors, [aid]: false },
-        }));
-      } catch {
-        set((st) => ({ loadErrors: { ...st.loadErrors, [aid]: true } }));
-      }
-    }
+    if (aid) await get().hydrateMessages(aid);
   },
 
   async renameSession(id, title) {
@@ -1547,10 +1840,6 @@ export const useStore = create<AppState>((set, get) => ({
     // rather than desync the optimistic title against the desktop's authoritative
     // session_list frame (the Sidebar hides the affordance in remote mode anyway).
     if (get().remoteConnected) return;
-    // Mirror the sibling session actions (newSession/selectSession/deleteSession):
-    // never mutate a session mid-turn. The Sidebar already hides the affordance
-    // while streaming, but the store action is the authoritative guard.
-    if (get().streaming) return;
     const trimmed = title.trim();
     const session = get().sessions.find((s) => s.id === id);
     if (!session) return;
@@ -1583,12 +1872,20 @@ export const useStore = create<AppState>((set, get) => ({
     // The picker is disabled/hidden in these states, but Command Palette can call
     // the action directly. The store is authoritative: never mutate an in-flight
     // run's identity, and never write the phone's local DB for a desktop-owned chat.
-    if (get().streaming || get().remoteMode || get().remoteConnected) return;
+    if (get().remoteMode || get().remoteConnected) return;
     // Point the active session at the chosen model, persist that conversation's
     // identity, then mirror it into settings.model so it becomes the last-used
     // default for NEW sessions. The session write is distinct from global settings:
     // without it the selector appears to work until reload, then silently reverts.
     const activeId = get().activeId;
+    const activeRun = activeId ? get().runs[runKey(activeId)] : undefined;
+    if (
+      activeRun?.streaming ||
+      activeRun?.finalizing ||
+      activeRun?.pendingPermission ||
+      (!activeRun && (get().streaming || get().pendingPermission))
+    )
+      return;
     const activeSession = activeId ? get().sessions.find((s) => s.id === activeId) : undefined;
     if (activeId && activeSession) {
       // With no queued optimistic write, the visible value is the durable baseline.
@@ -1638,6 +1935,8 @@ export const useStore = create<AppState>((set, get) => ({
   async send(text) {
     const { activeId, streaming } = get();
     if (!activeId || streaming || !text.trim()) return;
+    const messageLoad = get().messageLoads[activeId];
+    if (messageLoad && messageLoad.phase !== "ready" && messageLoad.phase !== "refreshing") return;
 
     // Trim once so the stored user bubble and the forwarded command match the
     // derived (trimmed) title — a padded draft otherwise renders odd blank lines.
@@ -1661,10 +1960,16 @@ export const useStore = create<AppState>((set, get) => ({
     // 900ms fallback for a slow first byte. Honest — never padded latency.
     // Reset the tool label up front so a new turn never briefly shows the previous
     // turn's last tool before its first real event arrives.
-    set({ composerPhase: "received", activeTool: null });
-    armSettleTimer();
     const provisionalTurnId = uid();
     const optimisticStartedAt = now();
+    setRun(set, activeId, {
+      composerPhase: "received",
+      activeTool: null,
+      turnId: provisionalTurnId,
+      startedAt: optimisticStartedAt,
+      unseenOutcome: null,
+    });
+    armSettleTimer(activeId, provisionalTurnId);
 
     // Remote mode: this device is the phone driving a paired desktop. Forward the
     // turn as a `run` command instead of running the local agent — the desktop is
@@ -1694,38 +1999,35 @@ export const useStore = create<AppState>((set, get) => ({
       // applyFrame), and every terminal/teardown path clears it (turn_end/error in
       // applyRemoteEvent, the drop listener, the send-command catch, stop(),
       // disconnectRemote).
-      clearRemoteWatchdog();
-      remoteLastActivity = now();
-      remoteWatchdog = setInterval(() => {
+      clearRemoteWatchdog(activeId);
+      remoteLastActivity.set(activeId, now());
+      const watchdog = setInterval(() => {
         // The turn already ended or was stopped elsewhere — just clean up. The
         // remote turn runs on the active session, so the active-run mirror is the
         // right "still streaming?" signal here.
-        if (!get().streaming) {
-          clearRemoteWatchdog();
+        const current = get().runs[runKey(activeId)];
+        if (!current?.streaming || remoteWatchdogs.get(activeId) !== watchdog) {
+          clearRemoteWatchdog(activeId);
           return;
         }
-        if (now() - remoteLastActivity < TURN_IDLE_TIMEOUT_MS) return;
+        if (now() - (remoteLastActivity.get(activeId) ?? 0) < TURN_IDLE_TIMEOUT_MS) return;
         // No live frame for the whole idle window → treat the desktop as hung and
         // recover, so the composer can't stay disabled forever.
-        clearRemoteWatchdog();
-        clearSettleTimer();
-        const sid = get().activeId;
+        clearRemoteWatchdog(activeId);
+        clearSettleTimer(activeId);
         set((st) => ({
-          ...(sid !== null
-            ? terminalizeTurnState(
-                st,
-                sid,
-                TOOL_INTERRUPTED_ERROR,
-                "interrupted",
-                undefined,
-                undefined,
-                "\n\n**The desktop stopped responding (timed out).**",
-              )
-            : projectActiveRun(st)),
-          composerPhase: "idle",
-          activeTool: null,
+          ...terminalizeTurnState(
+            st,
+            activeId,
+            TOOL_INTERRUPTED_ERROR,
+            "interrupted",
+            undefined,
+            undefined,
+            "\n\n**The desktop stopped responding (timed out).**",
+          ),
         }));
       }, 1000);
+      remoteWatchdogs.set(activeId, watchdog);
       await get().sendRemoteCommand({ cmd: "run", session_id: activeId, text: body });
       return;
     }
@@ -1883,7 +2185,7 @@ export const useStore = create<AppState>((set, get) => ({
         }));
         return;
       }
-      clearSettleTimer();
+      clearSettleTimer(activeId);
       set((st) => ({
         ...terminalizeTurnState(
           st,
@@ -1894,8 +2196,6 @@ export const useStore = create<AppState>((set, get) => ({
           receipt,
           terminalText,
         ),
-        composerPhase: "idle",
-        activeTool: null,
       }));
     };
 
@@ -1907,7 +2207,7 @@ export const useStore = create<AppState>((set, get) => ({
     ) => {
       pendingTools.clear();
       stopRequestedSessions.delete(activeId);
-      clearSettleTimer();
+      clearSettleTimer(activeId);
       set((st) => ({
         ...terminalizeTurnState(
           st,
@@ -1918,8 +2218,6 @@ export const useStore = create<AppState>((set, get) => ({
           undefined,
           terminalText,
         ),
-        composerPhase: "idle",
-        activeTool: null,
       }));
     };
 
@@ -1962,20 +2260,20 @@ export const useStore = create<AppState>((set, get) => ({
           // First real byte settles the receipt into "thinking with you…" (and
           // cancels the fallback timer). Only advance from "received" so a Stop
           // in flight ("stopping…") isn't overwritten by a late delta.
-          if (get().composerPhase === "received") {
-            clearSettleTimer();
-            set({ composerPhase: "thinking" });
+          if (get().runs[myKey]?.composerPhase === "received") {
+            clearSettleTimer(activeId);
+            setRun(set, activeId, { composerPhase: "thinking" });
           }
           apply((blocks) => appendText(blocks, e.text));
           break;
         case "tool_use":
-          if (get().composerPhase === "received") {
-            clearSettleTimer();
-            set({ composerPhase: "thinking" });
+          if (get().runs[myKey]?.composerPhase === "received") {
+            clearSettleTimer(activeId);
+            setRun(set, activeId, { composerPhase: "thinking" });
           }
           // Surface the running tool in the presence line ("running <tool>…").
           pendingTools.set(e.id, e.name);
-          set({ activeTool: e.name });
+          setRun(set, activeId, { activeTool: e.name });
           apply((blocks) => [
             ...blocks,
             { kind: "tool_use", id: e.id, name: e.name, input: e.input },
@@ -1984,7 +2282,7 @@ export const useStore = create<AppState>((set, get) => ({
         case "tool_result":
           // The tool finished — fall back to the generic "thinking with you…".
           pendingTools.delete(e.id);
-          set({ activeTool: Array.from(pendingTools.values()).pop() ?? null });
+          setRun(set, activeId, { activeTool: Array.from(pendingTools.values()).pop() ?? null });
           apply((blocks) => [
             ...blocks,
             {
@@ -2060,7 +2358,7 @@ export const useStore = create<AppState>((set, get) => ({
       if (run === null) {
         stopRequestedSessions.add(activeId);
         setRun(set, activeId, { finalizing: true });
-        set({ composerPhase: "stopping" });
+        setRun(set, activeId, { composerPhase: "stopping" });
         return;
       }
       watchdogCancelInFlight = true;
@@ -2087,7 +2385,7 @@ export const useStore = create<AppState>((set, get) => ({
               `\n\n**The agent timed out, but cancellation could not be confirmed:** ${errMessage(err)}. It may still be running.`,
             ),
           );
-          set({ composerPhase: "thinking" });
+          setRun(set, activeId, { composerPhase: "thinking" });
         });
     }, 1000);
 
@@ -2128,7 +2426,7 @@ export const useStore = create<AppState>((set, get) => ({
               `\n\n**Stop could not be confirmed:** ${errMessage(err)}. The agent may still be running.`,
             ),
           );
-          set({ composerPhase: "thinking" });
+          setRun(set, activeId, { composerPhase: "thinking" });
           return;
         }
         // Cancellation is acknowledged, but native still has to capture and emit
@@ -2146,25 +2444,31 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async stop() {
+    const activeId = get().activeId;
+    if (activeId) await get().stopSession(activeId);
+  },
+
+  async stopSession(activeId) {
     // Acknowledge the Stop intent in <100ms — before the backend cancel resolves —
     // by relabeling the presence to "stopping…" and stopping the settle fallback.
-    clearSettleTimer();
-    set({ composerPhase: "stopping" });
-    const activeId = get().activeId;
-    if (!activeId || !get().streaming) {
-      set({ composerPhase: "idle" });
+    clearSettleTimer(activeId);
+    const targetRun = get().runs[runKey(activeId)];
+    const legacyActiveStreaming = get().activeId === activeId && get().streaming;
+    if (!targetRun?.streaming && !legacyActiveStreaming) {
       return;
     }
     // A prior Stop is already acknowledged and waiting for its native terminal
     // receipt. Do not send duplicate cancel commands or reset the grace handshake.
-    if (get().runs[runKey(activeId)]?.finalizing) return;
+    if (targetRun?.finalizing) return;
     stopRequestedSessions.add(activeId);
     // Older restored/test state may have only the active-run mirror populated. Seed
     // the per-session source of truth from the observed assistant before patching it,
     // so Stop never clears its own cancel handle while marking finalization.
     set((st) => {
       const existing = st.runs[runKey(activeId)];
-      if (existing) return runPatch(st, activeId, { finalizing: true });
+      if (existing) {
+        return runPatch(st, activeId, { finalizing: true, composerPhase: "stopping" });
+      }
       const assistant = [...(st.messages[activeId] ?? [])]
         .reverse()
         .find((message) => message.role === "assistant");
@@ -2175,21 +2479,23 @@ export const useStore = create<AppState>((set, get) => ({
         turnId: assistant?.turnId ?? assistant?.id ?? null,
         startedAt: assistant?.createdAt ?? null,
         finalizing: true,
+        composerPhase: "stopping",
+        activeTool: st.activeTool,
       });
     });
     // Remote mode: the turn runs on the desktop, so stop it with a Cancel command
     // over the link (there is no local `cancel` handle on the phone).
     if (get().remoteConnected) {
-      clearRemoteWatchdog(); // the turn is over — stop the idle watchdog
+      clearRemoteWatchdog(activeId); // the turn is over — stop the idle watchdog
       const cancelledTurnId = get().runs[runKey(activeId)]?.turnId ?? null;
       if (activeId) await get().sendRemoteCommand({ cmd: "cancel", session_id: activeId });
       stopRequestedSessions.delete(activeId);
       if (get().remoteDropped) return;
       const current = get().runs[runKey(activeId)];
       if (!current?.streaming || current.turnId !== cancelledTurnId) return;
-      clearRemoteCancelTerminalTimer();
-      remoteCancelTerminalTimer = setTimeout(() => {
-        remoteCancelTerminalTimer = null;
+      clearRemoteCancelTerminalTimer(activeId);
+      const timer = setTimeout(() => {
+        remoteCancelTerminalTimers.delete(activeId);
         set((st) => {
           const run = st.runs[runKey(activeId)];
           if (!run?.streaming || run.turnId !== cancelledTurnId) return {};
@@ -2201,14 +2507,14 @@ export const useStore = create<AppState>((set, get) => ({
               "cancelled",
               "cancelled",
             ),
-            activeTool: null,
-            composerPhase: "idle" as const,
           };
         });
       }, CANCEL_TERMINAL_GRACE_MS);
+      remoteCancelTerminalTimers.set(activeId, timer);
       return;
     }
-    const c = get().cancel;
+    const c =
+      get().runs[runKey(activeId)]?.cancel ?? (get().activeId === activeId ? get().cancel : null);
     // runAgent has not returned its handle yet. Keep streaming/stopping true; its
     // post-await branch observes this intent and performs the acknowledged cancel.
     if (!c) return;
@@ -2222,9 +2528,7 @@ export const useStore = create<AppState>((set, get) => ({
       if (receiptAwareCancels.has(c)) return;
       set((st) => ({
         ...terminalizeTurnState(st, activeId, TOOL_INTERRUPTED_CANCELLED, "cancelled", "cancelled"),
-        activeTool: null,
       }));
-      set({ composerPhase: "idle" });
     } catch (err) {
       stopRequestedSessions.delete(activeId);
       setRun(set, activeId, { finalizing: false });
@@ -2243,7 +2547,7 @@ export const useStore = create<AppState>((set, get) => ({
             ),
           }),
         ),
-        composerPhase: "thinking",
+        ...runPatch(st, activeId, { composerPhase: "thinking" }),
       }));
     }
   },
@@ -2264,10 +2568,24 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  async resolvePermission(decision, always) {
-    const p = get().pendingPermission;
+  async resolvePermission(
+    sessionOrDecision: string,
+    permissionOrAlways?: string | boolean,
+    decisionArg?: "allow" | "deny",
+    alwaysArg?: boolean,
+  ) {
+    // Keep the historical `(decision, always?)` form while exposing the identity-
+    // bearing form used by prompts that can remain pending in background sessions.
+    const legacy = sessionOrDecision === "allow" || sessionOrDecision === "deny";
+    const sessionId = legacy ? (get().activeId ?? "__legacy-active__") : sessionOrDecision;
+    const p = legacy
+      ? (get().runs[runKey(sessionId)]?.pendingPermission ?? get().pendingPermission)
+      : get().runs[runKey(sessionId)]?.pendingPermission;
     if (!p) return;
-    const id = p.id;
+    const permissionId = legacy ? p.id : String(permissionOrAlways ?? "");
+    const decision = legacy ? sessionOrDecision : decisionArg;
+    const always = legacy ? Boolean(permissionOrAlways) : alwaysArg;
+    if ((decision !== "allow" && decision !== "deny") || permissionId !== p.id) return;
 
     // Remote mode: the permission gate belongs to the desktop's agent run, so
     // answer it as a Permission command over the link — the local
@@ -2276,23 +2594,27 @@ export const useStore = create<AppState>((set, get) => ({
     // this command, so it's ignored on the remote path. The same stale-click
     // guard applies (don't answer a request a newer one superseded).
     if (get().remoteConnected) {
-      const current = get().pendingPermission;
-      if (current && current.id !== id) return;
-      patchActiveRun(set, get, { pendingPermission: null });
-      await get().sendRemoteCommand({ cmd: "permission", id, decision });
+      const current = legacy
+        ? (get().runs[runKey(sessionId)]?.pendingPermission ?? get().pendingPermission)
+        : get().runs[runKey(sessionId)]?.pendingPermission;
+      if (current && current.id !== permissionId) return;
+      setRun(set, sessionId, { pendingPermission: null });
+      await get().sendRemoteCommand({ cmd: "permission", id: permissionId, decision });
       return;
     }
 
     // A superseding request may have replaced the prompt while we awaited
     // (or between render and click); only resolve the request we captured so a
     // stale click can't clear/answer a newer one.
-    const current = get().pendingPermission;
-    if (current && current.id !== id) return;
+    const current = legacy
+      ? (get().runs[runKey(sessionId)]?.pendingPermission ?? get().pendingPermission)
+      : get().runs[runKey(sessionId)]?.pendingPermission;
+    if (current && current.id !== permissionId) return;
     // Answer the backend gate FIRST (and clear the banner), so a later
     // best-effort policy save can't strand the prompt or leave the gate
     // unanswered if updateSettings rejects.
-    patchActiveRun(set, get, { pendingPermission: null });
-    await ipc.resolvePermission(id, decision);
+    setRun(set, sessionId, { pendingPermission: null });
+    await ipc.resolvePermission(permissionId, decision);
     if (always && decision === "allow") {
       // "Always allow" adds a SCOPED allow-rule for this tool (and, for commands,
       // this command) instead of flipping the global policy to allow-everything.
@@ -2493,6 +2815,9 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async updateSettings(s) {
+    // Permission mode is shared security policy. Changing it while any session is
+    // executing or waiting for approval would mutate the rules under that run.
+    if ("permissionMode" in s && anyRunBusy(get())) return;
     // Fail loudly: a saveSettings reject must surface (so the controlled UI doesn't
     // silently snap back to the old value) instead of being a swallowed rejection.
     set({ settingsError: null });
@@ -2806,7 +3131,39 @@ export const useStore = create<AppState>((set, get) => ({
           return {
             sessions: frame.sessions,
             activeId,
+            messageLoads: frame.sessions.reduce<Record<string, MessageLoadState>>(
+              (loads, session) => {
+                loads[session.id] = st.messageLoads[session.id] ?? {
+                  ...idleMessageLoad(),
+                  phase: session.id in st.messages ? "ready" : "loading",
+                };
+                return loads;
+              },
+              {},
+            ),
             ...projectActiveRun({ activeId, runs: st.runs }),
+          };
+        });
+        break;
+      case "session_created":
+        set((st) => {
+          const session = frame.session;
+          const sessions = [session, ...st.sessions.filter((item) => item.id !== session.id)];
+          const matchesRequest = pendingRemoteCreateRequestId === frame.request_id;
+          if (matchesRequest) clearPendingRemoteCreate();
+          if (!matchesRequest) return { sessions };
+          const runs = st.runs;
+          return {
+            sessions,
+            activeId: session.id,
+            messages: { ...st.messages, [session.id]: [] },
+            messageLoads: {
+              ...st.messageLoads,
+              [session.id]: { ...idleMessageLoad(), phase: "ready", loadedAt: now() },
+            },
+            creatingSession: false,
+            remoteChatOpen: true,
+            ...projectActiveRun({ activeId: session.id, runs }),
           };
         });
         break;
@@ -2827,6 +3184,17 @@ export const useStore = create<AppState>((set, get) => ({
             // This is what reconciles any optimistic user message we appended.
             messages: { ...st.messages, [frame.session_id]: rowsToMessages(frame.messages) },
             messagePaging: { ...st.messagePaging, [frame.session_id]: paging },
+            messageLoads: {
+              ...st.messageLoads,
+              [frame.session_id]: {
+                ...(st.messageLoads[frame.session_id] ?? idleMessageLoad()),
+                phase: "ready",
+                loadedAt: now(),
+                lastAccessedAt: now(),
+                error: null,
+                loadingOlder: false,
+              },
+            },
             activeId,
             ...projectActiveRun({ activeId, runs: st.runs }),
           };
@@ -2855,6 +3223,16 @@ export const useStore = create<AppState>((set, get) => ({
               ...st.messagePaging,
               [sid]: { hasMore: frame.has_more, loading: false, oldestSeq },
             },
+            messageLoads: {
+              ...st.messageLoads,
+              [sid]: {
+                ...(st.messageLoads[sid] ?? idleMessageLoad()),
+                phase: "ready",
+                loadingOlder: false,
+                error: null,
+                lastAccessedAt: now(),
+              },
+            },
           };
         });
         break;
@@ -2862,7 +3240,7 @@ export const useStore = create<AppState>((set, get) => ({
       case "live":
         // Keep the remote idle watchdog alive: any live frame for the active session
         // is proof the desktop is still talking, so reset its last-activity clock.
-        if (frame.session_id === get().activeId) remoteLastActivity = now();
+        remoteLastActivity.set(frame.session_id, now());
         applyRemoteEvent(set, frame.session_id, frame.event);
         break;
       case "pairing_reject": {
@@ -2913,6 +3291,7 @@ export const useStore = create<AppState>((set, get) => ({
     // orphaning one subscription that keeps double-feeding applyFrame. Serialize so
     // only one dial runs at a time.
     if (get().remoteConnecting) return;
+    clearPendingRemoteCreate();
     set({ remoteConnecting: true });
     // Clean reconnect: tear down any prior subscriptions before dialing so a second
     // connect can never leave two live listeners feeding the store.
@@ -2982,6 +3361,7 @@ export const useStore = create<AppState>((set, get) => ({
       // the UI can leave the dead session and offer a reconnect. A user-initiated
       // disconnect tears this listener down first, so it can't misfire as a drop.
       unlistenDrop = await ipc.onPhoneSyncDisconnected(() => {
+        clearPendingRemoteCreate();
         clearRemoteCancelTerminalTimer();
         // The turn is dead when the channel drops — clear turn state too, not just
         // connection flags, so neither the interim nor the reconnected session is
@@ -2994,6 +3374,7 @@ export const useStore = create<AppState>((set, get) => ({
           remoteVerified: false,
           remoteDropped: true,
           remoteChatOpen: false,
+          creatingSession: false,
           // The channel is dead — every remote-driven run is gone.
           runs: {},
           // ...and pagination cursors are stale; the reconnect's catch-up reseeds them.
@@ -3131,7 +3512,60 @@ export const useStore = create<AppState>((set, get) => ({
   // requests; the matching `message_page` frame clears it (and reconnect/drop reset
   // the whole `messagePaging` map). The page size is a fixed `PAGE_SIZE`.
   async loadOlderMessages(sessionId) {
-    if (!get().remoteConnected) return;
+    if (!get().remoteConnected) {
+      const load = get().messageLoads[sessionId];
+      if (!load || load.loadingOlder || load.nextCursor === null || load.phase === "loading")
+        return;
+      const cursor = load.nextCursor;
+      set((st) => ({
+        messageLoads: {
+          ...st.messageLoads,
+          [sessionId]: { ...load, loadingOlder: true, error: null },
+        },
+      }));
+      try {
+        const page = await ipc.getMessagePage(sessionId, cursor);
+        set((st) => {
+          const current = st.messageLoads[sessionId];
+          // A refresh/reload superseded this cursor request.
+          if (!current?.loadingOlder || current.nextCursor !== cursor) return {};
+          return {
+            messages: {
+              ...st.messages,
+              [sessionId]: mergeHydratedMessages(page.messages, st.messages[sessionId] ?? []),
+            },
+            messageLoads: {
+              ...st.messageLoads,
+              [sessionId]: {
+                ...current,
+                phase: "ready",
+                nextCursor: page.nextCursor,
+                loadingOlder: false,
+                lastAccessedAt: now(),
+                error: null,
+              },
+            },
+          };
+        });
+      } catch (error) {
+        set((st) => {
+          const current = st.messageLoads[sessionId];
+          if (!current?.loadingOlder || current.nextCursor !== cursor) return {};
+          return {
+            messageLoads: {
+              ...st.messageLoads,
+              [sessionId]: {
+                ...current,
+                phase: "error",
+                loadingOlder: false,
+                error: errMessage(error),
+              },
+            },
+          };
+        });
+      }
+      return;
+    }
     const paging = get().messagePaging[sessionId];
     // Unknown (undefined) paging means catch-up hasn't seeded it yet — nothing to
     // page from. hasMore === false means we hold the very first message already.
@@ -3149,6 +3583,13 @@ export const useStore = create<AppState>((set, get) => ({
     }
     set((st) => ({
       messagePaging: { ...st.messagePaging, [sessionId]: { ...paging, loading: true } },
+      messageLoads: {
+        ...st.messageLoads,
+        [sessionId]: {
+          ...(st.messageLoads[sessionId] ?? idleMessageLoad()),
+          loadingOlder: true,
+        },
+      },
     }));
     await get().sendRemoteCommand({
       cmd: "fetch_messages",
@@ -3159,6 +3600,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async disconnectRemote() {
+    clearPendingRemoteCreate();
     clearRemoteCancelTerminalTimer();
     clearRemoteWatchdog(); // user-initiated teardown — the turn is over
     clearSettleTimer();
@@ -3187,6 +3629,7 @@ export const useStore = create<AppState>((set, get) => ({
       // when no dial is in flight.
       remoteConnecting: false,
       remoteChatOpen: false,
+      creatingSession: false,
       // The turn is over — don't strand a stuck composer; drop every run too.
       runs: {},
       // Pagination cursors belong to the torn-down session; clear them.
@@ -3212,20 +3655,12 @@ export const useStore = create<AppState>((set, get) => ({
     await get().connectRemote(qr, true);
   },
 
-  // Open a session from the remote sessions list — switch to it, then reveal the
-  // chat view. selectSession is the single source of truth for activeId + lazy
-  // message load (and is a no-op mid-stream); opening the chat is unconditional so
-  // tapping the already-active running session still enters it.
+  // Open a session from the remote list. Selection commits synchronously and its
+  // run is projected immediately; transcript hydration continues independently.
   async openRemoteSession(id) {
-    // Mid-stream, selectSession is a no-op (switching activeId would strand the
-    // streaming turn). Opening the chat unconditionally would then reveal the WRONG
-    // session (the still-active one). So when switching is blocked — streaming AND a
-    // *different* session is tapped — bail before selecting or opening. Tapping the
-    // already-active running session still falls through and enters it.
-    const { streaming, activeId } = get();
-    if (streaming && id !== activeId) return;
-    await get().selectSession(id);
+    const selecting = get().selectSession(id);
     set({ remoteChatOpen: true });
+    await selecting;
   },
 
   // Back out of the chat view to the remote sessions list. The connection stays
@@ -3548,9 +3983,9 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
   // frames never touch the visible presence.
   const settleActivePresence = (): void => {
     const st = useStore.getState();
-    if (st.activeId === sessionId && st.composerPhase === "received") {
-      clearSettleTimer();
-      set(() => ({ composerPhase: "thinking" }));
+    if (st.runs[runKey(sessionId)]?.composerPhase === "received") {
+      clearSettleTimer(sessionId);
+      set((current) => runPatch(current, sessionId, { composerPhase: "thinking" }));
     }
   };
   const supersededTerminal = (receipt: TurnReceipt | undefined): boolean => {
@@ -3568,6 +4003,7 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       set((st) => {
         const previous = st.runs[runKey(sessionId)] ?? EMPTY_RUN;
         const turnId = e.turnId ?? e.messageId;
+        armRemoteWatchdog(sessionId, turnId);
         const startedAt = e.startedAt ?? previous.startedAt ?? now();
         let messages = reconcileTurnMessage(
           st.messages,
@@ -3601,6 +4037,9 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
             finalizing: false,
             receipt: null,
             outcome: null,
+            composerPhase: previous.composerPhase === "received" ? "received" : "thinking",
+            activeTool: null,
+            unseenOutcome: null,
           }),
           messages,
           // Each turn's agents panel starts empty. The desktop clears it in send();
@@ -3627,8 +4066,8 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       settleActivePresence();
       // Surface the running tool on the VISIBLE composer only — a background
       // session's tool must not show on screen (mirrors the presence settle).
-      if (useStore.getState().activeId === sessionId) set(() => ({ activeTool: e.name }));
       set((st) => ({
+        ...runPatch(st, sessionId, { activeTool: e.name }),
         messages: patchTurnMessage(
           st.messages,
           sessionId,
@@ -3656,7 +4095,7 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
         const turnBlocks = findTurnMessage(messages, sessionId, turnId)?.blocks ?? [];
         return {
           messages,
-          ...(st.activeId === sessionId ? { activeTool: latestPendingToolName(turnBlocks) } : {}),
+          ...runPatch(st, sessionId, { activeTool: latestPendingToolName(turnBlocks) }),
         };
       });
       break;
@@ -3705,11 +4144,9 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       // A terminal frame for the active session ends the turn — stop the remote idle
       // watchdog (it self-clears on its next tick once streaming is false, but clear
       // it eagerly so it can't fire a spurious timeout in the meantime).
-      if (useStore.getState().activeId === sessionId) {
-        clearRemoteWatchdog();
-        clearRemoteCancelTerminalTimer();
-        clearSettleTimer();
-      }
+      clearRemoteWatchdog(sessionId);
+      clearRemoteCancelTerminalTimer(sessionId);
+      clearSettleTimer(sessionId);
       set((st) => ({
         ...terminalizeTurnState(
           st,
@@ -3720,7 +4157,6 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
           e.receipt,
           `\n\n**Error:** ${e.message}`,
         ),
-        ...(st.activeId === sessionId ? { composerPhase: "idle" as const, activeTool: null } : {}),
       }));
       break;
     }
@@ -3737,11 +4173,9 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
         }));
         break;
       }
-      if (useStore.getState().activeId === sessionId) {
-        clearRemoteWatchdog();
-        clearRemoteCancelTerminalTimer();
-        clearSettleTimer();
-      }
+      clearRemoteWatchdog(sessionId);
+      clearRemoteCancelTerminalTimer(sessionId);
+      clearSettleTimer(sessionId);
       set((st) => ({
         ...terminalizeTurnState(
           st,
@@ -3751,7 +4185,6 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
           e.stopReason,
           e.receipt,
         ),
-        ...(st.activeId === sessionId ? { composerPhase: "idle" as const, activeTool: null } : {}),
       }));
       break;
     }

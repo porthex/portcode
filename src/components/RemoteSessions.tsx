@@ -9,28 +9,20 @@ import { relativeTime, workspaceLabel } from "../lib/sessionFormat";
 export function RemoteSessions() {
   const sessions = useStore((s) => s.sessions);
   const activeId = useStore((s) => s.activeId);
-  const streaming = useStore((s) => s.streaming);
+  const runs = useStore((s) => s.runs);
   const creatingSession = useStore((s) => s.creatingSession);
   const openRemoteSession = useStore((s) => s.openRemoteSession);
   const newSession = useStore((s) => s.newSession);
 
-  // Mid-stream, switching to a DIFFERENT session is blocked (selectSession is a
-  // no-op then), so a tap on a non-active card must not open the chat — it would
-  // reveal the wrong session. Mirror RemoteSessionSwitcher.pick()'s guard: only
-  // open when not streaming or when tapping the already-active session.
+  // Navigation is independent from execution: opening a card never stops another
+  // session's run, and the selected card immediately shows its own load state.
   const open = (id: string): void => {
-    if (streaming && id !== activeId) return;
     void openRemoteSession(id);
   };
 
-  // newSession() no-ops while streaming (switching activeId mid-turn would strand
-  // the live run). Disable the CTAs so the guard is visible, not silent.
-  const createDisabled = creatingSession || streaming;
-  const createDisabledTitle = creatingSession
-    ? "Creating a session…"
-    : streaming
-      ? "Finish the current response before creating a session."
-      : undefined;
+  // Only duplicate create requests are blocked; existing runs continue in place.
+  const createDisabled = creatingSession;
+  const createDisabledTitle = creatingSession ? "Creating a session…" : undefined;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-bg text-fg">
@@ -58,7 +50,7 @@ export function RemoteSessions() {
                 key={s.id}
                 session={s}
                 active={s.id === activeId}
-                running={s.id === activeId && streaming}
+                activity={activityFor(runs[s.id])}
                 onOpen={() => open(s.id)}
               />
             ))}
@@ -100,16 +92,33 @@ function ConnectedBanner() {
   );
 }
 
-/** A tappable row in the sessions list. Active = magenta; running shows a pulse. */
+type RemoteActivity = "idle" | "running" | "waiting" | "stopping";
+
+function activityFor(
+  run:
+    | {
+        streaming?: boolean;
+        finalizing?: boolean;
+        pendingPermission?: unknown | null;
+      }
+    | undefined,
+): RemoteActivity {
+  if (run?.pendingPermission) return "waiting";
+  if (run?.finalizing) return "stopping";
+  if (run?.streaming) return "running";
+  return "idle";
+}
+
+/** A tappable row in the sessions list. Selection and activity are independent. */
 function SessionCard({
   session,
   active,
-  running,
+  activity,
   onOpen,
 }: {
   session: Session;
   active: boolean;
-  running: boolean;
+  activity: RemoteActivity;
   onOpen: () => void;
 }) {
   return (
@@ -134,13 +143,16 @@ function SessionCard({
         <span className="min-w-0 truncate font-mono text-[11px] text-faint">
           <span aria-hidden="true">⎇</span> {workspaceLabel(session.workspace)}
         </span>
-        {running ? (
-          <span className="flex shrink-0 items-center gap-1.5 font-mono text-[10px] tracking-[1px] text-success">
+        {activity !== "idle" ? (
+          <span
+            role="status"
+            className={`flex shrink-0 items-center gap-1.5 font-mono text-[10px] tracking-[1px] ${activity === "waiting" ? "text-warn" : activity === "stopping" ? "text-danger" : "text-success"}`}
+          >
             <span
-              className="h-[5px] w-[5px] rounded-full bg-success shadow-[0_0_7px_#34ff9e] motion-safe:animate-[pcDot_1.4s_ease-in-out_infinite]"
+              className={`h-[5px] w-[5px] rounded-full motion-safe:animate-[pcDot_1.4s_ease-in-out_infinite] ${activity === "waiting" ? "bg-warn" : activity === "stopping" ? "bg-danger" : "bg-success shadow-[0_0_7px_#34ff9e]"}`}
               aria-hidden="true"
             />
-            RUNNING
+            {activity.toUpperCase()}
           </span>
         ) : (
           <span className="shrink-0 font-mono text-[10px] text-faint">

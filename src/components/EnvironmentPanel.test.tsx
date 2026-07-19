@@ -2,7 +2,12 @@ import { StrictMode } from "react";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { DEFAULT_SETTINGS, type AgentInfo, type WorkspaceSummary } from "../types";
+import {
+  DEFAULT_SETTINGS,
+  type AgentInfo,
+  type TurnReceipt,
+  type WorkspaceSummary,
+} from "../types";
 import { useStore } from "../store/store";
 import { EnvironmentPanel } from "./EnvironmentPanel";
 
@@ -14,6 +19,36 @@ import * as ipc from "../lib/ipc";
 
 const m = vi.mocked(ipc);
 const initialState = useStore.getState();
+
+const completedReceipt = (turnId: string): TurnReceipt => ({
+  turnId,
+  status: "completed",
+  stopReason: "end_turn",
+  startedAt: 1,
+  completedAt: 2,
+  durationMs: 1,
+  changedFiles: [],
+  changedFileCount: 0,
+  additions: 0,
+  deletions: 0,
+  filesTruncated: false,
+  changeCertainty: "exact",
+  backgroundTasksRunning: false,
+});
+
+const completedRun = (turnId: string) => ({
+  streaming: false,
+  cancel: null,
+  pendingPermission: null,
+  turnId,
+  startedAt: 1,
+  finalizing: false,
+  receipt: completedReceipt(turnId),
+  outcome: "completed" as const,
+  composerPhase: "idle" as const,
+  activeTool: null,
+  unseenOutcome: null,
+});
 
 const repositorySummary = (
   overrides: Partial<Extract<WorkspaceSummary["git"], { kind: "repository" }>> = {},
@@ -392,7 +427,7 @@ describe("EnvironmentPanel", () => {
     expect(m.getWorkspaceSummary).toHaveBeenCalledTimes(1);
   });
 
-  it("refreshes on focus, turn completion, and the open-panel interval", async () => {
+  it("refreshes on focus, any session receipt, and the open-panel interval", async () => {
     vi.useFakeTimers();
     render(<EnvironmentPanel />);
     await act(async () => Promise.resolve());
@@ -404,13 +439,23 @@ describe("EnvironmentPanel", () => {
     await act(async () => Promise.resolve());
     expect(m.getWorkspaceSummary.mock.calls.length).toBeGreaterThan(afterOpen);
 
-    act(() => useStore.setState({ streaming: true }));
-    act(() => useStore.setState({ streaming: false }));
+    act(() => useStore.setState({ runs: { background: completedRun("turn-background") } }));
     await act(async () => Promise.resolve());
     const afterTurn = m.getWorkspaceSummary.mock.calls.length;
 
     act(() => vi.advanceTimersByTime(5_000));
     await act(async () => Promise.resolve());
     expect(m.getWorkspaceSummary.mock.calls.length).toBeGreaterThan(afterTurn);
+  });
+
+  it("does not interpret selecting an idle session as turn completion", async () => {
+    render(<EnvironmentPanel />);
+    await act(async () => Promise.resolve());
+    const beforeSwitch = m.getWorkspaceSummary.mock.calls.length;
+
+    act(() => useStore.setState({ activeId: "s2", agents: { s1: [], s2: [] } }));
+    await act(async () => Promise.resolve());
+
+    expect(m.getWorkspaceSummary).toHaveBeenCalledTimes(beforeSwitch);
   });
 });

@@ -479,6 +479,22 @@ export async function getMessages(sessionId: string): Promise<Message[]> {
   return [];
 }
 
+/** Load one display-ready page of persisted history. Cursor null/undefined loads
+ * the newest page; a returned nextCursor walks toward older messages. */
+export async function getMessagePage(
+  sessionId: string,
+  cursor?: string | null,
+): Promise<import("../types").UiMessagePage> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<import("../types").UiMessagePage>("get_message_page", {
+      sessionId,
+      cursor: cursor ?? null,
+    });
+  }
+  return { messages: [], nextCursor: null };
+}
+
 // ── composer drafts (open-loop persistence) ───────────────────────────────────
 //
 // The DURABLE store. Under Tauri these reach the SQLite `drafts` table; outside
@@ -660,7 +676,14 @@ export async function runAgent(
     const unlisten: Unlisten = await event.listen<StreamEvent>(channel, (ev) =>
       onEvent(ev.payload),
     );
-    await core.invoke("run_agent", { sessionId, text, model });
+    try {
+      await core.invoke("run_agent", { sessionId, text, model });
+    } catch (error) {
+      // Listener installation precedes the invoke so no first event is missed. If
+      // reservation/invocation is rejected, tear it back down immediately.
+      unlisten();
+      throw error;
+    }
     return {
       // cancel_agent acknowledges the abort request before the native turn has
       // captured/emitted its terminal receipt. The store owns bounded disposal.

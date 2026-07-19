@@ -27,6 +27,55 @@ use crate::tools::{self, ToolCtx};
 
 type Cancels = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 
+/// A synchronous same-session reservation acquired before an async turn is
+/// spawned. Its cancel flag remains registered through terminal persistence and
+/// emission. Drop removes only this exact flag, preventing an old task from
+/// clearing a newer reservation for the same session.
+pub struct RunReservation {
+    cancels: Cancels,
+    session_id: String,
+    cancel: Arc<AtomicBool>,
+}
+
+impl RunReservation {
+    pub fn try_acquire(cancels: Cancels, session_id: &str) -> Result<Self, String> {
+        use std::collections::hash_map::Entry;
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut map = cancels.lock().unwrap();
+            match map.entry(session_id.to_string()) {
+                Entry::Occupied(_) => {
+                    return Err("A turn is already running for this session.".into())
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(cancel.clone());
+                }
+            }
+        }
+        Ok(Self {
+            cancels,
+            session_id: session_id.to_string(),
+            cancel,
+        })
+    }
+
+    fn cancel_flag(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+}
+
+impl Drop for RunReservation {
+    fn drop(&mut self) {
+        let mut map = self.cancels.lock().unwrap();
+        if map
+            .get(&self.session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.cancel))
+        {
+            map.remove(&self.session_id);
+        }
+    }
+}
+
 /// Refresh an OAuth access token once it is within this many seconds of expiry.
 const REFRESH_SKEW_SECS: i64 = 60;
 
@@ -336,7 +385,7 @@ pub async fn run(
     http: reqwest::Client,
     settings: Arc<Mutex<Settings>>,
     db: Arc<Db>,
-    cancels: Cancels,
+    reservation: RunReservation,
     pending: Pending,
     agents: agents::Agents,
     background: background::Background,
@@ -346,34 +395,7 @@ pub async fn run(
     model: Option<String>,
 ) {
     let channel = format!("agent://{session_id}");
-
-    // Refuse a second concurrent run for the same session. Two runs would collide on
-    // the cancel flag (Stop could hit the wrong one), the first run's entry would be
-    // evicted, and their DB writes would interleave and corrupt the conversation
-    // history. The desktop UI already guards this; this also covers a phone driving
-    // the same session over Phone Sync.
-    let cancel = Arc::new(AtomicBool::new(false));
-    let already_running = {
-        use std::collections::hash_map::Entry;
-        let mut map = cancels.lock().unwrap();
-        match map.entry(session_id.clone()) {
-            Entry::Occupied(_) => true,
-            Entry::Vacant(slot) => {
-                slot.insert(cancel.clone());
-                false
-            }
-        }
-    };
-    if already_running {
-        sink.emit(
-            &channel,
-            StreamEvent::Error {
-                message: "A turn is already running for this session.".to_string(),
-                receipt: None,
-            },
-        );
-        return;
-    }
+    let cancel = reservation.cancel_flag();
 
     let turn_id = Uuid::new_v4().to_string();
     let started_at = db::now_ms();
@@ -381,7 +403,6 @@ pub async fn run(
     let initial_receipt =
         crate::turn_receipt::unavailable_interrupted_receipt(&turn_id, started_at);
     if let Err(error) = db.save_pending_turn_receipt(&session_id, &turn_id, &initial_receipt) {
-        cancels.lock().unwrap().remove(&session_id);
         sink.emit(
             &channel,
             StreamEvent::Error {
@@ -458,11 +479,6 @@ pub async fn run(
         model,
     )
     .await;
-
-    {
-        let mut map = cancels.lock().unwrap();
-        map.remove(&session_id);
-    }
 
     let (status, stop_reason) = match &result {
         Ok(reason) if reason == "cancelled" => (TurnStatus::Cancelled, Some(reason.clone())),
@@ -1558,14 +1574,15 @@ mod tests {
         derive_title, ensure_openai_account_unchanged, finish_status, is_terminal_auth_error,
         precheck_outcome, reassemble_results, resolve_system_prompt, session_of,
         spawn_background_task, spawn_status, step_limit_exceeded, subagent_answer, subagent_label,
-        tool_result_block, tool_result_event, AgentConfig, Block, ChatMessage, Db, Decision,
-        LoopOutcome, Persist, StreamEvent, CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS,
-        MAX_PARALLEL_AGENTS, MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
+        tool_result_block, tool_result_event, AgentConfig, Block, Cancels, ChatMessage, Db,
+        Decision, LoopOutcome, Persist, RunReservation, StreamEvent, CANCELLED_TOOL_RESULT,
+        MAX_AGENT_STEPS, MAX_PARALLEL_AGENTS, MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
     };
     use crate::tool_names;
+    use std::collections::HashMap;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     fn spec_names(cfg: &AgentConfig) -> Vec<String> {
         cfg.registry
@@ -2111,5 +2128,20 @@ mod tests {
     #[test]
     fn derive_title_defaults_when_empty() {
         assert_eq!(derive_title("   "), "New chat");
+    }
+
+    #[test]
+    fn run_reservation_rejects_only_the_same_session_and_drops_safely() {
+        let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
+        let first = RunReservation::try_acquire(cancels.clone(), "a").unwrap();
+        assert!(RunReservation::try_acquire(cancels.clone(), "a").is_err());
+        let other = RunReservation::try_acquire(cancels.clone(), "b").unwrap();
+        assert!(cancels.lock().unwrap().contains_key("a"));
+        assert!(cancels.lock().unwrap().contains_key("b"));
+        drop(first);
+        assert!(!cancels.lock().unwrap().contains_key("a"));
+        assert!(cancels.lock().unwrap().contains_key("b"));
+        drop(other);
+        assert!(cancels.lock().unwrap().is_empty());
     }
 }

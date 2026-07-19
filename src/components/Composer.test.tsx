@@ -28,6 +28,21 @@ const m = vi.mocked(ipc);
 // before every test so cross-test state never leaks.
 const initial = useStore.getState();
 
+const run = (over: Partial<(typeof initial.runs)[string]> = {}): (typeof initial.runs)[string] => ({
+  streaming: false,
+  cancel: null,
+  pendingPermission: null,
+  turnId: null,
+  startedAt: null,
+  finalizing: false,
+  receipt: null,
+  outcome: null,
+  composerPhase: "idle",
+  activeTool: null,
+  unseenOutcome: null,
+  ...over,
+});
+
 const sendButton = () => screen.getByTitle("Send (Enter)");
 const stopButton = () => screen.getByTitle("Stop");
 const textarea = () =>
@@ -343,6 +358,51 @@ describe("Composer key handling", () => {
 
     expect(useStore.getState().drafts.a).toBe("queued");
     expect(m.runAgent).not.toHaveBeenCalled();
+  });
+
+  it("keeps the draft editable but guards Send after a cold history load error", () => {
+    useStore.setState({
+      activeId: "a",
+      messages: {},
+      drafts: { a: "keep this draft" },
+      messageLoads: {
+        a: {
+          phase: "error",
+          loadedAt: null,
+          lastAccessedAt: 1,
+          requestId: 1,
+          error: "offline",
+          nextCursor: null,
+          loadingOlder: false,
+        },
+      },
+    });
+    render(<Composer />);
+
+    expect(textarea()).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Conversation failed to load" })).toBeDisabled();
+  });
+
+  it("allows Send when a refresh fails but cached history remains", () => {
+    useStore.setState({
+      activeId: "a",
+      messages: { a: [] },
+      drafts: { a: "send from cache" },
+      messageLoads: {
+        a: {
+          phase: "error",
+          loadedAt: 1,
+          lastAccessedAt: 2,
+          requestId: 2,
+          error: "offline",
+          nextCursor: null,
+          loadingOlder: false,
+        },
+      },
+    });
+    render(<Composer />);
+
+    expect(sendButton()).toBeEnabled();
   });
 });
 
@@ -665,6 +725,17 @@ describe("Composer permission dropdown", () => {
     expect(picker).toHaveAttribute("title", expect.stringContaining("no confirmations"));
     expect(picker).toHaveClass("pc-permission-select--danger");
     expect(picker).toBeDisabled();
+  });
+
+  it("freezes global permission policy while a background session runs", () => {
+    useStore.setState({
+      activeId: "a",
+      runs: { b: run({ streaming: true }) },
+      settings: { ...DEFAULT_SETTINGS, permissionMode: "default" },
+    });
+    render(<Composer />);
+
+    expect(screen.getByRole("combobox", { name: "Permission mode" })).toBeDisabled();
   });
 
   it("removes the plan warning banner while keeping plan state clear in the composer", () => {

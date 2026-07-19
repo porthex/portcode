@@ -64,7 +64,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use tauri::{AppHandle, Manager, State};
 
-use crate::db::{Db, DraftRow, SearchHit, SessionRow, UiMessage, UsageRow};
+use crate::db::{Db, DraftRow, SearchHit, SessionRow, UiMessage, UiMessagePage, UsageRow};
 use crate::settings::Settings;
 
 pub struct AppState {
@@ -498,6 +498,12 @@ fn update_session_model(
 
 #[tauri::command]
 fn delete_session(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
+    #[cfg(desktop)]
+    if state.cancels.lock().unwrap().contains_key(&id)
+        || background::has_session(&state.background, &id)
+    {
+        return Err("Cannot delete a session while it is running or has background work.".into());
+    }
     state.db.delete_session(&id).map_err(|e| e.to_string())?;
     // Push the pruned list to any connected sync client (best-effort).
     push_session_list(&app, &state.db);
@@ -505,8 +511,28 @@ fn delete_session(app: AppHandle, state: State<AppState>, id: String) -> Result<
 }
 
 #[tauri::command]
-fn get_messages(state: State<AppState>, session_id: String) -> Vec<UiMessage> {
-    state.db.ui_messages(&session_id)
+async fn get_messages(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<UiMessage>, String> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.try_ui_messages(&session_id))
+        .await
+        .map_err(|error| format!("history worker failed: {error}"))?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn get_message_page(
+    state: State<'_, AppState>,
+    session_id: String,
+    cursor: Option<String>,
+) -> Result<UiMessagePage, String> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.try_ui_message_page(&session_id, cursor.as_deref()))
+        .await
+        .map_err(|error| format!("history worker failed: {error}"))?
+        .map_err(|error| error.to_string())
 }
 
 // ── drafts (composer open-loop persistence) ──────────────────────────────────
@@ -649,11 +675,17 @@ async fn run_agent(
     let http = state.http.clone();
     let settings = state.settings.clone();
     let db = state.db.clone();
-    let cancels = state.cancels.clone();
     let pending = state.pending.clone();
     let agents = state.agents.clone();
     let background = state.background.clone();
     let oauth_refresh = state.oauth_refresh.clone();
+    let reservation = agent::RunReservation::try_acquire(state.cancels.clone(), &session_id)?;
+    // Validate after reservation and before spawn so a missing/deleted session
+    // cannot create orphan receipt/message rows. An error drops the reservation.
+    state
+        .db
+        .session_model(&session_id)
+        .map_err(|error| error.to_string())?;
 
     // Wrap the AppHandle in the concrete EventSink at the command boundary, so the
     // agent core receives only the trait — its sole Tauri coupling (event emission)
@@ -668,7 +700,7 @@ async fn run_agent(
             http,
             settings,
             db,
-            cancels,
+            reservation,
             pending,
             agents,
             background,
@@ -1571,6 +1603,7 @@ pub fn run() {
         update_session_model,
         delete_session,
         get_messages,
+        get_message_page,
         save_draft,
         get_draft,
         get_drafts,
@@ -1623,6 +1656,7 @@ pub fn run() {
         update_session_model,
         delete_session,
         get_messages,
+        get_message_page,
         save_draft,
         get_draft,
         get_drafts,

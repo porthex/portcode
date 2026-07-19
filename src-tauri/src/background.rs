@@ -43,6 +43,14 @@ pub fn finish(bg: &Background, id: &str) {
     bg.lock().unwrap().remove(id);
 }
 
+/// Whether the session still owns an executing background command.
+pub fn has_session(bg: &Background, session_id: &str) -> bool {
+    bg.lock()
+        .unwrap()
+        .values()
+        .any(|entry| entry.session_id == session_id)
+}
+
 /// Kill every background task of a session — the session-wide Stop. Each waiter is
 /// aborted (its child is kill-on-drop, so the process dies) and removed. Returns
 /// how many were killed.

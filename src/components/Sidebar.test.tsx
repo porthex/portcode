@@ -19,6 +19,7 @@ vi.mock("../lib/ipc", () => ({
   listSessions: vi.fn(),
   createSession: vi.fn(),
   getMessages: vi.fn(),
+  getMessagePage: vi.fn(),
   deleteSession: vi.fn(),
   renameSession: vi.fn(),
   subscribeSessionEvents: vi.fn(),
@@ -47,6 +48,23 @@ const session = (over: Partial<Session> = {}): Session => ({
   ...over,
 });
 
+const run = (
+  over: Partial<(typeof initialState.runs)[string]> = {},
+): (typeof initialState.runs)[string] => ({
+  streaming: false,
+  cancel: null,
+  pendingPermission: null,
+  turnId: null,
+  startedAt: null,
+  finalizing: false,
+  receipt: null,
+  outcome: null,
+  composerPhase: "idle",
+  activeTool: null,
+  unseenOutcome: null,
+  ...over,
+});
+
 const settings = (over: Partial<Settings> = {}): Settings => ({
   ...DEFAULT_SETTINGS,
   ...over,
@@ -58,6 +76,7 @@ beforeEach(() => {
   useStore.setState(initialState, true);
 
   m.getMessages.mockResolvedValue([]);
+  m.getMessagePage.mockResolvedValue({ messages: [], nextCursor: null });
   m.createSession.mockResolvedValue(undefined);
   m.deleteSession.mockResolvedValue(undefined);
   m.renameSession.mockResolvedValue(undefined);
@@ -202,7 +221,26 @@ describe("Sidebar", () => {
     await Promise.resolve();
 
     expect(useStore.getState().activeId).toBe("b");
-    expect(m.getMessages).toHaveBeenCalledWith("b");
+    expect(m.getMessagePage).toHaveBeenCalledWith("b", null);
+  });
+
+  it("prefetches an inactive session after a 150ms hover dwell", () => {
+    vi.useFakeTimers();
+    const prefetchSession = vi.fn(async () => {});
+    useStore.setState({
+      sessions: [session({ id: "a", title: "First" }), session({ id: "b", title: "Second" })],
+      activeId: "a",
+      prefetchSession,
+    });
+    render(<Sidebar />);
+
+    fireEvent.mouseEnter(screen.getByRole("button", { name: /^Second/ }));
+    expect(prefetchSession).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(149);
+    expect(prefetchSession).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(prefetchSession).toHaveBeenCalledWith("b");
+    vi.useRealTimers();
   });
 
   it("deletes a session when its delete button is clicked", async () => {
@@ -498,7 +536,7 @@ describe("Sidebar", () => {
       expect(useStore.getState().activeId).toBe("a");
     });
 
-    it("does not navigate the list while a turn is streaming", () => {
+    it("navigates the list while another session keeps streaming", () => {
       useStore.setState({
         sessions: [session({ id: "a", title: "First" }), session({ id: "b", title: "Second" })],
         activeId: "a",
@@ -509,8 +547,7 @@ describe("Sidebar", () => {
       const nav = screen.getByRole("navigation", { name: "Session list" });
 
       fireEvent.keyDown(nav, { key: "ArrowDown" });
-      // selectSession no-ops while streaming, so the active session is unchanged.
-      expect(useStore.getState().activeId).toBe("a");
+      expect(useStore.getState().activeId).toBe("b");
     });
 
     it("no-ops arrow navigation when there are no sessions", () => {
@@ -612,7 +649,7 @@ describe("Sidebar", () => {
       expect(screen.queryByRole("menu", { name: "Sort sessions" })).not.toBeInTheDocument();
     });
 
-    it("group → status renders Active / Idle / Archived section headers in order", () => {
+    it("group → status renders Running / Idle / Archived section headers in order", () => {
       useStore.setState({
         sessions: [
           session({ id: "a", title: "Running one" }),
@@ -626,11 +663,40 @@ describe("Sidebar", () => {
       });
       render(<Sidebar />);
 
-      expect(screen.getByText("Active")).toBeInTheDocument();
+      expect(screen.getByText("Running")).toBeInTheDocument();
       expect(screen.getByText("Idle")).toBeInTheDocument();
       expect(screen.getByText("Archived")).toBeInTheDocument();
       // No folder UI in an automatic-grouping mode.
       expect(screen.queryByRole("button", { name: "New folder" })).not.toBeInTheDocument();
+    });
+
+    it("orders concurrent activity before idle and archived sessions", () => {
+      useStore.setState({
+        sessions: [
+          session({ id: "idle", title: "Idle chat" }),
+          session({ id: "run", title: "Running chat" }),
+          session({ id: "wait", title: "Waiting chat" }),
+          session({ id: "stop", title: "Stopping chat" }),
+          session({ id: "arch", title: "Archived chat" }),
+        ],
+        activeId: "idle",
+        groupBy: "status",
+        archivedIds: ["arch"],
+        runs: {
+          wait: run({
+            streaming: true,
+            pendingPermission: { id: "p", tool: "shell", summary: "confirm", input: {} },
+          }),
+          stop: run({ streaming: true, finalizing: true }),
+          run: run({ streaming: true }),
+        },
+      });
+      render(<Sidebar />);
+
+      const headers = [...document.querySelectorAll(".pc-group-head__label")].map(
+        (node) => node.textContent,
+      );
+      expect(headers).toEqual(["Needs attention", "Stopping", "Running", "Idle", "Archived"]);
     });
 
     it("group → workspace buckets by the ⎇ label", () => {
@@ -1229,7 +1295,7 @@ describe("Sidebar", () => {
       expect(screen.getByRole("menuitem", { name: "Delete" })).toHaveClass("pc-ctx__item--danger");
     });
 
-    it("disables mutating session actions while a turn streams", () => {
+    it("blocks destructive delete but keeps archive available while a turn streams", () => {
       useStore.setState({
         sessions: [session({ id: "a", title: "Chat A" })],
         activeId: "a",
@@ -1244,7 +1310,27 @@ describe("Sidebar", () => {
         "aria-disabled",
         "true",
       );
-      expect(screen.getByRole("menuitem", { name: "Archive" })).toHaveAttribute(
+      expect(screen.getByRole("menuitem", { name: "Archive" })).not.toHaveAttribute(
+        "aria-disabled",
+      );
+    });
+
+    it("only blocks Delete for the targeted busy session", () => {
+      useStore.setState({
+        sessions: [session({ id: "a", title: "Idle A" }), session({ id: "b", title: "Busy B" })],
+        activeId: "a",
+        runs: { b: run({ streaming: true }) },
+      });
+      render(<Sidebar />);
+
+      fireEvent.contextMenu(
+        screen.getByRole("button", { name: /^Idle A/ }).closest("[draggable]")!,
+      );
+      expect(screen.getByRole("menuitem", { name: "Delete" })).not.toHaveAttribute("aria-disabled");
+      fireEvent.contextMenu(
+        screen.getByRole("button", { name: /^Busy B/ }).closest("[draggable]")!,
+      );
+      expect(screen.getByRole("menuitem", { name: "Delete" })).toHaveAttribute(
         "aria-disabled",
         "true",
       );
@@ -1454,7 +1540,7 @@ describe("Sidebar", () => {
       expect(useStore.getState().sessions[0].title).toBe("Original");
     });
 
-    it("offers no rename affordance while a turn is streaming", () => {
+    it("keeps rename available while a turn is streaming", () => {
       useStore.setState({
         sessions: [session({ id: "a", title: "Busy" })],
         activeId: "a",
@@ -1462,12 +1548,9 @@ describe("Sidebar", () => {
       });
       render(<Sidebar />);
 
-      // No pencil button, and a double-click can't open the editor either.
-      expect(
-        screen.queryByRole("button", { name: "Rename session: Busy" }),
-      ).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Rename session: Busy" })).toBeInTheDocument();
       fireEvent.doubleClick(screen.getByText("Busy"));
-      expect(screen.queryByRole("textbox", { name: /^Rename session:/ })).not.toBeInTheDocument();
+      expect(screen.getByRole("textbox", { name: /^Rename session:/ })).toBeInTheDocument();
     });
 
     it("offers no rename affordance when driving a remote desktop", () => {

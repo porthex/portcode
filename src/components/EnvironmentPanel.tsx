@@ -64,7 +64,16 @@ export function EnvironmentPanelProvider({
     state.activeId ? (state.agents[state.activeId] ?? EMPTY_AGENTS) : EMPTY_AGENTS,
   );
   const workspace = useStore((state) => state.settings.workspace);
-  const streaming = useStore((state) => state.streaming);
+  const terminalReceiptKey = useStore((state) =>
+    Object.entries(state.runs)
+      .flatMap(([sessionId, run]) =>
+        run.receipt
+          ? [`${sessionId}:${run.receipt.turnId}:${run.receipt.status}:${run.receipt.stopReason}`]
+          : [],
+      )
+      .sort()
+      .join("|"),
+  );
   const showSettings = useStore((state) => state.showSettings);
   const showPalette = useStore((state) => state.showPalette);
   const workspaceSurface = useStore((state) => state.workspaceSurface);
@@ -77,7 +86,7 @@ export function EnvironmentPanelProvider({
   const requestVersionRef = useRef(0);
   const requestBusyRef = useRef(false);
   const requestQueuedRef = useRef(false);
-  const previousStreamingRef = useRef(streaming);
+  const previousTerminalReceiptKeyRef = useRef(terminalReceiptKey);
   const [showFinished, setShowFinished] = useState(false);
   const [summary, setSummary] = useState<WorkspaceSummary | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -163,12 +172,13 @@ export function EnvironmentPanelProvider({
     }
   }, [showSettings, showPalette, workspaceSurface, onOpenChange, restoreFocusFromPanel]);
 
-  // Tool edits often settle at turn-end. Refresh once on that edge without
-  // coupling Git polling to every agent progress event.
+  // Tool edits often settle at turn-end. Refresh from durable terminal receipts
+  // across every session; changing which session is selected must not look like
+  // a turn completion.
   useEffect(() => {
-    if (previousStreamingRef.current && !streaming) void refresh();
-    previousStreamingRef.current = streaming;
-  }, [streaming, refresh]);
+    if (previousTerminalReceiptKeyRef.current !== terminalReceiptKey) void refresh();
+    previousTerminalReceiptKeyRef.current = terminalReceiptKey;
+  }, [terminalReceiptKey, refresh]);
 
   useEffect(() => {
     if (!open) return;

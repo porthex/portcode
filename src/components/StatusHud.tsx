@@ -54,7 +54,7 @@ function countToolUses(messages: Message[] | undefined): number {
  * Every segment reflects real store state — no hardcoded counts or unverifiable
  * claims. The tools segment counts tool calls actually made this session; the
  * workspace segment reflects whether a folder is connected; the link segment
- * tracks the live `streaming` flag.
+ * counts every live run, including runs in background sessions.
  */
 export function StatusHud() {
   const sessions = useStore((s) => s.sessions);
@@ -66,6 +66,7 @@ export function StatusHud() {
   const policy = useStore((s) => s.settings.defaultPolicy);
   const mode = useStore((s) => s.settings.permissionMode);
   const streaming = useStore((s) => s.streaming);
+  const runs = useStore((s) => s.runs);
   const usage = useStore((s) => (s.activeId ? s.usage[s.activeId] : undefined));
   const usageMap = useStore((s) => s.usage);
   const messages = useStore((s) => (s.activeId ? s.messages[s.activeId] : undefined));
@@ -81,6 +82,10 @@ export function StatusHud() {
   const bgTasks = useStore((s) => (s.activeId ? s.backgroundTasks[s.activeId] : undefined));
   const runningBg = bgTasks ? bgTasks.filter((t) => t.status === "running").length : 0;
   const tokens = usage ? usage.input + usage.output : 0;
+  const liveRunCount = Math.max(
+    Object.values(runs).filter((run) => run.streaming || run.finalizing).length,
+    streaming ? 1 : 0,
+  );
   const [showPlanUsage, setShowPlanUsage] = useState(false);
   const [planRemaining, setPlanRemaining] = useState<number | null>(null);
   const planTriggerRef = useRef<HTMLButtonElement>(null);
@@ -248,10 +253,10 @@ export function StatusHud() {
         )}
         <div className="pc-hud-seg pc-hud-seg--right text-success">
           <span
-            className={`pc-dot ${streaming ? "pc-dot--ring" : "pc-dot--success"}`}
+            className={`pc-dot ${liveRunCount > 0 ? "pc-dot--ring" : "pc-dot--success"}`}
             aria-hidden="true"
           />
-          NEURAL LINK · {streaming ? "LIVE" : "IDLE"}
+          NEURAL LINK · {liveRunCount > 0 ? `${liveRunCount} LIVE` : "IDLE"}
         </div>
       </footer>
       {!remoteMode && (

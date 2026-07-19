@@ -1667,6 +1667,11 @@ const MODE_ORDER: PermissionMode[] = ["default", "acceptEdits", "plan", "auto", 
 function PermissionSettings() {
   const settings = useStore((s) => s.settings);
   const updateSettings = useStore((s) => s.updateSettings);
+  const permissionModeLocked = useStore((s) =>
+    Object.values(s.runs).some(
+      (run) => run.streaming || run.finalizing || run.pendingPermission !== null,
+    ),
+  );
   // Permission config is a desktop-side setting; on the phone the section is
   // hidden (the phone observes the active mode via the HUD but doesn't edit it).
   const remoteMode = useStore((s) => s.remoteMode);
@@ -1680,6 +1685,7 @@ function PermissionSettings() {
   const [ruleDecision, setRuleDecision] = useState<ToolPolicy>("ask");
 
   const pickMode = (m: PermissionMode) => {
+    if (permissionModeLocked) return;
     if (DANGER_MODES.includes(m)) {
       setConfirmMode(m); // require an explicit acknowledgment before engaging
     } else {
@@ -1687,6 +1693,10 @@ function PermissionSettings() {
       void updateSettings({ permissionMode: m });
     }
   };
+
+  useEffect(() => {
+    if (permissionModeLocked) setConfirmMode(null);
+  }, [permissionModeLocked]);
 
   const pickPolicy = (policy: ToolPolicy) => {
     if (policy === "allow") {
@@ -1765,7 +1775,12 @@ function PermissionSettings() {
               key={m}
               type="button"
               onClick={() => pickMode(m)}
-              title={MODE_INFO[m].hint}
+              disabled={permissionModeLocked}
+              title={
+                permissionModeLocked
+                  ? "Stop all active sessions before changing the global permission mode"
+                  : MODE_INFO[m].hint
+              }
               aria-pressed={active}
               className={`pc-permission-mode ${
                 active
@@ -1783,6 +1798,11 @@ function PermissionSettings() {
           );
         })}
       </div>
+      {permissionModeLocked && (
+        <p role="status" className="mt-1.5 text-[11px] text-warn">
+          Permission mode is locked while a session is running or awaiting approval.
+        </p>
+      )}
       <p className="mt-1.5 text-[11px] text-faint">{MODE_INFO[mode].hint}</p>
 
       {confirmMode && (

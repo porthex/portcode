@@ -28,6 +28,7 @@ vi.mock("../lib/ipc", () => ({
   listSessions: vi.fn(),
   createSession: vi.fn(),
   getMessages: vi.fn(),
+  getMessagePage: vi.fn(),
   deleteSession: vi.fn(),
   renameSession: vi.fn(),
   updateSessionModel: vi.fn(),
@@ -99,6 +100,9 @@ const runState = (
     finalizing: boolean;
     receipt: TurnReceipt | null;
     outcome: TurnStatus | null;
+    composerPhase: "idle" | "received" | "thinking" | "stopping";
+    activeTool: string | null;
+    unseenOutcome: TurnStatus | null;
   }> = {},
 ) => ({
   streaming: false,
@@ -109,6 +113,9 @@ const runState = (
   finalizing: false,
   receipt: null,
   outcome: null,
+  composerPhase: "idle" as const,
+  activeTool: null,
+  unseenOutcome: null,
   ...over,
 });
 
@@ -137,6 +144,10 @@ beforeEach(() => {
   m.getSettings.mockResolvedValue(DEFAULT_SETTINGS);
   m.listSessions.mockResolvedValue([]);
   m.getMessages.mockResolvedValue([]);
+  m.getMessagePage.mockImplementation(async (sessionId) => ({
+    messages: await m.getMessages(sessionId),
+    nextCursor: null,
+  }));
   m.createSession.mockResolvedValue(undefined);
   m.deleteSession.mockResolvedValue(undefined);
   m.renameSession.mockResolvedValue(undefined);
@@ -335,18 +346,20 @@ describe("newSession", () => {
     expect(useStore.getState().showSidebar).toBe(false);
   });
 
-  it("does nothing while a turn is streaming", async () => {
+  it("creates and selects a new session while another session keeps running", async () => {
     useStore.setState({
       streaming: true,
       sessions: [session({ id: "a" })],
       activeId: "a",
+      runs: { a: runState({ streaming: true }) },
     });
 
     await useStore.getState().newSession();
 
-    expect(m.createSession).not.toHaveBeenCalled();
-    expect(useStore.getState().activeId).toBe("a");
-    expect(useStore.getState().sessions).toHaveLength(1);
+    expect(m.createSession).toHaveBeenCalledOnce();
+    expect(useStore.getState().activeId).not.toBe("a");
+    expect(useStore.getState().sessions).toHaveLength(2);
+    expect(useStore.getState().runs.a.streaming).toBe(true);
   });
 
   it("re-entry guard: a rapid double-call creates exactly one session", async () => {
@@ -382,12 +395,62 @@ describe("newSession", () => {
 
     await useStore.getState().newSession();
 
-    expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({ cmd: "create_session" });
+    expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({
+      cmd: "create_session",
+      request_id: expect.any(String),
+    });
     expect(m.createSession).not.toHaveBeenCalled();
     const st = useStore.getState();
     expect(st.sessions).toHaveLength(1); // no optimistic local session inserted
-    expect(st.creatingSession).toBe(false); // lock released
+    expect(st.creatingSession).toBe(true); // held until the correlated acknowledgement
     expect(st.showSidebar).toBe(false); // drawer closed on navigation
+
+    const request = m.phoneSyncSendCommand.mock.calls[0][0] as Extract<
+      RemoteCommand,
+      { cmd: "create_session" }
+    >;
+    useStore.getState().applyFrame({
+      t: "session_created",
+      request_id: "another-device",
+      session: session({ id: "other" }),
+    });
+    expect(useStore.getState().activeId).not.toBe("other");
+    expect(useStore.getState().creatingSession).toBe(true);
+
+    useStore.getState().applyFrame({
+      t: "session_created",
+      request_id: request.request_id!,
+      session: session({ id: "created" }),
+    });
+    expect(useStore.getState()).toMatchObject({
+      activeId: "created",
+      creatingSession: false,
+      remoteChatOpen: true,
+    });
+  });
+
+  it("releases the remote create lock when its correlated acknowledgement times out", async () => {
+    vi.useFakeTimers();
+    try {
+      useStore.setState({
+        remoteConnected: true,
+        sessions: [session({ id: "old" })],
+        activeId: "old",
+      });
+
+      await useStore.getState().newSession();
+      expect(useStore.getState().creatingSession).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      expect(useStore.getState()).toMatchObject({
+        activeId: "old",
+        creatingSession: false,
+        remoteError: "Creating the conversation timed out. Please try again.",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("surfaces a local create rejection instead of an unhandled rejection", async () => {
@@ -538,13 +601,18 @@ describe("setSessionModel", () => {
 });
 
 describe("selectSession", () => {
-  it("does nothing while a turn is streaming", async () => {
-    useStore.setState({ streaming: true, activeId: "a" });
+  it("switches instantly while another session continues streaming", async () => {
+    useStore.setState({
+      streaming: true,
+      activeId: "a",
+      runs: { a: runState({ streaming: true }) },
+    });
 
     await useStore.getState().selectSession("b");
 
-    expect(useStore.getState().activeId).toBe("a");
-    expect(m.getMessages).not.toHaveBeenCalled();
+    expect(useStore.getState().activeId).toBe("b");
+    expect(useStore.getState().runs.a.streaming).toBe(true);
+    expect(m.getMessages).toHaveBeenCalledWith("b");
   });
 
   it("switches active session and lazily loads its messages once", async () => {
@@ -559,6 +627,165 @@ describe("selectSession", () => {
     m.getMessages.mockClear();
     await useStore.getState().selectSession("b");
     expect(m.getMessages).not.toHaveBeenCalled();
+  });
+
+  it("commits selection + cold loading state before history resolves", async () => {
+    let release!: (page: { messages: Message[]; nextCursor: string | null }) => void;
+    m.getMessagePage.mockReturnValueOnce(new Promise((resolve) => (release = resolve)));
+    useStore.setState({ sessions: [session({ id: "a" }), session({ id: "b" })], activeId: "a" });
+
+    const selecting = useStore.getState().selectSession("b");
+
+    expect(useStore.getState()).toMatchObject({
+      activeId: "b",
+      messageLoads: { b: { phase: "loading" } },
+    });
+    release({ messages: [], nextCursor: null });
+    await selecting;
+    expect(useStore.getState().messageLoads.b.phase).toBe("ready");
+  });
+
+  it("deduplicates concurrent hydration requests for one session", async () => {
+    let release!: (page: { messages: Message[]; nextCursor: string | null }) => void;
+    m.getMessagePage.mockReturnValueOnce(new Promise((resolve) => (release = resolve)));
+    useStore.setState({ sessions: [session({ id: "b" })] });
+
+    const first = useStore.getState().hydrateMessages("b");
+    const second = useStore.getState().hydrateMessages("b");
+    expect(m.getMessagePage).toHaveBeenCalledTimes(1);
+
+    release({ messages: [], nextCursor: null });
+    await Promise.all([first, second]);
+  });
+
+  it("renders a fresh cache with zero IPC and refreshes stale cache without losing live rows", async () => {
+    const cached: Message = { id: "cached", role: "user", blocks: [], createdAt: 1 };
+    useStore.setState({
+      sessions: [session({ id: "b" })],
+      messages: { b: [cached] },
+      messageLoads: {
+        b: {
+          phase: "ready",
+          loadedAt: Date.now(),
+          lastAccessedAt: Date.now(),
+          requestId: 1,
+          error: null,
+          nextCursor: "older",
+          loadingOlder: false,
+        },
+      },
+    });
+    await useStore.getState().hydrateMessages("b");
+    expect(m.getMessagePage).not.toHaveBeenCalled();
+
+    let release!: (page: { messages: Message[]; nextCursor: string | null }) => void;
+    m.getMessagePage.mockReturnValueOnce(new Promise((resolve) => (release = resolve)));
+    useStore.setState((st) => ({
+      messageLoads: { ...st.messageLoads, b: { ...st.messageLoads.b, loadedAt: 0 } },
+    }));
+    const refreshing = useStore.getState().hydrateMessages("b");
+    const live: Message = { id: "live", role: "assistant", blocks: [], createdAt: 2 };
+    useStore.setState((st) => ({ messages: { ...st.messages, b: [...st.messages.b, live] } }));
+    release({ messages: [cached], nextCursor: null });
+    await refreshing;
+    expect(useStore.getState().messages.b.map((message) => message.id)).toEqual(["cached", "live"]);
+  });
+
+  it("prepends an older desktop page and advances its opaque cursor", async () => {
+    const newest: Message = { id: "new", role: "assistant", blocks: [], createdAt: 2 };
+    const older: Message = { id: "old", role: "user", blocks: [], createdAt: 1 };
+    useStore.setState({
+      sessions: [session({ id: "b" })],
+      messages: { b: [newest] },
+      messageLoads: {
+        b: {
+          phase: "ready",
+          loadedAt: 1,
+          lastAccessedAt: 1,
+          requestId: 1,
+          error: null,
+          nextCursor: "page-2",
+          loadingOlder: false,
+        },
+      },
+    });
+    m.getMessagePage.mockResolvedValueOnce({ messages: [older], nextCursor: null });
+
+    await useStore.getState().loadOlderMessages("b");
+
+    expect(m.getMessagePage).toHaveBeenCalledWith("b", "page-2");
+    expect(useStore.getState().messages.b.map((message) => message.id)).toEqual(["old", "new"]);
+    expect(useStore.getState().messageLoads.b.nextCursor).toBeNull();
+  });
+
+  it("prefetches only inactive local sessions", async () => {
+    useStore.setState({
+      sessions: [session({ id: "active" }), session({ id: "inactive" })],
+      activeId: "active",
+    });
+
+    await useStore.getState().prefetchSession("active");
+    expect(m.getMessagePage).not.toHaveBeenCalled();
+
+    await useStore.getState().prefetchSession("inactive");
+    expect(m.getMessagePage).toHaveBeenCalledWith("inactive", null);
+    expect(useStore.getState().messageLoads.inactive.phase).toBe("ready");
+
+    m.getMessagePage.mockClear();
+    useStore.setState({ remoteConnected: true });
+    await useStore.getState().prefetchSession("another");
+    expect(m.getMessagePage).not.toHaveBeenCalled();
+  });
+
+  it("evicts least-recent inactive histories while protecting active and busy sessions", async () => {
+    const protectedIds = ["active", "running", "background"];
+    const idleIds = Array.from({ length: 22 }, (_, index) => `idle-${index}`);
+    const allIds = [...protectedIds, ...idleIds, "trigger"];
+    const messages = Object.fromEntries(
+      allIds.map((id) => [
+        id,
+        [{ id: `message-${id}`, role: "user" as const, blocks: [], createdAt: 1 }],
+      ]),
+    );
+    const messageLoads = Object.fromEntries(
+      [...protectedIds, ...idleIds].map((id, index) => [
+        id,
+        {
+          phase: "ready" as const,
+          loadedAt: 1,
+          lastAccessedAt: index,
+          requestId: 1,
+          error: null,
+          nextCursor: null,
+          loadingOlder: false,
+        },
+      ]),
+    );
+    useStore.setState({
+      sessions: allIds.map((id) => session({ id })),
+      activeId: "active",
+      messages,
+      messageLoads,
+      runs: { running: runState({ streaming: true }) },
+      backgroundTasks: {
+        background: [{ id: "task", command: "work", status: "running" }],
+      },
+    });
+    m.getMessagePage.mockResolvedValueOnce({
+      messages: [{ id: "message-trigger", role: "user", blocks: [], createdAt: 1 }],
+      nextCursor: null,
+    });
+
+    await useStore.getState().hydrateMessages("trigger", { force: true });
+
+    const state = useStore.getState();
+    for (const id of protectedIds) expect(state.messages[id]).toBeDefined();
+    expect(state.messages.trigger).toBeDefined();
+    expect(state.messages["idle-0"]).toBeUndefined();
+    expect(state.messages["idle-1"]).toBeUndefined();
+    expect(state.messages["idle-2"]).toBeUndefined();
+    expect(state.messageLoads["idle-0"].phase).toBe("idle");
+    expect(Object.keys(state.messages)).toHaveLength(23); // 20 cached idle + 3 protected
   });
 
   it("closes the mobile session drawer on switch", async () => {
@@ -798,15 +1025,17 @@ describe("renameSession", () => {
     expect(useStore.getState().sessions[0].title).toBe("Newer");
   });
 
-  it("does not rename mid-stream (a turn is in flight)", async () => {
+  it("renames while a turn is in flight without disturbing that run", async () => {
     useStore.setState({
       sessions: [session({ id: "a", title: "Busy" })],
       activeId: "a",
       streaming: true,
+      runs: { a: runState({ streaming: true }) },
     });
     await useStore.getState().renameSession("a", "Nope");
-    expect(m.renameSession).not.toHaveBeenCalled();
-    expect(useStore.getState().sessions[0].title).toBe("Busy");
+    expect(m.renameSession).toHaveBeenCalledWith("a", "Nope");
+    expect(useStore.getState().sessions[0].title).toBe("Nope");
+    expect(useStore.getState().runs.a.streaming).toBe(true);
   });
 
   it("does not rename in remote mode (the phone has no rename command)", async () => {
@@ -1966,6 +2195,20 @@ describe("cyclePermissionMode", () => {
       expect(m.saveSettings).toHaveBeenLastCalledWith({ permissionMode: "default" });
     }
   });
+
+  it("blocks a shared permission-mode change while any session is busy", async () => {
+    useStore.setState({
+      activeId: "idle",
+      runs: { background: runState({ streaming: true }) },
+      streaming: false,
+      settings: { ...DEFAULT_SETTINGS, permissionMode: "default" },
+    });
+
+    await useStore.getState().cyclePermissionMode();
+
+    expect(m.saveSettings).not.toHaveBeenCalled();
+    expect(useStore.getState().settings.permissionMode).toBe("default");
+  });
 });
 
 describe("draft + UI setters", () => {
@@ -2228,18 +2471,18 @@ describe("message search + jump", () => {
     expect(m.searchMessages).not.toHaveBeenCalled();
   });
 
-  it("jumpToMessage does not strand a scroll target when streaming blocks navigation", async () => {
-    // selectSession no-ops mid-stream; a cross-session jump must NOT set scrollTargetId
-    // (it would ghost-scroll a later navigation to that session).
+  it("jumpToMessage switches while another session continues running", async () => {
     useStore.setState({
       sessions: [session({ id: "b" })],
       activeId: "a",
       messages: { a: [] },
       streaming: true,
+      runs: { a: runState({ streaming: true }) },
     });
     await useStore.getState().jumpToMessage("b", "m7");
-    expect(useStore.getState().activeId).toBe("a");
-    expect(useStore.getState().scrollTargetId).toBeNull();
+    expect(useStore.getState().activeId).toBe("b");
+    expect(useStore.getState().scrollTargetId).toBe("m7");
+    expect(useStore.getState().runs.a.streaming).toBe(true);
   });
 
   it("jumpToMessage selects the session and sets the scroll target", async () => {
@@ -3492,6 +3735,41 @@ describe("remote client", () => {
       const bgLive = (event: StreamEvent) =>
         useStore.getState().applyFrame({ t: "live", session_id: "bg", event });
 
+      it("times out a silent background run without terminalizing an active run with fresh activity", async () => {
+        vi.useFakeTimers();
+        try {
+          useStore.setState({ activeId: "active", remoteConnected: true, runs: {}, messages: {} });
+          useStore.getState().applyFrame({
+            t: "live",
+            session_id: "active",
+            event: { type: "turn_start", messageId: "active-turn", turnId: "active-turn" },
+          });
+          bgLive({ type: "turn_start", messageId: "bg-turn", turnId: "bg-turn" });
+
+          await vi.advanceTimersByTimeAsync(149_000);
+          useStore.getState().applyFrame({
+            t: "live",
+            session_id: "active",
+            event: { type: "text_delta", text: "still working" },
+          });
+          await vi.advanceTimersByTimeAsync(2_000);
+
+          const st = useStore.getState();
+          expect(st.runs.bg.streaming).toBe(false);
+          expect(st.runs.bg.outcome).toBe("interrupted");
+          expect(st.runs.active.streaming).toBe(true);
+          expect(st.streaming).toBe(true);
+
+          useStore.getState().applyFrame({
+            t: "live",
+            session_id: "active",
+            event: { type: "turn_end", stopReason: "end_turn" },
+          });
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
       it("turn_start for a background session appends its message and tracks its own run, without flipping the visible composer", () => {
         useStore.setState({ activeId: "active", runs: {}, streaming: false });
 
@@ -4091,16 +4369,20 @@ describe("remote client", () => {
       expect(st.messages.z).toEqual([msg]);
     });
 
-    it("openRemoteSession is blocked for a different session while streaming", async () => {
-      // Mid-stream, tapping a DIFFERENT session must not open the chat (selectSession
-      // is a no-op, so opening would reveal the wrong session).
-      useStore.setState({ activeId: "a", streaming: true, remoteChatOpen: false });
+    it("openRemoteSession switches while the prior session continues streaming", async () => {
+      useStore.setState({
+        activeId: "a",
+        streaming: true,
+        remoteChatOpen: false,
+        runs: { a: runState({ streaming: true }) },
+      });
 
       await useStore.getState().openRemoteSession("b");
 
       const st = useStore.getState();
-      expect(st.activeId).toBe("a"); // unchanged
-      expect(st.remoteChatOpen).toBe(false); // chat did NOT open
+      expect(st.activeId).toBe("b");
+      expect(st.remoteChatOpen).toBe(true);
+      expect(st.runs.a.streaming).toBe(true);
     });
 
     it("openRemoteSession still enters the already-active session while streaming", async () => {
@@ -4679,7 +4961,7 @@ describe("background shell tasks (background-tasks panel)", () => {
     expect(m.subscribeSessionEvents).toHaveBeenCalledWith(newId, expect.any(Function));
   });
 
-  it("tears the listener down and drops the tasks when a session is deleted", async () => {
+  it("does not delete a session with running background work", async () => {
     const unlisten = vi.fn();
     m.subscribeSessionEvents.mockResolvedValue(unlisten);
     useStore.setState({
@@ -4691,8 +4973,8 @@ describe("background shell tasks (background-tasks panel)", () => {
     await useStore.getState().selectSession("bgt-del"); // installs the listener
     await flush(); // let the fire-and-forget subscription finish installing
     await useStore.getState().deleteSession("bgt-del");
-    expect(unlisten).toHaveBeenCalled();
-    expect(useStore.getState().backgroundTasks["bgt-del"]).toBeUndefined();
+    expect(unlisten).not.toHaveBeenCalled();
+    expect(useStore.getState().backgroundTasks["bgt-del"]).toHaveLength(1);
   });
 
   it("resets background tasks on a fresh remote dial", async () => {
