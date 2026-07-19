@@ -4,10 +4,15 @@ import { toolLabel } from "../lib/toolNames";
 import { useStore } from "../store/store";
 
 export function PermissionPrompt() {
+  const activeId = useStore((s) => s.activeId);
   const pending = useStore((s) => s.pendingPermission);
+  const pendingBelongsToRun = useStore((s) =>
+    Boolean(s.activeId && s.runs[s.activeId]?.pendingPermission?.id === s.pendingPermission?.id),
+  );
   const resolve = useStore((s) => s.resolvePermission);
   const remoteMode = useStore((s) => s.remoteMode);
   const denyRef = useRef<HTMLButtonElement>(null);
+  const pendingSession = useRef<string | null>(null);
   const wasPending = useRef(false);
 
   // Focus the safe "Deny" action whenever a new request appears, so a reflexive
@@ -29,16 +34,24 @@ export function PermissionPrompt() {
   useEffect(() => {
     if (pendingId) {
       wasPending.current = true;
+      pendingSession.current = activeId;
     } else if (wasPending.current) {
+      const answeredOnVisibleSession = pendingSession.current === activeId;
       wasPending.current = false;
-      if (!remoteMode && document.activeElement === document.body) {
+      pendingSession.current = null;
+      if (answeredOnVisibleSession && !remoteMode && document.activeElement === document.body) {
         const log = document.querySelector<HTMLElement>('[role="log"]');
         log?.focus();
       }
     }
-  }, [pendingId, remoteMode]);
+  }, [activeId, pendingId, remoteMode]);
 
   if (!pending) return null;
+
+  const answer = (decision: "allow" | "deny", always?: boolean): void => {
+    if (activeId && pendingBelongsToRun) void resolve(activeId, pending.id, decision, always);
+    else void resolve(decision, always);
+  };
 
   const label = toolLabel(pending.tool);
 
@@ -64,20 +77,20 @@ export function PermissionPrompt() {
         {pending.diff && pending.diff.trim() && <DiffView diff={pending.diff} />}
         <div className="flex flex-wrap gap-[9px]">
           <button
-            onClick={() => void resolve("allow")}
+            onClick={() => answer("allow")}
             className="pc-btn-allow px-3.5 py-1.5 text-[12.5px]"
           >
             Allow
           </button>
           <button
-            onClick={() => void resolve("allow", true)}
+            onClick={() => answer("allow", true)}
             className="pc-btn-deny pc-btn-confirm px-3.5 py-1.5 text-[12.5px]"
           >
             Always allow
           </button>
           <button
             ref={denyRef}
-            onClick={() => void resolve("deny")}
+            onClick={() => answer("deny")}
             className="pc-btn-deny px-3.5 py-1.5 text-[12.5px]"
           >
             ⏎ Deny

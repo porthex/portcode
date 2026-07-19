@@ -34,6 +34,28 @@ export interface Message {
   receipt?: TurnReceipt;
 }
 
+/** A display-ready page of persisted conversation history. `nextCursor` is an
+ * opaque backend cursor for the next older page; null means the beginning. */
+export interface UiMessagePage {
+  messages: Message[];
+  nextCursor: string | null;
+}
+
+export type MessageLoadPhase = "idle" | "loading" | "refreshing" | "ready" | "error";
+
+/** Per-session transcript hydration/cache metadata. */
+export interface MessageLoadState {
+  phase: MessageLoadPhase;
+  loadedAt: number | null;
+  lastAccessedAt: number;
+  requestId: number;
+  error: string | null;
+  nextCursor: string | null;
+  loadingOlder: boolean;
+}
+
+export type SessionActivity = "idle" | "running" | "waiting" | "stopping";
+
 /** Durable terminal state for one top-level agent turn. */
 export type TurnStatus = "completed" | "cancelled" | "error" | "interrupted";
 
@@ -774,7 +796,7 @@ export type RemoteCommand =
   | { cmd: "cancel"; session_id: string }
   | { cmd: "cancel_agent"; agent_id: string }
   | { cmd: "permission"; id: string; decision: string }
-  | { cmd: "create_session"; title?: string | null }
+  | { cmd: "create_session"; title?: string | null; request_id?: string }
   /**
    * Request an OLDER page of a session's history for scroll-up pagination. The
    * initial catch-up ships only the most-recent window; scrolling up past it asks
@@ -817,6 +839,7 @@ export interface MessageRow {
  */
 export type SyncFrame =
   | { t: "session_list"; sessions: Session[] }
+  | { t: "session_created"; request_id: string; session: Session }
   | { t: "message_delta"; session_id: string; messages: MessageRow[] }
   // An OLDER page of one session's history (scroll-up pagination), answering a
   // `fetch_messages` command. `messages` are the rows before the requested cursor,

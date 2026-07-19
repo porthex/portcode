@@ -48,12 +48,15 @@ export function Composer() {
   // can't bleed across sessions (the old single global `draft` did exactly that).
   const activeId = useStore((s) => s.activeId);
   const text = useStore((s) => (s.activeId ? (s.drafts[s.activeId] ?? "") : ""));
+  const hasCachedMessages = useStore((s) => Boolean(s.activeId && s.activeId in s.messages));
+  const messageLoad = useStore((s) => (s.activeId ? s.messageLoads[s.activeId] : undefined));
   const setText = useStore((s) => s.setDraft);
   const streaming = useStore((s) => s.streaming);
   const composerPhase = useStore((s) => s.composerPhase);
   const activeTool = useStore((s) => s.activeTool);
   const send = useStore((s) => s.send);
   const stop = useStore((s) => s.stop);
+  const stopSession = useStore((s) => s.stopSession);
   const newSession = useStore((s) => s.newSession);
   const setShowSettings = useStore((s) => s.setShowSettings);
   const remoteMode = useStore((s) => s.remoteMode);
@@ -91,7 +94,15 @@ export function Composer() {
     : activeProvider === "openai"
       ? "Connect ChatGPT"
       : "Connect Claude";
-  const canSend = text.trim().length > 0 && !streaming && authenticated;
+  const historyReady = Boolean(
+    activeId &&
+    (messageLoad === undefined ||
+      messageLoad.phase === "ready" ||
+      messageLoad.phase === "refreshing" ||
+      (messageLoad.phase === "error" && hasCachedMessages)),
+  );
+  const coldLoadError = Boolean(activeId && messageLoad?.phase === "error" && !hasCachedMessages);
+  const canSend = text.trim().length > 0 && !streaming && authenticated && historyReady;
   // Armed cue (motor anticipation): a one-shot pulse the moment Send becomes
   // fireable. Seeded from the initial value so a restored draft doesn't pulse on
   // mount — only a genuine disabled→enabled transition arms it.
@@ -121,9 +132,13 @@ export function Composer() {
   const stopping = composerPhase === "stopping";
   const presence = !activeId
     ? { text: "Create or select a chat to start", dot: "pc-dot--idle" }
-    : !authenticated
-      ? { text: authHint, dot: "pc-dot pc-dot--danger" }
-      : presenceFor(streaming, composerPhase, activeTool);
+    : coldLoadError
+      ? { text: "conversation unavailable — retry above", dot: "pc-dot pc-dot--danger" }
+      : !historyReady
+        ? { text: "loading conversationâ€¦", dot: "pc-dot pc-dot--cyan" }
+        : !authenticated
+          ? { text: authHint, dot: "pc-dot pc-dot--danger" }
+          : presenceFor(streaming, composerPhase, activeTool);
   const placeholder = !activeId
     ? "Create or select a chat to begin…"
     : streaming
@@ -159,7 +174,7 @@ export function Composer() {
 
   const submit = async () => {
     const t = text;
-    if (!t.trim() || streaming || !authenticated) return;
+    if (!t.trim() || streaming || !authenticated || !historyReady) return;
     setText("");
     // Collapse to the measured single-row height (a px target) so the declared
     // transition-[height] can ease the shrink; fall back to "auto" only if we
@@ -279,8 +294,24 @@ export function Composer() {
                 tabIndex={streaming ? -1 : 0}
                 aria-hidden={streaming || undefined}
                 className={`pc-send pc-action ${streaming ? "pc-action--hidden" : "pc-action--shown"}${armed ? " pc-armed" : ""}`}
-                title={authenticated ? "Send (Enter)" : authHint}
-                aria-label={authenticated ? "Send message" : authHint}
+                title={
+                  coldLoadError
+                    ? "Retry loading this conversation before sending"
+                    : activeId && !historyReady
+                      ? "Wait for this conversation to load"
+                      : authenticated
+                        ? "Send (Enter)"
+                        : authHint
+                }
+                aria-label={
+                  coldLoadError
+                    ? "Conversation failed to load"
+                    : activeId && !historyReady
+                      ? "Conversation is loading"
+                      : authenticated
+                        ? "Send message"
+                        : authHint
+                }
               >
                 <svg width="17" height="17" viewBox="0 0 24 24" fill="none">
                   <path
@@ -293,7 +324,7 @@ export function Composer() {
                 </svg>
               </button>
               <button
-                onClick={() => void stop()}
+                onClick={() => (activeId ? void stopSession(activeId) : void stop())}
                 disabled={!streaming || stopping}
                 tabIndex={streaming ? 0 : -1}
                 aria-hidden={!streaming || undefined}
@@ -335,7 +366,9 @@ function PermissionPicker() {
   const mode = useStore((s) => s.settings.permissionMode);
   const updateSettings = useStore((s) => s.updateSettings);
   const remoteMode = useStore((s) => s.remoteMode);
-  const streaming = useStore((s) => s.streaming);
+  const anyRunLive = useStore(
+    (s) => Object.values(s.runs).some((run) => run.streaming || run.finalizing) || s.streaming,
+  );
   if (remoteMode) return null;
   const danger = DANGER_MODES.includes(mode);
   const presentation = MODE_PRESENTATION[mode];
@@ -349,7 +382,7 @@ function PermissionPicker() {
         title={`${presentation.label} — ${presentation.detail}`}
         value={mode}
         onChange={(next) => void updateSettings({ permissionMode: next as PermissionMode })}
-        disabled={streaming}
+        disabled={anyRunLive}
         placement="top"
         className="min-w-0"
         buttonClassName={`pc-composer-select-button pc-permission-select${danger ? " pc-permission-select--danger" : ""}`}

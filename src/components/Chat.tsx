@@ -18,6 +18,8 @@ type ChatProps = {
 export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps = {}) {
   const activeId = useStore((s) => s.activeId);
   const messages = useStore((s) => (activeId && s.messages[activeId]) || EMPTY);
+  const hasCachedMessages = useStore((s) => Boolean(activeId && activeId in s.messages));
+  const messageLoad = useStore((s) => (activeId ? s.messageLoads[activeId] : undefined));
   const streaming = useStore((s) => s.streaming);
   const activeRun = useStore((s) => (s.activeId ? s.runs[s.activeId] : undefined));
   const activeAgents = useStore((s) => (s.activeId ? s.agents[s.activeId] : undefined));
@@ -67,11 +69,12 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
       if (el.scrollTop < LOAD_OLDER_THRESHOLD_PX) {
         const st = useStore.getState();
         const id = st.activeId;
-        if (!id || !st.remoteConnected) return;
+        if (!id) return;
         const p = st.messagePaging[id];
-        // hasMore === false means we already hold the first message; undefined (not
-        // yet seeded) and true both allow a probe. Skip while a fetch is in flight.
-        if (p?.loading || p?.hasMore === false) return;
+        const load = st.messageLoads[id];
+        const canLoadLocal = !st.remoteConnected && Boolean(load?.nextCursor);
+        const canLoadRemote = st.remoteConnected && p?.hasMore !== false;
+        if ((!canLoadLocal && !canLoadRemote) || p?.loading || load?.loadingOlder) return;
         void st.loadOlderMessages(id);
       }
     };
@@ -148,6 +151,13 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
   }, [streaming]);
 
   const lastIndex = messages.length - 1;
+  const coldLoading = Boolean(
+    activeId &&
+    messages.length === 0 &&
+    (!hasCachedMessages || messageLoad?.phase === "idle" || messageLoad?.phase === "loading"),
+  );
+  const coldError = messages.length === 0 && (messageLoad?.phase === "error" || loadError);
+  const refreshError = messages.length > 0 && messageLoad?.phase === "error";
   const reviewTurn = useCallback(
     (receipt: NonNullable<Message["receipt"]>) => openTurnReview(receipt.turnId),
     [openTurnReview],
@@ -184,7 +194,7 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
               role="log"
               aria-live="polite"
               aria-relevant="additions text"
-              aria-busy={streaming}
+              aria-busy={streaming || coldLoading || messageLoad?.phase === "refreshing"}
               // Programmatically focusable (not in the Tab order) so the
               // PermissionPrompt can route focus back here when a gated turn clears
               // mid-stream and its Deny button unmounts.
@@ -192,8 +202,10 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
             >
               {initError ? (
                 <InitErrorPanel message={initError} onRetry={() => void retryInit()} />
-              ) : messages.length === 0 && loadError ? (
+              ) : coldError ? (
                 <LoadErrorPanel onRetry={() => activeId && void retryLoad(activeId)} />
+              ) : coldLoading ? (
+                <TranscriptSkeleton />
               ) : messages.length === 0 ? (
                 <EmptyState />
               ) : (
@@ -227,6 +239,9 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
                     />
                   );
                 })
+              )}
+              {refreshError && (
+                <RefreshErrorNotice onRetry={() => activeId && void retryLoad(activeId)} />
               )}
             </div>
           </div>
@@ -311,6 +326,52 @@ function LoadErrorPanel({ onRetry }: { onRetry: () => void }) {
         onClick={onRetry}
         className="rounded-lg border border-border bg-panel px-3 py-1.5 text-sm text-fg hover:border-accent"
       >
+        Retry
+      </button>
+    </div>
+  );
+}
+
+function TranscriptSkeleton() {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      aria-label="Loading conversation"
+      className="mx-auto flex w-full max-w-3xl flex-col gap-6 py-7"
+    >
+      <span className="text-center font-mono text-[11px] uppercase tracking-[1.6px] text-faint">
+        Loading conversationâ€¦
+      </span>
+      <div aria-hidden="true" className="flex flex-col gap-6">
+        <SkeletonMessage align="right" width="w-[58%]" />
+        <SkeletonMessage align="left" width="w-[78%]" />
+        <SkeletonMessage align="left" width="w-[64%]" />
+      </div>
+    </div>
+  );
+}
+
+function SkeletonMessage({ align, width }: { align: "left" | "right"; width: string }) {
+  return (
+    <div
+      className={`${width} ${align === "right" ? "ml-auto" : "mr-auto"} rounded-xl border border-border/60 bg-panel/60 p-4`}
+    >
+      <div className="h-2.5 w-24 animate-pulse rounded bg-border-2/70 motion-reduce:animate-none" />
+      <div className="mt-3 h-2.5 w-full animate-pulse rounded bg-border/80 motion-reduce:animate-none" />
+      <div className="mt-2 h-2.5 w-[72%] animate-pulse rounded bg-border/60 motion-reduce:animate-none" />
+    </div>
+  );
+}
+
+function RefreshErrorNotice({ onRetry }: { onRetry: () => void }) {
+  return (
+    <div
+      role="alert"
+      className="sticky bottom-2 mx-auto mt-5 flex w-fit items-center gap-2 rounded-lg border border-danger/30 bg-panel/95 px-3 py-2 text-xs text-muted shadow-lg"
+    >
+      <span>Couldnâ€™t refresh this conversation. Showing cached messages.</span>
+      <button type="button" onClick={onRetry} className="font-medium text-accent-2 hover:underline">
         Retry
       </button>
     </div>

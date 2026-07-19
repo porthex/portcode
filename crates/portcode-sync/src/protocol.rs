@@ -55,7 +55,10 @@ pub enum RemoteCommand {
     /// Answer a permission gate — proxies to `resolve_permission`.
     Permission { id: String, decision: String },
     /// Open a new session — proxies to `create_session`.
-    CreateSession { title: Option<String> },
+    CreateSession {
+        request_id: String,
+        title: Option<String>,
+    },
     /// Register the web client's Web Push subscription. The desktop currently
     /// accepts this command so the encrypted command channel remains compatible;
     /// persisting the subscription and sending pushes are separate features.
@@ -90,6 +93,12 @@ pub enum SyncFrame {
     },
     /// desktop → phone: the current session list (reuses the desktop `SessionRow`).
     SessionList { sessions: Vec<SessionRow> },
+    /// desktop → phone: correlated acknowledgement for a remotely-created
+    /// session, allowing the caller to select/open the exact row immediately.
+    SessionCreated {
+        request_id: String,
+        session: SessionRow,
+    },
     /// desktop → phone: append-only catch-up for one session.
     MessageDelta {
         session_id: String,
@@ -198,6 +207,26 @@ mod tests {
     }
 
     #[test]
+    fn session_created_ack_round_trips_with_request_correlation() {
+        let frame = SyncFrame::SessionCreated {
+            request_id: "create-42".into(),
+            session: SessionRow {
+                id: "s42".into(),
+                title: "New chat".into(),
+                branch: None,
+                workspace: None,
+                model: Some("gpt-5.6-sol".into()),
+                created_at: 10,
+                updated_at: 10,
+            },
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("\"t\":\"session_created\""), "{json}");
+        assert!(json.contains("\"request_id\":\"create-42\""), "{json}");
+        round_trips(&frame);
+    }
+
+    #[test]
     fn message_delta_frame_round_trips_with_message_rows() {
         // The catch-up frame a reconnecting phone receives — the most
         // load-bearing frame in the protocol.
@@ -296,9 +325,13 @@ mod tests {
                 decision: "allow".into(),
             },
             RemoteCommand::CreateSession {
+                request_id: "create-1".into(),
                 title: Some("New".into()),
             },
-            RemoteCommand::CreateSession { title: None },
+            RemoteCommand::CreateSession {
+                request_id: "create-2".into(),
+                title: None,
+            },
             RemoteCommand::RegisterPush {
                 endpoint: "https://push.example/abc".into(),
                 p256dh: "public-key".into(),

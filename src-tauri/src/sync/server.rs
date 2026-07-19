@@ -64,6 +64,18 @@ fn parse_decision(decision: &str) -> Decision {
     }
 }
 
+fn admit_remote_run(
+    cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    db: &Db,
+    session_id: &str,
+) -> Result<(agent::RunReservation, Option<String>), String> {
+    let reservation = agent::RunReservation::try_acquire(cancels, session_id)?;
+    let model = db
+        .session_model(session_id)
+        .map_err(|error| format!("Session is unavailable: {error}"))?;
+    Ok((reservation, model))
+}
+
 #[async_trait]
 impl CommandHandler for DesktopCommandHandler {
     async fn handle(&self, command: RemoteCommand) -> Result<(), String> {
@@ -77,10 +89,24 @@ impl CommandHandler for DesktopCommandHandler {
                 // sink the desktop `run_agent` command builds, so a phone-driven turn
                 // mirrors identically.
                 let sink: Arc<dyn EventSink> = Arc::new(AppEventSink(self.app.clone()));
+                let channel = format!("agent://{session_id}");
+                let (reservation, model) =
+                    match admit_remote_run(self.cancels.clone(), &self.db, &session_id) {
+                        Ok(admission) => admission,
+                        Err(message) => {
+                            sink.emit(
+                                &channel,
+                                crate::llm::StreamEvent::Error {
+                                    message,
+                                    receipt: None,
+                                },
+                            );
+                            return Ok(());
+                        }
+                    };
                 let http = self.http.clone();
                 let settings = self.settings.clone();
                 let db = self.db.clone();
-                let cancels = self.cancels.clone();
                 let pending = self.pending.clone();
                 let agents = self.agents.clone();
                 let background = self.background.clone();
@@ -91,7 +117,7 @@ impl CommandHandler for DesktopCommandHandler {
                         http,
                         settings,
                         db,
-                        cancels,
+                        reservation,
                         pending,
                         agents,
                         background,
@@ -101,7 +127,7 @@ impl CommandHandler for DesktopCommandHandler {
                         // The phone's Run command carries no per-session model override,
                         // so use the desktop default — `agent::run` falls back to
                         // settings.model on None, matching the pre-per-session behavior.
-                        None,
+                        model,
                     )
                     .await;
                 });
@@ -142,7 +168,7 @@ impl CommandHandler for DesktopCommandHandler {
             // it the created session would be invisible until the next
             // reconnect/catch-up (the catch-up `SessionList` is sent once, on Hello,
             // and `forward_live` only ever carried `Live` frames before this).
-            RemoteCommand::CreateSession { title } => {
+            RemoteCommand::CreateSession { request_id, title } => {
                 let id = uuid::Uuid::new_v4().to_string();
                 self.db
                     .create_session(
@@ -159,6 +185,13 @@ impl CommandHandler for DesktopCommandHandler {
                 if let Some(hub) = self.app.try_state::<SyncHub>() {
                     match self.db.list_sessions() {
                         Ok(sessions) => {
+                            if let Some(session) = sessions.iter().find(|row| row.id == id).cloned()
+                            {
+                                hub.publish_frame(SyncFrame::SessionCreated {
+                                    request_id,
+                                    session,
+                                });
+                            }
                             hub.publish_frame(SyncFrame::SessionList { sessions });
                         }
                         Err(e) => {
@@ -204,6 +237,7 @@ impl CommandHandler for DesktopCommandHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn parse_decision_only_allows_the_literal_allow() {
@@ -219,5 +253,19 @@ mod tests {
                 "unknown decision {bad:?} must map to Deny"
             );
         }
+    }
+
+    #[test]
+    fn remote_run_admission_rejects_duplicate_and_missing_without_poisoning_intake() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        db.create_session("a", "A", None, Some("gpt-5.6-sol"), 1)
+            .unwrap();
+        let cancels = Arc::new(Mutex::new(HashMap::new()));
+        let (lease, model) = admit_remote_run(cancels.clone(), &db, "a").unwrap();
+        assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+        assert!(admit_remote_run(cancels.clone(), &db, "a").is_err());
+        drop(lease);
+        assert!(admit_remote_run(cancels.clone(), &db, "missing").is_err());
+        assert!(cancels.lock().unwrap().is_empty());
     }
 }

@@ -46,6 +46,23 @@ const session = (over: Partial<Session> = {}): Session => ({
   ...over,
 });
 
+const run = (
+  over: Partial<(typeof initialState.runs)[string]> = {},
+): (typeof initialState.runs)[string] => ({
+  streaming: false,
+  cancel: null,
+  pendingPermission: null,
+  turnId: null,
+  startedAt: null,
+  finalizing: false,
+  receipt: null,
+  outcome: null,
+  composerPhase: "idle",
+  activeTool: null,
+  unseenOutcome: null,
+  ...over,
+});
+
 const settings = (over: Partial<Settings> = {}): Settings => ({
   ...DEFAULT_SETTINGS,
   ...over,
@@ -182,6 +199,20 @@ describe("StatusHud", () => {
     live.rerender(<StatusHud />);
     expect(live.getByText(/IDLE/)).toBeInTheDocument();
     expect(live.queryByText(/LIVE/)).not.toBeInTheDocument();
+  });
+
+  it("reports the total live-run count across selected and background sessions", () => {
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      runs: {
+        a: run({ streaming: true }),
+        b: run({ streaming: true, finalizing: true }),
+      },
+    });
+
+    render(<StatusHud />);
+    expect(screen.getByText(/NEURAL LINK · 2 LIVE/)).toBeInTheDocument();
   });
 
   it("gives the link dot a stronger ring pulse while streaming, success when idle", () => {

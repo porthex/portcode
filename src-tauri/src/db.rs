@@ -9,6 +9,8 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -122,7 +124,7 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum UiBlock {
     Text {
@@ -142,7 +144,7 @@ enum UiBlock {
     },
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct UiMessage {
     id: String,
@@ -153,6 +155,56 @@ pub struct UiMessage {
     turn_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     receipt: Option<TurnReceipt>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UiMessagePage {
+    pub messages: Vec<UiMessage>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct UiMessageCursor {
+    v: u8,
+    session_id: String,
+    anchor_seq: i64,
+    rank: i64,
+    tie: String,
+}
+
+const UI_MESSAGE_PAGE_SIZE: usize = 100;
+
+fn encode_ui_cursor(
+    session_id: &str,
+    anchor_seq: i64,
+    rank: i64,
+    tie: &str,
+) -> rusqlite::Result<String> {
+    let json = serde_json::to_vec(&UiMessageCursor {
+        v: 1,
+        session_id: session_id.to_string(),
+        anchor_seq,
+        rank,
+        tie: tie.to_string(),
+    })
+    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    Ok(URL_SAFE_NO_PAD.encode(json))
+}
+
+fn decode_ui_cursor(session_id: &str, value: &str) -> rusqlite::Result<UiMessageCursor> {
+    let bytes = URL_SAFE_NO_PAD.decode(value).map_err(|error| {
+        rusqlite::Error::InvalidParameterName(format!("invalid message cursor: {error}"))
+    })?;
+    let cursor: UiMessageCursor = serde_json::from_slice(&bytes).map_err(|error| {
+        rusqlite::Error::InvalidParameterName(format!("invalid message cursor: {error}"))
+    })?;
+    if cursor.v != 1 || cursor.session_id != session_id || cursor.anchor_seq < 0 {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "message cursor does not belong to this session".into(),
+        ));
+    }
+    Ok(cursor)
 }
 
 /// Durable receipt plus the terminal Git identity used by the historical Review
@@ -384,7 +436,8 @@ impl Db {
                 terminal_snapshot_id TEXT,
                 started_at INTEGER NOT NULL,
                 completed_at INTEGER NOT NULL,
-                terminal INTEGER NOT NULL DEFAULT 0
+                terminal INTEGER NOT NULL DEFAULT 0,
+                anchor_seq INTEGER
             );",
         )?;
         // Migrate pre-existing databases: the CREATE-IF-NOT-EXISTS above won't add
@@ -405,10 +458,16 @@ impl Db {
         Self::migrate_add_confirmed(&conn)?;
         Self::migrate_add_turn_id(&conn)?;
         Self::migrate_add_receipt_terminal(&conn)?;
+        Self::migrate_add_receipt_anchor(&conn)?;
         Self::recover_pending_turn_receipts(&conn, now_ms())?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_turn_receipts_session
              ON turn_receipts(session_id, started_at)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_turn_receipts_timeline
+             ON turn_receipts(session_id, terminal, anchor_seq)",
             [],
         )?;
         Ok(Self {
@@ -482,6 +541,37 @@ impl Db {
                 [],
             )?;
         }
+        Ok(())
+    }
+
+    /// Add a stable timeline position for receipts, including turns that failed
+    /// before writing a canonical message. The backfill first attaches receipts to
+    /// their turn's earliest row, otherwise places them immediately before the
+    /// first later message (or at the end for a receipt-only tail).
+    fn migrate_add_receipt_anchor(conn: &Connection) -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(turn_receipts)")?;
+        let has_anchor = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|column| column.ok())
+            .any(|name| name == "anchor_seq");
+        if !has_anchor {
+            conn.execute(
+                "ALTER TABLE turn_receipts ADD COLUMN anchor_seq INTEGER",
+                [],
+            )?;
+        }
+        conn.execute(
+            "UPDATE turn_receipts AS tr
+             SET anchor_seq = COALESCE(
+                 (SELECT MIN(m.seq) FROM messages m WHERE m.turn_id = tr.turn_id),
+                 (SELECT MIN(m.seq) FROM messages m
+                  WHERE m.session_id = tr.session_id AND m.created_at >= tr.started_at),
+                 (SELECT COALESCE(MAX(m.seq) + 1, 0) FROM messages m
+                  WHERE m.session_id = tr.session_id)
+             )
+             WHERE anchor_seq IS NULL",
+            [],
+        )?;
         Ok(())
     }
 
@@ -594,6 +684,28 @@ impl Db {
             params![id, model],
         )?;
         if updated == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        Ok(())
+    }
+
+    pub fn session_model(&self, id: &str) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT model FROM sessions WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+    }
+
+    fn require_session(&self, id: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let exists = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+            params![id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if exists == 0 {
             return Err(rusqlite::Error::QueryReturnedNoRows);
         }
         Ok(())
@@ -832,8 +944,10 @@ impl Db {
         conn.execute(
             "INSERT INTO turn_receipts (
                  turn_id, session_id, message_id, receipt_json,
-                 repository_root, terminal_snapshot_id, started_at, completed_at, terminal
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 repository_root, terminal_snapshot_id, started_at, completed_at, terminal,
+                 anchor_seq
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                 (SELECT COALESCE(MAX(seq) + 1, 0) FROM messages WHERE session_id = ?2))
              ON CONFLICT(turn_id) DO UPDATE SET
                  session_id = excluded.session_id,
                  message_id = excluded.message_id,
@@ -842,7 +956,8 @@ impl Db {
                  terminal_snapshot_id = excluded.terminal_snapshot_id,
                  started_at = excluded.started_at,
                  completed_at = excluded.completed_at,
-                 terminal = excluded.terminal
+                 terminal = excluded.terminal,
+                 anchor_seq = COALESCE(turn_receipts.anchor_seq, excluded.anchor_seq)
              WHERE turn_receipts.terminal = 0 OR excluded.terminal = 1",
             params![
                 receipt.turn_id,
@@ -1189,17 +1304,18 @@ impl Db {
         );
     }
 
-    /// Grouped view for the frontend (tool results folded under their assistant).
-    pub fn ui_messages(&self, session_id: &str) -> Vec<UiMessage> {
+    /// Truthful grouped view for the frontend (tool results folded under their
+    /// assistant). SQL and row errors propagate; malformed legacy block/receipt
+    /// JSON remains display-lenient for backwards compatibility.
+    pub fn try_ui_messages(&self, session_id: &str) -> rusqlite::Result<Vec<UiMessage>> {
+        self.require_session(session_id)?;
         let conn = self.conn.lock().unwrap();
-        let Ok(mut stmt) = conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT m.id, m.role, m.content, m.created_at, m.turn_id, tr.receipt_json
              FROM messages m
              LEFT JOIN turn_receipts tr ON tr.turn_id = m.turn_id AND tr.terminal = 1
              WHERE m.session_id = ?1 ORDER BY m.seq",
-        ) else {
-            return Vec::new();
-        };
+        )?;
         let rows = stmt.query_map(params![session_id], |r| {
             let id: String = r.get(0)?;
             let role: String = r.get(1)?;
@@ -1210,12 +1326,12 @@ impl Db {
                 .get::<_, Option<String>>(5)?
                 .and_then(|json| serde_json::from_str::<TurnReceipt>(&json).ok());
             Ok((id, role, content, ts, turn_id, receipt))
-        });
-        let Ok(rows) = rows else { return Vec::new() };
+        })?;
 
         let mut out: Vec<UiMessage> = Vec::new();
         let mut turn_assistants = HashMap::new();
-        for (id, role, content, ts, turn_id, receipt) in rows.filter_map(|r| r.ok()) {
+        for row in rows {
+            let (id, role, content, ts, turn_id, receipt) = row?;
             let blocks: Vec<Block> = serde_json::from_str(&content).unwrap_or_default();
             if let Some(turn_id) = turn_id {
                 let tool_results: Vec<UiBlock> = blocks
@@ -1306,40 +1422,317 @@ impl Db {
         // A provider/config failure can terminalize after the durable TurnStart but
         // before any canonical chat row is appended. Keep that receipt reloadable by
         // synthesizing the same empty assistant bubble live TurnStart created.
-        if let Ok(mut receipts) = conn.prepare(
+        let mut receipts = conn.prepare(
             "SELECT receipt_json FROM turn_receipts
-             WHERE session_id = ?1 AND terminal = 1 ORDER BY started_at",
-        ) {
-            if let Ok(records) = receipts.query_map(params![session_id], |row| {
-                let json: String = row.get(0)?;
-                Ok(serde_json::from_str::<TurnReceipt>(&json).ok())
-            }) {
-                for receipt in records.filter_map(|row| row.ok().flatten()) {
-                    if turn_assistants.contains_key(&receipt.turn_id) {
-                        continue;
-                    }
-                    let index = out
-                        .iter()
-                        .position(|message| message.created_at > receipt.started_at)
-                        .unwrap_or(out.len());
-                    out.insert(
-                        index,
-                        UiMessage {
-                            id: receipt.turn_id.clone(),
-                            role: "assistant".into(),
-                            blocks: Vec::new(),
-                            created_at: receipt.started_at,
-                            turn_id: Some(receipt.turn_id.clone()),
-                            receipt: Some(receipt),
-                        },
+             WHERE session_id = ?1 AND terminal = 1
+             ORDER BY anchor_seq, started_at, turn_id",
+        )?;
+        let records = receipts.query_map(params![session_id], |row| {
+            let json: String = row.get(0)?;
+            Ok(serde_json::from_str::<TurnReceipt>(&json).ok())
+        })?;
+        for row in records {
+            let Some(receipt) = row? else { continue };
+            if turn_assistants.contains_key(&receipt.turn_id) {
+                continue;
+            }
+            let index = out
+                .iter()
+                .position(|message| message.created_at > receipt.started_at)
+                .unwrap_or(out.len());
+            out.insert(
+                index,
+                UiMessage {
+                    id: receipt.turn_id.clone(),
+                    role: "assistant".into(),
+                    blocks: Vec::new(),
+                    created_at: receipt.started_at,
+                    turn_id: Some(receipt.turn_id.clone()),
+                    receipt: Some(receipt),
+                },
+            );
+        }
+        for message in &mut out {
+            finalize_unmatched_ui_tools(&mut message.blocks);
+        }
+        Ok(out)
+    }
+
+    /// Legacy best-effort wrapper retained for Phone Sync tests and non-critical
+    /// internal callers. New Tauri history commands use `try_ui_messages`.
+    pub fn ui_messages(&self, session_id: &str) -> Vec<UiMessage> {
+        self.try_ui_messages(session_id).unwrap_or_default()
+    }
+
+    /// Newest-first cursor paging over a bounded SQL timeline. The base window is
+    /// 100 persisted events; only the oldest boundary may expand so one logical
+    /// turn, legacy tool owner/result pair, or same-anchor receipt group is never
+    /// split between pages.
+    pub fn try_ui_message_page(
+        &self,
+        session_id: &str,
+        cursor: Option<&str>,
+    ) -> rusqlite::Result<UiMessagePage> {
+        self.require_session(session_id)?;
+        let decoded = cursor
+            .map(|value| decode_ui_cursor(session_id, value))
+            .transpose()?;
+        let has_cursor = i64::from(decoded.is_some());
+        let upper_anchor = decoded.as_ref().map_or(i64::MAX, |value| value.anchor_seq);
+        let upper_rank = decoded.as_ref().map_or(i64::MAX, |value| value.rank);
+        let upper_tie = decoded
+            .as_ref()
+            .map_or_else(String::new, |value| value.tie.clone());
+
+        let conn = self.conn.lock().unwrap();
+        let timeline = "WITH timeline(kind, anchor_seq, rank, tie, turn_id, role, content) AS (
+                 SELECT 'message', m.seq, 1, m.id, m.turn_id, m.role, m.content
+                 FROM messages m WHERE m.session_id = ?1
+                 UNION ALL
+                 SELECT 'receipt', tr.anchor_seq, 0, tr.turn_id, tr.turn_id,
+                        'assistant', '[]'
+                 FROM turn_receipts tr
+                 WHERE tr.session_id = ?1 AND tr.terminal = 1
+                   AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.turn_id = tr.turn_id)
+             )";
+        let key_sql = format!(
+            "{timeline}
+             SELECT kind, anchor_seq, rank, tie, turn_id, role, content
+             FROM timeline
+             WHERE ?2 = 0 OR anchor_seq < ?3
+                OR (anchor_seq = ?3 AND rank < ?4)
+                OR (anchor_seq = ?3 AND rank = ?4 AND tie < ?5)
+             ORDER BY anchor_seq DESC, rank DESC, tie DESC LIMIT ?6"
+        );
+        let mut key_stmt = conn.prepare(&key_sql)?;
+        let key_rows = key_stmt.query_map(
+            params![
+                session_id,
+                has_cursor,
+                upper_anchor,
+                upper_rank,
+                upper_tie,
+                (UI_MESSAGE_PAGE_SIZE + 1) as i64
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )?;
+        let mut keys = key_rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        if keys.is_empty() {
+            return Ok(UiMessagePage {
+                messages: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        keys.truncate(UI_MESSAGE_PAGE_SIZE);
+        let oldest = keys.last().expect("non-empty timeline window");
+        let mut start_anchor = oldest.1;
+
+        // A turn can span many persisted rows. Expand to its first row so the
+        // display fold never creates a partial assistant/tool group.
+        if let Some(turn_id) = oldest.4.as_deref() {
+            if let Some(first) = conn.query_row(
+                "SELECT MIN(seq) FROM messages WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id, turn_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )? {
+                start_anchor = start_anchor.min(first);
+            }
+        } else if oldest.0 == "message" && oldest.5 != "assistant" {
+            let blocks: Vec<Block> = serde_json::from_str(&oldest.6).unwrap_or_default();
+            if blocks
+                .iter()
+                .any(|block| matches!(block, Block::ToolResult { .. }))
+            {
+                if let Some(owner) = conn.query_row(
+                    "SELECT MAX(seq) FROM messages WHERE session_id = ?1 AND seq < ?2",
+                    params![session_id, start_anchor],
+                    |row| row.get::<_, Option<i64>>(0),
+                )? {
+                    start_anchor = owner;
+                }
+            }
+        }
+
+        let data_sql = "WITH timeline(kind, anchor_seq, rank, tie, id, role, content, created_at,
+                            turn_id, receipt_json) AS (
+                 SELECT 'message', m.seq, 1, m.id, m.id, m.role, m.content,
+                        m.created_at, m.turn_id, tr.receipt_json
+                 FROM messages m
+                 LEFT JOIN turn_receipts tr
+                   ON tr.turn_id = m.turn_id AND tr.terminal = 1
+                 WHERE m.session_id = ?1
+                 UNION ALL
+                 SELECT 'receipt', tr.anchor_seq, 0, tr.turn_id, tr.turn_id,
+                        'assistant', '[]', tr.started_at, tr.turn_id, tr.receipt_json
+                 FROM turn_receipts tr
+                 WHERE tr.session_id = ?1 AND tr.terminal = 1
+                   AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.turn_id = tr.turn_id)
+             )
+             SELECT kind, id, role, content, created_at, turn_id, receipt_json
+             FROM timeline
+             WHERE anchor_seq >= ?6 AND (
+                    ?2 = 0 OR anchor_seq < ?3
+                    OR (anchor_seq = ?3 AND rank < ?4)
+                    OR (anchor_seq = ?3 AND rank = ?4 AND tie < ?5)
+             )
+             ORDER BY anchor_seq, rank, tie";
+        let mut data_stmt = conn.prepare(data_sql)?;
+        let rows = data_stmt.query_map(
+            params![
+                session_id,
+                has_cursor,
+                upper_anchor,
+                upper_rank,
+                upper_tie,
+                start_anchor
+            ],
+            |row| {
+                let receipt = row
+                    .get::<_, Option<String>>(6)?
+                    .and_then(|json| serde_json::from_str::<TurnReceipt>(&json).ok());
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    receipt,
+                ))
+            },
+        )?;
+
+        let mut out = Vec::new();
+        let mut turn_assistants = HashMap::new();
+        for row in rows {
+            let (kind, id, role, content, ts, turn_id, receipt) = row?;
+            if kind == "receipt" {
+                let turn_id = turn_id.expect("receipt timeline event has turn id");
+                ensure_turn_assistant(
+                    &mut out,
+                    &mut turn_assistants,
+                    &turn_id,
+                    ts,
+                    receipt.as_ref(),
+                );
+                continue;
+            }
+            let blocks: Vec<Block> = serde_json::from_str(&content).unwrap_or_default();
+            if let Some(turn_id) = turn_id {
+                let tool_results: Vec<UiBlock> = blocks
+                    .iter()
+                    .filter(|block| matches!(block, Block::ToolResult { .. }))
+                    .filter_map(to_ui_block)
+                    .collect();
+                let texts: Vec<UiBlock> = blocks
+                    .iter()
+                    .filter(|block| matches!(block, Block::Text { .. }))
+                    .filter_map(to_ui_block)
+                    .collect();
+                if role == "assistant" {
+                    let index = ensure_turn_assistant(
+                        &mut out,
+                        &mut turn_assistants,
+                        &turn_id,
+                        ts,
+                        receipt.as_ref(),
                     );
+                    out[index]
+                        .blocks
+                        .extend(blocks.iter().filter_map(to_ui_block));
+                } else {
+                    if !texts.is_empty() {
+                        out.push(UiMessage {
+                            id,
+                            role: "user".into(),
+                            blocks: texts,
+                            created_at: ts,
+                            turn_id: Some(turn_id.clone()),
+                            receipt: None,
+                        });
+                    }
+                    if !tool_results.is_empty() || receipt.is_some() {
+                        let index = ensure_turn_assistant(
+                            &mut out,
+                            &mut turn_assistants,
+                            &turn_id,
+                            receipt.as_ref().map_or(ts, |value| value.started_at),
+                            receipt.as_ref(),
+                        );
+                        out[index].blocks.extend(tool_results);
+                    }
+                }
+            } else if role == "assistant" {
+                out.push(UiMessage {
+                    id,
+                    role,
+                    blocks: blocks.iter().filter_map(to_ui_block).collect(),
+                    created_at: ts,
+                    turn_id: None,
+                    receipt: None,
+                });
+            } else {
+                let tool_results: Vec<UiBlock> = blocks
+                    .iter()
+                    .filter(|block| matches!(block, Block::ToolResult { .. }))
+                    .filter_map(to_ui_block)
+                    .collect();
+                if !tool_results.is_empty() {
+                    if let Some(last) = out.last_mut() {
+                        last.blocks.extend(tool_results);
+                    }
+                }
+                let texts: Vec<UiBlock> = blocks
+                    .iter()
+                    .filter(|block| matches!(block, Block::Text { .. }))
+                    .filter_map(to_ui_block)
+                    .collect();
+                if !texts.is_empty() {
+                    out.push(UiMessage {
+                        id,
+                        role: "user".into(),
+                        blocks: texts,
+                        created_at: ts,
+                        turn_id: None,
+                        receipt: None,
+                    });
                 }
             }
         }
         for message in &mut out {
             finalize_unmatched_ui_tools(&mut message.blocks);
         }
-        out
+
+        let has_older = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM messages WHERE session_id = ?1 AND seq < ?2
+                 UNION ALL
+                 SELECT 1 FROM turn_receipts tr
+                 WHERE tr.session_id = ?1 AND tr.terminal = 1 AND tr.anchor_seq < ?2
+                   AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.turn_id = tr.turn_id)
+             )",
+            params![session_id, start_anchor],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        let next_cursor = if has_older {
+            Some(encode_ui_cursor(session_id, start_anchor, 0, "")?)
+        } else {
+            None
+        };
+        Ok(UiMessagePage {
+            messages: out,
+            next_cursor,
+        })
     }
 }
 
@@ -2441,5 +2834,106 @@ mod tests {
         let total_in: i64 = all.iter().map(|u| u.input).sum();
         let total_out: i64 = all.iter().map(|u| u.output).sum();
         assert_eq!((total_in, total_out), (300, 30));
+    }
+
+    #[test]
+    fn ui_message_pages_are_bounded_and_reconstruct_the_full_history() {
+        let db = mem_db();
+        db.create_session("paged", "Paged", None, None, 1).unwrap();
+        for index in 0..250 {
+            db.append_message("paged", &text(&format!("message-{index}")), index + 2);
+        }
+
+        let full = db.try_ui_messages("paged").unwrap();
+        let mut reconstructed = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = db.try_ui_message_page("paged", cursor.as_deref()).unwrap();
+            assert!(page.messages.len() <= UI_MESSAGE_PAGE_SIZE);
+            let mut combined = page.messages;
+            combined.extend(reconstructed);
+            reconstructed = combined;
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            reconstructed.iter().map(|m| &m.id).collect::<Vec<_>>(),
+            full.iter().map(|m| &m.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ui_message_page_cursor_rejects_malformed_and_cross_session_values() {
+        let db = mem_db();
+        db.create_session("a", "A", None, None, 1).unwrap();
+        db.create_session("b", "B", None, None, 1).unwrap();
+        for index in 0..101 {
+            db.append_message("a", &text(&index.to_string()), index + 2);
+        }
+        let cursor = db
+            .try_ui_message_page("a", None)
+            .unwrap()
+            .next_cursor
+            .unwrap();
+        assert!(db.try_ui_message_page("b", Some(&cursor)).is_err());
+        assert!(db.try_ui_message_page("a", Some("not-base64")).is_err());
+    }
+
+    #[test]
+    fn ui_message_page_expands_a_turn_at_the_oldest_boundary() {
+        let db = mem_db();
+        db.create_session("turns", "Turns", None, None, 1).unwrap();
+        for index in 0..48 {
+            db.append_message("turns", &text(&format!("before-{index}")), index + 2);
+        }
+        for index in 0..5 {
+            db.try_append_message_for_turn(
+                "turns",
+                Some("boundary-turn"),
+                &assistant(&format!("turn-{index}")),
+                100 + index,
+            )
+            .unwrap();
+        }
+        for index in 0..97 {
+            db.append_message("turns", &text(&format!("after-{index}")), 200 + index);
+        }
+
+        let page = db.try_ui_message_page("turns", None).unwrap();
+        let turn = page
+            .messages
+            .iter()
+            .find(|message| message.turn_id.as_deref() == Some("boundary-turn"))
+            .expect("expanded boundary turn");
+        assert_eq!(turn.blocks.len(), 5);
+    }
+
+    #[test]
+    fn receipt_only_turn_is_paged_at_its_anchor() {
+        let db = mem_db();
+        db.create_session("receipts", "Receipts", None, None, 1)
+            .unwrap();
+        for index in 0..105 {
+            db.append_message("receipts", &text(&index.to_string()), index + 2);
+        }
+        let receipt = receipt("receipt-only");
+        db.save_turn_receipt("receipts", "receipt-only", &receipt, None, None)
+            .unwrap();
+
+        let page = db.try_ui_message_page("receipts", None).unwrap();
+        assert!(page
+            .messages
+            .iter()
+            .any(|message| message.id == "receipt-only" && message.receipt.is_some()));
+        assert!(page.next_cursor.is_some());
+    }
+
+    #[test]
+    fn ui_message_reads_error_for_an_unknown_session() {
+        let db = mem_db();
+        assert!(db.try_ui_messages("missing").is_err());
+        assert!(db.try_ui_message_page("missing", None).is_err());
     }
 }

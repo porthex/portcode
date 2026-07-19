@@ -22,6 +22,21 @@ const session = (over: Partial<Session> = {}): Session => ({
   ...over,
 });
 
+const run = (over: Partial<(typeof initial.runs)[string]> = {}): (typeof initial.runs)[string] => ({
+  streaming: false,
+  cancel: null,
+  pendingPermission: null,
+  turnId: null,
+  startedAt: null,
+  finalizing: false,
+  receipt: null,
+  outcome: null,
+  composerPhase: "idle",
+  activeTool: null,
+  unseenOutcome: null,
+  ...over,
+});
+
 const openRemoteSession = vi.fn();
 const newSession = vi.fn();
 const disconnectRemote = vi.fn();
@@ -66,11 +81,11 @@ describe("RemoteSessions — list", () => {
     expect(screen.getByRole("button", { name: /Alpha/ })).not.toHaveAttribute("aria-current");
   });
 
-  it("shows RUNNING only for the active session while streaming", () => {
+  it("shows activity for a running session even when it is not selected", () => {
     useStore.setState({
       sessions: [session({ id: "a", title: "Alpha" }), session({ id: "b", title: "Beta" })],
-      activeId: "a",
-      streaming: true,
+      activeId: "b",
+      runs: { a: run({ streaming: true }) },
     });
     render(<RemoteSessions />);
 
@@ -112,19 +127,15 @@ describe("RemoteSessions — list", () => {
     expect(button).toHaveAttribute("title", "Creating a session…");
   });
 
-  it("disables the new-session footer while streaming", () => {
+  it("keeps the new-session footer available while another session streams", () => {
     useStore.setState({ sessions: [session()], activeId: "s1", streaming: true });
     render(<RemoteSessions />);
 
     const button = screen.getByRole("button", { name: /New session on desktop/ });
-    expect(button).toBeDisabled();
-    expect(button).toHaveAttribute(
-      "title",
-      "Finish the current response before creating a session.",
-    );
+    expect(button).toBeEnabled();
   });
 
-  it("does not open a different session when tapped mid-stream", () => {
+  it("opens a different session while the active session keeps streaming", () => {
     useStore.setState({
       sessions: [session({ id: "a", title: "Alpha" }), session({ id: "b", title: "Beta" })],
       activeId: "a",
@@ -132,10 +143,8 @@ describe("RemoteSessions — list", () => {
     });
     render(<RemoteSessions />);
 
-    // Tapping the non-active Beta card while streaming is a no-op (would otherwise
-    // open the wrong session, since selectSession is blocked mid-stream).
     fireEvent.click(screen.getByRole("button", { name: /Beta/ }));
-    expect(openRemoteSession).not.toHaveBeenCalled();
+    expect(openRemoteSession).toHaveBeenCalledWith("b");
   });
 
   it("still opens the active session when tapped mid-stream", () => {
@@ -175,14 +184,10 @@ describe("RemoteSessions — empty", () => {
     expect(button).toHaveAttribute("title", "Creating a session…");
   });
 
-  it("disables the empty-state CTA while streaming", () => {
+  it("keeps the empty-state CTA available while a session streams", () => {
     useStore.setState({ sessions: [], activeId: null, streaming: true });
     render(<RemoteSessions />);
     const button = screen.getByRole("button", { name: /New session/ });
-    expect(button).toBeDisabled();
-    expect(button).toHaveAttribute(
-      "title",
-      "Finish the current response before creating a session.",
-    );
+    expect(button).toBeEnabled();
   });
 });

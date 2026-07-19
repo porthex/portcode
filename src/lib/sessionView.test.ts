@@ -40,8 +40,19 @@ describe("workspaceLabel", () => {
 });
 
 describe("deriveStatus", () => {
-  it("archived wins over everything", () => {
-    expect(deriveStatus("a", "a", true, new Set(["a"]))).toBe("archived");
+  it("live activity wins over an archived presentation flag", () => {
+    expect(deriveStatus("a", { streaming: true }, new Set(["a"]))).toBe("running");
+  });
+
+  it("prioritizes permission attention, then stopping, then running", () => {
+    expect(
+      deriveStatus(
+        "a",
+        { streaming: true, finalizing: true, pendingPermission: { id: "p1" } },
+        noArchive,
+      ),
+    ).toBe("waiting");
+    expect(deriveStatus("a", { streaming: true, finalizing: true }, noArchive)).toBe("stopping");
   });
 
   it("the open session is running while a turn streams", () => {
@@ -189,7 +200,7 @@ describe("buildSidebarRows — status mode", () => {
     });
     const headers = rows.filter((r) => r.kind === "groupHeader");
     expect(headers.map((h) => (h.kind === "groupHeader" ? h.label : ""))).toEqual([
-      "Active",
+      "Running",
       "Idle",
       "Archived",
     ]);

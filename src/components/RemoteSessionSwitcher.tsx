@@ -13,7 +13,7 @@ const FOCUSABLE =
 export function RemoteSessionSwitcher({ onClose }: { onClose: () => void }) {
   const sessions = useStore((s) => s.sessions);
   const activeId = useStore((s) => s.activeId);
-  const streaming = useStore((s) => s.streaming);
+  const runs = useStore((s) => s.runs);
   const selectSession = useStore((s) => s.selectSession);
   const sheetRef = useRef<HTMLDivElement>(null);
 
@@ -67,10 +67,6 @@ export function RemoteSessionSwitcher({ onClose }: { onClose: () => void }) {
   };
 
   const pick = (id: string) => {
-    // selectSession is a no-op mid-stream (switching activeId would strand the
-    // streaming turn). Closing the sheet then would falsely imply the session
-    // changed, so when a switch can't take effect, keep the sheet open instead.
-    if (streaming && id !== activeId) return;
     void selectSession(id);
     onClose();
   };
@@ -103,7 +99,14 @@ export function RemoteSessionSwitcher({ onClose }: { onClose: () => void }) {
         <div className="flex max-h-[50vh] flex-col gap-2 overflow-y-auto">
           {sessions.map((s) => {
             const active = s.id === activeId;
-            const running = active && streaming;
+            const run = runs[s.id];
+            const activity = run?.pendingPermission
+              ? "waiting"
+              : run?.finalizing
+                ? "stopping"
+                : run?.streaming
+                  ? "running"
+                  : "idle";
             return (
               <button
                 key={s.id}
@@ -123,7 +126,7 @@ export function RemoteSessionSwitcher({ onClose }: { onClose: () => void }) {
                   <div className="truncate text-[14px] font-semibold text-fg">{s.title}</div>
                   <div className="mt-0.5 font-mono text-[10.5px] text-faint">
                     <span aria-hidden="true">⎇</span> {workspaceLabel(s.workspace)} ·{" "}
-                    {running ? "running" : `idle ${relativeTime(s.updatedAt)}`}
+                    {activity !== "idle" ? activity : `idle ${relativeTime(s.updatedAt)}`}
                   </div>
                 </div>
                 {active && (

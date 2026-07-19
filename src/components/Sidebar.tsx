@@ -8,6 +8,7 @@ import {
   sortSessions,
   workspaceLabel,
   type SidebarRow,
+  type SessionActivityStatus,
 } from "../lib/sessionView";
 import { useStore } from "../store/store";
 import {
@@ -16,7 +17,6 @@ import {
   type SessionFolder,
   type SessionGroup,
   type SessionSort,
-  type SessionStatus,
 } from "../types";
 
 const SORT_OPTIONS: { value: SessionSort; label: string }[] = [
@@ -60,9 +60,13 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   const sessions = useStore((s) => s.sessions);
   const activeId = useStore((s) => s.activeId);
   const streaming = useStore((s) => s.streaming);
+  const runs = useStore((s) => s.runs);
+  const backgroundTasks = useStore((s) => s.backgroundTasks);
+  const creatingSession = useStore((s) => s.creatingSession);
   const remoteConnected = useStore((s) => s.remoteConnected);
   const newSession = useStore((s) => s.newSession);
   const selectSession = useStore((s) => s.selectSession);
+  const prefetchSession = useStore((s) => s.prefetchSession);
   const deleteSession = useStore((s) => s.deleteSession);
   const renameSession = useStore((s) => s.renameSession);
   const setShowSettings = useStore((s) => s.setShowSettings);
@@ -128,7 +132,16 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   // Renames are a desktop-local DB write with no remote equivalent, and (like the
   // sibling row actions) are never allowed mid-turn — so the affordance is hidden
   // in both states. The store action guards these too; this just keeps the UI honest.
-  const canRename = !streaming && !remoteConnected;
+  const runBusy = (id: string): boolean => {
+    const run = runs[id];
+    return Boolean(
+      run?.streaming || run?.finalizing || run?.pendingPermission || (id === activeId && streaming),
+    );
+  };
+  const hasBackgroundWork = (id: string): boolean =>
+    Boolean(backgroundTasks[id]?.some((task) => task.status === "running"));
+  const targetBusy = (id: string): boolean => runBusy(id) || hasBackgroundWork(id);
+  const canRenameSession = (_id: string): boolean => !remoteConnected;
   // The folder currently under a dragged chat (drop-target highlight).
   const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
   // Where a drag-reorder would drop, for the insertion-line indicator.
@@ -138,6 +151,13 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   const { onContextMenu, menu: ctxMenu } = useContextMenu();
 
   const archived = useMemo(() => new Set(archivedIds), [archivedIds]);
+  const activityRuns = useMemo(
+    () =>
+      activeId && streaming && !runs[activeId]
+        ? { ...runs, [activeId]: { streaming: true } }
+        : runs,
+    [activeId, runs, streaming],
+  );
   const { rows, visible } = useMemo(
     () =>
       buildSidebarRows({
@@ -150,8 +170,20 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         folderOf,
         archived,
         manualOrder,
+        runs: activityRuns,
       }),
-    [sessions, activeId, streaming, sortBy, groupBy, folders, folderOf, archived, manualOrder],
+    [
+      sessions,
+      activeId,
+      streaming,
+      sortBy,
+      groupBy,
+      folders,
+      folderOf,
+      archived,
+      manualOrder,
+      activityRuns,
+    ],
   );
 
   // Exactly one session row is a tab stop: the active session when it's visible,
@@ -164,10 +196,28 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   // Roving-tabindex stops for arrow-key navigation, indexed by position in the
   // flat `visible` list (so nav follows the on-screen order, not raw insertion).
   const rowRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const prefetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const schedulePrefetch = (id: string): void => {
+    if (prefetchTimer.current) clearTimeout(prefetchTimer.current);
+    prefetchTimer.current = setTimeout(() => {
+      prefetchTimer.current = null;
+      void prefetchSession(id);
+    }, 150);
+  };
+  const cancelPrefetch = (): void => {
+    if (prefetchTimer.current) clearTimeout(prefetchTimer.current);
+    prefetchTimer.current = null;
+  };
+  useEffect(
+    () => () => {
+      if (prefetchTimer.current) clearTimeout(prefetchTimer.current);
+    },
+    [],
+  );
 
   // ── Inline session rename handlers ─────────────────────────────────────────
   const beginEdit = (s: Session) => {
-    if (!canRename) return;
+    if (!canRenameSession(s.id)) return;
     editingRef.current = s.id;
     setEditingSessionId(s.id);
     setDraft(s.title);
@@ -209,7 +259,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   }, [editingSessionId, visible]);
 
   const onListKeyDown = (e: KeyboardEvent<HTMLElement>) => {
-    if (streaming || visible.length === 0) return;
+    if (visible.length === 0) return;
     const current = visible.findIndex((s) => s.id === activeId);
     const from = current === -1 ? 0 : current;
     let next: number;
@@ -261,7 +311,8 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   // This is the "reorder (sort by goes off) / move to other group" gesture.
   const reorder = (draggedId: string, target: Session, place: "before" | "after"): void => {
     if (!draggedId || draggedId === target.id) return;
-    const statusOf = (id: string): SessionStatus => deriveStatus(id, activeId, streaming, archived);
+    const statusOf = (id: string): SessionActivityStatus =>
+      deriveStatus(id, activityRuns[id], archived);
     const order = sortSessions(sessions, sortBy, statusOf, manualOrder)
       .map((s) => s.id)
       .filter((id) => id !== draggedId);
@@ -277,20 +328,20 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   // streams (mirrors the per-row button guards). "Move to folder" is a flat section
   // (a heading + one item per folder) so there's no submenu risk; "Remove from
   // folder" only appears when the chat is in one.
-  const sessionMenuItems = (s: Session, status: SessionStatus): ContextMenuItem[] => {
+  const sessionMenuItems = (s: Session, status: SessionActivityStatus): ContextMenuItem[] => {
+    const busy = targetBusy(s.id);
     const inFolder = folderOf[s.id] ?? null;
     const items: ContextMenuItem[] = [
       {
         label: "New chat",
         icon: <PlusGlyph />,
         onSelect: () => void newSession(),
-        disabled: streaming,
+        disabled: creatingSession,
       },
       {
         label: status === "archived" ? "Unarchive" : "Archive",
         icon: <ArchiveIcon />,
         onSelect: () => toggleArchived(s.id),
-        disabled: streaming,
       },
     ];
     // Move-to-folder section: only meaningful in the manual (folder) mode.
@@ -321,7 +372,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
       danger: true,
       separatorBefore: true,
       onSelect: () => void deleteSession(s.id),
-      disabled: streaming,
+      disabled: busy,
     });
     return items;
   };
@@ -346,7 +397,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         label: "New chat",
         icon: <PlusGlyph />,
         onSelect: () => void newSession(),
-        disabled: streaming,
+        disabled: creatingSession,
       },
     ];
     if (groupBy === "none") {
@@ -461,11 +512,12 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   const renderSession = (row: Extract<SidebarRow, { kind: "session" }>) => {
     const { session: s, status, navIndex, indented } = row;
     const active = s.id === activeId;
+    const busy = targetBusy(s.id);
     const isTabStop = s.id === tabStopId;
     const isArchived = status === "archived" && !active;
     // Reorder + folder DnD only applies in the manual ("none") mode; the auto
     // groupings derive their order, so rows aren't draggable there.
-    const reorderable = groupBy === "none" && !streaming;
+    const reorderable = groupBy === "none";
     // The ⎇ glyph names the real git branch when known (its true meaning); the
     // workspace folder rides alongside. Falls back to just the workspace when the
     // session isn't in a git repo.
@@ -515,6 +567,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         }
       >
         <div className="flex items-center">
+          <span role="status" aria-label={`Session status: ${status}`} className="sr-only" />
           {reorderable && (
             // Explicit drag handle. The title is a full-width <button>, and
             // Chromium/WebView2 won't reliably start the parent row's native
@@ -558,16 +611,21 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
               }}
               onClick={() => selectSession(s.id)}
               onDoubleClick={() => beginEdit(s)}
-              disabled={streaming}
+              onMouseEnter={() => schedulePrefetch(s.id)}
+              onMouseLeave={cancelPrefetch}
+              onFocus={() => schedulePrefetch(s.id)}
+              onBlur={cancelPrefetch}
               tabIndex={isTabStop ? 0 : -1}
               aria-current={active ? "true" : undefined}
-              className={`flex min-w-0 flex-1 flex-col text-left ${
-                streaming ? "cursor-not-allowed" : ""
-              }`}
-              title={streaming ? "Finish or stop the current turn first" : s.title}
+              className="flex min-w-0 flex-1 flex-col text-left"
+              title={s.title}
             >
               <span className="relative flex items-center">
-                <RowIndicator status={status} active={active} />
+                <RowIndicator
+                  status={status}
+                  active={active}
+                  unseenOutcome={runs[s.id]?.unseenOutcome ?? null}
+                />
                 <span
                   className={`truncate pl-3 text-[13px] ${
                     active ? "text-fg" : isArchived ? "text-faint" : "text-muted"
@@ -585,7 +643,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
               </span>
             </button>
           )}
-          {canRename && editingSessionId !== s.id && (
+          {canRenameSession(s.id) && editingSessionId !== s.id && (
             <button
               onClick={() => beginEdit(s)}
               tabIndex={isTabStop ? 0 : -1}
@@ -601,31 +659,22 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
             <>
               <button
                 onClick={() => toggleArchived(s.id)}
-                disabled={streaming}
                 tabIndex={isTabStop ? 0 : -1}
-                className={`ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-accent-2/10 hover:text-accent-2 group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none ${
-                  streaming ? "cursor-not-allowed opacity-50" : ""
-                }`}
+                className="ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-accent-2/10 hover:text-accent-2 group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none"
                 aria-label={`${status === "archived" ? "Unarchive" : "Archive"} session: ${s.title}`}
-                title={
-                  streaming
-                    ? "Finish or stop the current turn first"
-                    : status === "archived"
-                      ? "Unarchive"
-                      : "Archive"
-                }
+                title={status === "archived" ? "Unarchive" : "Archive"}
               >
                 <ArchiveIcon />
               </button>
               <button
                 onClick={() => deleteSession(s.id)}
-                disabled={streaming}
+                disabled={busy}
                 tabIndex={isTabStop ? 0 : -1}
                 className={`ml-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-danger/10 hover:text-danger group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none ${
-                  streaming ? "cursor-not-allowed opacity-50" : ""
+                  busy ? "cursor-not-allowed opacity-50" : ""
                 }`}
                 aria-label={`Delete session: ${s.title}`}
-                title={streaming ? "Finish or stop the current turn first" : "Delete session"}
+                title={busy ? "Finish or stop this session's work first" : "Delete session"}
               >
                 ✕
               </button>
@@ -657,7 +706,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
       <div
         data-testid="sidebar-titlebar"
         data-tauri-drag-region={isTauri() ? "deep" : undefined}
-        className="flex h-[46px] shrink-0 items-center gap-2.5 px-4"
+        className="flex h-[56px] shrink-0 items-center gap-2.5 px-5"
       >
         <div className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-lg border border-accent/60 bg-gradient-to-br from-accent/30 to-accent-2/25 shadow-[0_0_14px_rgba(255,46,126,0.4)]">
           <Logo />
@@ -686,9 +735,9 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
       <div className="px-3 pb-2">
         <button
           onClick={newSession}
-          disabled={streaming}
-          title={streaming ? "Finish or stop the current turn first" : undefined}
-          className={`pc-newsession ${streaming ? "cursor-not-allowed opacity-50" : ""}`}
+          disabled={creatingSession}
+          title={creatingSession ? "Creating a sessionâ€¦" : undefined}
+          className={`pc-newsession ${creatingSession ? "cursor-not-allowed opacity-50" : ""}`}
         >
           <span className="text-[15px] leading-none">+</span>
           NEW SESSION
@@ -845,7 +894,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
  *  panel header, expand from here. */
 function SessionRail() {
   const sessions = useStore((s) => s.sessions);
-  const streaming = useStore((s) => s.streaming);
+  const creatingSession = useStore((s) => s.creatingSession);
   const newSession = useStore((s) => s.newSession);
   const setShowSettings = useStore((s) => s.setShowSettings);
   const setSidebarCollapsed = useStore((s) => s.setSidebarCollapsed);
@@ -896,10 +945,10 @@ function SessionRail() {
       </button>
       <button
         onClick={newSession}
-        disabled={streaming}
+        disabled={creatingSession}
         aria-label="New session"
-        title={streaming ? "Finish or stop the current turn first" : "New session"}
-        className={`pc-rail-btn pc-rail-btn--accent ${streaming ? "cursor-not-allowed opacity-50" : ""}`}
+        title={creatingSession ? "Creating a sessionâ€¦" : "New session"}
+        className={`pc-rail-btn pc-rail-btn--accent ${creatingSession ? "cursor-not-allowed opacity-50" : ""}`}
       >
         <span className="text-[17px] leading-none">+</span>
       </button>
@@ -969,10 +1018,26 @@ function PopMenu<T extends string>({
  * session) gets a green pulsing dot; archived a dim box glyph; the open idle
  * session the magenta dot; any other idle row a faint static pip.
  */
-function RowIndicator({ status, active }: { status: SessionStatus; active: boolean }) {
+function RowIndicator({
+  status,
+  active,
+  unseenOutcome,
+}: {
+  status: SessionActivityStatus;
+  active: boolean;
+  unseenOutcome: string | null;
+}) {
   const pos = "absolute left-[3px] top-1/2 -translate-y-1/2";
+  if (status === "waiting") return <span className={`pc-dot bg-warn ${pos}`} aria-hidden="true" />;
+  if (status === "stopping")
+    return <span className={`pc-dot bg-danger ${pos}`} aria-hidden="true" />;
   if (status === "running")
-    return <span className={`pc-dot pc-dot--success ${pos}`} aria-hidden="true" />;
+    return (
+      <span
+        className={`pc-dot pc-dot--success motion-reduce:animate-none ${pos}`}
+        aria-hidden="true"
+      />
+    );
   if (status === "archived")
     return (
       <span
@@ -982,6 +1047,7 @@ function RowIndicator({ status, active }: { status: SessionStatus; active: boole
         ▢
       </span>
     );
+  if (unseenOutcome) return <span className={`pc-dot bg-danger ${pos}`} aria-hidden="true" />;
   if (active) return <span className={`pc-dot pc-dot--accent ${pos}`} aria-hidden="true" />;
   return <span className={`pc-dot--idle ${pos}`} aria-hidden="true" />;
 }

@@ -92,14 +92,14 @@ describe("Chat empty state", () => {
     expect(screen.queryByText("for files")).not.toBeInTheDocument();
   });
 
-  it("falls back to the empty state when the active session has no message entry", () => {
-    // activeId is set, but `messages[activeId]` is undefined -> the `|| EMPTY`
-    // fallback in the selector kicks in.
+  it("shows a transcript loader instead of a false empty state before history arrives", () => {
     useStore.setState({ activeId: "s1", messages: {}, streaming: false });
 
     render(<Chat />);
 
-    expect(screen.getByRole("heading", { name: EMPTY_HEADING })).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Loading conversation" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: EMPTY_HEADING })).not.toBeInTheDocument();
+    expect(screen.getByRole("log")).toHaveAttribute("aria-busy", "true");
   });
 
   it("shows the empty state when the active session has an empty message array", () => {
@@ -226,6 +226,9 @@ describe("Chat transcript", () => {
           finalizing: false,
           receipt: null,
           outcome: null,
+          composerPhase: "thinking",
+          activeTool: null,
+          unseenOutcome: null,
         },
       },
     });
@@ -248,6 +251,9 @@ describe("Chat transcript", () => {
             finalizing: true,
             receipt: null,
             outcome: null,
+            composerPhase: "stopping",
+            activeTool: null,
+            unseenOutcome: null,
           },
         },
       });
@@ -682,6 +688,33 @@ describe("Chat load-error retry block", () => {
     });
 
     render(<Chat />);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(retryLoad).toHaveBeenCalledWith("s1");
+  });
+
+  it("keeps cached messages visible when a background refresh fails", () => {
+    const retryLoad = vi.fn(async () => {});
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "cached transcript")] },
+      messageLoads: {
+        s1: {
+          phase: "error",
+          loadedAt: 1,
+          lastAccessedAt: 2,
+          requestId: 2,
+          error: "offline",
+          nextCursor: null,
+          loadingOlder: false,
+        },
+      },
+      retryLoad,
+    });
+
+    render(<Chat />);
+    expect(screen.getByText("cached transcript")).toBeInTheDocument();
+    expect(screen.getByText(/Showing cached messages/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(retryLoad).toHaveBeenCalledWith("s1");
   });

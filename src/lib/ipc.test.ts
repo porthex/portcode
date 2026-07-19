@@ -171,6 +171,7 @@ describe("Tauri command serialization", () => {
     await ipc.updateSessionModel("s1", "gpt-5.6-sol");
     await ipc.deleteSession("s1");
     await ipc.getMessages("s1");
+    await ipc.getMessagePage("s1", "cursor-1");
     expect(invoke).toHaveBeenCalledWith("create_session", {
       id: "s1",
       title: "Title",
@@ -184,6 +185,10 @@ describe("Tauri command serialization", () => {
     });
     expect(invoke).toHaveBeenCalledWith("delete_session", { id: "s1" });
     expect(invoke).toHaveBeenCalledWith("get_messages", { sessionId: "s1" });
+    expect(invoke).toHaveBeenCalledWith("get_message_page", {
+      sessionId: "s1",
+      cursor: "cursor-1",
+    });
   });
 
   it("draft commands serialize their identifiers", async () => {
@@ -471,6 +476,19 @@ describe("Tauri command serialization", () => {
     expect(invoke).not.toHaveBeenCalledWith("cancel_agent", { sessionId: "sess-2" });
   });
 
+  it("run_agent tears down its new listener when invocation is rejected", async () => {
+    const { ipc, invoke, listen } = await load();
+    const unlisten = vi.fn();
+    listen.mockResolvedValue(unlisten);
+    invoke.mockRejectedValueOnce(new Error("session already running"));
+
+    await expect(ipc.runAgent("busy", "hi", "claude-opus-4-8", vi.fn())).rejects.toThrow(
+      "session already running",
+    );
+
+    expect(unlisten).toHaveBeenCalledOnce();
+  });
+
   it("cancelAgentById invokes cancel_agent_by_id with the agent id", async () => {
     const { ipc, invoke } = await load();
     invoke.mockResolvedValue(undefined);
@@ -590,6 +608,7 @@ describe("browser fallback (no Tauri core)", () => {
     const { ipc } = await load();
     await expect(ipc.listSessions()).resolves.toEqual([]);
     await expect(ipc.getMessages("any")).resolves.toEqual([]);
+    await expect(ipc.getMessagePage("any")).resolves.toEqual({ messages: [], nextCursor: null });
   });
 
   it("session mutations are no-ops that still resolve", async () => {

@@ -1025,6 +1025,35 @@ describe("SettingsPanel — permission modes & rules", () => {
     expect(m.saveSettings).toHaveBeenCalledWith({ permissionMode: "acceptEdits" });
   });
 
+  it("locks the global permission mode while any session is live", async () => {
+    useStore.setState({
+      runs: {
+        background: {
+          streaming: true,
+          cancel: null,
+          pendingPermission: null,
+          turnId: "turn-background",
+          startedAt: 1,
+          finalizing: false,
+          receipt: null,
+          outcome: null,
+          composerPhase: "thinking",
+          activeTool: null,
+          unseenOutcome: null,
+        },
+      },
+    });
+    renderPanel({ permissionMode: "default" });
+
+    const acceptEdits = screen.getByRole("button", { name: "Accept edits" });
+    expect(acceptEdits).toBeDisabled();
+    expect(
+      screen.getByText(/Permission mode is locked while a session is running/i),
+    ).toBeInTheDocument();
+    await act(async () => fireEvent.click(acceptEdits));
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
   it("requires an explicit acknowledgment before enabling a danger mode (auto)", async () => {
     renderPanel({ permissionMode: "default" });
 

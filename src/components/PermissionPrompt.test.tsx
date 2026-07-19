@@ -36,6 +36,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   // Zustand has no built-in reset; restore the captured pristine state.
   useStore.setState(initialState, true);
+  useStore.setState({ activeId: "s1" });
   m.resolvePermission.mockResolvedValue(undefined);
   m.saveSettings.mockResolvedValue({ ...initialState.settings, defaultPolicy: "allow" });
 });
