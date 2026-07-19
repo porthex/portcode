@@ -32,11 +32,14 @@ type CdpResponse = {
 };
 
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const skipBuild = process.env.PORTCODE_E2E_SKIP_BUILD === "1";
 // Keep the smoke binary separate from the user's normal debug build. Windows
 // cannot replace a running executable, and dogfooding commonly leaves the
-// stable `target/debug/portcode.exe` open while this journey runs.
-const e2eTarget = path.join(projectRoot, "src-tauri", "target", "e2e");
-const application = path.join(e2eTarget, "debug", "portcode.exe");
+// stable `target/debug/portcode.exe` open while this journey runs. CI prebuilds
+// that standard target and opts out of the script-owned build, so reuse it when
+// PORTCODE_E2E_SKIP_BUILD=1 instead of looking for a binary CI never produced.
+const cargoTarget = path.join(projectRoot, "src-tauri", "target", ...(skipBuild ? [] : ["e2e"]));
+const application = path.join(cargoTarget, "debug", "portcode.exe");
 const logs: string[] = [];
 let appProcess: ChildProcess | undefined;
 let appPid: number | undefined;
@@ -569,7 +572,7 @@ const main = async () => {
   if (process.platform !== "win32") {
     throw new Error("The desktop smoke test currently supports Windows only.");
   }
-  if (!process.env.PORTCODE_E2E_SKIP_BUILD) {
+  if (!skipBuild) {
     const pnpmCli = process.env.npm_execpath;
     if (!pnpmCli) throw new Error("pnpm did not provide npm_execpath.");
     const build = spawnSync(
@@ -585,7 +588,7 @@ const main = async () => {
       ],
       {
         cwd: projectRoot,
-        env: { ...process.env, CARGO_TARGET_DIR: e2eTarget },
+        env: { ...process.env, CARGO_TARGET_DIR: cargoTarget },
         stdio: "inherit",
       },
     );
