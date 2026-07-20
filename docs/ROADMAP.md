@@ -18,7 +18,7 @@
 - Deferred concepts and operational guides: [`REPO_MODE_PLAN.md`](REPO_MODE_PLAN.md)
   and [`SELF_DEV.md`](SELF_DEV.md)
 
-## Progress snapshot — 2026-07-20
+## Progress snapshot — 2026-07-21
 
 Percentages hid whether evidence was code, automated testing, manual testing, or
 external acceptance. This snapshot uses explicit evidence states instead.
@@ -26,7 +26,7 @@ external acceptance. This snapshot uses explicit evidence states instead.
 | Track                           | Evidence state                                       | Missing proof or implementation                                                         |
 | ------------------------------- | ---------------------------------------------------- | --------------------------------------------------------------------------------------- |
 | Multiple ChatGPT accounts       | **Merged in PR #130; automated acceptance complete** | Owner-credential live smoke remains a broad-release gate                                |
-| Desktop/release roadmap         | **Foundations implemented**                          | Security baseline, deterministic acceptance, rehearsal, signing, live checks            |
+| Desktop/release roadmap         | **Security baseline complete in PR #131**            | Deterministic acceptance, rehearsal, signing, and live checks                           |
 | Android remote client           | **Scaffolded; correctness blockers found**           | Initial catch-up, capability/trust boundary, permission ack/replay, CI, device evidence |
 | iOS/web client                  | **Scaffolded; correctness blockers found**           | Reconnect, key persistence, permission ack/replay, lifecycle/cursors, relay/PWA CI      |
 | OpenAI subscription integration | **Transport implemented**                            | Per-profile hardening, catalog cache, retries, local telemetry, broad-release approval  |
@@ -58,13 +58,18 @@ required device, credential, or owner decision is available.
    - **Dependency:** existing direct-subscription transport and capability gate.
    - **Evidence:** the plan's migration, identity, concurrency, UX, redaction,
      Rust, frontend-coverage, PR CI, and merge acceptance is green.
-2. **Release security baseline (P0).** Scrub shell subprocess environments to a
-   reviewed allowlist; project phone-bound `StreamEvent` data through a bounded,
-   default-deny schema with credential redaction; and define an always-ask floor
-   for shell, install, and future high-risk Git actions.
+2. **Release security baseline (P0) — complete in
+   [PR #131](https://github.com/porthex/portcode/pull/131).** Scrub shell
+   subprocess environments to a reviewed allowlist; project phone-bound
+   `StreamEvent` data through a bounded, default-deny schema with credential
+   redaction; and define an always-ask floor for shell, install, and future
+   high-risk Git actions.
    - **Dependency:** none.
-   - **Done when:** focused Rust tests prove disallowed environment variables and
-     raw tool payloads cannot cross these boundaries.
+   - **Evidence:** focused adversarial tests, documented local automated gates,
+     and exact-head CI/Android/E2E acceptance are green.
+   - **Deferred:** permission-response acknowledgement and idempotent replay
+     remain in the Android/iOS correctness plans; physical-device,
+     live-provider, and signing evidence remain external gates.
 3. **Deterministic desktop acceptance (P0).** Exercise session → mocked turn →
    permission → tool → persistence → process restart, including explicit
    interrupted-run behavior.
@@ -220,7 +225,7 @@ blocks the base desktop v1 release is an explicit product-scope decision.
 
 ## Milestone 7 — Stabilize and release
 
-- [ ] Harden shell environment inheritance and phone-bound event projection
+- [x] Harden shell environment inheritance and phone-bound event projection
 - [ ] Add a deterministic full acceptance path: session → mocked turn → permission → tool → restart
 - [ ] Rehearse packaging, install/update, checksums, and SBOM without production signing
 - [ ] Run the signed Windows release workflow into a **draft** GitHub Release

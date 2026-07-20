@@ -1,6 +1,7 @@
 # Release security baseline — plan
 
-- Status: local verification complete; GitHub PR CI pending
+- Status: complete in [PR #131](https://github.com/porthex/portcode/pull/131);
+  local and exact-head GitHub automated acceptance green
 - Priority: P0, before deterministic desktop and mobile acceptance
 - Audit baseline: `d7526aa` (`feat(openai): add multiple ChatGPT accounts`)
 - Audit date: 2026-07-20
@@ -344,7 +345,7 @@ transport limit.
 - [x] Credentialed redirects cannot cross origin.
 - [x] Focused adversarial tests pass.
 - [x] Full local release gates pass.
-- [ ] GitHub PR CI passes.
+- [x] GitHub PR CI passes on the exact merge head.
 
 ## Manual and external evidence
 
@@ -374,8 +375,10 @@ existing later gates and must not be inferred from this PR.
   workspace tests passed (403 desktop core + 58 shared sync).
 - WASM: `portcode-sync` and `portcode-wasm` built for
   `wasm32-unknown-unknown`; strict target clippy passed; `wasm-pack 0.15.0`
-  rebuilt the web package; SHA-256 comparisons proved all four committed
-  JS/declaration/binary artifacts fresh.
+  rebuilt the web package, and the locally generated package matched the
+  then-committed files. The Linux CI freshness gate later detected
+  JS/declaration drift and repaired it through the same-repository artifact job;
+  see GitHub verification.
 - Desktop journey: the isolated debug Tauri build launched successfully and the
   real WebView passed shell/title, Settings/model-listbox, close, composer draft,
   nested-list, Tab-escape, and no-fallback checks.
@@ -390,11 +393,30 @@ existing later gates and must not be inferred from this PR.
   app cross-check is unavailable because this machine has no Android NDK compiler,
   so the GitHub Android job remains the authoritative target proof.
 
-### GitHub verification
+### GitHub verification — 2026-07-21
 
-Pending PR publication and required-check completion. Physical phones, live
-provider credentials, production signing/updater publication, and broad-release
-approval were intentionally unavailable and remain later roadmap gates.
+- [Initial CI run 29778669443](https://github.com/porthex/portcode/actions/runs/29778669443)
+  on source head `fe9a0a9` passed repository safety, both frontend legs, both
+  Rust legs, and the WASM compile/clippy/build steps, but its final committed
+  artifact freshness check correctly failed because the Linux-generated
+  JS/declaration files had drifted.
+- The same run's same-repository artifact job regenerated the package and pushed
+  bot commit
+  [`484c337`](https://github.com/porthex/portcode/commit/484c337eaeb1624b398ca2b39fef0a03cafe9496),
+  including the JS/declaration contract and rebuilt WASM binary. The
+  `GITHUB_TOKEN` push did not recursively run workflows, so that bot commit alone
+  was not treated as acceptance evidence.
+- A subsequent human-authored evidence commit on top of `484c337` re-triggered
+  all workflows. [PR #131](https://github.com/porthex/portcode/pull/131) passed
+  required CI, Android, and Tauri E2E checks on its exact merge head. The initial
+  [Android run 29778669259](https://github.com/porthex/portcode/actions/runs/29778669259)
+  and [E2E run 29778668877](https://github.com/porthex/portcode/actions/runs/29778668877)
+  had also passed on source head `fe9a0a9`.
+- Physical phones, live provider credentials, production signing/updater
+  publication, and broad-release approval were intentionally unavailable and
+  remain later roadmap gates. Remote permission-response acknowledgement and
+  idempotent replay across link loss remain Android/iOS protocol-correctness
+  work.
 
 ## Rollback
 
