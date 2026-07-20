@@ -455,6 +455,10 @@ is no way to keep it alive. The design accepts this and makes resume seamless:
    kept running on the desktop the entire time — the phone just re-mirrors.
 4. **Backoff.** Exponential backoff + jitter (≈1s→30s) on failed re-dials;
    surface `remoteDropped` (already in the store) with a one-tap reconnect.
+5. **Permission-decision outbox.** Keep a decision pending until the desktop
+   acknowledges that exact request id; after reconnect, replay it idempotently.
+   A send/enqueue acknowledgement alone is insufficient because the link can drop
+   before the desktop permission gate resolves.
 
 This is exactly why the desktop-does-all-the-work model matters: the iOS client
 can die and resurrect freely without losing session state, because **state lives
@@ -525,7 +529,8 @@ New frontend code **must** ship with tests in the same change (per `CLAUDE.md`).
   for the Noise round-trip). Rust tests run in CI.
 - **Frontend:** the reused store/components and the WASM adapter, scanner,
   install gate, storage, and reconnect/visibility wiring have matching Vitest
-  coverage. Keep those tests hermetic and extend them with each behavior change.
+  coverage. Keep those tests hermetic and extend them with each behavior change,
+  including permission-response ack/replay across forced disconnects.
 - **E2E (wdio):** add a browser-mode smoke that pairs against a headless desktop
   - local relay and exercises connect → command → frame → background → resume.
 - **iOS on-device:** the Phase 0 spike and a manual pre-launch checklist

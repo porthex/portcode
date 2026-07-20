@@ -4,7 +4,7 @@
 //! isolation, with no transport or crypto attached yet.
 //!
 //! Both ends are Rust, so `serde` is the entire contract. Frames are encoded as
-//! JSON (`serde_json`): several inner types (`StreamEvent`, `RemoteCommand`) are
+//! JSON (`serde_json`): several inner types (`PhoneStreamEvent`, `RemoteCommand`) are
 //! `#[serde(tag = …)]` internally-tagged enums, which JSON handles cleanly and a
 //! compact binary format (bincode) does not.
 //!
@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::wire::{MessageRow, SessionRow, StreamEvent};
+use crate::wire::{PhoneMessageRow, PhoneSessionRow, PhoneStreamEvent};
 
 // On wasm the protocol types additionally derive `Tsify` so the browser client's
 // TypeScript types are generated from THIS Rust source of truth (§5.4). The derive
@@ -115,13 +115,13 @@ pub enum SyncFrame {
         device_id: String,
         cursors: Vec<Cursor>,
     },
-    /// desktop → phone: the current session list (reuses the desktop `SessionRow`).
-    SessionList { sessions: Vec<SessionRow> },
+    /// desktop → phone: the current projected public session list.
+    SessionList { sessions: Vec<PhoneSessionRow> },
     /// desktop → phone: correlated acknowledgement for a remotely-created
     /// session, allowing the caller to select/open the exact row immediately.
     SessionCreated {
         request_id: String,
-        session: SessionRow,
+        session: PhoneSessionRow,
     },
     /// desktop → phone: a command was safely rejected without closing command
     /// intake. Currently emitted for [`RemoteCommand::CreateSession`] as the
@@ -140,7 +140,7 @@ pub enum SyncFrame {
     /// desktop → phone: append-only catch-up for one session.
     MessageDelta {
         session_id: String,
-        messages: Vec<MessageRow>,
+        messages: Vec<PhoneMessageRow>,
     },
     /// desktop → phone: an OLDER page of one session's history, answering a
     /// [`RemoteCommand::FetchMessages`] (scroll-up pagination). `messages` are the
@@ -150,13 +150,13 @@ pub enum SyncFrame {
     /// recent/new rows): a page is PREPENDED to the held history, a delta appended.
     MessagePage {
         session_id: String,
-        messages: Vec<MessageRow>,
+        messages: Vec<PhoneMessageRow>,
         has_more: bool,
     },
-    /// desktop → phone: a live agent event, forwarded verbatim from `agent://{id}`.
+    /// desktop → phone: a projected, bounded public live event.
     Live {
         session_id: String,
-        event: StreamEvent,
+        event: PhoneStreamEvent,
     },
     /// phone → desktop: drive the session.
     Command { command: RemoteCommand },
@@ -173,8 +173,7 @@ pub enum SyncFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // SessionRow/MessageRow/StreamEvent come via `use super::*`; only Block is new.
-    use crate::wire::Block;
+    use crate::wire::PhoneBlock;
 
     /// Round-trip a frame through JSON and assert the decoded value re-encodes to
     /// the same JSON — the property both ends rely on.
@@ -203,10 +202,10 @@ mod tests {
     }
 
     #[test]
-    fn live_frame_carries_a_streamevent_verbatim() {
+    fn live_frame_carries_a_public_stream_event() {
         let frame = SyncFrame::Live {
             session_id: "s1".into(),
-            event: StreamEvent::TextDelta { text: "hi".into() },
+            event: PhoneStreamEvent::TextDelta { text: "hi".into() },
         };
         let json = serde_json::to_string(&frame).expect("encode");
         // The outer tag and the inner StreamEvent tag both survive.
@@ -232,13 +231,12 @@ mod tests {
     #[test]
     fn session_list_frame_round_trips_with_all_session_row_fields() {
         round_trips(&SyncFrame::SessionList {
-            sessions: vec![SessionRow {
+            sessions: vec![PhoneSessionRow {
                 id: "s1".into(),
                 title: "Alpha".into(),
                 branch: Some("main".into()),
                 workspace: Some("C:/ws".into()),
                 model: Some("claude-opus-4-8".into()),
-                account_profile_id: Some("profile-a".into()),
                 created_at: 1_000_000,
                 updated_at: 2_000_000,
             }],
@@ -249,13 +247,12 @@ mod tests {
     fn session_created_ack_round_trips_with_request_correlation() {
         let frame = SyncFrame::SessionCreated {
             request_id: "create-42".into(),
-            session: SessionRow {
+            session: PhoneSessionRow {
                 id: "s42".into(),
                 title: "New chat".into(),
                 branch: None,
                 workspace: None,
                 model: Some("gpt-5.6-sol".into()),
-                account_profile_id: None,
                 created_at: 10,
                 updated_at: 10,
             },
@@ -316,12 +313,12 @@ mod tests {
         // load-bearing frame in the protocol.
         round_trips(&SyncFrame::MessageDelta {
             session_id: "s1".into(),
-            messages: vec![MessageRow {
+            messages: vec![PhoneMessageRow {
                 id: "m1".into(),
                 session_id: "s1".into(),
                 seq: 3,
                 role: "assistant".into(),
-                content: vec![Block::Text { text: "hi".into() }],
+                content: vec![PhoneBlock::Text { text: "hi".into() }],
                 created_at: 12345,
                 turn_id: None,
                 receipt: None,
@@ -371,12 +368,12 @@ mod tests {
     fn message_page_frame_round_trips_with_has_more() {
         let frame = SyncFrame::MessagePage {
             session_id: "s1".into(),
-            messages: vec![MessageRow {
+            messages: vec![PhoneMessageRow {
                 id: "m1".into(),
                 session_id: "s1".into(),
                 seq: 2,
                 role: "user".into(),
-                content: vec![Block::Text {
+                content: vec![PhoneBlock::Text {
                     text: "older".into(),
                 }],
                 created_at: 999,

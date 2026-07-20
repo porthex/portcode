@@ -547,11 +547,11 @@ function OpenAIAccountSessionGate({ sessionId }: { sessionId: string }) {
 }
 
 const MODE_PRESENTATION: Record<PermissionMode, { label: string; detail: string }> = {
-  default: { label: "Ask", detail: "confirms sensitive actions" },
-  acceptEdits: { label: "Edits allowed", detail: "workspace edits don’t ask" },
+  default: { label: "Ask", detail: "protected actions always ask once" },
+  acceptEdits: { label: "Edits allowed", detail: "edits skip prompts; protected actions ask" },
   plan: { label: "Plan only", detail: "no files will change" },
-  auto: { label: "Auto approve", detail: "broad access" },
-  bypass: { label: "Bypass confirmations", detail: "no confirmations" },
+  auto: { label: "Auto configurable", detail: "protected actions still ask once" },
+  bypass: { label: "Bypass configurable", detail: "protected actions still ask once" },
 };
 
 /** Every desktop permission mode in one explicit, provider-native dropdown. */

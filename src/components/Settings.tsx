@@ -470,17 +470,24 @@ export function SettingsPanel() {
     try {
       setKeyError(null);
       await ipc.setApiKey(apiKey.trim());
-      // Persist the apiKeySet flag directly (not via updateSettings, which swallows
-      // a reject into settingsError and resolves anyway) so a save failure hits this
-      // catch — "Saved" is never shown and the typed value is kept for retry.
-      const next = await ipc.saveSettings({ apiKeySet: true });
-      useStore.setState({ settings: next });
+      // The credential write is the commit point. Drop the raw secret before any
+      // follow-up work, then refresh the derived apiKeySet flag from the native
+      // credential store. A read failure cannot roll the committed credential
+      // back, so keep the UI conservative and mark the key present locally.
       setApiKey("");
+      try {
+        useStore.setState({ settings: await ipc.getSettings() });
+      } catch {
+        useStore.setState((state) => ({
+          settings: { ...state.settings, apiKeySet: true },
+        }));
+      }
       setSavedKey(true);
       if (savedTimer.current !== null) clearTimeout(savedTimer.current);
       savedTimer.current = setTimeout(() => setSavedKey(false), 1800);
     } catch (err) {
-      // Surface the failure and keep the typed value so the user can retry.
+      // Only the credential write itself can fail this operation. Until it
+      // succeeds, retain the typed value so the user can retry.
       setKeyError(err instanceof Error ? err.message : String(err));
     } finally {
       setSaving(false);
@@ -1834,22 +1841,30 @@ function ScaleRow({
 const PERM_TOOLS = ["write_file", "edit_file", "run_command", "*"] as const;
 
 const MODE_INFO: Record<PermissionMode, { label: string; hint: string }> = {
-  default: { label: "Default", hint: "Use the policy below (ask / allow / deny)." },
+  default: {
+    label: "Default",
+    hint: "Use the policy below for configurable actions; protected actions always ask once.",
+  },
   acceptEdits: {
     label: "Accept edits",
-    hint: "Auto-allow file changes; still ask before commands.",
+    hint: "Auto-allow file changes; protected actions always ask once.",
   },
   plan: { label: "Plan", hint: "Read-only — deny every mutating tool." },
-  auto: { label: "Auto", hint: "Auto-allow EVERY mutating tool, including commands." },
-  bypass: { label: "Bypass", hint: "Skip the permission gate entirely." },
+  auto: {
+    label: "Auto",
+    hint: "Auto-allow configurable actions; protected actions always ask once.",
+  },
+  bypass: {
+    label: "Bypass",
+    hint: "Skip prompts and rules for configurable actions; protected actions always ask once.",
+  },
 };
 const MODE_ORDER: PermissionMode[] = ["default", "acceptEdits", "plan", "auto", "bypass"];
 
 /**
  * The permission mode + per-tool/command rule editor. auto/bypass require an
- * explicit danger acknowledgment to engage, and an over-broad allow rule (any
- * tool, or command execution with no prefix) is flagged loudly — the UI guardrails
- * the security review of the gate flagged as the layer that must enforce them.
+ * explicit danger acknowledgment to engage. New command Allow rules are blocked;
+ * the core also enforces that protected actions can only be approved one time.
  */
 function PermissionSettings() {
   const settings = useStore((s) => s.settings);
@@ -1894,13 +1909,13 @@ function PermissionSettings() {
     void updateSettings({ defaultPolicy: policy });
   };
 
-  // An allow rule that matches everything (any tool, or command execution with no
-  // prefix) is the footgun the gate security review flagged — warn loudly.
-  const overBroadAllow =
-    ruleDecision === "allow" &&
-    (ruleTool === "*" || (isCommandToolName(ruleTool) && ruleCommand.trim() === ""));
+  // A wildcard Allow still loosens every configurable action, so warn loudly.
+  const overBroadAllow = ruleDecision === "allow" && ruleTool === "*";
 
   const addRule = () => {
+    // Independent from the decision picker: stale state or a future UI refactor
+    // still cannot create a new shell Allow rule.
+    if (isCommandToolName(ruleTool) && ruleDecision === "allow") return;
     const command = isCommandToolName(ruleTool) && ruleCommand.trim() ? ruleCommand : undefined;
     const rule: Rule = command
       ? { tool: ruleTool, command, decision: ruleDecision }
@@ -1999,8 +2014,8 @@ function PermissionSettings() {
         >
           <p>
             ⚠ <strong className="capitalize">{MODE_INFO[confirmMode].label}</strong> lets the agent
-            run mutating tools — including commands — without asking. Only enable it if you trust
-            the task.
+            run configurable mutations without asking. Commands and other protected actions still
+            require one-time approval. Only enable it if you trust the task.
           </p>
           <div className="mt-2 flex gap-2">
             <button
@@ -2026,7 +2041,7 @@ function PermissionSettings() {
 
       <div id="pc-setting-default-policy" className="mt-3">
         <div className="mb-1 text-[11px] text-faint">
-          Default-mode policy (used when the mode is Default)
+          Default-mode policy for configurable actions (used when the mode is Default)
         </div>
         <div className="flex gap-2">
           {(["allow", "ask", "deny"] as ToolPolicy[]).map((p) => (
@@ -2050,8 +2065,9 @@ function PermissionSettings() {
             className="mt-2 rounded-lg border border-danger/50 bg-danger/10 p-2.5 text-[11.5px] text-danger"
           >
             <p>
-              ⚠ <strong>Allow by default</strong> lets every unmatched tool—including commands—run
-              without asking. Use specific rules when possible.
+              ⚠ <strong>Allow by default</strong> lets every unmatched configurable action run
+              without asking. Protected actions still require one-time approval. Use specific rules
+              when possible.
             </p>
             <div className="mt-2 flex gap-2">
               <button
@@ -2078,11 +2094,11 @@ function PermissionSettings() {
 
       <div id="pc-setting-tool-rules" className="mt-3">
         <div className="mb-1 text-[11px] text-faint">
-          Rules — first match wins, evaluated before the mode default
+          Rules — first match wins; protected one-time approval is enforced last
         </div>
         {rules.length === 0 ? (
           <p className="text-[11px] text-faint">
-            No rules yet. The mode above applies to every tool.
+            No rules yet. The mode above applies to configurable tools; protected actions ask once.
           </p>
         ) : (
           <ul className="flex flex-col gap-1">
@@ -2105,6 +2121,9 @@ function PermissionSettings() {
                   >
                     → {r.decision}
                   </span>
+                  {r.decision === "allow" && isCommandToolName(r.tool) ? (
+                    <span className="ml-1 text-warn">(overridden: asks every time)</span>
+                  ) : null}
                 </span>
                 <button
                   type="button"
@@ -2123,7 +2142,12 @@ function PermissionSettings() {
           <SelectMenu
             label="Rule tool"
             value={ruleTool}
-            onChange={setRuleTool}
+            onChange={(next) => {
+              setRuleTool(next);
+              if (isCommandToolName(next) && ruleDecision === "allow") {
+                setRuleDecision("ask");
+              }
+            }}
             placement="top"
             className="w-[136px]"
             buttonClassName="px-2 py-1.5 font-mono text-[11.5px]"
@@ -2157,10 +2181,10 @@ function PermissionSettings() {
             groups={[
               {
                 id: "decisions",
-                options: (["allow", "ask", "deny"] as ToolPolicy[]).map((decision) => ({
-                  value: decision,
-                  label: decision,
-                })),
+                options: (isCommandToolName(ruleTool)
+                  ? (["ask", "deny"] as ToolPolicy[])
+                  : (["allow", "ask", "deny"] as ToolPolicy[])
+                ).map((decision) => ({ value: decision, label: decision })),
               },
             ]}
           />
@@ -2174,14 +2198,13 @@ function PermissionSettings() {
         </div>
         {overBroadAllow && (
           <p role="alert" className="mt-1.5 text-[11px] text-danger">
-            ⚠ This allow rule matches {ruleTool === "*" ? "every tool" : "every command"} — anything
-            chained after a trusted prefix runs without asking. Prefer a specific tool and command
-            prefix.
+            ⚠ This allow rule matches every configurable tool. Protected actions still ask once.
+            Prefer a specific tool.
           </p>
         )}
         <p className="mt-1.5 text-[11px] text-faint">
-          A command prefix is a literal match — “git ” also matches “git x; rm -rf y”. It’s a
-          convenience, not a guarantee.
+          Command prefixes scope Ask or Deny rules. Historical shell Allow rules remain visible for
+          compatibility, but mandatory approval overrides them.
         </p>
         <p className="mt-1 text-[11px] text-faint">
           Read-only browsing and delegated tasks never require permission rules.

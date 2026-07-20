@@ -439,6 +439,8 @@ Because publishing is the final gate, the cleanest rollback is to **catch it in
 Before cutting a release:
 
 - [ ] CI is **green** on `main` (`ci.yml`, `e2e.yml`).
+- [ ] The [`Release security baseline`](RELEASE_SECURITY_BASELINE_PLAN.md) is
+      marked complete with its focused adversarial tests and final PR CI recorded.
 - [ ] `main` has been **promoted to `release`** (PR `main → release` merged, or
       fast-forwarded).
 - [ ] The `release` **environment** exists with **all 8 secrets** and **≥ 2

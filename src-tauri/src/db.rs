@@ -918,7 +918,7 @@ impl Db {
         Ok(result)
     }
 
-    fn require_session(&self, id: &str) -> rusqlite::Result<()> {
+    pub(crate) fn require_session(&self, id: &str) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         let exists = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",

@@ -1,6 +1,7 @@
 //! Tool system. Each tool declares a JSON schema (sent to the model) and an
-//! async `run`. Tools flagged `mutating()` route through the permission gate
-//! before executing; read-only tools run immediately.
+//! async `run`. Every tool declares its permission risk explicitly: read-only
+//! tools run immediately, while configurable and protected mutations route
+//! through the permission gate before executing.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -9,8 +10,10 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::tool_names;
+use portcode_sync::wire::PermissionRisk;
 
 pub struct ToolCtx {
     pub workspace: PathBuf,
@@ -78,10 +81,11 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &'static str;
     fn input_schema(&self) -> Value;
 
-    /// Mutating tools (write / edit / command) go through the permission gate.
-    fn mutating(&self) -> bool {
-        false
-    }
+    /// Required classification for the authorization boundary. `None` is an
+    /// explicitly reviewed read-only/delegation tool; every other value reaches
+    /// the Rust permission gate. There is deliberately no default so a newly
+    /// registered tool cannot become ungated by omission.
+    fn permission_risk(&self) -> Option<PermissionRisk>;
 
     /// Short human-readable summary of a call, for the permission prompt. Takes
     /// `ctx` so a tool can resolve a path to its real destination (so an "ask"
@@ -366,6 +370,9 @@ impl Tool for FsRead {
             "required": ["path"]
         })
     }
+    fn permission_risk(&self) -> Option<PermissionRisk> {
+        None
+    }
     async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String, String> {
         let base = base_dir(ctx)?;
         let p = str_arg(&input, "path")?;
@@ -394,6 +401,9 @@ impl Tool for ListDir {
                 "path": { "type": "string", "description": "Directory path relative to the workspace root. Defaults to '.'." }
             }
         })
+    }
+    fn permission_risk(&self) -> Option<PermissionRisk> {
+        None
     }
     async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String, String> {
         let base = base_dir(ctx)?;
@@ -439,6 +449,9 @@ impl Tool for GlobTool {
             },
             "required": ["pattern"]
         })
+    }
+    fn permission_risk(&self) -> Option<PermissionRisk> {
+        None
     }
     async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String, String> {
         let base = base_dir(ctx)?;
@@ -494,6 +507,9 @@ impl Tool for GrepTool {
             },
             "required": ["pattern"]
         })
+    }
+    fn permission_risk(&self) -> Option<PermissionRisk> {
+        None
     }
     async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String, String> {
         let base = base_dir(ctx)?;
@@ -568,8 +584,8 @@ impl Tool for FsWrite {
             "required": ["path", "content"]
         })
     }
-    fn mutating(&self) -> bool {
-        true
+    fn permission_risk(&self) -> Option<PermissionRisk> {
+        Some(PermissionRisk::Configurable)
     }
     /// Show the RESOLVED absolute destination in the permission prompt, not the raw
     /// argument, so a benign-looking relative path (or one that traverses a symlink/
@@ -660,8 +676,8 @@ impl Tool for FsEdit {
             "required": ["path", "old_string", "new_string"]
         })
     }
-    fn mutating(&self) -> bool {
-        true
+    fn permission_risk(&self) -> Option<PermissionRisk> {
+        Some(PermissionRisk::Configurable)
     }
     /// Preview the edit as a diff without writing — exactly the change `run`
     /// would apply (both go through `compute_edit`). Returns `None` if anything
@@ -713,17 +729,121 @@ impl Tool for FsEdit {
 
 struct Shell;
 
-/// Resolve a requested shell to its executable and the leading args that make it
-/// run a single command string. PowerShell variants run non-interactively and
-/// skip the user profile so output is predictable and they never hang on a prompt.
-fn shell_invocation(shell: &str) -> Result<(&'static str, &'static [&'static str]), String> {
+/// Maximum retained bytes from each child pipe. The drain continues after this
+/// prefix is full so a noisy child cannot deadlock on a full pipe, while memory
+/// use stays fixed for foreground and background commands.
+const SHELL_PIPE_LIMIT: usize = 50_000;
+
+struct BoundedPipe {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+pub(crate) struct BoundedShellOutput {
+    pub(crate) status: std::process::ExitStatus,
+    stdout: BoundedPipe,
+    stderr: BoundedPipe,
+}
+
+async fn read_bounded_pipe(
+    mut reader: impl AsyncRead + Unpin,
+    limit: usize,
+) -> std::io::Result<BoundedPipe> {
+    let mut bytes = Vec::with_capacity(limit.min(8192));
+    let mut truncated = false;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(bytes.len());
+        let keep = remaining.min(read);
+        bytes.extend_from_slice(&chunk[..keep]);
+        truncated |= keep < read;
+    }
+    Ok(BoundedPipe { bytes, truncated })
+}
+
+/// Wait for a piped child while draining stdout and stderr concurrently with a
+/// fixed retained prefix. Dropping this future drops the kill-on-drop child.
+pub(crate) async fn wait_with_bounded_output(
+    mut child: tokio::process::Child,
+) -> std::io::Result<BoundedShellOutput> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("child stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("child stderr was not piped"))?;
+    let (status, stdout, stderr) = tokio::join!(
+        child.wait(),
+        read_bounded_pipe(stdout, SHELL_PIPE_LIMIT),
+        read_bounded_pipe(stderr, SHELL_PIPE_LIMIT),
+    );
+    Ok(BoundedShellOutput {
+        status: status?,
+        stdout: stdout?,
+        stderr: stderr?,
+    })
+}
+
+#[cfg(windows)]
+fn default_shell() -> &'static str {
+    "powershell"
+}
+
+#[cfg(not(windows))]
+fn default_shell() -> &'static str {
+    "sh"
+}
+
+/// Resolve a requested shell to an absolute executable and the leading args that
+/// run one command string without user profiles or Windows cmd AutoRun hooks.
+#[cfg(windows)]
+fn shell_invocation(shell: &str) -> Result<(PathBuf, &'static [&'static str]), String> {
+    let system_root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| "Windows system directory is unavailable".to_string())?;
     match shell {
-        "powershell" => Ok(("powershell", &["-NoProfile", "-NonInteractive", "-Command"])),
-        "pwsh" => Ok(("pwsh", &["-NoProfile", "-NonInteractive", "-Command"])),
-        "cmd" => Ok(("cmd", &["/C"])),
+        "powershell" => Ok((
+            system_root
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe"),
+            &["-NoProfile", "-NonInteractive", "-Command"],
+        )),
+        "pwsh" => crate::process_env::resolve_in_sanitized_path(
+            std::ffi::OsStr::new("pwsh.exe"),
+            crate::process_env::ChildKind::AgentShell,
+        )
+        .map(|path| {
+            (
+                path,
+                &["-NoProfile", "-NonInteractive", "-Command"] as &'static [&'static str],
+            )
+        })
+        .ok_or_else(|| "PowerShell 7 (pwsh.exe) was not found in the reviewed PATH".to_string()),
+        "cmd" => Ok((
+            system_root.join("System32").join("cmd.exe"),
+            &["/D", "/S", "/C"],
+        )),
         other => Err(format!(
             "unknown shell '{other}'; expected one of: powershell, pwsh, cmd"
         )),
+    }
+}
+
+#[cfg(not(windows))]
+fn shell_invocation(shell: &str) -> Result<(PathBuf, &'static [&'static str]), String> {
+    match shell {
+        "sh" => Ok((PathBuf::from("/bin/sh"), &["-c"])),
+        other => Err(format!("unknown shell '{other}'; expected: sh")),
     }
 }
 
@@ -738,9 +858,21 @@ fn build_shell_command(
 ) -> Result<tokio::process::Command, String> {
     let (program, leading_args) = shell_invocation(shell)?;
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(leading_args)
-        .arg(command)
-        .current_dir(workspace)
+    crate::process_env::apply_to_tokio(&mut cmd, crate::process_env::ChildKind::AgentShell);
+
+    #[cfg(windows)]
+    if shell == "cmd" {
+        // cmd.exe parses its command line itself instead of using
+        // CommandLineToArgvW. Keep AutoRun disabled and pass one quoted command
+        // string literally so Rust's generic argument quoting cannot rewrite it.
+        cmd.raw_arg(format!("/D /S /C \"{command}\""));
+    } else {
+        cmd.args(leading_args).arg(command);
+    }
+    #[cfg(not(windows))]
+    cmd.args(leading_args).arg(command);
+
+    cmd.current_dir(workspace)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -759,15 +891,24 @@ fn build_shell_command(
     Ok(cmd)
 }
 
-/// Format a finished process's combined stdout/stderr and exit code into the
-/// agent-facing result string. Shared by the foreground run and the background
-/// waiter so both report identically.
-pub(crate) fn format_shell_output(out: &std::process::Output) -> String {
+fn format_shell_parts(
+    status: std::process::ExitStatus,
+    stdout_bytes: &[u8],
+    stdout_truncated: bool,
+    stderr_bytes: &[u8],
+    stderr_truncated: bool,
+) -> String {
     let mut buf = String::new();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(stdout_bytes);
+    let stderr = String::from_utf8_lossy(stderr_bytes);
     if !stdout.trim().is_empty() {
         buf.push_str(&stdout);
+    }
+    if stdout_truncated {
+        if !buf.ends_with('\n') {
+            buf.push('\n');
+        }
+        buf.push_str("[stdout truncated]\n");
     }
     if !stderr.trim().is_empty() {
         if !buf.is_empty() {
@@ -776,11 +917,33 @@ pub(crate) fn format_shell_output(out: &std::process::Output) -> String {
         buf.push_str("[stderr]\n");
         buf.push_str(&stderr);
     }
-    let code = out.status.code().unwrap_or(-1);
+    if stderr_truncated {
+        if !buf.ends_with('\n') {
+            buf.push('\n');
+        }
+        buf.push_str("[stderr truncated]\n");
+    }
+    let code = status.code().unwrap_or(-1);
     if buf.trim().is_empty() {
         buf = "(no output)".into();
     }
-    format!("{}\n\n[exit code {code}]", truncate_chars(buf, 100_000))
+    format!("{}\n\n[exit code {code}]", buf.trim_end())
+}
+
+/// Format the fixed-memory capture shared by foreground and background commands.
+pub(crate) fn format_bounded_shell_output(out: &BoundedShellOutput) -> String {
+    format_shell_parts(
+        out.status,
+        &out.stdout.bytes,
+        out.stdout.truncated,
+        &out.stderr.bytes,
+        out.stderr.truncated,
+    )
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn format_shell_output(out: &std::process::Output) -> String {
+    format_shell_parts(out.status, &out.stdout, false, &out.stderr, false)
 }
 
 #[async_trait]
@@ -789,23 +952,42 @@ impl Tool for Shell {
         tool_names::RUN_COMMAND
     }
     fn description(&self) -> &'static str {
-        "Run a shell command in the workspace. Defaults to PowerShell (Windows PowerShell 5.1, \
+        #[cfg(windows)]
+        {
+            "Run a shell command in the workspace. Defaults to PowerShell (Windows PowerShell 5.1, \
          powershell.exe); set `shell` to \"pwsh\" for PowerShell 7+ or \"cmd\" for the legacy \
          Windows command prompt. PowerShell and cmd differ in quoting, path, and exit-code \
          semantics, so write the command for the shell you select. Returns combined stdout/stderr \
          and the exit code. Set `background: true` for a long-running command (server, build, \
          watcher): it returns immediately with a task id and reports its result when it finishes, \
          instead of blocking."
+        }
+        #[cfg(not(windows))]
+        {
+            "Run a /bin/sh command with the workspace as its current directory. Returns bounded \
+             combined stdout/stderr and the exit code. Set `background: true` for a long-running \
+             command so it returns immediately and reports its result when it finishes."
+        }
     }
     fn input_schema(&self) -> Value {
+        #[cfg(windows)]
+        let (shells, default_description) = (
+            vec!["powershell", "pwsh", "cmd"],
+            "Shell to run. powershell is the default; pwsh selects PowerShell 7+; cmd selects the legacy command prompt.",
+        );
+        #[cfg(not(windows))]
+        let (shells, default_description) = (
+            vec!["sh"],
+            "Shell to run. /bin/sh is the only supported value and the default.",
+        );
         json!({
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "Command line to execute." },
                 "shell": {
                     "type": "string",
-                    "enum": ["powershell", "pwsh", "cmd"],
-                    "description": "Shell to run the command in. \"powershell\" = Windows PowerShell 5.1 (default), \"pwsh\" = PowerShell 7+, \"cmd\" = legacy command prompt."
+                    "enum": shells,
+                    "description": default_description
                 },
                 "background": {
                     "type": "boolean",
@@ -815,15 +997,15 @@ impl Tool for Shell {
             "required": ["command"]
         })
     }
-    fn mutating(&self) -> bool {
-        true
+    fn permission_risk(&self) -> Option<PermissionRisk> {
+        Some(PermissionRisk::Shell)
     }
     async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String, String> {
         let command = str_arg(&input, "command")?;
         let shell = input
             .get("shell")
             .and_then(|v| v.as_str())
-            .unwrap_or("powershell");
+            .unwrap_or(default_shell());
         let background = input
             .get("background")
             .and_then(|v| v.as_bool())
@@ -860,21 +1042,21 @@ impl Tool for Shell {
             ));
         }
 
-        let out = tokio::time::timeout(Duration::from_secs(120), child.wait_with_output())
+        let out = tokio::time::timeout(Duration::from_secs(120), wait_with_bounded_output(child))
             .await
             .map_err(|_| "command timed out after 120s".to_string())?
             .map_err(|e| format!("command failed: {e}"))?;
         if let Some(mutation) = mutation {
             mutation.finish_observed();
         }
-        Ok(format_shell_output(&out))
+        Ok(format_bounded_shell_output(&out))
     }
 }
 
 /// Launch an autonomous subagent. The subagent gets its own tools and a fresh
 /// context, works through the task on its own, and returns a single final summary
 /// — its only output to the launching agent. The launch itself is NOT gated
-/// (`mutating()` stays false): every mutating tool the subagent runs still goes
+/// (`permission_risk()` is `None`): every mutating tool the subagent runs still goes
 /// through the permission gate, so nothing it does escapes the user's control.
 struct Task;
 
@@ -900,6 +1082,9 @@ impl Tool for Task {
             },
             "required": ["description", "prompt"]
         })
+    }
+    fn permission_risk(&self) -> Option<PermissionRisk> {
+        None
     }
     async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String, String> {
         let prompt = str_arg(&input, "prompt")?.to_string();
@@ -1226,16 +1411,70 @@ mod tests {
         assert!(out.contains("[output truncated at 5 characters]"));
     }
 
+    #[tokio::test]
+    async fn bounded_pipe_retains_only_the_limit_but_drains_to_eof() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(32);
+        let producer = tokio::spawn(async move {
+            writer.write_all(&vec![b'x'; 10_000]).await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+        let captured = read_bounded_pipe(reader, 37).await.unwrap();
+        producer.await.unwrap();
+
+        assert_eq!(captured.bytes, vec![b'x'; 37]);
+        assert!(captured.truncated);
+    }
+
+    #[cfg(windows)]
     #[test]
-    fn shell_invocation_maps_known_shells_and_rejects_unknown() {
+    fn shell_invocation_maps_windows_shells_to_reviewed_executables() {
         let (prog, args) = shell_invocation("powershell").unwrap();
-        assert_eq!(prog, "powershell");
+        assert!(prog.is_absolute());
+        assert!(prog.ends_with("WindowsPowerShell/v1.0/powershell.exe"));
         assert!(args.contains(&"-NonInteractive"));
-        assert_eq!(shell_invocation("pwsh").unwrap().0, "pwsh");
         let (cprog, cargs) = shell_invocation("cmd").unwrap();
-        assert_eq!(cprog, "cmd");
-        assert_eq!(cargs.len(), 1);
-        assert_eq!(cargs[0], "/C");
+        assert!(cprog.is_absolute());
+        assert!(cprog.ends_with("System32/cmd.exe"));
+        assert_eq!(cargs, &["/D", "/S", "/C"]);
+        assert!(shell_invocation("bash")
+            .unwrap_err()
+            .contains("unknown shell"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cmd_shell_uses_its_native_command_line_parser() {
+        let workspace = std::env::current_dir().unwrap();
+        let output = build_shell_command(
+            r#"echo "PORTCODE CMD QUOTED"&echo PORTCODE_CMD_CHAINED"#,
+            "cmd",
+            &workspace,
+        )
+        .unwrap()
+        .output()
+        .await
+        .unwrap();
+
+        assert!(
+            output.status.success(),
+            "cmd failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.lines().collect::<Vec<_>>(),
+            [r#""PORTCODE CMD QUOTED""#, "PORTCODE_CMD_CHAINED"]
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn shell_invocation_uses_absolute_bin_sh_and_rejects_other_shells() {
+        let (program, args) = shell_invocation("sh").unwrap();
+        assert_eq!(program, PathBuf::from("/bin/sh"));
+        assert_eq!(args, &["-c"]);
         assert!(shell_invocation("bash")
             .unwrap_err()
             .contains("unknown shell"));
@@ -1245,7 +1484,7 @@ mod tests {
     fn build_shell_command_rejects_an_unknown_shell_and_accepts_known_ones() {
         // Propagates the shell_invocation error (no process is spawned here).
         assert!(build_shell_command("echo hi", "bash", Path::new(".")).is_err());
-        assert!(build_shell_command("echo hi", "cmd", Path::new(".")).is_ok());
+        assert!(build_shell_command("echo hi", default_shell(), Path::new(".")).is_ok());
     }
 
     #[tokio::test]
@@ -1345,6 +1584,29 @@ mod tests {
     }
 
     #[test]
+    fn every_default_tool_has_the_reviewed_permission_classification() {
+        let registry = default_registry();
+        let actual: Vec<(&str, Option<PermissionRisk>)> = registry
+            .tools
+            .iter()
+            .map(|tool| (tool.name(), tool.permission_risk()))
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                (tool_names::READ_FILE, None),
+                (tool_names::LIST_DIRECTORY, None),
+                (tool_names::FIND_FILES, None),
+                (tool_names::SEARCH_TEXT, None),
+                (tool_names::WRITE_FILE, Some(PermissionRisk::Configurable)),
+                (tool_names::EDIT_FILE, Some(PermissionRisk::Configurable)),
+                (tool_names::RUN_COMMAND, Some(PermissionRisk::Shell)),
+                (tool_names::DELEGATE_TASK, None),
+            ]
+        );
+    }
+
+    #[test]
     fn legacy_names_dispatch_to_their_canonical_tools_without_being_advertised() {
         let registry = default_registry();
         let advertised = spec_names(&registry);
@@ -1438,7 +1700,7 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("not available"), "got: {err}");
         // `task` is never gated: the subagent's own tools carry the permission.
-        assert!(!Task.mutating());
+        assert_eq!(Task.permission_risk(), None);
     }
 
     #[tokio::test]

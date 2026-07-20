@@ -10,12 +10,13 @@
 //!
 //! The desktop's agent loop already persists an append-only message log and emits
 //! a typed [`StreamEvent`](crate::llm::StreamEvent) stream on `agent://{id}`. The
-//! hub taps that emit so a future transport can forward it untouched — the desktop
-//! keeps doing all the work; the phone is only ever a mirror + remote control.
+//! hub taps that emit and exhaustively projects them into public bounded DTOs —
+//! the desktop keeps doing all the work; the phone is only a mirror + remote control.
 
 pub mod client;
 pub mod noise;
 pub mod pairing;
+pub mod public;
 // DESKTOP-ONLY: the device-trust gate (pairing window + pending-confirm map) is
 // part of the accept-loop SERVER. The phone is a pure CLIENT and never gates an
 // inbound peer, so this is excluded from the mobile binary alongside `server`.
@@ -34,8 +35,11 @@ pub mod transport;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::broadcast;
 
+use std::sync::{Arc, Mutex};
+
 use crate::llm::StreamEvent;
 use protocol::SyncFrame;
+use public::PhoneEventProjector;
 
 /// Capacity of the broadcast ring buffer. A subscriber that falls more than this
 /// many events behind gets a `Lagged` signal and must re-sync from the DB via the
@@ -53,6 +57,7 @@ const AGENT_CHANNEL_PREFIX: &str = "agent://";
 #[derive(Clone)]
 pub struct SyncHub {
     tx: broadcast::Sender<SyncFrame>,
+    projector: Arc<Mutex<PhoneEventProjector>>,
 }
 
 impl Default for SyncHub {
@@ -64,7 +69,10 @@ impl Default for SyncHub {
 impl SyncHub {
     pub fn new() -> Self {
         let (tx, _rx) = broadcast::channel(HUB_CAPACITY);
-        Self { tx }
+        Self {
+            tx,
+            projector: Arc::new(Mutex::new(PhoneEventProjector::new())),
+        }
     }
 
     /// Attach a new sync session. The receiver observes every frame published
@@ -72,7 +80,17 @@ impl SyncHub {
     // TODO(phase-2): the consuming sync session must handle `RecvError::Lagged(n)`
     // by re-syncing from the DB (`messages_since`) instead of unwrapping the recv.
     pub fn subscribe(&self) -> broadcast::Receiver<SyncFrame> {
-        self.tx.subscribe()
+        let starts_new_generation = self.tx.receiver_count() == 0;
+        let receiver = self.tx.subscribe();
+        if starts_new_generation {
+            // A TextDelta may have been held when the previous last subscriber
+            // disconnected. Catch-up owns reconciliation for this new connection;
+            // never flush an old tail after it as a duplicate/out-of-order frame.
+            if let Ok(mut projector) = self.projector.lock() {
+                projector.clear();
+            }
+        }
+        receiver
     }
 
     /// Number of attached sync sessions (0 when no phone is connected).
@@ -93,20 +111,26 @@ impl SyncHub {
         if self.subscriber_count() == 0 {
             return false;
         }
-        let session_id = channel
-            .strip_prefix(AGENT_CHANNEL_PREFIX)
-            .unwrap_or(channel)
-            .to_string();
+        let Some(session_id) = channel.strip_prefix(AGENT_CHANNEL_PREFIX) else {
+            return false;
+        };
         // Subagent stream channels are `agent://{session}:{agentId}`, so the
         // recovered id carries a ':'. The phone has no view for a subagent's private
         // transcript, and `applyRemoteEvent` keys frames by session id — mirroring
         // these would only spawn a phantom session. Skip them. (A subagent's
         // permission prompts route on the PARENT channel, so they still reach the
         // phone.) A real session id is a UUID and never contains ':'.
-        if session_id.contains(':') {
+        if !public::valid_remote_identifier(session_id) {
             return false;
         }
-        self.tx.send(SyncFrame::Live { session_id, event }).is_ok()
+        let Ok(mut projector) = self.projector.lock() else {
+            return false;
+        };
+        let mut published = false;
+        for frame in projector.project_frames(session_id, &event) {
+            published = self.tx.send(frame).is_ok() || published;
+        }
+        published
     }
 
     /// Publish an arbitrary [`SyncFrame`] to attached sync sessions. Returns `true`
@@ -149,11 +173,18 @@ pub fn emit_event(app: &AppHandle, channel: &str, event: StreamEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // StreamEvent/SyncFrame come via `use super::*`; only TryRecvError is new.
+    use portcode_sync::wire::PhoneStreamEvent;
     use tokio::sync::broadcast::error::TryRecvError;
 
     fn delta() -> StreamEvent {
         StreamEvent::TextDelta { text: "hi".into() }
+    }
+
+    fn usage() -> StreamEvent {
+        StreamEvent::Usage {
+            input_tokens: 1,
+            output_tokens: 2,
+        }
     }
 
     #[test]
@@ -171,15 +202,23 @@ mod tests {
 
         // `broadcast::send` is synchronous, so `try_recv` right after it is not
         // racy and needs no runtime.
-        assert!(hub.publish("agent://s1", delta()));
+        assert!(!hub.publish("agent://s1", delta()));
+        assert!(hub.publish("agent://s1", usage()));
 
         match rx.try_recv() {
             Ok(SyncFrame::Live { session_id, event }) => {
                 assert_eq!(session_id, "s1"); // "agent://" prefix stripped
-                assert!(matches!(event, StreamEvent::TextDelta { text } if text == "hi"));
+                assert!(matches!(event, PhoneStreamEvent::TextDelta { text } if text == "hi"));
             }
             other => panic!("expected a Live frame, got {other:?}"),
         }
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SyncFrame::Live {
+                event: PhoneStreamEvent::Usage { .. },
+                ..
+            })
+        ));
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
@@ -190,7 +229,7 @@ mod tests {
         let mut b = hub.subscribe();
         assert_eq!(hub.subscriber_count(), 2);
 
-        assert!(hub.publish("agent://s9", delta()));
+        assert!(hub.publish("agent://s9", usage()));
 
         for rx in [&mut a, &mut b] {
             assert!(matches!(
@@ -201,14 +240,11 @@ mod tests {
     }
 
     #[test]
-    fn a_channel_without_the_prefix_passes_through_unchanged() {
+    fn a_channel_without_the_prefix_is_rejected() {
         let hub = SyncHub::new();
         let mut rx = hub.subscribe();
-        assert!(hub.publish("s1", delta()));
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(SyncFrame::Live { session_id, .. }) if session_id == "s1"
-        ));
+        assert!(!hub.publish("s1", usage()));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]
@@ -223,12 +259,12 @@ mod tests {
         let mut rx = hub.subscribe();
         assert_eq!(hub.subscriber_count(), 1);
 
-        assert!(!hub.publish("agent://sess-1:agent-abc", delta()));
+        assert!(!hub.publish("agent://sess-1:agent-abc", usage()));
         // Nothing was broadcast for the subagent channel.
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
 
         // The parent channel for the same session is still mirrored.
-        assert!(hub.publish("agent://sess-1", delta()));
+        assert!(hub.publish("agent://sess-1", usage()));
         assert!(matches!(
             rx.try_recv(),
             Ok(SyncFrame::Live { session_id, .. }) if session_id == "sess-1"
@@ -246,5 +282,29 @@ mod tests {
         drop(rx);
         assert_eq!(hub.subscriber_count(), 0);
         assert!(!hub.publish("agent://s1", delta()));
+    }
+
+    #[test]
+    fn a_new_subscriber_generation_never_receives_a_stale_held_text_tail() {
+        let hub = SyncHub::new();
+        let first = hub.subscribe();
+        assert!(!hub.publish(
+            "agent://s1",
+            StreamEvent::TextDelta {
+                text: "held for first phone".into(),
+            },
+        ));
+        drop(first);
+
+        let mut second = hub.subscribe();
+        assert!(hub.publish("agent://s1", usage()));
+        assert!(matches!(
+            second.try_recv(),
+            Ok(SyncFrame::Live {
+                event: PhoneStreamEvent::Usage { .. },
+                ..
+            })
+        ));
+        assert!(matches!(second.try_recv(), Err(TryRecvError::Empty)));
     }
 }

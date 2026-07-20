@@ -6,7 +6,8 @@
 
 ## Supporting documents
 
-- Release gates: [`RELEASE.md`](RELEASE.md)
+- Release gates and security boundary: [`RELEASE.md`](RELEASE.md) and
+  [`RELEASE_SECURITY_BASELINE_PLAN.md`](RELEASE_SECURITY_BASELINE_PLAN.md)
 - Phone clients and device evidence: [`ANDROID_APP_PLAN.md`](ANDROID_APP_PLAN.md),
   [`IOS_WEB_CLIENT_PLAN.md`](IOS_WEB_CLIENT_PLAN.md), and the
   [iOS connection spike](../spike/ios-iroh-echo/README.md)
@@ -17,23 +18,23 @@
 - Deferred concepts and operational guides: [`REPO_MODE_PLAN.md`](REPO_MODE_PLAN.md)
   and [`SELF_DEV.md`](SELF_DEV.md)
 
-## Progress snapshot — 2026-07-20
+## Progress snapshot — 2026-07-21
 
 Percentages hid whether evidence was code, automated testing, manual testing, or
 external acceptance. This snapshot uses explicit evidence states instead.
 
-| Track                           | Evidence state                                   | Missing proof or implementation                                                        |
-| ------------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------- |
-| Multiple ChatGPT accounts       | **Implementation and local acceptance complete** | GitHub PR CI/merge; owner-credential live smoke remains a broad-release gate           |
-| Desktop/release roadmap         | **Foundations implemented**                      | Security baseline, deterministic acceptance, rehearsal, signing, live checks           |
-| Android remote client           | **Scaffolded; correctness blockers found**       | Initial catch-up, mobile capability boundary, verified trust, CI, device evidence      |
-| iOS/web client                  | **Scaffolded; correctness blockers found**       | Reconnect pattern, private-key persistence, lifecycle redial, cursors, relay/PWA CI    |
-| OpenAI subscription integration | **Transport implemented**                        | Per-profile hardening, catalog cache, retries, local telemetry, broad-release approval |
-| Git Review workspace            | **Phase 1 implemented**                          | Large-diff UX, structured read-only review, persistence, Fix handoff                   |
-| Turn completion receipts        | **Lifecycle implemented**                        | Terminal immutability repair, patch blobs, retention, exact historical anchors         |
-| Self-dev mode                   | **Deferred from this execution**                 | Optional Phase 2 remains deliberately unscheduled                                      |
-| Repo Mode                       | **Proposal only**                                | Re-grounding, one Git engine, GitHub auth decision, executable security bootstrap      |
-| iOS connection spike            | **Harness only**                                 | No recorded physical-device go/no-go result                                            |
+| Track                           | Evidence state                                       | Missing proof or implementation                                                         |
+| ------------------------------- | ---------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| Multiple ChatGPT accounts       | **Merged in PR #130; automated acceptance complete** | Owner-credential live smoke remains a broad-release gate                                |
+| Desktop/release roadmap         | **Security baseline complete in PR #131**            | Deterministic acceptance, rehearsal, signing, and live checks                           |
+| Android remote client           | **Scaffolded; correctness blockers found**           | Initial catch-up, capability/trust boundary, permission ack/replay, CI, device evidence |
+| iOS/web client                  | **Scaffolded; correctness blockers found**           | Reconnect, key persistence, permission ack/replay, lifecycle/cursors, relay/PWA CI      |
+| OpenAI subscription integration | **Transport implemented**                            | Per-profile hardening, catalog cache, retries, local telemetry, broad-release approval  |
+| Git Review workspace            | **Phase 1 implemented**                              | Large-diff UX, structured read-only review, persistence, Fix handoff                    |
+| Turn completion receipts        | **Lifecycle implemented**                            | Terminal immutability repair, patch blobs, retention, exact historical anchors          |
+| Self-dev mode                   | **Deferred from this execution**                     | Optional Phase 2 remains deliberately unscheduled                                       |
+| Repo Mode                       | **Proposal only**                                    | Re-grounding, one Git engine, GitHub auth decision, executable security bootstrap       |
+| iOS connection spike            | **Harness only**                                     | No recorded physical-device go/no-go result                                             |
 
 The retired parity tracker was **57% complete as a checklist**, but it was not a
 coherent feature. It remains historical only; its unfinished items are represented
@@ -49,20 +50,26 @@ required device, credential, or owner decision is available.
 
 ### Executable now
 
-1. **Multiple ChatGPT accounts (P0).** Replace singleton OpenAI subscription
-   state with crash-safe native profiles, pin every OpenAI session and complete
-   turn to one profile, propagate an immutable identity through root/subagents,
-   and add fast account selection plus Settings management.
+1. **Multiple ChatGPT accounts (P0) — complete in
+   [PR #130](https://github.com/porthex/portcode/pull/130).** Singleton OpenAI
+   subscription state is now represented by crash-safe native profiles; every
+   OpenAI session and completed turn is pinned to one profile; identity is
+   immutable through root/subagents; and account selection/management is shipped.
    - **Dependency:** existing direct-subscription transport and capability gate.
-   - **Done when:** the plan's migration, identity, concurrency, UX, redaction,
-     Rust, and frontend-coverage acceptance evidence is green.
-2. **Release security baseline (P0).** Scrub shell subprocess environments to a
-   reviewed allowlist; project phone-bound `StreamEvent` data through a bounded,
-   default-deny schema with credential redaction; and define an always-ask floor
-   for shell, install, and future high-risk Git actions.
+   - **Evidence:** the plan's migration, identity, concurrency, UX, redaction,
+     Rust, frontend-coverage, PR CI, and merge acceptance is green.
+2. **Release security baseline (P0) — complete in
+   [PR #131](https://github.com/porthex/portcode/pull/131).** Scrub shell
+   subprocess environments to a reviewed allowlist; project phone-bound
+   `StreamEvent` data through a bounded, default-deny schema with credential
+   redaction; and define an always-ask floor for shell, install, and future
+   high-risk Git actions.
    - **Dependency:** none.
-   - **Done when:** focused Rust tests prove disallowed environment variables and
-     raw tool payloads cannot cross these boundaries.
+   - **Evidence:** focused adversarial tests, documented local automated gates,
+     and exact-head CI/Android/E2E acceptance are green.
+   - **Deferred:** permission-response acknowledgement and idempotent replay
+     remain in the Android/iOS correctness plans; physical-device,
+     live-provider, and signing evidence remain external gates.
 3. **Deterministic desktop acceptance (P0).** Exercise session → mocked turn →
    permission → tool → persistence → process restart, including explicit
    interrupted-run behavior.
@@ -71,13 +78,15 @@ required device, credential, or owner decision is available.
      the broken boundary.
 4. **Android protocol and security correctness (P0).** Repair initial Hello/
    catch-up, remove credential-management commands from the mobile boundary,
-   persist trust only after SAS verification, and make Android CI mandatory.
+   persist trust only after SAS verification, add acknowledged/idempotent replay
+   for permission decisions across link loss, and make Android CI mandatory.
    - **Dependency:** release security baseline.
    - **Done when:** production client catch-up and capability-boundary regression
      tests pass before physical-device acceptance is claimed.
 5. **iOS/web protocol and security correctness (P0).** Standardize reconnect
    handshakes, persist the browser private identity only after SAS verification,
-   make lifecycle redial and durable cursors real, and add web/PWA CI gates.
+   make lifecycle redial and durable cursors real, replay unacknowledged permission
+   decisions idempotently, and add web/PWA CI gates.
    - **Dependency:** release security baseline.
    - **Done when:** reconnect, lifecycle, cursor, relay, and browser security tests
      pass before physical-device acceptance is claimed.
@@ -216,7 +225,7 @@ blocks the base desktop v1 release is an explicit product-scope decision.
 
 ## Milestone 7 — Stabilize and release
 
-- [ ] Harden shell environment inheritance and phone-bound event projection
+- [x] Harden shell environment inheritance and phone-bound event projection
 - [ ] Add a deterministic full acceptance path: session → mocked turn → permission → tool → restart
 - [ ] Rehearse packaging, install/update, checksums, and SBOM without production signing
 - [ ] Run the signed Windows release workflow into a **draft** GitHub Release

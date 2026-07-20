@@ -20,8 +20,8 @@ const m = vi.mocked(ipc);
 const initialState = useStore.getState();
 
 // The buttons fire-and-forget the async action (`void resolve(...)`). The
-// allow-always path awaits saveSettings *then* resolvePermission, so we drain
-// the whole microtask queue (a single Promise.resolve only clears one await).
+// allow-always resolves the gate and then awaits the optional settings save, so
+// drain the whole microtask queue (one Promise.resolve only clears one await).
 const flush = () => new Promise<void>((r) => setTimeout(r, 0));
 
 const pending = (over: Partial<PendingPermission> = {}): PendingPermission => ({
@@ -82,6 +82,41 @@ describe("PermissionPrompt", () => {
     expect(screen.getByRole("button", { name: "Always allow" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "⏎ Deny" })).toBeInTheDocument();
   });
+
+  it.each(["shell", "dependencyInstall", "highRiskGit", "unknown", "futureRisk"] as const)(
+    "makes %s approvals one-shot and hides Always allow",
+    (risk) => {
+      useStore.setState({
+        pendingPermission: pending({ tool: "run_command", risk, summary: "echo safe" }),
+      });
+
+      render(<PermissionPrompt />);
+
+      expect(screen.getByRole("button", { name: "Allow" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Always allow" })).not.toBeInTheDocument();
+      expect(screen.getByText(/requires one-time approval/i)).toBeInTheDocument();
+      expect(screen.getByText(/Auto, Bypass, and saved rules cannot skip it/i)).toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    ["remote shell", { remoteMode: true }],
+    ["active remote link", { remoteConnected: true }],
+  ] as const)(
+    "makes every %s approval one-shot even when its risk is configurable",
+    (_name, state) => {
+      useStore.setState({
+        ...state,
+        pendingPermission: pending({ risk: "configurable" }),
+      });
+
+      render(<PermissionPrompt />);
+
+      expect(screen.queryByRole("button", { name: "Always allow" })).not.toBeInTheDocument();
+      expect(screen.getByText(/Remote approvals apply once/i)).toBeInTheDocument();
+      expect(screen.getByText(/persistent permission rules on the desktop/i)).toBeInTheDocument();
+    },
+  );
 
   it("announces the banner via role='alert' including the tool and summary", () => {
     useStore.setState({

@@ -1367,7 +1367,8 @@ fn precheck_outcome(decision: Decision, cancelled_now: bool) -> Option<(&'static
     }
 }
 
-/// Gate (if mutating) and run ONE tool call, returning `(output, is_error)`. Sets
+/// Gate (when explicitly classified as mutating/protected) and run ONE tool call,
+/// returning `(output, is_error)`. Sets
 /// `*cancelled` if a Stop landed during the gate or right before the tool ran.
 ///
 /// The gate prompt is serialized through `ask_lock`: only one "ask" is outstanding
@@ -1387,7 +1388,7 @@ async fn gate_and_run(
     input: &Value,
     cancelled: &mut bool,
 ) -> (String, bool) {
-    let decision = if tool.mutating() {
+    let decision = if let Some(risk) = tool.permission_risk() {
         // Compute the pre-apply diff (write_file/edit_file) so the prompt can show the
         // change BEFORE it's written.
         let diff = tool.preview(input, ctx).await;
@@ -1401,6 +1402,7 @@ async fn gate_and_run(
             pending,
             cancel,
             tool.name(),
+            risk,
             &tool.summarize(input, ctx),
             input,
             diff,
@@ -1797,10 +1799,10 @@ impl tools::BackgroundRunner for BackgroundLauncher {
             &self.session_id,
             &command,
             async move {
-                let (exit_code, output) = match child.wait_with_output().await {
+                let (exit_code, output) = match tools::wait_with_bounded_output(child).await {
                     Ok(out) => (
                         out.status.code().unwrap_or(-1),
-                        tools::format_shell_output(&out),
+                        tools::format_bounded_shell_output(&out),
                     ),
                     Err(e) => (-1, format!("background command failed: {e}")),
                 };

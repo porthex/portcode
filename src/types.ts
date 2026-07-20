@@ -192,6 +192,23 @@ export interface SessionFolder {
   open: boolean;
 }
 
+/**
+ * Security classification supplied by the native tool registry. Missing is a
+ * legacy peer and therefore means `configurable`; any unknown future value is
+ * protected and must remain one-shot.
+ */
+export type PermissionRisk =
+  | "configurable"
+  | "shell"
+  | "dependencyInstall"
+  | "highRiskGit"
+  | "unknown"
+  | (string & Record<never, never>);
+
+export function permissionRiskRequiresOneShot(risk?: PermissionRisk): boolean {
+  return risk !== undefined && risk !== "configurable";
+}
+
 /** Events streamed from the core during an agent run. */
 export type StreamEvent =
   | {
@@ -209,6 +226,8 @@ export type StreamEvent =
       type: "permission_request";
       id: string;
       tool: ToolName;
+      /** Optional only for legacy peers; unknown values are treated as protected. */
+      risk?: PermissionRisk;
       summary: string;
       input: unknown;
       /** Pre-apply unified diff for file tools; absent for commands/other. */
@@ -272,6 +291,8 @@ export interface AgentInfo {
 export interface PendingPermission {
   id: string;
   tool: ToolName;
+  /** Optional only for legacy peers; unknown values are treated as protected. */
+  risk?: PermissionRisk;
   summary: string;
   input: unknown;
   /** Pre-apply unified diff for file tools; absent for commands/other. */
@@ -392,9 +413,9 @@ export type ToolPolicy = "allow" | "ask" | "deny";
 
 /**
  * The permission MODE — the coarse default behaviour of the gate. Mirrors the
- * Rust `PermissionMode`. `auto` auto-allows every mutating tool and `bypass`
- * skips the gate entirely, so both are opt-in only and shown with a danger
- * indicator; the quick-cycle covers only the safe trio.
+ * Rust `PermissionMode`. `auto` and `bypass` loosen configurable mutations, but
+ * protected actions always require one-time approval. Both remain opt-in and
+ * the quick-cycle covers only the safe trio.
  */
 export type PermissionMode = "default" | "acceptEdits" | "plan" | "auto" | "bypass";
 
@@ -408,8 +429,9 @@ export const DANGER_MODES: PermissionMode[] = ["auto", "bypass"];
 /**
  * A per-tool / per-command permission rule. Mirrors the Rust `Rule`. Evaluated
  * before the mode default, first match wins. `command` is a literal terminal
- * command PREFIX (an allow-list convenience, never a guarantee — anything
- * chained after the prefix matches too).
+ * command prefix, so anything chained after it also matches. Historical command
+ * Allow rules remain readable, but the native protected-action floor overrides
+ * them with one-time approval.
  */
 export interface Rule {
   tool: ToolName | "*";

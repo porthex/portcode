@@ -731,8 +731,8 @@ describe("Composer permission dropdown", () => {
     expect(screen.getByRole("option", { name: "Ask" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Edits allowed" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Plan only" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "Auto approve" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "Bypass confirmations" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Auto configurable" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Bypass configurable" })).toBeInTheDocument();
   });
 
   it("persists any selected permission mode", async () => {
@@ -740,7 +740,7 @@ describe("Composer permission dropdown", () => {
 
     fireEvent.click(screen.getByRole("combobox", { name: "Permission mode" }));
     await act(async () => {
-      fireEvent.click(screen.getByRole("option", { name: "Bypass confirmations" }));
+      fireEvent.click(screen.getByRole("option", { name: "Bypass configurable" }));
     });
 
     expect(m.saveSettings).toHaveBeenCalledWith({ permissionMode: "bypass" });
@@ -762,8 +762,8 @@ describe("Composer permission dropdown", () => {
     render(<Composer />);
 
     const picker = screen.getByRole("combobox", { name: "Permission mode" });
-    expect(picker).toHaveTextContent("Bypass confirmations");
-    expect(picker).toHaveAttribute("title", expect.stringContaining("no confirmations"));
+    expect(picker).toHaveTextContent("Bypass configurable");
+    expect(picker).toHaveAttribute("title", expect.stringContaining("protected actions still ask"));
     expect(picker).toHaveClass("pc-permission-select--danger");
     expect(picker).toBeDisabled();
   });

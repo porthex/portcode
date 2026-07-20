@@ -175,14 +175,7 @@ async fn post_tokens(
     .await
     .map_err(|_| "Token request timed out.".to_string())?
     .map_err(|e| format!("Token request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        // A failed token response carries an OAuth error object, never our
-        // tokens, so it is safe to surface for diagnostics.
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("OAuth token request failed ({status}): {text}"));
-    }
+    let resp = require_token_success(resp)?;
 
     let tr: TokenResponse = resp
         .json()
@@ -201,6 +194,18 @@ async fn post_tokens(
         email: None,
         plan: None,
     })
+}
+
+fn require_token_success(response: reqwest::Response) -> Result<reqwest::Response, String> {
+    let status = response.status();
+    if status.is_success() {
+        Ok(response)
+    } else {
+        // Never buffer or reflect provider-controlled error bodies. A status is
+        // sufficient for the refresh retry/reauth classifier and cannot contain
+        // a refresh token or other attacker-controlled diagnostic text.
+        Err(format!("OAuth token request failed ({status})."))
+    }
 }
 
 // ── loopback login ───────────────────────────────────────────────────────────
@@ -269,9 +274,7 @@ pub struct Profile {
 /// on ANY failure (network, auth, parse) — this is display-only metadata and
 /// must never block sign-in or inference.
 pub async fn fetch_profile(http: &reqwest::Client, access_token: &str) -> Option<Profile> {
-    let resp = http
-        .get(PROFILE_URL)
-        .header("authorization", format!("Bearer {access_token}"))
+    let resp = profile_request(http, access_token)
         .header("anthropic-beta", "oauth-2025-04-20")
         .send()
         .await
@@ -291,6 +294,10 @@ pub async fn fetch_profile(http: &reqwest::Client, access_token: &str) -> Option
         email: account.email,
         plan,
     })
+}
+
+fn profile_request(http: &reqwest::Client, access_token: &str) -> reqwest::RequestBuilder {
+    http.get(PROFILE_URL).bearer_auth(access_token)
 }
 
 /// Accept connections until the OAuth callback arrives, ignoring speculative
@@ -446,6 +453,59 @@ mod tests {
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1234%2Fcallback"));
         // scope is present (value starts with the first url-encoded scope).
         assert!(url.contains("scope=org"));
+    }
+
+    #[test]
+    fn profile_bearer_header_is_marked_sensitive() {
+        let request = profile_request(&reqwest::Client::new(), "profile-secret")
+            .build()
+            .unwrap();
+        let authorization = request.headers().get("authorization").unwrap();
+        assert!(authorization.is_sensitive());
+    }
+
+    #[tokio::test]
+    async fn token_non_success_status_never_reads_or_reflects_the_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before sending request headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\n\
+Content-Type: application/json\r\n\
+Content-Length: 1048576\r\n\
+Connection: keep-alive\r\n\r\n\
+{\"refresh_token\":\"must-not-be-read",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let response = reqwest::Client::new()
+                .post(format!("http://{address}/token"))
+                .send()
+                .await
+                .unwrap();
+            require_token_success(response)
+        })
+        .await
+        .expect("status-only handling must not wait for the open body")
+        .expect_err("HTTP 401 must fail");
+        server.abort();
+
+        assert_eq!(result, "OAuth token request failed (401 Unauthorized).");
+        assert!(!result.contains("refresh_token"));
     }
 
     #[test]

@@ -24,6 +24,7 @@ use crate::openai_accounts::OpenAiAccountRegistry;
 use crate::permissions::{self, Decision, Pending};
 use crate::settings::Settings;
 use crate::sync::protocol::{CommandRejectionCode, RemoteCommand, SyncFrame};
+use crate::sync::public;
 use crate::sync::session::CommandHandler;
 use crate::sync::SyncHub;
 
@@ -56,8 +57,6 @@ const MAX_PAGE_LIMIT: i64 = 200;
 /// accepted alphabet and size narrow prevents a hostile paired device from making
 /// the desktop reflect control characters or an almost-frame-sized string back at
 /// every subscriber. Invalid identifiers receive an uncorrelated, safe rejection.
-const MAX_REMOTE_REQUEST_ID_BYTES: usize = 128;
-
 /// Public command errors are intentionally much smaller than the encrypted frame
 /// limit. This is defense in depth around future copy changes: a diagnostic can
 /// never turn a command rejection into an oversized-frame transport failure.
@@ -71,8 +70,6 @@ const MAX_REMOTE_SESSION_TITLE_BYTES: usize = 256;
 /// Noise transport plaintext tops out just below 64 KiB. Leave several KiB for
 /// framing/version growth and reject a remote create *before* persistence when
 /// the resulting authoritative SessionList would no longer fit in one message.
-const MAX_SYNC_SESSION_LIST_BYTES: usize = 60 * 1_024;
-
 /// Command loops are per connection, so two phones can create concurrently.
 /// Serialize the list-size preflight with the DB write to prevent two remote
 /// requests from both observing the same remaining frame budget.
@@ -117,11 +114,17 @@ fn remote_create_model(settings: &Settings) -> Result<String, CommandRejectionCo
 }
 
 fn valid_remote_request_id(request_id: &str) -> bool {
-    !request_id.is_empty()
-        && request_id.len() <= MAX_REMOTE_REQUEST_ID_BYTES
-        && request_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    public::valid_remote_identifier(request_id)
+}
+
+/// Resolve only a syntactically-safe phone id to the exact stored session id.
+/// Callers use the returned value for all later lookup/channel/reflection work.
+fn authoritative_remote_session_id(db: &Db, candidate: &str) -> Option<String> {
+    if !public::valid_remote_identifier(candidate) {
+        return None;
+    }
+    db.require_session(candidate).ok()?;
+    Some(candidate.to_string())
 }
 
 fn normalize_remote_session_title(title: Option<&str>) -> Result<String, CommandRejectionCode> {
@@ -143,9 +146,14 @@ fn session_list_with_candidate_fits(
         .list_sessions()
         .map_err(|_| CommandRejectionCode::DesktopUnavailable)?;
     sessions.insert(0, candidate.clone());
-    let encoded = serde_json::to_vec(&SyncFrame::SessionList { sessions })
-        .map_err(|_| CommandRejectionCode::DesktopUnavailable)?;
-    Ok(encoded.len() <= MAX_SYNC_SESSION_LIST_BYTES)
+    let expected = sessions.len();
+    let frame = public::session_list_frame(sessions);
+    let SyncFrame::SessionList { sessions } = frame else {
+        unreachable!("session_list_frame always returns SessionList")
+    };
+    let complete = sessions.len() == expected;
+    let frame = SyncFrame::SessionList { sessions };
+    Ok(complete && public::frame_fits(&frame, public::PHONE_FRAME_BUDGET))
 }
 
 fn rejection_message(code: CommandRejectionCode) -> &'static str {
@@ -171,20 +179,18 @@ fn rejection_message(code: CommandRejectionCode) -> &'static str {
 /// admission also uses this boundary so an unexpected lower-level diagnostic can
 /// never leak or grow into an oversized live frame.
 fn bounded_public_message(message: &str) -> String {
-    let redacted = crate::scrub::redact_secrets(message);
-    let mut output = String::with_capacity(redacted.len().min(MAX_COMMAND_REJECTION_MESSAGE_BYTES));
-    for character in redacted.chars() {
-        let character = if character.is_control() {
-            ' '
-        } else {
-            character
-        };
-        if output.len() + character.len_utf8() > MAX_COMMAND_REJECTION_MESSAGE_BYTES {
-            break;
-        }
-        output.push(character);
-    }
-    output.trim().to_string()
+    public::bounded_public_text(message, MAX_COMMAND_REJECTION_MESSAGE_BYTES)
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn command_rejection_frame(request_id: &str, mut code: CommandRejectionCode) -> SyncFrame {
@@ -250,6 +256,13 @@ impl CommandHandler for DesktopCommandHandler {
             // blocked by a turn. Each arg is an owned clone → the spawned future is
             // `Send + 'static` (nothing borrowed from `&self` escapes).
             RemoteCommand::Run { session_id, text } => {
+                let Some(session_id) = authoritative_remote_session_id(&self.db, &session_id)
+                else {
+                    return Ok(());
+                };
+                if text.is_empty() || text.len() > public::MAX_REMOTE_RUN_TEXT_BYTES {
+                    return Ok(());
+                }
                 // Wrap the AppHandle in the concrete EventSink so the agent core sees
                 // only the trait (its sole Tauri coupling now lives behind it). Same
                 // sink the desktop `run_agent` command builds, so a phone-driven turn
@@ -328,6 +341,10 @@ impl CommandHandler for DesktopCommandHandler {
             // cascade to the session's subagents, and deny pending gates. Guard
             // dropped at the `if let` end; no await.
             RemoteCommand::Cancel { session_id } => {
+                let Some(session_id) = authoritative_remote_session_id(&self.db, &session_id)
+                else {
+                    return Ok(());
+                };
                 if let Some(flag) = self.cancels.lock().unwrap().get(&session_id) {
                     flag.store(true, Ordering::Relaxed);
                 }
@@ -339,6 +356,9 @@ impl CommandHandler for DesktopCommandHandler {
             // Mirror `cancel_agent_by_id`: stop ONE subagent (and its descendants),
             // leaving the rest of the session running.
             RemoteCommand::CancelAgent { agent_id } => {
+                if !public::valid_remote_identifier(&agent_id) {
+                    return Ok(());
+                }
                 agents::cancel_one(&self.agents, &agent_id);
                 Ok(())
             }
@@ -350,6 +370,9 @@ impl CommandHandler for DesktopCommandHandler {
             // can only come from a confirmed device, but we still refuse to coerce
             // an unknown value into Allow.
             RemoteCommand::Permission { id, decision } => {
+                if !public::valid_remote_identifier(&id) {
+                    return Ok(());
+                }
                 permissions::resolve(&self.pending, &id, parse_decision(&decision));
                 Ok(())
             }
@@ -383,13 +406,10 @@ impl CommandHandler for DesktopCommandHandler {
                 // error here must not fail the (already-committed) create, so log +
                 // continue; the phone still picks the session up on next catch-up.
                 if let Some(hub) = self.app.try_state::<SyncHub>() {
-                    hub.publish_frame(SyncFrame::SessionCreated {
-                        request_id,
-                        session,
-                    });
+                    hub.publish_frame(public::session_created_frame(request_id, &session));
                     match self.db.list_sessions() {
                         Ok(sessions) => {
-                            hub.publish_frame(SyncFrame::SessionList { sessions });
+                            hub.publish_frame(public::session_list_frame(sessions));
                         }
                         Err(e) => {
                             eprintln!("phone-sync: list_sessions after create failed: {e}");
@@ -416,14 +436,14 @@ impl CommandHandler for DesktopCommandHandler {
                 before_seq,
                 limit,
             } => {
+                let Some(session_id) = authoritative_remote_session_id(&self.db, &session_id)
+                else {
+                    return Ok(());
+                };
                 let limit = (limit as i64).clamp(1, MAX_PAGE_LIMIT);
                 let (messages, has_more) = self.db.messages_page(&session_id, before_seq, limit);
                 if let Some(hub) = self.app.try_state::<SyncHub>() {
-                    hub.publish_frame(SyncFrame::MessagePage {
-                        session_id,
-                        messages,
-                        has_more,
-                    });
+                    hub.publish_frame(public::message_page_frame(&session_id, messages, has_more));
                 }
                 Ok(())
             }
@@ -565,8 +585,9 @@ mod tests {
         );
         let sessions = db.list_sessions().unwrap();
         assert_eq!(sessions.len(), successful);
-        let encoded = serde_json::to_vec(&SyncFrame::SessionList { sessions }).unwrap();
-        assert!(encoded.len() <= MAX_SYNC_SESSION_LIST_BYTES);
+        let frame = public::session_list_frame(sessions);
+        let encoded = serde_json::to_vec(&frame).unwrap();
+        assert!(encoded.len() <= public::PHONE_FRAME_BUDGET);
         assert_eq!(
             create_remote_session(&db, &Settings::default(), "capacity-final", Some(&title),)
                 .unwrap_err(),
@@ -610,8 +631,8 @@ mod tests {
 
     #[test]
     fn unsafe_request_id_is_not_reflected_to_the_phone() {
-        let oversized = "r".repeat(MAX_REMOTE_REQUEST_ID_BYTES + 1);
-        for request_id in ["", "line\nbreak", oversized.as_str()] {
+        let oversized = "r".repeat(public::MAX_REMOTE_IDENTIFIER_BYTES + 1);
+        for request_id in ["", "line\nbreak", "session:agent", oversized.as_str()] {
             assert!(matches!(
                 command_rejection_frame(
                     request_id,
@@ -624,5 +645,26 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn remote_session_ids_are_validated_before_authoritative_lookup() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        db.create_session("stored-session", "Stored", None, None, 1)
+            .unwrap();
+
+        assert_eq!(
+            authoritative_remote_session_id(&db, "stored-session").as_deref(),
+            Some("stored-session")
+        );
+        for rejected in [
+            "unknown-session",
+            "stored-session:agent",
+            "stored-session\nreflected",
+            "",
+        ] {
+            assert_eq!(authoritative_remote_session_id(&db, rejected), None);
+        }
+        assert_eq!(db.list_sessions().unwrap().len(), 1);
     }
 }

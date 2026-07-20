@@ -219,7 +219,18 @@ mod tests {
         // half; we read one frame inline (Send-safe, no spawned closure) to assert
         // the path, then confirm the loop drains-then-returns on close below.
         hub.publish("agent://s1", StreamEvent::TextDelta { text: "hi".into() });
+        hub.publish(
+            "agent://s1",
+            StreamEvent::Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        );
         match c_recv.recv_frame().await.expect("client receives live") {
+            SyncFrame::Live { session_id, .. } => assert_eq!(session_id, "s1"),
+            other => panic!("expected Live, got {other:?}"),
+        }
+        match c_recv.recv_frame().await.expect("client receives usage") {
             SyncFrame::Live { session_id, .. } => assert_eq!(session_id, "s1"),
             other => panic!("expected Live, got {other:?}"),
         }

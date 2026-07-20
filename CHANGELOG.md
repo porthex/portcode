@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Multiple crash-safe ChatGPT subscription profiles with explicit per-session
   account pinning, isolated refresh/model/usage state, safe legacy migration,
   and reconnectable account tombstones that preserve conversation history.
+- A release security baseline with structurally classified tool risk, public
+  Phone Sync DTOs, adversarial boundary tests, and an executable acceptance
+  matrix for subprocess, permission, sync, settings, and provider HTTP controls.
 - Focused accessibility, cancellation, reconnect, large-transcript, and desktop
   smoke-test coverage for the new interaction paths.
 - Open-source community-health and contributor infrastructure: `LICENSE`
@@ -50,6 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The status HUD now reports the active provider's most constrained included
   plan allowance, while Settings navigation remains pinned to the chosen route
   during smooth scrolling.
+- Agent shells and native read-only Git now receive an exact-name, default-deny
+  environment; shell output is memory-bounded; and credentialed provider clients
+  reject cross-origin redirects and status errors without reading response bodies.
 
 ### Fixed
 
@@ -60,6 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Aligned remote push-registration protocol handling and hardened partial-turn
   cancellation, secret scrubbing, file-edit previews, telemetry consent,
   pairing/reconnect controls, and remote-client lifecycle cleanup.
+- Protected shell actions can no longer bypass one-shot approval through Auto,
+  Bypass, legacy rules, or remembered phone decisions; pre-commit settings failures
+  preserve the live policy while post-commit durability uncertainty is reconciled
+  explicitly; and Phone Sync no longer forwards raw desktop tool payloads or account
+  attribution.
 
 ## [0.1.0] - 2026-06-19
 

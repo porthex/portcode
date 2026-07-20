@@ -47,6 +47,9 @@ async-trait = "0.1"
 anyhow = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
+# Cross-platform crash-durable settings replacement: the crate fsyncs the parent
+# directory on Unix and uses MOVEFILE_WRITE_THROUGH on Windows.
+atomicwrites = "0.4.4"
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Subscription OAuth (PKCE S256). All safe Rust. The OAuth constants and flow in
@@ -123,6 +126,9 @@ tauri-plugin-sentry = "=0.5.0"
 # `app_config_dir()` is `dirs::config_dir().join(<identifier>)`, so this reproduces the
 # exact path. `dirs = "6"` matches the version Tauri 2 already resolves (no dup in lock).
 dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"
 
 # Lint policy. CI runs `cargo clippy --all-targets -- -D warnings`; these make
 # the same baseline reproducible for local `cargo clippy`. `unsafe_code = "deny"`

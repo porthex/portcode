@@ -21,6 +21,7 @@ import {
 } from "../types";
 import * as ipc from "../lib/ipc";
 import { markdownLiteralText } from "../lib/sessionFormat";
+import { SETTINGS_COMMITTED_DURABILITY_UNCONFIRMED_PREFIX } from "../lib/settingsPersistence";
 import { modelsForOpenAIProfile, teardownAllBackgroundListeners, useStore } from "./store";
 
 // The store is the app's brain: it orchestrates the IPC bridge and folds the
@@ -1671,11 +1672,13 @@ describe("send", () => {
       type: "permission_request",
       id: "p1",
       tool: "fs_edit",
+      risk: "configurable",
       summary: "x",
       input: {},
       diff: "-a\n+b\n",
     });
     expect(useStore.getState().pendingPermission?.id).toBe("p1");
+    expect(useStore.getState().pendingPermission?.risk).toBe("configurable");
     expect(useStore.getState().pendingPermission?.diff).toBe("-a\n+b\n");
 
     // turn_end clears streaming + any pending prompt
@@ -2614,6 +2617,27 @@ describe("resolvePermission", () => {
     });
   });
 
+  it.each(["shell", "dependencyInstall", "highRiskGit", "unknown", "futureRisk"] as const)(
+    "refuses to remember %s approval while still resolving the one-shot gate",
+    async (risk) => {
+      useStore.setState({
+        pendingPermission: {
+          id: `protected-${risk}`,
+          tool: "run_command",
+          risk,
+          summary: "protected action",
+          input: { command: "echo safe" },
+        },
+      });
+
+      await useStore.getState().resolvePermission("allow", true);
+
+      expect(m.resolvePermission).toHaveBeenCalledWith(`protected-${risk}`, "allow");
+      expect(m.saveSettings).not.toHaveBeenCalled();
+      expect(useStore.getState().pendingPermission).toBeNull();
+    },
+  );
+
   it("allow-always does not add a duplicate rule if an equivalent one exists", async () => {
     useStore.setState({
       settings: { ...DEFAULT_SETTINGS, rules: [{ tool: "fs_edit", decision: "allow" }] },
@@ -2746,13 +2770,13 @@ describe("resolvePermission", () => {
     expect(useStore.getState().pendingPermission).toEqual(newer);
   });
 
-  it("answers as a Permission command in remote mode (not the desktop-only local resolve)", async () => {
+  it("answers once in remote mode and never persists an allow rule", async () => {
     useStore.setState({
       remoteConnected: true,
       pendingPermission: { id: "p1", tool: "fs_edit", summary: "x", input: {} },
     });
 
-    await useStore.getState().resolvePermission("allow");
+    await useStore.getState().resolvePermission("allow", true);
 
     expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({
       cmd: "permission",
@@ -2760,7 +2784,24 @@ describe("resolvePermission", () => {
       decision: "allow",
     });
     expect(m.resolvePermission).not.toHaveBeenCalled();
+    expect(m.saveSettings).not.toHaveBeenCalled();
     expect(useStore.getState().pendingPermission).toBeNull();
+  });
+
+  it("fails closed when the remote shell is disconnected", async () => {
+    const pending = { id: "p-disconnected", tool: "fs_edit", summary: "x", input: {} };
+    useStore.setState({
+      remoteMode: true,
+      remoteConnected: false,
+      pendingPermission: pending,
+    });
+
+    await useStore.getState().resolvePermission("allow", true);
+
+    expect(m.phoneSyncSendCommand).not.toHaveBeenCalled();
+    expect(m.resolvePermission).not.toHaveBeenCalled();
+    expect(m.saveSettings).not.toHaveBeenCalled();
+    expect(useStore.getState().pendingPermission).toEqual(pending);
   });
 });
 
@@ -4098,6 +4139,21 @@ describe("settings + workspace", () => {
     expect(st.settings).toEqual(prior); // controlled UI doesn't silently corrupt
   });
 
+  it("updateSettings reconciles a committed value when durability is unconfirmed", async () => {
+    const committed = { ...DEFAULT_SETTINGS, model: "claude-sonnet-4-6" };
+    m.saveSettings.mockRejectedValueOnce(
+      new Error(`${SETTINGS_COMMITTED_DURABILITY_UNCONFIRMED_PREFIX} Directory sync failed.`),
+    );
+    m.getSettings.mockResolvedValueOnce(committed);
+
+    await useStore.getState().updateSettings({ model: committed.model });
+
+    const st = useStore.getState();
+    expect(m.getSettings).toHaveBeenCalledTimes(1);
+    expect(st.settings).toEqual(committed);
+    expect(st.settingsError).toBe("Directory sync failed.");
+  });
+
   it("updateSettings clears a prior settingsError on a successful save", async () => {
     useStore.setState({ settingsError: "old failure" });
 
@@ -4122,6 +4178,21 @@ describe("settings + workspace", () => {
     await useStore.getState().openWorkspace();
 
     expect(useStore.getState().workspaceError).toBe("save failed");
+  });
+
+  it("openWorkspace reconciles a committed folder when durability is unconfirmed", async () => {
+    const committed = { ...DEFAULT_SETTINGS, workspace: "C:/work/repo" };
+    m.openFolder.mockResolvedValueOnce(committed.workspace);
+    m.saveSettings.mockRejectedValueOnce(
+      new Error(`${SETTINGS_COMMITTED_DURABILITY_UNCONFIRMED_PREFIX} Metadata sync failed.`),
+    );
+    m.getSettings.mockResolvedValueOnce(committed);
+
+    await useStore.getState().openWorkspace();
+
+    const st = useStore.getState();
+    expect(st.settings.workspace).toBe(committed.workspace);
+    expect(st.workspaceError).toBe("Metadata sync failed.");
   });
 });
 
@@ -4802,6 +4873,7 @@ describe("remote client", () => {
           type: "permission_request",
           id: "p1",
           tool: "fs_edit",
+          risk: "highRiskGit",
           summary: "x",
           input: {},
           diff: "-a\n+b\n",
@@ -4811,6 +4883,7 @@ describe("remote client", () => {
       expect(useStore.getState().pendingPermission).toEqual({
         id: "p1",
         tool: "fs_edit",
+        risk: "highRiskGit",
         summary: "x",
         input: {},
         diff: "-a\n+b\n",
@@ -5007,11 +5080,19 @@ describe("remote client", () => {
       it("permission_request for a background session is recorded on its run but does NOT pop the visible prompt", () => {
         useStore.setState({ activeId: "active", runs: {}, pendingPermission: null });
 
-        bgLive({ type: "permission_request", id: "p9", tool: "fs_edit", summary: "x", input: {} });
+        bgLive({
+          type: "permission_request",
+          id: "p9",
+          tool: "fs_edit",
+          risk: "unknown",
+          summary: "x",
+          input: {},
+        });
 
         const st = useStore.getState();
         expect(st.pendingPermission).toBeNull(); // the visible gate stays closed
         expect(st.runs.bg.pendingPermission?.id).toBe("p9"); // but the bg run holds it
+        expect(st.runs.bg.pendingPermission?.risk).toBe("unknown");
       });
 
       it("text_delta still folds into the background session's message", () => {
