@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 
 import { MessageView } from "./Message";
+import { markdownLiteralText } from "../lib/sessionFormat";
 import { STEP_MS } from "../lib/useScramble";
 import { useStore } from "../store/store";
 import type { ContentBlock, Message, Role, TurnReceipt as TurnReceiptData } from "../types";
@@ -207,6 +208,28 @@ describe("MessageView — assistant role", () => {
     expect(screen.getByText("bold")).toBeInTheDocument();
     expect(container.querySelector("strong")).not.toBeNull();
     expect(container.querySelector(".prose-pc")).not.toBeNull();
+  });
+
+  it("renders escaped account attribution literally without links, images, or HTML", () => {
+    const label =
+      "one@chatgpt.test ``` ![root [nested]](https://evil.test/pixel) <img src=x> &lbrack;text&rbrack;";
+    const { container } = render(
+      <MessageView
+        message={message("assistant", [
+          {
+            kind: "text",
+            text: `**Error:** ${markdownLiteralText(label)}: ChatGPT provider request failed.`,
+          },
+        ])}
+      />,
+    );
+
+    const prose = container.querySelector(".prose-pc");
+    expect(prose?.textContent).toContain(label);
+    expect(prose?.querySelector("code")?.textContent).toBe(label);
+    expect(prose?.querySelector("a")).toBeNull();
+    expect(prose?.querySelector("img")).toBeNull();
+    expect(prose?.querySelector("script, style, iframe, object, embed")).toBeNull();
   });
 
   it("renders a settled long unbroken token inside a .prose-pc <p> so it wraps at full width", () => {

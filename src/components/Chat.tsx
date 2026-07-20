@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { useStore } from "../store/store";
+import { modelsForOpenAIProfile, useStore } from "../store/store";
 import { MessageView } from "./Message";
 import { Composer } from "./Composer";
 import { PermissionPrompt } from "./PermissionPrompt";
@@ -384,26 +384,55 @@ function EmptyState() {
   const remoteMode = useStore((s) => s.remoteMode);
   const oauthStatus = useStore((s) => s.oauthStatus);
   const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
-  const openAIModels = useStore((s) => s.openAIModels);
+  const openAIAccountsError = useStore((s) => s.openAIAccountsError);
+  const activeSession = useStore((s) =>
+    s.activeId ? s.sessions.find((session) => session.id === s.activeId) : undefined,
+  );
+  const openAIModels = useStore((s) =>
+    modelsForOpenAIProfile(activeSession?.accountProfileId, s.openAIModelCatalogs, s.openAIModels),
+  );
+  const activeOpenAIAccount = useStore((s) =>
+    activeSession?.accountProfileId
+      ? s.openAIAccounts.find((account) => account.id === activeSession.accountProfileId)
+      : undefined,
+  );
+  const connectedOpenAIAccountCount = useStore(
+    (s) => s.openAIAccounts.filter((account) => account.state === "connected").length,
+  );
   const settings = useStore((s) => s.settings);
   const activeModel = useStore((s) => {
     const session = s.activeId ? s.sessions.find((item) => item.id === s.activeId) : undefined;
     return session?.model ?? s.settings.model;
   });
   const setShowSettings = useStore((s) => s.setShowSettings);
+  const refreshOpenAIStatus = useStore((s) => s.refreshOpenAIStatus);
   // oauthStatus is null until the first refresh resolves; treat unknown as not
   // signed in, so the sign-in nudge shows until auth is confirmed.
   const provider = providerForModel(activeModel, openAIModels);
   const openAIUnavailable = provider === "openai" && openAIAuthStatus?.available === false;
+  const openAIRegistryUnavailable = Boolean(
+    provider === "openai" &&
+    activeSession?.accountProfileId &&
+    !activeOpenAIAccount &&
+    openAIAccountsError,
+  );
   const authed =
     provider === "openai"
-      ? !openAIUnavailable && !!openAIAuthStatus?.signedIn
+      ? !openAIUnavailable && activeOpenAIAccount?.state === "connected"
       : !!oauthStatus?.signedIn || settings.apiKeySet;
-  const authNudge = openAIUnavailable
-    ? `${openAIAuthStatus?.unavailableReason ?? "ChatGPT subscription access is unavailable in this build"}. Choose Claude in Settings to start`
-    : provider === "openai"
-      ? "Sign in with ChatGPT to start"
-      : "Sign in with Claude or add an API key to start";
+  const authNudge = openAIRegistryUnavailable
+    ? "This chat's ChatGPT account is unavailable because account discovery failed"
+    : openAIUnavailable
+      ? `${openAIAuthStatus?.unavailableReason ?? "ChatGPT subscription access is unavailable in this build"}. Choose Claude in Settings to start`
+      : provider === "openai"
+        ? activeSession?.accountProfileId
+          ? "Reconnect this chat's ChatGPT account to start"
+          : activeSession
+            ? "Choose a ChatGPT account for this legacy chat"
+            : connectedOpenAIAccountCount > 0
+              ? "Choose a ChatGPT account when starting a new chat"
+              : "Add a ChatGPT account to start"
+        : "Sign in with Claude or add an API key to start";
   return (
     <div className="flex min-h-[60vh] flex-col items-center justify-center text-center">
       <div className="mb-4 rounded-2xl border border-border bg-panel p-4">
@@ -425,13 +454,32 @@ function EmptyState() {
       {!remoteMode && !authed && (
         <div className="mt-4 flex items-center gap-2 text-xs text-muted">
           <span>{authNudge}</span>
-          <button
-            type="button"
-            onClick={() => setShowSettings(true)}
-            className="rounded border border-border bg-panel px-2 py-0.5 text-fg hover:border-accent"
-          >
-            {openAIUnavailable ? "Choose Claude" : "Open settings"}
-          </button>
+          {openAIRegistryUnavailable ? (
+            <>
+              <button
+                type="button"
+                onClick={() => void refreshOpenAIStatus()}
+                className="rounded border border-border bg-panel px-2 py-0.5 text-fg hover:border-accent"
+              >
+                Retry accounts
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowSettings(true)}
+                className="rounded border border-border bg-panel px-2 py-0.5 text-fg hover:border-accent"
+              >
+                Manage accounts
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setShowSettings(true)}
+              className="rounded border border-border bg-panel px-2 py-0.5 text-fg hover:border-accent"
+            >
+              {openAIUnavailable ? "Choose Claude" : "Open settings"}
+            </button>
+          )}
         </div>
       )}
       {!remoteMode && (

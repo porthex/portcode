@@ -37,7 +37,7 @@ pub async fn serve_catch_up<C: FrameChannel + ?Sized>(
 ) -> Result<(), String> {
     let cursors = match channel.recv().await? {
         SyncFrame::Hello { cursors, .. } => cursors,
-        other => return Err(format!("expected Hello, got {other:?}")),
+        _ => return Err("expected Hello, got an unexpected frame".into()),
     };
     serve_catch_up_with_cursors(channel, db, cursors).await
 }

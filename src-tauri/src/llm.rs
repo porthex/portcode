@@ -13,6 +13,7 @@
 
 use serde::Serialize;
 use serde_json::{json, Value};
+#[cfg(any(desktop, test))]
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -28,6 +29,10 @@ use crate::tool_names;
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
 const MAX_TOKENS: u32 = 8192;
+#[cfg(desktop)]
+const OPENAI_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+/// Stable classifier for the agent's one-shot OAuth refresh-and-retry path.
+pub(crate) const OPENAI_UNAUTHORIZED_ERROR: &str = "OpenAI response authentication failed (401).";
 
 /// Beta header that opts an OAuth (subscription) request into Anthropic's
 /// OAuth-authenticated inference path.
@@ -425,6 +430,7 @@ impl LlmProvider for AnthropicProvider {
     }
 }
 
+#[cfg(any(desktop, test))]
 fn openai_input(messages: &[ChatMessage], model: &str) -> Vec<Value> {
     let mut input = Vec::new();
     for message in messages {
@@ -476,6 +482,7 @@ fn openai_input(messages: &[ChatMessage], model: &str) -> Vec<Value> {
     input
 }
 
+#[cfg(any(desktop, test))]
 fn openai_tools(tools: &[Value]) -> Vec<Value> {
     tools
         .iter()
@@ -493,11 +500,13 @@ fn openai_tools(tools: &[Value]) -> Vec<Value> {
 }
 
 #[derive(Default)]
+#[cfg(any(desktop, test))]
 struct OpenAiFunction {
     name: String,
     arguments: String,
 }
 
+#[cfg(any(desktop, test))]
 struct OpenAiTurnBuilder {
     model: String,
     blocks: Vec<Block>,
@@ -510,6 +519,7 @@ struct OpenAiTurnBuilder {
     cancelled: bool,
 }
 
+#[cfg(any(desktop, test))]
 impl OpenAiTurnBuilder {
     fn new(model: &str) -> Self {
         Self {
@@ -644,19 +654,16 @@ impl OpenAiTurnBuilder {
                     .unwrap_or_default()
                     .min(u32::MAX as u64) as u32;
             }
-            Some("response.failed") | Some("response.incomplete") => {
-                let message = event["response"]["error"]["message"]
-                    .as_str()
-                    .or_else(|| event["response"]["incomplete_details"]["reason"].as_str())
-                    .unwrap_or("OpenAI response did not complete.");
-                return Err(message.into());
+            Some("response.failed") => {
+                return Err("OpenAI response failed before completion. Please retry.".into());
+            }
+            Some("response.incomplete") => {
+                return Err("OpenAI response was incomplete. Please retry.".into());
             }
             Some("error") => {
-                return Err(event["message"]
-                    .as_str()
-                    .or_else(|| event["error"]["message"].as_str())
-                    .unwrap_or("Unknown OpenAI streaming error.")
-                    .into())
+                // Provider messages can include remote account or request IDs.
+                // Keep every error crossing the event/IPC boundary value-free.
+                return Err("OpenAI response stream reported an error. Please retry.".into());
             }
             _ => {}
         }
@@ -694,15 +701,47 @@ impl OpenAiTurnBuilder {
 /// `AtomicBool` has no wake mechanism, so poll it briefly while network I/O is
 /// pending. This keeps Stop responsive without changing the shared cancellation
 /// type used by the agent loop.
+#[cfg(desktop)]
 async fn wait_for_cancellation(cancel: &AtomicBool) {
     while !cancel.load(Ordering::Relaxed) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
-pub struct OpenAiProvider;
+/// OpenAI Responses transport.
+///
+/// Production always uses [`OPENAI_RESPONSES_URL`]. Keeping the endpoint on the
+/// provider instance gives integration tests a per-run transport seam: they can
+/// exercise the real request builder, authentication headers, SSE decoder, and
+/// agent retry path against a local server without mutating process-global
+/// environment or weakening any authentication checks.
+#[derive(Clone)]
+#[cfg(desktop)]
+pub struct OpenAiProvider {
+    responses_url: Arc<str>,
+}
+
+#[cfg(desktop)]
+impl Default for OpenAiProvider {
+    fn default() -> Self {
+        Self {
+            responses_url: Arc::from(OPENAI_RESPONSES_URL),
+        }
+    }
+}
+
+#[cfg(desktop)]
+impl OpenAiProvider {
+    #[cfg(test)]
+    pub(crate) fn with_responses_url(responses_url: impl Into<Arc<str>>) -> Self {
+        Self {
+            responses_url: responses_url.into(),
+        }
+    }
+}
 
 #[async_trait]
+#[cfg(desktop)]
 impl LlmProvider for OpenAiProvider {
     #[allow(clippy::too_many_arguments)]
     async fn stream_turn(
@@ -743,22 +782,11 @@ impl LlmProvider for OpenAiProvider {
             "include": ["reasoning.encrypted_content"],
         });
         apply_openai_response_speed(&mut body, response_speed);
-        let mut request = http
-            .post("https://chatgpt.com/backend-api/codex/responses")
-            .header("authorization", format!("Bearer {}", tokens.access_token))
+        let request = http
+            .post(self.responses_url.as_ref())
             .header("content-type", "application/json")
-            .header("accept", "text/event-stream")
-            .header("originator", "portcode")
-            .header(
-                "user-agent",
-                concat!("Portcode/", env!("CARGO_PKG_VERSION")),
-            );
-        if let Some(account_id) = &tokens.account_id {
-            request = request.header("ChatGPT-Account-ID", account_id);
-        }
-        if tokens.is_fedramp {
-            request = request.header("X-OpenAI-Fedramp", "true");
-        }
+            .header("accept", "text/event-stream");
+        let request = crate::openai_oauth::authenticated_request(request, tokens)?;
         let mut builder = OpenAiTurnBuilder::new(model);
         let response = tokio::select! {
             biased;
@@ -776,21 +804,16 @@ impl LlmProvider for OpenAiProvider {
         if !response.status().is_success() {
             let status = response.status();
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                return Err("OpenAI response authentication failed (401).".into());
+                return Err(OPENAI_UNAUTHORIZED_ERROR.into());
             }
-            let error = tokio::select! {
-                biased;
-                _ = wait_for_cancellation(cancel) => {
-                    builder.cancelled = true;
-                    return builder.finish();
-                }
-                error = response.json::<Value>() => error,
-            };
-            let message = error
-                .ok()
-                .and_then(|value| value["error"]["message"].as_str().map(str::to_string))
-                .unwrap_or_else(|| "request rejected".into());
-            return Err(format!("OpenAI response error ({status}): {message}"));
+            // Provider-controlled error bodies are neither displayed nor needed
+            // for classification. Do not buffer or parse them: an unbounded or
+            // never-ending error response must not allocate indefinitely or park
+            // the turn after the status line has already supplied the safe result.
+            return Err(format!(
+                "OpenAI response was rejected (HTTP {}). Please retry.",
+                status.as_u16()
+            ));
         }
 
         let mut stream = response.bytes_stream();
@@ -841,6 +864,7 @@ impl LlmProvider for OpenAiProvider {
     }
 }
 
+#[cfg(any(desktop, test))]
 fn apply_openai_response_speed(body: &mut Value, response_speed: &str) {
     // Standard intentionally leaves the field absent so the subscription backend
     // keeps its native default. Fast opts into Responses priority processing.
@@ -855,10 +879,25 @@ fn apply_openai_response_speed(body: &mut Value, response_speed: &str) {
 pub fn provider_for(name: &str) -> Result<Box<dyn LlmProvider>, String> {
     match name {
         "anthropic" => Ok(Box::new(AnthropicProvider)),
-        "openai" => Ok(Box::new(OpenAiProvider)),
-        other => Err(format!(
-            "Unknown LLM provider '{other}'. Portcode currently supports: anthropic, openai."
-        )),
+        "openai" => {
+            #[cfg(desktop)]
+            {
+                Ok(Box::new(OpenAiProvider::default()))
+            }
+            #[cfg(not(desktop))]
+            {
+                Err("OpenAI subscription inference is available on desktop builds only.".into())
+            }
+        }
+        other => {
+            #[cfg(desktop)]
+            let supported = "anthropic, openai";
+            #[cfg(not(desktop))]
+            let supported = "anthropic";
+            Err(format!(
+                "Unknown LLM provider '{other}'. Portcode currently supports: {supported}."
+            ))
+        }
     }
 }
 
@@ -889,6 +928,14 @@ mod tests {
     use super::*;
     use crate::secrets::OAuthTokens;
 
+    #[cfg(desktop)]
+    struct NoopSink;
+
+    #[cfg(desktop)]
+    impl EventSink for NoopSink {
+        fn emit(&self, _channel: &str, _event: StreamEvent) {}
+    }
+
     fn oauth_cred() -> Credential {
         Credential::OAuth(OAuthTokens {
             access_token: "access".into(),
@@ -899,6 +946,7 @@ mod tests {
         })
     }
 
+    #[cfg(desktop)]
     #[tokio::test]
     async fn cancellation_wait_observes_a_later_stop_signal() {
         let cancel = Arc::new(AtomicBool::new(false));
@@ -911,6 +959,82 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), wait_for_cancellation(&cancel))
             .await
             .expect("cancellation polling should release pending OpenAI I/O");
+    }
+
+    #[cfg(desktop)]
+    #[tokio::test]
+    async fn openai_non_success_status_does_not_wait_for_or_buffer_the_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before sending request headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\n\
+Content-Type: application/json\r\n\
+Content-Length: 1048576\r\n\
+Connection: keep-alive\r\n\r\n\
+{\"provider_secret\":\"must-not-be-read",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let credential = Credential::OpenAiOAuth(crate::secrets::OpenAiOAuthTokens {
+            access_token: "access-token".into(),
+            refresh_token: "refresh-token".into(),
+            id_token: None,
+            expires_at: i64::MAX,
+            account_id: Some("account-id".into()),
+            email: None,
+            plan: None,
+            is_fedramp: false,
+        });
+        let provider = OpenAiProvider::with_responses_url(format!("http://{address}/responses"));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.stream_turn(
+                &reqwest::Client::new(),
+                &credential,
+                "gpt-5.6-sol",
+                "medium",
+                "standard",
+                "system",
+                &[ChatMessage {
+                    role: "user".into(),
+                    content: vec![Block::Text {
+                        text: "hello".into(),
+                    }],
+                }],
+                &[],
+                &NoopSink,
+                "test",
+                &cancel,
+            ),
+        )
+        .await
+        .expect("status-only error handling must not wait for the open body")
+        .expect_err("HTTP 500 must fail the turn");
+        server.abort();
+
+        assert_eq!(
+            result,
+            "OpenAI response was rejected (HTTP 500). Please retry."
+        );
+        assert!(!result.contains("provider_secret"));
     }
 
     #[test]
@@ -936,9 +1060,15 @@ mod tests {
     }
 
     #[test]
-    fn provider_for_resolves_both_and_rejects_unknown() {
+    fn provider_for_resolves_available_providers_and_rejects_unknown() {
         assert!(provider_for("anthropic").is_ok());
+        #[cfg(desktop)]
         assert!(provider_for("openai").is_ok());
+        #[cfg(not(desktop))]
+        assert_eq!(
+            provider_for("openai").err().as_deref(),
+            Some("OpenAI subscription inference is available on desktop builds only.")
+        );
         // Extract the error without `unwrap_err()` — that requires the `Ok` type
         // (`Box<dyn LlmProvider>`) to be `Debug`, which a trait object is not.
         let Err(err) = provider_for("other") else {
@@ -1114,6 +1244,33 @@ mod tests {
             .finish()
             .expect_err("must reject truncation")
             .contains("response.completed"));
+    }
+
+    #[test]
+    fn openai_parser_never_echoes_provider_error_values() {
+        for (event, expected) in [
+            (
+                r#"{"type":"response.failed","response":{"error":{"message":"secret-account@example.invalid"}}}"#,
+                "OpenAI response failed before completion. Please retry.",
+            ),
+            (
+                r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"request_remote_id_123"}}}"#,
+                "OpenAI response was incomplete. Please retry.",
+            ),
+            (
+                r#"{"type":"error","message":"remote-account-token"}"#,
+                "OpenAI response stream reported an error. Please retry.",
+            ),
+        ] {
+            let mut builder = OpenAiTurnBuilder::new("gpt-5.3-codex");
+            let error = builder
+                .process(event)
+                .expect_err("provider error must abort");
+            assert_eq!(error, expected);
+            assert!(!error.contains("secret-account"));
+            assert!(!error.contains("remote_id"));
+            assert!(!error.contains("remote-account"));
+        }
     }
 
     // ---- TurnBuilder: the SSE event → turn state machine ----------------------

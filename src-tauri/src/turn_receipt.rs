@@ -25,9 +25,22 @@ const MAX_RECEIPT_FILES: usize = 200;
 /// Durable fail-closed row written before `TurnStart` is emitted or any async
 /// workspace capture begins. A crash in that window therefore reloads as an
 /// interrupted turn with unavailable provenance rather than disappearing.
+#[cfg(test)]
 pub(crate) fn unavailable_interrupted_receipt(turn_id: &str, started_at: i64) -> TurnReceipt {
+    unavailable_interrupted_receipt_with_account(turn_id, started_at, None)
+}
+
+/// Account-attributed form used once session admission has resolved the immutable
+/// local profile for the run. The legacy wrapper above remains available for
+/// providers and pre-admission failures that have no ChatGPT profile.
+pub(crate) fn unavailable_interrupted_receipt_with_account(
+    turn_id: &str,
+    started_at: i64,
+    account_profile_id: Option<String>,
+) -> TurnReceipt {
     TurnReceipt {
         turn_id: turn_id.to_string(),
+        account_profile_id,
         status: TurnStatus::Interrupted,
         stop_reason: None,
         started_at,
@@ -66,6 +79,7 @@ struct MutationState {
 /// its subagent tree.
 pub(crate) struct TurnReceiptTracker {
     turn_id: String,
+    account_profile_id: Option<String>,
     started_at: i64,
     started: Instant,
     workspace: PathBuf,
@@ -117,11 +131,15 @@ pub(crate) struct CompletedReceipt {
 }
 
 impl TurnReceiptTracker {
-    pub(crate) async fn new(
+    /// Build a tracker after run admission has frozen the selected local profile.
+    /// Every pending, interrupted, and terminal receipt emitted by this tracker
+    /// inherits that same attribution.
+    pub(crate) async fn new_with_account(
         turn_id: String,
         started_at: i64,
         started: Instant,
         workspace: PathBuf,
+        account_profile_id: Option<String>,
     ) -> Arc<Self> {
         let baseline = git_review::capture_turn_workspace(&workspace).await.ok();
         let repository_root = baseline
@@ -130,6 +148,7 @@ impl TurnReceiptTracker {
             .map(|root| root.canonicalize().unwrap_or(root));
         Arc::new(Self {
             turn_id,
+            account_profile_id,
             started_at,
             started,
             workspace,
@@ -142,6 +161,7 @@ impl TurnReceiptTracker {
     pub(crate) fn interrupted_placeholder(&self) -> TurnReceipt {
         TurnReceipt {
             turn_id: self.turn_id.clone(),
+            account_profile_id: self.account_profile_id.clone(),
             status: TurnStatus::Interrupted,
             stop_reason: None,
             started_at: self.started_at,
@@ -261,6 +281,7 @@ impl TurnReceiptTracker {
         CompletedReceipt {
             receipt: TurnReceipt {
                 turn_id: self.turn_id.clone(),
+                account_profile_id: self.account_profile_id.clone(),
                 status,
                 stop_reason,
                 started_at: self.started_at,
@@ -516,6 +537,51 @@ fn digest(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::git_review::{GitChangeArea, GitChangedFile};
+
+    #[test]
+    fn unavailable_receipt_account_attribution_is_explicit_and_optional() {
+        assert_eq!(
+            unavailable_interrupted_receipt("legacy", 1).account_profile_id,
+            None
+        );
+        assert_eq!(
+            unavailable_interrupted_receipt_with_account("pinned", 1, Some("profile-a".into()))
+                .account_profile_id
+                .as_deref(),
+            Some("profile-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn tracker_carries_one_profile_through_pending_and_terminal_receipts() {
+        let missing_workspace = std::env::temp_dir().join(format!(
+            "portcode-missing-receipt-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let tracker = TurnReceiptTracker::new_with_account(
+            "turn-a".into(),
+            1,
+            Instant::now(),
+            missing_workspace,
+            Some("profile-a".into()),
+        )
+        .await;
+
+        assert_eq!(
+            tracker
+                .interrupted_placeholder()
+                .account_profile_id
+                .as_deref(),
+            Some("profile-a")
+        );
+        let completed = tracker
+            .complete(TurnStatus::Completed, Some("end_turn".into()))
+            .await;
+        assert_eq!(
+            completed.receipt.account_profile_id.as_deref(),
+            Some("profile-a")
+        );
+    }
 
     fn entry(path: &str, fingerprint: &str, content: &[u8]) -> TurnWorkspaceEntry {
         TurnWorkspaceEntry {

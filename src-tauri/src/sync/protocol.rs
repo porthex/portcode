@@ -7,4 +7,4 @@
 // Full-surface compatibility re-export (see noise.rs); `#[allow(unused_imports)]`
 // because src-tauri doesn't itself reference every wire type under `-D warnings`.
 #[allow(unused_imports)]
-pub use portcode_sync::protocol::{Cursor, RemoteCommand, SyncFrame};
+pub use portcode_sync::protocol::{CommandRejectionCode, Cursor, RemoteCommand, SyncFrame};

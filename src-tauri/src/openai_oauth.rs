@@ -151,6 +151,35 @@ fn claim_string(claims: &Value, key: &str) -> Option<String> {
     claims.get(key)?.as_str().map(str::to_string)
 }
 
+fn account_identity_claim(token: Option<&str>) -> Option<String> {
+    token.and_then(jwt_claims).and_then(|claims| {
+        claims
+            .get("https://api.openai.com/auth")
+            .and_then(|auth| claim_string(auth, "chatgpt_account_id"))
+    })
+}
+
+/// Resolve the identity asserted by only the newly returned token material.
+/// When both tokens carry the claim they must agree; accepting the ID token's
+/// account while sending a bearer token for a different account would break the
+/// profile isolation boundary.
+fn asserted_token_account_identity(
+    id_token: Option<&str>,
+    access_token: Option<&str>,
+) -> Result<Option<String>, String> {
+    let id_identity = account_identity_claim(id_token);
+    let access_identity = account_identity_claim(access_token);
+    if id_identity.is_some() && access_identity.is_some() && id_identity != access_identity {
+        return Err(
+            "OpenAI returned conflicting ChatGPT account identities. Reconnect the intended account."
+                .into(),
+        );
+    }
+    // The access token is the credential actually sent to ChatGPT. An ID-token-
+    // only assertion cannot prove that bearer belongs to the pinned profile.
+    Ok(access_identity)
+}
+
 fn claim_metadata(
     id_token: Option<&str>,
     access_token: &str,
@@ -197,6 +226,48 @@ fn claim_metadata(
     (account_id, email, plan, exp, is_fedramp)
 }
 
+fn validate_asserted_account_identity(
+    previous: Option<&OpenAiOAuthTokens>,
+    asserted_account_id: Option<&str>,
+) -> Result<(), String> {
+    let asserted = asserted_account_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            if previous.is_some() {
+                "OpenAI token refresh did not assert a ChatGPT account. Reconnect this account in Settings."
+            } else {
+                "OpenAI sign-in did not identify a ChatGPT account. Please try another account."
+            }
+            .to_string()
+        })?;
+    if asserted.len() > 512
+        || !asserted.is_ascii()
+        || asserted
+            .chars()
+            .any(|ch| ch.is_ascii_control() || ch.is_ascii_whitespace())
+    {
+        return Err("OpenAI returned an invalid ChatGPT account identity.".into());
+    }
+    if let Some(previous) = previous {
+        let expected = previous
+            .account_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or(
+                "The stored ChatGPT credential has no account identity. Reconnect it in Settings.",
+            )?;
+        if asserted != expected {
+            return Err(
+                "OpenAI token refresh returned a different ChatGPT account. Reconnect the original account in Settings."
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn merge_token_response(
     response: TokenResponse,
     previous: Option<&OpenAiOAuthTokens>,
@@ -239,21 +310,7 @@ async fn parse_token_response(
 ) -> Result<OpenAiOAuthTokens, String> {
     if !response.status().is_success() {
         let status = response.status();
-        let safe_error = response
-            .json::<Value>()
-            .await
-            .ok()
-            .and_then(|value| {
-                value["error_description"]
-                    .as_str()
-                    .or_else(|| value["error"]["message"].as_str())
-                    .or_else(|| value["error"].as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| "request rejected".into());
-        return Err(format!(
-            "OpenAI OAuth token request failed ({status}): {safe_error}"
-        ));
+        return Err(format!("OpenAI OAuth token request failed ({status})."));
     }
     let token_response = response
         .json::<TokenResponse>()
@@ -266,13 +323,44 @@ async fn parse_token_response(
     {
         return Err("OpenAI sign-in returned an incomplete token set. Please try again.".into());
     }
+    let asserted_account_id = asserted_token_account_identity(
+        token_response.id_token.as_deref(),
+        token_response.access_token.as_deref(),
+    )?;
+    if require_complete || previous.is_some() {
+        validate_asserted_account_identity(previous, asserted_account_id.as_deref())?;
+    }
     let tokens = merge_token_response(token_response, previous)?;
-    if require_complete && tokens.account_id.is_none() {
+    Ok(tokens)
+}
+
+/// Apply the complete ChatGPT subscription authentication envelope to a request.
+/// Account identity is mandatory: no OpenAI request may silently omit the
+/// account header or inherit a different global profile.
+pub fn authenticated_request(
+    request: reqwest::RequestBuilder,
+    tokens: &OpenAiOAuthTokens,
+) -> Result<reqwest::RequestBuilder, String> {
+    let access_token = tokens.access_token.trim();
+    if access_token.is_empty() {
         return Err(
-            "OpenAI sign-in did not identify a ChatGPT account. Please try another account.".into(),
+            "The selected ChatGPT account has no access token. Reconnect it in Settings.".into(),
         );
     }
-    Ok(tokens)
+    let account_id = tokens.account_id.as_deref().map(str::trim);
+    validate_asserted_account_identity(None, account_id)?;
+    let mut request = request
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("ChatGPT-Account-ID", account_id.expect("validated above"))
+        .header("originator", "portcode")
+        .header(
+            "user-agent",
+            concat!("Portcode/", env!("CARGO_PKG_VERSION")),
+        );
+    if tokens.is_fedramp {
+        request = request.header("X-OpenAI-Fedramp", "true");
+    }
+    Ok(request)
 }
 
 async fn exchange_code(
@@ -333,6 +421,19 @@ pub fn is_terminal_auth_error(error: &str) -> bool {
         || error.contains("refresh_token_expired")
         || error.contains("refresh_token_reused")
         || error.contains("refresh_token_invalidated")
+}
+
+/// Whether a failed refresh must quarantine only the selected profile. Besides
+/// provider-rejected refresh tokens, any missing/conflicting/different identity
+/// assertion is terminal for that profile: retrying it as Connected would repeat
+/// the unsafe response forever.
+pub fn refresh_failure_requires_reconnect(error: &str) -> bool {
+    is_terminal_auth_error(error)
+        || error.starts_with("OpenAI token refresh did not assert a ChatGPT account.")
+        || error.starts_with("OpenAI returned conflicting ChatGPT account identities.")
+        || error.starts_with("OpenAI returned an invalid ChatGPT account identity.")
+        || error.starts_with("The stored ChatGPT credential has no account identity.")
+        || error.starts_with("OpenAI token refresh returned a different ChatGPT account.")
 }
 
 pub async fn run_loopback_login(http: &reqwest::Client) -> Result<OpenAiOAuthTokens, String> {
@@ -428,16 +529,20 @@ async fn await_callback(listener: &TcpListener, expected_state: &str) -> Result<
             continue;
         }
         if let Some(error) = oauth_error {
-            if error.contains("missing_codex_entitlement") {
-                return Err(
-                    "This ChatGPT workspace does not have Codex access. Ask the workspace administrator to enable it."
-                        .into(),
-                );
-            }
-            return Err(format!("OpenAI sign-in was not completed: {error}"));
+            return Err(oauth_callback_error_message(&error));
         }
         return code.ok_or_else(|| "OpenAI callback did not include a code.".into());
     }
+}
+
+fn oauth_callback_error_message(error: &str) -> String {
+    if error.contains("missing_codex_entitlement") {
+        return "This ChatGPT workspace does not have Codex access. Ask the workspace administrator to enable it."
+            .into();
+    }
+    // OAuth callback values are controlled by the provider/browser and may
+    // contain account identifiers. Never forward them across IPC.
+    "OpenAI sign-in was not completed. Please try again.".into()
 }
 
 async fn read_request_line(stream: &mut TcpStream) -> Result<String, String> {
@@ -481,25 +586,6 @@ pub struct OpenAiModel {
     pub default_reasoning_effort: String,
 }
 
-fn fallback_models() -> Vec<OpenAiModel> {
-    ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
-        .into_iter()
-        .map(|id| OpenAiModel {
-            id: id.into(),
-            label: id.into(),
-            reasoning_efforts: vec![
-                "none".into(),
-                "low".into(),
-                "medium".into(),
-                "high".into(),
-                "xhigh".into(),
-                "max".into(),
-            ],
-            default_reasoning_effort: "medium".into(),
-        })
-        .collect()
-}
-
 fn display_models(value: &Value) -> Vec<OpenAiModel> {
     let mut rows: Vec<(i64, OpenAiModel)> = value["models"]
         .as_array()
@@ -541,6 +627,25 @@ fn display_models(value: &Value) -> Vec<OpenAiModel> {
     rows.into_iter().map(|(_, model)| model).collect()
 }
 
+fn model_catalog_status_error(status: reqwest::StatusCode) -> Option<String> {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        Some("OpenAI model catalog authentication failed (401).".into())
+    } else if !status.is_success() {
+        Some(format!("OpenAI model catalog request failed ({status})."))
+    } else {
+        None
+    }
+}
+
+fn require_display_models(value: &Value) -> Result<Vec<OpenAiModel>, String> {
+    let rows = display_models(value);
+    if rows.is_empty() {
+        Err("OpenAI model catalog returned no supported models.".into())
+    } else {
+        Ok(rows)
+    }
+}
+
 pub async fn models(
     http: &reqwest::Client,
     tokens: &OpenAiOAuthTokens,
@@ -550,36 +655,23 @@ pub async fn models(
         "https://chatgpt.com/backend-api/codex/models?client_version={}",
         env!("CARGO_PKG_VERSION")
     );
-    let mut request = http
-        .get(url)
-        .header("authorization", format!("Bearer {}", tokens.access_token))
-        .header("originator", "portcode")
-        .header(
-            "user-agent",
-            concat!("Portcode/", env!("CARGO_PKG_VERSION")),
-        );
-    if let Some(account_id) = &tokens.account_id {
-        request = request.header("ChatGPT-Account-ID", account_id);
+    let request = authenticated_request(http.get(url), tokens)?;
+    let response = tokio::time::timeout(Duration::from_secs(30), request.send())
+        .await
+        .map_err(|_| "OpenAI model catalog request timed out.".to_string())?
+        .map_err(|_| "Could not reach the OpenAI model catalog.".to_string())?;
+    if let Some(error) = model_catalog_status_error(response.status()) {
+        return Err(error);
     }
-    if tokens.is_fedramp {
-        request = request.header("X-OpenAI-Fedramp", "true");
-    }
-    let live = tokio::time::timeout(Duration::from_secs(30), async {
-        let response = request.send().await.ok()?;
-        if !response.status().is_success() {
-            return None;
-        }
-        response.json::<Value>().await.ok()
-    })
-    .await
-    .ok()
-    .flatten();
-    let rows = live.as_ref().map(display_models).unwrap_or_default();
-    Ok(if rows.is_empty() {
-        fallback_models()
-    } else {
-        rows
-    })
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|_| "OpenAI model catalog returned invalid data.".to_string())?;
+    require_display_models(&value)
+}
+
+pub fn is_model_authentication_error(error: &str) -> bool {
+    error == "OpenAI model catalog authentication failed (401)."
 }
 
 #[cfg(test)]
@@ -683,6 +775,39 @@ mod tests {
     }
 
     #[test]
+    fn newly_returned_id_and_access_tokens_cannot_assert_different_accounts() {
+        let token = |account_id: &str| {
+            format!(
+                "x.{}.y",
+                URL_SAFE_NO_PAD.encode(
+                    serde_json::to_vec(&json!({
+                        "https://api.openai.com/auth": {
+                            "chatgpt_account_id": account_id
+                        }
+                    }))
+                    .unwrap()
+                )
+            )
+        };
+        let account_a = token("acct-a");
+        let account_b = token("acct-b");
+
+        assert_eq!(
+            asserted_token_account_identity(Some(&account_a), Some(&account_a)).unwrap(),
+            Some("acct-a".into())
+        );
+        assert!(asserted_token_account_identity(Some(&account_a), Some(&account_b)).is_err());
+        assert_eq!(
+            asserted_token_account_identity(None, Some(&account_b)).unwrap(),
+            Some("acct-b".into())
+        );
+        assert_eq!(
+            asserted_token_account_identity(Some(&account_a), Some("opaque-access")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn refresh_merge_retains_optional_tokens_and_rotates_supplied_refresh_token() {
         let previous = OpenAiOAuthTokens {
             access_token: "old-access".into(),
@@ -741,10 +866,82 @@ mod tests {
     }
 
     #[test]
+    fn refresh_identity_must_be_present_and_match_exactly() {
+        let previous = OpenAiOAuthTokens {
+            access_token: "old-access".into(),
+            refresh_token: "old-refresh".into(),
+            id_token: None,
+            expires_at: 123,
+            account_id: Some("acct-a".into()),
+            email: None,
+            plan: None,
+            is_fedramp: false,
+        };
+        assert!(validate_asserted_account_identity(Some(&previous), Some("acct-a")).is_ok());
+        for asserted in [None, Some(""), Some("acct-b")] {
+            assert!(validate_asserted_account_identity(Some(&previous), asserted).is_err());
+        }
+    }
+
+    #[test]
+    fn authenticated_request_applies_one_strict_account_envelope() {
+        let tokens = OpenAiOAuthTokens {
+            access_token: "access-a".into(),
+            refresh_token: "refresh-a".into(),
+            id_token: None,
+            expires_at: 123,
+            account_id: Some("acct-a".into()),
+            email: None,
+            plan: None,
+            is_fedramp: true,
+        };
+        let request = authenticated_request(
+            reqwest::Client::new().get("https://example.invalid"),
+            &tokens,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(request.headers()["authorization"], "Bearer access-a");
+        assert_eq!(request.headers()["ChatGPT-Account-ID"], "acct-a");
+        assert_eq!(request.headers()["originator"], "portcode");
+        assert_eq!(request.headers()["X-OpenAI-Fedramp"], "true");
+
+        let mut missing = tokens;
+        missing.account_id = None;
+        assert!(authenticated_request(
+            reqwest::Client::new().get("https://example.invalid"),
+            &missing,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn permanent_refresh_errors_are_classified_for_reauthentication() {
         assert!(is_terminal_auth_error("refresh_token_reused"));
         assert!(is_terminal_auth_error("request failed (401 Unauthorized)"));
         assert!(!is_terminal_auth_error("network timed out"));
+
+        for identity_error in [
+            "OpenAI token refresh did not assert a ChatGPT account. Reconnect this account in Settings.",
+            "OpenAI returned conflicting ChatGPT account identities. Reconnect the intended account.",
+            "OpenAI token refresh returned a different ChatGPT account. Reconnect the original account in Settings.",
+        ] {
+            assert!(refresh_failure_requires_reconnect(identity_error));
+        }
+        assert!(!refresh_failure_requires_reconnect("network timed out"));
+    }
+
+    #[test]
+    fn oauth_callback_errors_never_echo_provider_values() {
+        let provider_value = "access_denied for secret-account@example.invalid";
+        let message = oauth_callback_error_message(provider_value);
+        assert_eq!(
+            message,
+            "OpenAI sign-in was not completed. Please try again."
+        );
+        assert!(!message.contains("secret-account"));
+        assert!(oauth_callback_error_message("missing_codex_entitlement").contains("Codex access"));
     }
 
     #[test]
@@ -785,5 +982,33 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "good");
         assert_eq!(rows[0].reasoning_efforts, ["low", "high"]);
+    }
+
+    #[test]
+    fn model_catalog_failures_never_become_a_valid_fallback_catalog() {
+        assert_eq!(
+            model_catalog_status_error(reqwest::StatusCode::UNAUTHORIZED).as_deref(),
+            Some("OpenAI model catalog authentication failed (401).")
+        );
+        assert!(
+            model_catalog_status_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+                .unwrap()
+                .contains("500")
+        );
+        assert_eq!(model_catalog_status_error(reqwest::StatusCode::OK), None);
+        for value in [
+            json!({}),
+            json!({ "models": [] }),
+            json!({ "models": [{
+                "slug": "hidden",
+                "visibility": "hide",
+                "supported_in_api": true
+            }] }),
+        ] {
+            assert_eq!(
+                require_display_models(&value).unwrap_err(),
+                "OpenAI model catalog returned no supported models."
+            );
+        }
     }
 }

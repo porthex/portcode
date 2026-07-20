@@ -80,6 +80,30 @@ pub enum RemoteCommand {
     },
 }
 
+/// Stable, non-sensitive reason a desktop rejected a correlated remote command.
+///
+/// The phone should use `code` for behavior and may display the accompanying
+/// bounded public message. `Unknown` keeps newer desktop codes decodable by an
+/// older phone instead of turning an application-level rejection into a protocol
+/// failure and reconnect loop.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(rename_all = "snake_case")]
+pub enum CommandRejectionCode {
+    /// The current protocol cannot select the desktop's required ChatGPT profile.
+    OpenAiAccountSelectionRequired,
+    /// The desktop's authoritative provider/model configuration is inconsistent.
+    InvalidDesktopConfiguration,
+    /// A local persistence/settings failure prevented the command from completing.
+    DesktopUnavailable,
+    /// The caller supplied an invalid or unsafe correlation identifier.
+    InvalidRequest,
+    /// A future rejection code unknown to this peer.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
 /// Everything that crosses the encrypted channel, in both directions.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[cfg_attr(target_arch = "wasm32", derive(Tsify))]
@@ -98,6 +122,20 @@ pub enum SyncFrame {
     SessionCreated {
         request_id: String,
         session: SessionRow,
+    },
+    /// desktop → phone: a command was safely rejected without closing command
+    /// intake. Currently emitted for [`RemoteCommand::CreateSession`] as the
+    /// correlated failure counterpart to the successful
+    /// [`SyncFrame::SessionCreated`] frame. `request_id` is absent only when the
+    /// inbound identifier itself was unsafe to echo. Defaults keep the additive
+    /// frame tolerant of peers that omit newer diagnostic fields.
+    CommandRejected {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        #[serde(default)]
+        code: CommandRejectionCode,
+        #[serde(default)]
+        message: String,
     },
     /// desktop → phone: append-only catch-up for one session.
     MessageDelta {
@@ -200,6 +238,7 @@ mod tests {
                 branch: Some("main".into()),
                 workspace: Some("C:/ws".into()),
                 model: Some("claude-opus-4-8".into()),
+                account_profile_id: Some("profile-a".into()),
                 created_at: 1_000_000,
                 updated_at: 2_000_000,
             }],
@@ -216,6 +255,7 @@ mod tests {
                 branch: None,
                 workspace: None,
                 model: Some("gpt-5.6-sol".into()),
+                account_profile_id: None,
                 created_at: 10,
                 updated_at: 10,
             },
@@ -224,6 +264,50 @@ mod tests {
         assert!(json.contains("\"t\":\"session_created\""), "{json}");
         assert!(json.contains("\"request_id\":\"create-42\""), "{json}");
         round_trips(&frame);
+    }
+
+    #[test]
+    fn command_rejection_round_trips_with_safe_correlation() {
+        let frame = SyncFrame::CommandRejected {
+            request_id: Some("create-42".into()),
+            code: CommandRejectionCode::OpenAiAccountSelectionRequired,
+            message: "Create this ChatGPT conversation on the desktop.".into(),
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("\"t\":\"command_rejected\""), "{json}");
+        assert!(json.contains("\"request_id\":\"create-42\""), "{json}");
+        assert!(
+            json.contains("\"code\":\"open_ai_account_selection_required\""),
+            "{json}"
+        );
+        round_trips(&frame);
+    }
+
+    #[test]
+    fn command_rejection_defaults_and_unknown_codes_are_forward_compatible() {
+        let minimal: SyncFrame =
+            serde_json::from_str(r#"{"t":"command_rejected"}"#).expect("minimal frame");
+        assert!(matches!(
+            minimal,
+            SyncFrame::CommandRejected {
+                request_id: None,
+                code: CommandRejectionCode::Unknown,
+                message,
+            } if message.is_empty()
+        ));
+
+        let future: SyncFrame = serde_json::from_str(
+            r#"{"t":"command_rejected","request_id":"r1","code":"future_reason","message":"Rejected."}"#,
+        )
+        .expect("unknown future code");
+        assert!(matches!(
+            future,
+            SyncFrame::CommandRejected {
+                request_id: Some(request_id),
+                code: CommandRejectionCode::Unknown,
+                message,
+            } if request_id == "r1" && message == "Rejected."
+        ));
     }
 
     #[test]

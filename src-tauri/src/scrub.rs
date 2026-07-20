@@ -62,9 +62,9 @@ fn redactors() -> &'static [Redactor] {
                 r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*",
                 "${1}[redacted-token]",
             ),
-            // Authorization / x-api-key / api-key header or assignment values.
+            // Authorization / API key / ChatGPT account header or assignment values.
             p(
-                r#"(?i)("?(?:authorization|x-api-key|api[_-]?key)"?\s*[:=]\s*"?)[^"\s,}\]]+"#,
+                r#"(?i)("?(?:authorization|x-api-key|api[_-]?key|chatgpt-account-id)"?\s*[:=]\s*"?)[^"\s,}\]]+"#,
                 "${1}[redacted]",
             ),
             // Emails (non-overlapping labels).
@@ -131,6 +131,9 @@ mod tests {
     fn redacts_bearer_tokens_and_auth_headers() {
         assert!(redact_secrets("Authorization: Bearer abc.def-ghi123").contains("[redacted-token]"));
         assert!(redact_secrets(r#""x-api-key":"supersecretvalue""#).contains("[redacted]"));
+        let account = redact_secrets(r#""ChatGPT-Account-ID":"acct-private-a""#);
+        assert!(account.contains("[redacted]"));
+        assert!(!account.contains("acct-private-a"));
     }
 
     #[test]

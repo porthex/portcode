@@ -190,6 +190,9 @@ async fn json_response(request: reqwest::RequestBuilder, provider: &str) -> Resu
             .await
             .map_err(|error| format!("{provider} usage request failed: {error}"))?;
         if !response.status().is_success() {
+            if provider == "ChatGPT" && response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                return Err("ChatGPT usage authentication failed (401).".into());
+            }
             return Err(format!(
                 "{provider} usage is temporarily unavailable ({}).",
                 response.status()
@@ -202,6 +205,10 @@ async fn json_response(request: reqwest::RequestBuilder, provider: &str) -> Resu
     })
     .await
     .map_err(|_| format!("{provider} usage request timed out."))?
+}
+
+pub fn is_openai_authentication_error(error: &str) -> bool {
+    error == "ChatGPT usage authentication failed (401)."
 }
 
 pub async fn anthropic(
@@ -226,20 +233,7 @@ pub async fn openai(
     http: &reqwest::Client,
     tokens: &OpenAiOAuthTokens,
 ) -> Result<PlanUsageSnapshot, String> {
-    let mut request = http
-        .get(OPENAI_USAGE_URL)
-        .header("authorization", format!("Bearer {}", tokens.access_token))
-        .header("originator", "portcode")
-        .header(
-            "user-agent",
-            concat!("Portcode/", env!("CARGO_PKG_VERSION")),
-        );
-    if let Some(account_id) = &tokens.account_id {
-        request = request.header("ChatGPT-Account-ID", account_id);
-    }
-    if tokens.is_fedramp {
-        request = request.header("X-OpenAI-Fedramp", "true");
-    }
+    let request = crate::openai_oauth::authenticated_request(http.get(OPENAI_USAGE_URL), tokens)?;
     let value = json_response(request, "ChatGPT").await?;
     let snapshot = parse_openai(&value, tokens.plan.as_deref(), crate::oauth::now_secs());
     if snapshot.windows.is_empty() {
@@ -303,5 +297,18 @@ mod tests {
         );
         assert_eq!(snapshot.windows[0].used_percent, 100.0);
         assert_eq!(snapshot.windows[1].used_percent, 0.0);
+    }
+
+    #[test]
+    fn openai_usage_authentication_classifier_is_exact() {
+        assert!(is_openai_authentication_error(
+            "ChatGPT usage authentication failed (401)."
+        ));
+        assert!(!is_openai_authentication_error(
+            "ChatGPT usage is temporarily unavailable (401 Unauthorized)."
+        ));
+        assert!(!is_openai_authentication_error(
+            "ChatGPT usage authentication failed (401). extra"
+        ));
     }
 }

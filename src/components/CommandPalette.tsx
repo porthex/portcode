@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useStore } from "../store/store";
+import { modelsForOpenAIProfile, useStore } from "../store/store";
 import { modelCatalog } from "../types";
 import type { SearchHit } from "../types";
 
@@ -23,7 +23,17 @@ export function CommandPalette() {
   const setShowSettings = useStore((s) => s.setShowSettings);
   const openWorkspace = useStore((s) => s.openWorkspace);
   const setSessionModel = useStore((s) => s.setSessionModel);
-  const openAIModels = useStore((s) => s.openAIModels);
+  const activeAccountProfileId = useStore((s) =>
+    s.activeId
+      ? (s.sessions.find((candidate) => candidate.id === s.activeId)?.accountProfileId ?? null)
+      : null,
+  );
+  const openAIModels = useStore((s) => {
+    const session = s.activeId
+      ? s.sessions.find((candidate) => candidate.id === s.activeId)
+      : undefined;
+    return modelsForOpenAIProfile(session?.accountProfileId, s.openAIModelCatalogs, s.openAIModels);
+  });
   const streaming = useStore((s) => s.streaming);
   const remoteMode = useStore((s) => s.remoteMode);
   const remoteConnected = useStore((s) => s.remoteConnected);
@@ -58,12 +68,14 @@ export function CommandPalette() {
         run: () => setShowSettings(true),
       },
       ...(!streaming && !remoteMode && !remoteConnected
-        ? modelCatalog(openAIModels).map((m) => ({
-            id: "model-" + m.id,
-            label: `Model: ${m.label}`,
-            glyph: "◉",
-            run: () => void setSessionModel(m.id),
-          }))
+        ? modelCatalog(openAIModels)
+            .filter((model) => !activeAccountProfileId || model.provider === "openai")
+            .map((m) => ({
+              id: "model-" + m.id,
+              label: `Model: ${m.label}`,
+              glyph: "◉",
+              run: () => void setSessionModel(m.id),
+            }))
         : []),
     ],
     [
@@ -73,6 +85,7 @@ export function CommandPalette() {
       openWorkspace,
       setShowSettings,
       setSessionModel,
+      activeAccountProfileId,
       openAIModels,
       streaming,
       remoteMode,

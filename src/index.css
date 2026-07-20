@@ -631,6 +631,166 @@ input[type="radio"]:not(:disabled) {
   box-shadow: 0 0 22px rgba(255, 46, 126, 0.28);
 }
 
+.pc-newsession-split {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+}
+.pc-newsession-split__primary {
+  min-width: 0;
+  justify-content: flex-start;
+  border-radius: 8px 0 0 8px;
+}
+.pc-newsession-choice {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 2px;
+  text-align: left;
+}
+.pc-newsession-choice__row {
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr);
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  color: var(--color-faint);
+}
+.pc-newsession-choice__row strong {
+  overflow: hidden;
+  color: var(--color-accent-2);
+  font-weight: 550;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pc-newsession-split__menu {
+  border: 1px solid rgba(255, 46, 126, 0.4);
+  border-left: 0;
+  border-radius: 0 8px 8px 0;
+  background: rgba(255, 46, 126, 0.08);
+  color: #ff7eb0;
+  transition:
+    background 0.18s ease,
+    box-shadow 0.18s ease;
+}
+.pc-newsession-split__menu:hover:not(:disabled),
+.pc-newsession-split__menu[aria-expanded="true"] {
+  background: rgba(255, 46, 126, 0.18);
+  box-shadow: 0 0 18px rgba(255, 46, 126, 0.2);
+}
+.pc-newsession-split__menu:focus-visible {
+  outline: 2px solid rgba(33, 230, 255, 0.55);
+  outline-offset: 1px;
+}
+.pc-newsession-menu {
+  position: absolute;
+  z-index: 70;
+  top: calc(100% + 6px);
+  right: 0;
+  left: 0;
+  overflow: hidden;
+  padding: 5px;
+  border: 1px solid var(--color-border-2);
+  border-radius: 10px;
+  background: #0c0e16;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.62);
+}
+.pc-newsession-menu__heading {
+  padding: 4px 7px 5px;
+  color: var(--color-faint);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.14em;
+}
+.pc-newsession-menu__item,
+.pc-newsession-menu__manage {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 7px;
+  padding: 7px;
+  border-radius: 7px;
+  color: var(--color-muted);
+  font-size: 11px;
+}
+.pc-newsession-menu__model {
+  display: grid;
+  gap: 5px;
+  margin: 5px 3px;
+  padding: 7px;
+  border: 1px solid var(--color-border);
+  border-radius: 7px;
+  color: var(--color-faint);
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  letter-spacing: 0.08em;
+}
+.pc-newsession-menu__model select {
+  width: 100%;
+  min-width: 0;
+  padding: 5px 6px;
+  border: 1px solid var(--color-border-2);
+  border-radius: 6px;
+  background: var(--color-panel-2);
+  color: var(--color-fg);
+  font-size: 10px;
+}
+.pc-newsession-recovery {
+  display: grid;
+  gap: 5px;
+}
+.pc-newsession-recovery__manage {
+  color: var(--color-accent-2);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  text-decoration: underline;
+}
+.pc-newsession-menu__item > span:nth-last-child(1),
+.pc-newsession-menu__item > span:nth-last-child(2) {
+  flex-shrink: 0;
+  color: var(--color-faint);
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  text-transform: uppercase;
+}
+.pc-newsession-menu__item:hover:not(:disabled),
+.pc-newsession-menu__manage:hover {
+  background: rgba(33, 230, 255, 0.08);
+  color: var(--color-fg);
+}
+.pc-newsession-menu__item:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.pc-newsession-menu__manage {
+  margin-top: 4px;
+  border-top: 1px solid var(--color-border);
+  border-radius: 0 0 7px 7px;
+  color: var(--color-accent-2);
+}
+.pc-newsession-menu__empty,
+.pc-newsession-menu__error,
+.pc-newsession-menu__pending {
+  padding: 7px;
+  color: var(--color-faint);
+  font-size: 10px;
+}
+.pc-newsession-menu__pending {
+  color: var(--color-accent-2);
+}
+.pc-newsession-menu__error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--color-danger);
+}
+.pc-newsession-menu__error button {
+  color: var(--color-accent-2);
+  text-decoration: underline;
+}
+
 /* One-shot success-accent pulse for Settings Save / Copy confirmations
    (pcFlash box-shadow; neutralized under prefers-reduced-motion). */
 .pc-flash {
@@ -2125,6 +2285,113 @@ button.pc-turn-receipt__strip:focus-visible {
   font-weight: 600;
   color: var(--color-fg);
 }
+
+.pc-openai-capability-notice,
+.pc-openai-account-empty,
+.pc-openai-accounts-error {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 10px;
+  padding: 10px 11px;
+  border: 1px solid var(--color-border);
+  border-radius: 9px;
+  background: var(--color-panel-2);
+  color: var(--color-muted);
+  font-size: 11px;
+}
+.pc-openai-capability-notice {
+  border-color: rgba(255, 176, 46, 0.3);
+}
+.pc-openai-capability-notice strong,
+.pc-openai-account-empty strong {
+  color: var(--color-fg);
+  font-size: 12px;
+}
+.pc-openai-account-list {
+  display: grid;
+  gap: 7px;
+  margin-top: 10px;
+}
+.pc-openai-account-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 11px;
+  border: 1px solid var(--color-border);
+  border-radius: 9px;
+  background: var(--color-panel-2);
+}
+.pc-openai-account-row__identity {
+  min-width: 0;
+}
+.pc-openai-account-row__identity > div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+}
+.pc-openai-account-row__identity strong {
+  overflow: hidden;
+  color: var(--color-fg);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pc-openai-account-row__identity small {
+  display: block;
+  margin-top: 3px;
+  padding-left: 15px;
+  color: var(--color-faint);
+  font-size: 10.5px;
+}
+.pc-openai-account-tier {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #34ff9e, #21e6ff);
+  color: #071015;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+.pc-openai-account-row__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.pc-openai-account-row__actions button,
+.pc-openai-accounts-error button {
+  padding: 5px 8px;
+  border: 1px solid var(--color-border-2);
+  border-radius: 7px;
+  background: var(--color-panel);
+  color: var(--color-muted);
+  font-size: 10.5px;
+}
+.pc-openai-account-row__actions button:hover:not(:disabled),
+.pc-openai-accounts-error button:hover:not(:disabled) {
+  border-color: rgba(33, 230, 255, 0.4);
+  color: var(--color-fg);
+}
+.pc-openai-account-row__actions button.is-danger {
+  border-color: rgba(255, 77, 87, 0.4);
+  color: var(--color-danger);
+}
+.pc-openai-account-row__actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.pc-openai-accounts-error {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  border-color: rgba(255, 77, 87, 0.32);
+  color: var(--color-danger);
+}
 .pc-provider-empty-control {
   min-height: 40px;
   display: flex;
@@ -3606,6 +3873,55 @@ button.pc-turn-receipt__strip:focus-visible {
   padding: 10px clamp(12px, 1.6vw, 20px) 7px;
   background: linear-gradient(180deg, rgba(10, 12, 19, 0.88), rgba(7, 9, 14, 0.98));
   box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.14);
+}
+.pc-openai-session-gate {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 8px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 176, 46, 0.36);
+  border-radius: 10px;
+  background: linear-gradient(100deg, rgba(255, 176, 46, 0.09), rgba(12, 14, 22, 0.96));
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
+}
+.pc-openai-session-gate > div > strong,
+.pc-openai-session-gate > div > span {
+  display: block;
+}
+.pc-openai-session-gate > div > strong {
+  color: var(--color-fg);
+  font-size: 12px;
+}
+.pc-openai-session-gate > div > span {
+  margin-top: 2px;
+  color: var(--color-muted);
+  font-size: 10.5px;
+}
+.pc-openai-session-gate > button {
+  flex-shrink: 0;
+  padding: 7px 10px;
+  border: 1px solid rgba(33, 230, 255, 0.35);
+  border-radius: 8px;
+  background: rgba(33, 230, 255, 0.08);
+  color: var(--color-accent-2);
+  font-size: 11px;
+}
+.pc-openai-session-gate > button:hover:not(:disabled) {
+  background: rgba(33, 230, 255, 0.14);
+}
+.pc-openai-session-gate > button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.pc-openai-session-gate__account {
+  color: var(--color-accent-2) !important;
+  font-family: var(--font-mono);
+}
+.pc-openai-session-gate__error {
+  color: var(--color-danger) !important;
 }
 
 /* Select popovers size to their content but never escape a narrow WebView. */

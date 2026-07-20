@@ -4,7 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import App from "./App";
 import { useStore } from "./store/store";
-import { DEFAULT_SETTINGS } from "./types";
+import { DEFAULT_SETTINGS, type OpenAIModelCatalogState } from "./types";
 import * as ipc from "./lib/ipc";
 import { getInstallState } from "./lib/installGate";
 
@@ -151,9 +151,10 @@ vi.mock("./lib/ipc", () => ({
   startOauthLogin: vi.fn(),
   oauthLogout: vi.fn(),
   openaiOauthStatus: vi.fn(),
-  startOpenaiOauthLogin: vi.fn(),
-  openaiOauthLogout: vi.fn(),
+  listOpenAIAccounts: vi.fn(),
   openaiModels: vi.fn(),
+  getPlanUsage: vi.fn(),
+  subscribeSessionEvents: vi.fn(),
   // store.init() also fetches phone sync status.
   phoneSyncStatus: vi.fn(),
   phoneSyncBeginPairing: vi.fn(),
@@ -182,7 +183,24 @@ beforeEach(() => {
   m.isTauri.mockReturnValue(false);
   m.getSettings.mockResolvedValue(DEFAULT_SETTINGS);
   m.listSessions.mockResolvedValue([]);
-  m.createSession.mockResolvedValue(undefined);
+  m.createSession.mockImplementation(
+    async (
+      id,
+      title = "New chat",
+      workspace = null,
+      model = DEFAULT_SETTINGS.model,
+      accountProfileId = null,
+    ) => ({
+      id,
+      title,
+      workspace,
+      branch: null,
+      model,
+      accountProfileId,
+      createdAt: 1,
+      updatedAt: 1,
+    }),
+  );
   m.getMessages.mockResolvedValue([]);
   m.getDrafts.mockResolvedValue([]);
   m.getAllUsage.mockResolvedValue([]);
@@ -194,6 +212,14 @@ beforeEach(() => {
     tier: null,
   });
   m.openaiModels.mockResolvedValue([]);
+  m.listOpenAIAccounts.mockResolvedValue([]);
+  m.getPlanUsage.mockImplementation(async (provider) => ({
+    provider,
+    plan: null,
+    updatedAt: 1,
+    windows: [],
+  }));
+  m.subscribeSessionEvents.mockResolvedValue(() => {});
   m.phoneSyncStatus.mockResolvedValue({ devicePublicKey: "DEVICE==", paired: [] });
   m.phoneSyncDisconnect.mockResolvedValue(undefined);
   m.onPhoneSyncPairingRequest.mockResolvedValue(() => {});
@@ -230,6 +256,50 @@ describe("App layout", () => {
       expect(m.getUpdateChannel).toHaveBeenCalledTimes(1);
       expect(m.checkForUpdate).toHaveBeenCalledTimes(1);
     });
+  });
+
+  it("folds native updater events into store progress and tears down the listener", async () => {
+    m.isTauri.mockReturnValue(true);
+    const off = vi.fn();
+    let handler:
+      | ((
+          event:
+            { kind: "progress"; downloaded: number; total: number | null } | { kind: "finished" },
+        ) => void)
+      | undefined;
+    m.onUpdaterEvent.mockImplementation(async (next) => {
+      handler = next;
+      return off;
+    });
+
+    const view = render(<App />);
+    await waitFor(() => expect(handler).toBeTypeOf("function"));
+
+    act(() => handler?.({ kind: "progress", downloaded: 4, total: 10 }));
+    expect(useStore.getState().update.progress).toBe(40);
+    act(() => handler?.({ kind: "finished" }));
+    expect(useStore.getState().update).toMatchObject({ phase: "ready", progress: 100 });
+
+    view.unmount();
+    expect(off).toHaveBeenCalledOnce();
+  });
+
+  it("drops a native updater listener that resolves after unmount", async () => {
+    m.isTauri.mockReturnValue(true);
+    const off = vi.fn();
+    let resolveListener!: (off: () => void) => void;
+    m.onUpdaterEvent.mockReturnValue(
+      new Promise((resolve) => {
+        resolveListener = resolve;
+      }),
+    );
+
+    const view = render(<App />);
+    await waitFor(() => expect(m.onUpdaterEvent).toHaveBeenCalledOnce());
+    view.unmount();
+    await act(async () => resolveListener(off));
+
+    expect(off).toHaveBeenCalledOnce();
   });
 
   it("keeps a background update-check failure out of the workspace chrome", async () => {
@@ -610,6 +680,154 @@ describe("TitleBar", () => {
     expect(screen.getByText("Refactor the parser")).toBeInTheDocument();
   });
 
+  it("shows the active ChatGPT account label without exposing its local profile id", async () => {
+    const accountProfileId = "00000000-0000-4000-8000-000000000001";
+    const activeSession = {
+      id: "openai-session",
+      title: "OpenAI work",
+      workspace: null,
+      branch: null,
+      model: "gpt-5.6-sol",
+      accountProfileId,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    const account = {
+      id: accountProfileId,
+      accountLabel: "one@chatgpt.test",
+      tier: "ChatGPT Plus",
+      expiresAt: null,
+      state: "connected" as const,
+      createdAt: 1,
+      updatedAt: 1,
+      lastUsedAt: 1,
+    };
+    m.listSessions.mockResolvedValue([activeSession]);
+    m.listOpenAIAccounts.mockResolvedValue([account]);
+    useStore.setState({
+      sessions: [activeSession],
+      activeId: activeSession.id,
+      openAIAccounts: [account],
+    });
+
+    const { container } = render(<App />);
+
+    expect((await screen.findAllByText("one@chatgpt.test")).length).toBeGreaterThan(0);
+    expect(container).toHaveTextContent("one@chatgpt.test");
+    expect(container).not.toHaveTextContent(accountProfileId);
+  });
+
+  it.each(["ready", "absent", "loading", "error"] as const)(
+    "shows the pinned account pill for a catalog-only model when its catalog is %s",
+    (catalogState) => {
+      const accountProfileId = "00000000-0000-4000-8000-000000000002";
+      const accountModel = {
+        id: "account-exclusive-model",
+        label: "Account exclusive model",
+        provider: "openai" as const,
+        reasoningEfforts: ["medium" as const],
+        defaultReasoningEffort: "medium" as const,
+      };
+      const activeSession = {
+        id: "catalog-only-openai-session",
+        title: "Catalog-only OpenAI work",
+        workspace: null,
+        branch: null,
+        model: accountModel.id,
+        accountProfileId,
+        createdAt: 1,
+        updatedAt: 1,
+      };
+      const account = {
+        id: accountProfileId,
+        accountLabel: "catalog@chatgpt.test",
+        tier: "ChatGPT Plus",
+        expiresAt: null,
+        state: "connected" as const,
+        createdAt: 1,
+        updatedAt: 1,
+        lastUsedAt: 1,
+      };
+      m.listSessions.mockResolvedValue([activeSession]);
+      m.listOpenAIAccounts.mockResolvedValue([account]);
+      m.openaiModels.mockResolvedValue([accountModel]);
+      const openAIModelCatalogs: Record<string, OpenAIModelCatalogState> =
+        catalogState === "absent"
+          ? {}
+          : {
+              [accountProfileId]:
+                catalogState === "ready"
+                  ? { status: "ready" as const, models: [accountModel], error: null }
+                  : catalogState === "loading"
+                    ? { status: "loading" as const, models: [], error: null }
+                    : { status: "error" as const, models: [], error: "catalog unavailable" },
+            };
+      useStore.setState({
+        sessions: [activeSession],
+        activeId: activeSession.id,
+        openAIAccounts: [account],
+        openAIModels: [accountModel],
+        openAIModelCatalogs,
+      });
+
+      render(<App />);
+
+      expect(screen.getByRole("banner")).toHaveTextContent("catalog@chatgpt.test");
+    },
+  );
+
+  it("uses a safe tombstone badge when the active ChatGPT profile is gone", async () => {
+    const accountProfileId = "00000000-0000-4000-8000-000000000099";
+    const activeSession = {
+      id: "removed-account-session",
+      title: "Old OpenAI work",
+      workspace: null,
+      branch: null,
+      model: "gpt-5.6-sol",
+      accountProfileId,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    m.listSessions.mockResolvedValue([activeSession]);
+    m.listOpenAIAccounts.mockResolvedValue([]);
+    useStore.setState({ sessions: [activeSession], activeId: activeSession.id });
+
+    const { container } = render(<App />);
+
+    await waitFor(() => expect(screen.getByRole("banner")).toHaveTextContent("ACCOUNT REMOVED"));
+    expect(container).not.toHaveTextContent(accountProfileId);
+  });
+
+  it("does not call a pinned ChatGPT profile removed while account discovery is unavailable", async () => {
+    const accountProfileId = "00000000-0000-4000-8000-000000000098";
+    const activeSession = {
+      id: "unavailable-account-session",
+      title: "Pinned OpenAI work",
+      workspace: null,
+      branch: null,
+      model: "gpt-5.6-sol",
+      accountProfileId,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    m.listSessions.mockResolvedValue([activeSession]);
+    m.listOpenAIAccounts.mockRejectedValue(new Error("credential registry is locked"));
+    useStore.setState({
+      sessions: [activeSession],
+      activeId: activeSession.id,
+      openAIAccounts: [],
+      openAIAccountsError: "credential registry is locked",
+    });
+
+    const { container } = render(<App />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("banner")).toHaveTextContent("ACCOUNT UNAVAILABLE"),
+    );
+    expect(screen.getByRole("banner")).not.toHaveTextContent("ACCOUNT REMOVED");
+    expect(container).not.toHaveTextContent(accountProfileId);
+  });
+
   it("shows the active session title in the title-bar breadcrumb (not as a competing heading)", () => {
     useStore.setState({
       sessions: [
@@ -812,6 +1030,59 @@ describe("global keyboard shortcuts", () => {
     expect(screen.getByTestId("file-rail")).toHaveAttribute("inert");
     expect(toggle).toHaveAttribute("aria-pressed", "false");
     expect(toggle).toHaveFocus();
+  });
+
+  it("Ctrl+N resolves the guarded OpenAI default to its preferred account", async () => {
+    const accountProfileId = "00000000-0000-4000-8000-000000000001";
+    const model = {
+      id: "gpt-live",
+      label: "GPT Live",
+      provider: "openai" as const,
+      reasoningEfforts: ["high" as const],
+      defaultReasoningEffort: "high" as const,
+    };
+    useStore.setState({
+      init: vi.fn(async () => {}),
+      sessions: [],
+      activeId: null,
+      settings: { ...DEFAULT_SETTINGS, provider: "openai", model: model.id },
+      openAIAuthStatus: {
+        signedIn: true,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: true,
+      },
+      openAIAccounts: [
+        {
+          id: accountProfileId,
+          accountLabel: "one@chatgpt.test",
+          tier: "ChatGPT Plus",
+          expiresAt: null,
+          state: "connected",
+          createdAt: 1,
+          updatedAt: 1,
+          lastUsedAt: 1,
+        },
+      ],
+      openAIModelCatalogs: {
+        [accountProfileId]: { status: "ready", models: [model], error: null },
+      },
+      openAIModels: [model],
+      lastOpenAIAccountProfileId: accountProfileId,
+    });
+    render(<App />);
+
+    fireEvent.keyDown(window, { key: "n", ctrlKey: true });
+
+    await waitFor(() => expect(m.createSession).toHaveBeenCalledOnce());
+    expect(m.createSession).toHaveBeenCalledWith(
+      expect.any(String),
+      "New chat",
+      null,
+      model.id,
+      accountProfileId,
+    );
   });
 
   it("Ctrl+, opens settings", () => {

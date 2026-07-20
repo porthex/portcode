@@ -1930,6 +1930,7 @@ u UU N... 100644 100644 100644 100644 a a a src/conflict.rs\0\
         db.create_session("s", "S", None, None, 1).unwrap();
         let receipt = TurnReceipt {
             turn_id: "pending-review".into(),
+            account_profile_id: None,
             status: TurnStatus::Interrupted,
             stop_reason: None,
             started_at: 1,

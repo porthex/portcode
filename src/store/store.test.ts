@@ -4,6 +4,9 @@ import {
   DEFAULT_SETTINGS,
   type Message,
   type MessageRow,
+  type ModelInfo,
+  type OpenAIAccountSummary,
+  type OpenAIModelCatalogRow,
   type PairedDevice,
   type PairingPayload,
   type PendingPermission,
@@ -17,7 +20,8 @@ import {
   type UpdateInfo,
 } from "../types";
 import * as ipc from "../lib/ipc";
-import { teardownAllBackgroundListeners, useStore } from "./store";
+import { markdownLiteralText } from "../lib/sessionFormat";
+import { modelsForOpenAIProfile, teardownAllBackgroundListeners, useStore } from "./store";
 
 // The store is the app's brain: it orchestrates the IPC bridge and folds the
 // agent's streamed events into renderable message blocks. We mock the IPC layer
@@ -50,8 +54,11 @@ vi.mock("../lib/ipc", () => ({
   startOauthLogin: vi.fn(),
   oauthLogout: vi.fn(),
   openaiOauthStatus: vi.fn(),
-  startOpenaiOauthLogin: vi.fn(),
-  openaiOauthLogout: vi.fn(),
+  listOpenAIAccounts: vi.fn(),
+  startOpenAIAccountLogin: vi.fn(),
+  reconnectOpenAIAccount: vi.fn(),
+  removeOpenAIAccount: vi.fn(),
+  pinSessionOpenAIAccount: vi.fn(),
   openaiModels: vi.fn(),
   phoneSyncStatus: vi.fn(),
   phoneSyncBeginPairing: vi.fn(),
@@ -88,6 +95,18 @@ const session = (over: Partial<Session> = {}): Session => ({
   model: "claude-opus-4-8",
   createdAt: 1,
   updatedAt: 1,
+  ...over,
+});
+
+const openAIAccount = (over: Partial<OpenAIAccountSummary> = {}): OpenAIAccountSummary => ({
+  id: "00000000-0000-4000-8000-000000000001",
+  accountLabel: "one@chatgpt.test",
+  tier: "ChatGPT Plus",
+  expiresAt: 9_999,
+  state: "connected",
+  createdAt: 100,
+  updatedAt: 100,
+  lastUsedAt: null,
   ...over,
 });
 
@@ -150,7 +169,10 @@ beforeEach(() => {
     nextCursor: null,
   }));
   m.getSessionArchiveWarning.mockResolvedValue(null);
-  m.createSession.mockResolvedValue(undefined);
+  m.createSession.mockImplementation(
+    async (id, title, workspace, model = DEFAULT_SETTINGS.model, accountProfileId = null) =>
+      session({ id, title, workspace, model, accountProfileId }),
+  );
   m.deleteSession.mockResolvedValue(undefined);
   m.renameSession.mockResolvedValue(undefined);
   m.updateSessionModel.mockResolvedValue(undefined);
@@ -171,8 +193,16 @@ beforeEach(() => {
   m.startOauthLogin.mockResolvedValue(signedOut);
   m.oauthLogout.mockResolvedValue(undefined);
   m.openaiOauthStatus.mockResolvedValue(signedOut);
-  m.startOpenaiOauthLogin.mockResolvedValue(signedOut);
-  m.openaiOauthLogout.mockResolvedValue(undefined);
+  m.listOpenAIAccounts.mockResolvedValue([]);
+  m.startOpenAIAccountLogin.mockResolvedValue(openAIAccount());
+  m.reconnectOpenAIAccount.mockImplementation(async (accountProfileId) => ({
+    status: "reconnected" as const,
+    account: openAIAccount({ id: accountProfileId }),
+  }));
+  m.removeOpenAIAccount.mockResolvedValue(undefined);
+  m.pinSessionOpenAIAccount.mockImplementation(async (sessionId, accountProfileId) =>
+    session({ id: sessionId, model: "gpt-live", accountProfileId }),
+  );
   m.openaiModels.mockResolvedValue([]);
   m.phoneSyncStatus.mockResolvedValue(noPhoneSync);
   m.phoneSyncBeginPairing.mockResolvedValue({
@@ -295,6 +325,140 @@ describe("init", () => {
     expect(useStore.getState().initError).toBeNull();
   });
 
+  it("auto-creates only when the preferred account advertises the exact persisted OpenAI model", async () => {
+    const account = openAIAccount();
+    m.getSettings.mockResolvedValue({
+      ...DEFAULT_SETTINGS,
+      provider: "openai",
+      model: "gpt-account-default",
+      reasoningEffort: "high",
+    });
+    m.openaiOauthStatus.mockResolvedValue({
+      signedIn: true,
+      expiresAt: null,
+      account: null,
+      tier: null,
+      available: true,
+    });
+    m.listOpenAIAccounts.mockResolvedValue([account]);
+    m.openaiModels.mockResolvedValue([
+      {
+        id: "gpt-account-default",
+        label: "GPT Account Default",
+        reasoningEfforts: ["low", "high"],
+        defaultReasoningEffort: "high",
+      },
+    ]);
+
+    await useStore.getState().init();
+
+    expect(m.createSession).toHaveBeenCalledWith(
+      expect.any(String),
+      "New chat",
+      null,
+      "gpt-account-default",
+      account.id,
+    );
+    expect(useStore.getState()).toMatchObject({
+      settings: {
+        model: "gpt-account-default",
+        provider: "openai",
+        reasoningEffort: "high",
+      },
+      sessions: [
+        expect.objectContaining({
+          model: "gpt-account-default",
+          accountProfileId: account.id,
+        }),
+      ],
+    });
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("keeps a disjoint persisted OpenAI choice visible and does not auto-create", async () => {
+    const account = openAIAccount();
+    m.getSettings.mockResolvedValue({
+      ...DEFAULT_SETTINGS,
+      provider: "openai",
+      model: "gpt-persisted",
+      reasoningEffort: "ultra",
+    });
+    m.openaiOauthStatus.mockResolvedValue({
+      signedIn: true,
+      expiresAt: null,
+      account: null,
+      tier: null,
+      available: true,
+    });
+    m.listOpenAIAccounts.mockResolvedValue([account]);
+    m.openaiModels.mockResolvedValue([
+      {
+        id: "gpt-account-default",
+        label: "GPT Account Default",
+        reasoningEfforts: ["low", "high"],
+        defaultReasoningEffort: "high",
+      },
+    ]);
+
+    await useStore.getState().init();
+
+    expect(m.createSession).not.toHaveBeenCalled();
+    expect(useStore.getState()).toMatchObject({
+      settings: {
+        model: "gpt-persisted",
+        provider: "openai",
+        reasoningEffort: "ultra",
+      },
+      sessions: [],
+      activeId: null,
+      showSettings: true,
+      openAIAuthError: "Choose a model available to one@chatgpt.test before creating this session.",
+    });
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["failed", new Error("catalogue offline"), "catalogue offline"],
+    ["empty", [], "This account returned no compatible OpenAI models."],
+  ])(
+    "keeps startup recoverable without auto-creating when the preferred OpenAI catalogue is %s",
+    async (_case, catalogueResult, expectedError) => {
+      const account = openAIAccount();
+      m.getSettings.mockResolvedValue({
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: "gpt-persisted",
+      });
+      m.openaiOauthStatus.mockResolvedValue({
+        signedIn: true,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: true,
+      });
+      m.listOpenAIAccounts.mockResolvedValue([account]);
+      if (catalogueResult instanceof Error) {
+        m.openaiModels.mockRejectedValue(catalogueResult);
+      } else {
+        m.openaiModels.mockResolvedValue(catalogueResult);
+      }
+
+      await useStore.getState().init();
+
+      expect(m.createSession).not.toHaveBeenCalled();
+      expect(useStore.getState()).toMatchObject({
+        settings: { model: "gpt-persisted", provider: "openai" },
+        openAIModelCatalogs: {
+          [account.id]: { status: "error", models: [], error: expectedError },
+        },
+        sessions: [],
+        activeId: null,
+        showSettings: true,
+        openAIAuthError: expectedError,
+      });
+    },
+  );
+
   it("is a no-op for the remote client (no desktop IPCs, no stale initError)", async () => {
     // On the phone the desktop-only session/settings commands would reject and
     // strand a spurious crash panel over the connected remote session, so init()
@@ -339,6 +503,7 @@ describe("newSession", () => {
       "New chat",
       null,
       "claude-haiku-4-5-20251001",
+      null,
     );
   });
 
@@ -369,10 +534,11 @@ describe("newSession", () => {
     // second same-tick call bail so two fast clicks (or Ctrl+N + click) can't create
     // two orphan empty sessions.
     let release!: () => void;
-    m.createSession.mockReturnValueOnce(
-      new Promise<void>((res) => {
-        release = res;
-      }),
+    m.createSession.mockImplementationOnce(
+      (id, title, workspace, model = DEFAULT_SETTINGS.model, accountProfileId = null) =>
+        new Promise<Session>((resolve) => {
+          release = () => resolve(session({ id, title, workspace, model, accountProfileId }));
+        }),
     );
     useStore.setState({ sessions: [session({ id: "old" })] });
 
@@ -429,6 +595,340 @@ describe("newSession", () => {
       creatingSession: false,
       remoteChatOpen: true,
     });
+  });
+
+  it("stays connected after a correlated desktop rejection and can retry successfully", async () => {
+    useStore.setState({
+      remoteConnected: true,
+      remoteVerified: true,
+      // Phone state may be stale: the desktop is authoritative and can reject this
+      // apparently-Claude create because its actual default is an unpinned OpenAI account.
+      settings: { ...DEFAULT_SETTINGS, model: "claude-opus-4-8", provider: "anthropic" },
+    });
+
+    await useStore.getState().newSession();
+    const first = m.phoneSyncSendCommand.mock.calls[0][0] as Extract<
+      RemoteCommand,
+      { cmd: "create_session" }
+    >;
+    useStore.getState().applyFrame({
+      t: "command_rejected",
+      request_id: first.request_id,
+      code: "open_ai_account_selection_required",
+      message: "Choose a ChatGPT account on the desktop, then try again.",
+    });
+
+    expect(m.createSession).not.toHaveBeenCalled();
+    expect(useStore.getState()).toMatchObject({
+      creatingSession: false,
+      remoteConnected: true,
+      remoteVerified: true,
+      remoteError: "Choose a ChatGPT account on the desktop, then try again.",
+    });
+
+    useStore.getState().clearRemoteError();
+    await useStore.getState().newSession();
+    const second = m.phoneSyncSendCommand.mock.calls[1][0] as Extract<
+      RemoteCommand,
+      { cmd: "create_session" }
+    >;
+    expect(second.request_id).not.toBe(first.request_id);
+    useStore.getState().applyFrame({
+      t: "session_created",
+      request_id: second.request_id!,
+      session: session({ id: "retry-created" }),
+    });
+    expect(useStore.getState()).toMatchObject({
+      activeId: "retry-created",
+      creatingSession: false,
+      remoteConnected: true,
+      remoteError: null,
+    });
+  });
+
+  it("ignores a broadcast rejection for another phone without cancelling the pending create", async () => {
+    useStore.setState({ remoteConnected: true, remoteVerified: true });
+
+    await useStore.getState().newSession();
+    const request = m.phoneSyncSendCommand.mock.calls[0][0] as Extract<
+      RemoteCommand,
+      { cmd: "create_session" }
+    >;
+    useStore.getState().applyFrame({
+      t: "command_rejected",
+      request_id: "another-request",
+      code: "invalid_request",
+      message: "Another request was rejected.",
+    });
+
+    expect(useStore.getState()).toMatchObject({
+      creatingSession: true,
+      remoteConnected: true,
+      remoteError: null,
+    });
+    useStore.getState().applyFrame({
+      t: "command_rejected",
+      code: "unknown",
+      message: "An uncorrelated rejection must not attach to this create.",
+    });
+    expect(useStore.getState()).toMatchObject({ creatingSession: true, remoteError: null });
+    useStore.getState().applyFrame({
+      t: "session_created",
+      request_id: request.request_id!,
+      session: session({ id: "expected" }),
+    });
+    expect(useStore.getState()).toMatchObject({ activeId: "expected", creatingSession: false });
+  });
+
+  it("uses generic copy when the matching rejection omits defaulted code and message", async () => {
+    useStore.setState({ remoteConnected: true, remoteVerified: true });
+
+    await useStore.getState().newSession();
+    const request = m.phoneSyncSendCommand.mock.calls[0][0] as Extract<
+      RemoteCommand,
+      { cmd: "create_session" }
+    >;
+    useStore.getState().applyFrame({
+      t: "command_rejected",
+      request_id: request.request_id,
+    });
+
+    expect(useStore.getState()).toMatchObject({
+      creatingSession: false,
+      remoteConnected: true,
+      remoteError: "The desktop rejected this command.",
+    });
+  });
+
+  it("routes unavailable or missing ChatGPT profiles to Settings without creating", async () => {
+    const account = openAIAccount();
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS, model: "gpt-5.6-sol", provider: "openai" },
+      openAIAuthStatus: {
+        signedIn: false,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: false,
+        unavailableReason: "Disabled by this build",
+      },
+      openAIAccounts: [account],
+    });
+
+    await useStore.getState().newSession(account.id);
+    expect(useStore.getState()).toMatchObject({
+      showSettings: true,
+      openAIAuthError: "Disabled by this build",
+      creatingSession: false,
+    });
+
+    useStore.setState({
+      showSettings: false,
+      openAIAuthError: null,
+      openAIAuthStatus: {
+        signedIn: false,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: true,
+        unavailableReason: null,
+      },
+      openAIAccounts: [],
+    });
+    await useStore.getState().newSession(account.id);
+    expect(useStore.getState()).toMatchObject({
+      showSettings: true,
+      openAIAuthError: "Add a ChatGPT account before creating an OpenAI session.",
+      creatingSession: false,
+    });
+    expect(m.createSession).not.toHaveBeenCalled();
+  });
+
+  it("routes bare OpenAI creation to registry recovery before claiming an account is missing", async () => {
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS, model: "gpt-5.6-sol", provider: "openai" },
+      openAIAccounts: [],
+      openAIAccountsError: "credential registry is locked",
+    });
+
+    await useStore.getState().newSession();
+
+    expect(m.createSession).not.toHaveBeenCalled();
+    expect(m.openaiModels).not.toHaveBeenCalled();
+    expect(useStore.getState()).toMatchObject({
+      sessions: [],
+      showSettings: true,
+      openAIAuthError:
+        "ChatGPT account registry is unavailable: credential registry is locked. Retry account discovery before creating a session.",
+      creatingSession: false,
+    });
+  });
+
+  it("uses the exact visible account-compatible model for no-arg creation", async () => {
+    const account = openAIAccount();
+    const models: ModelInfo[] = [
+      {
+        id: "gpt-live",
+        label: "GPT Live",
+        provider: "openai",
+        reasoningEfforts: ["low", "high"],
+        defaultReasoningEffort: "high",
+      },
+    ];
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS, model: "gpt-live", provider: "openai" },
+      openAIAuthStatus: {
+        signedIn: true,
+        expiresAt: 9_999,
+        account: null,
+        tier: null,
+        available: true,
+        unavailableReason: null,
+      },
+      openAIAccounts: [account],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: [...models], error: null },
+      },
+      openAIModels: [...models],
+    });
+
+    await useStore.getState().newSession();
+
+    expect(m.saveSettings).not.toHaveBeenCalled();
+    expect(m.createSession).toHaveBeenCalledWith(
+      expect.any(String),
+      "New chat",
+      null,
+      "gpt-live",
+      account.id,
+    );
+    expect(useStore.getState().sessions[0]).toMatchObject({
+      model: "gpt-live",
+      accountProfileId: account.id,
+    });
+    expect(useStore.getState().settings.model).toBe("gpt-live");
+  });
+
+  it("routes disjoint no-arg OpenAI creation to visible recovery instead of models[0]", async () => {
+    const account = openAIAccount();
+    const models: ModelInfo[] = [
+      {
+        id: "gpt-live",
+        label: "GPT Live",
+        provider: "openai",
+        reasoningEfforts: ["high"],
+        defaultReasoningEffort: "high",
+      },
+    ];
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS, model: "gpt-missing", provider: "openai" },
+      openAIAuthStatus: {
+        signedIn: true,
+        expiresAt: 9_999,
+        account: null,
+        tier: null,
+        available: true,
+        unavailableReason: null,
+      },
+      openAIAccounts: [account],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models, error: null },
+      },
+      openAIModels: models,
+    });
+
+    await useStore.getState().newSession();
+
+    expect(m.createSession).not.toHaveBeenCalled();
+    expect(useStore.getState()).toMatchObject({
+      sessions: [],
+      showSettings: true,
+      openAIAuthError: "Choose a model available to one@chatgpt.test before creating this session.",
+      settings: { model: "gpt-missing", provider: "openai" },
+      creatingSession: false,
+    });
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when an explicit account/model pair is incompatible", async () => {
+    const account = openAIAccount();
+    const models: ModelInfo[] = [
+      {
+        id: "gpt-live",
+        label: "GPT Live",
+        provider: "openai",
+        reasoningEfforts: ["high"],
+        defaultReasoningEffort: "high",
+      },
+    ];
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS, model: "gpt-5.6-sol", provider: "openai" },
+      openAIAuthStatus: {
+        signedIn: true,
+        expiresAt: 9_999,
+        account: null,
+        tier: null,
+        available: true,
+        unavailableReason: null,
+      },
+      openAIAccounts: [account],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models, error: null },
+      },
+      openAIModels: models,
+    });
+
+    await useStore.getState().newSession(account.id, "gpt-5.6-sol");
+
+    expect(m.createSession).not.toHaveBeenCalled();
+    expect(m.saveSettings).not.toHaveBeenCalled();
+    expect(useStore.getState()).toMatchObject({
+      openAIAuthError: "Choose a model available to one@chatgpt.test before creating this session.",
+      creatingSession: false,
+    });
+  });
+
+  it("requires authoritative create identity and account confirmation", async () => {
+    const account = openAIAccount();
+    const models: ModelInfo[] = [
+      {
+        id: "gpt-live",
+        label: "GPT Live",
+        provider: "openai",
+        reasoningEfforts: ["high"],
+        defaultReasoningEffort: "high",
+      },
+    ];
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS, model: "gpt-live", provider: "openai" },
+      openAIAuthStatus: {
+        signedIn: true,
+        expiresAt: 9_999,
+        account: null,
+        tier: null,
+        available: true,
+        unavailableReason: null,
+      },
+      openAIAccounts: [account],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: [...models], error: null },
+      },
+      openAIModels: [...models],
+    });
+    m.createSession.mockImplementationOnce(async (_id, title, workspace, model) =>
+      session({ id: "different", title, workspace, model }),
+    );
+
+    await useStore.getState().newSession(account.id);
+    expect(useStore.getState().initError).toBe("The native core did not confirm the new session.");
+
+    m.createSession.mockImplementationOnce(async (id, title, workspace, model) =>
+      session({ id, title, workspace, model, accountProfileId: null }),
+    );
+    await useStore.getState().newSession(account.id);
+    expect(useStore.getState().initError).toBe(
+      "The native core did not preserve the selected ChatGPT account.",
+    );
   });
 
   it("releases the remote create lock when its correlated acknowledgement times out", async () => {
@@ -502,8 +1002,40 @@ describe("setSessionModel", () => {
     expect(st.sessions[0].model).toBe("claude-sonnet-4-6");
     expect(m.updateSessionModel).toHaveBeenCalledWith("a", "claude-sonnet-4-6");
     // Last-used sync: settings.model is updated through ipc.saveSettings.
-    expect(m.saveSettings).toHaveBeenCalledWith({ model: "claude-sonnet-4-6" });
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      model: "claude-sonnet-4-6",
+      reasoningEffort: "medium",
+    });
     expect(st.settings.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("rejects every model outside a pinned account's ready catalogue before native write", async () => {
+    const account = openAIAccount();
+    const accountModel = {
+      id: "gpt-live",
+      label: "GPT Live",
+      provider: "openai" as const,
+      reasoningEfforts: ["high" as const],
+      defaultReasoningEffort: "high" as const,
+    };
+    useStore.setState({
+      sessions: [session({ id: "a", model: accountModel.id, accountProfileId: account.id })],
+      activeId: "a",
+      openAIAccounts: [account],
+      openAIModels: [accountModel],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: [accountModel], error: null },
+      },
+    });
+
+    await useStore.getState().setSessionModel("claude-sonnet-4-6");
+
+    expect(useStore.getState().sessions[0].model).toBe(accountModel.id);
+    expect(useStore.getState().settingsError).toBe(
+      "That model is not available to this conversation's ChatGPT account.",
+    );
+    expect(m.updateSessionModel).not.toHaveBeenCalled();
+    expect(m.saveSettings).not.toHaveBeenCalled();
   });
 
   it("reverts the optimistic session model when durable persistence fails", async () => {
@@ -513,7 +1045,7 @@ describe("setSessionModel", () => {
       activeId: "a",
     });
 
-    await expect(useStore.getState().setSessionModel("gpt-5.6-sol")).resolves.toBeUndefined();
+    await expect(useStore.getState().setSessionModel("claude-sonnet-4-6")).resolves.toBeUndefined();
 
     const st = useStore.getState();
     expect(st.sessions[0].model).toBe("claude-opus-4-8");
@@ -538,20 +1070,22 @@ describe("setSessionModel", () => {
     });
 
     const first = useStore.getState().setSessionModel("claude-sonnet-4-6");
-    const second = useStore.getState().setSessionModel("gpt-5.6-sol");
+    const second = useStore.getState().setSessionModel("claude-haiku-4-5-20251001");
     // Per-session writes are serialized: the second invoke cannot overtake the
     // unresolved first and become vulnerable to the old value finishing last.
     expect(m.updateSessionModel).toHaveBeenCalledTimes(1);
     resolveFirst();
     await Promise.all([first, second]);
 
-    expect(useStore.getState().sessions[0].model).toBe("gpt-5.6-sol");
-    expect(useStore.getState().settings.model).toBe("gpt-5.6-sol");
+    expect(useStore.getState().sessions[0].model).toBe("claude-haiku-4-5-20251001");
+    expect(useStore.getState().settings.model).toBe("claude-haiku-4-5-20251001");
     expect(m.saveSettings).toHaveBeenCalledTimes(1);
-    expect(m.saveSettings).toHaveBeenCalledWith(expect.objectContaining({ model: "gpt-5.6-sol" }));
+    expect(m.saveSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ model: "claude-haiku-4-5-20251001" }),
+    );
     expect(m.updateSessionModel.mock.calls).toEqual([
       ["a", "claude-sonnet-4-6"],
-      ["a", "gpt-5.6-sol"],
+      ["a", "claude-haiku-4-5-20251001"],
     ]);
   });
 
@@ -565,11 +1099,11 @@ describe("setSessionModel", () => {
     });
 
     const first = useStore.getState().setSessionModel("claude-sonnet-4-6");
-    const second = useStore.getState().setSessionModel("gpt-5.6-sol");
+    const second = useStore.getState().setSessionModel("claude-haiku-4-5-20251001");
     await Promise.all([first, second]);
 
-    expect(useStore.getState().sessions[0].model).toBe("gpt-5.6-sol");
-    expect(useStore.getState().settings.model).toBe("gpt-5.6-sol");
+    expect(useStore.getState().sessions[0].model).toBe("claude-haiku-4-5-20251001");
+    expect(useStore.getState().settings.model).toBe("claude-haiku-4-5-20251001");
     expect(useStore.getState().settingsError).toBeNull();
   });
 
@@ -583,7 +1117,7 @@ describe("setSessionModel", () => {
     });
 
     const first = useStore.getState().setSessionModel("claude-sonnet-4-6");
-    const second = useStore.getState().setSessionModel("gpt-5.6-sol");
+    const second = useStore.getState().setSessionModel("claude-haiku-4-5-20251001");
     await Promise.all([first, second]);
 
     expect(useStore.getState().sessions[0].model).toBe("claude-opus-4-8");
@@ -596,7 +1130,10 @@ describe("setSessionModel", () => {
 
     await useStore.getState().setSessionModel("claude-haiku-4-5-20251001");
 
-    expect(m.saveSettings).toHaveBeenCalledWith({ model: "claude-haiku-4-5-20251001" });
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      model: "claude-haiku-4-5-20251001",
+      reasoningEffort: "medium",
+    });
     expect(m.updateSessionModel).not.toHaveBeenCalled();
     expect(useStore.getState().settings.model).toBe("claude-haiku-4-5-20251001");
   });
@@ -1093,7 +1630,7 @@ describe("send", () => {
 
   it("appends user+assistant turns, titles the first turn, and folds streamed events", async () => {
     let emit!: (e: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
       emit = onEvent;
       return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
     });
@@ -1110,12 +1647,7 @@ describe("send", () => {
     expect(st.messages.a).toHaveLength(2);
     expect(st.messages.a[0].role).toBe("user");
     expect(st.sessions[0].title).toBe("Refactor the parser"); // derived from first message
-    expect(m.runAgent).toHaveBeenCalledWith(
-      "a",
-      "Refactor the parser",
-      "claude-opus-4-8",
-      expect.any(Function),
-    );
+    expect(m.runAgent).toHaveBeenCalledWith("a", "Refactor the parser", expect.any(Function));
 
     const assistant = () => useStore.getState().messages.a[1];
 
@@ -1156,7 +1688,7 @@ describe("send", () => {
   it("reconciles the optimistic assistant to native turn identity and attaches its receipt", async () => {
     const dispose = vi.fn();
     let emit!: (e: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
       emit = onEvent;
       return { cancel: vi.fn(async () => {}), dispose };
     });
@@ -1217,7 +1749,7 @@ describe("send", () => {
       const cancel = vi.fn(async () => {});
       const dispose = vi.fn();
       let emit!: (e: StreamEvent) => void;
-      m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+      m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
         emit = onEvent;
         return { cancel, dispose };
       });
@@ -1298,7 +1830,7 @@ describe("send", () => {
 
   it("trims surrounding whitespace from the stored user bubble and derived title", async () => {
     let emit!: (e: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
       emit = onEvent;
       return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
     });
@@ -1316,7 +1848,7 @@ describe("send", () => {
     expect(st.sessions[0].title).toBe("hi");
     // The local agent is also prompted with the trimmed body (not the raw padded
     // draft), so what the user sees and what the model receives stay consistent.
-    expect(m.runAgent).toHaveBeenCalledWith("a", "hi", "claude-opus-4-8", expect.any(Function));
+    expect(m.runAgent).toHaveBeenCalledWith("a", "hi", expect.any(Function));
   });
 
   it("trims the forwarded run text in remote mode", async () => {
@@ -1339,7 +1871,7 @@ describe("send", () => {
 
   it("keeps the existing title once a session already has messages", async () => {
     let emit!: (e: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
       emit = onEvent;
       return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
     });
@@ -1433,7 +1965,7 @@ describe("send", () => {
   it("tears down the turn's listener on turn_end so a later turn can't edit this message", async () => {
     const handles: { cancel: ReturnType<typeof vi.fn>; dispose: ReturnType<typeof vi.fn> }[] = [];
     const emits: ((e: StreamEvent) => void)[] = [];
-    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
       emits.push(onEvent);
       const handle = { cancel: vi.fn(async () => {}), dispose: vi.fn() };
       handles.push(handle);
@@ -1462,7 +1994,7 @@ describe("send", () => {
   it("disposes the listener when a turn ends in an error event", async () => {
     const dispose = vi.fn();
     let emit!: (e: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
       emit = onEvent;
       return { cancel: vi.fn(async () => {}), dispose };
     });
@@ -1475,11 +2007,139 @@ describe("send", () => {
     expect(useStore.getState().streaming).toBe(false);
   });
 
+  it.each([
+    [
+      "HTTP 429",
+      "one@chatgpt.test: HTTP 429 quota exceeded for acct_remote_secret",
+      "ChatGPT rate limit or quota was reached.",
+    ],
+    ["authentication", "HTTP 401 token expired", "ChatGPT authentication failed."],
+    ["other HTTP", "HTTP 503 upstream body", "ChatGPT provider request failed."],
+  ])(
+    "attributes a pinned account's %s error once using safe provider copy",
+    async (_case, raw, copy) => {
+      const account = openAIAccount();
+      let emit!: (event: StreamEvent) => void;
+      m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+        emit = onEvent;
+        return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+      });
+      useStore.setState({
+        sessions: [session({ id: "a", model: "gpt-live", accountProfileId: account.id })],
+        activeId: "a",
+        messages: { a: [] },
+        openAIAccounts: [account],
+      });
+
+      await useStore.getState().send("go");
+      emit({ type: "error", message: raw });
+
+      const text = useStore
+        .getState()
+        .messages.a[1].blocks.map((block) => (block.kind === "text" ? block.text : ""))
+        .join("");
+      const label = markdownLiteralText("one@chatgpt.test");
+      expect(text).toContain(`${label}: ${copy}`);
+      expect(text.split(`${label}:`)).toHaveLength(2);
+      expect(text).not.toContain(account.id);
+      expect(text).not.toContain("acct_remote_secret");
+      expect(text).not.toContain("upstream body");
+    },
+  );
+
+  it("preserves a pinned session's local durable-turn failure without provider attribution", async () => {
+    const account = openAIAccount();
+    const localFailure = "Failed to start a durable turn: database is locked";
+    let emit!: (event: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
+    useStore.setState({
+      sessions: [session({ id: "a", model: "gpt-live", accountProfileId: account.id })],
+      activeId: "a",
+      messages: { a: [] },
+      openAIAccounts: [account],
+    });
+
+    await useStore.getState().send("go");
+    emit({ type: "error", message: localFailure });
+
+    const text = useStore
+      .getState()
+      .messages.a[1].blocks.map((block) => (block.kind === "text" ? block.text : ""))
+      .join("");
+    expect(text).toContain(localFailure);
+    expect(text).not.toContain("one@chatgpt.test:");
+    expect(text).not.toContain(markdownLiteralText("one@chatgpt.test"));
+    expect(text).not.toContain("ChatGPT request failed");
+  });
+
+  it.each([
+    "OpenAI response was incomplete. Please retry.",
+    "The OpenAI response stream ended before response.completed. Please try again.",
+    "ChatGPT response stream stalled. Please try again.",
+  ])("attributes a display-safe native provider failure to its pinned account: %s", async (raw) => {
+    const account = openAIAccount();
+    let emit!: (event: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
+    useStore.setState({
+      sessions: [session({ id: "a", model: "gpt-live", accountProfileId: account.id })],
+      activeId: "a",
+      messages: { a: [] },
+      openAIAccounts: [account],
+    });
+
+    await useStore.getState().send("go");
+    emit({ type: "error", message: raw });
+
+    const text = useStore
+      .getState()
+      .messages.a[1].blocks.map((block) => (block.kind === "text" ? block.text : ""))
+      .join("");
+    const label = markdownLiteralText("one@chatgpt.test");
+    expect(text).toContain(`${label}: ${raw}`);
+    expect(text.split(`${label}:`)).toHaveLength(2);
+    expect(text).not.toContain(account.id);
+  });
+
+  it("escapes nested Markdown, image, autolink, and HTML syntax in root error attribution", async () => {
+    const hostileLabel =
+      "![root [nested]](https://evil.test/pixel) <img src=x> &lbrack;entity&rbrack;";
+    const account = openAIAccount({ accountLabel: hostileLabel });
+    let emit!: (event: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
+    useStore.setState({
+      sessions: [session({ id: "a", model: "gpt-live", accountProfileId: account.id })],
+      activeId: "a",
+      messages: { a: [] },
+      openAIAccounts: [account],
+    });
+
+    await useStore.getState().send("go");
+    emit({ type: "error", message: "HTTP 503 upstream body" });
+
+    const text = useStore
+      .getState()
+      .messages.a[1].blocks.map((block) => (block.kind === "text" ? block.text : ""))
+      .join("");
+    expect(text).toContain(
+      `${markdownLiteralText(hostileLabel)}: ChatGPT provider request failed.`,
+    );
+    expect(text).not.toContain(account.id);
+  });
+
   it("recovers a hung turn via the idle watchdog so future sends aren't bricked", async () => {
     vi.useFakeTimers();
     try {
       const cancel = vi.fn(async () => {});
-      m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+      m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
         // The turn starts streaming, then the backend goes silent — no turn_end/error.
         onEvent({ type: "text_delta", text: "thinking" });
         return { cancel, dispose: vi.fn() };
@@ -1517,7 +2177,7 @@ describe("send", () => {
       const cancel = vi.fn(async () => {
         throw new Error("cancel transport down");
       });
-      m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+      m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
         onEvent({ type: "text_delta", text: "thinking" });
         return { cancel, dispose: vi.fn() };
       });
@@ -1665,7 +2325,7 @@ describe("send", () => {
     const dispose = vi.fn();
     let resolveRun!: (h: { cancel: typeof cancel; dispose: typeof dispose }) => void;
     let emit!: (event: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
       emit = onEvent;
       return new Promise((res) => {
         resolveRun = res;
@@ -2352,7 +3012,7 @@ describe("composer presence phase", () => {
   // test can drive presence transitions from real events.
   const startTurn = async (): Promise<(e: StreamEvent) => void> => {
     let emit!: (e: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
       emit = onEvent;
       return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
     });
@@ -2769,14 +3429,16 @@ describe("oauth (Claude subscription sign-in)", () => {
   });
 });
 
-describe("OpenAI subscription auth and live catalogue", () => {
+describe("OpenAI account registry and scoped catalogues", () => {
   const signedIn = {
     signedIn: true,
-    expiresAt: 9999,
-    account: "me@openai.com",
-    tier: "ChatGPT Plus",
+    expiresAt: 9_999,
+    account: null,
+    tier: null,
+    available: true,
+    unavailableReason: null,
   };
-  const liveRows = [
+  const liveRows: OpenAIModelCatalogRow[] = [
     {
       id: "gpt-live",
       label: "GPT Live",
@@ -2784,38 +3446,193 @@ describe("OpenAI subscription auth and live catalogue", () => {
       defaultReasoningEffort: "high",
     },
   ];
+  const liveModels = (): ModelInfo[] =>
+    liveRows.map((row) => ({
+      ...row,
+      provider: "openai",
+      reasoningEfforts: [...row.reasoningEfforts],
+    }));
 
-  it("hydrates OpenAI status and replaces fallback models with a non-empty live catalogue", async () => {
+  it("hydrates summaries and a profile-scoped live catalogue", async () => {
+    const account = openAIAccount();
     m.openaiOauthStatus.mockResolvedValue(signedIn);
+    m.listOpenAIAccounts.mockResolvedValue([account]);
     m.openaiModels.mockResolvedValue(liveRows);
 
     await useStore.getState().init();
 
-    expect(useStore.getState().openAIAuthStatus).toEqual(signedIn);
-    expect(useStore.getState().openAIModels).toEqual([
-      {
-        ...liveRows[0],
-        provider: "openai",
-      },
-    ]);
+    expect(m.openaiModels).toHaveBeenCalledWith(account.id);
+    expect(useStore.getState()).toMatchObject({
+      openAIAuthStatus: signedIn,
+      openAIAccounts: [account],
+      openAIAccountsError: null,
+    });
+    expect(useStore.getState().openAIModelCatalogs[account.id]).toMatchObject({
+      status: "ready",
+      models: [{ id: "gpt-live", provider: "openai" }],
+    });
   });
 
-  it("refreshes OpenAI auth and capabilities after startup", async () => {
+  it("refreshes capability, prunes stale catalogues, and surfaces later discovery failures", async () => {
+    const account = openAIAccount();
+    const staleAccountId = "00000000-0000-4000-8000-000000000099";
+    useStore.setState({
+      openAIAccounts: [account],
+      openAIAuthStatus: signedIn,
+      lastOpenAIAccountProfileId: account.id,
+      openAIModelCatalogs: {
+        [staleAccountId]: { status: "ready", models: liveModels(), error: null },
+      },
+    });
     m.openaiOauthStatus.mockResolvedValue(signedIn);
+    m.listOpenAIAccounts.mockResolvedValue([account]);
     m.openaiModels.mockResolvedValue(liveRows);
 
     await useStore.getState().refreshOpenAIStatus();
 
-    expect(useStore.getState().openAIAuthStatus).toEqual(signedIn);
-    expect(useStore.getState().openAIModels.map((model) => model.id)).toEqual(["gpt-live"]);
+    expect(useStore.getState()).toMatchObject({
+      openAIAccounts: [account],
+      openAIAccountsLoading: false,
+      openAIAccountsError: null,
+    });
+    expect(useStore.getState().openAIModelCatalogs[staleAccountId]).toBeUndefined();
+    expect(useStore.getState().openAIModelCatalogs[account.id]).toMatchObject({
+      status: "ready",
+      models: [{ id: "gpt-live" }],
+    });
+
+    m.listOpenAIAccounts.mockRejectedValueOnce(new Error("registry temporarily unavailable"));
+    await useStore.getState().refreshOpenAIStatus();
+    expect(useStore.getState()).toMatchObject({
+      openAIAccounts: [account],
+      openAIAccountsLoading: false,
+      openAIAccountsError: "registry temporarily unavailable",
+    });
+
+    m.openaiModels.mockClear();
+    m.openaiOauthStatus.mockResolvedValueOnce({
+      ...signedIn,
+      signedIn: false,
+      available: false,
+      unavailableReason: "Disabled",
+    });
+    m.listOpenAIAccounts.mockResolvedValueOnce([account]);
+    await useStore.getState().refreshOpenAIStatus();
+    expect(useStore.getState().openAIModels).toEqual([]);
+    expect(m.openaiModels).not.toHaveBeenCalled();
   });
 
-  it("fails closed at startup when this build disables OpenAI subscription access", async () => {
-    m.getSettings.mockResolvedValue({
-      ...DEFAULT_SETTINGS,
-      provider: "openai",
-      model: "gpt-5.6-sol",
+  it("surfaces registry discovery failure without blocking app init or treating it as empty", async () => {
+    m.listOpenAIAccounts.mockRejectedValue(new Error("credential registry is locked"));
+
+    await useStore.getState().init();
+
+    const state = useStore.getState();
+    expect(state.initError).toBeNull();
+    expect(state.sessions).toHaveLength(1);
+    expect(state.openAIAccounts).toEqual([]);
+    expect(state.openAIAccountsError).toBe("credential registry is locked");
+  });
+
+  it("represents a successful empty registry as signed out without an error", async () => {
+    m.listOpenAIAccounts.mockResolvedValue([]);
+
+    await useStore.getState().init();
+
+    expect(useStore.getState().openAIAccounts).toEqual([]);
+    expect(useStore.getState().openAIAccountsError).toBeNull();
+  });
+
+  it("falls back to the backend's most recently used connected profile", async () => {
+    const older = openAIAccount({
+      id: "00000000-0000-4000-8000-000000000001",
+      lastUsedAt: 100,
     });
+    const newer = openAIAccount({
+      id: "00000000-0000-4000-8000-000000000002",
+      accountLabel: "two@chatgpt.test",
+      lastUsedAt: 200,
+    });
+    m.listOpenAIAccounts.mockResolvedValue([older, newer]);
+    m.openaiModels.mockResolvedValue(liveRows);
+    useStore.setState({ lastOpenAIAccountProfileId: null });
+
+    await useStore.getState().init();
+
+    expect(m.openaiModels).toHaveBeenCalledWith(newer.id);
+  });
+
+  it("keeps catalogues isolated by account, including errors", async () => {
+    const one = openAIAccount();
+    const two = openAIAccount({
+      id: "00000000-0000-4000-8000-000000000002",
+      accountLabel: "two@chatgpt.test",
+    });
+    useStore.setState({ openAIAccounts: [one, two], openAIAuthStatus: signedIn });
+    m.openaiModels.mockImplementation(async (accountProfileId) => {
+      if (accountProfileId === two.id) throw new Error("second account failed");
+      return liveRows;
+    });
+
+    await useStore.getState().loadOpenAIAccountModels(one.id);
+    await expect(useStore.getState().loadOpenAIAccountModels(two.id)).rejects.toThrow(
+      "second account failed",
+    );
+
+    expect(useStore.getState().openAIModelCatalogs[one.id]).toMatchObject({
+      status: "ready",
+      models: [{ id: "gpt-live" }],
+    });
+    expect(useStore.getState().openAIModelCatalogs[two.id]).toMatchObject({
+      status: "error",
+      models: [],
+      error: "second account failed",
+    });
+  });
+
+  it("does not expose stale profile models while refresh is loading or after it fails", async () => {
+    const account = openAIAccount();
+    const stale = liveModels();
+    useStore.setState({
+      openAIAccounts: [account],
+      openAIAuthStatus: signedIn,
+      lastOpenAIAccountProfileId: account.id,
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: stale, error: null },
+      },
+      openAIModels: stale,
+    });
+    let rejectRefresh!: (error: Error) => void;
+    m.openaiModels.mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectRefresh = reject;
+        }),
+    );
+
+    const refresh = useStore.getState().loadOpenAIAccountModels(account.id, true);
+    expect(useStore.getState().openAIModelCatalogs[account.id]).toEqual({
+      status: "loading",
+      models: [],
+      error: null,
+    });
+    expect(modelsForOpenAIProfile(account.id, useStore.getState().openAIModelCatalogs)).toEqual([]);
+    expect(useStore.getState().openAIModels).toEqual([]);
+
+    rejectRefresh(new Error("catalogue offline"));
+    await expect(refresh).rejects.toThrow("catalogue offline");
+    expect(useStore.getState().openAIModelCatalogs[account.id]).toEqual({
+      status: "error",
+      models: [],
+      error: "catalogue offline",
+    });
+    expect(
+      modelsForOpenAIProfile(account.id, useStore.getState().openAIModelCatalogs, stale),
+    ).toEqual([]);
+  });
+
+  it("fails closed when the capability envelope disables ChatGPT access", async () => {
+    m.getSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, model: "gpt-5.6-sol" });
     m.openaiOauthStatus.mockResolvedValue({
       signedIn: false,
       expiresAt: null,
@@ -2824,138 +3641,428 @@ describe("OpenAI subscription auth and live catalogue", () => {
       available: false,
       unavailableReason: "Disabled in this build",
     });
+    m.listOpenAIAccounts.mockResolvedValue([openAIAccount()]);
 
     await useStore.getState().init();
 
-    const state = useStore.getState();
-    expect(state.openAIModels).toEqual([]);
-    expect(state.settings).toMatchObject({
-      provider: "anthropic",
-      model: DEFAULT_SETTINGS.model,
+    expect(useStore.getState().settings).toMatchObject({
+      model: "gpt-5.6-sol",
+      provider: "openai",
+    });
+    expect(useStore.getState().openAIModels).toEqual([]);
+    expect(m.openaiModels).not.toHaveBeenCalled();
+    expect(m.createSession).not.toHaveBeenCalled();
+    expect(useStore.getState()).toMatchObject({
+      sessions: [],
+      activeId: null,
+      showSettings: true,
+      openAIAuthError: "Disabled in this build",
+    });
+  });
+
+  it("adds an account, scopes its catalogue, and reports login failure", async () => {
+    const account = openAIAccount();
+    const other = openAIAccount({
+      id: "00000000-0000-4000-8000-000000000002",
+      accountLabel: "two@chatgpt.test",
+    });
+    m.startOpenAIAccountLogin.mockResolvedValue(account);
+    m.openaiModels.mockResolvedValue(liveRows);
+    useStore.setState({
+      openAIAuthStatus: signedIn,
+      openAIAuthError: "old error",
+      openAIAccounts: [other, account],
+    });
+
+    await useStore.getState().loginWithOpenAI();
+
+    expect(useStore.getState().openAIAccounts).toEqual([account, other]);
+    expect(m.openaiModels).toHaveBeenCalledWith(account.id);
+    expect(useStore.getState().openAIAuthError).toBeNull();
+
+    m.startOpenAIAccountLogin.mockRejectedValueOnce(new Error("browser login denied"));
+    await useStore.getState().loginWithOpenAI();
+    expect(useStore.getState().openAIAuthError).toBe("browser login denied");
+  });
+
+  it("blocks account login when the capability envelope is unavailable", async () => {
+    useStore.setState({
+      openAIAuthStatus: {
+        ...signedIn,
+        signedIn: false,
+        available: false,
+        unavailableReason: "ChatGPT accounts are disabled",
+      },
+    });
+
+    await useStore.getState().loginWithOpenAI();
+
+    expect(m.startOpenAIAccountLogin).not.toHaveBeenCalled();
+    expect(useStore.getState().openAIAuthError).toBe("ChatGPT accounts are disabled");
+  });
+
+  it("retains an authoritative removal tombstone, excludes it from selection, and reconnects the exact id", async () => {
+    const account = openAIAccount();
+    const removed = openAIAccount({
+      state: "removed",
+      expiresAt: null,
+      updatedAt: 200,
+    });
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS, model: "gpt-live", provider: "openai" },
+      openAIAuthStatus: signedIn,
+      openAIAccounts: [account],
+      openAIModelCatalogs: {
+        [account.id]: {
+          status: "ready",
+          models: [
+            {
+              ...liveRows[0],
+              reasoningEfforts: [...liveRows[0].reasoningEfforts],
+              provider: "openai",
+            },
+          ],
+          error: null,
+        },
+      },
+      openAIModels: [
+        { ...liveRows[0], reasoningEfforts: [...liveRows[0].reasoningEfforts], provider: "openai" },
+      ],
+      lastOpenAIAccountProfileId: account.id,
+    });
+    m.listOpenAIAccounts.mockResolvedValue([removed]);
+
+    await useStore.getState().removeOpenAIAccount(account.id);
+
+    expect(m.removeOpenAIAccount).toHaveBeenCalledWith(account.id);
+    expect(useStore.getState().openAIAccounts).toEqual([removed]);
+    expect(useStore.getState().openAIModelCatalogs[account.id]).toBeUndefined();
+    expect(useStore.getState().lastOpenAIAccountProfileId).toBeNull();
+
+    await useStore.getState().newSession(account.id);
+    expect(m.createSession).not.toHaveBeenCalled();
+    expect(useStore.getState().showSettings).toBe(true);
+
+    const reconnected = { ...removed, state: "connected" as const, updatedAt: 300 };
+    m.reconnectOpenAIAccount.mockResolvedValue({
+      status: "reconnected",
+      account: reconnected,
+    });
+    m.openaiModels.mockResolvedValue(liveRows);
+    await useStore.getState().reconnectOpenAIAccount(account.id);
+    expect(m.reconnectOpenAIAccount).toHaveBeenCalledWith(account.id);
+    expect(useStore.getState().openAIAccounts).toEqual([reconnected]);
+
+    m.reconnectOpenAIAccount.mockRejectedValueOnce(new Error("reconnect cancelled"));
+    await useStore.getState().reconnectOpenAIAccount(account.id);
+    expect(useStore.getState().openAIAuthError).toBe("reconnect cancelled");
+  });
+
+  it("retains a typed identity mismatch and adds the new sign-in as a separate profile", async () => {
+    const original = openAIAccount({
+      accountLabel: "original@chatgpt.test",
+      state: "reconnect_required",
+      expiresAt: null,
+    });
+    const separate = openAIAccount({
+      id: "00000000-0000-4000-8000-000000000002",
+      accountLabel: "different@chatgpt.test",
+    });
+    useStore.setState({
+      openAIAuthStatus: { ...signedIn, signedIn: false },
+      openAIAccounts: [original],
+    });
+    m.reconnectOpenAIAccount.mockResolvedValue({
+      status: "identity_mismatch",
+      message: "That sign-in belongs to a different ChatGPT account.",
+    });
+
+    await useStore.getState().reconnectOpenAIAccount(original.id);
+
+    expect(useStore.getState().openAIAccounts).toEqual([original]);
+    expect(useStore.getState().openAIReconnectMismatch).toEqual({
+      accountProfileId: original.id,
+      message: "That sign-in belongs to a different ChatGPT account.",
     });
     expect(m.openaiModels).not.toHaveBeenCalled();
+
+    m.startOpenAIAccountLogin.mockResolvedValue(separate);
+    m.openaiModels.mockResolvedValue(liveRows);
+    await useStore.getState().loginWithOpenAI();
+
+    expect(useStore.getState().openAIAccounts).toEqual([separate, original]);
+    expect(useStore.getState().openAIReconnectMismatch).toBeNull();
+    expect(m.openaiModels).toHaveBeenCalledWith(separate.id);
+  });
+
+  it("keeps a safe local tombstone when post-removal discovery fails", async () => {
+    const account = openAIAccount();
+    useStore.setState({
+      openAIAuthStatus: signedIn,
+      openAIAccounts: [account],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: liveModels(), error: null },
+      },
+      openAIModels: liveModels(),
+      lastOpenAIAccountProfileId: account.id,
+    });
+    m.listOpenAIAccounts.mockRejectedValueOnce(new Error("registry read failed"));
+
+    await useStore.getState().removeOpenAIAccount(account.id);
+
+    expect(useStore.getState().openAIAccounts).toEqual([
+      expect.objectContaining({ id: account.id, state: "removed", expiresAt: null }),
+    ]);
+    expect(useStore.getState()).toMatchObject({
+      openAIAccountsError: "registry read failed",
+      lastOpenAIAccountProfileId: null,
+    });
+    expect(useStore.getState().openAIModelCatalogs[account.id]).toBeUndefined();
+
+    useStore.setState({ openAIAccounts: [account], openAIAuthError: null });
+    m.removeOpenAIAccount.mockRejectedValueOnce(new Error("credential delete failed"));
+    await useStore.getState().removeOpenAIAccount(account.id);
+    expect(useStore.getState().openAIAuthError).toBe("credential delete failed");
+  });
+
+  it("fails profile catalogue loads closed and reuses a confirmed cache", async () => {
+    const account = openAIAccount();
+    const missingProfileId = "00000000-0000-4000-8000-000000000099";
+    useStore.setState({ openAIAuthStatus: signedIn, openAIAccounts: [] });
+
+    await expect(useStore.getState().loadOpenAIAccountModels(missingProfileId)).rejects.toThrow(
+      /not found/i,
+    );
+    expect(useStore.getState().openAIModelCatalogs[missingProfileId]).toMatchObject({
+      status: "error",
+      models: [],
+    });
+
+    useStore.setState({
+      openAIAccounts: [{ ...account, state: "removed", expiresAt: null }],
+    });
+    await expect(useStore.getState().loadOpenAIAccountModels(account.id)).rejects.toThrow(
+      /Reconnect/i,
+    );
+
+    useStore.setState({
+      openAIAccounts: [account],
+      openAIAuthStatus: {
+        ...signedIn,
+        available: false,
+        unavailableReason: "Capability unavailable",
+      },
+    });
+    await expect(useStore.getState().loadOpenAIAccountModels(account.id)).rejects.toThrow(
+      "Capability unavailable",
+    );
+
+    useStore.setState({
+      openAIAuthStatus: signedIn,
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: liveModels(), error: null },
+      },
+    });
+    m.openaiModels.mockClear();
+    await expect(useStore.getState().loadOpenAIAccountModels(account.id)).resolves.toEqual(
+      liveModels(),
+    );
+    expect(m.openaiModels).not.toHaveBeenCalled();
+
+    useStore.setState({ openAIModelCatalogs: {} });
+    m.openaiModels.mockResolvedValueOnce([]);
+    await expect(useStore.getState().loadOpenAIAccountModels(account.id)).rejects.toThrow(
+      /no compatible OpenAI models/i,
+    );
+    expect(useStore.getState().openAIModelCatalogs[account.id]).toMatchObject({
+      status: "error",
+      models: [],
+      error: "This account returned no compatible OpenAI models.",
+    });
+  });
+
+  it("pins new sessions to the explicitly selected profile and remembers only confirmed creates", async () => {
+    const account = openAIAccount();
+    const models = [
+      {
+        ...liveRows[0],
+        reasoningEfforts: [...liveRows[0].reasoningEfforts],
+        provider: "openai" as const,
+      },
+    ];
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS, model: "gpt-live", provider: "openai" },
+      openAIAuthStatus: signedIn,
+      openAIAccounts: [account],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models, error: null },
+      },
+      openAIModels: models,
+      lastOpenAIAccountProfileId: null,
+    });
+
+    await useStore.getState().newSession(account.id);
+
     expect(m.createSession).toHaveBeenCalledWith(
       expect.any(String),
-      expect.any(String),
+      "New chat",
       null,
-      DEFAULT_SETTINGS.model,
+      "gpt-live",
+      account.id,
     );
+    expect(useStore.getState().sessions[0].accountProfileId).toBe(account.id);
+    expect(useStore.getState().lastOpenAIAccountProfileId).toBe(account.id);
+
+    const previous = openAIAccount({ id: "00000000-0000-4000-8000-000000000002" });
+    useStore.setState({ lastOpenAIAccountProfileId: previous.id });
+    m.createSession.mockRejectedValueOnce(new Error("database locked"));
+    await useStore.getState().newSession(account.id);
+    expect(useStore.getState().lastOpenAIAccountProfileId).toBe(previous.id);
   });
 
-  it("clears the OpenAI catalogue when a capability refresh reports unavailable", async () => {
-    const unavailable = {
-      signedIn: false,
-      expiresAt: null,
-      account: null,
-      tier: null,
-      available: false,
-      unavailableReason: "Disabled in this build",
-    };
+  it("pins a legacy session using the authoritative result and supports a void compatibility response", async () => {
+    const account = openAIAccount();
+    const legacy = session({ model: "gpt-live", accountProfileId: null });
+    const pinned = { ...legacy, accountProfileId: account.id };
     useStore.setState({
-      openAIModels: [{ ...liveRows[0], provider: "openai" }],
-    });
-    m.openaiOauthStatus.mockResolvedValue(unavailable);
-
-    await useStore.getState().refreshOpenAIStatus();
-
-    expect(useStore.getState().openAIAuthStatus).toEqual(unavailable);
-    expect(useStore.getState().openAIModels).toEqual([]);
-    expect(m.openaiModels).not.toHaveBeenCalled();
-  });
-
-  it("keeps startup resilient when both OpenAI discovery calls fail", async () => {
-    m.openaiOauthStatus.mockRejectedValue(new Error("auth unavailable"));
-    m.openaiModels.mockRejectedValue(new Error("catalog unavailable"));
-
-    await useStore.getState().init();
-
-    expect(useStore.getState().openAIAuthStatus).toBeNull();
-    expect(useStore.getState().openAIModels.length).toBeGreaterThan(0);
-  });
-
-  it("login refreshes capabilities and persists the advertised default when needed", async () => {
-    useStore.setState({
-      settings: {
-        ...DEFAULT_SETTINGS,
-        provider: "openai",
-        model: "gpt-live",
-        reasoningEffort: "medium",
-      },
-      openAIAuthError: "old error",
-    });
-    m.startOpenaiOauthLogin.mockResolvedValue(signedIn);
-    m.openaiModels.mockResolvedValue(liveRows);
-    m.saveSettings.mockImplementation(async (patch) => ({
-      ...useStore.getState().settings,
-      ...patch,
-    }));
-
-    await useStore.getState().loginWithOpenAI();
-
-    expect(useStore.getState().openAIAuthStatus).toEqual(signedIn);
-    expect(useStore.getState().openAIAuthError).toBeNull();
-    expect(m.saveSettings).toHaveBeenCalledWith({
-      provider: "openai",
-      reasoningEffort: "high",
-    });
-    expect(useStore.getState().settings.reasoningEffort).toBe("high");
-  });
-
-  it("selecting an OpenAI model persists its provider and supported reasoning level", async () => {
-    useStore.setState({
-      sessions: [session()],
-      activeId: "s1",
-      openAIModels: [
-        {
-          id: "gpt-live",
-          label: "GPT Live",
-          provider: "openai",
-          reasoningEfforts: ["high"],
-          defaultReasoningEffort: "high",
+      sessions: [legacy],
+      activeId: legacy.id,
+      openAIAuthStatus: signedIn,
+      openAIAccounts: [account],
+      openAIModelCatalogs: {
+        [account.id]: {
+          status: "ready",
+          models: [
+            {
+              ...liveRows[0],
+              reasoningEfforts: [...liveRows[0].reasoningEfforts],
+              provider: "openai",
+            },
+          ],
+          error: null,
         },
-      ],
+      },
     });
+    m.pinSessionOpenAIAccount.mockResolvedValueOnce(pinned);
 
-    await useStore.getState().setSessionModel("gpt-live");
+    await useStore.getState().pinSessionOpenAIAccount(legacy.id, account.id);
+    expect(useStore.getState().sessions[0].accountProfileId).toBe(account.id);
 
-    expect(m.saveSettings).toHaveBeenCalledWith({
-      model: "gpt-live",
-      provider: "openai",
-      reasoningEffort: "high",
-    });
-    expect(useStore.getState().sessions[0].model).toBe("gpt-live");
+    useStore.setState({ sessions: [legacy] });
+    m.pinSessionOpenAIAccount.mockResolvedValueOnce(undefined as unknown as Session);
+    m.listSessions.mockResolvedValueOnce([pinned]);
+    await useStore.getState().pinSessionOpenAIAccount(legacy.id, account.id);
+    expect(m.listSessions).toHaveBeenCalled();
+    expect(useStore.getState().sessions[0].accountProfileId).toBe(account.id);
   });
 
-  it("records login failures and clears status on logout", async () => {
-    m.startOpenaiOauthLogin.mockRejectedValueOnce(new Error("denied"));
-    await useStore.getState().loginWithOpenAI();
-    expect(useStore.getState().openAIAuthError).toBe("denied");
-
-    useStore.setState({ openAIAuthStatus: signedIn });
-    await useStore.getState().logoutOpenAI();
-    expect(m.openaiOauthLogout).toHaveBeenCalledTimes(1);
-    expect(useStore.getState().openAIAuthStatus?.signedIn).toBe(false);
-  });
-
-  it("surfaces a disabled login capability and preserves it across logout", async () => {
-    const unavailable = {
-      signedIn: false,
-      expiresAt: null,
-      account: null,
-      tier: null,
-      available: false,
-      unavailableReason: "Disabled in this build",
+  it("keeps a legacy draft and transcript untouched until native pin confirmation", async () => {
+    const account = openAIAccount();
+    const legacy = session({ id: "legacy", model: "gpt-live", accountProfileId: null });
+    const existing: Message = {
+      id: "existing",
+      role: "assistant",
+      blocks: [{ kind: "text", text: "Existing history" }],
+      createdAt: 1,
     };
-    m.startOpenaiOauthLogin.mockResolvedValue(unavailable);
+    let confirmPin!: (value: Session) => void;
+    m.pinSessionOpenAIAccount.mockImplementationOnce(
+      () =>
+        new Promise<Session>((resolve) => {
+          confirmPin = resolve;
+        }),
+    );
+    useStore.setState({
+      sessions: [legacy],
+      activeId: legacy.id,
+      drafts: { [legacy.id]: "Keep this unsent draft" },
+      messages: { [legacy.id]: [existing] },
+      openAIAuthStatus: signedIn,
+      openAIAccounts: [account],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: liveModels(), error: null },
+      },
+    });
 
-    await useStore.getState().loginWithOpenAI();
+    const pinning = useStore.getState().pinSessionOpenAIAccount(legacy.id, account.id);
+    await vi.waitFor(() => expect(m.pinSessionOpenAIAccount).toHaveBeenCalledOnce());
 
-    expect(useStore.getState().openAIModels).toEqual([]);
-    expect(useStore.getState().openAIAuthError).toBe("Disabled in this build");
-    expect(m.openaiModels).not.toHaveBeenCalled();
+    await useStore.getState().send("Keep this unsent draft");
+    expect(useStore.getState().drafts[legacy.id]).toBe("Keep this unsent draft");
+    expect(useStore.getState().messages[legacy.id]).toEqual([existing]);
+    expect(useStore.getState().runs[legacy.id]).toBeUndefined();
+    expect(m.runAgent).not.toHaveBeenCalled();
+    expect(m.saveDraft).not.toHaveBeenCalled();
 
-    await useStore.getState().logoutOpenAI();
-    expect(useStore.getState().openAIAuthStatus).toEqual(unavailable);
+    confirmPin({ ...legacy, accountProfileId: account.id });
+    await pinning;
+    expect(useStore.getState().sessions[0].accountProfileId).toBe(account.id);
+    expect(useStore.getState().drafts[legacy.id]).toBe("Keep this unsent draft");
+    expect(useStore.getState().messages[legacy.id]).toEqual([existing]);
+  });
+
+  it("blocks unsafe legacy pin attempts and requires native confirmation", async () => {
+    const account = openAIAccount();
+    const legacy = session({ model: "gpt-live", accountProfileId: null });
+    useStore.setState({
+      sessions: [legacy],
+      activeId: legacy.id,
+      openAIAuthStatus: signedIn,
+      openAIAccounts: [account],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: liveModels(), error: null },
+      },
+      runs: { [legacy.id]: runState({ streaming: true }) },
+    });
+
+    await useStore.getState().pinSessionOpenAIAccount(legacy.id, account.id);
+    expect(useStore.getState().openAIAuthError).toMatch(/active turn/i);
+    expect(m.pinSessionOpenAIAccount).not.toHaveBeenCalled();
+
+    useStore.setState({
+      runs: {},
+      openAIAccounts: [{ ...account, state: "removed", expiresAt: null }],
+      openAIAuthError: null,
+    });
+    await useStore.getState().pinSessionOpenAIAccount(legacy.id, account.id);
+    expect(useStore.getState().openAIAuthError).toBe("Choose a connected ChatGPT account.");
+
+    useStore.setState({
+      openAIAccounts: [account],
+      openAIModelCatalogs: {
+        [account.id]: {
+          status: "ready",
+          models: [
+            {
+              id: "gpt-other",
+              label: "GPT Other",
+              provider: "openai",
+              reasoningEfforts: ["high"],
+              defaultReasoningEffort: "high",
+            },
+          ],
+          error: null,
+        },
+      },
+      openAIAuthError: null,
+    });
+    await useStore.getState().pinSessionOpenAIAccount(legacy.id, account.id);
+    expect(useStore.getState().openAIAuthError).toMatch(/model is not available/i);
+    expect(m.pinSessionOpenAIAccount).not.toHaveBeenCalled();
+
+    useStore.setState({
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: liveModels(), error: null },
+      },
+      openAIAuthError: null,
+    });
+    m.pinSessionOpenAIAccount.mockResolvedValueOnce(legacy);
+    await useStore.getState().pinSessionOpenAIAccount(legacy.id, account.id);
+    expect(useStore.getState().openAIAuthError).toMatch(/did not confirm/i);
+
+    m.pinSessionOpenAIAccount.mockRejectedValueOnce(new Error("compare-and-set failed"));
+    await useStore.getState().pinSessionOpenAIAccount(legacy.id, account.id);
+    expect(useStore.getState().openAIAuthError).toBe("compare-and-set failed");
   });
 });
 
@@ -3387,6 +4494,25 @@ describe("remote client", () => {
       expect(after.activeId).toBe(before.activeId);
     });
 
+    it("ignores minimal and other-client rejections while idle", () => {
+      useStore.setState({ remoteConnected: true, remoteError: null });
+
+      useStore.getState().applyFrame({
+        t: "command_rejected",
+        request_id: "another-phone",
+        code: "invalid_request",
+        message: "This belongs to another client.",
+      });
+      expect(useStore.getState().remoteError).toBeNull();
+
+      useStore.getState().applyFrame({ t: "command_rejected" });
+
+      expect(useStore.getState()).toMatchObject({
+        remoteConnected: true,
+        remoteError: null,
+      });
+    });
+
     it("pairing_reject drops the session and marks it rejected (REACT: desktop declined)", () => {
       const unlisten = vi.fn();
       useStore.setState({
@@ -3734,6 +4860,66 @@ describe("remote client", () => {
       const text = st.messages.s1[0].blocks.map((b) => (b.kind === "text" ? b.text : "")).join("");
       expect(text).toContain("Error");
       expect(text).toContain("boom");
+    });
+
+    it("uses a safe remote account ordinal for a pinned HTTP 429 error", () => {
+      const firstProfile = "00000000-0000-4000-8000-000000000001";
+      const secondProfile = "00000000-0000-4000-8000-000000000002";
+      useStore.setState({
+        remoteMode: true,
+        sessions: [
+          session({ id: "s1", model: "gpt-live", accountProfileId: secondProfile }),
+          session({ id: "s2", model: "gpt-live", accountProfileId: firstProfile }),
+        ],
+      });
+      seedTurn("s1", "a1");
+
+      useStore.getState().applyFrame({
+        t: "live",
+        session_id: "s1",
+        event: {
+          type: "error",
+          message: `HTTP 429 for ${secondProfile} / acct_remote_secret`,
+        },
+      });
+
+      const text = useStore
+        .getState()
+        .messages.s1[0].blocks.map((block) => (block.kind === "text" ? block.text : ""))
+        .join("");
+      const label = markdownLiteralText("ChatGPT account 2");
+      expect(text).toContain(`${label}: ChatGPT rate limit or quota was reached.`);
+      expect(text.split(`${label}:`)).toHaveLength(2);
+      expect(text).not.toContain(firstProfile);
+      expect(text).not.toContain(secondProfile);
+      expect(text).not.toContain("acct_remote_secret");
+      expect(text).not.toContain("HTTP 429");
+    });
+
+    it("escapes a hostile desktop account label in the frame-folded terminal error path", () => {
+      const hostileLabel = "[outer ![nested](https://evil.test/pixel)](https://evil.test) <svg>";
+      const account = openAIAccount({ accountLabel: hostileLabel });
+      useStore.setState({
+        remoteMode: false,
+        sessions: [session({ id: "s1", model: "gpt-live", accountProfileId: account.id })],
+        openAIAccounts: [account],
+      });
+      seedTurn("s1", "a1");
+
+      useStore.getState().applyFrame({
+        t: "live",
+        session_id: "s1",
+        event: { type: "error", message: "OpenAI response was incomplete. Please retry." },
+      });
+
+      const text = useStore
+        .getState()
+        .messages.s1[0].blocks.map((block) => (block.kind === "text" ? block.text : ""))
+        .join("");
+      expect(text).toContain(
+        `${markdownLiteralText(hostileLabel)}: OpenAI response was incomplete`,
+      );
+      expect(text).not.toContain(account.id);
     });
 
     it("attaches an authoritative error receipt to its exact remote turn", () => {
@@ -4776,7 +5962,7 @@ describe("live subagents (agents panel)", () => {
   // the agent lifecycle events the Rust spawner emits on the session channel.
   const startTurn = async (id = "a") => {
     let emit!: (e: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
       emit = onEvent;
       return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
     });
@@ -5166,7 +6352,7 @@ describe("background shell tasks (background-tasks panel)", () => {
     // persistent one must act on background events. Drive a background event through
     // the per-turn onEvent and assert it changes nothing — no double-count.
     let perTurn!: (e: StreamEvent) => void;
-    m.runAgent.mockImplementation(async (_id, _text, _model, onEvent) => {
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
       perTurn = onEvent;
       return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
     });

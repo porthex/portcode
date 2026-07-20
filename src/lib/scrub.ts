@@ -38,6 +38,10 @@ const REDACTORS: ReadonlyArray<readonly [RegExp, string]> = [
   // Bearer / Authorization token values.
   [/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, "$1[redacted-token]"],
   [/("?(?:authorization|x-api-key|api[_-]?key)"?\s*[:=]\s*"?)[^"\s,}\]]+/gi, "$1[redacted]"],
+  // Remote ChatGPT workspace identity is not a credential, but it is still
+  // account-identifying data and must never survive logs/telemetry. Values can
+  // be short, so the generic long-key redactor is insufficient.
+  [/("?chatgpt-account-id"?\s*[:=]\s*"?)[^"\s,}\]]+/gi, "$1[redacted-account-id]"],
   // Emails (non-overlapping labels — no catastrophic backtracking).
   [/[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/g, "[redacted-email]"],
   // IPv4 addresses.

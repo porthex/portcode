@@ -2,7 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import * as ipc from "../lib/ipc";
 import { useStore } from "../store/store";
-import type { PlanUsageSnapshot, PlanUsageWindow, ProviderId } from "../types";
+import {
+  openAIAccountLabel,
+  type PlanUsageSnapshot,
+  type PlanUsageWindow,
+  type ProviderId,
+} from "../types";
 
 interface UsageState {
   snapshot: PlanUsageSnapshot | null;
@@ -124,6 +129,7 @@ interface ProviderUsageCardProps {
   state: UsageState;
   onRefresh: () => void;
   onOpenSettings?: (provider: ProviderId) => void;
+  ariaLabel?: string;
 }
 
 function ProviderUsageCard({
@@ -134,6 +140,7 @@ function ProviderUsageCard({
   state,
   onRefresh,
   onOpenSettings,
+  ariaLabel,
 }: ProviderUsageCardProps) {
   const isClaude = provider === "anthropic";
   const name = isClaude ? "Claude" : "GPT";
@@ -151,7 +158,7 @@ function ProviderUsageCard({
   return (
     <article
       className={`pc-plan-card pc-plan-card--${isClaude ? "claude" : "openai"}`}
-      aria-label={`${name} plan usage`}
+      aria-label={ariaLabel ?? `${name} plan usage`}
     >
       <header className="pc-plan-card__header">
         <span className="pc-plan-card__mark" aria-hidden="true">
@@ -222,32 +229,100 @@ function ProviderUsageCard({
   );
 }
 
-/** Combined plan allowance view. Each provider loads independently so one failed
- * subscription backend never hides a healthy snapshot from the other. */
+interface UsageTarget {
+  key: string;
+  provider: ProviderId;
+  accountProfileId: string | null;
+  account: string | null;
+  tier: string | null;
+  signedIn: boolean;
+}
+
+/** Combined plan allowance view. Every ChatGPT card has its own request key and
+ * profile id, so a slow/error response for Account A cannot replace Account B. */
 export function PlanUsagePanel({
   compact = false,
   onlyProvider,
+  openAIAccountProfileId,
   onOpenSettings,
   onRemainingChange,
 }: {
   compact?: boolean;
   onlyProvider?: ProviderId;
+  openAIAccountProfileId?: string | null;
   onOpenSettings?: (provider: ProviderId) => void;
   onRemainingChange?: (remaining: number | null) => void;
 } = {}) {
   const claude = useStore((state) => state.oauthStatus);
-  const openai = useStore((state) => state.openAIAuthStatus);
-  const claudeSignedIn = Boolean(claude?.signedIn);
-  const openaiSignedIn = Boolean(openai?.signedIn);
-  const openAIAvailable = openai?.available !== false;
+  const openAIStatus = useStore((state) => state.openAIAuthStatus);
+  const openAIAccounts = useStore((state) => state.openAIAccounts);
   const showClaude = onlyProvider !== "openai";
-  const showOpenAI = onlyProvider !== "anthropic" && openAIAvailable;
-  const [states, setStates] = useState<Record<ProviderId, UsageState>>({
-    anthropic: EMPTY,
-    openai: EMPTY,
-  });
+  const openAIAvailable = openAIStatus?.available !== false;
+
+  const targets = useMemo<UsageTarget[]>(() => {
+    const next: UsageTarget[] = [];
+    if (showClaude) {
+      next.push({
+        key: "anthropic",
+        provider: "anthropic",
+        accountProfileId: null,
+        account: claude?.account ?? null,
+        tier: claude?.tier ?? null,
+        signedIn: Boolean(claude?.signedIn),
+      });
+    }
+    if (onlyProvider === "anthropic") return next;
+
+    const scopedAccounts = openAIAccountProfileId
+      ? openAIAccounts.filter((account) => account.id === openAIAccountProfileId)
+      : openAIAccounts;
+    if (scopedAccounts.length > 0) {
+      for (const account of scopedAccounts) {
+        next.push({
+          key: `openai:${account.id}`,
+          provider: "openai",
+          accountProfileId: account.id,
+          account: openAIAccountLabel(account, openAIAccounts),
+          tier: account.tier,
+          signedIn: openAIAvailable && account.state === "connected",
+        });
+      }
+    } else if (openAIAccountProfileId) {
+      // A removed profile remains a readable session identity, but its local UUID
+      // is intentionally not rendered. The card routes users to account Settings.
+      next.push({
+        key: `openai:${openAIAccountProfileId}`,
+        provider: "openai",
+        accountProfileId: openAIAccountProfileId,
+        account: "Removed ChatGPT account",
+        tier: null,
+        signedIn: false,
+      });
+    } else if (openAIAvailable) {
+      next.push({
+        key: "openai:none",
+        provider: "openai",
+        accountProfileId: null,
+        account: null,
+        tier: null,
+        signedIn: false,
+      });
+    }
+    return next;
+  }, [
+    claude?.account,
+    claude?.signedIn,
+    claude?.tier,
+    onlyProvider,
+    openAIAccountProfileId,
+    openAIAccounts,
+    openAIAvailable,
+    showClaude,
+  ]);
+
+  const [states, setStates] = useState<Record<string, UsageState>>({});
   const mounted = useRef(true);
-  const requestIds = useRef<Record<ProviderId, number>>({ anthropic: 0, openai: 0 });
+  const requestIds = useRef<Record<string, number>>({});
 
   useEffect(() => {
     mounted.current = true;
@@ -256,29 +331,34 @@ export function PlanUsagePanel({
     };
   }, []);
 
-  const refresh = useCallback(async (provider: ProviderId, signedIn: boolean) => {
-    const requestId = ++requestIds.current[provider];
-    if (!signedIn) {
-      setStates((current) => ({ ...current, [provider]: EMPTY }));
+  const refresh = useCallback(async (target: UsageTarget) => {
+    const requestId = (requestIds.current[target.key] ?? 0) + 1;
+    requestIds.current[target.key] = requestId;
+    if (!target.signedIn) {
+      setStates((current) => ({ ...current, [target.key]: EMPTY }));
       return;
     }
     setStates((current) => ({
       ...current,
-      [provider]: { ...current[provider], loading: true, error: null },
+      [target.key]: {
+        ...(current[target.key] ?? EMPTY),
+        loading: true,
+        error: null,
+      },
     }));
     try {
-      const snapshot = await ipc.getPlanUsage(provider);
-      if (!mounted.current || requestIds.current[provider] !== requestId) return;
+      const snapshot = await ipc.getPlanUsage(target.provider, target.accountProfileId);
+      if (!mounted.current || requestIds.current[target.key] !== requestId) return;
       setStates((current) => ({
         ...current,
-        [provider]: { snapshot, loading: false, error: null },
+        [target.key]: { snapshot, loading: false, error: null },
       }));
     } catch (error) {
-      if (!mounted.current || requestIds.current[provider] !== requestId) return;
+      if (!mounted.current || requestIds.current[target.key] !== requestId) return;
       setStates((current) => ({
         ...current,
-        [provider]: {
-          snapshot: current[provider].snapshot,
+        [target.key]: {
+          snapshot: current[target.key]?.snapshot ?? null,
           loading: false,
           error: errorMessage(error),
         },
@@ -287,54 +367,29 @@ export function PlanUsagePanel({
   }, []);
 
   useEffect(() => {
-    void refresh("anthropic", showClaude && claudeSignedIn);
-  }, [claudeSignedIn, refresh, showClaude]);
+    for (const target of targets) void refresh(target);
+  }, [refresh, targets]);
 
-  useEffect(() => {
-    void refresh("openai", showOpenAI && openaiSignedIn);
-  }, [openaiSignedIn, refresh, showOpenAI]);
-
-  const latest = useMemo(
+  const snapshots = useMemo(
     () =>
-      Math.max(
-        showClaude ? (states.anthropic.snapshot?.updatedAt ?? 0) : 0,
-        showOpenAI ? (states.openai.snapshot?.updatedAt ?? 0) : 0,
-      ),
-    [
-      showClaude,
-      showOpenAI,
-      states.anthropic.snapshot?.updatedAt,
-      states.openai.snapshot?.updatedAt,
-    ],
+      targets
+        .map((target) => states[target.key]?.snapshot ?? null)
+        .filter((snapshot): snapshot is PlanUsageSnapshot => snapshot !== null),
+    [states, targets],
   );
-  const refreshing =
-    (showClaude && states.anthropic.loading) || (showOpenAI && states.openai.loading);
+  const latest = Math.max(0, ...snapshots.map((snapshot) => snapshot.updatedAt));
+  const refreshing = targets.some((target) => states[target.key]?.loading);
+  const anyConnected = targets.some((target) => target.signedIn);
   const refreshAll = () => {
-    if (showClaude) void refresh("anthropic", claudeSignedIn);
-    if (showOpenAI) void refresh("openai", openaiSignedIn);
+    for (const target of targets) void refresh(target);
   };
 
   useEffect(() => {
     if (!onRemainingChange) return;
-    const snapshots = [
-      showClaude ? states.anthropic.snapshot : null,
-      showOpenAI ? states.openai.snapshot : null,
-    ].filter((snapshot): snapshot is PlanUsageSnapshot => snapshot !== null);
-    if (snapshots.length > 0) {
-      onRemainingChange(lowestPlanRemaining(snapshots));
-    } else if (!(showClaude && claudeSignedIn) && !(showOpenAI && openaiSignedIn)) {
-      onRemainingChange(null);
-    }
-  }, [
-    claudeSignedIn,
-    onRemainingChange,
-    openaiSignedIn,
-    showClaude,
-    showOpenAI,
-    states.anthropic.snapshot,
-    states.openai.snapshot,
-  ]);
+    onRemainingChange(snapshots.length > 0 ? lowestPlanRemaining(snapshots) : null);
+  }, [onRemainingChange, snapshots]);
 
+  const openAITargetCount = targets.filter((target) => target.provider === "openai").length;
   return (
     <div className={`pc-plan-usage${compact ? " pc-plan-usage--compact" : ""}`}>
       <div className="pc-plan-usage__toolbar">
@@ -348,37 +403,33 @@ export function PlanUsagePanel({
           type="button"
           className="pc-settings-action"
           onClick={refreshAll}
-          disabled={
-            refreshing || (!(showClaude && claudeSignedIn) && !(showOpenAI && openaiSignedIn))
-          }
+          disabled={refreshing || !anyConnected}
           aria-label="Refresh all plan usage"
         >
           <span aria-hidden="true">↻</span> {refreshing ? "Refreshing" : "Refresh all"}
         </button>
       </div>
       <div className="pc-plan-usage__grid">
-        {showOpenAI && (
-          <ProviderUsageCard
-            provider="openai"
-            account={openai?.account ?? null}
-            tier={openai?.tier ?? null}
-            signedIn={openaiSignedIn}
-            state={states.openai}
-            onRefresh={() => void refresh("openai", openaiSignedIn)}
-            onOpenSettings={onOpenSettings}
-          />
-        )}
-        {showClaude && (
-          <ProviderUsageCard
-            provider="anthropic"
-            account={claude?.account ?? null}
-            tier={claude?.tier ?? null}
-            signedIn={claudeSignedIn}
-            state={states.anthropic}
-            onRefresh={() => void refresh("anthropic", claudeSignedIn)}
-            onOpenSettings={onOpenSettings}
-          />
-        )}
+        {targets.map((target) => {
+          const name = target.provider === "openai" ? "GPT" : "Claude";
+          const ariaLabel =
+            target.provider === "openai" && openAITargetCount > 1 && target.account
+              ? `GPT plan usage for ${target.account}`
+              : `${name} plan usage`;
+          return (
+            <ProviderUsageCard
+              key={target.key}
+              provider={target.provider}
+              account={target.account}
+              tier={target.tier}
+              signedIn={target.signedIn}
+              state={states[target.key] ?? EMPTY}
+              onRefresh={() => void refresh(target)}
+              onOpenSettings={onOpenSettings}
+              ariaLabel={ariaLabel}
+            />
+          );
+        })}
       </div>
       <p className="pc-plan-usage__note">
         Short-term and weekly limits apply at the same time. Work pauses when either reaches 0%.

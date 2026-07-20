@@ -7,11 +7,12 @@ import {
   type ReactNode,
 } from "react";
 import { QRCodeSVG } from "qrcode.react";
-import { useStore } from "../store/store";
+import { modelsForOpenAIProfile, preferredOpenAIAccount, useStore } from "../store/store";
 import {
   ANTHROPIC_MODELS,
   DANGER_MODES,
   modelInfo,
+  openAIAccountLabel,
   providerForModel,
   reasoningEffortLabel,
   type PairingPayload,
@@ -214,9 +215,17 @@ export function SettingsPanel() {
   const logoutClaude = useStore((s) => s.logoutClaude);
   const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
   const openAIAuthError = useStore((s) => s.openAIAuthError);
+  const openAIReconnectMismatch = useStore((s) => s.openAIReconnectMismatch);
   const openAIModels = useStore((s) => s.openAIModels);
+  const openAIAccounts = useStore((s) => s.openAIAccounts);
+  const openAIAccountsLoading = useStore((s) => s.openAIAccountsLoading);
+  const openAIAccountsError = useStore((s) => s.openAIAccountsError);
+  const openAIModelCatalogs = useStore((s) => s.openAIModelCatalogs);
+  const lastOpenAIAccountProfileId = useStore((s) => s.lastOpenAIAccountProfileId);
   const loginWithOpenAI = useStore((s) => s.loginWithOpenAI);
-  const logoutOpenAI = useStore((s) => s.logoutOpenAI);
+  const reconnectOpenAIAccount = useStore((s) => s.reconnectOpenAIAccount);
+  const removeOpenAIAccount = useStore((s) => s.removeOpenAIAccount);
+  const refreshOpenAIStatus = useStore((s) => s.refreshOpenAIStatus);
 
   const ambientRain = useStore((s) => s.ambientRain);
   const scanlines = useStore((s) => s.scanlines);
@@ -251,6 +260,8 @@ export function SettingsPanel() {
   const [keyError, setKeyError] = useState<string | null>(null);
   const [signingIn, setSigningIn] = useState(false);
   const [signingInOpenAI, setSigningInOpenAI] = useState(false);
+  const [openAIAccountAction, setOpenAIAccountAction] = useState<string | null>(null);
+  const [pendingOpenAIRemoval, setPendingOpenAIRemoval] = useState<string | null>(null);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const modalRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLElement | null>(null);
@@ -265,10 +276,24 @@ export function SettingsPanel() {
   );
 
   const signedIn = !!oauthStatus?.signedIn;
-  const signedInOpenAI = !!openAIAuthStatus?.signedIn;
+  const connectedOpenAIAccounts = openAIAccounts.filter((account) => account.state === "connected");
+  const signedInOpenAI = connectedOpenAIAccounts.length > 0;
+  const reconnectOnlyOpenAI = openAIAccounts.length > 0 && connectedOpenAIAccounts.length === 0;
   const openAIAvailable = openAIAuthStatus?.available !== false;
-  const selectedModel = modelInfo(settings.model, openAIModels);
-  const selectedProvider = providerForModel(settings.model, openAIModels);
+  const reconnectMismatchAccount = openAIAccounts.find(
+    (account) => account.id === openAIReconnectMismatch?.accountProfileId,
+  );
+  const defaultOpenAIAccount = preferredOpenAIAccount(
+    connectedOpenAIAccounts,
+    lastOpenAIAccountProfileId,
+  );
+  const defaultOpenAIModels = modelsForOpenAIProfile(
+    defaultOpenAIAccount?.id,
+    openAIModelCatalogs,
+    openAIModels,
+  );
+  const selectedModel = modelInfo(settings.model, defaultOpenAIModels);
+  const selectedProvider = providerForModel(settings.model, defaultOpenAIModels);
   const claudeModelValue = selectedProvider === "anthropic" ? settings.model : "choose-claude";
   const openAIModelValue = selectedProvider === "openai" ? settings.model : "choose-openai";
   const reasoningEfforts =
@@ -277,7 +302,8 @@ export function SettingsPanel() {
     () =>
       SETTINGS_SECTIONS.filter(
         (section) =>
-          !(remoteMode && section.desktopOnly) && (openAIAvailable || section.id !== "openai"),
+          !(remoteMode && section.desktopOnly) &&
+          (openAIAvailable || openAIAccounts.length > 0 || section.id !== "openai"),
       ).map((section) => {
         if (section.id === "openai" && reasoningEfforts.length === 0) {
           return {
@@ -295,7 +321,7 @@ export function SettingsPanel() {
         }
         return section;
       }),
-    [openAIAvailable, reasoningEfforts.length, remoteMode],
+    [openAIAccounts.length, openAIAvailable, reasoningEfforts.length, remoteMode],
   );
   const visibleSections = useMemo(
     () => availableSections.filter((section) => matchesSettingsQuery(section, searchQuery)),
@@ -315,8 +341,8 @@ export function SettingsPanel() {
   }, [searchQuery, visibleSections]);
   const sectionStatus: Record<SettingsSectionId, string> = {
     claude: `${selectedProvider === "anthropic" ? "default" : "available"} · ${signedIn ? "signed in" : settings.apiKeySet ? "key stored" : "not connected"}`,
-    openai: `${selectedProvider === "openai" ? "default" : "available"} · ${signedInOpenAI ? "signed in" : "not connected"}`,
-    usage: `${Number(signedIn) + Number(openAIAvailable && signedInOpenAI)} of ${openAIAvailable ? 2 : 1} connected`,
+    openai: `${selectedProvider === "openai" ? "default" : "available"} · ${connectedOpenAIAccounts.length} account${connectedOpenAIAccounts.length === 1 ? "" : "s"}`,
+    usage: `${Number(signedIn) + connectedOpenAIAccounts.length} connected account${Number(signedIn) + connectedOpenAIAccounts.length === 1 ? "" : "s"}`,
     permissions: `${settings.permissionMode} · ${settings.rules.length} rule${settings.rules.length === 1 ? "" : "s"}`,
     interface: `${Math.round(uiScale * 100)}% · ${ambientRain || scanlines ? "effects on" : "effects off"}`,
     system: remoteMode
@@ -476,6 +502,25 @@ export function SettingsPanel() {
       await loginWithOpenAI();
     } finally {
       setSigningInOpenAI(false);
+    }
+  };
+
+  const reconnectOpenAI = async (accountProfileId: string) => {
+    setOpenAIAccountAction(`reconnect:${accountProfileId}`);
+    try {
+      await reconnectOpenAIAccount(accountProfileId);
+    } finally {
+      setOpenAIAccountAction(null);
+    }
+  };
+
+  const removeOpenAI = async (accountProfileId: string) => {
+    setOpenAIAccountAction(`remove:${accountProfileId}`);
+    try {
+      await removeOpenAIAccount(accountProfileId);
+      setPendingOpenAIRemoval((current) => (current === accountProfileId ? null : current));
+    } finally {
+      setOpenAIAccountAction(null);
     }
   };
 
@@ -856,6 +901,11 @@ export function SettingsPanel() {
                         label="OpenAI model for new sessions"
                         value={openAIModelValue}
                         onChange={(next) => void updateSettings({ model: next })}
+                        disabled={
+                          !openAIAvailable ||
+                          !defaultOpenAIAccount ||
+                          openAIModelCatalogs[defaultOpenAIAccount.id]?.status !== "ready"
+                        }
                         className="w-full"
                         buttonClassName="px-3 py-2.5 text-[12.5px]"
                         groups={[
@@ -867,7 +917,7 @@ export function SettingsPanel() {
                                 label: "Choose a GPT model…",
                                 disabled: true,
                               },
-                              ...openAIModels.map((model) => ({
+                              ...defaultOpenAIModels.map((model) => ({
                                 value: model.id,
                                 label: model.label,
                               })),
@@ -876,7 +926,17 @@ export function SettingsPanel() {
                         ]}
                       />
                       <p className="mt-1.5 text-[11px] text-faint">
-                        Choosing a GPT model makes OpenAI the default for new chats.
+                        {!openAIAvailable
+                          ? (openAIAuthStatus?.unavailableReason ??
+                            "ChatGPT subscription access is unavailable in this build.")
+                          : !defaultOpenAIAccount
+                            ? "Add a ChatGPT account to load its model catalogue."
+                            : openAIModelCatalogs[defaultOpenAIAccount.id]?.status === "loading"
+                              ? `Loading models for ${openAIAccountLabel(defaultOpenAIAccount, openAIAccounts)}…`
+                              : openAIModelCatalogs[defaultOpenAIAccount.id]?.status === "error"
+                                ? (openAIModelCatalogs[defaultOpenAIAccount.id]?.error ??
+                                  "This account's model catalogue is unavailable.")
+                                : `Models for ${openAIAccountLabel(defaultOpenAIAccount, openAIAccounts)}. Choosing one makes OpenAI the default for new chats.`}
                       </p>
                     </div>
 
@@ -924,53 +984,180 @@ export function SettingsPanel() {
                         <span>Authentication</span>
                         <span>CHATGPT SUBSCRIPTION</span>
                       </div>
-                      <h3>ChatGPT account</h3>
-                      {signedInOpenAI ? (
-                        <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-panel-2 px-3 py-2.5">
-                          <div className="min-w-0 text-[12.5px]">
-                            <div className="flex items-center gap-1.5">
-                              <span className="pc-dot pc-dot--success" />
-                              <span className="min-w-0 truncate text-fg">
-                                Signed in
-                                {openAIAuthStatus?.account ? ` as ${openAIAuthStatus.account}` : ""}
-                              </span>
-                              {openAIAuthStatus?.tier && (
-                                <span
-                                  title={openAIAuthStatus.tier}
-                                  className="shrink-0 rounded-full bg-gradient-to-r from-emerald-400 to-cyan-500 px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wider text-black shadow-sm"
-                                >
-                                  {openAIAuthStatus.tier.replace(/^ChatGPT\s+/i, "")}
-                                </span>
-                              )}
-                            </div>
-                            {openAIAuthStatus?.expiresAt != null && (
-                              <div className="mt-0.5 text-[11px] text-muted">
-                                Access expires {formatExpiry(openAIAuthStatus.expiresAt)}
-                              </div>
-                            )}
-                          </div>
+                      <div className="flex items-center justify-between gap-3">
+                        <h3>ChatGPT accounts</h3>
+                        {openAIAvailable && (
                           <button
                             type="button"
-                            aria-label="Log out of ChatGPT"
-                            onClick={() => void logoutOpenAI()}
-                            className="shrink-0 rounded-lg border border-border bg-panel px-3 py-2 text-[12.5px] text-muted hover:text-fg"
+                            onClick={() => void signInOpenAI()}
+                            disabled={signingInOpenAI || openAIAccountAction !== null}
+                            className="pc-settings-action"
                           >
-                            Log out
+                            {signingInOpenAI ? "Adding…" : "+ Add account"}
+                          </button>
+                        )}
+                      </div>
+                      {!openAIAvailable && (
+                        <div className="pc-openai-capability-notice" role="status">
+                          <strong>New ChatGPT connections are disabled</strong>
+                          <span>
+                            {openAIAuthStatus?.unavailableReason ??
+                              "ChatGPT subscription access is unavailable in this build."}
+                            {openAIAccounts.length > 0
+                              ? " Existing credentials can still be removed below."
+                              : ""}
+                          </span>
+                        </div>
+                      )}
+                      {openAIAccountsLoading && openAIAccounts.length === 0 ? (
+                        <div className="pc-openai-account-empty" role="status">
+                          Loading ChatGPT accounts…
+                        </div>
+                      ) : openAIAccountsError && openAIAccounts.length === 0 ? (
+                        <div className="pc-openai-account-empty" role="alert">
+                          <strong>Couldn’t load ChatGPT accounts</strong>
+                          <span>{openAIAccountsError}</span>
+                          <button type="button" onClick={() => void refreshOpenAIStatus()}>
+                            Retry account discovery
                           </button>
                         </div>
+                      ) : openAIAccounts.length === 0 ? (
+                        <div className="pc-openai-account-empty">
+                          <strong>No ChatGPT accounts connected</strong>
+                          <span>
+                            Add an eligible ChatGPT subscription account to create GPT chats.
+                          </span>
+                        </div>
                       ) : (
-                        <button
-                          type="button"
-                          onClick={() => void signInOpenAI()}
-                          disabled={signingInOpenAI}
-                          className="w-full rounded-lg border border-accent-2/50 bg-accent-2/10 px-3 py-2.5 text-[12.5px] text-accent-2 transition-colors hover:bg-accent-2/20 disabled:opacity-30"
-                        >
-                          {signingInOpenAI ? "Signing in…" : "Sign in with ChatGPT"}
-                        </button>
+                        <>
+                          {reconnectOnlyOpenAI && (
+                            <div className="pc-openai-capability-notice" role="status">
+                              <strong>No connected ChatGPT account</strong>
+                              <span>
+                                Reconnect a saved profile below; history remains readable.
+                              </span>
+                            </div>
+                          )}
+                          <div className="pc-openai-account-list" aria-label="ChatGPT accounts">
+                            {openAIAccounts.map((account) => {
+                              const reconnecting =
+                                openAIAccountAction === `reconnect:${account.id}`;
+                              const removing = openAIAccountAction === `remove:${account.id}`;
+                              const confirmingRemoval = pendingOpenAIRemoval === account.id;
+                              const connected = account.state === "connected";
+                              const displayLabel = openAIAccountLabel(account, openAIAccounts);
+                              const stateLabel = connected
+                                ? "Connected"
+                                : account.state === "reconnect_required"
+                                  ? "Reconnect required"
+                                  : account.state === "removed"
+                                    ? "Removed · history retained"
+                                    : "Unavailable";
+                              return (
+                                <div key={account.id} className="pc-openai-account-row">
+                                  <div className="pc-openai-account-row__identity">
+                                    <div>
+                                      <span
+                                        className={`pc-dot ${connected ? "pc-dot--success" : "pc-dot--warn"}`}
+                                        aria-hidden="true"
+                                      />
+                                      <strong title={displayLabel}>{displayLabel}</strong>
+                                      {account.tier && (
+                                        <span className="pc-openai-account-tier">
+                                          {account.tier.replace(/^ChatGPT\s+/i, "")}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <small>
+                                      {stateLabel}
+                                      {account.expiresAt != null
+                                        ? ` · access expires ${formatExpiry(account.expiresAt)}`
+                                        : ""}
+                                    </small>
+                                  </div>
+                                  <div className="pc-openai-account-row__actions">
+                                    {confirmingRemoval ? (
+                                      <>
+                                        <button
+                                          type="button"
+                                          onClick={() => setPendingOpenAIRemoval(null)}
+                                          disabled={removing}
+                                        >
+                                          Cancel
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="is-danger"
+                                          onClick={() => void removeOpenAI(account.id)}
+                                          disabled={removing}
+                                          aria-label={`Confirm remove ${displayLabel}`}
+                                        >
+                                          {removing ? "Removing…" : "Confirm remove"}
+                                        </button>
+                                      </>
+                                    ) : (
+                                      <>
+                                        {!connected && openAIAvailable && (
+                                          <button
+                                            type="button"
+                                            onClick={() => void reconnectOpenAI(account.id)}
+                                            disabled={openAIAccountAction !== null}
+                                            aria-label={`Reconnect ${displayLabel}`}
+                                          >
+                                            {reconnecting ? "Reconnecting…" : "Reconnect"}
+                                          </button>
+                                        )}
+                                        <button
+                                          type="button"
+                                          onClick={() => setPendingOpenAIRemoval(account.id)}
+                                          disabled={openAIAccountAction !== null}
+                                          aria-label={`Remove ${displayLabel}`}
+                                        >
+                                          Remove
+                                        </button>
+                                      </>
+                                    )}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                          {openAIReconnectMismatch && (
+                            <div className="pc-openai-capability-notice" role="alert">
+                              <strong>Different ChatGPT account detected</strong>
+                              <span>
+                                {openAIReconnectMismatch.message} The original profile
+                                {reconnectMismatchAccount && (
+                                  <>
+                                    {" ("}
+                                    {openAIAccountLabel(reconnectMismatchAccount, openAIAccounts)}
+                                    {")"}
+                                  </>
+                                )}{" "}
+                                was unchanged.
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => void signInOpenAI()}
+                                disabled={signingInOpenAI || openAIAccountAction !== null}
+                              >
+                                {signingInOpenAI ? "Adding…" : "Add as separate account"}
+                              </button>
+                            </div>
+                          )}
+                        </>
+                      )}
+                      {openAIAccountsError && openAIAccounts.length > 0 && (
+                        <div className="pc-openai-accounts-error" role="alert">
+                          <span>Couldn’t refresh accounts: {openAIAccountsError}</span>
+                          <button type="button" onClick={() => void refreshOpenAIStatus()}>
+                            Retry
+                          </button>
+                        </div>
                       )}
                       {openAIAuthError && (
                         <p className="mt-1.5 text-[11px] text-danger" role="alert">
-                          OpenAI sign-in: {openAIAuthError}
+                          ChatGPT accounts: {openAIAuthError}
                         </p>
                       )}
                       <p className="mt-1.5 text-[11px] text-faint">

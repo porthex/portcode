@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useStore } from "../store/store";
-import { relativeTime, workspaceLabel } from "../lib/sessionFormat";
+import { relativeTime, remoteAccountLabel, workspaceLabel } from "../lib/sessionFormat";
 
 const FOCUSABLE =
   'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
@@ -127,6 +127,9 @@ export function RemoteSessionSwitcher({ onClose }: { onClose: () => void }) {
                   <div className="mt-0.5 font-mono text-[10.5px] text-faint">
                     <span aria-hidden="true">⎇</span> {workspaceLabel(s.workspace)} ·{" "}
                     {activity !== "idle" ? activity : `idle ${relativeTime(s.updatedAt)}`}
+                    {s.accountProfileId && (
+                      <> · {remoteAccountLabel(s.accountProfileId, sessions)}</>
+                    )}
                   </div>
                 </div>
                 {active && (

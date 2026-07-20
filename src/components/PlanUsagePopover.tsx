@@ -7,6 +7,7 @@ import { PlanUsagePanel } from "./PlanUsagePanel";
 interface PlanUsagePopoverProps {
   open: boolean;
   provider: ProviderId;
+  openAIAccountProfileId?: string | null;
   triggerRef: RefObject<HTMLButtonElement | null>;
   onClose: () => void;
   onOpenSettings: (provider?: ProviderId) => void;
@@ -17,6 +18,7 @@ interface PlanUsagePopoverProps {
 export function PlanUsagePopover({
   open,
   provider,
+  openAIAccountProfileId,
   triggerRef,
   onClose,
   onOpenSettings,
@@ -80,6 +82,7 @@ export function PlanUsagePopover({
       <PlanUsagePanel
         compact
         onlyProvider={provider}
+        openAIAccountProfileId={openAIAccountProfileId}
         onOpenSettings={onOpenSettings}
         onRemainingChange={onRemainingChange}
       />

@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Provider-aware settings, model and reasoning controls, included-plan usage,
   and an experimental direct ChatGPT subscription provider that is enabled for
   self-development but release-gated pending an approved production boundary.
+- Multiple crash-safe ChatGPT subscription profiles with explicit per-session
+  account pinning, isolated refresh/model/usage state, safe legacy migration,
+  and reconnectable account tombstones that preserve conversation history.
 - Focused accessibility, cancellation, reconnect, large-transcript, and desktop
   smoke-test coverage for the new interaction paths.
 - Open-source community-health and contributor infrastructure: `LICENSE`

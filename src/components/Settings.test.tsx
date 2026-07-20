@@ -8,6 +8,7 @@ import {
   ANTHROPIC_MODELS,
   DEFAULT_SETTINGS,
   MODELS,
+  type OpenAIAccountSummary,
   type PairedDevice,
   type PhoneSyncStatus,
   type Settings,
@@ -35,9 +36,11 @@ vi.mock("../lib/ipc", () => ({
   startOauthLogin: vi.fn(),
   oauthLogout: vi.fn(),
   oauthStatus: vi.fn(),
-  startOpenaiOauthLogin: vi.fn(),
-  openaiOauthLogout: vi.fn(),
   openaiOauthStatus: vi.fn(),
+  listOpenAIAccounts: vi.fn(),
+  startOpenAIAccountLogin: vi.fn(),
+  reconnectOpenAIAccount: vi.fn(),
+  removeOpenAIAccount: vi.fn(),
   openaiModels: vi.fn(),
   getPlanUsage: vi.fn(),
   // Phone sync: reached via the store's refreshPhoneSync/beginPairing/unpair.
@@ -51,6 +54,18 @@ vi.mock("../lib/ipc", () => ({
 
 const m = vi.mocked(ipc);
 const initial = useStore.getState();
+
+const openAIAccount = (over: Partial<OpenAIAccountSummary> = {}): OpenAIAccountSummary => ({
+  id: "00000000-0000-4000-8000-000000000001",
+  accountLabel: "you@openai.com",
+  tier: "ChatGPT Plus",
+  expiresAt: 4_102_444_800,
+  state: "connected",
+  createdAt: 1,
+  updatedAt: 1,
+  lastUsedAt: null,
+  ...over,
+});
 
 /** Arrange a settings object on the real store, then render the panel. */
 function renderPanel(over: Partial<Settings> = {}) {
@@ -79,19 +94,19 @@ beforeEach(() => {
   });
   m.oauthLogout.mockResolvedValue(undefined);
   m.oauthStatus.mockResolvedValue({ signedIn: false, expiresAt: null, account: null, tier: null });
-  m.startOpenaiOauthLogin.mockResolvedValue({
-    signedIn: true,
-    expiresAt: 4102444800,
-    account: "you@openai.com",
-    tier: "ChatGPT Plus",
-  });
-  m.openaiOauthLogout.mockResolvedValue(undefined);
   m.openaiOauthStatus.mockResolvedValue({
     signedIn: false,
     expiresAt: null,
     account: null,
     tier: null,
   });
+  m.listOpenAIAccounts.mockResolvedValue([]);
+  m.startOpenAIAccountLogin.mockResolvedValue(openAIAccount());
+  m.reconnectOpenAIAccount.mockImplementation(async (accountProfileId) => ({
+    status: "reconnected" as const,
+    account: openAIAccount({ id: accountProfileId }),
+  }));
+  m.removeOpenAIAccount.mockResolvedValue(undefined);
   m.openaiModels.mockResolvedValue([
     {
       id: "gpt-live",
@@ -158,12 +173,10 @@ describe("SettingsPanel — structure", () => {
     expect(within(claude).getByLabelText("Claude model for new sessions")).toBeInTheDocument();
     expect(within(claude).getByRole("button", { name: "Sign in with Claude" })).toBeInTheDocument();
     expect(within(claude).getByLabelText("Anthropic API key")).toBeInTheDocument();
-    expect(within(claude).queryByRole("button", { name: "Sign in with ChatGPT" })).toBeNull();
+    expect(within(claude).queryByRole("button", { name: "+ Add account" })).toBeNull();
 
     expect(within(openai).getByLabelText("OpenAI model for new sessions")).toBeInTheDocument();
-    expect(
-      within(openai).getByRole("button", { name: "Sign in with ChatGPT" }),
-    ).toBeInTheDocument();
+    expect(within(openai).getByRole("button", { name: "+ Add account" })).toBeInTheDocument();
     expect(within(openai).getByText(/OpenAI API keys are not used/i)).toBeInTheDocument();
     expect(within(openai).queryByLabelText("Anthropic API key")).toBeNull();
   });
@@ -185,7 +198,7 @@ describe("SettingsPanel — structure", () => {
     const map = screen.getByRole("navigation", { name: "Settings map" });
     expect(within(map).queryByRole("button", { name: "OpenAI / GPT" })).not.toBeInTheDocument();
     expect(document.getElementById("pc-settings-openai")).toHaveClass("hidden");
-    expect(within(map).getByText("0 of 1 connected")).toBeInTheDocument();
+    expect(within(map).getByText("0 connected accounts")).toBeInTheDocument();
     expect(screen.queryByRole("article", { name: "GPT plan usage" })).not.toBeInTheDocument();
   });
 
@@ -391,42 +404,259 @@ describe("SettingsPanel — structure", () => {
 });
 
 describe("SettingsPanel — OpenAI subscription", () => {
+  it("distinguishes loading, discovery error, true zero, and reconnect-only registries", () => {
+    const refresh = vi.fn(async () => {});
+    useStore.setState({
+      openAIAccounts: [],
+      openAIAccountsLoading: true,
+      openAIAccountsError: null,
+      refreshOpenAIStatus: refresh,
+    });
+    const view = renderPanel();
+
+    expect(screen.getByText(/Loading ChatGPT accounts/)).toHaveAttribute("role", "status");
+
+    useStore.setState({ openAIAccountsLoading: false, openAIAccountsError: "registry locked" });
+    view.rerender(<SettingsPanel />);
+    expect(screen.getByText(/load ChatGPT accounts/).closest("[role=alert]")).toHaveTextContent(
+      "registry locked",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry account discovery" }));
+    expect(refresh).toHaveBeenCalledOnce();
+
+    useStore.setState({ openAIAccountsError: null });
+    view.rerender(<SettingsPanel />);
+    expect(screen.getByText("No ChatGPT accounts connected")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "+ Add account" })).toBeEnabled();
+
+    const saved = openAIAccount({ state: "reconnect_required", expiresAt: null });
+    useStore.setState({ openAIAccounts: [saved] });
+    view.rerender(<SettingsPanel />);
+    expect(screen.getByText("No connected ChatGPT account")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reconnect you@openai.com" })).toBeEnabled();
+  });
+
   it("switches the default provider only from the provider-scoped GPT picker", async () => {
+    const account = openAIAccount();
+    const gptModel = MODELS.find((model) => model.provider === "openai")!;
+    useStore.setState({
+      openAIAccounts: [account],
+      openAIModels: [gptModel],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: [gptModel], error: null },
+      },
+    });
     renderPanel({ provider: "anthropic", model: ANTHROPIC_MODELS[0].id });
 
     const picker = screen.getByLabelText("OpenAI model for new sessions");
     expect(picker).toHaveValue("choose-openai");
     fireEvent.click(picker);
     expect(screen.queryByRole("option", { name: "Claude Opus 4.8" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("option", { name: "GPT-5.6 Sol" }));
+    fireEvent.click(screen.getByRole("option", { name: gptModel.label }));
 
-    expect(m.saveSettings).toHaveBeenCalledWith({ model: "gpt-5.6-sol", provider: "openai" });
+    expect(m.saveSettings).toHaveBeenCalledWith({ model: gptModel.id, provider: "openai" });
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
     });
     expect(useStore.getState().settings).toMatchObject({
-      model: "gpt-5.6-sol",
+      model: gptModel.id,
       provider: "openai",
     });
   });
 
-  it("signs in with ChatGPT and refreshes the live model catalogue", async () => {
+  it("scopes the default picker to backend MRU when no local account preference exists", () => {
+    const model = MODELS.find((candidate) => candidate.provider === "openai")!;
+    const older = openAIAccount({ lastUsedAt: 100 });
+    const newer = openAIAccount({
+      id: "00000000-0000-4000-8000-000000000002",
+      accountLabel: "recent@chatgpt.test",
+      lastUsedAt: 200,
+    });
+    useStore.setState({
+      openAIAccounts: [older, newer],
+      lastOpenAIAccountProfileId: null,
+      openAIModels: [model],
+      openAIModelCatalogs: {
+        [older.id]: { status: "ready", models: [model], error: null },
+        [newer.id]: { status: "ready", models: [model], error: null },
+      },
+    });
+    renderPanel({ provider: "openai", model: model.id });
+
+    expect(screen.getByText(/Models for recent@chatgpt\.test/)).toBeInTheDocument();
+  });
+
+  it("adds a ChatGPT profile and refreshes only its live model catalogue", async () => {
     renderPanel();
 
-    fireEvent.click(screen.getByRole("button", { name: "Sign in with ChatGPT" }));
+    fireEvent.click(screen.getByRole("button", { name: "+ Add account" }));
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
     });
 
-    expect(m.startOpenaiOauthLogin).toHaveBeenCalledTimes(1);
-    expect(m.openaiModels).toHaveBeenCalledTimes(1);
-    expect(useStore.getState().openAIAuthStatus).toMatchObject({
-      signedIn: true,
-      account: "you@openai.com",
-    });
+    expect(m.startOpenAIAccountLogin).toHaveBeenCalledTimes(1);
+    expect(m.openaiModels).toHaveBeenCalledWith("00000000-0000-4000-8000-000000000001");
+    expect(useStore.getState().openAIAccounts).toEqual([openAIAccount()]);
     expect(useStore.getState().openAIModels.map((model) => model.id)).toEqual(["gpt-live"]);
+  });
+
+  it("shows per-account state, reconnects a tombstone in place, and never renders its UUID", async () => {
+    const removed = openAIAccount({
+      accountLabel: "returning@chatgpt.test",
+      state: "removed",
+      expiresAt: null,
+    });
+    useStore.setState({
+      openAIAuthStatus: {
+        signedIn: false,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: true,
+      },
+      openAIAccounts: [removed],
+    });
+    const connected = { ...removed, state: "connected" as const, updatedAt: 2 };
+    m.reconnectOpenAIAccount.mockResolvedValue({
+      status: "reconnected",
+      account: connected,
+    });
+    renderPanel();
+
+    expect(screen.getAllByText("returning@chatgpt.test").length).toBeGreaterThan(0);
+    expect(screen.getByText(/Removed .* history retained/)).toBeInTheDocument();
+    expect(screen.queryByText(removed.id)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Reconnect returning@chatgpt.test" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(m.reconnectOpenAIAccount).toHaveBeenCalledWith(removed.id);
+    expect(useStore.getState().openAIAccounts).toEqual([connected]);
+  });
+
+  it("offers a mismatched reconnect as a separate account without changing the original", async () => {
+    const original = openAIAccount({
+      accountLabel: "original@chatgpt.test",
+      state: "reconnect_required",
+      expiresAt: null,
+    });
+    const separate = openAIAccount({
+      id: "00000000-0000-4000-8000-000000000002",
+      accountLabel: "different@chatgpt.test",
+    });
+    useStore.setState({
+      openAIAuthStatus: {
+        signedIn: false,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: true,
+      },
+      openAIAccounts: [original],
+    });
+    m.reconnectOpenAIAccount.mockResolvedValue({
+      status: "identity_mismatch",
+      message: "That sign-in belongs to a different ChatGPT account.",
+    });
+    m.startOpenAIAccountLogin.mockResolvedValue(separate);
+    renderPanel();
+
+    fireEvent.click(screen.getByRole("button", { name: "Reconnect original@chatgpt.test" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const notice = screen.getByRole("alert");
+    expect(notice).toHaveTextContent("Different ChatGPT account detected");
+    expect(notice).toHaveTextContent("The original profile (original@chatgpt.test) was unchanged.");
+    expect(useStore.getState().openAIAccounts).toEqual([original]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Add as separate account" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(m.startOpenAIAccountLogin).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().openAIAccounts).toEqual([separate, original]);
+    expect(useStore.getState().openAIReconnectMismatch).toBeNull();
+  });
+
+  it("disambiguates missing labels with stable ordinals and never renders profile ids", () => {
+    const first = openAIAccount({ accountLabel: null, createdAt: 10 });
+    const second = openAIAccount({
+      id: "00000000-0000-4000-8000-000000000002",
+      accountLabel: null,
+      createdAt: 20,
+    });
+    useStore.setState({ openAIAccounts: [second, first] });
+    const { container } = renderPanel();
+
+    expect(screen.getAllByText("ChatGPT account 1").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("ChatGPT account 2").length).toBeGreaterThan(0);
+    expect(container).not.toHaveTextContent(first.id);
+    expect(container).not.toHaveTextContent(second.id);
+  });
+
+  it("does not offer stale model rows when a profile catalogue is in error", () => {
+    const account = openAIAccount();
+    const stale = {
+      id: "gpt-stale",
+      label: "GPT Stale",
+      provider: "openai" as const,
+      reasoningEfforts: ["high" as const],
+      defaultReasoningEffort: "high" as const,
+    };
+    useStore.setState({
+      openAIAccounts: [account],
+      openAIModels: [stale],
+      openAIModelCatalogs: {
+        [account.id]: { status: "error", models: [stale], error: "catalogue offline" },
+      },
+    });
+    renderPanel({ provider: "openai", model: stale.id, reasoningEffort: "high" });
+
+    const picker = screen.getByLabelText("OpenAI model for new sessions");
+    expect(picker).toBeDisabled();
+    expect(screen.getByText("catalogue offline")).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "GPT Stale" })).not.toBeInTheDocument();
+    expect(screen.getByText("Choose a GPT model to configure reasoning.")).toBeInTheDocument();
+  });
+
+  it("keeps removal available when connection capability is off and retains the tombstone", async () => {
+    const connected = openAIAccount();
+    const removed = { ...connected, state: "removed" as const, expiresAt: null, updatedAt: 2 };
+    useStore.setState({
+      openAIAuthStatus: {
+        signedIn: false,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: false,
+        unavailableReason: "Disabled in this build",
+      },
+      openAIAccounts: [connected],
+    });
+    m.listOpenAIAccounts.mockResolvedValue([removed]);
+    renderPanel();
+
+    expect(screen.getByText("New ChatGPT connections are disabled")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "+ Add account" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Remove you@openai.com" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm remove you@openai.com" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(m.removeOpenAIAccount).toHaveBeenCalledWith(connected.id);
+    expect(useStore.getState().openAIAccounts).toEqual([removed]);
+    expect(screen.getByText(/Removed .* history retained/)).toBeInTheDocument();
   });
 
   it("shows and persists only supported reasoning levels for the selected OpenAI model", async () => {

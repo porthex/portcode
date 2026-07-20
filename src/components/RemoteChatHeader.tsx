@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useStore } from "../store/store";
-import { workspaceLabel } from "../lib/sessionFormat";
+import { remoteAccountLabel, workspaceLabel } from "../lib/sessionFormat";
 import { RemoteSessionSwitcher } from "./RemoteSessionSwitcher";
 
 // Header for the remote chat view (design_handoff_mobile_remote, screen 5): a back
@@ -9,11 +9,13 @@ import { RemoteSessionSwitcher } from "./RemoteSessionSwitcher";
 // icon. Owns the bottom-sheet switcher's open state. Render inside a `relative`
 // container so the switcher's scrim/sheet position against the chat view.
 export function RemoteChatHeader() {
+  const sessions = useStore((s) => s.sessions);
   const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
   const closeRemoteSession = useStore((s) => s.closeRemoteSession);
   const [switcherOpen, setSwitcherOpen] = useState(false);
 
   const title = session?.title ?? "New chat";
+  const accountLabel = remoteAccountLabel(session?.accountProfileId, sessions);
 
   return (
     <>
@@ -52,6 +54,7 @@ export function RemoteChatHeader() {
               <span className="truncate font-mono text-[10px] tracking-[0.5px] text-[#21899a]">
                 your desktop · <span aria-hidden="true">⎇</span>{" "}
                 {workspaceLabel(session?.workspace)}
+                {accountLabel && <> · {accountLabel}</>}
               </span>
             </div>
           </button>

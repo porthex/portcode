@@ -53,7 +53,24 @@ beforeEach(() => {
   m.getSettings.mockResolvedValue(DEFAULT_SETTINGS);
   m.listSessions.mockResolvedValue([]);
   m.getMessages.mockResolvedValue([]);
-  m.createSession.mockResolvedValue(undefined);
+  m.createSession.mockImplementation(
+    async (
+      id,
+      title = "New chat",
+      workspace = null,
+      model = DEFAULT_SETTINGS.model,
+      accountProfileId = null,
+    ) => ({
+      id,
+      title,
+      workspace,
+      branch: null,
+      model,
+      accountProfileId,
+      createdAt: 1,
+      updatedAt: 1,
+    }),
+  );
   m.deleteSession.mockResolvedValue(undefined);
   m.updateSessionModel.mockResolvedValue(undefined);
   m.saveSettings.mockImplementation(async (s) => ({ ...DEFAULT_SETTINGS, ...s }));
@@ -107,6 +124,51 @@ describe("visibility", () => {
     expect(commandButtons()).toHaveLength(FIXED_COMMANDS + ANTHROPIC_MODELS.length);
     expect(screen.getByText("Model: Claude Opus 4.8")).toBeInTheDocument();
     expect(screen.queryByText(/^Model: GPT/)).not.toBeInTheDocument();
+  });
+
+  it("offers only the pinned ChatGPT account's models for an account-owned chat", () => {
+    const account = {
+      id: "00000000-0000-4000-8000-000000000001",
+      accountLabel: "one@chatgpt.test",
+      tier: "ChatGPT Plus",
+      expiresAt: null,
+      state: "connected" as const,
+      createdAt: 1,
+      updatedAt: 1,
+      lastUsedAt: null,
+    };
+    const model = {
+      id: "gpt-live",
+      label: "GPT Live",
+      provider: "openai" as const,
+      reasoningEfforts: ["high" as const],
+      defaultReasoningEffort: "high" as const,
+    };
+    useStore.setState({
+      showPalette: true,
+      sessions: [
+        {
+          id: "a",
+          title: "Pinned chat",
+          workspace: null,
+          model: model.id,
+          accountProfileId: account.id,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+      activeId: "a",
+      openAIAccounts: [account],
+      openAIModels: [model],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: [model], error: null },
+      },
+    });
+    render(<CommandPalette />);
+
+    expect(screen.getByText("Model: GPT Live")).toBeInTheDocument();
+    expect(screen.queryByText(/^Model: Claude/)).not.toBeInTheDocument();
+    expect(commandButtons()).toHaveLength(FIXED_COMMANDS + 1);
   });
 
   it("gives the search input an accessible name (not just a placeholder)", () => {
@@ -306,6 +368,58 @@ describe("running commands", () => {
     expect(useStore.getState().showPalette).toBe(false);
   });
 
+  it("New chat resolves the guarded OpenAI default to its preferred account", async () => {
+    const accountProfileId = "00000000-0000-4000-8000-000000000001";
+    const model = {
+      id: "gpt-live",
+      label: "GPT Live",
+      provider: "openai" as const,
+      reasoningEfforts: ["high" as const],
+      defaultReasoningEffort: "high" as const,
+    };
+    useStore.setState({
+      showPalette: true,
+      settings: { ...DEFAULT_SETTINGS, provider: "openai", model: model.id },
+      openAIAuthStatus: {
+        signedIn: true,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: true,
+      },
+      openAIAccounts: [
+        {
+          id: accountProfileId,
+          accountLabel: "one@chatgpt.test",
+          tier: "ChatGPT Plus",
+          expiresAt: null,
+          state: "connected",
+          createdAt: 1,
+          updatedAt: 1,
+          lastUsedAt: 1,
+        },
+      ],
+      openAIModelCatalogs: {
+        [accountProfileId]: { status: "ready", models: [model], error: null },
+      },
+      openAIModels: [model],
+      lastOpenAIAccountProfileId: accountProfileId,
+    });
+    render(<CommandPalette />);
+
+    fireEvent.keyDown(input(), { key: "Enter" });
+
+    await vi.waitFor(() => expect(m.createSession).toHaveBeenCalledOnce());
+    expect(m.createSession).toHaveBeenCalledWith(
+      expect.any(String),
+      "New chat",
+      null,
+      model.id,
+      accountProfileId,
+    );
+    expect(useStore.getState().showPalette).toBe(false);
+  });
+
   it("Enter on a model command persists the model via updateSettings", async () => {
     open();
     render(<CommandPalette />);
@@ -314,7 +428,10 @@ describe("running commands", () => {
     fireEvent.keyDown(input(), { key: "Enter" });
 
     await vi.waitFor(() =>
-      expect(m.saveSettings).toHaveBeenCalledWith({ model: "claude-haiku-4-5-20251001" }),
+      expect(m.saveSettings).toHaveBeenCalledWith({
+        model: "claude-haiku-4-5-20251001",
+        reasoningEffort: "medium",
+      }),
     );
     expect(useStore.getState().showPalette).toBe(false);
   });

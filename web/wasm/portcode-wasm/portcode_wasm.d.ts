@@ -33,6 +33,11 @@ export interface SessionRow {
      * to the global default model when it is None.
      */
     model?: string | null;
+    /**
+     * Opaque local ChatGPT account profile pinned to this session. Legacy and
+     * non-OpenAI sessions remain unpinned, and older peers can omit the field.
+     */
+    accountProfileId?: string;
     createdAt: number;
     updatedAt: number;
 }
@@ -54,7 +59,7 @@ export type StreamEvent = { type: "turn_start"; messageId: string; turnId?: stri
 /**
  * Everything that crosses the encrypted channel, in both directions.
  */
-export type SyncFrame = { t: "hello"; device_id: string; cursors: Cursor[] } | { t: "session_list"; sessions: SessionRow[] } | { t: "session_created"; request_id: string; session: SessionRow } | { t: "message_delta"; session_id: string; messages: MessageRow[] } | { t: "message_page"; session_id: string; messages: MessageRow[]; has_more: boolean } | { t: "live"; session_id: string; event: StreamEvent } | { t: "command"; command: RemoteCommand } | { t: "ack"; session_id: string; seq: number } | { t: "pairing_reject"; reason: string | null };
+export type SyncFrame = { t: "hello"; device_id: string; cursors: Cursor[] } | { t: "session_list"; sessions: SessionRow[] } | { t: "session_created"; request_id: string; session: SessionRow } | { t: "command_rejected"; request_id?: string; code?: CommandRejectionCode; message?: string } | { t: "message_delta"; session_id: string; messages: MessageRow[] } | { t: "message_page"; session_id: string; messages: MessageRow[]; has_more: boolean } | { t: "live"; session_id: string; event: StreamEvent } | { t: "command"; command: RemoteCommand } | { t: "ack"; session_id: string; seq: number } | { t: "pairing_reject"; reason: string | null };
 
 /**
  * Git-shaped status used by the immutable, bounded changed-file summary.
@@ -73,6 +78,12 @@ export type TurnChangeCertainty = "exact" | "observed" | "ambiguous" | "unavaila
  */
 export interface TurnReceipt {
     turnId: string;
+    /**
+     * Opaque local ChatGPT account profile used for this turn. This is never a
+     * remote account identifier and is optional so receipts written by older
+     * Portcode versions remain readable.
+     */
+    accountProfileId?: string;
     status: TurnStatus;
     stopReason?: string;
     startedAt: number;
@@ -139,6 +150,16 @@ export interface MessageRow {
      */
     receipt?: TurnReceipt;
 }
+
+/**
+ * Stable, non-sensitive reason a desktop rejected a correlated remote command.
+ *
+ * The phone should use `code` for behavior and may display the accompanying
+ * bounded public message. `Unknown` keeps newer desktop codes decodable by an
+ * older phone instead of turning an application-level rejection into a protocol
+ * failure and reconnect loop.
+ */
+export type CommandRejectionCode = "open_ai_account_selection_required" | "invalid_desktop_configuration" | "desktop_unavailable" | "invalid_request" | "unknown";
 
 /**
  * Terminal state of one root agent turn. `Interrupted` is persisted when a

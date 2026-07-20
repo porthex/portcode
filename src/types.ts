@@ -125,6 +125,13 @@ export interface Session {
   branch?: string | null;
   /** The model this chat uses. Defaults to the last-used `settings.model`. */
   model: string;
+  /**
+   * Opaque, local identifier for the ChatGPT subscription profile permanently
+   * pinned to this conversation. It is deliberately nullable so databases from
+   * before multi-account support can be migrated without guessing ownership.
+   * The remote ChatGPT account id and all credentials stay native-only.
+   */
+  accountProfileId?: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -523,6 +530,68 @@ export interface OpenAIAuthStatus {
   unavailableReason?: string | null;
 }
 
+/** Display-safe connection state for one native ChatGPT credential profile. */
+export type OpenAIAccountState = "connected" | "reconnect_required" | "unavailable" | "removed";
+
+/**
+ * Display-only ChatGPT account data returned across IPC. `id` is an opaque local
+ * UUID; it is never the provider's remote account identifier. All optional native
+ * metadata is represented as `null`, matching serde's `Option` encoding.
+ */
+export interface OpenAIAccountSummary {
+  id: string;
+  accountLabel: string | null;
+  tier: string | null;
+  expiresAt: number | null;
+  state: OpenAIAccountState;
+  createdAt: number;
+  updatedAt: number;
+  lastUsedAt: number | null;
+}
+
+/** Result of reconnecting one exact saved profile. An identity mismatch is a
+ * safe, non-mutating outcome: native credentials for the original profile remain
+ * untouched and the UI may offer a separate add-account flow. */
+export type OpenAIReconnectOutcome =
+  | { status: "reconnected"; account: OpenAIAccountSummary }
+  | { status: "identity_mismatch"; message: string };
+
+/** Display-safe recovery context retained after a reconnect identity mismatch. */
+export interface OpenAIReconnectMismatch {
+  accountProfileId: string;
+  message: string;
+}
+
+/** A profile-scoped model request has an explicit lifecycle and never silently
+ * converts an empty/failed response into a valid-looking fallback catalogue. */
+export interface OpenAIModelCatalogState {
+  status: "idle" | "loading" | "ready" | "error";
+  models: ModelInfo[];
+  error: string | null;
+}
+
+/** Display-safe account label. Duplicate or absent provider labels gain a stable
+ * local ordinal; the opaque profile UUID is used only for deterministic ordering
+ * and is never rendered. */
+export function openAIAccountLabel(
+  account: OpenAIAccountSummary | undefined,
+  accounts: OpenAIAccountSummary[] = account ? [account] : [],
+): string {
+  if (!account) return "ChatGPT account";
+  const providerLabel = account.accountLabel?.trim();
+  const base = providerLabel || "ChatGPT account";
+  const peers = accounts.filter((candidate) => {
+    const candidateBase = candidate.accountLabel?.trim() || "ChatGPT account";
+    return candidateBase.localeCompare(base, undefined, { sensitivity: "accent" }) === 0;
+  });
+  if (providerLabel && peers.length <= 1) return base;
+  const ordered = (peers.length > 0 ? [...peers] : [account]).sort(
+    (left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id),
+  );
+  const ordinal = Math.max(1, ordered.findIndex((candidate) => candidate.id === account.id) + 1);
+  return `${base} ${ordinal}`;
+}
+
 /** Row returned by the native `openai_models` catalogue command. */
 export interface OpenAIModelCatalogRow {
   id: string;
@@ -588,8 +657,8 @@ export const OPENAI_FALLBACK_MODELS: ModelInfo[] = [
   },
 ];
 
-/** Prefer a non-empty live subscription catalogue; use fallbacks only offline. */
-export function mergeOpenAIModels(rows: OpenAIModelCatalogRow[] = []): ModelInfo[] {
+/** Normalize one account's live catalogue without inventing a successful result. */
+export function normalizeOpenAIModels(rows: OpenAIModelCatalogRow[] = []): ModelInfo[] {
   const normalized = rows
     .filter((row) => row.id.trim() !== "")
     .map<ModelInfo>((row) => ({
@@ -600,6 +669,12 @@ export function mergeOpenAIModels(rows: OpenAIModelCatalogRow[] = []): ModelInfo
       defaultReasoningEffort: row.defaultReasoningEffort || "medium",
     }));
   const live = [...new Map(normalized.map((model) => [model.id, model])).values()];
+  return live;
+}
+
+/** Prefer a non-empty live subscription catalogue; use fallbacks only offline. */
+export function mergeOpenAIModels(rows: OpenAIModelCatalogRow[] = []): ModelInfo[] {
+  const live = normalizeOpenAIModels(rows);
   return live.length > 0 ? live : OPENAI_FALLBACK_MODELS;
 }
 
@@ -864,6 +939,18 @@ export interface MessageRow {
 export type SyncFrame =
   | { t: "session_list"; sessions: Session[] }
   | { t: "session_created"; request_id: string; session: Session }
+  | {
+      t: "command_rejected";
+      request_id?: string | null;
+      code?:
+        | "open_ai_account_selection_required"
+        | "invalid_desktop_configuration"
+        | "desktop_unavailable"
+        | "invalid_request"
+        | "unknown"
+        | (string & {});
+      message?: string;
+    }
   | { t: "message_delta"; session_id: string; messages: MessageRow[] }
   // An OLDER page of one session's history (scroll-up pagination), answering a
   // `fetch_messages` command. `messages` are the rows before the requested cursor,

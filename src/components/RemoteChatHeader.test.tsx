@@ -38,6 +38,24 @@ describe("RemoteChatHeader", () => {
     expect(screen.getByText(/portcode/)).toBeInTheDocument();
   });
 
+  it("attributes a pinned chat with a stable display-only account ordinal", () => {
+    const firstProfile = "00000000-0000-4000-8000-000000000001";
+    const secondProfile = "00000000-0000-4000-8000-000000000002";
+    useStore.setState({
+      sessions: [
+        session({ id: "a", model: "gpt-live", accountProfileId: secondProfile }),
+        session({ id: "b", model: "gpt-live", accountProfileId: firstProfile }),
+      ],
+      activeId: "a",
+    });
+
+    const { container } = render(<RemoteChatHeader />);
+
+    expect(screen.getByText(/ChatGPT account 2/)).toBeInTheDocument();
+    expect(container).not.toHaveTextContent(firstProfile);
+    expect(container).not.toHaveTextContent(secondProfile);
+  });
+
   it("falls back to 'New chat' with no active session", () => {
     useStore.setState({ sessions: [], activeId: null });
     render(<RemoteChatHeader />);

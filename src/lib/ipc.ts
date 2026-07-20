@@ -12,8 +12,10 @@ import type {
   GitReviewScope,
   Message,
   OAuthStatus,
+  OpenAIAccountSummary,
   OpenAIAuthStatus,
   OpenAIModelCatalogRow,
+  OpenAIReconnectOutcome,
   PairingPayload,
   PairingRequest,
   PlanUsageSnapshot,
@@ -140,12 +142,26 @@ export async function oauthLogout(): Promise<void> {
 
 // ── ChatGPT subscription OAuth + live Codex model catalogue ─────────────────
 
-export async function startOpenaiOauthLogin(): Promise<OpenAIAuthStatus> {
-  if (isTauri()) {
-    const { core } = await tauri();
-    return core.invoke<OpenAIAuthStatus>("start_openai_oauth_login");
-  }
-  return mock.startOpenaiOauthLogin();
+/** Runtime allowlist for the only ChatGPT account fields permitted to cross into
+ * React state. TypeScript annotations do not erase accidental native/mock extras,
+ * so clone explicitly at this boundary instead of retaining the returned object. */
+function publicOpenAIAccountSummary(account: OpenAIAccountSummary): OpenAIAccountSummary {
+  return {
+    id: account.id,
+    accountLabel: account.accountLabel,
+    tier: account.tier,
+    expiresAt: account.expiresAt,
+    state: account.state,
+    createdAt: account.createdAt,
+    updatedAt: account.updatedAt,
+    lastUsedAt: account.lastUsedAt,
+  };
+}
+
+function publicOpenAIReconnectOutcome(outcome: OpenAIReconnectOutcome): OpenAIReconnectOutcome {
+  return outcome.status === "reconnected"
+    ? { status: "reconnected", account: publicOpenAIAccountSummary(outcome.account) }
+    : { status: "identity_mismatch", message: outcome.message };
 }
 
 export async function openaiOauthStatus(): Promise<OpenAIAuthStatus> {
@@ -156,30 +172,65 @@ export async function openaiOauthStatus(): Promise<OpenAIAuthStatus> {
   return mock.openaiOauthStatus();
 }
 
-export async function openaiOauthLogout(): Promise<void> {
-  if (isTauri()) {
-    const { core } = await tauri();
-    await core.invoke("openai_oauth_logout");
-    return;
-  }
-  return mock.openaiOauthLogout();
+/** Display-safe summaries for every locally stored ChatGPT credential profile. */
+export async function listOpenAIAccounts(): Promise<OpenAIAccountSummary[]> {
+  const accounts = isTauri()
+    ? await (await tauri()).core.invoke<OpenAIAccountSummary[]>("list_openai_accounts")
+    : await mock.listOpenAIAccounts();
+  return accounts.map(publicOpenAIAccountSummary);
 }
 
-export async function openaiModels(): Promise<OpenAIModelCatalogRow[]> {
+/** Start a globally serialized browser login and add/deduplicate one profile. */
+export async function startOpenAIAccountLogin(): Promise<OpenAIAccountSummary> {
+  const account = isTauri()
+    ? await (await tauri()).core.invoke<OpenAIAccountSummary>("start_openai_account_login")
+    : await mock.startOpenAIAccountLogin();
+  return publicOpenAIAccountSummary(account);
+}
+
+export async function reconnectOpenAIAccount(
+  accountProfileId: string,
+): Promise<OpenAIReconnectOutcome> {
+  const outcome = isTauri()
+    ? await (
+        await tauri()
+      ).core.invoke<OpenAIReconnectOutcome>("reconnect_openai_account", {
+        accountProfileId,
+      })
+    : await mock.reconnectOpenAIAccount(accountProfileId);
+  return publicOpenAIReconnectOutcome(outcome);
+}
+
+export async function removeOpenAIAccount(accountProfileId: string): Promise<void> {
   if (isTauri()) {
     const { core } = await tauri();
-    return core.invoke<OpenAIModelCatalogRow[]>("openai_models");
+    await core.invoke("remove_openai_account", { accountProfileId });
+    return;
   }
-  return mock.openaiModels();
+  return mock.removeOpenAIAccount(accountProfileId);
+}
+
+export async function openaiModels(accountProfileId: string): Promise<OpenAIModelCatalogRow[]> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<OpenAIModelCatalogRow[]>("openai_models", { accountProfileId });
+  }
+  return mock.openaiModels(accountProfileId);
 }
 
 /** Live included-plan quota windows for one signed-in subscription provider. */
-export async function getPlanUsage(provider: ProviderId): Promise<PlanUsageSnapshot> {
+export async function getPlanUsage(
+  provider: ProviderId,
+  accountProfileId?: string | null,
+): Promise<PlanUsageSnapshot> {
   if (isTauri()) {
     const { core } = await tauri();
-    return core.invoke<PlanUsageSnapshot>("get_plan_usage", { provider });
+    return core.invoke<PlanUsageSnapshot>("get_plan_usage", {
+      provider,
+      accountProfileId: accountProfileId ?? null,
+    });
   }
-  return mock.getPlanUsage(provider);
+  return mock.getPlanUsage(provider, accountProfileId);
 }
 
 // ── Auto-update (desktop only) ─────────────────────────────────────────────────
@@ -435,7 +486,7 @@ export async function listSessions(): Promise<Session[]> {
     const { core } = await tauri();
     return core.invoke<Session[]>("list_sessions");
   }
-  return [];
+  return mock.listSessions();
 }
 
 export async function createSession(
@@ -443,11 +494,34 @@ export async function createSession(
   title?: string,
   workspace?: string | null,
   model?: string,
-): Promise<void> {
+  accountProfileId?: string | null,
+): Promise<Session> {
   if (isTauri()) {
     const { core } = await tauri();
-    await core.invoke("create_session", { id, title, workspace, model });
+    return core.invoke<Session>("create_session", {
+      id,
+      title,
+      workspace,
+      model,
+      accountProfileId: accountProfileId ?? null,
+    });
   }
+  return mock.createSession(id, title, workspace, model, accountProfileId);
+}
+
+/** Pin a migrated OpenAI session once. Native code enforces the NULL-only CAS. */
+export async function pinSessionOpenAIAccount(
+  sessionId: string,
+  accountProfileId: string,
+): Promise<Session> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<Session>("pin_session_openai_account", {
+      sessionId,
+      accountProfileId,
+    });
+  }
+  return mock.pinSessionOpenAIAccount(sessionId, accountProfileId);
 }
 
 export async function renameSession(id: string, title: string): Promise<void> {
@@ -685,7 +759,6 @@ export interface AgentRunHandle {
 export async function runAgent(
   sessionId: string,
   text: string,
-  model: string,
   onEvent: (e: StreamEvent) => void,
 ): Promise<AgentRunHandle> {
   if (isTauri()) {
@@ -695,7 +768,7 @@ export async function runAgent(
       onEvent(ev.payload),
     );
     try {
-      await core.invoke("run_agent", { sessionId, text, model });
+      await core.invoke("run_agent", { sessionId, text });
     } catch (error) {
       // Listener installation precedes the invoke so no first event is missed. If
       // reservation/invocation is rejected, tear it back down immediately.
@@ -709,7 +782,7 @@ export async function runAgent(
       dispose: unlisten,
     };
   }
-  return mock.runAgent(sessionId, text, model, onEvent);
+  return mock.runAgent(sessionId, text, onEvent);
 }
 
 /**
@@ -877,6 +950,9 @@ const mock = (() => {
     available: true,
     unavailableReason: null,
   };
+  let openaiAccountSequence = 0;
+  let openaiAccounts: OpenAIAccountSummary[] = [];
+  const mockSessions = new Map<string, Session>();
   const openaiCatalogue: OpenAIModelCatalogRow[] = [
     {
       id: "gpt-5.6-sol",
@@ -934,39 +1010,90 @@ const mock = (() => {
     async oauthLogout() {
       oauth = { signedIn: false, expiresAt: null, account: null, tier: null };
     },
-    async startOpenaiOauthLogin() {
-      openaiOauth = {
-        signedIn: true,
-        expiresAt: Math.floor(Date.now() / 1000) + 8 * 60 * 60,
-        account: "preview@chatgpt.local",
-        tier: "ChatGPT Plus",
-        available: true,
-        unavailableReason: null,
-      };
-      return { ...openaiOauth };
-    },
     async openaiOauthStatus() {
       return { ...openaiOauth };
     },
-    async openaiOauthLogout() {
+    async listOpenAIAccounts() {
+      return openaiAccounts.map((account) => ({ ...account }));
+    },
+    async startOpenAIAccountLogin() {
+      openaiAccountSequence += 1;
+      const timestamp = Math.floor(Date.now() / 1000);
+      const suffix = openaiAccountSequence === 1 ? "" : `+${openaiAccountSequence}`;
+      const account: OpenAIAccountSummary = {
+        id: `00000000-0000-4000-8000-${String(openaiAccountSequence).padStart(12, "0")}`,
+        accountLabel: `preview${suffix}@chatgpt.local`,
+        tier: "ChatGPT Plus",
+        expiresAt: timestamp + 8 * 60 * 60,
+        state: "connected",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        lastUsedAt: null,
+      };
+      openaiAccounts = [...openaiAccounts, account];
       openaiOauth = {
-        signedIn: false,
-        expiresAt: null,
-        account: null,
-        tier: null,
+        signedIn: true,
+        expiresAt: account.expiresAt,
+        account: account.accountLabel,
+        tier: account.tier,
         available: true,
         unavailableReason: null,
       };
+      return { ...account };
     },
-    async openaiModels() {
+    async reconnectOpenAIAccount(accountProfileId: string) {
+      const index = openaiAccounts.findIndex((account) => account.id === accountProfileId);
+      if (index < 0) throw new Error("ChatGPT account profile was not found.");
+      const timestamp = Math.floor(Date.now() / 1000);
+      const account: OpenAIAccountSummary = {
+        ...openaiAccounts[index],
+        expiresAt: timestamp + 8 * 60 * 60,
+        state: "connected",
+        updatedAt: timestamp,
+      };
+      openaiAccounts = openaiAccounts.map((item, itemIndex) =>
+        itemIndex === index ? account : item,
+      );
+      return { status: "reconnected" as const, account: { ...account } };
+    },
+    async removeOpenAIAccount(accountProfileId: string) {
+      const timestamp = Math.floor(Date.now() / 1000);
+      openaiAccounts = openaiAccounts.map((account) =>
+        account.id === accountProfileId
+          ? { ...account, state: "removed" as const, expiresAt: null, updatedAt: timestamp }
+          : account,
+      );
+      if (!openaiAccounts.some((account) => account.state === "connected")) {
+        openaiOauth = {
+          signedIn: false,
+          expiresAt: null,
+          account: null,
+          tier: null,
+          available: true,
+          unavailableReason: null,
+        };
+      }
+    },
+    async openaiModels(accountProfileId: string) {
+      const account = openaiAccounts.find((item) => item.id === accountProfileId);
+      if (!account || account.state !== "connected") {
+        throw new Error("Reconnect this ChatGPT account before loading models.");
+      }
       return openaiCatalogue.map((model) => ({
         ...model,
         reasoningEfforts: [...model.reasoningEfforts],
       }));
     },
-    async getPlanUsage(provider: ProviderId): Promise<PlanUsageSnapshot> {
+    async getPlanUsage(
+      provider: ProviderId,
+      accountProfileId?: string | null,
+    ): Promise<PlanUsageSnapshot> {
       const now = Math.floor(Date.now() / 1000);
-      const signedIn = provider === "anthropic" ? oauth.signedIn : openaiOauth.signedIn;
+      const openAIAccount = accountProfileId
+        ? openaiAccounts.find((account) => account.id === accountProfileId)
+        : undefined;
+      const signedIn =
+        provider === "anthropic" ? oauth.signedIn : openAIAccount?.state === "connected";
       if (!signedIn)
         throw new Error(`Sign in with ${provider === "anthropic" ? "Claude" : "ChatGPT"} first.`);
       return {
@@ -974,7 +1101,7 @@ const mock = (() => {
         plan:
           provider === "anthropic"
             ? (oauth.tier?.replace(/^Claude\s+/i, "") ?? null)
-            : (openaiOauth.tier?.replace(/^ChatGPT\s+/i, "") ?? null),
+            : (openAIAccount?.tier?.replace(/^ChatGPT\s+/i, "") ?? null),
         updatedAt: now,
         windows: [
           {
@@ -993,6 +1120,56 @@ const mock = (() => {
           },
         ],
       };
+    },
+    async listSessions() {
+      return [...mockSessions.values()].map((session) => ({ ...session }));
+    },
+    async createSession(
+      id: string,
+      title = "New chat",
+      workspace: string | null = null,
+      model = "claude-opus-4-8",
+      accountProfileId?: string | null,
+    ): Promise<Session> {
+      const timestamp = Date.now();
+      if (accountProfileId) {
+        const account = openaiAccounts.find((candidate) => candidate.id === accountProfileId);
+        if (!account || account.state !== "connected") {
+          throw new Error("Choose a connected ChatGPT account.");
+        }
+        const usedAt = Math.floor(timestamp / 1000);
+        openaiAccounts = openaiAccounts.map((candidate) =>
+          candidate.id === accountProfileId
+            ? { ...candidate, lastUsedAt: usedAt, updatedAt: usedAt }
+            : candidate,
+        );
+      }
+      const session: Session = {
+        id,
+        title,
+        workspace,
+        branch: null,
+        model,
+        accountProfileId: accountProfileId ?? null,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      mockSessions.set(id, session);
+      return { ...session };
+    },
+    async pinSessionOpenAIAccount(sessionId: string, accountProfileId: string): Promise<Session> {
+      const session = mockSessions.get(sessionId);
+      if (!session) throw new Error("Session was not found.");
+      if (session.accountProfileId) {
+        throw new Error("This session is already pinned to a ChatGPT account.");
+      }
+      const account = openaiAccounts.find((candidate) => candidate.id === accountProfileId);
+      if (!account || account.state !== "connected") {
+        throw new Error("Choose a connected ChatGPT account.");
+      }
+      const pinned = { ...session, accountProfileId };
+      mockSessions.set(sessionId, pinned);
+      return { ...pinned };
     },
     // Auto-update — inert in the preview: never offer an update, never relaunch,
     // never emit progress/finished. The desktop preview shows no update banner.
@@ -1210,12 +1387,7 @@ const mock = (() => {
       }
       throw new Error("Historical turn patches are unavailable in preview mode.");
     },
-    async runAgent(
-      _sessionId: string,
-      text: string,
-      _model: string,
-      onEvent: (e: StreamEvent) => void,
-    ) {
+    async runAgent(_sessionId: string, text: string, onEvent: (e: StreamEvent) => void) {
       let cancelled = false;
       (async () => {
         await delay(120);
