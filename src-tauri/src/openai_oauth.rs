@@ -349,9 +349,14 @@ pub fn authenticated_request(
     }
     let account_id = tokens.account_id.as_deref().map(str::trim);
     validate_asserted_account_identity(None, account_id)?;
+    let mut account_header =
+        reqwest::header::HeaderValue::try_from(account_id.expect("validated above")).map_err(
+            |_| "The selected ChatGPT account identity is not a valid header value.".to_string(),
+        )?;
+    account_header.set_sensitive(true);
     let mut request = request
-        .header("authorization", format!("Bearer {access_token}"))
-        .header("ChatGPT-Account-ID", account_id.expect("validated above"))
+        .bearer_auth(access_token)
+        .header("ChatGPT-Account-ID", account_header)
         .header("originator", "portcode")
         .header(
             "user-agent",
@@ -904,6 +909,8 @@ mod tests {
         .unwrap();
         assert_eq!(request.headers()["authorization"], "Bearer access-a");
         assert_eq!(request.headers()["ChatGPT-Account-ID"], "acct-a");
+        assert!(request.headers()["authorization"].is_sensitive());
+        assert!(request.headers()["ChatGPT-Account-ID"].is_sensitive());
         assert_eq!(request.headers()["originator"], "portcode");
         assert_eq!(request.headers()["X-OpenAI-Fedramp"], "true");
 

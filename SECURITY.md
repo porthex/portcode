@@ -77,6 +77,48 @@ that demonstrates breaking one of these is **in scope**:
 - Vulnerabilities in third-party dependencies with no demonstrated impact on
   Portcode — please report those upstream (we track them via Dependabot).
 
+## Enforced release boundaries
+
+The executable controls behind this policy are specified and tested in the
+[`Release security baseline`](docs/RELEASE_SECURITY_BASELINE_PLAN.md). The most
+important guarantees and limits are:
+
+- **Protected actions cannot inherit a remembered allow.** `run_command` is a
+  protected Shell action and requires one approval per call. Auto, Bypass,
+  legacy `allow`, wildcard rules, command-prefix rules, and historical shell
+  rules cannot lower it below Ask. Plan mode and cancellation are hard denies.
+  The same structural floor is reserved for typed dependency installation,
+  high-risk Git, and unknown future protected actions.
+- **Agent children start from a default-deny environment.** Portcode clears the
+  inherited environment for agent shells and its native read-only Git process,
+  then adds only reviewed exact-name variables. Ambient API/registry tokens,
+  proxy credentials, Git overrides, SSH-agent sockets, loader hooks, and runtime
+  injection variables are not copied. Shell output is drained with fixed memory
+  for foreground and background commands.
+- **Phone Sync receives public projections, not desktop internals.** Live events,
+  reconnect catch-up, and history pages use separate public DTOs. Raw tool
+  inputs/results, permission diffs, reasoning payloads, account-profile IDs,
+  absolute paths, and background output are removed; retained strings are
+  redacted and byte-bounded below the encrypted transport limit. Remote
+  identifiers are validated before lookup or reflection.
+- **Security settings commit transactionally.** A partial settings patch is
+  written through a flushed temporary file beneath the destination parent, then
+  atomically replaced with a parent-directory durability barrier. A pre-commit
+  failure leaves the previous memory and file in force. If replacement succeeds
+  but its final metadata sync cannot be confirmed, runtime memory follows the
+  visible candidate and the UI receives an explicit durability warning instead
+  of a false clean-success signal.
+- **Credentialed HTTP cannot redirect across origins.** Provider clients accept
+  only a bounded number of same-scheme, same-host, same-effective-port redirects.
+  Non-success API/OAuth handling does not read or reflect provider error bodies,
+  and credential headers are marked sensitive.
+
+These controls are not a shell sandbox. Once a user approves a command, it runs
+with the workspace as its working directory and can use the machine's filesystem
+and network under that user's OS authority. The environment boundary prevents
+automatic inheritance; it does not contain an explicitly approved program or
+all of its descendants.
+
 ## Phone Sync web client (browser)
 
 Phone Sync lets you drive a desktop coding session from your phone. Alongside the
@@ -85,6 +127,11 @@ native mobile client there is a **browser-based web client** — a static PWA
 and dials your desktop over an iroh relay. See
 [`docs/IOS_WEB_CLIENT_PLAN.md`](docs/IOS_WEB_CLIENT_PLAN.md) §5.10 for the full
 design; the security-relevant model:
+
+The items below are required architecture invariants, not a claim that physical
+phone, browser lifecycle, or production-relay acceptance is complete. Those
+device gates remain tracked in the roadmap and must pass before Phone Sync is
+advertised as release-ready.
 
 - **End-to-end encryption is preserved.** The Noise XX handshake +
   ChaCha20-Poly1305 transport runs **inside** the iroh QUIC stream. The relay —

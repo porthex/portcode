@@ -191,10 +191,14 @@ and path-filtered pull-request triggers:
    excluded from mobile; mobile run path registers the sync-client commands.
 6. **Remote-mode `ipc.ts` + QR pairing UI** (§4) — ✅ **IMPLEMENTED** with mobile
    platform detection, native scanning, remote shell, and automated tests.
-7. **On-device acceptance** — ⏳ **NEXT GATE**: install the debug APK, pair with a
+7. **Permission-decision delivery** — ⏳ **OPEN CORRECTNESS GATE**: add a desktop
+   receipt/ack plus idempotent client replay so a link drop after enqueue cannot
+   clear the phone prompt while leaving the desktop permission gate pending.
+8. **On-device acceptance** — ⏳ **NEXT GATE**: install the debug APK, pair with a
    real desktop through the relay/network path, verify SAS, run/cancel/permission
-   flows, background/lock, resume/reconnect, and catch up without loss.
-8. **Signing + push** (owner / later phases).
+   flows (including a forced link drop during a permission response), background/
+   lock, resume/reconnect, and catch up without loss.
+9. **Signing + push** (owner / later phases).
 
 ---
 
@@ -208,8 +212,9 @@ and path-filtered pull-request triggers:
 - ✅ `reqwest` → rustls (#37): **the app now cross-compiles for Android**; the probe is
   green and uploads a debug APK artifact on every run.
 - ✅ Platform split, mobile sync commands, remote-mode UI, and QR pairing surface landed.
-- ⏳ **Next:** increment 7 physical-device and background/resume acceptance, then
-  release signing, distribution, and push/wake work.
+- ⏳ **Next:** implement permission receipt/replay, then complete increment 8
+  physical-device and background/resume acceptance before release signing,
+  distribution, and push/wake work.
 
 The protocol foundation being already cross-platform + merged, plus the now-unblocked
 Android cross-compile, is what makes the rest tractable — the phone reuses the hard,

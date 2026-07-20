@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use reqwest::header::HeaderValue;
 
 use crate::events::EventSink;
 use crate::secrets::Credential;
@@ -58,6 +59,37 @@ fn build_system(cred: &Credential, system: &str) -> Value {
         ]),
         Credential::ApiKey(_) => Value::String(system.to_string()),
         Credential::OpenAiOAuth(_) => Value::String(system.to_string()),
+    }
+}
+
+fn authenticated_anthropic_request(
+    request: reqwest::RequestBuilder,
+    cred: &Credential,
+) -> Result<reqwest::RequestBuilder, String> {
+    match cred {
+        Credential::ApiKey(key) => {
+            let mut value = HeaderValue::try_from(key.as_str())
+                .map_err(|_| "Anthropic API key is not a valid header value.".to_string())?;
+            value.set_sensitive(true);
+            Ok(request.header("x-api-key", value))
+        }
+        Credential::OAuth(tokens) => Ok(request
+            .bearer_auth(tokens.access_token.as_str())
+            .header("anthropic-beta", OAUTH_BETA)),
+        Credential::OpenAiOAuth(_) => {
+            Err("An OpenAI credential cannot authenticate an Anthropic request.".into())
+        }
+    }
+}
+
+fn require_anthropic_success(response: reqwest::Response) -> Result<reqwest::Response, String> {
+    let status = response.status();
+    if status.is_success() {
+        Ok(response)
+    } else {
+        // Provider-controlled bodies may be unbounded, deliberately delayed, or
+        // contain secrets. The status is sufficient for a safe terminal error.
+        Err(format!("Anthropic API error ({status})."))
     }
 }
 
@@ -303,31 +335,14 @@ pub async fn stream_turn(
     // Authentication differs by credential: an API key uses `x-api-key`; an
     // OAuth token uses a bearer `authorization` header plus the OAuth beta flag
     // and deliberately omits `x-api-key`.
-    let req = match cred {
-        Credential::ApiKey(key) => req.header("x-api-key", key.as_str()),
-        Credential::OAuth(tokens) => req
-            .header("authorization", format!("Bearer {}", tokens.access_token))
-            .header("anthropic-beta", OAUTH_BETA),
-        Credential::OpenAiOAuth(_) => {
-            return Err("An OpenAI credential cannot authenticate an Anthropic request.".into())
-        }
-    };
+    let req = authenticated_anthropic_request(req, cred)?;
 
     let resp = req
         .json(&body)
         .send()
         .await
         .map_err(|e| format!("Request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        let msg = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| v["error"]["message"].as_str().map(String::from))
-            .unwrap_or(text);
-        return Err(format!("Anthropic API error ({status}): {msg}"));
-    }
+    let resp = require_anthropic_success(resp)?;
 
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
@@ -944,6 +959,79 @@ mod tests {
             email: None,
             plan: None,
         })
+    }
+
+    #[test]
+    fn anthropic_authentication_headers_are_marked_sensitive() {
+        let client = reqwest::Client::new();
+        let api_key_request = authenticated_anthropic_request(
+            client.get("http://example.invalid/messages"),
+            &Credential::ApiKey("api-secret".into()),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let api_key = api_key_request.headers().get("x-api-key").unwrap();
+        assert!(api_key.is_sensitive());
+        assert!(api_key_request.headers().get("authorization").is_none());
+
+        let oauth_request = authenticated_anthropic_request(
+            client.get("http://example.invalid/messages"),
+            &oauth_cred(),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let authorization = oauth_request.headers().get("authorization").unwrap();
+        assert!(authorization.is_sensitive());
+        assert!(oauth_request.headers().get("x-api-key").is_none());
+    }
+
+    #[tokio::test]
+    async fn anthropic_non_success_status_never_reads_or_reflects_the_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before sending request headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\n\
+Content-Type: application/json\r\n\
+Content-Length: 1048576\r\n\
+Connection: keep-alive\r\n\r\n\
+{\"provider_secret\":\"must-not-be-read",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let response = reqwest::Client::new()
+                .get(format!("http://{address}/messages"))
+                .send()
+                .await
+                .unwrap();
+            require_anthropic_success(response)
+        })
+        .await
+        .expect("status-only handling must not wait for the open body")
+        .expect_err("HTTP 500 must fail");
+        server.abort();
+
+        assert_eq!(result, "Anthropic API error (500 Internal Server Error).");
+        assert!(!result.contains("provider_secret"));
     }
 
     #[cfg(desktop)]

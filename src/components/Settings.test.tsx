@@ -21,6 +21,7 @@ import {
 // IPC layer (TDD London style) and drive the real store so the assertions check
 // genuine wiring: which ipc calls fire and how store state changes.
 vi.mock("../lib/ipc", () => ({
+  getSettings: vi.fn(async () => DEFAULT_SETTINGS),
   // Reached by the store's updateSettings; echoes a merged settings object.
   saveSettings: vi.fn(async (s: Partial<Settings>) => ({ ...DEFAULT_SETTINGS, ...s })),
   // Reached by the store's checkForUpdate (manual "Check now" button); no update.
@@ -83,6 +84,7 @@ beforeEach(() => {
     ...DEFAULT_SETTINGS,
     ...s,
   }));
+  m.getSettings.mockResolvedValue(DEFAULT_SETTINGS);
   m.setApiKey.mockResolvedValue(undefined);
   m.openFolder.mockResolvedValue("C:/work/repo");
   m.isTauri.mockReturnValue(false);
@@ -952,6 +954,12 @@ describe("SettingsPanel — model picker", () => {
 });
 
 describe("SettingsPanel — API key", () => {
+  beforeEach(() => {
+    // A successful credential write makes get_settings derive apiKeySet=true
+    // from the native credential store.
+    m.getSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, apiKeySet: true });
+  });
+
   it("shows the input placeholder and unsaved hint when no key is stored", () => {
     renderPanel({ apiKeySet: false });
 
@@ -1011,16 +1019,16 @@ describe("SettingsPanel — API key", () => {
     // The credential is sent trimmed.
     expect(m.setApiKey).toHaveBeenCalledWith("sk-ant-secret");
 
-    // saveKey awaits setApiKey then updateSettings (-> ipc.saveSettings -> set);
-    // all are microtasks. Flush several turns inside act so React commits the
-    // resulting state. Avoid vi.waitFor here — it polls on real time and would
-    // hang under fake timers.
+    // saveKey awaits setApiKey then refreshes authoritative settings. Flush
+    // several turns inside act so React commits the resulting state. Avoid
+    // vi.waitFor here — it polls on real time and would hang under fake timers.
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(m.saveSettings).toHaveBeenCalledWith({ apiKeySet: true });
+    expect(m.getSettings).toHaveBeenCalledTimes(1);
+    expect(m.saveSettings).not.toHaveBeenCalled();
 
     // Store now reflects a stored key; the input is cleared; button reads "Saved".
     expect(useStore.getState().settings.apiKeySet).toBe(true);
@@ -1034,6 +1042,36 @@ describe("SettingsPanel — API key", () => {
       vi.advanceTimersByTime(1800);
     });
     expect(screen.getByRole("button", { name: "Replace" })).toBeInTheDocument();
+  });
+
+  it("clears the raw key before the authoritative settings refresh completes", async () => {
+    let resolveSettings!: (settings: Settings) => void;
+    m.getSettings.mockReturnValueOnce(
+      new Promise<Settings>((resolve) => {
+        resolveSettings = resolve;
+      }),
+    );
+    renderPanel({ apiKeySet: false });
+
+    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(m.setApiKey).toHaveBeenCalledWith("sk-ant-secret");
+    expect(m.getSettings).toHaveBeenCalledTimes(1);
+    expect(input.value).toBe("");
+    expect(m.saveSettings).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveSettings({ ...DEFAULT_SETTINGS, apiKeySet: true });
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("button", { name: "Saved" })).toBeInTheDocument();
   });
 
   it("keeps focus inside the dialog after a successful save (no flash remount)", async () => {
@@ -1110,13 +1148,8 @@ describe("SettingsPanel — API key", () => {
     expect(useStore.getState().settings.apiKeySet).toBe(false);
   });
 
-  it("does not show 'Saved' when the apiKeySet persist fails; surfaces keyError, not a stray Model-section settingsError", async () => {
-    // The credential write succeeds but persisting the apiKeySet flag rejects.
-    // saveKey persists directly via ipc.saveSettings (not the swallow-everything
-    // updateSettings), so the reject hits its own catch: no "Saved", keep the value,
-    // and the failure surfaces next to the key — not as a far-away settingsError.
-    m.setApiKey.mockResolvedValueOnce(undefined);
-    m.saveSettings.mockRejectedValueOnce(new Error("disk full"));
+  it("does not write settings and keeps the committed key visible if its refresh fails", async () => {
+    m.getSettings.mockRejectedValueOnce(new Error("settings read unavailable"));
     renderPanel({ apiKeySet: false });
 
     const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
@@ -1129,23 +1162,17 @@ describe("SettingsPanel — API key", () => {
       await Promise.resolve();
     });
 
-    // The failure is announced next to the key input, and the typed value is kept.
-    const keyAlert = screen.getByText(/Couldn't save key: disk full/);
-    expect(keyAlert).toBeInTheDocument();
-    expect(keyAlert).toHaveAttribute("role", "alert");
-    expect(input.value).toBe("sk-ant-secret");
-
-    // "Saved" is NEVER shown (label stays resting "Save") and the polite "API key
-    // saved" status is never announced — success must not be claimed on a failure.
-    expect(screen.queryByRole("button", { name: "Saved" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
-    expect(screen.getByRole("status")).toHaveTextContent("");
-
-    // The failure must NOT misroute to the Model/CONNECTION section as a
-    // settingsError, and the store's apiKeySet stays false (never flipped).
+    // set_api_key already committed the credential. A failed follow-up read is
+    // therefore not a failed save: discard the secret, mark key presence locally,
+    // and avoid the unrelated settings write path entirely.
+    expect(m.getSettings).toHaveBeenCalledTimes(1);
+    expect(m.saveSettings).not.toHaveBeenCalled();
+    expect(input.value).toBe("");
+    expect(useStore.getState().settings.apiKeySet).toBe(true);
+    expect(screen.getByRole("button", { name: "Saved" })).toBeInTheDocument();
+    expect(screen.queryByText(/Couldn't save key/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Couldn't save settings/)).not.toBeInTheDocument();
     expect(useStore.getState().settingsError).toBeNull();
-    expect(useStore.getState().settings.apiKeySet).toBe(false);
   });
 
   it("announces the saved key via a polite live region after a successful save", async () => {
@@ -1216,7 +1243,10 @@ describe("SettingsPanel — default tool permission", () => {
     fireEvent.click(allow);
     expect(m.saveSettings).not.toHaveBeenCalled();
     expect(
-      screen.getByText(/every unmatched tool.*including commands.*without asking/i),
+      screen.getByText(/every unmatched configurable action.*without asking/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Protected actions still require one-time approval/i),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Enable default Allow" }));
     expect(m.saveSettings).toHaveBeenCalledWith({ defaultPolicy: "allow" });
@@ -1293,6 +1323,9 @@ describe("SettingsPanel — permission modes & rules", () => {
     });
     expect(m.saveSettings).not.toHaveBeenCalled();
     const confirm = screen.getByRole("button", { name: /Enable Auto/i });
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      /Commands and other protected actions still require one-time approval/i,
+    );
 
     // Confirming engages the mode.
     await act(async () => {
@@ -1326,12 +1359,24 @@ describe("SettingsPanel — permission modes & rules", () => {
     });
   });
 
-  it("warns when an allow rule would match every command (over-broad)", () => {
-    renderPanel(); // tool=Run command, command empty
+  it("does not offer Allow when creating a Run command rule", () => {
+    renderPanel(); // tool=Run command
+    fireEvent.click(screen.getByLabelText("Rule decision"));
+
+    expect(screen.queryByRole("option", { name: "allow" })).not.toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "ask" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "deny" })).toBeInTheDocument();
+  });
+
+  it("warns when a wildcard Allow would match every configurable tool", () => {
+    renderPanel();
+    fireEvent.click(screen.getByLabelText("Rule tool"));
+    fireEvent.click(screen.getByRole("option", { name: "Any tool" }));
     fireEvent.click(screen.getByLabelText("Rule decision"));
     fireEvent.click(screen.getByRole("option", { name: "allow" }));
 
-    expect(screen.getByText(/matches every command/i)).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(/every configurable tool/i);
+    expect(screen.getByRole("alert")).toHaveTextContent(/Protected actions still ask once/i);
   });
 
   it("renders a historical rule with a friendly label and removes it", async () => {
@@ -1339,6 +1384,19 @@ describe("SettingsPanel — permission modes & rules", () => {
 
     expect(screen.getByText("Edit file")).toBeInTheDocument();
     expect(screen.queryByText("fs_edit")).not.toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Remove rule 1" }));
+    });
+
+    expect(m.saveSettings).toHaveBeenCalledWith({ rules: [] });
+  });
+
+  it("marks a historical shell Allow as overridden and lets the user remove it", async () => {
+    renderPanel({ rules: [{ tool: "shell", command: "git ", decision: "allow" }] });
+
+    expect(screen.getAllByText("Run command").length).toBeGreaterThan(0);
+    expect(screen.getByText(/overridden: asks every time/i)).toBeInTheDocument();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Remove rule 1" }));
@@ -1361,6 +1419,8 @@ describe("SettingsPanel — permission modes & rules", () => {
   it("replaces a conflicting legacy rule instead of appending an inert duplicate", async () => {
     // The form defaults to Run command + ask; the stored equivalent says allow.
     renderPanel({ rules: [{ tool: "shell", decision: "allow" }] });
+
+    expect(screen.getByText(/overridden: asks every time/i)).toBeInTheDocument();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Add rule" }));

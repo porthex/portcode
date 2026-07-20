@@ -11,6 +11,9 @@
 // precise stack frame; a false negative leaks a user's secret. We always choose
 // the former.
 
+// This module is deliberately cross-target: the shared Phone Sync public
+// projector also runs every outbound string through the same redaction core.
+// Keep desktop-only telemetry dependencies out of this file.
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -19,6 +22,7 @@ use regex::Regex;
 /// cannot ride out inside an exception message. The regex crate is linear and
 /// non-backtracking; privacy requires matching the complete input before this cap
 /// is applied so a boundary-spanning secret cannot leak a partial value.
+#[cfg(any(desktop, test))]
 const MAX_REDACT_LEN: usize = 2048;
 
 /// One ordered redaction pass: a compiled pattern + its replacement template.
@@ -89,15 +93,38 @@ fn redactors() -> &'static [Redactor] {
     })
 }
 
-/// Run every redaction pass over the complete string, then apply the dump guard.
-/// Redacting first prevents a secret that crosses the cap from leaking its
-/// unmatched prefix in the retained head.
-pub fn redact_secrets(value: &str) -> String {
+/// Run every redaction pass over the complete string without truncating it.
+/// Callers must apply an appropriate field-specific bound before publication.
+fn redact_secrets_full(value: &str) -> String {
     let mut out = value.to_string();
     for r in redactors() {
         // `replace_all` returns Cow; only allocate when something actually matched.
         out = r.re.replace_all(&out, r.repl).into_owned();
     }
+    out
+}
+
+/// Redact the complete value and then truncate it to an exact UTF-8 byte budget.
+/// This is used by public boundaries whose field limits differ from telemetry's
+/// 2,048-character dump guard. Matching always sees the complete input first.
+pub fn redact_secrets_bounded(value: &str, max_bytes: usize) -> String {
+    let out = redact_secrets_full(value);
+    if out.len() <= max_bytes {
+        return out;
+    }
+    let mut end = max_bytes.min(out.len());
+    while !out.is_char_boundary(end) {
+        end -= 1;
+    }
+    out[..end].to_string()
+}
+
+/// Run every redaction pass over the complete string, then apply the telemetry
+/// dump guard. Redacting first prevents a secret that crosses the cap from
+/// leaking its unmatched prefix in the retained head.
+#[cfg(any(desktop, test))]
+pub fn redact_secrets(value: &str) -> String {
+    let mut out = redact_secrets_full(value);
     // Cap by CHARS (not bytes) so a UTF-8 codepoint is never split. This happens
     // only after every secret in the original input has been replaced.
     if out.chars().count() > MAX_REDACT_LEN {
@@ -245,6 +272,19 @@ mod tests {
     fn leaves_ordinary_text_untouched() {
         let s = "TypeError: cannot read property 'x' of undefined";
         assert_eq!(redact_secrets(s), s);
+    }
+
+    #[test]
+    fn field_specific_byte_limit_can_retain_more_than_the_telemetry_cap() {
+        let ordinary = "short words ".repeat(400);
+        let out = redact_secrets_bounded(&ordinary, 4_096);
+        assert_eq!(out.len(), 4_096);
+        assert!(out.len() > MAX_REDACT_LEN);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+
+        let unicode = redact_secrets_bounded(&"🙂".repeat(2_000), 4_095);
+        assert!(unicode.len() <= 4_095);
+        assert!(unicode.is_char_boundary(unicode.len()));
     }
 
     // The cross-cutting contract: feed one string laced with every kind of planted

@@ -313,7 +313,7 @@ async fn read_framed(recv: &mut RecvStream) -> Result<Vec<u8>, RecvError> {
 mod tests {
     use super::*;
     use crate::noise::StaticKeypair;
-    use crate::wire::StreamEvent;
+    use crate::wire::PhoneStreamEvent;
 
     /// The pairing nonce both peers bind into the handshake prologue. Real code
     /// derives it from the QR / the open pairing window; the tests just need both
@@ -396,7 +396,7 @@ mod tests {
             .channel
             .send_frame(&SyncFrame::Live {
                 session_id: "s1".into(),
-                event: StreamEvent::TextDelta { text: "hi".into() },
+                event: PhoneStreamEvent::TextDelta { text: "hi".into() },
             })
             .await
             .unwrap();
@@ -524,7 +524,7 @@ mod tests {
         hub_tx
             .send(SyncFrame::Live {
                 session_id: "s1".into(),
-                event: StreamEvent::TextDelta { text: "hi".into() },
+                event: PhoneStreamEvent::TextDelta { text: "hi".into() },
             })
             .unwrap();
 

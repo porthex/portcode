@@ -10,6 +10,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::process_env::{self, ChildKind};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Failure {
     Missing,
@@ -33,11 +35,8 @@ pub async fn run<S: AsRef<OsStr>>(
     duration: Duration,
     max_stdout: usize,
 ) -> Result<Output, Failure> {
-    let mut command = git_command(workspace, args);
+    let mut command = git_command(workspace, args)?;
     command
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("LC_ALL", "C")
-        .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -83,16 +82,21 @@ pub async fn run<S: AsRef<OsStr>>(
 /// Construct every Git process with repository fsmonitor integration disabled.
 /// A configured fsmonitor hook can launch another process even for read-only
 /// commands, so override it process-locally before the subcommand is parsed.
-fn git_command<S: AsRef<OsStr>>(workspace: &Path, args: &[S]) -> Command {
+fn git_command<S: AsRef<OsStr>>(workspace: &Path, args: &[S]) -> Result<Command, Failure> {
     let args = hardened_args(args);
-    let mut command = Command::new("git");
+    let executable_name = if cfg!(windows) { "git.exe" } else { "git" };
+    let executable =
+        process_env::resolve_in_sanitized_path(OsStr::new(executable_name), ChildKind::ReadOnlyGit)
+            .ok_or(Failure::Missing)?;
+    let mut command = Command::new(executable);
+    process_env::apply_to_tokio(&mut command, ChildKind::ReadOnlyGit);
     command
         .arg("--no-pager")
         .arg("-c")
         .arg("core.fsmonitor=false")
         .args(args)
         .current_dir(workspace);
-    command
+    Ok(command)
 }
 
 /// Keep repository-configured diff drivers and text conversion from spawning
@@ -145,6 +149,7 @@ async fn read_bounded<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[tokio::test]
     async fn bounded_reader_keeps_the_prefix_and_reports_truncation() {
@@ -200,7 +205,8 @@ mod tests {
 
     #[test]
     fn disables_fsmonitor_before_every_git_subcommand() {
-        let command = git_command(Path::new("repo"), &["status", "--porcelain=v2"]);
+        let command = git_command(Path::new("repo"), &["status", "--porcelain=v2"])
+            .expect("Git must resolve in the test PATH");
         assert_eq!(
             command.as_std().get_args().collect::<Vec<_>>(),
             [
@@ -211,5 +217,35 @@ mod tests {
                 OsStr::new("--porcelain=v2"),
             ]
         );
+    }
+
+    #[test]
+    fn native_git_uses_only_portcode_owned_git_environment() {
+        let command =
+            git_command(Path::new("repo"), &["status"]).expect("Git must resolve in test PATH");
+        let environment: BTreeMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(name, value)| value.map(|value| (name.to_owned(), value.to_owned())))
+            .collect();
+        let git_environment: BTreeMap<_, _> = environment
+            .iter()
+            .filter(|(name, _)| name.to_string_lossy().starts_with("GIT_"))
+            .collect();
+
+        assert_eq!(git_environment.len(), 2);
+        assert_eq!(
+            environment.get(OsStr::new("GIT_OPTIONAL_LOCKS")),
+            Some(&OsStr::new("0").to_owned())
+        );
+        assert_eq!(
+            environment.get(OsStr::new("GIT_TERMINAL_PROMPT")),
+            Some(&OsStr::new("0").to_owned())
+        );
+        assert_eq!(
+            environment.get(OsStr::new("LC_ALL")),
+            Some(&OsStr::new("C").to_owned())
+        );
+        assert!(Path::new(command.as_std().get_program()).is_absolute());
     }
 }

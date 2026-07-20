@@ -47,12 +47,14 @@ import {
   OPENAI_FALLBACK_MODELS,
   normalizeOpenAIModels,
   openAIAccountLabel,
+  permissionRiskRequiresOneShot,
   providerForModel,
   reasoningEffortForModel,
 } from "../types";
 import * as ipc from "../lib/ipc";
 import { isMobilePlatform } from "../lib/platform";
 import { markdownLiteralText, remoteAccountLabel } from "../lib/sessionFormat";
+import { classifySettingsSaveFailure } from "../lib/settingsPersistence";
 import { canonicalToolName, isCommandToolName, toolNamesEquivalent } from "../lib/toolNames";
 
 // ── Per-run state ─────────────────────────────────────────────────────────────
@@ -107,11 +109,15 @@ const EMPTY_RUN: RunState = {
 const runKey = (sessionId: string): string => sessionId;
 
 // Build the scoped allow-RULE that "Always allow" adds, instead of flipping the
-// global policy to allow-everything. For a command call it scopes to that exact
-// command (a literal prefix — narrower and safer than a blanket allow); for any
-// other tool it allows just that tool. Historical names are normalized before
-// persistence so new settings never extend the legacy vocabulary.
-const scopedAllowRule = (p: PendingPermission): Rule => {
+// global policy to allow-everything. A legacy peer without risk can still scope a
+// command to that exact text; current protected command requests return null.
+// Other configurable tools are scoped by tool. Historical names are normalized
+// before persistence so new settings never extend the legacy vocabulary.
+const scopedAllowRule = (p: PendingPermission): Rule | null => {
+  // This guard is deliberately independent from the prompt UI. A stale client,
+  // forged call, or future surface cannot persist an Allow for protected or
+  // unknown actions. Missing risk remains configurable for legacy peers.
+  if (permissionRiskRequiresOneShot(p.risk)) return null;
   const tool = canonicalToolName(p.tool);
   if (isCommandToolName(p.tool)) {
     const command = (p.input as { command?: unknown } | null)?.command;
@@ -2603,6 +2609,7 @@ export const useStore = create<AppState>((set, get) => ({
             pendingPermission: {
               id: e.id,
               tool: e.tool,
+              risk: e.risk,
               summary: e.summary,
               input: e.input,
               diff: e.diff,
@@ -2899,6 +2906,11 @@ export const useStore = create<AppState>((set, get) => ({
     // "always" policy is a desktop-side setting the phone can't change through
     // this command, so it's ignored on the remote path. The same stale-click
     // guard applies (don't answer a request a newer one superseded).
+    // A disconnected phone shell must fail closed here. It must never fall
+    // through to the desktop-only IPC path (or persist a local allow rule) just
+    // because its transport dropped between rendering and resolving a prompt.
+    if (get().remoteMode && !get().remoteConnected) return;
+
     if (get().remoteConnected) {
       const current = legacy
         ? (get().runs[runKey(sessionId)]?.pendingPermission ?? get().pendingPermission)
@@ -2922,9 +2934,10 @@ export const useStore = create<AppState>((set, get) => ({
     setRun(set, sessionId, { pendingPermission: null });
     await ipc.resolvePermission(permissionId, decision);
     if (always && decision === "allow") {
-      // "Always allow" adds a SCOPED allow-rule for this tool (and, for commands,
-      // this command) instead of flipping the global policy to allow-everything.
+      // "Always allow" adds a scoped rule for a configurable tool instead of
+      // flipping the global policy. Protected/unknown requests return null.
       const rule = scopedAllowRule(p);
+      if (!rule) return;
       const rules = get().settings.rules;
       const nextRules = rulesWithEffectiveAllow(rules, rule);
       if (nextRules !== rules) {
@@ -3136,7 +3149,11 @@ export const useStore = create<AppState>((set, get) => ({
         set({ settings: next });
       }
     } catch (err) {
-      set({ workspaceError: errMessage(err) });
+      const failure = await reconcileSettingsSaveFailure(err);
+      set({
+        workspaceError: failure.message,
+        ...(failure.authoritative ? { settings: failure.authoritative } : {}),
+      });
     }
   },
 
@@ -3164,7 +3181,11 @@ export const useStore = create<AppState>((set, get) => ({
       const next = await ipc.saveSettings(patch);
       set({ settings: next });
     } catch (err) {
-      set({ settingsError: errMessage(err) });
+      const failure = await reconcileSettingsSaveFailure(err);
+      set({
+        settingsError: failure.message,
+        ...(failure.authoritative ? { settings: failure.authoritative } : {}),
+      });
     }
   },
 
@@ -4334,6 +4355,22 @@ function deriveTitle(text: string): string {
   return t.length > 42 ? t.slice(0, 42) + "…" : t || "New chat";
 }
 
+async function reconcileSettingsSaveFailure(error: unknown): Promise<{
+  message: string;
+  authoritative: Settings | null;
+}> {
+  const failure = classifySettingsSaveFailure(error);
+  if (!failure.reconcileAuthoritativeSettings) {
+    return { message: failure.message, authoritative: null };
+  }
+  try {
+    return { message: failure.message, authoritative: await ipc.getSettings() };
+  } catch {
+    // Keep the durability warning visible even if the follow-up read also fails.
+    return { message: failure.message, authoritative: null };
+  }
+}
+
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -4695,6 +4732,7 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
         pendingPermission: {
           id: e.id,
           tool: e.tool,
+          risk: e.risk,
           summary: e.summary,
           input: e.input,
           diff: e.diff,

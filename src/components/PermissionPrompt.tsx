@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 
 import { toolLabel } from "../lib/toolNames";
 import { useStore } from "../store/store";
+import { permissionRiskRequiresOneShot } from "../types";
 
 export function PermissionPrompt() {
   const activeId = useStore((s) => s.activeId);
@@ -11,6 +12,7 @@ export function PermissionPrompt() {
   );
   const resolve = useStore((s) => s.resolvePermission);
   const remoteMode = useStore((s) => s.remoteMode);
+  const remoteConnected = useStore((s) => s.remoteConnected);
   const denyRef = useRef<HTMLButtonElement>(null);
   const pendingSession = useRef<string | null>(null);
   const wasPending = useRef(false);
@@ -54,6 +56,9 @@ export function PermissionPrompt() {
   };
 
   const label = toolLabel(pending.tool);
+  const protectedAction = permissionRiskRequiresOneShot(pending.risk);
+  const remoteApproval = remoteMode || remoteConnected;
+  const rememberable = !remoteApproval && !protectedAction;
 
   return (
     <div role="alert" className="pc-gate px-6 py-3.5">
@@ -75,6 +80,13 @@ export function PermissionPrompt() {
           </span>
         </div>
         {pending.diff && pending.diff.trim() && <DiffView diff={pending.diff} />}
+        {!rememberable && (
+          <p className="text-[11.5px] leading-relaxed text-muted">
+            {remoteApproval
+              ? "Remote approvals apply once. Change persistent permission rules on the desktop."
+              : "This protected action requires one-time approval. Auto, Bypass, and saved rules cannot skip it."}
+          </p>
+        )}
         <div className="flex flex-wrap gap-[9px]">
           <button
             onClick={() => answer("allow")}
@@ -82,12 +94,14 @@ export function PermissionPrompt() {
           >
             Allow
           </button>
-          <button
-            onClick={() => answer("allow", true)}
-            className="pc-btn-deny pc-btn-confirm px-3.5 py-1.5 text-[12.5px]"
-          >
-            Always allow
-          </button>
+          {rememberable && (
+            <button
+              onClick={() => answer("allow", true)}
+              className="pc-btn-deny pc-btn-confirm px-3.5 py-1.5 text-[12.5px]"
+            >
+              Always allow
+            </button>
+          )}
           <button
             ref={denyRef}
             onClick={() => answer("deny")}

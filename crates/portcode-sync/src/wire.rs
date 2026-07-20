@@ -156,9 +156,33 @@ pub struct TurnReceipt {
     pub background_tasks_running: bool,
 }
 
+/// Security classification attached to a permission request.
+///
+/// Missing values are legacy `Configurable` requests. Unknown future values
+/// decode as `Unknown`, which callers must handle fail-safe (one-shot approval,
+/// never a remembered allow).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionRisk {
+    #[default]
+    Configurable,
+    Shell,
+    DependencyInstall,
+    HighRiskGit,
+    #[serde(other)]
+    Unknown,
+}
+
+impl PermissionRisk {
+    pub fn is_configurable(&self) -> bool {
+        *self == Self::Configurable
+    }
+}
+
 /// Events streamed to the frontend. Tagged + camelCased to match `StreamEvent`
-/// in `src/types.ts`. `Deserialize` lets Phone Sync decode it on the phone side
-/// (it is forwarded verbatim inside `protocol::SyncFrame::Live`).
+/// in `src/types.ts`. This is the rich internal desktop event; Phone Sync frames
+/// embed the separate projected [`PhoneStreamEvent`] type below.
 /// (Was `crate::llm::StreamEvent`.)
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[cfg_attr(target_arch = "wasm32", derive(Tsify))]
@@ -191,6 +215,10 @@ pub enum StreamEvent {
     PermissionRequest {
         id: String,
         tool: String,
+        /// Additive classification. Missing values from older persisted/wire
+        /// events retain the historical configurable behavior.
+        #[serde(default, skip_serializing_if = "PermissionRisk::is_configurable")]
+        risk: PermissionRisk,
         summary: String,
         input: Value,
         /// A pre-apply unified diff for file tools (fs_write/fs_edit), shown in
@@ -287,7 +315,8 @@ pub struct SessionRow {
 }
 
 /// One persisted message, with its raw append-only `seq` — the flat row Phone
-/// Sync replicates (the `MessageDelta` catch-up frame ships these verbatim).
+/// Sync persistence reads internally. Phone catch-up projects this into the
+/// separate [`PhoneMessageRow`] type below.
 /// `content` is the typed block list (same shape as [`ChatMessage::content`]).
 /// (Was `crate::db::MessageRow`.)
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -308,6 +337,202 @@ pub struct MessageRow {
     /// carries the same receipt directly on the grouped assistant bubble.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt: Option<TurnReceipt>,
+}
+
+// ---------------------------------------------------------------------------
+// Public Phone Sync DTOs
+// ---------------------------------------------------------------------------
+//
+// These deliberately duplicate the legacy JSON shapes instead of wrapping the
+// internal DTOs above. The desktop projector is the only intended conversion
+// path. Consequently, adding a rich internal field or event cannot make it onto
+// the encrypted phone channel through a derived conversion or a raw clone.
+
+/// Public content block replicated to Phone Sync peers. Raw tool payloads are
+/// represented by the same legacy fields, but the projector fills `input` with
+/// `{}` and uses a static result summary.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PhoneBlock {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        #[serde(default)]
+        is_error: bool,
+    },
+}
+
+/// Public changed-file item. Paths are labels projected and bounded by the
+/// desktop; this type cannot carry a receipt's local account attribution.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(rename_all = "camelCase")]
+pub struct PhoneTurnChangedFile {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    pub status: TurnFileStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<u64>,
+    pub binary: bool,
+    pub certainty: TurnChangeCertainty,
+}
+
+/// Public terminal turn summary. This preserves the legacy receipt field names
+/// while intentionally omitting `accountProfileId`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(rename_all = "camelCase")]
+pub struct PhoneTurnReceipt {
+    pub turn_id: String,
+    pub status: TurnStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    pub started_at: i64,
+    pub completed_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    pub changed_files: Vec<PhoneTurnChangedFile>,
+    pub changed_file_count: u64,
+    pub additions: u64,
+    pub deletions: u64,
+    pub files_truncated: bool,
+    pub change_certainty: TurnChangeCertainty,
+    pub background_tasks_running: bool,
+}
+
+/// Public session header. The projector replaces an absolute workspace with a
+/// safe label and this schema has no account-profile field at all.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(rename_all = "camelCase")]
+pub struct PhoneSessionRow {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Public persisted message row. Its content and receipt are public DTOs, so a
+/// raw reasoning block, tool payload, or account profile cannot be embedded.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(rename_all = "camelCase")]
+pub struct PhoneMessageRow {
+    pub id: String,
+    pub session_id: String,
+    pub seq: i64,
+    pub role: String,
+    pub content: Vec<PhoneBlock>,
+    pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<PhoneTurnReceipt>,
+}
+
+/// Public live event delivered to Phone Sync peers. Required fields and JSON
+/// tags match the legacy `StreamEvent` shape; `Unknown` keeps future public
+/// event tags from terminating an older receive loop.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PhoneStreamEvent {
+    TurnStart {
+        #[serde(rename = "messageId")]
+        message_id: String,
+        #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        #[serde(rename = "startedAt", default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<i64>,
+    },
+    TextDelta {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        id: String,
+        output: String,
+        #[serde(rename = "isError")]
+        is_error: bool,
+    },
+    PermissionRequest {
+        id: String,
+        tool: String,
+        #[serde(default, skip_serializing_if = "PermissionRisk::is_configurable")]
+        risk: PermissionRisk,
+        summary: String,
+        input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<String>,
+    },
+    Usage {
+        #[serde(rename = "inputTokens")]
+        input_tokens: u32,
+        #[serde(rename = "outputTokens")]
+        output_tokens: u32,
+    },
+    TurnEnd {
+        #[serde(rename = "stopReason")]
+        stop_reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<PhoneTurnReceipt>,
+    },
+    Error {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<PhoneTurnReceipt>,
+    },
+    AgentStarted {
+        #[serde(rename = "agentId")]
+        agent_id: String,
+        description: String,
+        #[serde(rename = "parentId", default, skip_serializing_if = "Option::is_none")]
+        parent_id: Option<String>,
+    },
+    AgentProgress {
+        #[serde(rename = "agentId")]
+        agent_id: String,
+        step: u32,
+    },
+    AgentFinished {
+        #[serde(rename = "agentId")]
+        agent_id: String,
+        status: String,
+    },
+    BackgroundTaskStarted {
+        id: String,
+        command: String,
+    },
+    BackgroundTaskFinished {
+        id: String,
+        command: String,
+        #[serde(rename = "exitCode")]
+        exit_code: i32,
+        output: String,
+    },
+    #[serde(other)]
+    Unknown,
 }
 
 #[cfg(test)]
@@ -455,5 +680,93 @@ mod tests {
                 "startedAt": 42
             })
         );
+    }
+
+    #[test]
+    fn permission_risk_is_additive_and_unknown_values_fail_safe() {
+        let legacy: StreamEvent = serde_json::from_value(json!({
+            "type": "permission_request",
+            "id": "p1",
+            "tool": "write_file",
+            "summary": "Write file",
+            "input": {}
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            StreamEvent::PermissionRequest {
+                risk: PermissionRisk::Configurable,
+                ..
+            }
+        ));
+
+        let future: PhoneStreamEvent = serde_json::from_value(json!({
+            "type": "permission_request",
+            "id": "p2",
+            "tool": "run_command",
+            "risk": "futureProtectedRisk",
+            "summary": "Run command",
+            "input": {}
+        }))
+        .unwrap();
+        assert!(matches!(
+            future,
+            PhoneStreamEvent::PermissionRequest {
+                risk: PermissionRisk::Unknown,
+                ..
+            }
+        ));
+
+        let configurable = PhoneStreamEvent::PermissionRequest {
+            id: "p3".into(),
+            tool: "write_file".into(),
+            risk: PermissionRisk::Configurable,
+            summary: "Write file".into(),
+            input: json!({}),
+            diff: None,
+        };
+        assert!(serde_json::to_value(configurable)
+            .unwrap()
+            .get("risk")
+            .is_none());
+    }
+
+    #[test]
+    fn unknown_public_events_decode_to_the_compatibility_sink() {
+        let event: PhoneStreamEvent = serde_json::from_value(json!({
+            "type": "future_public_event",
+            "newField": "ignored"
+        }))
+        .unwrap();
+        assert_eq!(event, PhoneStreamEvent::Unknown);
+    }
+
+    #[test]
+    fn public_rows_preserve_legacy_fields_without_account_attribution() {
+        let row: PhoneSessionRow = serde_json::from_value(json!({
+            "id": "s1",
+            "title": "Legacy",
+            "branch": null,
+            "workspace": "project",
+            "model": null,
+            "accountProfileId": "must-not-survive",
+            "createdAt": 1,
+            "updatedAt": 2
+        }))
+        .unwrap();
+        let encoded = serde_json::to_value(row).unwrap();
+        assert_eq!(encoded["id"], "s1");
+        assert!(encoded.get("accountProfileId").is_none());
+
+        // A deployed legacy decoder can still read the required public event
+        // fields because the JSON tag/field names did not change.
+        let public = PhoneStreamEvent::ToolResult {
+            id: "tool-public".into(),
+            output: "Tool completed.".into(),
+            is_error: false,
+        };
+        let legacy: StreamEvent = serde_json::from_value(serde_json::to_value(public).unwrap())
+            .expect("legacy StreamEvent shape remains decodable");
+        assert!(matches!(legacy, StreamEvent::ToolResult { .. }));
     }
 }

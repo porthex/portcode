@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 use crate::db::{Db, SYNC_CACHE_WINDOW};
 use crate::sync::protocol::{Cursor, SyncFrame};
+use crate::sync::public;
 
 // Re-export the shared session surface so every existing `crate::sync::session::…`
 // path (in `lib.rs`, `server.rs`, `client.rs`, and their tests) keeps resolving.
@@ -75,25 +76,29 @@ pub async fn serve_catch_up_with_cursors<C: FrameChannel + ?Sized>(
     let sessions = db.list_sessions().map_err(|e| e.to_string())?;
 
     // The client's per-session high-water marks, for the sessions it already holds.
-    let cursor_seqs: HashMap<String, i64> =
-        cursors.into_iter().map(|c| (c.session_id, c.seq)).collect();
+    let cursor_seqs: HashMap<String, i64> = cursors
+        .into_iter()
+        .filter(|cursor| public::valid_remote_identifier(&cursor.session_id))
+        .map(|cursor| (cursor.session_id, cursor.seq))
+        .collect();
 
-    channel
-        .send(&SyncFrame::SessionList {
-            sessions: sessions.clone(),
-        })
-        .await?;
+    let session_list = public::session_list_frame(sessions.clone());
+    let served_session_count = match &session_list {
+        SyncFrame::SessionList { sessions } => sessions.len(),
+        _ => unreachable!("session_list_frame always returns SessionList"),
+    };
+    channel.send(&session_list).await?;
 
     // One bounded delta PER session. Use the client's cursor seq when it has one,
     // else -1 (full tail) for a session it has never seen.
-    for session in &sessions {
+    // The bounded public list retains a prefix. Send deltas for exactly that
+    // prefix so an oversized local session set cannot leave the peer with extra
+    // unlisted delta frames queued at the start of its live command loop.
+    for session in sessions.iter().take(served_session_count) {
         let after_seq = cursor_seqs.get(&session.id).copied().unwrap_or(-1);
         let messages = db.messages_tail(&session.id, after_seq, SYNC_CACHE_WINDOW);
         channel
-            .send(&SyncFrame::MessageDelta {
-                session_id: session.id.clone(),
-                messages,
-            })
+            .send(&public::message_delta_frame(&session.id, messages))
             .await?;
     }
     Ok(())
@@ -258,6 +263,45 @@ mod tests {
         serve_res.unwrap();
     }
 
+    #[tokio::test]
+    async fn unsafe_cursor_ids_are_ignored_and_never_reflected() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        db.create_session("s1", "Alpha", None, None, 100).unwrap();
+        db.append_message("s1", &user("first"), 101);
+
+        let (mut desktop, mut phone) = mem_pair();
+        let (serve_res, ()) = tokio::join!(
+            serve_catch_up_with_cursors(
+                &mut desktop,
+                &db,
+                vec![Cursor {
+                    session_id: "s1:forged-agent\nchannel".into(),
+                    seq: i64::MAX,
+                }],
+            ),
+            async {
+                match phone.recv().await.unwrap() {
+                    SyncFrame::SessionList { sessions } => {
+                        assert_eq!(sessions.len(), 1);
+                        assert_eq!(sessions[0].id, "s1");
+                    }
+                    other => panic!("expected SessionList, got {other:?}"),
+                }
+                match phone.recv().await.unwrap() {
+                    SyncFrame::MessageDelta {
+                        session_id,
+                        messages,
+                    } => {
+                        assert_eq!(session_id, "s1");
+                        assert_eq!(messages.len(), 1);
+                    }
+                    other => panic!("expected MessageDelta, got {other:?}"),
+                }
+            }
+        );
+        serve_res.unwrap();
+    }
+
     /// Read the catch-up reply directly off the phone end: a `SessionList` followed
     /// by exactly `expect_sessions` `MessageDelta` frames (one per session), returned
     /// as `(session_id, messages)` pairs. Used for the empty-cursor path, where
@@ -266,8 +310,8 @@ mod tests {
         phone: &mut MemChannel,
         expect_sessions: usize,
     ) -> (
-        Vec<crate::db::SessionRow>,
-        Vec<(String, Vec<crate::db::MessageRow>)>,
+        Vec<portcode_sync::wire::PhoneSessionRow>,
+        Vec<(String, Vec<portcode_sync::wire::PhoneMessageRow>)>,
     ) {
         let sessions = match phone.recv().await.unwrap() {
             SyncFrame::SessionList { sessions } => sessions,

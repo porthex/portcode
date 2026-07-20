@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use crate::protocol::{Cursor, RemoteCommand, SyncFrame};
-use crate::wire::{MessageRow, SessionRow};
+use crate::wire::{PhoneMessageRow, PhoneSessionRow};
 
 // The concrete secure-channel types come from whichever transport this build
 // targets; the frame-channel trait impls below are identical against either.
@@ -119,8 +119,8 @@ impl FrameSource for ChannelReceiver {
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub struct CatchUp {
-    pub sessions: Vec<SessionRow>,
-    pub deltas: Vec<(String, Vec<MessageRow>)>,
+    pub sessions: Vec<PhoneSessionRow>,
+    pub deltas: Vec<(String, Vec<PhoneMessageRow>)>,
 }
 
 /// Phone side: run a catch-up against the desktop. Sends `Hello` with `cursors`,
@@ -248,6 +248,8 @@ pub async fn handle_commands(
                     );
                 }
             }
+            // Ack identifiers are intentionally ignored at this layer: they are
+            // never looked up, logged, formatted into a channel, or reflected.
             Ok(SyncFrame::Ack { .. }) => {}
             Ok(_) => return Err("unexpected frame in command loop".into()),
             Err(RecvError::Closed) => return Ok(()), // peer closed cleanly → done
@@ -294,7 +296,7 @@ pub async fn send_command(sink: &mut impl FrameSink, command: RemoteCommand) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::StreamEvent;
+    use crate::wire::PhoneStreamEvent;
     use tokio::sync::mpsc;
 
     /// In-memory channel for testing the protocol without QUIC/Noise.
@@ -360,13 +362,12 @@ mod tests {
             }
             desktop
                 .send(&SyncFrame::SessionList {
-                    sessions: vec![SessionRow {
+                    sessions: vec![PhoneSessionRow {
                         id: "s1".into(),
                         title: "Alpha".into(),
                         branch: None,
                         workspace: None,
                         model: None,
-                        account_profile_id: None,
                         created_at: 1,
                         updated_at: 2,
                     }],
@@ -376,7 +377,7 @@ mod tests {
             desktop
                 .send(&SyncFrame::MessageDelta {
                     session_id: "s1".into(),
-                    messages: vec![MessageRow {
+                    messages: vec![PhoneMessageRow {
                         id: "m1".into(),
                         session_id: "s1".into(),
                         seq: 0,
@@ -563,13 +564,13 @@ mod tests {
         hub_tx
             .send(SyncFrame::Live {
                 session_id: "s1".into(),
-                event: StreamEvent::TextDelta { text: "a".into() },
+                event: PhoneStreamEvent::TextDelta { text: "a".into() },
             })
             .unwrap();
         hub_tx
             .send(SyncFrame::Live {
                 session_id: "s1".into(),
-                event: StreamEvent::TextDelta { text: "b".into() },
+                event: PhoneStreamEvent::TextDelta { text: "b".into() },
             })
             .unwrap();
         drop(hub_tx); // close the broadcast so forward_live drains then returns
@@ -693,7 +694,7 @@ mod tests {
         desktop
             .send(&SyncFrame::Live {
                 session_id: "s1".into(),
-                event: StreamEvent::TextDelta { text: "hi".into() },
+                event: PhoneStreamEvent::TextDelta { text: "hi".into() },
             })
             .await
             .unwrap();

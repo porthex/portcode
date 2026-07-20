@@ -217,7 +217,7 @@ pub async fn anthropic(
 ) -> Result<PlanUsageSnapshot, String> {
     let value = json_response(
         http.get(CLAUDE_USAGE_URL)
-            .header("authorization", format!("Bearer {}", tokens.access_token))
+            .bearer_auth(tokens.access_token.as_str())
             .header("anthropic-beta", "oauth-2025-04-20"),
         "Claude",
     )

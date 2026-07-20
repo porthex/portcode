@@ -1,4 +1,7 @@
+use atomicwrites::{AllowOverwrite, AtomicFile};
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::io::Write;
 use std::path::Path;
 
 use crate::permissions::{PermissionMode, Rule};
@@ -65,6 +68,65 @@ fn default_auto_update() -> bool {
     true
 }
 
+pub(crate) const COMMITTED_DURABILITY_UNCONFIRMED_PREFIX: &str =
+    "SETTINGS_COMMITTED_DURABILITY_UNCONFIRMED:";
+
+/// A failed atomic write has materially different recovery semantics depending
+/// on whether the destination name already points at the candidate bytes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SettingsSaveError {
+    /// The destination is provably unchanged from the pre-write snapshot.
+    Uncommitted(String),
+    /// The candidate is visible at the destination, but its final metadata sync
+    /// failed. Runtime memory must follow the candidate to avoid split-brain.
+    CommittedDurabilityUnconfirmed(String),
+    /// The destination could not be proven equal to either snapshot.
+    StateUnknown(String),
+}
+
+impl SettingsSaveError {
+    pub(crate) fn candidate_is_committed(&self) -> bool {
+        matches!(self, Self::CommittedDurabilityUnconfirmed(_))
+    }
+}
+
+impl fmt::Display for SettingsSaveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Uncommitted(message) | Self::StateUnknown(message) => {
+                formatter.write_str(message)
+            }
+            Self::CommittedDurabilityUnconfirmed(message) => write!(
+                formatter,
+                "{COMMITTED_DURABILITY_UNCONFIRMED_PREFIX} Settings were updated, but storage durability could not be confirmed. {message}"
+            ),
+        }
+    }
+}
+
+fn read_settings_bytes(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn confirm_parent_durability(directory: &Path) -> std::io::Result<()> {
+    std::fs::File::open(directory)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn confirm_parent_durability(_directory: &Path) -> std::io::Result<()> {
+    // Windows' durability barrier is part of MoveFileExW(WRITE_THROUGH). If that
+    // call returned an error after the destination changed, std has no separate
+    // safe metadata barrier with which to upgrade the result to durable.
+    Err(std::io::Error::other(
+        "the write-through replacement reported an error after changing the destination",
+    ))
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -97,10 +159,83 @@ impl Settings {
         }
     }
 
-    pub fn save(&self, dir: &Path) {
-        if let Ok(s) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(Self::path(dir), s);
+    /// Persist settings without exposing a partially-written `settings.json`.
+    ///
+    /// The temporary file lives beneath the destination's parent, so the final
+    /// move stays on one filesystem and uses the platform's atomic replacement
+    /// primitive. The replacement is made crash-durable by syncing its parent
+    /// directory on Unix and using a write-through move on Windows. Failures are
+    /// classified by whether the candidate reached the destination, allowing the
+    /// in-memory transaction to follow an already-visible candidate without
+    /// treating an unconfirmed durability barrier as a clean save.
+    pub(crate) fn save(&self, dir: &Path) -> Result<(), SettingsSaveError> {
+        self.save_with(
+            dir,
+            |destination, bytes| {
+                AtomicFile::new(destination, AllowOverwrite)
+                    .write(|temporary| temporary.write_all(bytes))
+                    .map_err(std::io::Error::from)
+            },
+            confirm_parent_durability,
+        )
+    }
+
+    fn save_with(
+        &self,
+        dir: &Path,
+        persist: impl FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+        confirm_durability: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<(), SettingsSaveError> {
+        let bytes = serde_json::to_vec_pretty(self).map_err(|error| {
+            SettingsSaveError::Uncommitted(format!("failed to serialize settings: {error}"))
+        })?;
+        std::fs::create_dir_all(dir).map_err(|error| {
+            SettingsSaveError::Uncommitted(format!(
+                "failed to create settings directory {}: {error}",
+                dir.display()
+            ))
+        })?;
+
+        let destination = Self::path(dir);
+        let before = read_settings_bytes(&destination);
+        let Err(error) = persist(&destination, &bytes) else {
+            return Ok(());
+        };
+        let after = read_settings_bytes(&destination);
+
+        if matches!(&after, Ok(Some(current)) if current.as_slice() == bytes.as_slice()) {
+            return match confirm_durability(dir) {
+                Ok(()) => Ok(()),
+                Err(sync_error) => Err(SettingsSaveError::CommittedDurabilityUnconfirmed(
+                    format!(
+                        "Atomic replacement error: {error}. Parent durability retry failed: {sync_error}."
+                    ),
+                )),
+            };
         }
+
+        let base_message = format!(
+            "failed to save settings to {}: {error}",
+            destination.display()
+        );
+        match (before, after) {
+            (Ok(previous), Ok(current)) if previous == current => {
+                Err(SettingsSaveError::Uncommitted(base_message))
+            }
+            (before, after) => Err(SettingsSaveError::StateUnknown(format!(
+                "{base_message}. The destination could not be verified against either snapshot (before: {}; after: {}); the running policy was kept unchanged.",
+                snapshot_description(&before),
+                snapshot_description(&after),
+            ))),
+        }
+    }
+}
+
+fn snapshot_description(snapshot: &std::io::Result<Option<Vec<u8>>>) -> &'static str {
+    match snapshot {
+        Ok(Some(_)) => "readable",
+        Ok(None) => "missing",
+        Err(_) => "unreadable",
     }
 }
 
@@ -108,6 +243,171 @@ impl Settings {
 mod tests {
     use super::*;
     use crate::permissions::RuleDecision;
+    use uuid::Uuid;
+
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("portcode-settings-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&path).expect("create settings test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn has_atomic_write_debris(dir: &Path) -> bool {
+        std::fs::read_dir(dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".atomicwrite")
+        })
+    }
+
+    #[test]
+    fn save_succeeds_and_reloads_the_committed_settings() {
+        let dir = TestDir::new();
+        Settings::default()
+            .save(&dir.0)
+            .expect("initial settings save should succeed");
+        let expected = Settings {
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            permission_mode: PermissionMode::AcceptEdits,
+            default_policy: "deny".into(),
+            ..Settings::default()
+        };
+
+        expected
+            .save(&dir.0)
+            .expect("replacement settings save should succeed");
+
+        let loaded = Settings::load(&dir.0);
+        assert_eq!(loaded.provider, expected.provider);
+        assert_eq!(loaded.model, expected.model);
+        assert_eq!(loaded.permission_mode, expected.permission_mode);
+        assert_eq!(loaded.default_policy, expected.default_policy);
+        assert!(
+            !has_atomic_write_debris(&dir.0),
+            "a successful save must not leave atomic-write debris behind"
+        );
+    }
+
+    #[test]
+    fn save_failure_leaves_the_last_committed_file_unchanged() {
+        let dir = TestDir::new();
+        let committed = Settings {
+            model: "committed-model".into(),
+            ..Settings::default()
+        };
+        committed.save(&dir.0).expect("commit baseline settings");
+        let destination = Settings::path(&dir.0);
+        let committed_bytes = std::fs::read(&destination).expect("read committed settings");
+
+        let attempted = Settings {
+            model: "must-not-commit".into(),
+            ..committed
+        };
+        let error = attempted
+            .save_with(
+                &dir.0,
+                |_destination, _bytes| Err(std::io::Error::other("injected replacement failure")),
+                |_directory| panic!("durability retry must not run before replacement"),
+            )
+            .expect_err("an atomic replacement failure must be returned");
+
+        assert!(matches!(error, SettingsSaveError::Uncommitted(_)));
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            committed_bytes,
+            "a failed replacement must preserve the exact prior file"
+        );
+        assert_eq!(Settings::load(&dir.0).model, "committed-model");
+        assert!(
+            !has_atomic_write_debris(&dir.0),
+            "a failed save must not leave atomic-write debris behind"
+        );
+    }
+
+    #[test]
+    fn post_replace_sync_failure_is_reported_as_committed_but_unconfirmed() {
+        let dir = TestDir::new();
+        let candidate = Settings {
+            model: "candidate-on-disk".into(),
+            ..Settings::default()
+        };
+
+        let error = candidate
+            .save_with(
+                &dir.0,
+                |destination, bytes| {
+                    std::fs::write(destination, bytes)?;
+                    Err(std::io::Error::other("injected post-replace failure"))
+                },
+                |_directory| Err(std::io::Error::other("injected sync retry failure")),
+            )
+            .expect_err("a failed durability retry must remain visible");
+
+        assert!(matches!(
+            error,
+            SettingsSaveError::CommittedDurabilityUnconfirmed(_)
+        ));
+        assert!(error.candidate_is_committed());
+        assert_eq!(Settings::load(&dir.0).model, "candidate-on-disk");
+    }
+
+    #[test]
+    fn successful_parent_sync_retry_upgrades_visible_candidate_to_durable() {
+        let dir = TestDir::new();
+        let candidate = Settings {
+            model: "candidate-retried".into(),
+            ..Settings::default()
+        };
+
+        candidate
+            .save_with(
+                &dir.0,
+                |destination, bytes| {
+                    std::fs::write(destination, bytes)?;
+                    Err(std::io::Error::other("injected post-replace failure"))
+                },
+                |_directory| Ok(()),
+            )
+            .expect("a successful metadata retry confirms durability");
+
+        assert_eq!(Settings::load(&dir.0).model, "candidate-retried");
+    }
+
+    #[test]
+    fn unexpected_destination_after_failure_is_state_unknown() {
+        let dir = TestDir::new();
+        Settings::default().save(&dir.0).unwrap();
+        let candidate = Settings {
+            model: "candidate".into(),
+            ..Settings::default()
+        };
+
+        let error = candidate
+            .save_with(
+                &dir.0,
+                |destination, _bytes| {
+                    std::fs::write(destination, b"externally changed")?;
+                    Err(std::io::Error::other("injected replacement race"))
+                },
+                |_directory| panic!("durability retry requires exact candidate bytes"),
+            )
+            .expect_err("a third destination state cannot be classified as uncommitted");
+
+        assert!(matches!(error, SettingsSaveError::StateUnknown(_)));
+        assert!(!error.candidate_is_committed());
+    }
 
     #[test]
     fn legacy_settings_without_typing_animation_still_load() {

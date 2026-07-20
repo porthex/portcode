@@ -23,6 +23,7 @@ mod events;
 mod git;
 #[cfg(desktop)]
 mod git_review;
+mod http_client;
 mod llm;
 #[cfg(desktop)]
 mod oauth;
@@ -34,6 +35,7 @@ mod permissions;
 #[cfg(desktop)]
 mod plan_usage;
 #[cfg(desktop)]
+mod process_env;
 mod scrub;
 mod secrets;
 mod settings;
@@ -133,54 +135,189 @@ fn get_settings(state: State<AppState>) -> Settings {
 }
 
 #[tauri::command]
-fn save_settings(state: State<AppState>, settings: Value) -> Settings {
-    {
-        let mut s = state.settings.lock().unwrap();
-        if let Some(p) = settings.get("provider").and_then(|v| v.as_str()) {
-            s.provider = p.to_string();
-        }
-        if let Some(m) = settings.get("model").and_then(|v| v.as_str()) {
-            s.model = m.to_string();
-        }
-        if let Some(effort) = settings.get("reasoningEffort").and_then(|v| v.as_str()) {
-            s.reasoning_effort = effort.to_string();
-        }
-        if let Some(speed) = settings.get("responseSpeed").and_then(|v| v.as_str()) {
-            if matches!(speed, "standard" | "fast") {
-                s.response_speed = speed.to_string();
-            }
-        }
-        if let Some(p) = settings.get("defaultPolicy").and_then(|v| v.as_str()) {
-            s.default_policy = p.to_string();
-        }
-        if settings.get("workspace").is_some() {
-            s.workspace = settings
-                .get("workspace")
-                .and_then(|v| v.as_str())
-                .map(|x| x.to_string());
-        }
-        if let Some(t) = settings.get("typingAnimation").and_then(|v| v.as_bool()) {
-            s.typing_animation = t;
-        }
-        // Permission mode + rules. Parse defensively: an unknown mode or a
-        // malformed rule list is IGNORED (keep the prior, safer value) rather than
-        // coerced — a bad save must never silently downgrade the permission gate.
-        if let Some(v) = settings.get("permissionMode") {
-            if let Ok(mode) = serde_json::from_value::<permissions::PermissionMode>(v.clone()) {
-                s.permission_mode = mode;
-            }
-        }
-        if let Some(v) = settings.get("rules") {
-            if let Ok(rules) = serde_json::from_value::<Vec<permissions::Rule>>(v.clone()) {
-                s.rules = rules;
-            }
-        }
-        if let Some(b) = settings.get("autoUpdate").and_then(|v| v.as_bool()) {
-            s.auto_update = b;
-        }
-        s.save(&state.config_dir);
+fn save_settings(state: State<AppState>, settings: Value) -> Result<Settings, String> {
+    // Serialize the whole disk transaction. Two concurrent partial patches must
+    // not clone the same base and silently lose whichever commit finishes first.
+    let mut current = state
+        .settings
+        .lock()
+        .map_err(|_| "Settings are temporarily unavailable.".to_string())?;
+    let mut candidate = current.clone();
+    if let Some(p) = settings.get("provider").and_then(|v| v.as_str()) {
+        candidate.provider = p.to_string();
     }
-    get_settings(state)
+    if let Some(m) = settings.get("model").and_then(|v| v.as_str()) {
+        candidate.model = m.to_string();
+    }
+    if let Some(effort) = settings.get("reasoningEffort").and_then(|v| v.as_str()) {
+        candidate.reasoning_effort = effort.to_string();
+    }
+    if let Some(speed) = settings.get("responseSpeed").and_then(|v| v.as_str()) {
+        if matches!(speed, "standard" | "fast") {
+            candidate.response_speed = speed.to_string();
+        }
+    }
+    if let Some(p) = settings.get("defaultPolicy").and_then(|v| v.as_str()) {
+        candidate.default_policy = p.to_string();
+    }
+    if settings.get("workspace").is_some() {
+        candidate.workspace = settings
+            .get("workspace")
+            .and_then(|v| v.as_str())
+            .map(|x| x.to_string());
+    }
+    if let Some(t) = settings.get("typingAnimation").and_then(|v| v.as_bool()) {
+        candidate.typing_animation = t;
+    }
+    // Permission mode + rules. Parse defensively: an unknown mode or a
+    // malformed rule list is IGNORED (keep the prior, safer value) rather than
+    // coerced — a bad save must never silently downgrade the permission gate.
+    if let Some(v) = settings.get("permissionMode") {
+        if let Ok(mode) = serde_json::from_value::<permissions::PermissionMode>(v.clone()) {
+            candidate.permission_mode = mode;
+        }
+    }
+    if let Some(v) = settings.get("rules") {
+        if let Ok(rules) = serde_json::from_value::<Vec<permissions::Rule>>(v.clone()) {
+            candidate.rules = rules;
+        }
+    }
+    if let Some(b) = settings.get("autoUpdate").and_then(|v| v.as_bool()) {
+        candidate.auto_update = b;
+    }
+    persist_settings_candidate(&mut current, candidate.clone(), &state.config_dir)?;
+    drop(current);
+
+    // Credential presence is derived from the OS store. It is never accepted
+    // from the patch or persisted as the source of truth.
+    candidate.api_key_set = secrets::has_api_key();
+    Ok(candidate)
+}
+
+fn persist_settings_candidate(
+    current: &mut Settings,
+    candidate: Settings,
+    config_dir: &std::path::Path,
+) -> Result<(), String> {
+    let save_result = candidate.save(config_dir);
+    finish_settings_transaction(current, candidate, save_result)
+}
+
+fn finish_settings_transaction(
+    current: &mut Settings,
+    candidate: Settings,
+    save_result: Result<(), settings::SettingsSaveError>,
+) -> Result<(), String> {
+    match save_result {
+        Ok(()) => {
+            *current = candidate;
+            Ok(())
+        }
+        Err(error) if error.candidate_is_committed() => {
+            // The destination already contains the candidate. Keep runtime and
+            // disk policy consistent, but return the coded durability warning so
+            // the frontend reconciles and does not present this as a clean save.
+            *current = candidate;
+            Err(error.to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod settings_command_transaction_tests {
+    use super::*;
+
+    #[test]
+    fn successful_persist_commits_memory_and_disk_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut current = Settings::default();
+        let candidate = Settings {
+            provider: "openai".into(),
+            model: "gpt-5.6-sol".into(),
+            response_speed: "fast".into(),
+            ..current.clone()
+        };
+
+        persist_settings_candidate(&mut current, candidate, dir.path()).unwrap();
+
+        let reloaded = Settings::load(dir.path());
+        assert_eq!(current.provider, "openai");
+        assert_eq!(current.model, "gpt-5.6-sol");
+        assert_eq!(current.response_speed, "fast");
+        assert_eq!(reloaded.provider, current.provider);
+        assert_eq!(reloaded.model, current.model);
+        assert_eq!(reloaded.response_speed, current.response_speed);
+    }
+
+    #[test]
+    fn failed_persist_leaves_live_memory_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let config_file = root.path().join("not-a-directory");
+        std::fs::write(&config_file, b"occupied").unwrap();
+        let mut current = Settings {
+            model: "committed-model".into(),
+            ..Settings::default()
+        };
+        let candidate = Settings {
+            model: "must-not-commit".into(),
+            ..current.clone()
+        };
+
+        let error = persist_settings_candidate(&mut current, candidate, &config_file)
+            .expect_err("an unwritable settings directory must reject the transaction");
+
+        assert!(error.contains("failed to create settings directory"));
+        assert_eq!(current.model, "committed-model");
+        assert_eq!(std::fs::read(&config_file).unwrap(), b"occupied");
+    }
+
+    #[test]
+    fn committed_but_unconfirmed_save_updates_memory_and_surfaces_warning() {
+        let mut current = Settings {
+            model: "old-model".into(),
+            ..Settings::default()
+        };
+        let candidate = Settings {
+            model: "candidate-model".into(),
+            ..current.clone()
+        };
+
+        let error = finish_settings_transaction(
+            &mut current,
+            candidate,
+            Err(settings::SettingsSaveError::CommittedDurabilityUnconfirmed(
+                "injected sync failure".into(),
+            )),
+        )
+        .expect_err("durability uncertainty must be surfaced");
+
+        assert!(error.starts_with(settings::COMMITTED_DURABILITY_UNCONFIRMED_PREFIX));
+        assert_eq!(current.model, "candidate-model");
+    }
+
+    #[test]
+    fn unknown_commit_state_keeps_the_running_policy_unchanged() {
+        let mut current = Settings {
+            model: "old-model".into(),
+            ..Settings::default()
+        };
+        let candidate = Settings {
+            model: "candidate-model".into(),
+            ..current.clone()
+        };
+
+        finish_settings_transaction(
+            &mut current,
+            candidate,
+            Err(settings::SettingsSaveError::StateUnknown(
+                "injected verification failure".into(),
+            )),
+        )
+        .expect_err("unknown state must be surfaced");
+
+        assert_eq!(current.model, "old-model");
+    }
 }
 
 #[tauri::command]
@@ -763,7 +900,7 @@ fn push_session_list(app: &AppHandle, db: &Db) {
     if let Some(hub) = app.try_state::<sync::SyncHub>() {
         match db.list_sessions() {
             Ok(sessions) => {
-                hub.publish_frame(sync::protocol::SyncFrame::SessionList { sessions });
+                hub.publish_frame(sync::public::session_list_frame(sessions));
             }
             Err(e) => eprintln!("phone-sync: list_sessions after session change failed: {e}"),
         }
@@ -2125,7 +2262,7 @@ pub fn run() {
             // do NOT set a blanket request `.timeout()` — that would kill long but
             // healthy streaming turns; the per-read idle timeout in `llm::stream_turn`
             // handles a stream that connects and then stalls.
-            let http = reqwest::Client::builder()
+            let http = http_client::credentialed_client_builder()
                 .connect_timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("failed to build HTTP client");
