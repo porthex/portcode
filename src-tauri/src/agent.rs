@@ -1079,7 +1079,7 @@ async fn run_loop_core(
             .await;
         let mut turn = match first_attempt {
             Err(error)
-                if error == "OpenAI response authentication failed (401)."
+                if error == crate::llm::OPENAI_UNAUTHORIZED_ERROR
                     && matches!(&cred, Credential::OpenAiOAuth(_)) =>
             {
                 let openai = auth.openai.as_ref().ok_or(

@@ -31,6 +31,8 @@ const API_VERSION: &str = "2023-06-01";
 const MAX_TOKENS: u32 = 8192;
 #[cfg(desktop)]
 const OPENAI_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+/// Stable classifier for the agent's one-shot OAuth refresh-and-retry path.
+pub(crate) const OPENAI_UNAUTHORIZED_ERROR: &str = "OpenAI response authentication failed (401).";
 
 /// Beta header that opts an OAuth (subscription) request into Anthropic's
 /// OAuth-authenticated inference path.
@@ -802,7 +804,7 @@ impl LlmProvider for OpenAiProvider {
         if !response.status().is_success() {
             let status = response.status();
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                return Err("OpenAI response authentication failed (401).".into());
+                return Err(OPENAI_UNAUTHORIZED_ERROR.into());
             }
             // Provider-controlled error bodies are neither displayed nor needed
             // for classification. Do not buffer or parse them: an unbounded or

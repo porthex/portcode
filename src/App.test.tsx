@@ -4,7 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import App from "./App";
 import { useStore } from "./store/store";
-import { DEFAULT_SETTINGS } from "./types";
+import { DEFAULT_SETTINGS, type OpenAIModelCatalogState } from "./types";
 import * as ipc from "./lib/ipc";
 import { getInstallState } from "./lib/installGate";
 
@@ -717,6 +717,65 @@ describe("TitleBar", () => {
     expect(container).not.toHaveTextContent(accountProfileId);
   });
 
+  it.each(["ready", "absent", "loading", "error"] as const)(
+    "shows the pinned account pill for a catalog-only model when its catalog is %s",
+    (catalogState) => {
+      const accountProfileId = "00000000-0000-4000-8000-000000000002";
+      const accountModel = {
+        id: "account-exclusive-model",
+        label: "Account exclusive model",
+        provider: "openai" as const,
+        reasoningEfforts: ["medium" as const],
+        defaultReasoningEffort: "medium" as const,
+      };
+      const activeSession = {
+        id: "catalog-only-openai-session",
+        title: "Catalog-only OpenAI work",
+        workspace: null,
+        branch: null,
+        model: accountModel.id,
+        accountProfileId,
+        createdAt: 1,
+        updatedAt: 1,
+      };
+      const account = {
+        id: accountProfileId,
+        accountLabel: "catalog@chatgpt.test",
+        tier: "ChatGPT Plus",
+        expiresAt: null,
+        state: "connected" as const,
+        createdAt: 1,
+        updatedAt: 1,
+        lastUsedAt: 1,
+      };
+      m.listSessions.mockResolvedValue([activeSession]);
+      m.listOpenAIAccounts.mockResolvedValue([account]);
+      m.openaiModels.mockResolvedValue([accountModel]);
+      const openAIModelCatalogs: Record<string, OpenAIModelCatalogState> =
+        catalogState === "absent"
+          ? {}
+          : {
+              [accountProfileId]:
+                catalogState === "ready"
+                  ? { status: "ready" as const, models: [accountModel], error: null }
+                  : catalogState === "loading"
+                    ? { status: "loading" as const, models: [], error: null }
+                    : { status: "error" as const, models: [], error: "catalog unavailable" },
+            };
+      useStore.setState({
+        sessions: [activeSession],
+        activeId: activeSession.id,
+        openAIAccounts: [account],
+        openAIModels: [accountModel],
+        openAIModelCatalogs,
+      });
+
+      render(<App />);
+
+      expect(screen.getByRole("banner")).toHaveTextContent("catalog@chatgpt.test");
+    },
+  );
+
   it("uses a safe tombstone badge when the active ChatGPT profile is gone", async () => {
     const accountProfileId = "00000000-0000-4000-8000-000000000099";
     const activeSession = {
@@ -735,7 +794,7 @@ describe("TitleBar", () => {
 
     const { container } = render(<App />);
 
-    expect((await screen.findAllByText("ACCOUNT REMOVED")).length).toBeGreaterThan(0);
+    await waitFor(() => expect(screen.getByRole("banner")).toHaveTextContent("ACCOUNT REMOVED"));
     expect(container).not.toHaveTextContent(accountProfileId);
   });
 
@@ -762,8 +821,10 @@ describe("TitleBar", () => {
 
     const { container } = render(<App />);
 
-    expect((await screen.findAllByText("ACCOUNT UNAVAILABLE")).length).toBeGreaterThan(0);
-    expect(screen.queryByText("ACCOUNT REMOVED")).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByRole("banner")).toHaveTextContent("ACCOUNT UNAVAILABLE"),
+    );
+    expect(screen.getByRole("banner")).not.toHaveTextContent("ACCOUNT REMOVED");
     expect(container).not.toHaveTextContent(accountProfileId);
   });
 

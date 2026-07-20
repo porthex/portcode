@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useStore } from "./store/store";
+import { modelsForOpenAIProfile, useStore } from "./store/store";
 import { Sidebar } from "./components/Sidebar";
 import { Chat } from "./components/Chat";
 import { FileExplorer } from "./components/FileExplorer";
@@ -367,6 +367,8 @@ function TitleBar({
   const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
   const openAIAccounts = useStore((s) => s.openAIAccounts);
   const openAIAccountsError = useStore((s) => s.openAIAccountsError);
+  const openAIModelCatalogs = useStore((s) => s.openAIModelCatalogs);
+  const openAIModels = useStore((s) => s.openAIModels);
   const openAIAccount = useStore((s) =>
     session?.accountProfileId
       ? s.openAIAccounts.find((account) => account.id === session.accountProfileId)
@@ -377,6 +379,15 @@ function TitleBar({
   const workspaceSurface = useStore((s) => s.workspaceSurface);
   const setWorkspaceSurface = useStore((s) => s.setWorkspaceSurface);
   const openWorkspaceReview = useStore((s) => s.openWorkspaceReview);
+  const sessionOpenAIModels = modelsForOpenAIProfile(
+    session?.accountProfileId,
+    openAIModelCatalogs,
+    openAIModels,
+  );
+  const sessionUsesOpenAI =
+    !!session &&
+    (session.accountProfileId != null ||
+      providerForModel(session.model, sessionOpenAIModels) === "openai");
   return (
     <header
       data-tauri-drag-region={isTauri() ? "deep" : undefined}
@@ -410,7 +421,7 @@ function TitleBar({
             {workspaceSurface === "review" ? "Review changes" : (session?.title ?? "New chat")}
           </span>
         </span>
-        {session && providerForModel(session.model) === "openai" && (
+        {sessionUsesOpenAI && (
           <span
             className={`pc-pill ${openAIAccount?.state === "connected" ? "pc-pill--success" : "pc-pill--warn"}`}
             title={

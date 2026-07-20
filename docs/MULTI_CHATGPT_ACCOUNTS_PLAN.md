@@ -658,7 +658,7 @@ couple it to the account-registry migration or session-picker release.
 - Browser transport: both WASM crates built and linted for
   `wasm32-unknown-unknown`; dependency-boundary and committed interop-contract
   freshness checks passed.
-- Frontend: lint, typecheck, 1,624 tests, and coverage passed at 96.19% statements,
+- Frontend: lint, typecheck, 1,628 tests, and coverage passed at 96.19% statements,
   97.41% functions, and 98.04% lines without lowering thresholds.
 - Product builds: desktop and web/PWA production builds, E2E typecheck, the normal
   gated Tauri debug build, and its live WebView2 smoke journey passed. Self-dev was
