@@ -132,6 +132,11 @@ pub struct TurnChangedFile {
 #[serde(rename_all = "camelCase")]
 pub struct TurnReceipt {
     pub turn_id: String,
+    /// Opaque local ChatGPT account profile used for this turn. This is never a
+    /// remote account identifier and is optional so receipts written by older
+    /// Portcode versions remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_profile_id: Option<String>,
     pub status: TurnStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
@@ -273,6 +278,10 @@ pub struct SessionRow {
     /// to the global default model when it is None.
     #[serde(default)]
     pub model: Option<String>,
+    /// Opaque local ChatGPT account profile pinned to this session. Legacy and
+    /// non-OpenAI sessions remain unpinned, and older peers can omit the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_profile_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -357,6 +366,77 @@ mod tests {
         .unwrap();
         assert!(row.turn_id.is_none());
         assert!(row.receipt.is_none());
+    }
+
+    #[test]
+    fn legacy_session_and_receipt_decode_without_account_attribution() {
+        let session: SessionRow = serde_json::from_value(json!({
+            "id": "s1",
+            "title": "Legacy",
+            "branch": null,
+            "workspace": null,
+            "model": "gpt-5.6-sol",
+            "createdAt": 1,
+            "updatedAt": 2
+        }))
+        .unwrap();
+        assert_eq!(session.account_profile_id, None);
+
+        let receipt: TurnReceipt = serde_json::from_value(json!({
+            "turnId": "turn-1",
+            "status": "completed",
+            "stopReason": "end_turn",
+            "startedAt": 1,
+            "completedAt": 2,
+            "durationMs": 1,
+            "changedFiles": [],
+            "changedFileCount": 0,
+            "additions": 0,
+            "deletions": 0,
+            "filesTruncated": false,
+            "changeCertainty": "exact",
+            "backgroundTasksRunning": false
+        }))
+        .unwrap();
+        assert_eq!(receipt.account_profile_id, None);
+        assert!(serde_json::to_value(&receipt)
+            .unwrap()
+            .get("accountProfileId")
+            .is_none());
+    }
+
+    #[test]
+    fn account_attribution_serializes_as_an_opaque_camel_case_field() {
+        let session = SessionRow {
+            id: "s1".into(),
+            title: "Pinned".into(),
+            branch: None,
+            workspace: None,
+            model: Some("gpt-5.6-sol".into()),
+            account_profile_id: Some("profile-a".into()),
+            created_at: 1,
+            updated_at: 2,
+        };
+        let encoded = serde_json::to_value(session).unwrap();
+        assert_eq!(encoded["accountProfileId"], "profile-a");
+
+        let mut receipt: TurnReceipt = serde_json::from_value(json!({
+            "turnId": "turn-1",
+            "status": "completed",
+            "startedAt": 1,
+            "completedAt": 2,
+            "changedFiles": [],
+            "changedFileCount": 0,
+            "additions": 0,
+            "deletions": 0,
+            "filesTruncated": false,
+            "changeCertainty": "exact",
+            "backgroundTasksRunning": false
+        }))
+        .unwrap();
+        receipt.account_profile_id = Some("profile-a".into());
+        let encoded = serde_json::to_value(receipt).unwrap();
+        assert_eq!(encoded["accountProfileId"], "profile-a");
     }
 
     #[test]

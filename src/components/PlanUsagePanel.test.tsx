@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as ipc from "../lib/ipc";
 import { useStore } from "../store/store";
-import type { PlanUsageSnapshot, ProviderId } from "../types";
+import type { OpenAIAccountSummary, PlanUsageSnapshot, ProviderId } from "../types";
 import { PlanUsagePanel } from "./PlanUsagePanel";
 
 vi.mock("../lib/ipc", () => ({
@@ -12,6 +12,18 @@ vi.mock("../lib/ipc", () => ({
 
 const m = vi.mocked(ipc);
 const initial = useStore.getState();
+
+const account = (over: Partial<OpenAIAccountSummary> = {}): OpenAIAccountSummary => ({
+  id: "00000000-0000-4000-8000-000000000001",
+  accountLabel: "gpt@example.com",
+  tier: "ChatGPT Plus",
+  expiresAt: null,
+  state: "connected",
+  createdAt: 1,
+  updatedAt: 1,
+  lastUsedAt: null,
+  ...over,
+});
 
 function usage(
   provider: ProviderId,
@@ -91,6 +103,7 @@ describe("PlanUsagePanel", () => {
         account: "gpt@example.com",
         tier: "ChatGPT Plus",
       },
+      openAIAccounts: [account()],
     });
     m.getPlanUsage.mockImplementation(async (provider) => usage(provider));
 
@@ -114,6 +127,69 @@ describe("PlanUsagePanel", () => {
         2,
       ),
     );
+    expect(m.getPlanUsage).toHaveBeenCalledWith("openai", "00000000-0000-4000-8000-000000000001");
+    expect(m.getPlanUsage).toHaveBeenCalledWith("anthropic", null);
+  });
+
+  it("renders and requests each ChatGPT profile independently", async () => {
+    const first = account();
+    const second = account({
+      id: "00000000-0000-4000-8000-000000000002",
+      accountLabel: "second@chatgpt.test",
+    });
+    useStore.setState({
+      openAIAuthStatus: {
+        signedIn: true,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: true,
+      },
+      openAIAccounts: [first, second],
+    });
+    m.getPlanUsage.mockImplementation(async (provider, accountProfileId) =>
+      usage(provider, {
+        windows: [
+          {
+            id: "session",
+            label: "Current session",
+            usedPercent: accountProfileId === second.id ? 60 : 20,
+            resetsAt: null,
+            windowMinutes: 300,
+          },
+        ],
+      }),
+    );
+
+    render(<PlanUsagePanel onlyProvider="openai" />);
+
+    const firstCard = screen.getByRole("article", {
+      name: "GPT plan usage for gpt@example.com",
+    });
+    const secondCard = screen.getByRole("article", {
+      name: "GPT plan usage for second@chatgpt.test",
+    });
+    expect(
+      await within(firstCard).findByRole("progressbar", {
+        name: "Current session remaining",
+      }),
+    ).toHaveAttribute("aria-valuenow", "80");
+    expect(
+      await within(secondCard).findByRole("progressbar", {
+        name: "Current session remaining",
+      }),
+    ).toHaveAttribute("aria-valuenow", "40");
+    expect(m.getPlanUsage).toHaveBeenCalledWith("openai", first.id);
+    expect(m.getPlanUsage).toHaveBeenCalledWith("openai", second.id);
+  });
+
+  it("never exposes a missing profile UUID in the scoped removed-account card", () => {
+    const missing = "00000000-0000-4000-8000-000000000009";
+    render(<PlanUsagePanel onlyProvider="openai" openAIAccountProfileId={missing} />);
+
+    expect(screen.getByText("Removed ChatGPT account")).toBeInTheDocument();
+    expect(screen.queryByText(missing)).not.toBeInTheDocument();
+    expect(m.getPlanUsage).not.toHaveBeenCalled();
   });
 
   it("keeps a healthy snapshot visible when a later refresh fails", async () => {
@@ -124,6 +200,7 @@ describe("PlanUsagePanel", () => {
         account: "gpt@example.com",
         tier: "ChatGPT Plus",
       },
+      openAIAccounts: [account()],
     });
     m.getPlanUsage.mockResolvedValueOnce(
       usage("openai", {

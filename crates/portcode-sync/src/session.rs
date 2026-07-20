@@ -142,7 +142,7 @@ pub async fn request_catch_up<C: FrameChannel + ?Sized>(
 
     let sessions = match channel.recv().await? {
         SyncFrame::SessionList { sessions } => sessions,
-        other => return Err(format!("expected SessionList, got {other:?}")),
+        _ => return Err("expected SessionList, got an unexpected frame".into()),
     };
 
     let mut deltas = Vec::with_capacity(cursors.len());
@@ -158,15 +158,14 @@ pub async fn request_catch_up<C: FrameChannel + ?Sized>(
                 messages,
             } => {
                 if session_id != cursor.session_id {
-                    return Err(format!(
-                        "catch-up MessageDelta session_id {session_id:?} does not match the \
-                         requested cursor {:?}",
-                        cursor.session_id
-                    ));
+                    return Err(
+                        "catch-up MessageDelta session id does not match the requested cursor"
+                            .into(),
+                    );
                 }
                 deltas.push((session_id, messages));
             }
-            other => return Err(format!("expected MessageDelta, got {other:?}")),
+            _ => return Err("expected MessageDelta, got an unexpected frame".into()),
         }
     }
     Ok(CatchUp { sessions, deltas })
@@ -225,16 +224,32 @@ pub trait CommandHandler: Send + Sync {
 
 /// Read frames from the phone and dispatch each `Command` to `handler`, until the
 /// channel closes. `Ack`s (phone progress) are accepted and ignored for now; any
-/// other frame in this position is a protocol error.
+/// other frame in this position is a protocol error. A handler error rejects only
+/// that application command: the handler is responsible for publishing any
+/// correlated result, and intake continues so a stale setting or unavailable DB
+/// cannot tear down an otherwise healthy encrypted transport. Only receive/wire
+/// failures terminate this loop.
 pub async fn handle_commands(
     source: &mut impl FrameSource,
     handler: &dyn CommandHandler,
 ) -> Result<(), String> {
     loop {
         match source.recv().await {
-            Ok(SyncFrame::Command { command }) => handler.handle(command).await?,
+            Ok(SyncFrame::Command { command }) => {
+                // Application failures are command-scoped, not transport failures.
+                // Do not log the handler's string here: implementations may carry
+                // local diagnostics, while any peer-safe error belongs in a bounded
+                // structured response frame emitted by the handler. Keep a generic
+                // local signal so an unexpectedly unmapped application failure is
+                // observable without exposing command text, paths, or credentials.
+                if handler.handle(command).await.is_err() {
+                    eprintln!(
+                        "phone-sync: remote command handler rejected a command; intake continues"
+                    );
+                }
+            }
             Ok(SyncFrame::Ack { .. }) => {}
-            Ok(other) => return Err(format!("unexpected frame in command loop: {other:?}")),
+            Ok(_) => return Err("unexpected frame in command loop".into()),
             Err(RecvError::Closed) => return Ok(()), // peer closed cleanly → done
             // A transport/protocol error is NOT a clean shutdown: surface it so the
             // session is torn down + reconnected rather than silently ending intake.
@@ -351,6 +366,7 @@ mod tests {
                         branch: None,
                         workspace: None,
                         model: None,
+                        account_profile_id: None,
                         created_at: 1,
                         updated_at: 2,
                     }],
@@ -617,6 +633,57 @@ mod tests {
         assert!(matches!(
             &seen[0],
             RemoteCommand::Run { session_id, .. } if session_id == "s1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_command_does_not_stop_subsequent_command_intake() {
+        use std::sync::{Arc, Mutex};
+
+        struct RejectFirst {
+            seen: Arc<Mutex<Vec<RemoteCommand>>>,
+        }
+        #[async_trait]
+        impl CommandHandler for RejectFirst {
+            async fn handle(&self, command: RemoteCommand) -> Result<(), String> {
+                let mut seen = self.seen.lock().unwrap();
+                seen.push(command);
+                if seen.len() == 1 {
+                    Err("private application diagnostic".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let mut source = ScriptedSource {
+            frames: [
+                SyncFrame::Command {
+                    command: RemoteCommand::CreateSession {
+                        request_id: "stale-create".into(),
+                        title: None,
+                    },
+                },
+                SyncFrame::Command {
+                    command: RemoteCommand::Cancel {
+                        session_id: "still-alive".into(),
+                    },
+                },
+            ]
+            .into(),
+            terminal: None,
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        handle_commands(&mut source, &RejectFirst { seen: seen.clone() })
+            .await
+            .expect("a command rejection is nonfatal");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "the command after a rejection must run");
+        assert!(matches!(
+            &seen[1],
+            RemoteCommand::Cancel { session_id } if session_id == "still-alive"
         ));
     }
 

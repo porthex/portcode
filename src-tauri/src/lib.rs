@@ -27,6 +27,8 @@ mod llm;
 #[cfg(desktop)]
 mod oauth;
 #[cfg(desktop)]
+mod openai_accounts;
+#[cfg(desktop)]
 mod openai_oauth;
 mod permissions;
 #[cfg(desktop)]
@@ -87,6 +89,17 @@ pub struct AppState {
     /// login persistence, and logout. Refreshes stay single-flight, and a queued
     /// refresh can never recreate a credential that logout cleared.
     pub oauth_refresh: Arc<tokio::sync::Mutex<()>>,
+    /// Native, profile-scoped ChatGPT credential registry. The registry owns its
+    /// own short commit lock, per-profile refresh locks, browser-login gate, and
+    /// lifecycle leases; it is intentionally independent from Anthropic OAuth.
+    #[cfg(desktop)]
+    pub openai_accounts: Arc<openai_accounts::OpenAiAccountRegistry>,
+    /// A failed singleton-to-registry migration must never be rendered as
+    /// "signed out". Commands retry the migration and clear this slot on success;
+    /// until then OpenAI admission fails visibly while exact profile removal stays
+    /// available as a recovery action.
+    #[cfg(desktop)]
+    pub openai_accounts_startup_error: Arc<Mutex<Option<String>>>,
     /// The phone's live remote-control session, when connected. Holds the
     /// command-injection sender + the session task handle; `None` when not
     /// connected. The `std::sync::Mutex` guard is only ever held across cheap
@@ -271,65 +284,242 @@ fn openai_tier_label(plan: Option<&str>) -> Option<String> {
 }
 
 #[cfg(desktop)]
-fn current_openai_oauth_status() -> OAuthStatus {
-    if let Err(reason) = openai_oauth::ensure_direct_subscription_enabled() {
-        return OAuthStatus {
-            available: false,
-            unavailable_reason: Some(reason),
-            signed_in: false,
-            expires_at: None,
-            account: None,
-            tier: None,
-        };
+fn account_error_message(error: &openai_accounts::OpenAiAccountError) -> String {
+    error.user_message().to_string()
+}
+
+/// Retry a failed legacy migration before any operation that could otherwise
+/// mistake an unavailable singleton credential for an empty account registry.
+/// The health slot serializes retries and is cleared only after a complete,
+/// journaled migration succeeds.
+#[cfg(desktop)]
+pub(crate) fn ensure_openai_accounts_ready(
+    registry: &openai_accounts::OpenAiAccountRegistry,
+    startup_error: &Mutex<Option<String>>,
+) -> Result<(), String> {
+    let mut health = startup_error
+        .lock()
+        .map_err(|_| "ChatGPT account health check is unavailable.".to_string())?;
+    if health.is_none() {
+        return Ok(());
     }
-    match secrets::get_openai_oauth() {
-        Some(tokens) => OAuthStatus {
-            available: true,
-            unavailable_reason: None,
-            signed_in: true,
-            expires_at: Some(tokens.expires_at),
-            account: tokens.email,
-            tier: openai_tier_label(tokens.plan.as_deref()),
-        },
-        None => OAuthStatus {
-            available: true,
-            unavailable_reason: None,
-            signed_in: false,
-            expires_at: None,
-            account: None,
-            tier: None,
-        },
+    match registry.migrate_legacy(oauth::now_secs()) {
+        Ok(_) => {
+            *health = None;
+            Ok(())
+        }
+        Err(error) => {
+            let message = account_error_message(&error);
+            *health = Some(message.clone());
+            Err(message)
+        }
     }
 }
 
 #[cfg(desktop)]
-async fn fresh_openai_tokens(
-    state: &State<'_, AppState>,
-) -> Result<secrets::OpenAiOAuthTokens, String> {
-    const REFRESH_SKEW_SECS: i64 = 300;
-    openai_oauth::ensure_direct_subscription_enabled()?;
-    let tokens = secrets::get_openai_oauth()
-        .ok_or("Sign in with your ChatGPT subscription in Settings first.")?;
-    if tokens.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS {
-        return Ok(tokens);
+fn unavailable_openai_status(reason: String) -> OAuthStatus {
+    OAuthStatus {
+        available: false,
+        unavailable_reason: Some(reason),
+        signed_in: false,
+        expires_at: None,
+        account: None,
+        tier: None,
     }
-    let _guard = state.oauth_refresh.lock().await;
-    let current = secrets::get_openai_oauth()
-        .ok_or("Your ChatGPT subscription session was removed. Sign in again.")?;
-    if current.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS {
+}
+
+#[cfg(desktop)]
+fn current_openai_oauth_status(state: &AppState) -> OAuthStatus {
+    if let Err(reason) = openai_oauth::ensure_direct_subscription_enabled() {
+        return unavailable_openai_status(reason);
+    }
+    if let Err(reason) =
+        ensure_openai_accounts_ready(&state.openai_accounts, &state.openai_accounts_startup_error)
+    {
+        return unavailable_openai_status(reason);
+    }
+    match state.openai_accounts.list_accounts() {
+        Ok(accounts) => {
+            let connected = accounts
+                .into_iter()
+                .find(|account| account.state == openai_accounts::OpenAiAccountState::Connected);
+            OAuthStatus {
+                available: true,
+                unavailable_reason: None,
+                signed_in: connected.is_some(),
+                expires_at: connected.as_ref().and_then(|account| account.expires_at),
+                account: connected
+                    .as_ref()
+                    .and_then(|account| account.account_label.clone()),
+                tier: connected
+                    .as_ref()
+                    .and_then(|account| openai_tier_label(account.tier.as_deref())),
+            }
+        }
+        Err(error) => unavailable_openai_status(account_error_message(&error)),
+    }
+}
+
+#[cfg(desktop)]
+fn load_connected_openai_profile(
+    registry: &openai_accounts::OpenAiAccountRegistry,
+    id: &openai_accounts::AccountProfileId,
+) -> Result<openai_accounts::OpenAiAccountProfile, String> {
+    let summary = registry
+        .list_accounts()
+        .map_err(|error| account_error_message(&error))?
+        .into_iter()
+        .find(|account| account.id == *id)
+        .ok_or_else(|| "ChatGPT account profile was not found.".to_string())?;
+    if summary.state != openai_accounts::OpenAiAccountState::Connected {
+        return Err(match summary.state {
+            openai_accounts::OpenAiAccountState::Removed => {
+                "This ChatGPT account was removed. Reconnect it before use.".into()
+            }
+            openai_accounts::OpenAiAccountState::ReconnectRequired
+            | openai_accounts::OpenAiAccountState::Unavailable => {
+                "This ChatGPT account must be reconnected before use.".into()
+            }
+            openai_accounts::OpenAiAccountState::Connected => unreachable!(),
+        });
+    }
+    registry
+        .load_profile(id)
+        .map_err(|error| account_error_message(&error))
+}
+
+#[cfg(desktop)]
+fn openai_profile_is_fresh(profile: &openai_accounts::OpenAiAccountProfile) -> bool {
+    const REFRESH_SKEW_SECS: i64 = 300;
+    profile.tokens.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS
+}
+
+#[cfg(desktop)]
+async fn fresh_openai_profile(
+    http: &reqwest::Client,
+    registry: &openai_accounts::OpenAiAccountRegistry,
+    id: &openai_accounts::AccountProfileId,
+) -> Result<openai_accounts::OpenAiAccountProfile, String> {
+    openai_oauth::ensure_direct_subscription_enabled()?;
+    let profile = load_connected_openai_profile(registry, id)?;
+    if openai_profile_is_fresh(&profile) {
+        return Ok(profile);
+    }
+
+    let _refresh = registry
+        .lock_refresh(id)
+        .await
+        .map_err(|error| account_error_message(&error))?;
+    let current = load_connected_openai_profile(registry, id)?;
+    if openai_profile_is_fresh(&current) {
         return Ok(current);
     }
-    match openai_oauth::refresh(&state.http, &current).await {
-        Ok(refreshed) => {
-            secrets::set_openai_oauth(&refreshed)?;
-            Ok(refreshed)
+
+    match openai_oauth::refresh(http, &current.tokens).await {
+        Ok(tokens) => match registry.store_refreshed_profile(
+            id,
+            current.credential_generation,
+            tokens,
+            oauth::now_secs(),
+        ) {
+            Ok(profile) => Ok(profile),
+            Err(openai_accounts::OpenAiAccountError::CredentialConflict) => {
+                let latest = load_connected_openai_profile(registry, id)?;
+                if openai_profile_is_fresh(&latest) {
+                    Ok(latest)
+                } else {
+                    Err("The ChatGPT credential changed during refresh. Please retry.".into())
+                }
+            }
+            Err(error) => Err(account_error_message(&error)),
+        },
+        Err(error) if openai_oauth::refresh_failure_requires_reconnect(&error) => {
+            match registry.mark_reconnect_required(
+                id,
+                current.credential_generation,
+                oauth::now_secs(),
+            ) {
+                Ok(()) => Err(
+                    "Your ChatGPT subscription session expired. Reconnect this account in Settings."
+                        .into(),
+                ),
+                Err(openai_accounts::OpenAiAccountError::CredentialConflict) => {
+                    let latest = load_connected_openai_profile(registry, id)?;
+                    if openai_profile_is_fresh(&latest) {
+                        Ok(latest)
+                    } else {
+                        Err("The ChatGPT credential changed during refresh. Please retry.".into())
+                    }
+                }
+                Err(mark_error) => Err(account_error_message(&mark_error)),
+            }
         }
-        Err(error) if openai_oauth::is_terminal_auth_error(&error) => {
-            let _ = secrets::clear_openai_oauth();
-            Err(
-                "Your ChatGPT subscription session expired. Please sign in again in Settings."
-                    .into(),
-            )
+        Err(error) => Err(error),
+    }
+}
+
+/// Recover one account-scoped 401 without changing profile identity. A newer
+/// access token committed while the failed request was in flight is reused;
+/// otherwise this performs one generation-checked refresh. The caller retries
+/// the failed request exactly once with the returned profile.
+#[cfg(desktop)]
+async fn recover_openai_authentication(
+    http: &reqwest::Client,
+    registry: &openai_accounts::OpenAiAccountRegistry,
+    id: &openai_accounts::AccountProfileId,
+    attempted: &openai_accounts::OpenAiAccountProfile,
+) -> Result<openai_accounts::OpenAiAccountProfile, String> {
+    let _refresh = registry
+        .lock_refresh(id)
+        .await
+        .map_err(|error| account_error_message(&error))?;
+    let current = load_connected_openai_profile(registry, id)?;
+    if current.tokens.access_token != attempted.tokens.access_token {
+        return Ok(current);
+    }
+
+    match openai_oauth::refresh(http, &current.tokens).await {
+        Ok(tokens) => match registry.store_refreshed_profile(
+            id,
+            current.credential_generation,
+            tokens,
+            oauth::now_secs(),
+        ) {
+            Ok(profile) => Ok(profile),
+            Err(openai_accounts::OpenAiAccountError::CredentialConflict) => {
+                let latest = load_connected_openai_profile(registry, id)?;
+                if latest.tokens.access_token != attempted.tokens.access_token {
+                    Ok(latest)
+                } else {
+                    Err(account_error_message(
+                        &openai_accounts::OpenAiAccountError::CredentialConflict,
+                    ))
+                }
+            }
+            Err(error) => Err(account_error_message(&error)),
+        },
+        Err(error) if openai_oauth::refresh_failure_requires_reconnect(&error) => {
+            match registry.mark_reconnect_required(
+                id,
+                current.credential_generation,
+                oauth::now_secs(),
+            ) {
+                Ok(()) => Err(
+                    "Your ChatGPT subscription session expired. Reconnect this account in Settings."
+                        .into(),
+                ),
+                Err(openai_accounts::OpenAiAccountError::CredentialConflict) => {
+                    let latest = load_connected_openai_profile(registry, id)?;
+                    if latest.tokens.access_token != attempted.tokens.access_token {
+                        Ok(latest)
+                    } else {
+                        Err(account_error_message(
+                            &openai_accounts::OpenAiAccountError::CredentialConflict,
+                        ))
+                    }
+                }
+                Err(mark_error) => Err(account_error_message(&mark_error)),
+            }
         }
         Err(error) => Err(error),
     }
@@ -337,36 +527,148 @@ async fn fresh_openai_tokens(
 
 #[cfg(desktop)]
 #[tauri::command]
-async fn start_openai_oauth_login(state: State<'_, AppState>) -> Result<OAuthStatus, String> {
-    // Serialize login, persistence, refresh, and logout. Holding the lock through
-    // the browser flow gives a concurrent logout deterministic "last action"
-    // semantics: it clears the credential after login finishes.
-    let _guard = state.oauth_refresh.lock().await;
+fn list_openai_accounts(
+    state: State<'_, AppState>,
+) -> Result<Vec<openai_accounts::OpenAiAccountSummary>, String> {
+    ensure_openai_accounts_ready(&state.openai_accounts, &state.openai_accounts_startup_error)?;
+    state
+        .openai_accounts
+        .list_accounts()
+        .map_err(|error| account_error_message(&error))
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn start_openai_account_login(
+    state: State<'_, AppState>,
+) -> Result<openai_accounts::OpenAiAccountSummary, String> {
+    openai_oauth::ensure_direct_subscription_enabled()?;
+    ensure_openai_accounts_ready(&state.openai_accounts, &state.openai_accounts_startup_error)?;
+    let _browser_login = state
+        .openai_accounts
+        .try_lock_browser_login()
+        .map_err(|error| account_error_message(&error))?;
     let tokens = openai_oauth::run_loopback_login(&state.http).await?;
-    secrets::set_openai_oauth(&tokens)?;
-    Ok(current_openai_oauth_status())
+    state
+        .openai_accounts
+        .register_account(tokens, oauth::now_secs())
+        .map_err(|error| account_error_message(&error))
+}
+
+#[cfg(desktop)]
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum OpenAiReconnectOutcome {
+    Reconnected {
+        account: openai_accounts::OpenAiAccountSummary,
+    },
+    IdentityMismatch {
+        message: String,
+    },
 }
 
 #[cfg(desktop)]
 #[tauri::command]
-fn openai_oauth_status() -> Result<OAuthStatus, String> {
-    Ok(current_openai_oauth_status())
+async fn reconnect_openai_account(
+    state: State<'_, AppState>,
+    account_profile_id: String,
+) -> Result<OpenAiReconnectOutcome, String> {
+    openai_oauth::ensure_direct_subscription_enabled()?;
+    ensure_openai_accounts_ready(&state.openai_accounts, &state.openai_accounts_startup_error)?;
+    let id = openai_accounts::AccountProfileId::parse(&account_profile_id)
+        .map_err(|error| account_error_message(&error))?;
+    if !state
+        .openai_accounts
+        .list_accounts()
+        .map_err(|error| account_error_message(&error))?
+        .iter()
+        .any(|account| account.id == id)
+    {
+        return Err("ChatGPT account profile was not found.".into());
+    }
+    // Hold the lifecycle lease before opening the browser and through the
+    // credential commit. A concurrent removal therefore cannot tombstone this
+    // profile and then be silently undone by the in-flight reconnect.
+    let _profile = state
+        .openai_accounts
+        .acquire_run_lease(&id)
+        .map_err(|error| account_error_message(&error))?;
+    let _browser_login = state
+        .openai_accounts
+        .try_lock_browser_login()
+        .map_err(|error| account_error_message(&error))?;
+    let tokens = openai_oauth::run_loopback_login(&state.http).await?;
+    match state
+        .openai_accounts
+        .reconnect_account(&id, tokens, oauth::now_secs())
+    {
+        Ok(account) => Ok(OpenAiReconnectOutcome::Reconnected { account }),
+        Err(openai_accounts::OpenAiAccountError::IdentityMismatch) => {
+            Ok(OpenAiReconnectOutcome::IdentityMismatch {
+                message: openai_accounts::OpenAiAccountError::IdentityMismatch
+                    .user_message()
+                    .to_string(),
+            })
+        }
+        Err(error) => Err(account_error_message(&error)),
+    }
 }
 
 #[cfg(desktop)]
 #[tauri::command]
-async fn openai_oauth_logout(state: State<'_, AppState>) -> Result<(), String> {
-    let _guard = state.oauth_refresh.lock().await;
-    secrets::clear_openai_oauth()
+async fn remove_openai_account(
+    state: State<'_, AppState>,
+    account_profile_id: String,
+) -> Result<(), String> {
+    // Removal deliberately bypasses the capability and migration-health gates:
+    // users must be able to delete an exact local profile while network access is
+    // disabled or another registry entry is damaged.
+    let id = openai_accounts::AccountProfileId::parse(&account_profile_id)
+        .map_err(|error| account_error_message(&error))?;
+    // Removal participates in the global browser-flow ordering without checking
+    // the network capability gate. If a login is already open, the queued remove
+    // commits afterward and wins; if removal owns the lock first, a new login
+    // fails fast rather than resurrecting the profile after its tombstone.
+    let _browser_login = state.openai_accounts.lock_browser_login().await;
+    state
+        .openai_accounts
+        .remove_account(&id, oauth::now_secs())
+        .map_err(|error| account_error_message(&error))
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+fn openai_oauth_status(state: State<'_, AppState>) -> Result<OAuthStatus, String> {
+    Ok(current_openai_oauth_status(&state))
 }
 
 #[cfg(desktop)]
 #[tauri::command]
 async fn openai_models(
     state: State<'_, AppState>,
+    account_profile_id: String,
 ) -> Result<Vec<openai_oauth::OpenAiModel>, String> {
-    let tokens = fresh_openai_tokens(&state).await?;
-    openai_oauth::models(&state.http, &tokens).await
+    ensure_openai_accounts_ready(&state.openai_accounts, &state.openai_accounts_startup_error)?;
+    let id = openai_accounts::AccountProfileId::parse(&account_profile_id)
+        .map_err(|error| account_error_message(&error))?;
+    let _profile = state
+        .openai_accounts
+        .acquire_run_lease(&id)
+        .map_err(|error| account_error_message(&error))?;
+    let profile = fresh_openai_profile(&state.http, &state.openai_accounts, &id).await?;
+    // Re-check the runtime kill switch immediately before the network request.
+    openai_oauth::ensure_direct_subscription_enabled()?;
+    match openai_oauth::models(&state.http, &profile.tokens).await {
+        Ok(models) => Ok(models),
+        Err(error) if openai_oauth::is_model_authentication_error(&error) => {
+            let recovered =
+                recover_openai_authentication(&state.http, &state.openai_accounts, &id, &profile)
+                    .await?;
+            openai_oauth::ensure_direct_subscription_enabled()?;
+            openai_oauth::models(&state.http, &recovered.tokens).await
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Fetch a display-safe subscription quota snapshot for one signed-in provider.
@@ -377,9 +679,13 @@ async fn openai_models(
 async fn get_plan_usage(
     state: State<'_, AppState>,
     provider: String,
+    account_profile_id: Option<String>,
 ) -> Result<plan_usage::PlanUsageSnapshot, String> {
     match provider.as_str() {
         "anthropic" => {
+            if account_profile_id.is_some() {
+                return Err("Claude usage does not accept a ChatGPT account profile.".into());
+            }
             let tokens = secrets::get_oauth()
                 .ok_or("Sign in with your Claude subscription in Settings first.")?;
             let credential = agent::ensure_fresh(
@@ -394,15 +700,46 @@ async fn get_plan_usage(
             plan_usage::anthropic(&state.http, &tokens).await
         }
         "openai" => {
-            let tokens = fresh_openai_tokens(&state).await?;
-            // Re-check directly before the usage request so a runtime kill
-            // switch applied after refresh still prevents network access.
+            ensure_openai_accounts_ready(
+                &state.openai_accounts,
+                &state.openai_accounts_startup_error,
+            )?;
+            let account_profile_id =
+                account_profile_id.ok_or("Choose a ChatGPT account before loading plan usage.")?;
+            let id = openai_accounts::AccountProfileId::parse(&account_profile_id)
+                .map_err(|error| account_error_message(&error))?;
+            let _profile = state
+                .openai_accounts
+                .acquire_run_lease(&id)
+                .map_err(|error| account_error_message(&error))?;
+            let profile = fresh_openai_profile(&state.http, &state.openai_accounts, &id).await?;
             openai_oauth::ensure_direct_subscription_enabled()?;
-            plan_usage::openai(&state.http, &tokens).await
+            match plan_usage::openai(&state.http, &profile.tokens).await {
+                Ok(snapshot) => Ok(snapshot),
+                Err(error) if plan_usage::is_openai_authentication_error(&error) => {
+                    let recovered = recover_openai_authentication(
+                        &state.http,
+                        &state.openai_accounts,
+                        &id,
+                        &profile,
+                    )
+                    .await?;
+                    openai_oauth::ensure_direct_subscription_enabled()?;
+                    // Exactly one retry; another 401 is returned without a loop.
+                    plan_usage::openai(&state.http, &recovered.tokens).await
+                }
+                Err(error) => Err(error),
+            }
         }
         _ => Err("Unknown plan-usage provider.".into()),
     }
 }
+
+/*
+ * The singleton OpenAI credential commands intentionally end here. Profiles are
+ * always addressed by canonical local UUID; no command reads or rewrites a
+ * process-global OpenAI credential slot.
+ */
 
 // ── sessions ─────────────────────────────────────────────────────────────────
 
@@ -445,6 +782,137 @@ fn list_sessions(state: State<AppState>) -> Vec<SessionRow> {
     state.db.list_sessions().unwrap_or_default()
 }
 
+fn settings_snapshot(state: &AppState) -> Result<Settings, String> {
+    state
+        .settings
+        .lock()
+        .map(|settings| settings.clone())
+        .map_err(|_| "Settings are temporarily unavailable.".to_string())
+}
+
+fn effective_session_model(settings: &Settings, requested: Option<&str>) -> Result<String, String> {
+    let model = requested.unwrap_or(&settings.model);
+    if model.is_empty() || model.trim() != model {
+        return Err("Select a valid model before creating the conversation.".into());
+    }
+    llm::provider_name_for_model(model)?;
+    Ok(model.to_string())
+}
+
+fn require_session_row(db: &Db, id: &str) -> Result<SessionRow, String> {
+    db.list_sessions()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|session| session.id == id)
+        .ok_or_else(|| "Session was not found after it was saved.".to_string())
+}
+
+#[cfg(desktop)]
+struct ValidatedOpenAiAccount {
+    id: openai_accounts::AccountProfileId,
+    _lease: openai_accounts::ProfileRunLease,
+}
+
+#[cfg(desktop)]
+fn validate_model_account(
+    state: &AppState,
+    model: &str,
+    account_profile_id: Option<&str>,
+) -> Result<Option<ValidatedOpenAiAccount>, String> {
+    match llm::provider_name_for_model(model)? {
+        "anthropic" => {
+            if account_profile_id.is_some() {
+                Err("A Claude conversation cannot be assigned a ChatGPT account.".into())
+            } else {
+                Ok(None)
+            }
+        }
+        "openai" => {
+            openai_oauth::ensure_direct_subscription_enabled()?;
+            ensure_openai_accounts_ready(
+                &state.openai_accounts,
+                &state.openai_accounts_startup_error,
+            )?;
+            let raw_id = account_profile_id
+                .ok_or("Choose a connected ChatGPT account for this conversation.")?;
+            let id = openai_accounts::AccountProfileId::parse(raw_id)
+                .map_err(|error| account_error_message(&error))?;
+            let lease = state
+                .openai_accounts
+                .acquire_run_lease(&id)
+                .map_err(|error| account_error_message(&error))?;
+            load_connected_openai_profile(&state.openai_accounts, &id)?;
+            Ok(Some(ValidatedOpenAiAccount { id, _lease: lease }))
+        }
+        _ => unreachable!("provider_name_for_model returns only supported providers"),
+    }
+}
+
+#[cfg(mobile)]
+fn validate_model_account(
+    _state: &AppState,
+    model: &str,
+    account_profile_id: Option<&str>,
+) -> Result<(), String> {
+    match llm::provider_name_for_model(model)? {
+        "anthropic" if account_profile_id.is_none() => Ok(()),
+        "anthropic" => Err("A Claude conversation cannot be assigned a ChatGPT account.".into()),
+        "openai" => {
+            Err("ChatGPT account selection is available on the paired desktop only.".into())
+        }
+        _ => unreachable!("provider_name_for_model returns only supported providers"),
+    }
+}
+
+#[cfg(test)]
+mod session_command_contract_tests {
+    use super::*;
+
+    #[test]
+    fn effective_model_is_validated_and_freezes_the_current_default() {
+        let settings = Settings::default();
+        assert_eq!(
+            effective_session_model(&settings, None).unwrap(),
+            "claude-opus-4-8"
+        );
+        assert_eq!(
+            effective_session_model(&settings, Some("gpt-5.6-sol")).unwrap(),
+            "gpt-5.6-sol"
+        );
+        assert!(effective_session_model(&settings, Some(" gpt-5.6-sol")).is_err());
+        assert!(effective_session_model(&settings, Some("custom-model")).is_err());
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn account_storage_errors_do_not_cross_ipc_with_backend_details() {
+        let error = openai_accounts::OpenAiAccountError::Storage(
+            secrets::SecretStoreError::Backend("access-token-at-C:/private/path".into()),
+        );
+        let display = account_error_message(&error);
+        assert!(display.contains("unavailable or corrupt"));
+        assert!(!display.contains("access-token"));
+        assert!(!display.contains("private/path"));
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn reconnect_identity_mismatch_is_a_typed_display_safe_outcome() {
+        let value = serde_json::to_value(OpenAiReconnectOutcome::IdentityMismatch {
+            message: openai_accounts::OpenAiAccountError::IdentityMismatch
+                .user_message()
+                .to_string(),
+        })
+        .unwrap();
+        assert_eq!(value["status"], "identity_mismatch");
+        assert_eq!(
+            value["message"],
+            "The signed-in ChatGPT account does not match this profile."
+        );
+        assert_eq!(value.as_object().unwrap().len(), 2);
+    }
+}
+
 #[tauri::command]
 fn create_session(
     app: AppHandle,
@@ -453,20 +921,116 @@ fn create_session(
     title: Option<String>,
     workspace: Option<String>,
     model: Option<String>,
-) -> Result<(), String> {
+    account_profile_id: Option<String>,
+) -> Result<SessionRow, String> {
+    let settings = settings_snapshot(&state)?;
+    let model = effective_session_model(&settings, model.as_deref())?;
+    #[cfg(desktop)]
+    let account = validate_model_account(&state, &model, account_profile_id.as_deref())?;
+    #[cfg(mobile)]
+    validate_model_account(&state, &model, account_profile_id.as_deref())?;
+    #[cfg(desktop)]
+    let persisted_account_profile_id = account.as_ref().map(|account| account.id.as_str());
+    #[cfg(mobile)]
+    let persisted_account_profile_id: Option<&str> = None;
+
     state
         .db
-        .create_session(
+        .create_session_with_account(
             &id,
             title.as_deref().unwrap_or("New chat"),
             workspace.as_deref(),
-            model.as_deref(),
+            Some(&model),
+            persisted_account_profile_id,
             db::now_ms(),
         )
         .map_err(|e| e.to_string())?;
+
+    #[cfg(desktop)]
+    if let Some(account) = &account {
+        // Metadata follows the committed session write. Its best-effort failure
+        // must not turn a successful create into a false client-visible failure.
+        if state
+            .openai_accounts
+            .record_last_used(&account.id, oauth::now_secs())
+            .is_err()
+        {
+            eprintln!("openai-accounts: failed to update last-used metadata after session create");
+        }
+    }
+
+    let saved = require_session_row(&state.db, &id)?;
     // Notify any connected sync client of the new session (best-effort).
     push_session_list(&app, &state.db);
-    Ok(())
+    Ok(saved)
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+fn pin_session_openai_account(
+    app: AppHandle,
+    state: State<AppState>,
+    session_id: String,
+    account_profile_id: String,
+) -> Result<SessionRow, String> {
+    let settings = settings_snapshot(&state)?;
+    let run_config = state
+        .db
+        .session_run_config(&session_id)
+        .map_err(|error| format!("Session is unavailable: {error}"))?;
+    let effective_model = effective_session_model(&settings, run_config.model.as_deref())?;
+    if llm::provider_name_for_model(&effective_model)? != "openai" {
+        return Err("Only an OpenAI conversation can be pinned to a ChatGPT account.".into());
+    }
+    let account = validate_model_account(&state, &effective_model, Some(&account_profile_id))?
+        .expect("OpenAI validation always returns a profile lease");
+
+    match state
+        .db
+        .pin_legacy_session_account_if_config(
+            &session_id,
+            account.id.as_str(),
+            &run_config,
+            Some(&effective_model),
+        )
+        .map_err(|error| error.to_string())?
+    {
+        db::LegacySessionAccountPin::Pinned | db::LegacySessionAccountPin::AlreadyPinnedSame => {}
+        db::LegacySessionAccountPin::Conflict { .. } => {
+            return Err(
+                "This conversation is already pinned to a different ChatGPT account.".into(),
+            );
+        }
+        db::LegacySessionAccountPin::SessionChanged { .. } => {
+            return Err(
+                "This conversation's model or account changed while it was being pinned. Review it and retry."
+                    .into(),
+            );
+        }
+    }
+    let persisted = state
+        .db
+        .session_run_config(&session_id)
+        .map_err(|error| format!("Session is unavailable after pinning: {error}"))?;
+    let persisted_model = effective_session_model(&settings, persisted.model.as_deref())?;
+    if llm::provider_name_for_model(&persisted_model)? != "openai"
+        || persisted.account_profile_id.as_deref() != Some(account.id.as_str())
+    {
+        return Err(
+            "The conversation changed while its ChatGPT account was being pinned. Review it before sending."
+                .into(),
+        );
+    }
+    if state
+        .openai_accounts
+        .record_last_used(&account.id, oauth::now_secs())
+        .is_err()
+    {
+        eprintln!("openai-accounts: failed to update last-used metadata after session pin");
+    }
+    let saved = require_session_row(&state.db, &session_id)?;
+    push_session_list(&app, &state.db);
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -492,10 +1056,25 @@ fn update_session_model(
     id: String,
     model: String,
 ) -> Result<(), String> {
-    state
+    let run_config = state
         .db
-        .update_session_model(&id, &model)
+        .session_run_config(&id)
+        .map_err(|error| format!("Session is unavailable: {error}"))?;
+    #[cfg(desktop)]
+    let _account =
+        validate_model_account(&state, &model, run_config.account_profile_id.as_deref())?;
+    #[cfg(mobile)]
+    validate_model_account(&state, &model, run_config.account_profile_id.as_deref())?;
+    let updated = state
+        .db
+        .compare_and_set_session_model(&id, &run_config, &model)
         .map_err(|e| e.to_string())?;
+    if !updated {
+        return Err(
+            "This conversation's model or account changed while the selection was saving. Review it and retry."
+                .into(),
+        );
+    }
     // Keep a connected phone's authoritative session list in sync with the DB.
     push_session_list(&app, &state.db);
     Ok(())
@@ -675,8 +1254,30 @@ async fn run_agent(
     state: State<'_, AppState>,
     session_id: String,
     text: String,
-    model: Option<String>,
 ) -> Result<(), String> {
+    let settings_for_admission = settings_snapshot(&state)?;
+    let run_config = state
+        .db
+        .session_run_config(&session_id)
+        .map_err(|error| format!("Session is unavailable: {error}"))?;
+    let effective_model =
+        effective_session_model(&settings_for_admission, run_config.model.as_deref())?;
+    if llm::provider_name_for_model(&effective_model)? == "openai" {
+        ensure_openai_accounts_ready(&state.openai_accounts, &state.openai_accounts_startup_error)?;
+    }
+    let admission = agent::admit_run(
+        state.cancels.clone(),
+        &state.db,
+        &settings_for_admission,
+        state.openai_accounts.clone(),
+        &session_id,
+    )?;
+    // Re-check against the immutable admission to close a provider/model race
+    // between the preliminary health lookup and the authoritative DB snapshot.
+    if admission.is_openai() {
+        ensure_openai_accounts_ready(&state.openai_accounts, &state.openai_accounts_startup_error)?;
+    }
+
     let http = state.http.clone();
     let settings = state.settings.clone();
     let db = state.db.clone();
@@ -684,13 +1285,6 @@ async fn run_agent(
     let agents = state.agents.clone();
     let background = state.background.clone();
     let oauth_refresh = state.oauth_refresh.clone();
-    let reservation = agent::RunReservation::try_acquire(state.cancels.clone(), &session_id)?;
-    // Validate after reservation and before spawn so a missing/deleted session
-    // cannot create orphan receipt/message rows. An error drops the reservation.
-    state
-        .db
-        .session_model(&session_id)
-        .map_err(|error| error.to_string())?;
 
     // Wrap the AppHandle in the concrete EventSink at the command boundary, so the
     // agent core receives only the trait — its sole Tauri coupling (event emission)
@@ -705,14 +1299,13 @@ async fn run_agent(
             http,
             settings,
             db,
-            reservation,
+            admission,
             pending,
             agents,
             background,
             oauth_refresh,
             session_id,
             text,
-            model,
         )
         .await;
     });
@@ -983,6 +1576,8 @@ fn phone_sync_listen(app: AppHandle, state: State<AppState>) -> Result<(), Strin
         state.agents.clone(),
         state.background.clone(),
         state.oauth_refresh.clone(),
+        state.openai_accounts.clone(),
+        state.openai_accounts_startup_error.clone(),
         state.listen_endpoint.clone(),
         state.pairing_gate.clone(),
     )
@@ -1110,10 +1705,14 @@ async fn serve_connection(
                             pairing_gate.forget_pending(&request_id);
                             break false;
                         }
-                        Ok(other) => {
+                        Ok(_) => {
+                            // The peer is not trusted yet. Never reflect the
+                            // frame's Debug representation into local logs: it
+                            // may contain arbitrary prompts, titles, or push
+                            // credentials supplied before SAS confirmation.
                             eprintln!(
-                                "phone-sync: unexpected frame before pairing confirmed: \
-                                 {other:?} — dropping connection"
+                                "phone-sync: unexpected frame before pairing confirmed — \
+                                 dropping connection"
                             );
                             pairing_gate.forget_pending(&request_id);
                             break false;
@@ -1210,7 +1809,7 @@ async fn serve_connection(
 // cross into the spawn. Called once from `setup` (startup) and from the idempotent
 // `phone_sync_listen` backstop.
 #[cfg(desktop)]
-// 9 params (the AppState pieces the accept loop needs as owned clones, plus the
+// The AppState pieces the accept loop needs as owned clones, plus the
 // shared `listen_endpoint` and `pairing_gate`) > clippy's 7-arg threshold; same
 // pattern + allow as `agent::run`. Bundling them into a struct buys nothing here —
 // they are already the `AppState` fields, threaded through once.
@@ -1225,6 +1824,8 @@ fn start_listener(
     agents: agents::Agents,
     background: background::Background,
     oauth_refresh: Arc<tokio::sync::Mutex<()>>,
+    openai_accounts: Arc<openai_accounts::OpenAiAccountRegistry>,
+    openai_accounts_startup_error: Arc<Mutex<Option<String>>>,
     listen_endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
     pairing_gate: Arc<sync::pairing_gate::PairingGate>,
 ) -> Result<(), String> {
@@ -1243,6 +1844,8 @@ fn start_listener(
         agents,
         background,
         oauth_refresh,
+        openai_accounts,
+        openai_accounts_startup_error,
     };
     let app_for_loop = app.clone();
 
@@ -1527,6 +2130,15 @@ pub fn run() {
                 .build()
                 .expect("failed to build HTTP client");
             let db = Db::open(&dir.join("portcode.db")).expect("failed to open database");
+            #[cfg(desktop)]
+            let openai_accounts = Arc::new(openai_accounts::OpenAiAccountRegistry::system());
+            #[cfg(desktop)]
+            let openai_accounts_startup_error = Arc::new(Mutex::new(
+                openai_accounts
+                    .migrate_legacy(oauth::now_secs())
+                    .err()
+                    .map(|error| account_error_message(&error)),
+            ));
 
             app.manage(AppState {
                 http,
@@ -1540,6 +2152,10 @@ pub fn run() {
                 #[cfg(desktop)]
                 background: background::new(),
                 oauth_refresh: Arc::new(tokio::sync::Mutex::new(())),
+                #[cfg(desktop)]
+                openai_accounts,
+                #[cfg(desktop)]
+                openai_accounts_startup_error,
                 phone_client: Arc::new(Mutex::new(None)),
                 listen_endpoint: Arc::new(Mutex::new(None)),
                 #[cfg(desktop)]
@@ -1568,6 +2184,8 @@ pub fn run() {
                     state.agents.clone(),
                     state.background.clone(),
                     state.oauth_refresh.clone(),
+                    state.openai_accounts.clone(),
+                    state.openai_accounts_startup_error.clone(),
                     state.listen_endpoint.clone(),
                     state.pairing_gate.clone(),
                 ) {
@@ -1597,13 +2215,16 @@ pub fn run() {
         start_oauth_login,
         oauth_status,
         oauth_logout,
-        start_openai_oauth_login,
         openai_oauth_status,
-        openai_oauth_logout,
+        list_openai_accounts,
+        start_openai_account_login,
+        reconnect_openai_account,
+        remove_openai_account,
         openai_models,
         get_plan_usage,
         list_sessions,
         create_session,
+        pin_session_openai_account,
         rename_session,
         update_session_model,
         delete_session,

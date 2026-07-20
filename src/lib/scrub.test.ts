@@ -17,6 +17,15 @@ describe("redactSecrets", () => {
     expect(redactSecrets('"x-api-key":"supersecretvalue"')).toContain("[redacted]");
   });
 
+  it("redacts ChatGPT account identity headers even when values are short", () => {
+    expect(redactSecrets("ChatGPT-Account-ID: acct_team_7")).toBe(
+      "ChatGPT-Account-ID: [redacted-account-id]",
+    );
+    expect(redactSecrets('{"ChatGPT-Account-ID":"workspace-42"}')).toBe(
+      '{"ChatGPT-Account-ID":"[redacted-account-id]"}',
+    );
+  });
+
   it("redacts emails", () => {
     expect(redactSecrets("contact person@example.test now")).toBe("contact [redacted-email] now");
   });

@@ -3,13 +3,47 @@ import { describe, expect, it } from "vitest";
 import {
   OPENAI_FALLBACK_MODELS,
   mergeOpenAIModels,
+  openAIAccountLabel,
   providerForModel,
   providerGroups,
   reasoningEffortForModel,
   reasoningEffortLabel,
 } from "./types";
 
+const account = (
+  id: string,
+  accountLabel: string | null,
+  createdAt: number,
+): import("./types").OpenAIAccountSummary => ({
+  id,
+  accountLabel,
+  tier: null,
+  expiresAt: null,
+  state: "connected",
+  createdAt,
+  updatedAt: createdAt,
+  lastUsedAt: null,
+});
+
 describe("OpenAI model catalogue helpers", () => {
+  it("disambiguates duplicate and missing account labels without exposing profile ids", () => {
+    const accounts = [
+      account("opaque-z", "same@example.test", 20),
+      account("opaque-a", null, 10),
+      account("opaque-b", "same@example.test", 10),
+      account("opaque-c", null, 30),
+      account("opaque-unique", "unique@example.test", 40),
+    ];
+
+    expect(openAIAccountLabel(accounts[0], accounts)).toBe("same@example.test 2");
+    expect(openAIAccountLabel(accounts[2], accounts)).toBe("same@example.test 1");
+    expect(openAIAccountLabel(accounts[1], accounts)).toBe("ChatGPT account 1");
+    expect(openAIAccountLabel(accounts[3], accounts)).toBe("ChatGPT account 2");
+    expect(openAIAccountLabel(accounts[4], accounts)).toBe("unique@example.test");
+    expect(accounts.map((item) => openAIAccountLabel(item, accounts)).join(" ")).not.toContain(
+      "opaque-",
+    );
+  });
   it("uses conservative fallbacks only when the live catalogue is empty", () => {
     expect(mergeOpenAIModels([])).toEqual(OPENAI_FALLBACK_MODELS);
 

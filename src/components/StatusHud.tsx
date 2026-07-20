@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import * as ipc from "../lib/ipc";
-import { useStore } from "../store/store";
+import { modelsForOpenAIProfile, useStore } from "../store/store";
 import {
   DANGER_MODES,
   estimateCost,
   modelInfo,
+  openAIAccountLabel,
   providerForModel,
   type Message,
   type ModelInfo,
@@ -72,6 +73,9 @@ export function StatusHud() {
   const messages = useStore((s) => (s.activeId ? s.messages[s.activeId] : undefined));
   const remoteMode = useStore((s) => s.remoteMode);
   const openAIModels = useStore((s) => s.openAIModels);
+  const openAIAccounts = useStore((s) => s.openAIAccounts);
+  const openAIAccountsError = useStore((s) => s.openAIAccountsError);
+  const openAIModelCatalogs = useStore((s) => s.openAIModelCatalogs);
   const claudeAuth = useStore((s) => s.oauthStatus);
   const openAIAuth = useStore((s) => s.openAIAuthStatus);
   const showSettings = useStore((s) => s.showSettings);
@@ -89,10 +93,18 @@ export function StatusHud() {
   const [showPlanUsage, setShowPlanUsage] = useState(false);
   const [planRemaining, setPlanRemaining] = useState<number | null>(null);
   const planTriggerRef = useRef<HTMLButtonElement>(null);
-  const activeProvider = providerForModel(model, openAIModels);
+  const activeOpenAIModels = modelsForOpenAIProfile(
+    session?.accountProfileId,
+    openAIModelCatalogs,
+    openAIModels,
+  );
+  const activeProvider = providerForModel(model, activeOpenAIModels);
+  const activeOpenAIAccount = session?.accountProfileId
+    ? openAIAccounts.find((account) => account.id === session.accountProfileId)
+    : undefined;
   const providerConnected =
     activeProvider === "openai"
-      ? openAIAuth?.available !== false && Boolean(openAIAuth?.signedIn)
+      ? openAIAuth?.available !== false && activeOpenAIAccount?.state === "connected"
       : Boolean(claudeAuth?.signedIn);
 
   const closePlanUsage = useCallback(() => setShowPlanUsage(false), []);
@@ -123,7 +135,10 @@ export function StatusHud() {
 
     let cancelled = false;
     void ipc
-      .getPlanUsage(activeProvider)
+      .getPlanUsage(
+        activeProvider,
+        activeProvider === "openai" ? (session?.accountProfileId ?? null) : null,
+      )
       .then((snapshot) => {
         if (!cancelled) setPlanRemaining(lowestPlanRemaining([snapshot]));
       })
@@ -133,7 +148,7 @@ export function StatusHud() {
     return () => {
       cancelled = true;
     };
-  }, [activeProvider, providerConnected, remoteMode]);
+  }, [activeProvider, providerConnected, remoteMode, session?.accountProfileId]);
 
   const workspaceConnected = Boolean(session?.workspace);
   // Memoized so a token/usage-only re-render (messages array reference stable)
@@ -148,11 +163,16 @@ export function StatusHud() {
     let total = 0;
     for (const item of sessions) {
       const itemUsage = usageMap[item.id];
-      if (!itemUsage || providerForModel(item.model, openAIModels) === "openai") continue;
+      const itemModels = modelsForOpenAIProfile(
+        item.accountProfileId,
+        openAIModelCatalogs,
+        openAIModels,
+      );
+      if (!itemUsage || providerForModel(item.model, itemModels) === "openai") continue;
       total += estimateCost(item.model, itemUsage);
     }
     return total;
-  }, [openAIModels, sessions, usageMap]);
+  }, [openAIModelCatalogs, openAIModels, sessions, usageMap]);
 
   return (
     <>
@@ -163,8 +183,32 @@ export function StatusHud() {
           <span className="pc-hud-trunc">{workspaceLabel(session?.workspace)}</span>
         </div>
         <div className="pc-hud-seg pc-hud-seg--left text-accent-2">
-          <span className="pc-hud-trunc">{modelLabel(model, openAIModels)}</span>
+          <span className="pc-hud-trunc">{modelLabel(model, activeOpenAIModels)}</span>
         </div>
+        {activeProvider === "openai" && (
+          <div
+            className={`pc-hud-seg pc-hud-seg--left ${activeOpenAIAccount?.state === "connected" ? "text-success" : "text-warn"}`}
+            title={
+              activeOpenAIAccount
+                ? `ChatGPT account: ${openAIAccountLabel(activeOpenAIAccount, openAIAccounts)}`
+                : session?.accountProfileId
+                  ? openAIAccountsError
+                    ? "ChatGPT account registry is unavailable"
+                    : "This session's ChatGPT account was removed"
+                  : "This legacy session needs a ChatGPT account"
+            }
+          >
+            <span className="pc-hud-trunc">
+              {activeOpenAIAccount
+                ? openAIAccountLabel(activeOpenAIAccount, openAIAccounts)
+                : session?.accountProfileId
+                  ? openAIAccountsError
+                    ? "ACCOUNT UNAVAILABLE"
+                    : "ACCOUNT REMOVED"
+                  : "ACCOUNT NEEDED"}
+            </span>
+          </div>
+        )}
         {/* The phone trims the HUD to essentials so the 7 desktop segments don't
           overflow a narrow screen — policy and the redundant workspace segment
           (the ⎇ branch above already names the workspace) are desktop-only. */}
@@ -263,6 +307,7 @@ export function StatusHud() {
         <PlanUsagePopover
           open={showPlanUsage}
           provider={activeProvider}
+          openAIAccountProfileId={session?.accountProfileId ?? null}
           triggerRef={planTriggerRef}
           onClose={closePlanUsage}
           onOpenSettings={openPlanSettings}

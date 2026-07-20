@@ -104,12 +104,10 @@ describe("Tauri command serialization", () => {
     expect(invoke).toHaveBeenCalledWith("oauth_logout");
   });
 
-  it("OpenAI subscription commands invoke auth and model catalogue counterparts", async () => {
+  it("OpenAI capability status and model catalogue invoke their scoped counterparts", async () => {
     const { ipc, invoke } = await load();
     const status = { signedIn: true, expiresAt: 123, account: "a@openai.com", tier: "Plus" };
     invoke.mockResolvedValue(status);
-    await expect(ipc.startOpenaiOauthLogin()).resolves.toBe(status);
-    expect(invoke).toHaveBeenCalledWith("start_openai_oauth_login");
     await expect(ipc.openaiOauthStatus()).resolves.toBe(status);
     expect(invoke).toHaveBeenCalledWith("openai_oauth_status");
 
@@ -122,15 +120,118 @@ describe("Tauri command serialization", () => {
       },
     ];
     invoke.mockResolvedValue(models);
-    await expect(ipc.openaiModels()).resolves.toBe(models);
-    expect(invoke).toHaveBeenCalledWith("openai_models");
-
-    invoke.mockResolvedValue(undefined);
-    await expect(ipc.openaiOauthLogout()).resolves.toBeUndefined();
-    expect(invoke).toHaveBeenCalledWith("openai_oauth_logout");
+    await expect(ipc.openaiModels("00000000-0000-4000-8000-000000000001")).resolves.toBe(models);
+    expect(invoke).toHaveBeenCalledWith("openai_models", {
+      accountProfileId: "00000000-0000-4000-8000-000000000001",
+    });
   });
 
-  it("get_plan_usage forwards the selected provider", async () => {
+  it("serializes multi-account registry commands with opaque profile ids", async () => {
+    const { ipc, invoke } = await load();
+    const accountProfileId = "00000000-0000-4000-8000-000000000001";
+    const summary = {
+      id: accountProfileId,
+      accountLabel: "one@chatgpt.test",
+      tier: "Plus",
+      expiresAt: 123,
+      state: "connected",
+      createdAt: 10,
+      updatedAt: 20,
+      lastUsedAt: null,
+    };
+    invoke.mockResolvedValue([summary]);
+
+    await expect(ipc.listOpenAIAccounts()).resolves.toEqual([summary]);
+    expect(invoke).toHaveBeenCalledWith("list_openai_accounts");
+    invoke.mockResolvedValue(summary);
+    await expect(ipc.startOpenAIAccountLogin()).resolves.toEqual(summary);
+    expect(invoke).toHaveBeenCalledWith("start_openai_account_login");
+    const reconnectOutcome = { status: "reconnected", account: summary };
+    invoke.mockResolvedValue(reconnectOutcome);
+    await expect(ipc.reconnectOpenAIAccount(accountProfileId)).resolves.toEqual(reconnectOutcome);
+    expect(invoke).toHaveBeenCalledWith("reconnect_openai_account", { accountProfileId });
+
+    invoke.mockResolvedValue(undefined);
+    await ipc.removeOpenAIAccount(accountProfileId);
+    expect(invoke).toHaveBeenCalledWith("remove_openai_account", { accountProfileId });
+  });
+
+  it("strips accidental credential and remote-identity fields before store serialization", async () => {
+    const { ipc, invoke } = await load();
+    const accessToken = "oauth-access-secret";
+    const refreshToken = "oauth-refresh-secret";
+    const idToken = "oauth-id-secret";
+    const rawRemoteAccountId = "acct_remote_secret";
+    const leakedNativeAccount = {
+      id: "00000000-0000-4000-8000-000000000001",
+      accountLabel: "one@chatgpt.test",
+      tier: "Plus",
+      expiresAt: 123,
+      state: "connected",
+      createdAt: 10,
+      updatedAt: 20,
+      lastUsedAt: null,
+      accessToken,
+      refreshToken,
+      idToken,
+      accountId: rawRemoteAccountId,
+      tokens: { accessToken, refreshToken, idToken },
+    };
+
+    invoke.mockResolvedValueOnce([leakedNativeAccount]);
+    const listed = await ipc.listOpenAIAccounts();
+    invoke.mockResolvedValueOnce(leakedNativeAccount);
+    const added = await ipc.startOpenAIAccountLogin();
+    invoke.mockResolvedValueOnce({
+      status: "reconnected",
+      account: leakedNativeAccount,
+      accessToken,
+      accountId: rawRemoteAccountId,
+    });
+    const reconnect = await ipc.reconnectOpenAIAccount(leakedNativeAccount.id);
+
+    const serializedStoreState = JSON.stringify({
+      openAIAccounts: listed,
+      addedOpenAIAccount: added,
+      reconnect,
+    });
+    expect(serializedStoreState).not.toContain(accessToken);
+    expect(serializedStoreState).not.toContain(refreshToken);
+    expect(serializedStoreState).not.toContain(idToken);
+    expect(serializedStoreState).not.toContain(rawRemoteAccountId);
+    for (const forbiddenKey of ["accessToken", "refreshToken", "idToken", "accountId", "tokens"]) {
+      expect(serializedStoreState).not.toContain(`"${forbiddenKey}"`);
+    }
+    expect(Object.keys(listed[0])).toEqual([
+      "id",
+      "accountLabel",
+      "tier",
+      "expiresAt",
+      "state",
+      "createdAt",
+      "updatedAt",
+      "lastUsedAt",
+    ]);
+  });
+
+  it("subscribes to the exact native session channel and unwraps event payloads", async () => {
+    const { ipc, listen } = await load();
+    const off = vi.fn();
+    let nativeHandler: ((event: { payload: StreamEvent }) => void) | undefined;
+    listen.mockImplementation(async (_channel, handler) => {
+      nativeHandler = handler as (event: { payload: StreamEvent }) => void;
+      return off;
+    });
+    const onEvent = vi.fn();
+
+    await expect(ipc.subscribeSessionEvents("session-1", onEvent)).resolves.toBe(off);
+    expect(listen).toHaveBeenCalledWith("agent://session-1", expect.any(Function));
+    const event = { type: "text_delta", text: "hello" } satisfies StreamEvent;
+    nativeHandler?.({ payload: event });
+    expect(onEvent).toHaveBeenCalledWith(event);
+  });
+
+  it("get_plan_usage forwards the provider and optional account profile", async () => {
     const { ipc, invoke } = await load();
     const snapshot = {
       provider: "openai",
@@ -140,8 +241,17 @@ describe("Tauri command serialization", () => {
     };
     invoke.mockResolvedValue(snapshot);
 
-    await expect(ipc.getPlanUsage("openai")).resolves.toBe(snapshot);
-    expect(invoke).toHaveBeenCalledWith("get_plan_usage", { provider: "openai" });
+    const accountProfileId = "00000000-0000-4000-8000-000000000001";
+    await expect(ipc.getPlanUsage("openai", accountProfileId)).resolves.toBe(snapshot);
+    expect(invoke).toHaveBeenCalledWith("get_plan_usage", {
+      provider: "openai",
+      accountProfileId,
+    });
+    await ipc.getPlanUsage("anthropic");
+    expect(invoke).toHaveBeenLastCalledWith("get_plan_usage", {
+      provider: "anthropic",
+      accountProfileId: null,
+    });
   });
 
   it("resolve_permission forwards id + decision", async () => {
@@ -167,6 +277,14 @@ describe("Tauri command serialization", () => {
     const { ipc, invoke } = await load();
     invoke.mockResolvedValue(undefined);
     await ipc.createSession("s1", "Title", "C:/ws");
+    await ipc.createSession(
+      "s2",
+      "OpenAI",
+      null,
+      "gpt-5.6-sol",
+      "00000000-0000-4000-8000-000000000001",
+    );
+    await ipc.pinSessionOpenAIAccount("legacy", "00000000-0000-4000-8000-000000000001");
     await ipc.renameSession("s1", "Renamed");
     await ipc.updateSessionModel("s1", "gpt-5.6-sol");
     await ipc.deleteSession("s1");
@@ -177,6 +295,18 @@ describe("Tauri command serialization", () => {
       title: "Title",
       workspace: "C:/ws",
       model: undefined,
+      accountProfileId: null,
+    });
+    expect(invoke).toHaveBeenCalledWith("create_session", {
+      id: "s2",
+      title: "OpenAI",
+      workspace: null,
+      model: "gpt-5.6-sol",
+      accountProfileId: "00000000-0000-4000-8000-000000000001",
+    });
+    expect(invoke).toHaveBeenCalledWith("pin_session_openai_account", {
+      sessionId: "legacy",
+      accountProfileId: "00000000-0000-4000-8000-000000000001",
     });
     expect(invoke).toHaveBeenCalledWith("rename_session", { id: "s1", title: "Renamed" });
     expect(invoke).toHaveBeenCalledWith("update_session_model", {
@@ -457,13 +587,12 @@ describe("Tauri command serialization", () => {
     invoke.mockResolvedValue(undefined);
 
     const onEvent = vi.fn();
-    const handle = await ipc.runAgent("sess-1", "hello", "claude-opus-4-8", onEvent);
+    const handle = await ipc.runAgent("sess-1", "hello", onEvent);
 
     expect(listen).toHaveBeenCalledWith("agent://sess-1", expect.any(Function));
     expect(invoke).toHaveBeenCalledWith("run_agent", {
       sessionId: "sess-1",
       text: "hello",
-      model: "claude-opus-4-8",
     });
 
     // Core events arrive wrapped as `{ payload }`; the bridge unwraps them.
@@ -485,7 +614,7 @@ describe("Tauri command serialization", () => {
     listen.mockImplementation(async () => unlisten);
     invoke.mockResolvedValue(undefined);
 
-    const handle = await ipc.runAgent("sess-2", "hi", "claude-opus-4-8", vi.fn());
+    const handle = await ipc.runAgent("sess-2", "hi", vi.fn());
     handle.dispose();
 
     // A normal turn end just stops listening — it must NOT fire cancel_agent.
@@ -499,9 +628,7 @@ describe("Tauri command serialization", () => {
     listen.mockResolvedValue(unlisten);
     invoke.mockRejectedValueOnce(new Error("session already running"));
 
-    await expect(ipc.runAgent("busy", "hi", "claude-opus-4-8", vi.fn())).rejects.toThrow(
-      "session already running",
-    );
+    await expect(ipc.runAgent("busy", "hi", vi.fn())).rejects.toThrow("session already running");
 
     expect(unlisten).toHaveBeenCalledOnce();
   });
@@ -629,9 +756,15 @@ describe("browser fallback (no Tauri core)", () => {
     await expect(ipc.getMessagePage("any")).resolves.toEqual({ messages: [], nextCursor: null });
   });
 
-  it("session mutations are no-ops that still resolve", async () => {
+  it("browser sessions round-trip authoritative rows", async () => {
     const { ipc, invoke } = await load();
-    await expect(ipc.createSession("id", "title", null)).resolves.toBeUndefined();
+    const created = await ipc.createSession("id", "title", null);
+    expect(created).toMatchObject({
+      id: "id",
+      title: "title",
+      accountProfileId: null,
+    });
+    await expect(ipc.listSessions()).resolves.toEqual([created]);
     await expect(ipc.renameSession("id", "new")).resolves.toBeUndefined();
     await expect(ipc.deleteSession("id")).resolves.toBeUndefined();
     await expect(ipc.getSessionArchiveWarning("id")).resolves.toBeNull();
@@ -715,6 +848,36 @@ describe("browser fallback (no Tauri core)", () => {
       },
     ]);
     expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("keeps every browser review scope deterministic and scope-specific", async () => {
+    const { ipc } = await load();
+
+    const staged = await ipc.getGitReviewManifest({ kind: "staged" });
+    expect(staged).toMatchObject({ baseLabel: "9c31f2ab", targetLabel: "Index" });
+    expect(staged.files.every((file) => file.areas.join() === "staged")).toBe(true);
+
+    const unstaged = await ipc.getGitReviewManifest({ kind: "unstaged" });
+    expect(unstaged).toMatchObject({ baseLabel: "Index", targetLabel: "Working tree" });
+    expect(unstaged.files.map((file) => file.areas[0])).toEqual(
+      expect.arrayContaining(["unstaged", "untracked"]),
+    );
+
+    const branch = await ipc.getGitReviewManifest({
+      kind: "branch",
+      base: "refs/heads/release",
+    });
+    expect(branch.baseLabel).toMatch(/^merge-base\(release\).*17a19ee0$/);
+    expect(branch.targetLabel).toBe("HEAD");
+    expect(branch.files.every((file) => file.areas.join() === "committed")).toBe(true);
+
+    const commit = await ipc.getGitReviewManifest({ kind: "commit", revision: "abc123" });
+    expect(commit).toMatchObject({
+      snapshotId: "preview-commit-abc123",
+      baseLabel: "parent of 9c31f2ab",
+      targetLabel: "abc123",
+    });
+    expect(commit.files.every((file) => file.areas.join() === "committed")).toBe(true);
   });
 
   it("rejects a stale browser-preview review snapshot", async () => {
@@ -850,10 +1013,31 @@ describe("browser fallback (no Tauri core)", () => {
     });
   });
 
-  it("OpenAI mock signs in, exposes deterministic capabilities, and logs out", async () => {
+  it("OpenAI mock retains canonical account tombstones and reconnects exact identities", async () => {
     const { ipc } = await load();
     expect((await ipc.openaiOauthStatus()).signedIn).toBe(false);
-    await expect(ipc.openaiModels()).resolves.toEqual(
+    expect(await ipc.listOpenAIAccounts()).toEqual([]);
+
+    const account = await ipc.startOpenAIAccountLogin();
+    expect(account).toMatchObject({
+      id: "00000000-0000-4000-8000-000000000001",
+      accountLabel: "preview@chatgpt.local",
+      tier: "ChatGPT Plus",
+      state: "connected",
+      lastUsedAt: null,
+    });
+    expect(Object.keys(account)).toEqual([
+      "id",
+      "accountLabel",
+      "tier",
+      "expiresAt",
+      "state",
+      "createdAt",
+      "updatedAt",
+      "lastUsedAt",
+    ]);
+    expect(account.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/);
+    await expect(ipc.openaiModels(account.id)).resolves.toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           id: "gpt-5.6-sol",
@@ -862,14 +1046,61 @@ describe("browser fallback (no Tauri core)", () => {
       ]),
     );
 
-    const status = await ipc.startOpenaiOauthLogin();
-    expect(status).toMatchObject({
-      signedIn: true,
-      account: "preview@chatgpt.local",
-      tier: "ChatGPT Plus",
+    await ipc.removeOpenAIAccount(account.id);
+    expect(await ipc.listOpenAIAccounts()).toEqual([
+      expect.objectContaining({ id: account.id, state: "removed", expiresAt: null }),
+    ]);
+    await expect(ipc.openaiModels(account.id)).rejects.toThrow(/Reconnect/i);
+
+    const reconnected = await ipc.reconnectOpenAIAccount(account.id);
+    expect(reconnected).toMatchObject({
+      status: "reconnected",
+      account: { id: account.id, state: "connected" },
     });
-    await ipc.openaiOauthLogout();
-    expect((await ipc.openaiOauthStatus()).signedIn).toBe(false);
+    await expect(ipc.openaiModels(account.id)).resolves.toHaveLength(3);
+  });
+
+  it("browser sessions enforce account-scoped creation and null-only legacy pinning", async () => {
+    const { ipc } = await load();
+    const unknownProfileId = "00000000-0000-4000-8000-000000000099";
+
+    await expect(
+      ipc.createSession("unknown", "Unknown", null, "gpt-5.6-sol", unknownProfileId),
+    ).rejects.toThrow(/connected ChatGPT account/i);
+
+    const account = await ipc.startOpenAIAccountLogin();
+    const created = await ipc.createSession(
+      "account-scoped",
+      "Account scoped",
+      null,
+      "gpt-5.6-sol",
+      account.id,
+    );
+    expect(created).toMatchObject({
+      id: "account-scoped",
+      accountProfileId: account.id,
+      branch: null,
+    });
+    expect(await ipc.listSessions()).toContainEqual(created);
+    expect((await ipc.listOpenAIAccounts())[0].lastUsedAt).toEqual(expect.any(Number));
+
+    const legacy = await ipc.createSession("legacy", "Legacy", null, "gpt-5.6-sol", null);
+    const pinned = await ipc.pinSessionOpenAIAccount(legacy.id, account.id);
+    expect(pinned.accountProfileId).toBe(account.id);
+    await expect(ipc.pinSessionOpenAIAccount(legacy.id, account.id)).rejects.toThrow(
+      /already pinned/i,
+    );
+    await expect(ipc.pinSessionOpenAIAccount("missing", account.id)).rejects.toThrow(/not found/i);
+
+    const unpinned = await ipc.createSession("unpinned", "Unpinned", null, "gpt-5.6-sol", null);
+    await ipc.removeOpenAIAccount(account.id);
+    await expect(
+      ipc.createSession("removed", "Removed", null, "gpt-5.6-sol", account.id),
+    ).rejects.toThrow(/connected ChatGPT account/i);
+    await expect(ipc.pinSessionOpenAIAccount(unpinned.id, account.id)).rejects.toThrow(
+      /connected ChatGPT account/i,
+    );
+    await expect(ipc.reconnectOpenAIAccount(unknownProfileId)).rejects.toThrow(/not found/i);
   });
 
   it("browser plan-usage mocks require sign-in and expose both reset windows", async () => {
@@ -883,8 +1114,8 @@ describe("browser fallback (no Tauri core)", () => {
       "Weekly limit",
     ]);
 
-    await ipc.startOpenaiOauthLogin();
-    const openai = await ipc.getPlanUsage("openai");
+    const account = await ipc.startOpenAIAccountLogin();
+    const openai = await ipc.getPlanUsage("openai", account.id);
     expect(openai).toMatchObject({ provider: "openai", plan: "Plus" });
     expect(openai.windows).toHaveLength(2);
     expect(invoke).not.toHaveBeenCalled();
@@ -900,7 +1131,7 @@ describe("browser fallback agent stream", () => {
     vi.useFakeTimers();
 
     const events: StreamEvent[] = [];
-    await ipc.runAgent("s", "hi", "claude-opus-4-8", (e) => events.push(e));
+    await ipc.runAgent("s", "hi", (e) => events.push(e));
     await vi.runAllTimersAsync();
 
     const types = events.map((e) => e.type);
@@ -922,7 +1153,7 @@ describe("browser fallback agent stream", () => {
     vi.useFakeTimers();
 
     const events: StreamEvent[] = [];
-    const { cancel } = await ipc.runAgent("s", "hi", "claude-opus-4-8", (e) => events.push(e));
+    const { cancel } = await ipc.runAgent("s", "hi", (e) => events.push(e));
     await vi.advanceTimersByTimeAsync(3000);
 
     expect(events.find((e) => e.type === "permission_request")).toMatchObject({
@@ -939,7 +1170,7 @@ describe("browser fallback agent stream", () => {
     vi.useFakeTimers();
 
     const onEvent = vi.fn();
-    const { cancel } = await ipc.runAgent("s", "hi", "claude-opus-4-8", onEvent);
+    const { cancel } = await ipc.runAgent("s", "hi", onEvent);
     await cancel();
     await vi.runAllTimersAsync();
 

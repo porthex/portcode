@@ -306,8 +306,9 @@ describe("StatusHud", () => {
   });
 
   it("opens a one-click plan-usage popover and restores focus on Escape", async () => {
+    const accountProfileId = "00000000-0000-4000-8000-000000000001";
     useStore.setState({
-      sessions: [session({ model: "gpt-5.6-sol" })],
+      sessions: [session({ model: "gpt-5.6-sol", accountProfileId })],
       activeId: "s1",
       oauthStatus: {
         signedIn: true,
@@ -321,6 +322,18 @@ describe("StatusHud", () => {
         account: "gpt@example.com",
         tier: "ChatGPT Plus",
       },
+      openAIAccounts: [
+        {
+          id: accountProfileId,
+          accountLabel: "gpt@example.com",
+          tier: "ChatGPT Plus",
+          expiresAt: null,
+          state: "connected",
+          createdAt: 1,
+          updatedAt: 1,
+          lastUsedAt: null,
+        },
+      ],
     });
     getPlanUsage.mockImplementation(async (provider: ProviderId): Promise<PlanUsageSnapshot> => ({
       provider,
@@ -474,6 +487,25 @@ describe("StatusHud", () => {
 
     expect(screen.getByText("GPT LIVE CODEX")).toBeInTheDocument();
     expect(container.textContent).not.toContain("$");
+  });
+
+  it("distinguishes an unavailable account registry from an authoritative removal", () => {
+    const accountProfileId = "00000000-0000-4000-8000-000000000098";
+    useStore.setState({
+      sessions: [session({ model: "gpt-5.6-sol", accountProfileId })],
+      activeId: "s1",
+      openAIAccounts: [],
+      openAIAccountsError: "registry locked",
+    });
+
+    const { container } = render(<StatusHud />);
+
+    expect(screen.getByText("ACCOUNT UNAVAILABLE").closest(".pc-hud-seg")).toHaveAttribute(
+      "title",
+      "ChatGPT account registry is unavailable",
+    );
+    expect(screen.queryByText("ACCOUNT REMOVED")).not.toBeInTheDocument();
+    expect(container).not.toHaveTextContent(accountProfileId);
   });
 
   it("drops the spend segment on the phone (remote mode) to fit a narrow bar", () => {

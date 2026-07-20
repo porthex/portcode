@@ -27,6 +27,7 @@ import { isTauri, isWebClientMode, onUpdaterEvent } from "./lib/ipc";
 import { isSelfDev } from "./lib/channel";
 import { getInstallState } from "./lib/installGate";
 import { initTelemetry, shutdownTelemetry, telemetryConfigured } from "./lib/telemetry";
+import { openAIAccountLabel, providerForModel } from "./types";
 
 export default function App() {
   const init = useStore((s) => s.init);
@@ -364,6 +365,13 @@ function TitleBar({
   onEnvironmentOpenChange: (open: boolean) => void;
 }) {
   const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
+  const openAIAccounts = useStore((s) => s.openAIAccounts);
+  const openAIAccountsError = useStore((s) => s.openAIAccountsError);
+  const openAIAccount = useStore((s) =>
+    session?.accountProfileId
+      ? s.openAIAccounts.find((account) => account.id === session.accountProfileId)
+      : undefined,
+  );
   const toggleFiles = useStore((s) => s.toggleFiles);
   const setShowPalette = useStore((s) => s.setShowPalette);
   const workspaceSurface = useStore((s) => s.workspaceSurface);
@@ -402,6 +410,32 @@ function TitleBar({
             {workspaceSurface === "review" ? "Review changes" : (session?.title ?? "New chat")}
           </span>
         </span>
+        {session && providerForModel(session.model) === "openai" && (
+          <span
+            className={`pc-pill ${openAIAccount?.state === "connected" ? "pc-pill--success" : "pc-pill--warn"}`}
+            title={
+              openAIAccount
+                ? `ChatGPT account: ${openAIAccountLabel(openAIAccount, openAIAccounts)}`
+                : session.accountProfileId
+                  ? openAIAccountsError
+                    ? "ChatGPT account registry is unavailable"
+                    : "This session's ChatGPT account was removed"
+                  : "Choose a ChatGPT account before continuing this legacy session"
+            }
+          >
+            <span
+              className={`pc-dot ${openAIAccount?.state === "connected" ? "pc-dot--success" : "pc-dot--warn"}`}
+              aria-hidden="true"
+            />
+            {openAIAccount
+              ? openAIAccountLabel(openAIAccount, openAIAccounts)
+              : session.accountProfileId
+                ? openAIAccountsError
+                  ? "ACCOUNT UNAVAILABLE"
+                  : "ACCOUNT REMOVED"
+                : "ACCOUNT NEEDED"}
+          </span>
+        )}
       </div>
       <div className="flex shrink-0 items-center gap-2.5">
         <ChannelBadge />

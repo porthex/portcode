@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { toolPresence } from "../lib/toolNames";
-import { useStore } from "../store/store";
+import { modelsForOpenAIProfile, preferredOpenAIAccount, useStore } from "../store/store";
 import {
   DANGER_MODES,
   MODEL_PRICING,
   estimateCost,
   modelInfo,
+  openAIAccountLabel,
   providerForModel,
   providerGroups,
   reasoningEffortLabel,
@@ -64,7 +65,13 @@ export function Composer() {
   const remoteMode = useStore((s) => s.remoteMode);
   const remoteConnected = useStore((s) => s.remoteConnected);
   const activeModel = useActiveModel();
-  const openAIModels = useStore((s) => s.openAIModels);
+  const activeSession = useStore((s) =>
+    s.activeId ? s.sessions.find((session) => session.id === s.activeId) : undefined,
+  );
+  const openAIModels = useStore((s) =>
+    modelsForOpenAIProfile(activeSession?.accountProfileId, s.openAIModelCatalogs, s.openAIModels),
+  );
+  const openAIAccounts = useStore((s) => s.openAIAccounts);
   const settings = useStore((s) => s.settings);
   const oauthStatus = useStore((s) => s.oauthStatus);
   const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
@@ -79,22 +86,34 @@ export function Composer() {
   // Send is fireable only with non-whitespace content and no turn in flight.
   const activeProvider = providerForModel(activeModel, openAIModels);
   const openAIUnavailable = activeProvider === "openai" && openAIAuthStatus?.available === false;
+  const activeOpenAIAccount = activeSession?.accountProfileId
+    ? openAIAccounts.find((account) => account.id === activeSession.accountProfileId)
+    : undefined;
+  const legacyOpenAISession = activeProvider === "openai" && !activeSession?.accountProfileId;
   const authenticated =
     (remoteMode && remoteConnected) ||
     (activeProvider === "openai"
-      ? !openAIUnavailable && !!openAIAuthStatus?.signedIn
+      ? !openAIUnavailable && activeOpenAIAccount?.state === "connected"
       : !!oauthStatus?.signedIn || settings.apiKeySet);
   const authHint =
     activeProvider === "openai"
       ? openAIUnavailable
         ? (openAIAuthStatus?.unavailableReason ??
           "ChatGPT subscription access is unavailable in this build")
-        : "Sign in with ChatGPT in Settings to send"
+        : legacyOpenAISession
+          ? "Choose the ChatGPT account for this legacy session"
+          : activeOpenAIAccount?.state === "reconnect_required"
+            ? `Reconnect ${openAIAccountLabel(activeOpenAIAccount, openAIAccounts)} in Settings to send`
+            : activeSession?.accountProfileId
+              ? "This session's ChatGPT account is unavailable"
+              : "Add a ChatGPT account in Settings to send"
       : "Sign in with Claude or add an API key in Settings to send";
   const authAction = openAIUnavailable
     ? "Open settings"
     : activeProvider === "openai"
-      ? "Connect ChatGPT"
+      ? legacyOpenAISession
+        ? "Choose account"
+        : "Manage ChatGPT"
       : "Connect Claude";
   const historyReady = Boolean(
     activeId &&
@@ -189,6 +208,9 @@ export function Composer() {
 
   return (
     <div className="pc-composer-dock">
+      {!remoteMode && activeProvider === "openai" && !authenticated && activeSession && (
+        <OpenAIAccountSessionGate sessionId={activeSession.id} />
+      )}
       {/* The perimeter is deliberately quiet at rest. Focus, a sendable draft, and a
           running turn each earn a distinct state cue instead of permanent rainbow noise. */}
       <div
@@ -340,6 +362,190 @@ export function Composer() {
   );
 }
 
+/** Explicit one-time ownership decision for migrated OpenAI sessions. The native
+ * command uses a NULL-only compare-and-swap, so two windows can never overwrite
+ * each other's choice even if they confirm concurrently. */
+function OpenAIAccountSessionGate({ sessionId }: { sessionId: string }) {
+  const session = useStore((state) =>
+    state.sessions.find((candidate) => candidate.id === sessionId),
+  );
+  const accounts = useStore((state) => state.openAIAccounts);
+  const accountsLoading = useStore((state) => state.openAIAccountsLoading);
+  const accountsError = useStore((state) => state.openAIAccountsError);
+  const lastUsed = useStore((state) => state.lastOpenAIAccountProfileId);
+  const capability = useStore((state) => state.openAIAuthStatus);
+  const error = useStore((state) => state.openAIAuthError);
+  const pinSession = useStore((state) => state.pinSessionOpenAIAccount);
+  const refreshAccounts = useStore((state) => state.refreshOpenAIStatus);
+  const setShowSettings = useStore((state) => state.setShowSettings);
+  const connected = accounts.filter((account) => account.state === "connected");
+  const preferred = preferredOpenAIAccount(connected, lastUsed);
+  const [selectedId, setSelectedId] = useState(preferred?.id ?? "");
+  const [pinning, setPinning] = useState(false);
+
+  useEffect(() => {
+    const preferredId = preferred?.id ?? "";
+    if (!connected.some((account) => account.id === selectedId) && selectedId !== preferredId) {
+      setSelectedId(preferredId);
+    }
+  }, [connected, preferred?.id, selectedId]);
+
+  if (!session) return null;
+  if (session.accountProfileId) {
+    const account = accounts.find((candidate) => candidate.id === session.accountProfileId);
+    if (!account && accountsError) {
+      return (
+        <div className="pc-openai-session-gate" role="status">
+          <div>
+            <strong>ChatGPT account registry is unavailable</strong>
+            <span>{accountsError}</span>
+          </div>
+          <button type="button" onClick={() => void refreshAccounts()}>
+            Retry account discovery
+          </button>
+          <button type="button" onClick={() => setShowSettings(true)}>
+            Manage accounts
+          </button>
+        </div>
+      );
+    }
+    return (
+      <div className="pc-openai-session-gate" role="status">
+        <div>
+          <strong>
+            {account?.state === "reconnect_required"
+              ? "Reconnect this conversation’s ChatGPT account"
+              : "This conversation’s ChatGPT account is unavailable"}
+          </strong>
+          <span>
+            {account
+              ? openAIAccountLabel(account, accounts)
+              : "The credential was removed; conversation history remains readable."}
+          </span>
+        </div>
+        <button type="button" onClick={() => setShowSettings(true)}>
+          Open account settings
+        </button>
+      </div>
+    );
+  }
+
+  if (capability?.available === false) {
+    return (
+      <div className="pc-openai-session-gate" role="status">
+        <div>
+          <strong>ChatGPT account access is unavailable</strong>
+          <span>{capability.unavailableReason ?? "ChatGPT access is disabled in this build."}</span>
+        </div>
+        <button type="button" onClick={() => setShowSettings(true)}>
+          Open account settings
+        </button>
+      </div>
+    );
+  }
+
+  if (connected.length === 0) {
+    const registryFailed = Boolean(accountsError);
+    const reconnectOnly = accounts.length > 0;
+    return (
+      <div className="pc-openai-session-gate" role="status">
+        <div>
+          <strong>
+            {accountsLoading
+              ? "Loading ChatGPT accounts"
+              : registryFailed
+                ? "Couldn’t load ChatGPT accounts"
+                : reconnectOnly
+                  ? "Reconnect a ChatGPT account before continuing"
+                  : "Choose a ChatGPT account before continuing"}
+          </strong>
+          <span>
+            {accountsLoading
+              ? "Checking the local account registry."
+              : registryFailed
+                ? accountsError
+                : reconnectOnly
+                  ? "Saved profiles remain attached to history, but none can run until reconnected."
+                  : "This session predates account pinning. Add an account without changing its history."}
+          </span>
+        </div>
+        <button
+          type="button"
+          disabled={accountsLoading}
+          onClick={() => {
+            if (registryFailed) void refreshAccounts();
+            else setShowSettings(true);
+          }}
+        >
+          {accountsLoading
+            ? "Loading…"
+            : registryFailed
+              ? "Retry account discovery"
+              : reconnectOnly
+                ? "Reconnect ChatGPT account"
+                : "Add ChatGPT account"}
+        </button>
+      </div>
+    );
+  }
+
+  const selected = connected.find((account) => account.id === selectedId) ?? preferred;
+  const confirm = async () => {
+    if (!selected || pinning) return;
+    setPinning(true);
+    try {
+      await pinSession(sessionId, selected.id);
+    } finally {
+      setPinning(false);
+    }
+  };
+
+  return (
+    <div className="pc-openai-session-gate" role="group" aria-label="Choose ChatGPT account">
+      <div className="min-w-0 flex-1">
+        <strong>Which ChatGPT account owns this conversation?</strong>
+        <span>This one-time choice cannot be silently changed later.</span>
+        {connected.length > 1 && (
+          <SelectMenu
+            value={selected?.id ?? ""}
+            label="ChatGPT account for this conversation"
+            onChange={setSelectedId}
+            disabled={pinning}
+            placement="top"
+            className="mt-2 max-w-sm"
+            buttonClassName="px-3 py-2 text-[11px]"
+            groups={[
+              {
+                id: "chatgpt-accounts",
+                options: connected.map((account) => ({
+                  value: account.id,
+                  label: `${openAIAccountLabel(account, accounts)}${account.tier ? ` · ${account.tier.replace(/^ChatGPT\s+/i, "")}` : ""}`,
+                })),
+              },
+            ]}
+          />
+        )}
+        {connected.length === 1 && selected && (
+          <span className="pc-openai-session-gate__account">
+            {openAIAccountLabel(selected, accounts)}
+            {selected.tier ? ` · ${selected.tier.replace(/^ChatGPT\s+/i, "")}` : ""}
+          </span>
+        )}
+        {error && (
+          <span className="pc-openai-session-gate__error" role="alert">
+            {error}
+          </span>
+        )}
+      </div>
+      <button type="button" onClick={() => void confirm()} disabled={!selected || pinning}>
+        {pinning
+          ? "Checking…"
+          : `Use ${selected ? openAIAccountLabel(selected, accounts) : "account"}`}
+      </button>
+    </div>
+  );
+}
+
 const MODE_PRESENTATION: Record<PermissionMode, { label: string; detail: string }> = {
   default: { label: "Ask", detail: "confirms sensitive actions" },
   acceptEdits: { label: "Edits allowed", detail: "workspace edits don’t ask" },
@@ -405,9 +611,19 @@ function ModelSetupPicker() {
   const model = useActiveModel();
   const setSessionModel = useStore((s) => s.setSessionModel);
   const activeId = useStore((s) => s.activeId);
+  const activeAccountProfileId = useStore((s) =>
+    s.activeId
+      ? (s.sessions.find((candidate) => candidate.id === s.activeId)?.accountProfileId ?? null)
+      : null,
+  );
   const streaming = useStore((s) => s.streaming);
   const remoteMode = useStore((s) => s.remoteMode);
-  const openAIModels = useStore((s) => s.openAIModels);
+  const openAIModels = useStore((s) => {
+    const session = s.activeId
+      ? s.sessions.find((candidate) => candidate.id === s.activeId)
+      : undefined;
+    return modelsForOpenAIProfile(session?.accountProfileId, s.openAIModelCatalogs, s.openAIModels);
+  });
   const effort = useStore((s) => s.settings.reasoningEffort);
   const speed = useStore((s) => s.settings.responseSpeed);
   const updateSettings = useStore((s) => s.updateSettings);
@@ -415,7 +631,10 @@ function ModelSetupPicker() {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(false);
   const [panel, setPanel] = useState<SetupPanel>("main");
-  const groups = providerGroups(openAIModels).filter((provider) => provider.models.length > 0);
+  const groups = providerGroups(openAIModels).filter(
+    (provider) =>
+      provider.models.length > 0 && (!activeAccountProfileId || provider.id === "openai"),
+  );
   const current = modelInfo(model, openAIModels);
   const openAI = providerForModel(model, openAIModels) === "openai";
   const supported = current?.reasoningEfforts ?? [];
@@ -726,7 +945,12 @@ function FormattingHelp() {
 
 function UsageMeter() {
   const model = useActiveModel();
-  const openAIModels = useStore((s) => s.openAIModels);
+  const openAIModels = useStore((s) => {
+    const session = s.activeId
+      ? s.sessions.find((candidate) => candidate.id === s.activeId)
+      : undefined;
+    return modelsForOpenAIProfile(session?.accountProfileId, s.openAIModelCatalogs, s.openAIModels);
+  });
   const usage = useStore((s) => (s.activeId ? s.usage[s.activeId] : undefined));
   const total = usage ? usage.input + usage.output : 0;
   const cost = usage ? estimateCost(model, usage) : 0;

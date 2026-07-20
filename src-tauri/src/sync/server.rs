@@ -20,9 +20,10 @@ use crate::agents;
 use crate::background;
 use crate::db::{self, Db};
 use crate::events::{AppEventSink, EventSink};
+use crate::openai_accounts::OpenAiAccountRegistry;
 use crate::permissions::{self, Decision, Pending};
 use crate::settings::Settings;
-use crate::sync::protocol::{RemoteCommand, SyncFrame};
+use crate::sync::protocol::{CommandRejectionCode, RemoteCommand, SyncFrame};
 use crate::sync::session::CommandHandler;
 use crate::sync::SyncHub;
 
@@ -41,6 +42,8 @@ pub struct DesktopCommandHandler {
     pub agents: agents::Agents,
     pub background: background::Background,
     pub oauth_refresh: Arc<tokio::sync::Mutex<()>>,
+    pub openai_accounts: Arc<OpenAiAccountRegistry>,
+    pub openai_accounts_startup_error: Arc<Mutex<Option<String>>>,
 }
 
 /// Upper bound on how many rows a single `FetchMessages` page may request. Clamps
@@ -48,6 +51,32 @@ pub struct DesktopCommandHandler {
 /// serializing a huge page that blows the Noise frame cap (~65 KB) — the same
 /// reason catch-up is windowed. Matches the catch-up window order of magnitude.
 const MAX_PAGE_LIMIT: i64 = 200;
+
+/// Correlation IDs are generated as UUIDs by current phone clients. Keeping the
+/// accepted alphabet and size narrow prevents a hostile paired device from making
+/// the desktop reflect control characters or an almost-frame-sized string back at
+/// every subscriber. Invalid identifiers receive an uncorrelated, safe rejection.
+const MAX_REMOTE_REQUEST_ID_BYTES: usize = 128;
+
+/// Public command errors are intentionally much smaller than the encrypted frame
+/// limit. This is defense in depth around future copy changes: a diagnostic can
+/// never turn a command rejection into an oversized-frame transport failure.
+const MAX_COMMAND_REJECTION_MESSAGE_BYTES: usize = 240;
+
+/// Remote-created titles are replicated in both `SessionCreated` and the full
+/// `SessionList`. Keep one confirmed-but-misbehaving phone from persisting an
+/// almost-frame-sized title or control characters into every future catch-up.
+const MAX_REMOTE_SESSION_TITLE_BYTES: usize = 256;
+
+/// Noise transport plaintext tops out just below 64 KiB. Leave several KiB for
+/// framing/version growth and reject a remote create *before* persistence when
+/// the resulting authoritative SessionList would no longer fit in one message.
+const MAX_SYNC_SESSION_LIST_BYTES: usize = 60 * 1_024;
+
+/// Command loops are per connection, so two phones can create concurrently.
+/// Serialize the list-size preflight with the DB write to prevent two remote
+/// requests from both observing the same remaining frame budget.
+static REMOTE_CREATE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Map a phone-supplied permission decision string to a [`Decision`], validated
 /// against an explicit allowlist. Only "allow"/"deny" are meaningful; ANY other
@@ -57,23 +86,160 @@ fn parse_decision(decision: &str) -> Decision {
     match decision {
         "allow" => Decision::Allow,
         "deny" => Decision::Deny,
-        other => {
-            eprintln!("phone-sync: unknown permission decision {other:?} — denying");
+        _ => {
+            // This value is supplied by a paired peer. Keep the audit signal,
+            // but never reflect arbitrary command content into local logs.
+            eprintln!("phone-sync: unknown permission decision — denying");
             Decision::Deny
         }
     }
 }
 
-fn admit_remote_run(
-    cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+fn settings_snapshot(settings: &Mutex<Settings>) -> Result<Settings, String> {
+    settings
+        .lock()
+        .map(|settings| settings.clone())
+        .map_err(|_| "Settings are temporarily unavailable.".to_string())
+}
+
+fn remote_create_model(settings: &Settings) -> Result<String, CommandRejectionCode> {
+    let model = crate::effective_session_model(settings, None)
+        .map_err(|_| CommandRejectionCode::InvalidDesktopConfiguration)?;
+    let provider = crate::llm::provider_name_for_model(&model)
+        .map_err(|_| CommandRejectionCode::InvalidDesktopConfiguration)?;
+    if settings.provider != provider {
+        return Err(CommandRejectionCode::InvalidDesktopConfiguration);
+    }
+    if provider == "openai" {
+        return Err(CommandRejectionCode::OpenAiAccountSelectionRequired);
+    }
+    Ok(model)
+}
+
+fn valid_remote_request_id(request_id: &str) -> bool {
+    !request_id.is_empty()
+        && request_id.len() <= MAX_REMOTE_REQUEST_ID_BYTES
+        && request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn normalize_remote_session_title(title: Option<&str>) -> Result<String, CommandRejectionCode> {
+    let title = title.unwrap_or("New chat").trim();
+    if title.is_empty()
+        || title.len() > MAX_REMOTE_SESSION_TITLE_BYTES
+        || title.chars().any(char::is_control)
+    {
+        return Err(CommandRejectionCode::InvalidRequest);
+    }
+    Ok(title.to_string())
+}
+
+fn session_list_with_candidate_fits(
     db: &Db,
-    session_id: &str,
-) -> Result<(agent::RunReservation, Option<String>), String> {
-    let reservation = agent::RunReservation::try_acquire(cancels, session_id)?;
-    let model = db
-        .session_model(session_id)
-        .map_err(|error| format!("Session is unavailable: {error}"))?;
-    Ok((reservation, model))
+    candidate: &db::SessionRow,
+) -> Result<bool, CommandRejectionCode> {
+    let mut sessions = db
+        .list_sessions()
+        .map_err(|_| CommandRejectionCode::DesktopUnavailable)?;
+    sessions.insert(0, candidate.clone());
+    let encoded = serde_json::to_vec(&SyncFrame::SessionList { sessions })
+        .map_err(|_| CommandRejectionCode::DesktopUnavailable)?;
+    Ok(encoded.len() <= MAX_SYNC_SESSION_LIST_BYTES)
+}
+
+fn rejection_message(code: CommandRejectionCode) -> &'static str {
+    match code {
+        CommandRejectionCode::OpenAiAccountSelectionRequired => {
+            "This desktop now defaults to ChatGPT. Create the conversation on the desktop to choose an account."
+        }
+        CommandRejectionCode::InvalidDesktopConfiguration => {
+            "The desktop default provider and model do not match. Fix Settings on the desktop."
+        }
+        CommandRejectionCode::DesktopUnavailable => {
+            "The desktop could not create the conversation. Please try again."
+        }
+        CommandRejectionCode::InvalidRequest => {
+            "The create request was invalid. Please try again."
+        }
+        CommandRejectionCode::Unknown => "The desktop rejected the command.",
+    }
+}
+
+/// Redact secrets/identifying paths, strip control characters, and truncate on a
+/// UTF-8 boundary. Create rejections pass only whitelisted public copy; remote-run
+/// admission also uses this boundary so an unexpected lower-level diagnostic can
+/// never leak or grow into an oversized live frame.
+fn bounded_public_message(message: &str) -> String {
+    let redacted = crate::scrub::redact_secrets(message);
+    let mut output = String::with_capacity(redacted.len().min(MAX_COMMAND_REJECTION_MESSAGE_BYTES));
+    for character in redacted.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if output.len() + character.len_utf8() > MAX_COMMAND_REJECTION_MESSAGE_BYTES {
+            break;
+        }
+        output.push(character);
+    }
+    output.trim().to_string()
+}
+
+fn command_rejection_frame(request_id: &str, mut code: CommandRejectionCode) -> SyncFrame {
+    let request_id = if valid_remote_request_id(request_id) {
+        Some(request_id.to_string())
+    } else {
+        code = CommandRejectionCode::InvalidRequest;
+        None
+    };
+    SyncFrame::CommandRejected {
+        request_id,
+        code,
+        message: bounded_public_message(rejection_message(code)),
+    }
+}
+
+fn create_remote_session(
+    db: &Db,
+    settings: &Settings,
+    request_id: &str,
+    title: Option<&str>,
+) -> Result<db::SessionRow, CommandRejectionCode> {
+    if !valid_remote_request_id(request_id) {
+        return Err(CommandRejectionCode::InvalidRequest);
+    }
+    let model = remote_create_model(settings)?;
+    let title = normalize_remote_session_title(title)?;
+    let _create_guard = REMOTE_CREATE_LOCK
+        .lock()
+        .map_err(|_| CommandRejectionCode::DesktopUnavailable)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let created_at = db::now_ms();
+    let candidate = db::SessionRow {
+        id: id.clone(),
+        title: title.clone(),
+        branch: None,
+        workspace: None,
+        model: Some(model.clone()),
+        account_profile_id: None,
+        created_at,
+        updated_at: created_at,
+    };
+    if !session_list_with_candidate_fits(db, &candidate)? {
+        return Err(CommandRejectionCode::DesktopUnavailable);
+    }
+    db.create_session_with_account(
+        &id,
+        &title,
+        None, // workspace
+        Some(&model),
+        None, // account profile: unsupported by this protocol version
+        created_at,
+    )
+    .map_err(|_| CommandRejectionCode::DesktopUnavailable)?;
+    Ok(candidate)
 }
 
 #[async_trait]
@@ -90,20 +256,49 @@ impl CommandHandler for DesktopCommandHandler {
                 // mirrors identically.
                 let sink: Arc<dyn EventSink> = Arc::new(AppEventSink(self.app.clone()));
                 let channel = format!("agent://{session_id}");
-                let (reservation, model) =
-                    match admit_remote_run(self.cancels.clone(), &self.db, &session_id) {
-                        Ok(admission) => admission,
-                        Err(message) => {
-                            sink.emit(
-                                &channel,
-                                crate::llm::StreamEvent::Error {
-                                    message,
-                                    receipt: None,
-                                },
-                            );
-                            return Ok(());
-                        }
-                    };
+                let admission: Result<agent::RunAdmission, String> = (|| {
+                    let settings = settings_snapshot(&self.settings)?;
+                    let run_config = self
+                        .db
+                        .session_run_config(&session_id)
+                        .map_err(|_| "Session is unavailable.".to_string())?;
+                    let model =
+                        crate::effective_session_model(&settings, run_config.model.as_deref())?;
+                    if crate::llm::provider_name_for_model(&model)? == "openai" {
+                        crate::ensure_openai_accounts_ready(
+                            &self.openai_accounts,
+                            &self.openai_accounts_startup_error,
+                        )?;
+                    }
+                    let admission = agent::admit_run(
+                        self.cancels.clone(),
+                        &self.db,
+                        &settings,
+                        self.openai_accounts.clone(),
+                        &session_id,
+                    )?;
+                    if admission.is_openai() {
+                        crate::ensure_openai_accounts_ready(
+                            &self.openai_accounts,
+                            &self.openai_accounts_startup_error,
+                        )?;
+                    }
+                    Ok(admission)
+                })();
+                let admission = match admission {
+                    Ok(admission) => admission,
+                    Err(message) => {
+                        let message = bounded_public_message(&message);
+                        sink.emit(
+                            &channel,
+                            crate::llm::StreamEvent::Error {
+                                message,
+                                receipt: None,
+                            },
+                        );
+                        return Ok(());
+                    }
+                };
                 let http = self.http.clone();
                 let settings = self.settings.clone();
                 let db = self.db.clone();
@@ -117,17 +312,13 @@ impl CommandHandler for DesktopCommandHandler {
                         http,
                         settings,
                         db,
-                        reservation,
+                        admission,
                         pending,
                         agents,
                         background,
                         oauth_refresh,
                         session_id,
                         text,
-                        // The phone's Run command carries no per-session model override,
-                        // so use the desktop default — `agent::run` falls back to
-                        // settings.model on None, matching the pre-per-session behavior.
-                        model,
                     )
                     .await;
                 });
@@ -169,29 +360,35 @@ impl CommandHandler for DesktopCommandHandler {
             // reconnect/catch-up (the catch-up `SessionList` is sent once, on Hello,
             // and `forward_live` only ever carried `Live` frames before this).
             RemoteCommand::CreateSession { request_id, title } => {
-                let id = uuid::Uuid::new_v4().to_string();
-                self.db
-                    .create_session(
-                        &id,
-                        title.as_deref().unwrap_or("New chat"),
-                        None, // workspace
-                        None, // model — phone-created sessions use the desktop default
-                        db::now_ms(),
-                    )
-                    .map_err(|e| e.to_string())?;
+                // This protocol carries neither a local profile UUID nor a
+                // capability/version acknowledgement. Fail closed for OpenAI
+                // instead of guessing an account or inheriting a desktop choice.
+                // Every application failure becomes a correlated, bounded result
+                // frame and returns Ok so command intake remains healthy.
+                let created = settings_snapshot(&self.settings)
+                    .map_err(|_| CommandRejectionCode::DesktopUnavailable)
+                    .and_then(|settings| {
+                        create_remote_session(&self.db, &settings, &request_id, title.as_deref())
+                    });
+                let session = match created {
+                    Ok(session) => session,
+                    Err(code) => {
+                        if let Some(hub) = self.app.try_state::<SyncHub>() {
+                            hub.publish_frame(command_rejection_frame(&request_id, code));
+                        }
+                        return Ok(());
+                    }
+                };
                 // Best-effort fan-out of the updated list. A `list_sessions` read
                 // error here must not fail the (already-committed) create, so log +
                 // continue; the phone still picks the session up on next catch-up.
                 if let Some(hub) = self.app.try_state::<SyncHub>() {
+                    hub.publish_frame(SyncFrame::SessionCreated {
+                        request_id,
+                        session,
+                    });
                     match self.db.list_sessions() {
                         Ok(sessions) => {
-                            if let Some(session) = sessions.iter().find(|row| row.id == id).cloned()
-                            {
-                                hub.publish_frame(SyncFrame::SessionCreated {
-                                    request_id,
-                                    session,
-                                });
-                            }
                             hub.publish_frame(SyncFrame::SessionList { sessions });
                         }
                         Err(e) => {
@@ -256,16 +453,176 @@ mod tests {
     }
 
     #[test]
-    fn remote_run_admission_rejects_duplicate_and_missing_without_poisoning_intake() {
+    fn remote_create_freezes_anthropic_default_and_rejects_openai() {
+        let anthropic = Settings::default();
+        assert_eq!(remote_create_model(&anthropic).unwrap(), "claude-opus-4-8");
+
+        let openai = Settings {
+            provider: "openai".into(),
+            model: "gpt-5.6-sol".into(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            remote_create_model(&openai).expect_err("profile negotiation is absent"),
+            CommandRejectionCode::OpenAiAccountSelectionRequired
+        );
+    }
+
+    #[test]
+    fn remote_create_rejects_provider_model_mismatch() {
+        let settings = Settings {
+            model: "gpt-5.6-sol".into(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            remote_create_model(&settings).expect_err("mismatch must fail closed"),
+            CommandRejectionCode::InvalidDesktopConfiguration
+        );
+    }
+
+    #[test]
+    fn stale_openai_rejection_does_not_poison_the_next_remote_create() {
         let db = Db::open(Path::new(":memory:")).unwrap();
-        db.create_session("a", "A", None, Some("gpt-5.6-sol"), 1)
-            .unwrap();
-        let cancels = Arc::new(Mutex::new(HashMap::new()));
-        let (lease, model) = admit_remote_run(cancels.clone(), &db, "a").unwrap();
-        assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
-        assert!(admit_remote_run(cancels.clone(), &db, "a").is_err());
-        drop(lease);
-        assert!(admit_remote_run(cancels.clone(), &db, "missing").is_err());
-        assert!(cancels.lock().unwrap().is_empty());
+        let stale_phone_request = "create-stale";
+        let openai = Settings {
+            provider: "openai".into(),
+            model: "gpt-5.6-sol".into(),
+            ..Settings::default()
+        };
+
+        assert_eq!(
+            create_remote_session(&db, &openai, stale_phone_request, None).unwrap_err(),
+            CommandRejectionCode::OpenAiAccountSelectionRequired
+        );
+        assert!(db.list_sessions().unwrap().is_empty());
+
+        let created = create_remote_session(
+            &db,
+            &Settings::default(),
+            "create-after-rejection",
+            Some("Still connected"),
+        )
+        .expect("subsequent command must still work");
+        assert_eq!(created.title, "Still connected");
+        assert_eq!(created.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(db.list_sessions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remote_create_rejects_unsafe_titles_without_persisting_them() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        for (index, title) in [
+            "   ".to_string(),
+            "line\nbreak".to_string(),
+            "x".repeat(MAX_REMOTE_SESSION_TITLE_BYTES + 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                create_remote_session(
+                    &db,
+                    &Settings::default(),
+                    &format!("unsafe-title-{index}"),
+                    Some(&title),
+                )
+                .unwrap_err(),
+                CommandRejectionCode::InvalidRequest
+            );
+        }
+        assert!(db.list_sessions().unwrap().is_empty());
+
+        let trimmed = create_remote_session(
+            &db,
+            &Settings::default(),
+            "trimmed-title",
+            Some("  Safe title  "),
+        )
+        .unwrap();
+        assert_eq!(trimmed.title, "Safe title");
+    }
+
+    #[test]
+    fn remote_create_cannot_persist_a_session_list_beyond_the_noise_budget() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let title = "t".repeat(MAX_REMOTE_SESSION_TITLE_BYTES);
+        let mut successful = 0;
+        for index in 0..1_000 {
+            match create_remote_session(
+                &db,
+                &Settings::default(),
+                &format!("capacity-{index}"),
+                Some(&title),
+            ) {
+                Ok(_) => successful += 1,
+                Err(CommandRejectionCode::DesktopUnavailable) => break,
+                Err(other) => panic!("unexpected capacity result: {other:?}"),
+            }
+        }
+        assert!(
+            successful > 1,
+            "fixture should admit ordinary remote creates"
+        );
+        let sessions = db.list_sessions().unwrap();
+        assert_eq!(sessions.len(), successful);
+        let encoded = serde_json::to_vec(&SyncFrame::SessionList { sessions }).unwrap();
+        assert!(encoded.len() <= MAX_SYNC_SESSION_LIST_BYTES);
+        assert_eq!(
+            create_remote_session(&db, &Settings::default(), "capacity-final", Some(&title),)
+                .unwrap_err(),
+            CommandRejectionCode::DesktopUnavailable
+        );
+        assert_eq!(db.list_sessions().unwrap().len(), successful);
+    }
+
+    #[test]
+    fn command_rejection_is_correlated_and_uses_only_bounded_public_copy() {
+        let frame = command_rejection_frame(
+            "create-42",
+            CommandRejectionCode::OpenAiAccountSelectionRequired,
+        );
+        assert!(matches!(
+            frame,
+            SyncFrame::CommandRejected {
+                request_id: Some(request_id),
+                code: CommandRejectionCode::OpenAiAccountSelectionRequired,
+                message,
+            } if request_id == "create-42"
+                && message.len() <= MAX_COMMAND_REJECTION_MESSAGE_BYTES
+                && !message.chars().any(char::is_control)
+                && message.contains("desktop")
+        ));
+
+        let hostile = format!("{}\nsecret\0{}", "x".repeat(400), "y".repeat(400));
+        let sanitized = bounded_public_message(&hostile);
+        assert!(sanitized.len() <= MAX_COMMAND_REJECTION_MESSAGE_BYTES);
+        assert!(!sanitized.chars().any(char::is_control));
+        assert!(!sanitized.contains(&"x".repeat(40)));
+        assert!(sanitized.contains("[redacted-key]"));
+
+        let redacted = bounded_public_message(
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789 at C:\\Users\\Alice\\db",
+        );
+        assert!(!redacted.contains("abcdefghijklmnopqrstuvwxyz"));
+        assert!(!redacted.contains("Alice"));
+        assert!(redacted.contains("[redacted"));
+    }
+
+    #[test]
+    fn unsafe_request_id_is_not_reflected_to_the_phone() {
+        let oversized = "r".repeat(MAX_REMOTE_REQUEST_ID_BYTES + 1);
+        for request_id in ["", "line\nbreak", oversized.as_str()] {
+            assert!(matches!(
+                command_rejection_frame(
+                    request_id,
+                    CommandRejectionCode::OpenAiAccountSelectionRequired,
+                ),
+                SyncFrame::CommandRejected {
+                    request_id: None,
+                    code: CommandRejectionCode::InvalidRequest,
+                    ..
+                }
+            ));
+        }
     }
 }

@@ -214,9 +214,32 @@ fn decode_ui_cursor(session_id: &str, value: &str) -> rusqlite::Result<UiMessage
 pub struct TurnReceiptRecord {
     pub session_id: String,
     pub message_id: String,
+    /// Opaque local account attribution duplicated in its own nullable column so
+    /// support/audit queries never need to inspect the receipt JSON. This is not
+    /// the remote ChatGPT account id.
+    pub account_profile_id: Option<String>,
     pub receipt: TurnReceipt,
     pub repository_root: Option<String>,
     pub terminal_snapshot_id: Option<String>,
+}
+
+/// Immutable session-owned values required to admit a run. Reading model and
+/// account together prevents execution from observing two different session
+/// states across separate queries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionRunConfig {
+    pub model: Option<String>,
+    pub account_profile_id: Option<String>,
+}
+
+/// Result of the compare-and-set used to attribute an unpinned legacy session.
+/// Once a non-NULL profile is present this API never rewrites it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LegacySessionAccountPin {
+    Pinned,
+    AlreadyPinnedSame,
+    Conflict { existing_account_profile_id: String },
+    SessionChanged { current: SessionRunConfig },
 }
 
 fn to_ui_block(b: &Block) -> Option<UiBlock> {
@@ -388,6 +411,7 @@ impl Db {
                 title TEXT NOT NULL,
                 workspace TEXT,
                 model TEXT,
+                account_profile_id TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -432,6 +456,7 @@ impl Db {
                 session_id TEXT NOT NULL,
                 message_id TEXT NOT NULL,
                 receipt_json TEXT NOT NULL,
+                account_profile_id TEXT,
                 repository_root TEXT,
                 terminal_snapshot_id TEXT,
                 started_at INTEGER NOT NULL,
@@ -446,6 +471,8 @@ impl Db {
         // failure must fail startup rather than make model changes appear durable
         // until the next reload.
         Self::migrate_add_model(&conn)?;
+        Self::migrate_add_session_account_profile_id(&conn)?;
+        Self::migrate_add_receipt_account_profile_id(&conn)?;
         // ADDITIVE migration: a `paired_devices` table created before the
         // device-trust gate landed has no `confirmed` column. Add it without
         // dropping the table, defaulting every pre-existing row to 0 (untrusted).
@@ -486,6 +513,41 @@ impl Db {
             .any(|name| name == "model");
         if !has_model {
             conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT", [])?;
+        }
+        Ok(())
+    }
+
+    /// Add the nullable local account attribution columns without rewriting any
+    /// legacy row. There is deliberately no foreign key: account credentials can
+    /// be removed while session history and turn receipts remain readable.
+    fn migrate_add_session_account_profile_id(conn: &Connection) -> rusqlite::Result<()> {
+        let mut sessions = conn.prepare("PRAGMA table_info(sessions)")?;
+        let session_has_account = sessions
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .any(|name| name == "account_profile_id");
+        drop(sessions);
+        if !session_has_account {
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN account_profile_id TEXT",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn migrate_add_receipt_account_profile_id(conn: &Connection) -> rusqlite::Result<()> {
+        let mut receipts = conn.prepare("PRAGMA table_info(turn_receipts)")?;
+        let receipt_has_account = receipts
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .any(|name| name == "account_profile_id");
+        drop(receipts);
+        if !receipt_has_account {
+            conn.execute(
+                "ALTER TABLE turn_receipts ADD COLUMN account_profile_id TEXT",
+                [],
+            )?;
         }
         Ok(())
     }
@@ -622,7 +684,7 @@ impl Db {
         let rows: Vec<SessionRow> = {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn.prepare(
-                "SELECT id, title, workspace, model, created_at, updated_at
+                "SELECT id, title, workspace, model, account_profile_id, created_at, updated_at
                  FROM sessions ORDER BY updated_at DESC",
             )?;
             let mapped = stmt.query_map([], |r| {
@@ -632,8 +694,9 @@ impl Db {
                     branch: None,
                     workspace: r.get(2)?,
                     model: r.get(3)?,
-                    created_at: r.get(4)?,
-                    updated_at: r.get(5)?,
+                    account_profile_id: r.get(4)?,
+                    created_at: r.get(5)?,
+                    updated_at: r.get(6)?,
                 })
             })?;
             mapped.collect::<rusqlite::Result<Vec<_>>>()?
@@ -670,11 +733,26 @@ impl Db {
         model: Option<&str>,
         ts: i64,
     ) -> rusqlite::Result<()> {
+        self.create_session_with_account(id, title, workspace, model, None, ts)
+    }
+
+    /// Create a session with an immutable local account attribution. The caller
+    /// validates that the profile exists before this persistence boundary.
+    pub fn create_session_with_account(
+        &self,
+        id: &str,
+        title: &str,
+        workspace: Option<&str>,
+        model: Option<&str>,
+        account_profile_id: Option<&str>,
+        ts: i64,
+    ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO sessions (id, title, workspace, model, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![id, title, workspace, model, ts],
+            "INSERT INTO sessions (
+                 id, title, workspace, model, account_profile_id, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![id, title, workspace, model, account_profile_id, ts],
         )?;
         Ok(())
     }
@@ -703,13 +781,141 @@ impl Db {
         Ok(())
     }
 
+    /// Change a session model only if both persisted execution selectors still
+    /// match the snapshot the caller validated. The NULL-safe predicates close
+    /// the race between model changes and legacy-account pinning.
+    pub fn compare_and_set_session_model(
+        &self,
+        id: &str,
+        expected: &SessionRunConfig,
+        model: &str,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE sessions SET model = ?4
+             WHERE id = ?1 AND model IS ?2 AND account_profile_id IS ?3",
+            params![
+                id,
+                expected.model.as_deref(),
+                expected.account_profile_id.as_deref(),
+                model,
+            ],
+        )?;
+        Ok(updated == 1)
+    }
+
     pub fn session_model(&self, id: &str) -> rusqlite::Result<Option<String>> {
+        Ok(self.session_run_config(id)?.model)
+    }
+
+    /// Load the complete session-owned execution selection in one database read.
+    /// An unknown session fails closed with `QueryReturnedNoRows`.
+    pub fn session_run_config(&self, id: &str) -> rusqlite::Result<SessionRunConfig> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT model FROM sessions WHERE id = ?1",
+            "SELECT model, account_profile_id FROM sessions WHERE id = ?1",
             params![id],
-            |row| row.get(0),
+            |row| {
+                Ok(SessionRunConfig {
+                    model: row.get(0)?,
+                    account_profile_id: row.get(1)?,
+                })
+            },
         )
+    }
+
+    /// Pin an un-attributed legacy session exactly once. A competing choice can
+    /// never overwrite the winner; callers receive the persisted profile in the
+    /// conflict result and can ask the user to reopen the now-pinned session.
+    pub fn pin_legacy_session_account(
+        &self,
+        id: &str,
+        account_profile_id: &str,
+    ) -> rusqlite::Result<LegacySessionAccountPin> {
+        self.pin_legacy_session_account_with_model(id, account_profile_id, None)
+    }
+
+    /// Atomically pin a legacy account and freeze the effective model when the
+    /// old row predates per-session model persistence. This prevents a later
+    /// global-default change from turning the newly pinned OpenAI session into a
+    /// cross-provider session between two separate writes.
+    pub fn pin_legacy_session_account_with_model(
+        &self,
+        id: &str,
+        account_profile_id: &str,
+        effective_model: Option<&str>,
+    ) -> rusqlite::Result<LegacySessionAccountPin> {
+        let expected = self.session_run_config(id)?;
+        self.pin_legacy_session_account_if_config(
+            id,
+            account_profile_id,
+            &expected,
+            effective_model,
+        )
+    }
+
+    /// Pin only the exact session configuration the caller validated. A model
+    /// change that lands between validation and persistence is reported rather
+    /// than combined with an incompatible account.
+    pub fn pin_legacy_session_account_if_config(
+        &self,
+        id: &str,
+        account_profile_id: &str,
+        expected: &SessionRunConfig,
+        effective_model: Option<&str>,
+    ) -> rusqlite::Result<LegacySessionAccountPin> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        let current = transaction
+            .query_row(
+                "SELECT model, account_profile_id FROM sessions WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(SessionRunConfig {
+                        model: row.get(0)?,
+                        account_profile_id: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+
+        let result = match current.account_profile_id.clone() {
+            None if current == *expected => {
+                let updated = transaction.execute(
+                    "UPDATE sessions
+                     SET account_profile_id = ?2, model = COALESCE(model, ?3)
+                     WHERE id = ?1 AND model IS ?4 AND account_profile_id IS NULL",
+                    params![
+                        id,
+                        account_profile_id,
+                        effective_model,
+                        expected.model.as_deref()
+                    ],
+                )?;
+                if updated != 1 {
+                    return Err(rusqlite::Error::StatementChangedRows(updated));
+                }
+                LegacySessionAccountPin::Pinned
+            }
+            Some(existing) if existing == account_profile_id => {
+                // Idempotent retries also repair a transitional row whose account
+                // was pinned by an older build before its effective model was
+                // frozen. A different account is never touched.
+                transaction.execute(
+                    "UPDATE sessions SET model = COALESCE(model, ?3)
+                     WHERE id = ?1 AND account_profile_id = ?2",
+                    params![id, account_profile_id, effective_model],
+                )?;
+                LegacySessionAccountPin::AlreadyPinnedSame
+            }
+            Some(existing) => LegacySessionAccountPin::Conflict {
+                existing_account_profile_id: existing,
+            },
+            None => LegacySessionAccountPin::SessionChanged { current },
+        };
+        transaction.commit()?;
+        Ok(result)
     }
 
     fn require_session(&self, id: &str) -> rusqlite::Result<()> {
@@ -958,26 +1164,28 @@ impl Db {
         conn.execute(
             "INSERT INTO turn_receipts (
                  turn_id, session_id, message_id, receipt_json,
-                 repository_root, terminal_snapshot_id, started_at, completed_at, terminal,
-                 anchor_seq
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
-                 (SELECT COALESCE(MAX(seq) + 1, 0) FROM messages WHERE session_id = ?2))
+                 account_profile_id, repository_root, terminal_snapshot_id,
+                 started_at, completed_at, terminal, anchor_seq
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                  (SELECT COALESCE(MAX(seq) + 1, 0) FROM messages WHERE session_id = ?2))
              ON CONFLICT(turn_id) DO UPDATE SET
                  session_id = excluded.session_id,
                  message_id = excluded.message_id,
                  receipt_json = excluded.receipt_json,
+                 account_profile_id = excluded.account_profile_id,
                  repository_root = excluded.repository_root,
                  terminal_snapshot_id = excluded.terminal_snapshot_id,
                  started_at = excluded.started_at,
                  completed_at = excluded.completed_at,
                  terminal = excluded.terminal,
                  anchor_seq = COALESCE(turn_receipts.anchor_seq, excluded.anchor_seq)
-             WHERE turn_receipts.terminal = 0 OR excluded.terminal = 1",
+             WHERE turn_receipts.terminal = 0",
             params![
                 receipt.turn_id,
                 session_id,
                 message_id,
                 json,
+                receipt.account_profile_id.as_deref(),
                 repository_root,
                 terminal_snapshot_id,
                 receipt.started_at,
@@ -991,8 +1199,8 @@ impl Db {
     pub fn get_turn_receipt(&self, turn_id: &str) -> Option<TurnReceiptRecord> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT session_id, message_id, receipt_json, repository_root,
-                    terminal_snapshot_id
+            "SELECT session_id, message_id, receipt_json, account_profile_id,
+                    repository_root, terminal_snapshot_id
              FROM turn_receipts WHERE turn_id = ?1 AND terminal = 1",
             params![turn_id],
             |row| {
@@ -1007,9 +1215,10 @@ impl Db {
                 Ok(TurnReceiptRecord {
                     session_id: row.get(0)?,
                     message_id: row.get(1)?,
+                    account_profile_id: row.get(3)?,
                     receipt,
-                    repository_root: row.get(3)?,
-                    terminal_snapshot_id: row.get(4)?,
+                    repository_root: row.get(4)?,
+                    terminal_snapshot_id: row.get(5)?,
                 })
             },
         )
@@ -1756,6 +1965,7 @@ mod tests {
     use portcode_sync::wire::{TurnChangeCertainty, TurnStatus};
     use serde_json::json;
     use std::path::PathBuf;
+    use std::sync::{Arc, Barrier};
 
     fn mem_db() -> Db {
         Db::open(Path::new(":memory:")).expect("in-memory db")
@@ -1778,6 +1988,7 @@ mod tests {
     fn receipt(turn_id: &str) -> TurnReceipt {
         TurnReceipt {
             turn_id: turn_id.into(),
+            account_profile_id: None,
             status: TurnStatus::Completed,
             stop_reason: Some("end_turn".into()),
             started_at: 2,
@@ -1849,6 +2060,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, "b"); // newer updated_at first
         assert_eq!(rows[0].workspace.as_deref(), Some("C:/ws"));
+        assert_eq!(rows[0].account_profile_id, None);
         assert_eq!(rows[1].workspace, None);
         // A non-existent workspace path resolves to no branch (not an error).
         assert_eq!(rows[0].branch, None);
@@ -1875,6 +2087,8 @@ mod tests {
 
         Db::migrate_add_model(&conn).unwrap();
         Db::migrate_add_model(&conn).unwrap(); // idempotent on every later launch
+        Db::migrate_add_session_account_profile_id(&conn).unwrap();
+        Db::migrate_add_session_account_profile_id(&conn).unwrap();
         let db = Db {
             conn: Mutex::new(conn),
         };
@@ -1887,6 +2101,259 @@ mod tests {
         db.update_session_model("legacy", "gpt-5.6-sol").unwrap();
         let after = db.list_sessions().unwrap();
         assert_eq!(after[0].model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn legacy_account_columns_migrate_idempotently_without_rewriting_rows() {
+        let conn = Connection::open(Path::new(":memory:")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace TEXT,
+                model TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO sessions (id, title, model, created_at, updated_at)
+            VALUES ('legacy-session', 'Kept chat', 'gpt-5.6-sol', 10, 20);
+            CREATE TABLE turn_receipts (
+                turn_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                receipt_json TEXT NOT NULL,
+                repository_root TEXT,
+                terminal_snapshot_id TEXT,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER NOT NULL,
+                terminal INTEGER NOT NULL DEFAULT 1,
+                anchor_seq INTEGER
+            );
+            INSERT INTO turn_receipts (
+                turn_id, session_id, message_id, receipt_json, started_at,
+                completed_at, terminal
+            ) VALUES ('legacy-turn', 'legacy-session', 'legacy-turn', '{}', 10, 20, 1);",
+        )
+        .unwrap();
+
+        Db::migrate_add_session_account_profile_id(&conn).unwrap();
+        Db::migrate_add_receipt_account_profile_id(&conn).unwrap();
+        Db::migrate_add_session_account_profile_id(&conn).unwrap();
+        Db::migrate_add_receipt_account_profile_id(&conn).unwrap();
+
+        let session: (String, Option<String>) = conn
+            .query_row(
+                "SELECT title, account_profile_id FROM sessions WHERE id = 'legacy-session'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(session, ("Kept chat".into(), None));
+        let receipt_account: Option<String> = conn
+            .query_row(
+                "SELECT account_profile_id FROM turn_receipts WHERE turn_id = 'legacy-turn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipt_account, None);
+    }
+
+    #[test]
+    fn account_pinned_session_round_trips_with_atomic_run_config() {
+        let db = mem_db();
+        db.create_session("legacy", "Legacy", None, Some("gpt-5.6-sol"), 1)
+            .unwrap();
+        db.create_session_with_account(
+            "pinned",
+            "Pinned",
+            Some("C:/workspace"),
+            Some("gpt-5.6-sol"),
+            Some("profile-a"),
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.session_run_config("legacy").unwrap(),
+            SessionRunConfig {
+                model: Some("gpt-5.6-sol".into()),
+                account_profile_id: None,
+            }
+        );
+        assert_eq!(
+            db.session_run_config("pinned").unwrap(),
+            SessionRunConfig {
+                model: Some("gpt-5.6-sol".into()),
+                account_profile_id: Some("profile-a".into()),
+            }
+        );
+        assert!(matches!(
+            db.session_run_config("missing"),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        ));
+
+        let pinned = db
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|session| session.id == "pinned")
+            .unwrap();
+        assert_eq!(pinned.account_profile_id.as_deref(), Some("profile-a"));
+    }
+
+    #[test]
+    fn legacy_account_pin_freezes_a_missing_effective_model_in_the_same_update() {
+        let db = mem_db();
+        db.create_session("legacy", "Legacy", None, None, 1)
+            .unwrap();
+
+        assert_eq!(
+            db.pin_legacy_session_account_with_model("legacy", "profile-a", Some("gpt-5.6-sol"),)
+                .unwrap(),
+            LegacySessionAccountPin::Pinned
+        );
+        assert_eq!(
+            db.session_run_config("legacy").unwrap(),
+            SessionRunConfig {
+                model: Some("gpt-5.6-sol".into()),
+                account_profile_id: Some("profile-a".into()),
+            }
+        );
+
+        db.create_session_with_account(
+            "transitional",
+            "Transitional",
+            None,
+            None,
+            Some("profile-a"),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            db.pin_legacy_session_account_with_model(
+                "transitional",
+                "profile-a",
+                Some("gpt-5.6-sol"),
+            )
+            .unwrap(),
+            LegacySessionAccountPin::AlreadyPinnedSame
+        );
+        assert_eq!(
+            db.session_run_config("transitional")
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("gpt-5.6-sol")
+        );
+    }
+
+    #[test]
+    fn legacy_account_pin_is_an_atomic_compare_and_set() {
+        let db = Arc::new(mem_db());
+        db.create_session("legacy", "Legacy", None, Some("gpt-5.6-sol"), 1)
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for profile in ["profile-a", "profile-b"] {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                (
+                    profile,
+                    db.pin_legacy_session_account("legacy", profile).unwrap(),
+                )
+            }));
+        }
+        barrier.wait();
+        let outcomes: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+
+        let winner = db
+            .session_run_config("legacy")
+            .unwrap()
+            .account_profile_id
+            .unwrap();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|(_, result)| matches!(result, LegacySessionAccountPin::Pinned))
+                .count(),
+            1
+        );
+        let conflict = outcomes
+            .iter()
+            .find_map(|(_, result)| match result {
+                LegacySessionAccountPin::Conflict {
+                    existing_account_profile_id,
+                } => Some(existing_account_profile_id),
+                _ => None,
+            })
+            .expect("the losing choice reports a conflict");
+        assert_eq!(conflict, &winner);
+        assert_eq!(
+            db.pin_legacy_session_account("legacy", &winner).unwrap(),
+            LegacySessionAccountPin::AlreadyPinnedSame
+        );
+        assert!(matches!(
+            db.pin_legacy_session_account("missing", "profile-a"),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        ));
+    }
+
+    #[test]
+    fn model_update_and_account_pin_cannot_combine_stale_validations() {
+        let db = mem_db();
+        db.create_session("pin-wins", "Pin wins", None, Some("gpt-5.6-sol"), 1)
+            .unwrap();
+        let before_pin = db.session_run_config("pin-wins").unwrap();
+        let stale_model_update = before_pin.clone();
+        assert_eq!(
+            db.pin_legacy_session_account_if_config(
+                "pin-wins",
+                "profile-a",
+                &before_pin,
+                Some("gpt-5.6-sol"),
+            )
+            .unwrap(),
+            LegacySessionAccountPin::Pinned
+        );
+        assert!(!db
+            .compare_and_set_session_model("pin-wins", &stale_model_update, "claude-opus-4-8",)
+            .unwrap());
+        assert_eq!(
+            db.session_run_config("pin-wins").unwrap(),
+            SessionRunConfig {
+                model: Some("gpt-5.6-sol".into()),
+                account_profile_id: Some("profile-a".into()),
+            }
+        );
+
+        db.create_session("model-wins", "Model wins", None, Some("gpt-5.6-sol"), 2)
+            .unwrap();
+        let stale_pin = db.session_run_config("model-wins").unwrap();
+        db.update_session_model("model-wins", "claude-opus-4-8")
+            .unwrap();
+        assert!(matches!(
+            db.pin_legacy_session_account_if_config(
+                "model-wins",
+                "profile-a",
+                &stale_pin,
+                Some("gpt-5.6-sol"),
+            )
+            .unwrap(),
+            LegacySessionAccountPin::SessionChanged { .. }
+        ));
+        assert_eq!(
+            db.session_run_config("model-wins").unwrap(),
+            SessionRunConfig {
+                model: Some("claude-opus-4-8".into()),
+                account_profile_id: None,
+            }
+        );
     }
 
     #[test]
@@ -2244,6 +2711,70 @@ mod tests {
             1
         );
         assert_eq!(replicated.last().unwrap().receipt.as_ref(), Some(&receipt));
+    }
+
+    #[test]
+    fn turn_receipt_persists_only_the_local_account_profile_attribution() {
+        let db = mem_db();
+        db.create_session_with_account("a", "A", None, Some("gpt-5.6-sol"), Some("profile-a"), 1)
+            .unwrap();
+        let mut receipt = receipt("account-turn");
+        receipt.account_profile_id = Some("profile-a".into());
+        db.save_turn_receipt("a", "account-turn", &receipt, None, None)
+            .unwrap();
+
+        let stored = db.get_turn_receipt("account-turn").unwrap();
+        assert_eq!(stored.account_profile_id.as_deref(), Some("profile-a"));
+        assert_eq!(
+            stored.receipt.account_profile_id.as_deref(),
+            Some("profile-a")
+        );
+        let raw_account: Option<String> = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT account_profile_id FROM turn_receipts WHERE turn_id = 'account-turn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_account.as_deref(), Some("profile-a"));
+    }
+
+    #[test]
+    fn terminal_turn_receipt_and_account_attribution_are_immutable() {
+        let db = mem_db();
+        db.create_session_with_account("a", "A", None, Some("gpt-5.6-sol"), Some("profile-a"), 1)
+            .unwrap();
+        let mut first = receipt("immutable-turn");
+        first.account_profile_id = Some("profile-a".into());
+        db.save_turn_receipt(
+            "a",
+            "immutable-turn",
+            &first,
+            Some("repo-a"),
+            Some("snap-a"),
+        )
+        .unwrap();
+
+        let mut conflicting = first.clone();
+        conflicting.account_profile_id = Some("profile-b".into());
+        conflicting.stop_reason = Some("conflicting-rewrite".into());
+        db.save_turn_receipt(
+            "a",
+            "immutable-turn",
+            &conflicting,
+            Some("repo-b"),
+            Some("snap-b"),
+        )
+        .unwrap();
+
+        let stored = db.get_turn_receipt("immutable-turn").unwrap();
+        assert_eq!(stored.account_profile_id.as_deref(), Some("profile-a"));
+        assert_eq!(stored.receipt, first);
+        assert_eq!(stored.repository_root.as_deref(), Some("repo-a"));
+        assert_eq!(stored.terminal_snapshot_id.as_deref(), Some("snap-a"));
     }
 
     #[test]

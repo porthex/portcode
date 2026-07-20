@@ -13,7 +13,10 @@ import type {
   MessageRow,
   ModelInfo,
   OAuthStatus,
+  OpenAIAccountSummary,
   OpenAIAuthStatus,
+  OpenAIModelCatalogState,
+  OpenAIReconnectMismatch,
   PairingPayload,
   PairingRequest,
   PendingPermission,
@@ -42,12 +45,14 @@ import {
   CYCLE_MODES,
   DEFAULT_SETTINGS,
   OPENAI_FALLBACK_MODELS,
-  mergeOpenAIModels,
+  normalizeOpenAIModels,
+  openAIAccountLabel,
   providerForModel,
   reasoningEffortForModel,
 } from "../types";
 import * as ipc from "../lib/ipc";
 import { isMobilePlatform } from "../lib/platform";
+import { markdownLiteralText, remoteAccountLabel } from "../lib/sessionFormat";
 import { canonicalToolName, isCommandToolName, toolNamesEquivalent } from "../lib/toolNames";
 
 // ── Per-run state ─────────────────────────────────────────────────────────────
@@ -170,7 +175,15 @@ interface AppState {
   oauthError: string | null; // last sign-in/out failure, surfaced in Settings
   openAIAuthStatus: OpenAIAuthStatus | null; // ChatGPT subscription sign-in state
   openAIAuthError: string | null; // OpenAI sign-in/out/catalog failure
-  openAIModels: ModelInfo[]; // live Codex catalogue merged over offline fallbacks
+  openAIReconnectMismatch: OpenAIReconnectMismatch | null;
+  openAIAccounts: OpenAIAccountSummary[]; // display-safe native profile summaries
+  openAIAccountsLoading: boolean;
+  openAIAccountsError: string | null;
+  openAIModelCatalogs: Record<string, OpenAIModelCatalogState>; // strictly profile-scoped
+  /** Compatibility/default view: the last-used connected profile's catalogue. */
+  openAIModels: ModelInfo[];
+  /** UI preference only. Existing runs always resolve through Session.accountProfileId. */
+  lastOpenAIAccountProfileId: string | null;
   phoneSync: PhoneSyncStatus | null; // phone sync device identity + paired devices
   pairingPayload: PairingPayload | null; // in-progress pairing code to display
   pairingError: string | null; // last begin-pairing/unpair failure, surfaced in Settings
@@ -240,7 +253,7 @@ interface AppState {
   remoteSas: string | null; // short-auth-string to compare out-of-band; null when not connected
   remotePeerKey: string | null; // the desktop's pinned static public key (from ConnectInfo); the STABLE identity, distinct from the SAS
   remoteVapidKey: string | null; // the desktop's Web Push VAPID public key (from ConnectInfo); null when the desktop sent none. Drives the installed-PWA push subscription (§5.7).
-  remoteError: string | null; // last connect failure, surfaced in the connect UI
+  remoteError: string | null; // last remote failure, surfaced in pairing or session UI
   remoteUnlisten: (() => void) | null; // tears down the frame subscription (private; mirrors `cancel`)
   remoteDropped: boolean; // the live session ended unexpectedly — the UI offers a reconnect
   remoteRejected: boolean; // the pairing was declined (this phone rejected the SAS, or the desktop did) — the UI shows a "rejected" notice
@@ -277,7 +290,7 @@ interface AppState {
   setDraft: (v: string) => void;
   appendDraft: (v: string) => void;
   openWorkspace: () => Promise<void>;
-  newSession: () => Promise<void>;
+  newSession: (accountProfileId?: string, modelId?: string) => Promise<void>;
   selectSession: (id: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
   renameSession: (id: string, title: string) => Promise<void>;
@@ -306,7 +319,10 @@ interface AppState {
   logoutClaude: () => Promise<void>;
   refreshOpenAIStatus: () => Promise<void>;
   loginWithOpenAI: () => Promise<void>;
-  logoutOpenAI: () => Promise<void>;
+  reconnectOpenAIAccount: (accountProfileId: string) => Promise<void>;
+  removeOpenAIAccount: (accountProfileId: string) => Promise<void>;
+  loadOpenAIAccountModels: (accountProfileId: string, force?: boolean) => Promise<ModelInfo[]>;
+  pinSessionOpenAIAccount: (sessionId: string, accountProfileId: string) => Promise<void>;
   refreshPhoneSync: () => Promise<void>;
   beginPairing: () => Promise<void>;
   unpair: (publicKey: string) => Promise<void>;
@@ -324,6 +340,7 @@ interface AppState {
     (decision: "allow" | "deny", always?: boolean): Promise<void>;
   };
   setRemoteMode: (v: boolean) => void;
+  clearRemoteError: () => void;
   confirmRemoteSas: () => void;
   rejectRemoteSas: () => Promise<void>;
   applyFrame: (frame: SyncFrame) => void;
@@ -859,6 +876,7 @@ const CANCEL_TERMINAL_GRACE_MS = 30_000;
 // out of order (a slower first invoke completing last would otherwise survive reload).
 const sessionModelWriteQueues = new Map<string, Promise<void>>();
 const persistedSessionModels = new Map<string, string>();
+const openAIModelRequestVersions = new Map<string, number>();
 const enqueueSessionModelWrite = (sessionId: string, model: string): Promise<void> => {
   const prior = sessionModelWriteQueues.get(sessionId);
   const write = prior
@@ -1257,7 +1275,39 @@ const uid = () =>
     ? crypto.randomUUID()
     : Math.random().toString(36).slice(2);
 
-function makeSession(model: string): Session {
+const connectedOpenAIAccounts = (accounts: OpenAIAccountSummary[]) =>
+  accounts.filter((account) => account.state === "connected");
+
+export const preferredOpenAIAccount = (
+  accounts: OpenAIAccountSummary[],
+  lastUsed: string | null,
+): OpenAIAccountSummary | undefined => {
+  const connected = connectedOpenAIAccounts(accounts);
+  const explicitlyPreferred = connected.find((account) => account.id === lastUsed);
+  if (explicitlyPreferred) return explicitlyPreferred;
+  return [...connected].sort(
+    (left, right) =>
+      (right.lastUsedAt ?? -1) - (left.lastUsedAt ?? -1) ||
+      right.updatedAt - left.updatedAt ||
+      left.createdAt - right.createdAt ||
+      left.id.localeCompare(right.id),
+  )[0];
+};
+
+/** Resolve a catalogue without ever borrowing another account's successful data. */
+const EMPTY_OPENAI_MODELS: ModelInfo[] = [];
+
+export function modelsForOpenAIProfile(
+  accountProfileId: string | null | undefined,
+  catalogs: Record<string, OpenAIModelCatalogState>,
+  unpinnedFallback?: ModelInfo[],
+): ModelInfo[] {
+  if (!accountProfileId) return unpinnedFallback ?? EMPTY_OPENAI_MODELS;
+  const catalog = catalogs[accountProfileId];
+  return catalog?.status === "ready" ? catalog.models : EMPTY_OPENAI_MODELS;
+}
+
+function makeSession(model: string, accountProfileId: string | null = null): Session {
   const t = now();
   return {
     id: uid(),
@@ -1267,6 +1317,7 @@ function makeSession(model: string): Session {
     // list; a fresh, workspace-less chat has none until then.
     branch: null,
     model,
+    accountProfileId,
     createdAt: t,
     updatedAt: t,
   };
@@ -1286,7 +1337,13 @@ export const useStore = create<AppState>((set, get) => ({
   oauthError: null,
   openAIAuthStatus: null,
   openAIAuthError: null,
+  openAIReconnectMismatch: null,
+  openAIAccounts: [],
+  openAIAccountsLoading: false,
+  openAIAccountsError: null,
+  openAIModelCatalogs: {},
   openAIModels: OPENAI_FALLBACK_MODELS,
+  lastOpenAIAccountProfileId: readStr("pc.lastOpenAIAccountProfileId"),
   phoneSync: null,
   pairingPayload: null,
   pairingError: null,
@@ -1378,11 +1435,21 @@ export const useStore = create<AppState>((set, get) => ({
         typeof ipc.openaiOauthStatus === "function"
           ? ipc.openaiOauthStatus().catch(() => null)
           : Promise.resolve(null);
+      const openAIAccountsPromise: Promise<{
+        accounts: OpenAIAccountSummary[];
+        error: string | null;
+      }> =
+        typeof ipc.listOpenAIAccounts === "function"
+          ? ipc
+              .listOpenAIAccounts()
+              .then((accounts) => ({ accounts, error: null }))
+              .catch((error) => ({ accounts: [], error: errMessage(error) }))
+          : Promise.resolve({ accounts: [], error: null });
       const [
         rawSettings,
         oauthStatus,
         openAIAuthStatus,
-        openAIModelRows,
+        openAIAccountDiscovery,
         phoneSync,
         backendDrafts,
         allUsage,
@@ -1390,29 +1457,84 @@ export const useStore = create<AppState>((set, get) => ({
         ipc.getSettings(),
         ipc.oauthStatus().catch(() => null),
         openAIStatusPromise,
-        openAIStatusPromise.then((status) =>
-          status?.available !== false && typeof ipc.openaiModels === "function"
-            ? ipc.openaiModels().catch(() => [])
-            : [],
-        ),
+        openAIAccountsPromise,
         ipc.phoneSyncStatus().catch(() => null),
         // Resilient: an older core that predates these commands must not block
         // startup — fall back to empty (the localStorage mirror still restores drafts).
         ipc.getDrafts().catch(() => []),
         ipc.getAllUsage().catch(() => []),
       ]);
+      const openAIAccounts = openAIAccountDiscovery.accounts;
       const openAIAvailable = openAIAuthStatus?.available !== false;
-      const openAIModels = openAIAvailable ? mergeOpenAIModels(openAIModelRows) : [];
+      const preferredAccount = preferredOpenAIAccount(
+        openAIAccounts,
+        get().lastOpenAIAccountProfileId,
+      );
+      let openAIModelCatalogs: Record<string, OpenAIModelCatalogState> = {};
+      let openAIModels = openAIAvailable && !preferredAccount ? OPENAI_FALLBACK_MODELS : [];
+      if (openAIAvailable && preferredAccount && typeof ipc.openaiModels === "function") {
+        try {
+          const models = normalizeOpenAIModels(await ipc.openaiModels(preferredAccount.id));
+          if (models.length === 0) {
+            openAIModelCatalogs = {
+              [preferredAccount.id]: {
+                status: "error",
+                models: [],
+                error: "This account returned no compatible OpenAI models.",
+              },
+            };
+          } else {
+            openAIModels = models;
+            openAIModelCatalogs = {
+              [preferredAccount.id]: { status: "ready", models, error: null },
+            };
+          }
+        } catch (error) {
+          openAIModelCatalogs = {
+            [preferredAccount.id]: {
+              status: "error",
+              models: [],
+              error: errMessage(error),
+            },
+          };
+        }
+      }
       const requestedModel = rawSettings.model ?? DEFAULT_SETTINGS.model;
-      const model =
-        !openAIAvailable && providerForModel(requestedModel, OPENAI_FALLBACK_MODELS) === "openai"
-          ? DEFAULT_SETTINGS.model
-          : requestedModel;
+      const requestedProvider =
+        rawSettings.provider === "openai"
+          ? "openai"
+          : providerForModel(requestedModel, openAIModels);
+      const preferredCatalog = preferredAccount
+        ? openAIModelCatalogs[preferredAccount.id]
+        : undefined;
+      // Keep the persisted provider/model intent intact. Startup may auto-create
+      // an OpenAI conversation only when the exact preferred-account catalogue
+      // proves that pair valid; failure, empty, or disjoint discovery is a visible
+      // recovery state, never an implicit Claude or first-row fallback.
+      const startupOpenAIBlockReason =
+        requestedProvider !== "openai"
+          ? null
+          : !openAIAvailable
+            ? (openAIAuthStatus?.unavailableReason ??
+              "ChatGPT subscription access is unavailable in this build.")
+            : openAIAccountDiscovery.error
+              ? "Couldn't load ChatGPT accounts: " + openAIAccountDiscovery.error
+              : !preferredAccount
+                ? "Add a ChatGPT account before creating an OpenAI session."
+                : preferredCatalog?.status !== "ready"
+                  ? (preferredCatalog?.error ??
+                    "Load this ChatGPT account's models before creating a session.")
+                  : !preferredCatalog.models.some((candidate) => candidate.id === requestedModel)
+                    ? "Choose a model available to " +
+                      openAIAccountLabel(preferredAccount, openAIAccounts) +
+                      " before creating this session."
+                    : null;
+      const model = requestedModel;
       const settings: Settings = {
         ...DEFAULT_SETTINGS,
         ...rawSettings,
         model,
-        provider: providerForModel(model, openAIModels),
+        provider: requestedProvider,
         reasoningEffort: reasoningEffortForModel(
           model,
           rawSettings.reasoningEffort ?? DEFAULT_SETTINGS.reasoningEffort,
@@ -1424,13 +1546,51 @@ export const useStore = create<AppState>((set, get) => ({
       const drafts = mergeDrafts(get().drafts, backendDrafts);
       const usage = usageFromRows(allUsage);
       const loaded = await ipc.listSessions();
-      if (loaded.length === 0) {
-        const s = makeSession(settings.model);
-        await ipc.createSession(s.id, s.title, s.workspace, s.model);
+      if (loaded.length === 0 && startupOpenAIBlockReason) {
         set((st) => ({
           settings,
           oauthStatus,
           openAIAuthStatus,
+          openAIAuthError: startupOpenAIBlockReason,
+          openAIAccounts,
+          openAIAccountsLoading: false,
+          openAIAccountsError: openAIAccountDiscovery.error,
+          openAIModelCatalogs,
+          openAIModels,
+          phoneSync,
+          drafts,
+          usage,
+          sessions: [],
+          activeId: null,
+          messages: {},
+          showSettings: true,
+          initError: null,
+          ...projectActiveRun({ activeId: null, runs: st.runs }),
+        }));
+        return;
+      }
+      if (loaded.length === 0) {
+        const accountProfileId =
+          providerForModel(settings.model, openAIModels) === "openai"
+            ? (preferredAccount?.id ?? null)
+            : null;
+        const optimistic = makeSession(settings.model, accountProfileId);
+        const s = await ipc.createSession(
+          optimistic.id,
+          optimistic.title,
+          optimistic.workspace,
+          optimistic.model,
+          optimistic.accountProfileId,
+        );
+        set((st) => ({
+          settings,
+          oauthStatus,
+          openAIAuthStatus,
+          openAIAuthError: null,
+          openAIAccounts,
+          openAIAccountsLoading: false,
+          openAIAccountsError: openAIAccountDiscovery.error,
+          openAIModelCatalogs,
           openAIModels,
           phoneSync,
           drafts,
@@ -1460,6 +1620,11 @@ export const useStore = create<AppState>((set, get) => ({
         settings,
         oauthStatus,
         openAIAuthStatus,
+        openAIAuthError: null,
+        openAIAccounts,
+        openAIAccountsLoading: false,
+        openAIAccountsError: openAIAccountDiscovery.error,
+        openAIModelCatalogs,
         openAIModels,
         phoneSync,
         drafts,
@@ -1612,7 +1777,7 @@ export const useStore = create<AppState>((set, get) => ({
     await get().hydrateMessages(id);
   },
 
-  async newSession() {
+  async newSession(accountProfileId, modelId) {
     // Re-entry guard (mirrors connectRemote's remoteConnecting): createSession is
     // async, so two fast clicks would both pass the streaming check and each create
     // a distinct empty session. The synchronous set() below makes the second
@@ -1646,8 +1811,78 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
     try {
-      const s = makeSession(get().settings.model);
-      await ipc.createSession(s.id, s.title, s.workspace, s.model);
+      const model = modelId ?? get().settings.model;
+      let profileId: string | null = null;
+      const provider = accountProfileId ? "openai" : providerForModel(model, get().openAIModels);
+      if (provider === "openai") {
+        const state = get();
+        if (!accountProfileId && state.openAIAccountsError) {
+          set({
+            showSettings: true,
+            openAIAuthError: `ChatGPT account registry is unavailable: ${state.openAIAccountsError}. Retry account discovery before creating a session.`,
+          });
+          return;
+        }
+        if (state.openAIAuthStatus?.available === false) {
+          set({
+            showSettings: true,
+            openAIAuthError:
+              state.openAIAuthStatus.unavailableReason ??
+              "ChatGPT subscription access is unavailable in this build.",
+          });
+          return;
+        }
+        const selected = accountProfileId
+          ? connectedOpenAIAccounts(state.openAIAccounts).find(
+              (account) => account.id === accountProfileId,
+            )
+          : preferredOpenAIAccount(state.openAIAccounts, state.lastOpenAIAccountProfileId);
+        if (!selected) {
+          set({
+            showSettings: true,
+            openAIAuthError: "Add a ChatGPT account before creating an OpenAI session.",
+          });
+          return;
+        }
+        profileId = selected.id;
+        const models = await get().loadOpenAIAccountModels(profileId);
+        if (models.length === 0) {
+          throw new Error(
+            get().openAIModelCatalogs[profileId]?.error ??
+              "No compatible OpenAI models are available for this ChatGPT account.",
+          );
+        }
+        if (!models.some((candidate) => candidate.id === model)) {
+          set({
+            ...(modelId ? {} : { showSettings: true }),
+            openAIAuthError:
+              "Choose a model available to " +
+              openAIAccountLabel(selected, state.openAIAccounts) +
+              " before creating this session.",
+          });
+          return;
+        }
+      }
+
+      const optimistic = makeSession(model, profileId);
+      const created = await ipc.createSession(
+        optimistic.id,
+        optimistic.title,
+        optimistic.workspace,
+        optimistic.model,
+        optimistic.accountProfileId,
+      );
+      if (!created || created.id !== optimistic.id) {
+        throw new Error("The native core did not confirm the new session.");
+      }
+      if (profileId && created.accountProfileId !== profileId) {
+        throw new Error("The native core did not preserve the selected ChatGPT account.");
+      }
+      const s: Session = {
+        ...created,
+        model: created.model ?? model,
+        accountProfileId: created.accountProfileId ?? profileId,
+      };
       set((st) => ({
         sessions: [s, ...st.sessions],
         activeId: s.id,
@@ -1660,6 +1895,15 @@ export const useStore = create<AppState>((set, get) => ({
         // A brand-new session has no run yet → the mirror projects to idle.
         ...projectActiveRun({ activeId: s.id, runs: st.runs }),
       }));
+      if (profileId) {
+        // This preference means "last successfully created", never merely the
+        // last account hovered or selected in a menu.
+        writeStr("pc.lastOpenAIAccountProfileId", profileId);
+        set({
+          lastOpenAIAccountProfileId: profileId,
+          openAIModels: modelsForOpenAIProfile(profileId, get().openAIModelCatalogs),
+        });
+      }
       // Track background tasks launched in the new session from the moment it exists.
       void ensureBackgroundListener(s.id);
     } catch (err) {
@@ -1889,6 +2133,25 @@ export const useStore = create<AppState>((set, get) => ({
     )
       return;
     const activeSession = activeId ? get().sessions.find((s) => s.id === activeId) : undefined;
+    const activeOpenAIModels = modelsForOpenAIProfile(
+      activeSession?.accountProfileId,
+      get().openAIModelCatalogs,
+      get().openAIModels,
+    );
+    if (activeSession?.accountProfileId) {
+      if (!activeOpenAIModels.some((candidate) => candidate.id === model)) {
+        set({
+          settingsError: "That model is not available to this conversation's ChatGPT account.",
+        });
+        return;
+      }
+    } else if (providerForModel(model, activeOpenAIModels) === "openai") {
+      set({
+        settingsError:
+          "Choose an account for this legacy conversation before selecting an OpenAI model.",
+      });
+      return;
+    }
     if (activeId && activeSession) {
       // With no queued optimistic write, the visible value is the durable baseline.
       // Keep that baseline stable across a burst so every rejection returns to the
@@ -1931,7 +2194,14 @@ export const useStore = create<AppState>((set, get) => ({
         return;
       }
     }
-    await get().updateSettings({ model });
+    await get().updateSettings({
+      model,
+      reasoningEffort: reasoningEffortForModel(
+        model,
+        get().settings.reasoningEffort,
+        activeOpenAIModels,
+      ),
+    });
   },
 
   async send(text) {
@@ -1939,6 +2209,39 @@ export const useStore = create<AppState>((set, get) => ({
     if (!activeId || streaming || !text.trim()) return;
     const messageLoad = get().messageLoads[activeId];
     if (messageLoad && messageLoad.phase !== "ready" && messageLoad.phase !== "refreshing") return;
+
+    // Native admission resolves the credential from the persisted session row,
+    // but keep the client honest too: never clear a draft or append an optimistic
+    // message for an unpinned/removed/reconnect-required OpenAI profile. Remote
+    // mode delegates this check to the credential-owning desktop.
+    const activeSession = get().sessions.find((session) => session.id === activeId);
+    if (!get().remoteConnected && activeSession) {
+      const sessionModels = modelsForOpenAIProfile(
+        activeSession.accountProfileId,
+        get().openAIModelCatalogs,
+        get().openAIModels,
+      );
+      if (providerForModel(activeSession.model, sessionModels) === "openai") {
+        const account = activeSession.accountProfileId
+          ? get().openAIAccounts.find(
+              (candidate) => candidate.id === activeSession.accountProfileId,
+            )
+          : undefined;
+        if (!activeSession.accountProfileId) {
+          set({ openAIAuthError: "Choose the ChatGPT account that owns this legacy session." });
+          return;
+        }
+        if (!account || account.state !== "connected") {
+          set({
+            openAIAuthError:
+              account?.state === "reconnect_required"
+                ? "Reconnect this session's ChatGPT account before sending."
+                : "This session's ChatGPT account is unavailable.",
+          });
+          return;
+        }
+      }
+    }
 
     // Trim once so the stored user bubble and the forwarded command match the
     // derived (trimmed) title — a padded draft otherwise renders odd blank lines.
@@ -2321,13 +2624,16 @@ export const useStore = create<AppState>((set, get) => ({
           });
           break;
         case "error":
-          applyTerminalEvent(
-            TOOL_INTERRUPTED_ERROR,
-            e.receipt?.status ?? "error",
-            e.receipt?.stopReason,
-            e.receipt,
-            `\n\n**Error:** ${e.message}`,
-          );
+          {
+            const errorMessage = sessionScopedStreamError(get(), activeId, e.message);
+            applyTerminalEvent(
+              TOOL_INTERRUPTED_ERROR,
+              e.receipt?.status ?? "error",
+              e.receipt?.stopReason,
+              e.receipt,
+              `\n\n**Error:** ${errorMessage}`,
+            );
+          }
           break;
         case "turn_end":
           applyTerminalEvent(
@@ -2393,9 +2699,7 @@ export const useStore = create<AppState>((set, get) => ({
 
     try {
       // Per-session model (PR #30): fall back to the global default for older rows.
-      const session = get().sessions.find((s) => s.id === activeId);
-      const model = session?.model ?? get().settings.model;
-      const handle = await ipc.runAgent(activeId, body, model, onEvent);
+      const handle = await ipc.runAgent(activeId, body, onEvent);
       run = handle;
       const cancelRun = async () => {
         await handle.cancel();
@@ -2905,99 +3209,268 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async refreshOpenAIStatus() {
-    if (typeof ipc.openaiOauthStatus !== "function") return;
+    if (typeof ipc.openaiOauthStatus !== "function" || typeof ipc.listOpenAIAccounts !== "function")
+      return;
+    set({ openAIAccountsLoading: true, openAIAccountsError: null });
     try {
-      const openAIAuthStatus = await ipc.openaiOauthStatus();
+      const [openAIAuthStatus, openAIAccounts] = await Promise.all([
+        ipc.openaiOauthStatus(),
+        ipc.listOpenAIAccounts(),
+      ]);
+      const ids = new Set(openAIAccounts.map((account) => account.id));
+      const openAIModelCatalogs = Object.fromEntries(
+        Object.entries(get().openAIModelCatalogs).filter(([id]) => ids.has(id)),
+      );
+      const preferred = preferredOpenAIAccount(openAIAccounts, get().lastOpenAIAccountProfileId);
       set({
         openAIAuthStatus,
-        ...(openAIAuthStatus.available === false ? { openAIModels: [] } : {}),
+        openAIAccounts,
+        openAIAccountsLoading: false,
+        openAIAccountsError: null,
+        openAIModelCatalogs,
+        openAIModels:
+          openAIAuthStatus.available === false
+            ? []
+            : preferred
+              ? modelsForOpenAIProfile(preferred.id, openAIModelCatalogs)
+              : OPENAI_FALLBACK_MODELS,
       });
-      if (
-        openAIAuthStatus.available === false ||
-        !openAIAuthStatus.signedIn ||
-        typeof ipc.openaiModels !== "function"
-      )
-        return;
-      const rows = await ipc.openaiModels();
-      const openAIModels = mergeOpenAIModels(rows);
-      set({ openAIModels });
-      const settings = get().settings;
-      const effort = reasoningEffortForModel(
-        settings.model,
-        settings.reasoningEffort,
-        openAIModels,
-      );
-      if (
-        providerForModel(settings.model, openAIModels) === "openai" &&
-        effort !== settings.reasoningEffort
-      ) {
-        await get().updateSettings({ provider: "openai", reasoningEffort: effort });
+      if (openAIAuthStatus.available !== false && preferred) {
+        await get().loadOpenAIAccountModels(preferred.id, true);
       }
-    } catch {
-      // Transient / older core: retain the last auth state and fallback catalogue.
+    } catch (error) {
+      // Retain the last known summaries and profile-local catalogues; unlike the
+      // old singleton path, surface that discovery is stale instead of pretending
+      // a fallback catalogue came from an account.
+      set({ openAIAccountsLoading: false, openAIAccountsError: errMessage(error) });
     }
   },
 
   async loginWithOpenAI() {
     set({ openAIAuthError: null });
-    if (typeof ipc.startOpenaiOauthLogin !== "function") {
+    if (get().openAIAuthStatus?.available === false) {
+      set({
+        openAIAuthError:
+          get().openAIAuthStatus?.unavailableReason ??
+          "ChatGPT subscription access is unavailable in this build.",
+      });
+      return;
+    }
+    if (typeof ipc.startOpenAIAccountLogin !== "function") {
       set({ openAIAuthError: "This Portcode core does not support ChatGPT sign-in yet." });
       return;
     }
     try {
-      const openAIAuthStatus = await ipc.startOpenaiOauthLogin();
-      set({ openAIAuthStatus });
-      if (openAIAuthStatus.available === false) {
-        set({
-          openAIModels: [],
-          openAIAuthError:
-            openAIAuthStatus.unavailableReason ??
-            "ChatGPT subscription access is unavailable in this build.",
-        });
-        return;
-      }
-      if (typeof ipc.openaiModels !== "function") return;
-      try {
-        const rows = await ipc.openaiModels();
-        const openAIModels = mergeOpenAIModels(rows);
-        set({ openAIModels });
-        const settings = get().settings;
-        const effort = reasoningEffortForModel(
-          settings.model,
-          settings.reasoningEffort,
-          openAIModels,
-        );
-        if (
-          providerForModel(settings.model, openAIModels) === "openai" &&
-          effort !== settings.reasoningEffort
-        ) {
-          await get().updateSettings({ provider: "openai", reasoningEffort: effort });
-        }
-      } catch (err) {
-        set({ openAIAuthError: `Signed in, but couldn't refresh models: ${errMessage(err)}` });
-      }
+      const account = await ipc.startOpenAIAccountLogin();
+      set((state) => ({
+        openAIAccounts: [
+          account,
+          ...state.openAIAccounts.filter((candidate) => candidate.id !== account.id),
+        ],
+        openAIReconnectMismatch: null,
+      }));
+      await get().loadOpenAIAccountModels(account.id, true);
     } catch (err) {
       set({ openAIAuthError: errMessage(err) });
     }
   },
 
-  async logoutOpenAI() {
-    set({ openAIAuthError: null });
-    if (typeof ipc.openaiOauthLogout !== "function") return;
+  async reconnectOpenAIAccount(accountProfileId) {
+    set({ openAIAuthError: null, openAIReconnectMismatch: null });
     try {
-      await ipc.openaiOauthLogout();
+      const outcome = await ipc.reconnectOpenAIAccount(accountProfileId);
+      if (outcome.status === "identity_mismatch") {
+        set({
+          openAIReconnectMismatch: { accountProfileId, message: outcome.message },
+        });
+        return;
+      }
+      const { account } = outcome;
       set((state) => ({
-        openAIAuthStatus: {
-          signedIn: false,
-          expiresAt: null,
-          account: null,
-          tier: null,
-          available: state.openAIAuthStatus?.available,
-          unavailableReason: state.openAIAuthStatus?.unavailableReason ?? null,
-        },
+        openAIAccounts: state.openAIAccounts.map((candidate) =>
+          candidate.id === account.id ? account : candidate,
+        ),
       }));
+      await get().loadOpenAIAccountModels(account.id, true);
     } catch (err) {
       set({ openAIAuthError: errMessage(err) });
+    }
+  },
+
+  async removeOpenAIAccount(accountProfileId) {
+    set({ openAIAuthError: null });
+    try {
+      await ipc.removeOpenAIAccount(accountProfileId);
+      openAIModelRequestVersions.set(
+        accountProfileId,
+        (openAIModelRequestVersions.get(accountProfileId) ?? 0) + 1,
+      );
+      let discoveryError: string | null = null;
+      let authoritativeAccounts: OpenAIAccountSummary[] | null = null;
+      try {
+        authoritativeAccounts = await ipc.listOpenAIAccounts();
+      } catch (error) {
+        discoveryError = errMessage(error);
+      }
+      set((state) => {
+        // A successful removal is represented as a retained safe tombstone. If
+        // the follow-up registry read fails, keep the local summary but mark it
+        // removed so history remains attributable and exact reconnect stays possible.
+        const openAIAccounts =
+          authoritativeAccounts ??
+          state.openAIAccounts.map((account) =>
+            account.id === accountProfileId
+              ? { ...account, state: "removed" as const, expiresAt: null }
+              : account,
+          );
+        const openAIModelCatalogs = { ...state.openAIModelCatalogs };
+        delete openAIModelCatalogs[accountProfileId];
+        const lastOpenAIAccountProfileId =
+          state.lastOpenAIAccountProfileId === accountProfileId
+            ? null
+            : state.lastOpenAIAccountProfileId;
+        if (lastOpenAIAccountProfileId === null) {
+          writeStr("pc.lastOpenAIAccountProfileId", null);
+        }
+        const preferred = preferredOpenAIAccount(openAIAccounts, lastOpenAIAccountProfileId);
+        return {
+          openAIAccounts,
+          openAIAccountsError: discoveryError,
+          openAIModelCatalogs,
+          lastOpenAIAccountProfileId,
+          openAIModels: preferred
+            ? modelsForOpenAIProfile(preferred.id, openAIModelCatalogs)
+            : state.openAIAuthStatus?.available === false
+              ? []
+              : OPENAI_FALLBACK_MODELS,
+        };
+      });
+    } catch (err) {
+      set({ openAIAuthError: errMessage(err) });
+    }
+  },
+
+  async loadOpenAIAccountModels(accountProfileId, force = false) {
+    const account = get().openAIAccounts.find((candidate) => candidate.id === accountProfileId);
+    if (!account || account.state !== "connected") {
+      const message = account
+        ? "Reconnect this ChatGPT account before loading models."
+        : "ChatGPT account profile was not found.";
+      set((state) => ({
+        openAIModelCatalogs: {
+          ...state.openAIModelCatalogs,
+          [accountProfileId]: { status: "error", models: [], error: message },
+        },
+      }));
+      throw new Error(message);
+    }
+    if (get().openAIAuthStatus?.available === false) {
+      throw new Error(
+        get().openAIAuthStatus?.unavailableReason ??
+          "ChatGPT subscription access is unavailable in this build.",
+      );
+    }
+    const current = get().openAIModelCatalogs[accountProfileId];
+    if (!force && current?.status === "ready" && current.models.length > 0) {
+      return current.models;
+    }
+    const requestVersion = (openAIModelRequestVersions.get(accountProfileId) ?? 0) + 1;
+    openAIModelRequestVersions.set(accountProfileId, requestVersion);
+    set((state) => ({
+      openAIModelCatalogs: {
+        ...state.openAIModelCatalogs,
+        [accountProfileId]: {
+          status: "loading",
+          models: [],
+          error: null,
+        },
+      },
+      ...(preferredOpenAIAccount(state.openAIAccounts, state.lastOpenAIAccountProfileId)?.id ===
+      accountProfileId
+        ? { openAIModels: [] }
+        : {}),
+    }));
+    try {
+      const models = normalizeOpenAIModels(await ipc.openaiModels(accountProfileId));
+      if (models.length === 0) {
+        throw new Error("This account returned no compatible OpenAI models.");
+      }
+      if (openAIModelRequestVersions.get(accountProfileId) !== requestVersion) {
+        return get().openAIModelCatalogs[accountProfileId]?.models ?? [];
+      }
+      if (!get().openAIAccounts.some((candidate) => candidate.id === accountProfileId)) {
+        return [];
+      }
+      set((state) => {
+        const preferred = preferredOpenAIAccount(
+          state.openAIAccounts,
+          state.lastOpenAIAccountProfileId,
+        );
+        return {
+          openAIModelCatalogs: {
+            ...state.openAIModelCatalogs,
+            [accountProfileId]: { status: "ready", models, error: null },
+          },
+          ...(preferred?.id === accountProfileId ? { openAIModels: models } : {}),
+        };
+      });
+      return models;
+    } catch (error) {
+      if (openAIModelRequestVersions.get(accountProfileId) === requestVersion) {
+        set((state) => ({
+          openAIModelCatalogs: {
+            ...state.openAIModelCatalogs,
+            [accountProfileId]: {
+              status: "error",
+              models: [],
+              error: errMessage(error),
+            },
+          },
+          ...(preferredOpenAIAccount(state.openAIAccounts, state.lastOpenAIAccountProfileId)?.id ===
+          accountProfileId
+            ? { openAIModels: [] }
+            : {}),
+        }));
+      }
+      throw error;
+    }
+  },
+
+  async pinSessionOpenAIAccount(sessionId, accountProfileId) {
+    set({ openAIAuthError: null });
+    const session = get().sessions.find((candidate) => candidate.id === sessionId);
+    const account = get().openAIAccounts.find((candidate) => candidate.id === accountProfileId);
+    const run = get().runs[runKey(sessionId)];
+    if (!session || session.accountProfileId) return;
+    if (run?.streaming || run?.finalizing || run?.pendingPermission) {
+      set({ openAIAuthError: "Wait for this conversation's active turn to finish." });
+      return;
+    }
+    if (!account || account.state !== "connected") {
+      set({ openAIAuthError: "Choose a connected ChatGPT account." });
+      return;
+    }
+    try {
+      const models = await get().loadOpenAIAccountModels(accountProfileId);
+      if (!models.some((model) => model.id === session.model)) {
+        throw new Error("This session's model is not available to the selected ChatGPT account.");
+      }
+      let pinned = await ipc.pinSessionOpenAIAccount(sessionId, accountProfileId);
+      // Compatibility with a transitional native command that performed the CAS
+      // but returned unit: reload and require authoritative confirmation.
+      if (!pinned) {
+        pinned = (await ipc.listSessions()).find((candidate) => candidate.id === sessionId)!;
+      }
+      if (!pinned || pinned.accountProfileId !== accountProfileId) {
+        throw new Error("The native core did not confirm the selected ChatGPT account.");
+      }
+      set((state) => ({
+        sessions: state.sessions.map((candidate) =>
+          candidate.id === sessionId ? { ...candidate, ...pinned } : candidate,
+        ),
+      }));
+    } catch (error) {
+      set({ openAIAuthError: errMessage(error) });
     }
   },
 
@@ -3189,6 +3662,20 @@ export const useStore = create<AppState>((set, get) => ({
           };
         });
         break;
+      case "command_rejected": {
+        const pendingRequestId = pendingRemoteCreateRequestId;
+        // The hub broadcasts frames to every paired phone. A rejection belongs
+        // only to the phone that owns that exact pending request. Missing and
+        // nonmatching ids are both ignored—even while idle—so another client's
+        // malformed create cannot contaminate this phone's UI.
+        if (pendingRequestId === null || frame.request_id !== pendingRequestId) break;
+        clearPendingRemoteCreate();
+        set({
+          creatingSession: false,
+          remoteError: remoteCommandRejectionMessage(frame.code, frame.message),
+        });
+        break;
+      }
       case "message_delta":
         set((st) => {
           const activeId = st.activeId ?? frame.session_id;
@@ -3451,6 +3938,10 @@ export const useStore = create<AppState>((set, get) => ({
       // connect can proceed.
       set({ remoteConnecting: false });
     }
+  },
+
+  clearRemoteError() {
+    set({ remoteError: null });
   },
 
   async sendRemoteCommand(command) {
@@ -3847,6 +4338,81 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** Account-scoped OpenAI failures are safe, actionable copy rather than raw
+ * provider payloads, which can contain request/account identifiers. The account
+ * attribution comes from display-safe local state on desktop and stable ordinals
+ * on remote clients, whose protocol intentionally omits account metadata. */
+function sessionScopedStreamError(
+  state: Pick<AppState, "sessions" | "openAIAccounts" | "remoteMode">,
+  sessionId: string,
+  rawMessage: string,
+): string {
+  const session = state.sessions.find((candidate) => candidate.id === sessionId);
+  if (!session?.accountProfileId) return rawMessage;
+
+  const account = state.openAIAccounts.find(
+    (candidate) => candidate.id === session.accountProfileId,
+  );
+  const label = markdownLiteralText(
+    (
+      (state.remoteMode
+        ? remoteAccountLabel(session.accountProfileId, state.sessions)
+        : openAIAccountLabel(account, state.openAIAccounts)) ?? "ChatGPT account"
+    )
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 80),
+  );
+  const quotaFailure = /(?:\b429\b|rate[\s_-]*limit|quota|allowance)/i.test(rawMessage);
+  const httpFailure = /(?:\bhttp\s*[45]\d\d\b|\bstatus\s*[45]\d\d\b)/i.test(rawMessage);
+  const authFailure = /(?:\b401\b|unauthori[sz]ed|authentication|credential|token expired)/i.test(
+    rawMessage,
+  );
+  const safeNativeProviderFailure = /^(?:OpenAI\b|The OpenAI\b|ChatGPT\b)/i.test(
+    rawMessage.trimStart(),
+  );
+  const detail = quotaFailure
+    ? "ChatGPT rate limit or quota was reached."
+    : authFailure
+      ? "ChatGPT authentication failed. Reconnect this account before retrying."
+      : httpFailure
+        ? "ChatGPT provider request failed."
+        : safeNativeProviderFailure
+          ? rawMessage.trim()
+          : null;
+  // StreamEvent.Error also carries local lifecycle failures (for example, a
+  // durable-turn database write). Those details are actionable and must not be
+  // misattributed to the pinned provider merely because the session is OpenAI.
+  if (!detail) return rawMessage;
+  // The detail is generated here rather than derived from a potentially prefixed
+  // provider payload, so account attribution is applied exactly once.
+  return `${label}: ${detail}`;
+}
+
+/** Keep remote rejection copy bounded and readable even when talking to a newer,
+ * older, or malformed peer. The desktop normally supplies already-scrubbed text;
+ * these local fallbacks make an empty/unknown frame actionable instead of invisible. */
+function remoteCommandRejectionMessage(code?: string, rawMessage?: string): string {
+  const message = (rawMessage ?? "")
+    // eslint-disable-next-line no-control-regex -- protocol text is untrusted and must be scrubbed.
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .trim()
+    .slice(0, 240);
+  if (message) return message;
+  switch (code) {
+    case "open_ai_account_selection_required":
+      return "Choose a ChatGPT account on the desktop, then try again.";
+    case "invalid_desktop_configuration":
+      return "Review the desktop account and model settings, then try again.";
+    case "desktop_unavailable":
+      return "The desktop is unavailable. Reconnect and try again.";
+    case "invalid_request":
+      return "The desktop could not use this request. Try again.";
+    default:
+      return "The desktop rejected this command.";
+  }
+}
+
 // Convert a desktop catch-up row (MessageRow: carries sessionId + seq) to the
 // in-memory Message shape the UI renders.
 function rowToMessage(r: MessageRow): Message {
@@ -4150,6 +4716,7 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
       });
       break;
     case "error": {
+      const errorMessage = sessionScopedStreamError(useStore.getState(), sessionId, e.message);
       if (supersededTerminal(e.receipt)) {
         set((st) => ({
           messages: patchTerminalTurnMessage(
@@ -4158,7 +4725,7 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
             e.receipt!.turnId,
             TOOL_INTERRUPTED_ERROR,
             e.receipt,
-            `\n\n**Error:** ${e.message}`,
+            `\n\n**Error:** ${errorMessage}`,
           ),
         }));
         break;
@@ -4177,7 +4744,7 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
           e.receipt?.status ?? "error",
           e.receipt?.stopReason,
           e.receipt,
-          `\n\n**Error:** ${e.message}`,
+          `\n\n**Error:** ${errorMessage}`,
         ),
       }));
       break;

@@ -42,6 +42,25 @@ describe("RemoteSessionSwitcher", () => {
     expect(screen.getByRole("button", { name: /Alpha/ })).toHaveAttribute("aria-current", "true");
   });
 
+  it("shows display-only account ordinals for pinned sessions", () => {
+    const firstProfile = "00000000-0000-4000-8000-000000000001";
+    const secondProfile = "00000000-0000-4000-8000-000000000002";
+    useStore.setState({
+      sessions: [
+        session({ id: "a", title: "Alpha", accountProfileId: secondProfile }),
+        session({ id: "b", title: "Beta", accountProfileId: firstProfile }),
+      ],
+      activeId: "a",
+    });
+
+    const { container } = render(<RemoteSessionSwitcher onClose={onClose} />);
+
+    expect(screen.getByRole("button", { name: /Alpha.*ChatGPT account 2/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Beta.*ChatGPT account 1/ })).toBeInTheDocument();
+    expect(container).not.toHaveTextContent(firstProfile);
+    expect(container).not.toHaveTextContent(secondProfile);
+  });
+
   it("switches session and closes when a row is picked", () => {
     render(<RemoteSessionSwitcher onClose={onClose} />);
 

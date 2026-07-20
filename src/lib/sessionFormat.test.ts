@@ -1,6 +1,11 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 
-import { relativeTime, workspaceLabel } from "./sessionFormat";
+import {
+  markdownLiteralText,
+  relativeTime,
+  remoteAccountLabel,
+  workspaceLabel,
+} from "./sessionFormat";
 
 describe("workspaceLabel", () => {
   it("returns 'local' when no workspace is set", () => {
@@ -47,5 +52,36 @@ describe("relativeTime", () => {
 
   it("reports days beyond one day", () => {
     expect(relativeTime(at(3 * 86_400_000))).toBe("3d");
+  });
+});
+
+describe("remoteAccountLabel", () => {
+  it("returns no attribution for an unpinned session", () => {
+    expect(remoteAccountLabel(null, [])).toBeNull();
+  });
+
+  it("derives stable ordinals without exposing opaque profile ids", () => {
+    const first = "00000000-0000-4000-8000-000000000001";
+    const second = "00000000-0000-4000-8000-000000000002";
+    const sessions = [{ accountProfileId: second }, { accountProfileId: first }];
+
+    expect(remoteAccountLabel(first, sessions)).toBe("ChatGPT account 1");
+    expect(remoteAccountLabel(second, sessions)).toBe("ChatGPT account 2");
+    expect(remoteAccountLabel(second, sessions)).not.toContain(second);
+  });
+});
+
+describe("markdownLiteralText", () => {
+  it("wraps an ordinary label in a literal code span", () => {
+    expect(markdownLiteralText("one@chatgpt.test")).toBe("` one@chatgpt.test `");
+  });
+
+  it("uses a fence longer than hostile backticks and leaves nested syntax literal", () => {
+    const hostile =
+      "`![root [nested]](https://evil.test/pixel)``` <img src=x> &lbrack;still-hostile&rbrack;";
+    const escaped = markdownLiteralText(hostile);
+
+    expect(escaped).toBe(`\`\`\`\` ${hostile} \`\`\`\``);
+    expect(markdownLiteralText("")).toBe("");
   });
 });

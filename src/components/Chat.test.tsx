@@ -987,15 +987,129 @@ describe("Chat EmptyState auth affordance", () => {
     });
 
     const { rerender } = render(<Chat />);
-    expect(screen.getByText("Sign in with ChatGPT to start")).toBeInTheDocument();
+    expect(screen.getByText("Add a ChatGPT account to start")).toBeInTheDocument();
 
+    const accountProfileId = "00000000-0000-4000-8000-000000000001";
     act(() =>
       useStore.setState({
+        sessions: [session({ model: "gpt-5.6-sol", accountProfileId })],
+        activeId: "s1",
         openAIAuthStatus: { signedIn: true, expiresAt: null, account: null, tier: null },
+        openAIAccounts: [
+          {
+            id: accountProfileId,
+            accountLabel: "one@chatgpt.test",
+            tier: "ChatGPT Plus",
+            expiresAt: null,
+            state: "connected",
+            createdAt: 1,
+            updatedAt: 1,
+            lastUsedAt: null,
+          },
+        ],
       }),
     );
     rerender(<Chat />);
-    expect(screen.queryByText("Sign in with ChatGPT to start")).toBeNull();
+    expect(screen.queryByText("Add a ChatGPT account to start")).toBeNull();
+  });
+
+  it("distinguishes new, legacy, and removed-account OpenAI empty states", () => {
+    const accountProfileId = "00000000-0000-4000-8000-000000000001";
+    const account = {
+      id: accountProfileId,
+      accountLabel: "one@chatgpt.test",
+      tier: "ChatGPT Plus",
+      expiresAt: null,
+      state: "connected" as const,
+      createdAt: 1,
+      updatedAt: 1,
+      lastUsedAt: null,
+    };
+    useStore.setState({
+      activeId: null,
+      sessions: [],
+      messages: {},
+      streaming: false,
+      remoteMode: false,
+      openAIAuthStatus: {
+        signedIn: true,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: true,
+      },
+      openAIAccounts: [account],
+      settings: { ...initial.settings, provider: "openai", model: "gpt-5.6-sol" },
+    });
+    const view = render(<Chat />);
+    expect(
+      screen.getByText("Choose a ChatGPT account when starting a new chat"),
+    ).toBeInTheDocument();
+
+    act(() =>
+      useStore.setState({
+        sessions: [session({ model: "gpt-5.6-sol", accountProfileId: null })],
+        activeId: "s1",
+        messages: { s1: [] },
+      }),
+    );
+    view.rerender(<Chat />);
+    expect(screen.getByText("Choose a ChatGPT account for this legacy chat")).toBeInTheDocument();
+
+    act(() =>
+      useStore.setState({
+        sessions: [session({ model: "gpt-5.6-sol", accountProfileId })],
+        openAIAccounts: [],
+      }),
+    );
+    view.rerender(<Chat />);
+    expect(screen.getByText("Reconnect this chat's ChatGPT account to start")).toBeInTheDocument();
+  });
+
+  it("offers registry retry and account management instead of reconnect during discovery failure", () => {
+    const accountProfileId = "00000000-0000-4000-8000-000000000098";
+    const refreshOpenAIStatus = vi.fn(async () => {});
+    useStore.setState({
+      sessions: [session({ model: "gpt-5.6-sol", accountProfileId })],
+      activeId: "s1",
+      messages: { s1: [] },
+      streaming: false,
+      remoteMode: false,
+      openAIAuthStatus: {
+        signedIn: true,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: true,
+      },
+      openAIAccounts: [],
+      openAIAccountsError: "credential registry is locked",
+      openAIModels: [
+        {
+          id: "gpt-5.6-sol",
+          label: "GPT-5.6 Sol",
+          provider: "openai",
+          reasoningEfforts: ["high"],
+          defaultReasoningEffort: "high",
+        },
+      ],
+      refreshOpenAIStatus,
+      showSettings: false,
+    });
+
+    render(<Chat />);
+
+    expect(
+      screen.getByText(
+        "This chat's ChatGPT account is unavailable because account discovery failed",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/reconnect this chat/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/credential was removed/i)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry accounts" }));
+    expect(refreshOpenAIStatus).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getAllByRole("button", { name: "Manage accounts" })[0]);
+    expect(useStore.getState().showSettings).toBe(true);
   });
 
   it("directs unavailable OpenAI builds to Claude instead of asking for ChatGPT sign-in", () => {

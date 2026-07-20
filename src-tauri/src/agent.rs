@@ -19,6 +19,9 @@ use crate::db::{self, Db};
 use crate::events::EventSink;
 use crate::llm::{self, Block, ChatMessage, StreamEvent};
 use crate::oauth;
+use crate::openai_accounts::{
+    AccountProfileId, OpenAiAccountError, OpenAiAccountRegistry, ProfileRunLease,
+};
 use crate::permissions::{self, Decision, Pending};
 use crate::secrets::{self, Credential};
 use crate::settings::Settings;
@@ -26,6 +29,10 @@ use crate::tool_names;
 use crate::tools::{self, ToolCtx};
 
 type Cancels = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
+
+fn openai_account_error(error: OpenAiAccountError) -> String {
+    error.user_message().to_string()
+}
 
 /// A synchronous same-session reservation acquired before an async turn is
 /// spawned. Its cancel flag remains registered through terminal persistence and
@@ -74,6 +81,161 @@ impl Drop for RunReservation {
             map.remove(&self.session_id);
         }
     }
+}
+
+/// Account-bound authentication captured once when a session run is admitted.
+///
+/// The local profile id and lifecycle lease never change for the duration of a
+/// root run. Subagents clone this context instead of consulting global secrets,
+/// so retries, nested agents, and concurrent sessions cannot drift onto another
+/// ChatGPT account. Access tokens may rotate, but every rotation is resolved
+/// through this exact profile and protected by its credential generation.
+#[derive(Clone)]
+struct OpenAiRunAuth {
+    registry: Arc<OpenAiAccountRegistry>,
+    profile_id: AccountProfileId,
+    _lease: Arc<ProfileRunLease>,
+}
+
+/// Per-run seam for rotating one ChatGPT credential. Production delegates to
+/// the reviewed OAuth transport; deterministic integration tests inject a
+/// recorder without changing global endpoints or bypassing registry CAS.
+#[async_trait::async_trait]
+trait OpenAiRefreshTransport: Send + Sync {
+    async fn refresh(
+        &self,
+        http: &reqwest::Client,
+        current: &crate::secrets::OpenAiOAuthTokens,
+    ) -> Result<crate::secrets::OpenAiOAuthTokens, String>;
+}
+
+#[derive(Clone, Copy, Default)]
+struct ProductionOpenAiRefreshTransport;
+
+#[async_trait::async_trait]
+impl OpenAiRefreshTransport for ProductionOpenAiRefreshTransport {
+    async fn refresh(
+        &self,
+        http: &reqwest::Client,
+        current: &crate::secrets::OpenAiOAuthTokens,
+    ) -> Result<crate::secrets::OpenAiOAuthTokens, String> {
+        crate::openai_oauth::refresh(http, current).await
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RunAuthContext {
+    model: String,
+    credential: Credential,
+    openai: Option<OpenAiRunAuth>,
+}
+
+impl RunAuthContext {
+    fn account_profile_id(&self) -> Option<&str> {
+        self.openai.as_ref().map(|auth| auth.profile_id.as_str())
+    }
+
+    fn record_last_used_best_effort(&self) {
+        if let Some(auth) = &self.openai {
+            if auth
+                .registry
+                .record_last_used(&auth.profile_id, oauth::now_secs())
+                .is_err()
+            {
+                // Attribution is a convenience field. Never fail a credential-
+                // resolved run or print a storage error that could contain secret
+                // backend details merely because the MRU timestamp could not save.
+                eprintln!("openai-accounts: failed to record profile usage");
+            }
+        }
+    }
+}
+
+/// A reservation and its immutable session-owned execution identity. Keeping
+/// these values together makes it impossible for a caller to reserve one session
+/// and then inject a frontend-selected model or credential into that run.
+pub(crate) struct RunAdmission {
+    reservation: RunReservation,
+    auth: RunAuthContext,
+}
+
+impl RunAdmission {
+    pub(crate) fn is_openai(&self) -> bool {
+        self.auth.openai.is_some()
+    }
+}
+
+/// Resolve the model and account from one authoritative DB read, acquire the
+/// profile lifecycle lease, and snapshot the matching credential before any turn
+/// task is spawned. Legacy OpenAI sessions must be explicitly pinned first.
+pub(crate) fn admit_run(
+    cancels: Cancels,
+    db: &Db,
+    settings: &Settings,
+    openai_accounts: Arc<OpenAiAccountRegistry>,
+    session_id: &str,
+) -> Result<RunAdmission, String> {
+    let reservation = RunReservation::try_acquire(cancels, session_id)?;
+    let session = db
+        .session_run_config(session_id)
+        .map_err(|error| format!("Session is unavailable: {error}"))?;
+    let model = session
+        .model
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| settings.model.clone());
+    let provider_name = llm::provider_name_for_model(&model)?;
+
+    let (credential, openai) = match provider_name {
+        "openai" => {
+            crate::openai_oauth::ensure_direct_subscription_enabled()?;
+            let raw_profile_id = session.account_profile_id.ok_or_else(|| {
+                "This legacy OpenAI session is not pinned to a ChatGPT account. Choose an account before sending."
+                    .to_string()
+            })?;
+            let profile_id =
+                AccountProfileId::parse(&raw_profile_id).map_err(openai_account_error)?;
+            // Acquire before reading the credential. Removal cannot pass this
+            // lease boundary, so the snapshot remains usable through the final
+            // durable receipt (the lease is held inside the auth context).
+            let lease = openai_accounts
+                .acquire_run_lease(&profile_id)
+                .map_err(openai_account_error)?;
+            let profile = openai_accounts
+                .load_profile(&profile_id)
+                .map_err(openai_account_error)?;
+            (
+                Credential::OpenAiOAuth(profile.tokens),
+                Some(OpenAiRunAuth {
+                    registry: openai_accounts,
+                    profile_id,
+                    _lease: Arc::new(lease),
+                }),
+            )
+        }
+        "anthropic" => {
+            if session.account_profile_id.is_some() {
+                return Err(
+                    "This session is pinned to a ChatGPT account and cannot run an Anthropic model. Create a new session instead."
+                        .into(),
+                );
+            }
+            let credential = secrets::load_credential_for(provider_name).ok_or_else(|| {
+                "No Anthropic credentials set. Sign in with your Claude subscription or add an Anthropic API key in Settings."
+                    .to_string()
+            })?;
+            (credential, None)
+        }
+        _ => unreachable!("provider_name_for_model returns only supported providers"),
+    };
+
+    Ok(RunAdmission {
+        reservation,
+        auth: RunAuthContext {
+            model,
+            credential,
+            openai,
+        },
+    })
 }
 
 /// Refresh an OAuth access token once it is within this many seconds of expiry.
@@ -244,10 +406,7 @@ fn ensure_openai_account_unchanged(
     original_account_id: Option<&str>,
     current_account_id: Option<&str>,
 ) -> Result<(), String> {
-    if original_account_id.is_some()
-        && current_account_id.is_some()
-        && original_account_id != current_account_id
-    {
+    if original_account_id.is_none() || original_account_id != current_account_id {
         return Err(
             "The signed-in ChatGPT account changed during this turn. Start the turn again.".into(),
         );
@@ -265,41 +424,15 @@ pub(crate) async fn ensure_fresh(
     cred: Credential,
     refresh_lock: &tokio::sync::Mutex<()>,
 ) -> Result<Credential, String> {
-    let tokens = match cred {
-        Credential::OAuth(t) => t,
-        Credential::OpenAiOAuth(tokens) => {
-            crate::openai_oauth::ensure_direct_subscription_enabled()?;
-            if tokens.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS {
-                return Ok(Credential::OpenAiOAuth(tokens));
-            }
-            let _guard = refresh_lock.lock().await;
-            // Never fall back to the caller's stale in-memory credential here.
-            // Logout may have cleared it while this turn waited for the lock;
-            // persisting a refresh of that stale value would resurrect logout.
-            let current = secrets::get_openai_oauth()
-                .ok_or("Your ChatGPT subscription session was removed. Sign in again.")?;
-            ensure_openai_account_unchanged(
-                tokens.account_id.as_deref(),
-                current.account_id.as_deref(),
-            )?;
-            if current.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS {
-                return Ok(Credential::OpenAiOAuth(current));
-            }
-            return match crate::openai_oauth::refresh(http, &current).await {
-                Ok(refreshed) => {
-                    secrets::set_openai_oauth(&refreshed)?;
-                    Ok(Credential::OpenAiOAuth(refreshed))
-                }
-                Err(error) if crate::openai_oauth::is_terminal_auth_error(&error) => {
-                    let _ = secrets::clear_openai_oauth();
-                    Err("Your ChatGPT subscription session expired. Please sign in again in Settings."
-                        .into())
-                }
-                Err(error) => Err(error),
-            };
-        }
-        Credential::ApiKey(key) => return Ok(Credential::ApiKey(key)),
-    };
+    let tokens =
+        match cred {
+            Credential::OAuth(t) => t,
+            Credential::OpenAiOAuth(_) => return Err(
+                "ChatGPT credentials require an account-bound run context. Start the turn again."
+                    .into(),
+            ),
+            Credential::ApiKey(key) => return Ok(Credential::ApiKey(key)),
+        };
 
     if tokens.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS {
         return Ok(Credential::OAuth(tokens));
@@ -344,36 +477,141 @@ pub(crate) async fn ensure_fresh(
     Ok(Credential::OAuth(refreshed))
 }
 
+fn refreshed_or_latest_profile(
+    auth: &OpenAiRunAuth,
+    expected_generation: u64,
+    refreshed: crate::secrets::OpenAiOAuthTokens,
+) -> Result<Credential, String> {
+    match auth.registry.store_refreshed_profile(
+        &auth.profile_id,
+        expected_generation,
+        refreshed,
+        oauth::now_secs(),
+    ) {
+        Ok(profile) => Ok(Credential::OpenAiOAuth(profile.tokens)),
+        Err(OpenAiAccountError::CredentialConflict) => auth
+            .registry
+            .load_profile(&auth.profile_id)
+            .map(|profile| Credential::OpenAiOAuth(profile.tokens))
+            .map_err(openai_account_error),
+        Err(error) => Err(openai_account_error(error)),
+    }
+}
+
+fn quarantine_or_use_newer_profile(
+    auth: &OpenAiRunAuth,
+    expected_generation: u64,
+) -> Result<Credential, String> {
+    match auth.registry.mark_reconnect_required(
+        &auth.profile_id,
+        expected_generation,
+        oauth::now_secs(),
+    ) {
+        Ok(()) => {
+            Err("This ChatGPT account session expired. Reconnect that account in Settings.".into())
+        }
+        Err(OpenAiAccountError::CredentialConflict) => auth
+            .registry
+            .load_profile(&auth.profile_id)
+            .map(|profile| Credential::OpenAiOAuth(profile.tokens))
+            .map_err(openai_account_error),
+        Err(error) => Err(openai_account_error(error)),
+    }
+}
+
+/// Refresh one exact ChatGPT profile. The per-profile lock gives concurrent runs
+/// single-flight refresh, while the credential-generation CAS prevents an older
+/// network response (success or terminal failure) from overwriting a reconnect.
+async fn ensure_fresh_openai(
+    http: &reqwest::Client,
+    cred: Credential,
+    auth: &OpenAiRunAuth,
+    refresh_transport: &dyn OpenAiRefreshTransport,
+) -> Result<Credential, String> {
+    crate::openai_oauth::ensure_direct_subscription_enabled()?;
+    let Credential::OpenAiOAuth(tokens) = cred else {
+        return Err("ChatGPT refresh received the wrong credential type.".into());
+    };
+    if tokens.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS {
+        return Ok(Credential::OpenAiOAuth(tokens));
+    }
+
+    let _guard = auth
+        .registry
+        .lock_refresh(&auth.profile_id)
+        .await
+        .map_err(openai_account_error)?;
+    let current = auth
+        .registry
+        .load_profile(&auth.profile_id)
+        .map_err(openai_account_error)?;
+    ensure_openai_account_unchanged(
+        tokens.account_id.as_deref(),
+        current.tokens.account_id.as_deref(),
+    )?;
+    if current.tokens.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS {
+        return Ok(Credential::OpenAiOAuth(current.tokens));
+    }
+
+    match refresh_transport.refresh(http, &current.tokens).await {
+        Ok(refreshed) => {
+            refreshed_or_latest_profile(auth, current.credential_generation, refreshed)
+        }
+        Err(error) if crate::openai_oauth::refresh_failure_requires_reconnect(&error) => {
+            quarantine_or_use_newer_profile(auth, current.credential_generation)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn ensure_fresh_for_run(
+    http: &reqwest::Client,
+    cred: Credential,
+    refresh_lock: &tokio::sync::Mutex<()>,
+    auth: &RunAuthContext,
+    openai_refresh: &dyn OpenAiRefreshTransport,
+) -> Result<Credential, String> {
+    match &auth.openai {
+        Some(openai) => ensure_fresh_openai(http, cred, openai, openai_refresh).await,
+        None => ensure_fresh(http, cred, refresh_lock).await,
+    }
+}
+
 /// Recover one OpenAI 401 without retry loops. This runs before any tool result
 /// can be executed: the provider reports the HTTP status before consuming SSE.
 async fn recover_openai_unauthorized(
     http: &reqwest::Client,
     failed_credential: &Credential,
-    refresh_lock: &tokio::sync::Mutex<()>,
+    auth: &OpenAiRunAuth,
+    refresh_transport: &dyn OpenAiRefreshTransport,
 ) -> Result<Credential, String> {
     crate::openai_oauth::ensure_direct_subscription_enabled()?;
     let Credential::OpenAiOAuth(failed) = failed_credential else {
         return Err("OpenAI authentication recovery received the wrong credential type.".into());
     };
-    let _guard = refresh_lock.lock().await;
-    let current = secrets::get_openai_oauth()
-        .ok_or("Your ChatGPT subscription session was removed. Sign in again.")?;
-    ensure_openai_account_unchanged(failed.account_id.as_deref(), current.account_id.as_deref())?;
+    let _guard = auth
+        .registry
+        .lock_refresh(&auth.profile_id)
+        .await
+        .map_err(openai_account_error)?;
+    let current = auth
+        .registry
+        .load_profile(&auth.profile_id)
+        .map_err(openai_account_error)?;
+    ensure_openai_account_unchanged(
+        failed.account_id.as_deref(),
+        current.tokens.account_id.as_deref(),
+    )?;
     // Another turn may already have recovered and persisted a rotated token.
-    if current.access_token != failed.access_token {
-        return Ok(Credential::OpenAiOAuth(current));
+    if current.tokens.access_token != failed.access_token {
+        return Ok(Credential::OpenAiOAuth(current.tokens));
     }
-    match crate::openai_oauth::refresh(http, &current).await {
+    match refresh_transport.refresh(http, &current.tokens).await {
         Ok(refreshed) => {
-            secrets::set_openai_oauth(&refreshed)?;
-            Ok(Credential::OpenAiOAuth(refreshed))
+            refreshed_or_latest_profile(auth, current.credential_generation, refreshed)
         }
-        Err(error) if crate::openai_oauth::is_terminal_auth_error(&error) => {
-            let _ = secrets::clear_openai_oauth();
-            Err(
-                "Your ChatGPT subscription session expired. Please sign in again in Settings."
-                    .into(),
-            )
+        Err(error) if crate::openai_oauth::refresh_failure_requires_reconnect(&error) => {
+            quarantine_or_use_newer_profile(auth, current.credential_generation)
         }
         Err(error) => Err(error),
     }
@@ -385,23 +623,27 @@ pub async fn run(
     http: reqwest::Client,
     settings: Arc<Mutex<Settings>>,
     db: Arc<Db>,
-    reservation: RunReservation,
+    admission: RunAdmission,
     pending: Pending,
     agents: agents::Agents,
     background: background::Background,
     oauth_refresh: Arc<tokio::sync::Mutex<()>>,
     session_id: String,
     user_text: String,
-    model: Option<String>,
 ) {
+    let RunAdmission { reservation, auth } = admission;
     let channel = format!("agent://{session_id}");
     let cancel = reservation.cancel_flag();
 
     let turn_id = Uuid::new_v4().to_string();
     let started_at = db::now_ms();
     let started = Instant::now();
-    let initial_receipt =
-        crate::turn_receipt::unavailable_interrupted_receipt(&turn_id, started_at);
+    let account_profile_id = auth.account_profile_id().map(str::to_owned);
+    let initial_receipt = crate::turn_receipt::unavailable_interrupted_receipt_with_account(
+        &turn_id,
+        started_at,
+        account_profile_id.clone(),
+    );
     if let Err(error) = db.save_pending_turn_receipt(&session_id, &turn_id, &initial_receipt) {
         sink.emit(
             &channel,
@@ -412,6 +654,7 @@ pub async fn run(
         );
         return;
     }
+    auth.record_last_used_best_effort();
     // The UI only learns about a turn after its interrupted fallback is durable.
     sink.emit(
         &channel,
@@ -430,11 +673,12 @@ pub async fn run(
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default();
-    let receipt_tracker = crate::turn_receipt::TurnReceiptTracker::new(
+    let receipt_tracker = crate::turn_receipt::TurnReceiptTracker::new_with_account(
         turn_id.clone(),
         started_at,
         started,
         workspace,
+        account_profile_id,
     )
     .await;
     let placeholder = receipt_tracker.interrupted_placeholder();
@@ -476,7 +720,7 @@ pub async fn run(
         receipt_tracker.clone(),
         user_text,
         config,
-        model,
+        auth.clone(),
     )
     .await;
 
@@ -532,17 +776,10 @@ async fn run_inner(
     receipt_tracker: Arc<crate::turn_receipt::TurnReceiptTracker>,
     user_text: String,
     config: AgentConfig,
-    model: Option<String>,
+    auth: RunAuthContext,
 ) -> Result<String, String> {
     let mut snapshot = { settings.lock().unwrap().clone() };
-
-    // Prefer the per-session model threaded from the frontend; fall back to the
-    // global settings default when it is absent or empty. Apply it onto the snapshot
-    // so the shared run loop (which reads `snapshot.model`) uses the per-session model.
-    let active_model = model
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| snapshot.model.clone());
-    snapshot.model = active_model;
+    snapshot.model = auth.model.clone();
 
     // Resolve only from the selected model so an unknown slug cannot inherit a
     // different configured provider and send a request to the wrong service.
@@ -552,16 +789,15 @@ async fn run_inner(
         // runtime policy has disabled the direct subscription transport.
         crate::openai_oauth::ensure_direct_subscription_enabled()?;
     }
-    let cred = secrets::load_credential_for(provider_name).ok_or_else(|| match provider_name {
-        "openai" => "No OpenAI credentials set. Sign in with your ChatGPT subscription in Settings.".to_string(),
-        _ => "No Anthropic credentials set. Sign in with your Claude subscription or add an Anthropic API key in Settings.".to_string(),
-    })?;
+    let cred = auth.credential.clone();
 
     // Resolve the LLM provider up front, alongside the credential check above:
     // both are pre-flight config validations that fail before any DB write (so an
     // unconfigured run never half-persists). An unknown `provider` value fails
     // here with a clear message instead of silently calling a different service.
-    let provider = llm::provider_for(provider_name)?;
+    let provider: Arc<dyn llm::LlmProvider> = Arc::from(llm::provider_for(provider_name)?);
+    let openai_refresh: Arc<dyn OpenAiRefreshTransport> =
+        Arc::new(ProductionOpenAiRefreshTransport);
 
     // No configured workspace falls back to the process working directory — but
     // never to an empty path (the old `unwrap_or_default()`), which would silently
@@ -594,9 +830,12 @@ async fn run_inner(
             Some(Arc::new(AgentSpawner {
                 sink: sink.clone(),
                 http: http.clone(),
+                provider: provider.clone(),
+                openai_refresh: openai_refresh.clone(),
                 // Freeze the resolved per-session model/provider/effort so children
                 // inherit this run, not a possibly different global default.
                 run_settings: snapshot.clone(),
+                auth: auth.clone(),
                 pending: pending.clone(),
                 agents: agents.clone(),
                 cancel: cancel.clone(),
@@ -661,6 +900,8 @@ async fn run_inner(
         &snapshot,
         cred,
         refresh_lock,
+        openai_refresh.as_ref(),
+        &auth,
         ask_lock,
         pending,
         cancel,
@@ -775,6 +1016,8 @@ async fn run_loop_core(
     snapshot: &Settings,
     mut cred: Credential,
     refresh_lock: &tokio::sync::Mutex<()>,
+    openai_refresh: &dyn OpenAiRefreshTransport,
+    auth: &RunAuthContext,
     ask_lock: &tokio::sync::Mutex<()>,
     pending: &Pending,
     cancel: &Arc<AtomicBool>,
@@ -810,7 +1053,7 @@ async fn run_loop_core(
         }
 
         // Refresh an expiring OAuth token before each turn (no-op for API keys).
-        cred = ensure_fresh(http, cred, refresh_lock).await?;
+        cred = ensure_fresh_for_run(http, cred, refresh_lock, auth, openai_refresh).await?;
 
         // Keep the kill switch adjacent to the actual Responses request as well
         // as in preflight/refresh, so a runtime disable takes effect between
@@ -839,7 +1082,10 @@ async fn run_loop_core(
                 if error == "OpenAI response authentication failed (401)."
                     && matches!(&cred, Credential::OpenAiOAuth(_)) =>
             {
-                cred = recover_openai_unauthorized(http, &cred, refresh_lock).await?;
+                let openai = auth.openai.as_ref().ok_or(
+                    "OpenAI authentication recovery is missing its account-bound context.",
+                )?;
+                cred = recover_openai_unauthorized(http, &cred, openai, openai_refresh).await?;
                 crate::openai_oauth::ensure_direct_subscription_enabled()?;
                 // Exactly one retry. A second 401 is returned as-is and never
                 // triggers another refresh/retry cycle.
@@ -1313,7 +1559,15 @@ fn session_of(channel: &str) -> &str {
 struct AgentSpawner {
     sink: Arc<dyn EventSink>,
     http: reqwest::Client,
+    /// One provider instance is selected by the root run and inherited by every
+    /// child. Production gets the normal provider; tests can bind a local
+    /// Responses endpoint without any process-global override.
+    provider: Arc<dyn llm::LlmProvider>,
+    openai_refresh: Arc<dyn OpenAiRefreshTransport>,
     run_settings: Settings,
+    /// Immutable model/profile selection inherited from the owning root run.
+    /// Children never reload a process-global OpenAI credential.
+    auth: RunAuthContext,
     pending: Pending,
     /// Live-subagent registry: each child registers its OWN cancel flag here so the
     /// agents panel can Stop one without the others, and a session-wide Stop can
@@ -1359,11 +1613,7 @@ impl tools::Spawner for AgentSpawner {
         if provider_name == "openai" {
             crate::openai_oauth::ensure_direct_subscription_enabled()?;
         }
-        let cred = secrets::load_credential_for(provider_name).ok_or_else(|| match provider_name {
-            "openai" => "No OpenAI credentials set. Sign in with your ChatGPT subscription in Settings.".to_string(),
-            _ => "No Anthropic credentials set. Sign in with your Claude subscription or add an Anthropic API key in Settings.".to_string(),
-        })?;
-        let provider = llm::provider_for(provider_name)?;
+        let cred = self.auth.credential.clone();
 
         let agent_id = Uuid::new_v4().to_string();
         let session_id = session_of(&self.parent_channel).to_string();
@@ -1428,10 +1678,12 @@ impl tools::Spawner for AgentSpawner {
         let result = run_loop_core(
             self.sink.as_ref(),
             &self.http,
-            provider.as_ref(),
+            self.provider.as_ref(),
             &snapshot,
             cred,
             &self.refresh_lock,
+            self.openai_refresh.as_ref(),
+            &self.auth,
             &self.ask_lock,
             &self.pending,
             &child_cancel,
@@ -1572,19 +1824,33 @@ impl tools::BackgroundRunner for BackgroundLauncher {
 #[cfg(test)]
 mod tests {
     use super::{
-        assistant_text, background, batch_cancelled, canonicalize_tool_history, child_can_spawn,
-        derive_title, ensure_openai_account_unchanged, finish_status, is_terminal_auth_error,
-        precheck_outcome, reassemble_results, resolve_system_prompt, session_of,
-        spawn_background_task, spawn_status, step_limit_exceeded, subagent_answer, subagent_label,
-        tool_result_block, tool_result_event, AgentConfig, Block, Cancels, ChatMessage, Db,
-        Decision, LoopOutcome, Persist, RunReservation, StreamEvent, CANCELLED_TOOL_RESULT,
-        MAX_AGENT_STEPS, MAX_PARALLEL_AGENTS, MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
+        admit_run, assistant_text, background, batch_cancelled, canonicalize_tool_history,
+        child_can_spawn, derive_title, ensure_openai_account_unchanged, finish_status,
+        is_terminal_auth_error, precheck_outcome, reassemble_results, resolve_system_prompt,
+        run_loop_core, session_of, spawn_background_task, spawn_status, step_limit_exceeded,
+        subagent_answer, subagent_label, tool_result_block, tool_result_event, AgentConfig,
+        AgentSpawner, Block, Cancels, ChatMessage, Db, Decision, LoopOutcome,
+        OpenAiRefreshTransport, OpenAiRunAuth, Persist, RunAuthContext, RunReservation,
+        StreamEvent, CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS, MAX_PARALLEL_AGENTS,
+        MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
     };
+    use crate::events::EventSink;
+    use crate::llm::{LlmProvider, OpenAiProvider};
+    use crate::openai_accounts::{
+        AccountProfileId, OpenAiAccountError, OpenAiAccountRegistry, OpenAiAccountState,
+    };
+    use crate::secrets::{Credential, OpenAiOAuthTokens, SecretStore, SecretStoreError};
+    use crate::settings::Settings;
     use crate::tool_names;
-    use std::collections::HashMap;
-    use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use crate::tools::ToolCtx;
+    use serde_json::Value;
+    use std::collections::{BTreeMap, HashMap};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
     fn spec_names(cfg: &AgentConfig) -> Vec<String> {
         cfg.registry
@@ -1596,6 +1862,1096 @@ mod tests {
 
     fn text_block(t: &str) -> Block {
         Block::Text { text: t.into() }
+    }
+
+    #[derive(Default)]
+    struct IsolationSecretStore {
+        values: Mutex<BTreeMap<String, String>>,
+    }
+
+    impl SecretStore for IsolationSecretStore {
+        fn get(&self, account: &str) -> Result<String, SecretStoreError> {
+            self.values
+                .lock()
+                .unwrap()
+                .get(account)
+                .cloned()
+                .ok_or(SecretStoreError::Absent)
+        }
+
+        fn set(&self, account: &str, value: &str) -> Result<(), SecretStoreError> {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(account.to_string(), value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, account: &str) -> Result<(), SecretStoreError> {
+            self.values.lock().unwrap().remove(account);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct RecordedTransportRequest {
+        prompt: String,
+        authorization: String,
+        account_id: String,
+        has_tool_output: bool,
+    }
+
+    struct IsolationTransportState {
+        requests: Mutex<Vec<RecordedTransportRequest>>,
+        failures: Mutex<Vec<String>>,
+        b_seen: AtomicBool,
+        b_seen_notify: tokio::sync::Notify,
+        first_a_root_unauthorized: AtomicBool,
+        parallel_arrivals: AtomicUsize,
+        parallel_barrier: tokio::sync::Barrier,
+    }
+
+    impl IsolationTransportState {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                requests: Mutex::new(Vec::new()),
+                failures: Mutex::new(Vec::new()),
+                b_seen: AtomicBool::new(false),
+                b_seen_notify: tokio::sync::Notify::new(),
+                first_a_root_unauthorized: AtomicBool::new(false),
+                parallel_arrivals: AtomicUsize::new(0),
+                parallel_barrier: tokio::sync::Barrier::new(2),
+            })
+        }
+
+        async fn wait_until_b_is_on_the_wire(&self) {
+            while !self.b_seen.load(Ordering::SeqCst) {
+                self.b_seen_notify.notified().await;
+            }
+        }
+    }
+
+    struct RecordingRefreshTransport {
+        state: Arc<IsolationTransportState>,
+        calls: Mutex<Vec<(String, String)>>,
+        a_refreshes: AtomicUsize,
+    }
+
+    impl RecordingRefreshTransport {
+        fn new(state: Arc<IsolationTransportState>) -> Arc<Self> {
+            Arc::new(Self {
+                state,
+                calls: Mutex::new(Vec::new()),
+                a_refreshes: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OpenAiRefreshTransport for RecordingRefreshTransport {
+        async fn refresh(
+            &self,
+            _http: &reqwest::Client,
+            current: &OpenAiOAuthTokens,
+        ) -> Result<OpenAiOAuthTokens, String> {
+            let account_id = current
+                .account_id
+                .clone()
+                .ok_or_else(|| "mock refresh received no account identity".to_string())?;
+            self.calls
+                .lock()
+                .unwrap()
+                .push((account_id.clone(), current.access_token.clone()));
+            if account_id != "account-a" {
+                return Err(format!(
+                    "mock refresh must never be invoked for {account_id}"
+                ));
+            }
+
+            let refresh_number = self.a_refreshes.fetch_add(1, Ordering::SeqCst) + 1;
+            // Hold A's expired-token refresh open until B has sent a real
+            // authenticated Responses request. This makes the account overlap a
+            // deterministic property of the proof rather than scheduler luck.
+            if refresh_number == 1 {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    self.state.wait_until_b_is_on_the_wire(),
+                )
+                .await
+                .map_err(|_| "B never reached the transport while A refreshed".to_string())?;
+            }
+
+            let mut refreshed = current.clone();
+            refreshed.access_token = match refresh_number {
+                1 => "access-a-preflight",
+                2 => "access-a-retry",
+                other => return Err(format!("unexpected A refresh number {other}")),
+            }
+            .into();
+            refreshed.expires_at = crate::oauth::now_secs() + 3_600;
+            Ok(refreshed)
+        }
+    }
+
+    struct RejectingRefreshTransport {
+        error: String,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl RejectingRefreshTransport {
+        fn new(error: impl Into<String>) -> Arc<Self> {
+            Arc::new(Self {
+                error: error.into(),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OpenAiRefreshTransport for RejectingRefreshTransport {
+        async fn refresh(
+            &self,
+            _http: &reqwest::Client,
+            current: &OpenAiOAuthTokens,
+        ) -> Result<OpenAiOAuthTokens, String> {
+            self.calls.lock().unwrap().push(
+                current
+                    .account_id
+                    .clone()
+                    .unwrap_or_else(|| "<missing>".into()),
+            );
+            Err(self.error.clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct IsolationSink;
+
+    impl EventSink for IsolationSink {
+        fn emit(&self, _channel: &str, _event: StreamEvent) {}
+    }
+
+    fn request_prompt(body: &Value) -> Option<String> {
+        body["input"].as_array()?.iter().find_map(|item| {
+            if item["type"].as_str() != Some("message") {
+                return None;
+            }
+            item["content"].as_array()?.iter().find_map(|content| {
+                (content["type"].as_str() == Some("input_text"))
+                    .then(|| content["text"].as_str().map(str::to_string))
+                    .flatten()
+            })
+        })
+    }
+
+    fn has_tool_output(body: &Value) -> bool {
+        body["input"].as_array().is_some_and(|input| {
+            input
+                .iter()
+                .any(|item| item["type"].as_str() == Some("function_call_output"))
+        })
+    }
+
+    fn completed_event() -> Value {
+        serde_json::json!({
+            "type": "response.completed",
+            "response": { "usage": { "input_tokens": 7, "output_tokens": 3 } }
+        })
+    }
+
+    fn sse_response(events: Vec<Value>) -> Vec<u8> {
+        let mut body = String::new();
+        for event in events {
+            body.push_str("data: ");
+            body.push_str(&serde_json::to_string(&event).unwrap());
+            body.push_str("\n\n");
+        }
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes()
+    }
+
+    fn final_text_response(text: &str) -> Vec<u8> {
+        sse_response(vec![
+            serde_json::json!({ "type": "response.output_text.delta", "delta": text }),
+            completed_event(),
+        ])
+    }
+
+    fn delegate_response(calls: &[(&str, &str)]) -> Vec<u8> {
+        let mut events = Vec::with_capacity(calls.len() + 1);
+        for (index, (description, prompt)) in calls.iter().enumerate() {
+            events.push(serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": format!("item-{index}-{prompt}"),
+                    "call_id": format!("call-{index}-{prompt}"),
+                    "name": "delegate_task",
+                    "arguments": serde_json::json!({
+                        "description": description,
+                        "prompt": prompt,
+                    }).to_string(),
+                }
+            }));
+        }
+        events.push(completed_event());
+        sse_response(events)
+    }
+
+    async fn read_http_request(socket: &mut TcpStream) -> Result<(String, Value), String> {
+        let mut bytes = Vec::new();
+        let (header_end, content_length) = loop {
+            let mut chunk = [0_u8; 4096];
+            let read = socket
+                .read(&mut chunk)
+                .await
+                .map_err(|error| format!("mock server read failed: {error}"))?;
+            if read == 0 {
+                return Err("mock client closed before sending a complete request".into());
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            if bytes.len() > 2 * 1024 * 1024 {
+                return Err("mock request exceeded 2 MiB".into());
+            }
+            if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                let header_end = end + 4;
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .ok_or_else(|| "mock request omitted content-length".to_string())?;
+                break (header_end, content_length);
+            }
+        };
+        while bytes.len() < header_end + content_length {
+            let mut chunk = [0_u8; 4096];
+            let read = socket
+                .read(&mut chunk)
+                .await
+                .map_err(|error| format!("mock server body read failed: {error}"))?;
+            if read == 0 {
+                return Err("mock client closed mid-body".into());
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+
+        let header_text = String::from_utf8(bytes[..header_end - 4].to_vec())
+            .map_err(|_| "mock request headers were not UTF-8".to_string())?;
+        let mut lines = header_text.lines();
+        let request_line = lines.next().unwrap_or_default();
+        if !request_line.starts_with("POST /responses HTTP/1.1") {
+            return Err(format!("unexpected mock request line: {request_line}"));
+        }
+        let mut headers = HashMap::new();
+        for line in lines {
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+        let body = serde_json::from_slice::<Value>(&bytes[header_end..header_end + content_length])
+            .map_err(|error| format!("mock request JSON was invalid: {error}"))?;
+        Ok((
+            format!(
+                "{}\n{}",
+                headers.get("authorization").cloned().unwrap_or_default(),
+                headers
+                    .get("chatgpt-account-id")
+                    .cloned()
+                    .unwrap_or_default()
+            ),
+            body,
+        ))
+    }
+
+    async fn handle_isolation_request(
+        mut socket: TcpStream,
+        state: Arc<IsolationTransportState>,
+    ) -> Result<(), String> {
+        let (auth_headers, body) = read_http_request(&mut socket).await?;
+        let (authorization, account_id) = auth_headers
+            .split_once('\n')
+            .ok_or_else(|| "mock request header framing failed".to_string())?;
+        let prompt = request_prompt(&body)
+            .ok_or_else(|| "mock request did not contain an initial user prompt".to_string())?;
+        let tool_output = has_tool_output(&body);
+        state
+            .requests
+            .lock()
+            .unwrap()
+            .push(RecordedTransportRequest {
+                prompt: prompt.clone(),
+                authorization: authorization.to_string(),
+                account_id: account_id.to_string(),
+                has_tool_output: tool_output,
+            });
+
+        if account_id == "account-b" {
+            state.b_seen.store(true, Ordering::SeqCst);
+            state.b_seen_notify.notify_waiters();
+        }
+
+        let response = match (prompt.as_str(), tool_output) {
+            ("root-a", false)
+                if authorization == "Bearer access-a-preflight"
+                    && !state.first_a_root_unauthorized.swap(true, Ordering::SeqCst) =>
+            {
+                b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    .to_vec()
+            }
+            ("root-a", false) => delegate_response(&[
+                ("parallel child", "parallel-child"),
+                ("nested parent", "nested-parent"),
+            ]),
+            ("root-a", true) => final_text_response("root-a-finished"),
+            ("parallel-child", false) => {
+                state.parallel_arrivals.fetch_add(1, Ordering::SeqCst);
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    state.parallel_barrier.wait(),
+                )
+                .await
+                .map_err(|_| "parallel child requests did not overlap".to_string())?;
+                final_text_response("parallel-child-finished")
+            }
+            ("nested-parent", false) => {
+                state.parallel_arrivals.fetch_add(1, Ordering::SeqCst);
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    state.parallel_barrier.wait(),
+                )
+                .await
+                .map_err(|_| "nested parent did not overlap its sibling".to_string())?;
+                delegate_response(&[("nested leaf", "nested-leaf")])
+            }
+            ("nested-parent", true) => final_text_response("nested-parent-finished"),
+            ("nested-leaf", false) => final_text_response("nested-leaf-finished"),
+            ("root-b", false) => final_text_response("root-b-finished"),
+            ("quota-a", false) => b"HTTP/1.1 429 Too Many Requests\r\n\
+                content-length: 0\r\nconnection: close\r\n\r\n"
+                .to_vec(),
+            _ => {
+                return Err(format!(
+                    "unexpected mock request state: {prompt}/{tool_output}"
+                ))
+            }
+        };
+        socket
+            .write_all(&response)
+            .await
+            .map_err(|error| format!("mock response write failed: {error}"))?;
+        socket
+            .shutdown()
+            .await
+            .map_err(|error| format!("mock response shutdown failed: {error}"))
+    }
+
+    async fn start_isolation_server(
+        state: Arc<IsolationTransportState>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        handle_isolation_request(socket, request_state.clone()).await
+                    {
+                        request_state.failures.lock().unwrap().push(error);
+                    }
+                });
+            }
+        });
+        (format!("http://{address}/responses"), handle)
+    }
+
+    fn openai_tokens(account_id: &str, access_token: &str, expires_at: i64) -> OpenAiOAuthTokens {
+        OpenAiOAuthTokens {
+            access_token: access_token.into(),
+            refresh_token: format!("refresh-{account_id}"),
+            id_token: None,
+            expires_at,
+            account_id: Some(account_id.into()),
+            email: Some(format!("{account_id}@example.test")),
+            plan: Some("plus".into()),
+            is_fedramp: false,
+        }
+    }
+
+    fn account_run_auth(
+        registry: Arc<OpenAiAccountRegistry>,
+        id: &AccountProfileId,
+        model: &str,
+    ) -> RunAuthContext {
+        let lease = registry.acquire_run_lease(id).unwrap();
+        let profile = registry.load_profile(id).unwrap();
+        RunAuthContext {
+            model: model.into(),
+            credential: Credential::OpenAiOAuth(profile.tokens),
+            openai: Some(OpenAiRunAuth {
+                registry,
+                profile_id: id.clone(),
+                _lease: Arc::new(lease),
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_isolation_root(
+        sink: Arc<dyn EventSink>,
+        http: reqwest::Client,
+        provider: Arc<dyn LlmProvider>,
+        openai_refresh: Arc<dyn OpenAiRefreshTransport>,
+        settings: Settings,
+        auth: RunAuthContext,
+        prompt: &str,
+        channel: &str,
+        workspace: PathBuf,
+        delegates: bool,
+    ) -> Result<LoopOutcome, String> {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let agents = crate::agents::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let refresh_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let ask_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let receipt_tracker = crate::turn_receipt::TurnReceiptTracker::new_with_account(
+            format!("receipt-{prompt}"),
+            crate::db::now_ms(),
+            Instant::now(),
+            workspace.clone(),
+            auth.account_profile_id().map(str::to_string),
+        )
+        .await;
+        let registry = if delegates {
+            crate::tools::default_registry()
+        } else {
+            crate::tools::read_only_registry()
+        };
+        let mut ctx = ToolCtx::new(workspace.clone());
+        ctx.receipt = Some(receipt_tracker.clone());
+        if delegates {
+            ctx.spawner = Some(Arc::new(AgentSpawner {
+                sink: sink.clone(),
+                http: http.clone(),
+                provider: provider.clone(),
+                openai_refresh: openai_refresh.clone(),
+                run_settings: settings.clone(),
+                auth: auth.clone(),
+                pending: pending.clone(),
+                agents,
+                cancel: cancel.clone(),
+                refresh_lock: refresh_lock.clone(),
+                ask_lock: ask_lock.clone(),
+                receipt_tracker,
+                parent_channel: channel.into(),
+                workspace,
+                self_id: None,
+                depth: 1,
+            }));
+        }
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: vec![text_block(prompt)],
+        }];
+        run_loop_core(
+            sink.as_ref(),
+            &http,
+            provider.as_ref(),
+            &settings,
+            auth.credential.clone(),
+            refresh_lock.as_ref(),
+            openai_refresh.as_ref(),
+            &auth,
+            ask_lock.as_ref(),
+            &pending,
+            &cancel,
+            channel,
+            channel,
+            None,
+            &registry,
+            "isolation transport system prompt",
+            &ctx,
+            messages,
+            &Persist::Ephemeral,
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_chatgpt_accounts_keep_transport_refresh_and_subagents_isolated() {
+        let state = IsolationTransportState::new();
+        let (responses_url, server) = start_isolation_server(state.clone()).await;
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(OpenAiProvider::with_responses_url(responses_url));
+        let refresh = RecordingRefreshTransport::new(state.clone());
+        let refresh_trait: Arc<dyn OpenAiRefreshTransport> = refresh.clone();
+        let registry = Arc::new(OpenAiAccountRegistry::with_store(Arc::new(
+            IsolationSecretStore::default(),
+        )));
+        let now = crate::oauth::now_secs();
+        let account_a = registry
+            .register_account(openai_tokens("account-a", "access-a-expired", 0), now)
+            .unwrap();
+        let account_b = registry
+            .register_account(
+                openai_tokens("account-b", "access-b-stable", now + 3_600),
+                now + 1,
+            )
+            .unwrap();
+        let initial_a = registry.load_profile(&account_a.id).unwrap();
+        let initial_b = registry.load_profile(&account_b.id).unwrap();
+        let auth_a = account_run_auth(registry.clone(), &account_a.id, "gpt-5.3-codex");
+        let auth_b = account_run_auth(registry.clone(), &account_b.id, "gpt-5.3-codex");
+        let settings = Settings {
+            provider: "openai".into(),
+            model: "gpt-5.3-codex".into(),
+            ..Settings::default()
+        };
+        let workspace = std::env::temp_dir().join(format!(
+            "portcode-two-account-transport-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let sink: Arc<dyn EventSink> = Arc::new(IsolationSink);
+
+        let a_run = run_isolation_root(
+            sink.clone(),
+            http.clone(),
+            provider.clone(),
+            refresh_trait.clone(),
+            settings.clone(),
+            auth_a,
+            "root-a",
+            "agent://session-a",
+            workspace.clone(),
+            true,
+        );
+        let b_run = run_isolation_root(
+            sink,
+            http,
+            provider,
+            refresh_trait,
+            settings,
+            auth_b,
+            "root-b",
+            "agent://session-b",
+            workspace.clone(),
+            false,
+        );
+        let (a_outcome, b_outcome) =
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                tokio::join!(a_run, b_run)
+            })
+            .await
+            .expect("isolation scenario must not hang");
+        let a_outcome = a_outcome.expect("account A root should finish");
+        let b_outcome = b_outcome.expect("account B root should finish");
+        server.abort();
+
+        assert_eq!(a_outcome.final_text, "root-a-finished");
+        assert_eq!(b_outcome.final_text, "root-b-finished");
+        assert!(state.first_a_root_unauthorized.load(Ordering::SeqCst));
+        assert_eq!(
+            state.parallel_arrivals.load(Ordering::SeqCst),
+            2,
+            "the two first-level A subagents must reach the server together"
+        );
+        assert!(
+            state.failures.lock().unwrap().is_empty(),
+            "mock transport failures: {:?}",
+            *state.failures.lock().unwrap()
+        );
+
+        let requests = state.requests.lock().unwrap().clone();
+        assert!(
+            requests.iter().any(|request| request.prompt == "root-a"
+                && request.authorization == "Bearer access-a-preflight"),
+            "A's expired credential must be refreshed before its first request"
+        );
+        assert!(
+            requests.iter().any(|request| request.prompt == "root-a"
+                && request.authorization == "Bearer access-a-retry"),
+            "A's 401 must rotate and retry exactly its own credential"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.prompt == "root-b")
+                .count(),
+            1,
+            "B must complete without A's 401 causing a retry"
+        );
+        for request in &requests {
+            let expected_account = if request.prompt == "root-b" {
+                "account-b"
+            } else {
+                "account-a"
+            };
+            assert_eq!(
+                request.account_id, expected_account,
+                "a run changed its immutable account identity: {request:?}"
+            );
+            match request.account_id.as_str() {
+                "account-a" => assert!(
+                    ["Bearer access-a-preflight", "Bearer access-a-retry"]
+                        .contains(&request.authorization.as_str()),
+                    "A request crossed credentials: {request:?}"
+                ),
+                "account-b" => assert_eq!(
+                    request.authorization, "Bearer access-b-stable",
+                    "B request crossed credentials: {request:?}"
+                ),
+                other => panic!("unexpected ChatGPT-Account-ID header {other:?}"),
+            }
+        }
+        for prompt in ["parallel-child", "nested-parent", "nested-leaf"] {
+            let inherited: Vec<_> = requests
+                .iter()
+                .filter(|request| request.prompt == prompt)
+                .collect();
+            assert!(!inherited.is_empty(), "missing {prompt} transport request");
+            assert!(inherited.iter().all(|request| {
+                request.account_id == "account-a"
+                    && request.authorization == "Bearer access-a-retry"
+            }));
+        }
+        assert!(requests
+            .iter()
+            .any(|request| { request.prompt == "nested-parent" && request.has_tool_output }));
+        assert!(requests
+            .iter()
+            .all(|request| request.authorization != "Bearer access-a-expired"));
+
+        assert_eq!(
+            *refresh.calls.lock().unwrap(),
+            vec![
+                ("account-a".into(), "access-a-expired".into()),
+                ("account-a".into(), "access-a-preflight".into()),
+            ],
+            "only A may enter preflight/401 refresh"
+        );
+        let final_a = registry.load_profile(&account_a.id).unwrap();
+        let final_b = registry.load_profile(&account_b.id).unwrap();
+        assert_eq!(final_a.tokens.access_token, "access-a-retry");
+        assert_eq!(
+            final_a.credential_generation,
+            initial_a.credential_generation + 2
+        );
+        assert_eq!(final_b.tokens.access_token, "access-b-stable");
+        assert_eq!(
+            final_b.credential_generation, initial_b.credential_generation,
+            "A refresh must not advance B's registry generation"
+        );
+
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn account_a_quota_rejection_never_falls_back_to_account_b() {
+        let state = IsolationTransportState::new();
+        let (responses_url, server) = start_isolation_server(state.clone()).await;
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(OpenAiProvider::with_responses_url(responses_url));
+        let refresh = RejectingRefreshTransport::new("refresh must not run for fresh tokens");
+        let refresh_trait: Arc<dyn OpenAiRefreshTransport> = refresh.clone();
+        let registry = Arc::new(OpenAiAccountRegistry::with_store(Arc::new(
+            IsolationSecretStore::default(),
+        )));
+        let now = crate::oauth::now_secs();
+        let account_a = registry
+            .register_account(
+                openai_tokens("account-a", "access-a-stable", now + 3_600),
+                now,
+            )
+            .unwrap();
+        let account_b = registry
+            .register_account(
+                openai_tokens("account-b", "access-b-stable", now + 3_600),
+                now + 1,
+            )
+            .unwrap();
+        let initial_b = registry.load_profile(&account_b.id).unwrap();
+        let auth_a = account_run_auth(registry.clone(), &account_a.id, "gpt-5.3-codex");
+        let settings = Settings {
+            provider: "openai".into(),
+            model: "gpt-5.3-codex".into(),
+            ..Settings::default()
+        };
+        let workspace = std::env::temp_dir().join(format!(
+            "portcode-account-quota-isolation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_isolation_root(
+                Arc::new(IsolationSink),
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+                provider,
+                refresh_trait,
+                settings,
+                auth_a,
+                "quota-a",
+                "agent://quota-a",
+                workspace.clone(),
+                false,
+            ),
+        )
+        .await
+        .expect("the quota response must not hang");
+        let Err(error) = result else {
+            panic!("Account A's 429 must fail the run");
+        };
+        server.abort();
+
+        assert_eq!(
+            error,
+            "OpenAI response was rejected (HTTP 429). Please retry."
+        );
+        assert!(refresh.calls.lock().unwrap().is_empty());
+        assert!(
+            state.failures.lock().unwrap().is_empty(),
+            "mock transport failures: {:?}",
+            *state.failures.lock().unwrap()
+        );
+        let requests = state.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            1,
+            "a 429 must not trigger a fallback request"
+        );
+        assert_eq!(requests[0].prompt, "quota-a");
+        assert_eq!(requests[0].account_id, "account-a");
+        assert_eq!(requests[0].authorization, "Bearer access-a-stable");
+        assert!(requests
+            .iter()
+            .all(|request| request.account_id != "account-b"));
+
+        let final_b = registry.load_profile(&account_b.id).unwrap();
+        assert_eq!(final_b.tokens.access_token, "access-b-stable");
+        assert_eq!(
+            final_b.credential_generation, initial_b.credential_generation,
+            "A's provider failure must not mutate B"
+        );
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_refresh_identity_quarantines_only_a_before_inference_and_b_still_runs() {
+        for refresh_error in [
+            "OpenAI token refresh did not assert a ChatGPT account. Reconnect this account in Settings.",
+            "OpenAI returned an invalid ChatGPT account identity.",
+        ] {
+            let state = IsolationTransportState::new();
+            let (responses_url, server) = start_isolation_server(state.clone()).await;
+            let provider: Arc<dyn LlmProvider> =
+                Arc::new(OpenAiProvider::with_responses_url(responses_url));
+            let refresh = RejectingRefreshTransport::new(refresh_error);
+            let refresh_trait: Arc<dyn OpenAiRefreshTransport> = refresh.clone();
+            let registry = Arc::new(OpenAiAccountRegistry::with_store(Arc::new(
+                IsolationSecretStore::default(),
+            )));
+            let now = crate::oauth::now_secs();
+            let account_a = registry
+                .register_account(openai_tokens("account-a", "access-a-expired", 0), now)
+                .unwrap();
+            let account_b = registry
+                .register_account(
+                    openai_tokens("account-b", "access-b-stable", now + 3_600),
+                    now + 1,
+                )
+                .unwrap();
+            let settings = Settings {
+                provider: "openai".into(),
+                model: "gpt-5.3-codex".into(),
+                ..Settings::default()
+            };
+            let workspace = std::env::temp_dir().join(format!(
+                "portcode-refresh-identity-isolation-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&workspace).unwrap();
+
+            let a_result = run_isolation_root(
+                Arc::new(IsolationSink),
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+                provider.clone(),
+                refresh_trait.clone(),
+                settings.clone(),
+                account_run_auth(registry.clone(), &account_a.id, "gpt-5.3-codex"),
+                "root-a-never-sent",
+                "agent://identity-a",
+                workspace.clone(),
+                false,
+            )
+            .await;
+            let Err(a_error) = a_result else {
+                panic!("an unsafe refresh identity must stop Account A");
+            };
+            assert_eq!(
+                a_error,
+                "This ChatGPT account session expired. Reconnect that account in Settings."
+            );
+            assert!(
+                state.requests.lock().unwrap().is_empty(),
+                "Account A must be quarantined before any inference request"
+            );
+
+            let summaries = registry.list_accounts().unwrap();
+            assert_eq!(
+                summaries
+                    .iter()
+                    .find(|summary| summary.id == account_a.id)
+                    .unwrap()
+                    .state,
+                OpenAiAccountState::ReconnectRequired
+            );
+            assert_eq!(
+                summaries
+                    .iter()
+                    .find(|summary| summary.id == account_b.id)
+                    .unwrap()
+                    .state,
+                OpenAiAccountState::Connected
+            );
+
+            let b_outcome = run_isolation_root(
+                Arc::new(IsolationSink),
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+                provider,
+                refresh_trait,
+                settings,
+                account_run_auth(registry.clone(), &account_b.id, "gpt-5.3-codex"),
+                "root-b",
+                "agent://identity-b",
+                workspace.clone(),
+                false,
+            )
+            .await
+            .expect("Account B must remain usable after A is quarantined");
+            server.abort();
+
+            assert_eq!(b_outcome.final_text, "root-b-finished");
+            assert_eq!(*refresh.calls.lock().unwrap(), vec!["account-a"]);
+            assert!(
+                state.failures.lock().unwrap().is_empty(),
+                "mock transport failures: {:?}",
+                *state.failures.lock().unwrap()
+            );
+            let requests = state.requests.lock().unwrap().clone();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].prompt, "root-b");
+            assert_eq!(requests[0].account_id, "account-b");
+            assert_eq!(requests[0].authorization, "Bearer access-b-stable");
+            std::fs::remove_dir_all(workspace).ok();
+        }
+    }
+
+    #[test]
+    fn removing_a_preserves_serialized_session_history_usage_and_account_b() {
+        let registry = Arc::new(OpenAiAccountRegistry::with_store(Arc::new(
+            IsolationSecretStore::default(),
+        )));
+        let now = crate::oauth::now_secs();
+        let account_a = registry
+            .register_account(
+                openai_tokens("account-a", "access-a-stable", now + 3_600),
+                now,
+            )
+            .unwrap();
+        let account_b = registry
+            .register_account(
+                openai_tokens("account-b", "access-b-stable", now + 3_600),
+                now + 1,
+            )
+            .unwrap();
+        let initial_b = registry.load_profile(&account_b.id).unwrap();
+        let db = Db::open(Path::new(":memory:")).expect("in-memory db");
+        db.create_session_with_account(
+            "session-a",
+            "Account A history",
+            None,
+            Some("gpt-5.3-codex"),
+            Some(account_a.id.as_str()),
+            10,
+        )
+        .unwrap();
+        db.create_session_with_account(
+            "session-b",
+            "Account B history",
+            None,
+            Some("gpt-5.3-codex"),
+            Some(account_b.id.as_str()),
+            11,
+        )
+        .unwrap();
+        db.append_message(
+            "session-a",
+            &ChatMessage {
+                role: "user".into(),
+                content: vec![text_block("durable question for A")],
+            },
+            12,
+        );
+        db.append_message(
+            "session-a",
+            &ChatMessage {
+                role: "assistant".into(),
+                content: vec![text_block("durable answer from A")],
+            },
+            13,
+        );
+        db.append_message(
+            "session-b",
+            &ChatMessage {
+                role: "assistant".into(),
+                content: vec![text_block("B remains here")],
+            },
+            14,
+        );
+        db.add_usage("session-a", 17, 23, 15).unwrap();
+
+        // SessionRow, MessageRow, and UsageRow are the serialized IPC/sync
+        // surfaces used by history views and export consumers. Capture them
+        // byte-for-value before removal so the assertion covers more than a row
+        // count or a provider-facing transcript reload.
+        let sessions_before = serde_json::to_value(db.list_sessions().unwrap()).unwrap();
+        let a_history_before = serde_json::to_value(db.messages_since("session-a", -1)).unwrap();
+        let b_history_before = serde_json::to_value(db.messages_since("session-b", -1)).unwrap();
+        let usage_before = serde_json::to_value(db.get_usage("session-a")).unwrap();
+
+        registry.remove_account(&account_a.id, now + 2).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(db.list_sessions().unwrap()).unwrap(),
+            sessions_before
+        );
+        assert_eq!(
+            serde_json::to_value(db.messages_since("session-a", -1)).unwrap(),
+            a_history_before
+        );
+        assert_eq!(
+            serde_json::to_value(db.messages_since("session-b", -1)).unwrap(),
+            b_history_before
+        );
+        assert_eq!(
+            serde_json::to_value(db.get_usage("session-a")).unwrap(),
+            usage_before
+        );
+        let loaded_a = db.load_chat_messages("session-a");
+        assert_eq!(loaded_a.len(), 2);
+        assert_eq!(
+            assistant_text(&loaded_a[1].content),
+            "durable answer from A"
+        );
+        assert!(matches!(
+            registry.load_profile(&account_a.id),
+            Err(OpenAiAccountError::ProfileRemoved)
+        ));
+        let final_b = registry.load_profile(&account_b.id).unwrap();
+        assert_eq!(final_b.tokens.access_token, "access-b-stable");
+        assert_eq!(
+            final_b.credential_generation,
+            initial_b.credential_generation
+        );
+    }
+
+    #[test]
+    fn run_and_account_read_admissions_hold_the_removal_boundary_until_all_drop() {
+        let registry = Arc::new(OpenAiAccountRegistry::with_store(Arc::new(
+            IsolationSecretStore::default(),
+        )));
+        let now = crate::oauth::now_secs();
+        let account_a = registry
+            .register_account(
+                openai_tokens("account-a", "access-a-stable", now + 3_600),
+                now,
+            )
+            .unwrap();
+        let account_b = registry
+            .register_account(
+                openai_tokens("account-b", "access-b-stable", now + 3_600),
+                now + 1,
+            )
+            .unwrap();
+        let db = Db::open(Path::new(":memory:")).expect("in-memory db");
+        db.create_session_with_account(
+            "session-a",
+            "Account A",
+            None,
+            Some("gpt-5.3-codex"),
+            Some(account_a.id.as_str()),
+            10,
+        )
+        .unwrap();
+        let settings = Settings {
+            provider: "openai".into(),
+            model: "gpt-5.3-codex".into(),
+            ..Settings::default()
+        };
+        let admission = admit_run(
+            Arc::new(Mutex::new(HashMap::new())),
+            &db,
+            &settings,
+            registry.clone(),
+            "session-a",
+        )
+        .expect("the account-bound run should be admitted");
+        // Model-catalog and usage commands acquire this same lifecycle lease in
+        // lib.rs before loading credentials or issuing network requests. Hold one
+        // lease for each command shape to prove removal cannot win any interleaving.
+        let model_catalog_admission = registry.acquire_run_lease(&account_a.id).unwrap();
+        let usage_admission = registry.acquire_run_lease(&account_a.id).unwrap();
+
+        assert!(matches!(
+            registry.remove_account(&account_a.id, now + 2),
+            Err(OpenAiAccountError::ActiveRuns)
+        ));
+        drop(admission);
+        assert!(matches!(
+            registry.remove_account(&account_a.id, now + 3),
+            Err(OpenAiAccountError::ActiveRuns)
+        ));
+        drop(model_catalog_admission);
+        assert!(matches!(
+            registry.remove_account(&account_a.id, now + 4),
+            Err(OpenAiAccountError::ActiveRuns)
+        ));
+        drop(usage_admission);
+        registry.remove_account(&account_a.id, now + 5).unwrap();
+
+        // The lifecycle map intentionally does not duplicate durable profile
+        // state. A post-removal caller can enter the lease boundary, but the
+        // authoritative profile load still fails closed before any credential or
+        // network work can begin.
+        let post_removal_lease = registry.acquire_run_lease(&account_a.id).unwrap();
+        assert!(matches!(
+            registry.load_profile(&account_a.id),
+            Err(OpenAiAccountError::ProfileRemoved)
+        ));
+        drop(post_removal_lease);
+        assert_eq!(
+            registry
+                .load_profile(&account_b.id)
+                .unwrap()
+                .tokens
+                .access_token,
+            "access-b-stable"
+        );
     }
 
     // The background-task waiter is gated so its `finish` (a map remove) can never
@@ -1994,6 +3350,52 @@ mod tests {
     }
 
     #[test]
+    fn admission_requires_an_explicit_profile_for_legacy_openai_sessions() {
+        let db = Db::open(Path::new(":memory:")).expect("in-memory db");
+        db.create_session("legacy", "Legacy", None, Some("gpt-5.6-sol"), 1)
+            .unwrap();
+        let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
+        let error = admit_run(
+            cancels.clone(),
+            &db,
+            &Settings::default(),
+            Arc::new(OpenAiAccountRegistry::system()),
+            "legacy",
+        )
+        .err()
+        .expect("legacy OpenAI sessions must not guess an account");
+        assert!(error.contains("not pinned"), "unexpected error: {error}");
+        assert!(
+            RunReservation::try_acquire(cancels, "legacy").is_ok(),
+            "failed admission must release the synchronous reservation"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_an_openai_profile_on_an_anthropic_session() {
+        let db = Db::open(Path::new(":memory:")).expect("in-memory db");
+        db.create_session_with_account(
+            "cross-provider",
+            "Cross provider",
+            None,
+            Some("claude-opus-4-8"),
+            Some("00000000-0000-4000-8000-000000000001"),
+            1,
+        )
+        .unwrap();
+        let error = admit_run(
+            Arc::new(Mutex::new(HashMap::new())),
+            &db,
+            &Settings::default(),
+            Arc::new(OpenAiAccountRegistry::system()),
+            "cross-provider",
+        )
+        .err()
+        .expect("provider/account crossing must fail before credential lookup");
+        assert!(error.contains("pinned to a ChatGPT account"));
+    }
+
+    #[test]
     fn resolve_system_prompt_prefers_an_explicit_override() {
         // A subagent run supplies its own prompt; the override wins verbatim and
         // the default workspace prompt is not consulted.
@@ -2110,7 +3512,8 @@ mod tests {
             "The signed-in ChatGPT account changed during this turn. Start the turn again."
         );
         assert!(ensure_openai_account_unchanged(Some("account-a"), Some("account-a")).is_ok());
-        assert!(ensure_openai_account_unchanged(None, Some("account-a")).is_ok());
+        assert!(ensure_openai_account_unchanged(None, Some("account-a")).is_err());
+        assert!(ensure_openai_account_unchanged(Some("account-a"), None).is_err());
     }
 
     #[test]

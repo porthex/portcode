@@ -1,6 +1,6 @@
 import { useStore } from "../store/store";
 import type { Session } from "../types";
-import { relativeTime, workspaceLabel } from "../lib/sessionFormat";
+import { relativeTime, remoteAccountLabel, workspaceLabel } from "../lib/sessionFormat";
 
 // The remote sessions list — shown after the SAS is confirmed and before a
 // session is opened (design_handoff_mobile_remote, screen 3/4). A connected
@@ -11,8 +11,10 @@ export function RemoteSessions() {
   const activeId = useStore((s) => s.activeId);
   const runs = useStore((s) => s.runs);
   const creatingSession = useStore((s) => s.creatingSession);
+  const remoteError = useStore((s) => s.remoteError);
   const openRemoteSession = useStore((s) => s.openRemoteSession);
   const newSession = useStore((s) => s.newSession);
+  const clearRemoteError = useStore((s) => s.clearRemoteError);
 
   // Navigation is independent from execution: opening a card never stops another
   // session's run, and the selected card immediately shows its own load state.
@@ -27,6 +29,32 @@ export function RemoteSessions() {
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-bg text-fg">
       <ConnectedBanner />
+
+      {remoteError && (
+        <div role="alert" className="mx-4 mt-3 rounded-xl border border-danger/35 bg-danger/10 p-3">
+          <p className="text-[12.5px] leading-relaxed text-danger">{remoteError}</p>
+          <div className="mt-2 flex gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                clearRemoteError();
+                void newSession();
+              }}
+              disabled={creatingSession}
+              className="rounded-lg border border-danger/40 px-2.5 py-1 font-mono text-[10px] text-danger disabled:opacity-40"
+            >
+              Retry
+            </button>
+            <button
+              type="button"
+              onClick={clearRemoteError}
+              className="rounded-lg border border-border-2 px-2.5 py-1 font-mono text-[10px] text-muted"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
 
       {sessions.length === 0 ? (
         <EmptyState
@@ -51,6 +79,7 @@ export function RemoteSessions() {
                 session={s}
                 active={s.id === activeId}
                 activity={activityFor(runs[s.id])}
+                accountLabel={remoteAccountLabel(s.accountProfileId, sessions)}
                 onOpen={() => open(s.id)}
               />
             ))}
@@ -114,11 +143,13 @@ function SessionCard({
   session,
   active,
   activity,
+  accountLabel,
   onOpen,
 }: {
   session: Session;
   active: boolean;
   activity: RemoteActivity;
+  accountLabel: string | null;
   onOpen: () => void;
 }) {
   return (
@@ -142,6 +173,7 @@ function SessionCard({
       <div className="flex items-center justify-between gap-2">
         <span className="min-w-0 truncate font-mono text-[11px] text-faint">
           <span aria-hidden="true">⎇</span> {workspaceLabel(session.workspace)}
+          {accountLabel && <> · {accountLabel}</>}
         </span>
         {activity !== "idle" ? (
           <span

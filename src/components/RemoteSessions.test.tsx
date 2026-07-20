@@ -40,11 +40,12 @@ const run = (over: Partial<(typeof initial.runs)[string]> = {}): (typeof initial
 const openRemoteSession = vi.fn();
 const newSession = vi.fn();
 const disconnectRemote = vi.fn();
+const clearRemoteError = vi.fn();
 
 beforeEach(() => {
   vi.clearAllMocks();
   useStore.setState(initial, true);
-  useStore.setState({ openRemoteSession, newSession, disconnectRemote });
+  useStore.setState({ openRemoteSession, newSession, disconnectRemote, clearRemoteError });
 });
 
 describe("RemoteSessions — list", () => {
@@ -67,6 +68,25 @@ describe("RemoteSessions — list", () => {
     expect(screen.getByText("Beta")).toBeInTheDocument();
     // The workspace basename is shown on each card (⎇ portcode).
     expect(screen.getAllByText(/portcode/).length).toBeGreaterThan(0);
+  });
+
+  it("labels pinned sessions by stable account ordinal without exposing profile ids", () => {
+    const firstProfile = "00000000-0000-4000-8000-000000000001";
+    const secondProfile = "00000000-0000-4000-8000-000000000002";
+    useStore.setState({
+      sessions: [
+        session({ id: "a", title: "Alpha", accountProfileId: secondProfile }),
+        session({ id: "b", title: "Beta", accountProfileId: firstProfile }),
+      ],
+      activeId: "a",
+    });
+
+    const { container } = render(<RemoteSessions />);
+
+    expect(screen.getByRole("button", { name: /Alpha.*ChatGPT account 2/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Beta.*ChatGPT account 1/ })).toBeInTheDocument();
+    expect(container).not.toHaveTextContent(firstProfile);
+    expect(container).not.toHaveTextContent(secondProfile);
   });
 
   it("marks the active session with aria-current", () => {
@@ -116,6 +136,50 @@ describe("RemoteSessions — list", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /New session on desktop/ }));
     expect(newSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a remote command rejection and retries without ending the connection", () => {
+    const accountProfileId = "00000000-0000-4000-8000-000000000001";
+    useStore.setState({
+      sessions: [session({ model: "gpt-live", accountProfileId })],
+      activeId: "s1",
+      remoteConnected: true,
+      remoteError: "Choose a ChatGPT account on the desktop, then try again.",
+    });
+    render(<RemoteSessions />);
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Choose a ChatGPT account on the desktop, then try again.",
+    );
+    expect(screen.getByRole("alert")).not.toHaveTextContent("ChatGPT account 1");
+    expect(screen.getByRole("alert")).not.toHaveTextContent(accountProfileId);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(clearRemoteError).toHaveBeenCalledOnce();
+    expect(newSession).toHaveBeenCalledOnce();
+    expect(disconnectRemote).not.toHaveBeenCalled();
+  });
+
+  it("dismisses a remote command rejection without retrying", () => {
+    useStore.setState({ sessions: [session()], remoteError: "Desktop rejected the request." });
+    render(<RemoteSessions />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+
+    expect(clearRemoteError).toHaveBeenCalledOnce();
+    expect(newSession).not.toHaveBeenCalled();
+  });
+
+  it("disables rejection retry while another create is pending", () => {
+    useStore.setState({
+      sessions: [session()],
+      remoteError: "Desktop rejected the request.",
+      creatingSession: true,
+    });
+    render(<RemoteSessions />);
+
+    expect(screen.getByRole("button", { name: "Retry" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeEnabled();
   });
 
   it("disables the new-session footer while a create is in flight (creatingSession)", () => {

@@ -33,6 +33,11 @@ export interface SessionRow {
      * to the global default model when it is None.
      */
     model?: string | null;
+    /**
+     * Opaque local ChatGPT account profile pinned to this session. Legacy and
+     * non-OpenAI sessions remain unpinned, and older peers can omit the field.
+     */
+    accountProfileId?: string;
     createdAt: number;
     updatedAt: number;
 }
@@ -54,7 +59,7 @@ export type StreamEvent = { type: "turn_start"; messageId: string; turnId?: stri
 /**
  * Everything that crosses the encrypted channel, in both directions.
  */
-export type SyncFrame = { t: "hello"; device_id: string; cursors: Cursor[] } | { t: "session_list"; sessions: SessionRow[] } | { t: "session_created"; request_id: string; session: SessionRow } | { t: "message_delta"; session_id: string; messages: MessageRow[] } | { t: "message_page"; session_id: string; messages: MessageRow[]; has_more: boolean } | { t: "live"; session_id: string; event: StreamEvent } | { t: "command"; command: RemoteCommand } | { t: "ack"; session_id: string; seq: number } | { t: "pairing_reject"; reason: string | null };
+export type SyncFrame = { t: "hello"; device_id: string; cursors: Cursor[] } | { t: "session_list"; sessions: SessionRow[] } | { t: "session_created"; request_id: string; session: SessionRow } | { t: "command_rejected"; request_id?: string; code?: CommandRejectionCode; message?: string } | { t: "message_delta"; session_id: string; messages: MessageRow[] } | { t: "message_page"; session_id: string; messages: MessageRow[]; has_more: boolean } | { t: "live"; session_id: string; event: StreamEvent } | { t: "command"; command: RemoteCommand } | { t: "ack"; session_id: string; seq: number } | { t: "pairing_reject"; reason: string | null };
 
 /**
  * Git-shaped status used by the immutable, bounded changed-file summary.
@@ -73,6 +78,12 @@ export type TurnChangeCertainty = "exact" | "observed" | "ambiguous" | "unavaila
  */
 export interface TurnReceipt {
     turnId: string;
+    /**
+     * Opaque local ChatGPT account profile used for this turn. This is never a
+     * remote account identifier and is optional so receipts written by older
+     * Portcode versions remain readable.
+     */
+    accountProfileId?: string;
     status: TurnStatus;
     stopReason?: string;
     startedAt: number;
@@ -139,6 +150,16 @@ export interface MessageRow {
      */
     receipt?: TurnReceipt;
 }
+
+/**
+ * Stable, non-sensitive reason a desktop rejected a correlated remote command.
+ *
+ * The phone should use `code` for behavior and may display the accompanying
+ * bounded public message. `Unknown` keeps newer desktop codes decodable by an
+ * older phone instead of turning an application-level rejection into a protocol
+ * failure and reconnect loop.
+ */
+export type CommandRejectionCode = "open_ai_account_selection_required" | "invalid_desktop_configuration" | "desktop_unavailable" | "invalid_request" | "unknown";
 
 /**
  * Terminal state of one root agent turn. `Interrupted` is persisted when a
@@ -299,15 +320,15 @@ export interface InitOutput {
     readonly intounderlyingsource_cancel: (a: number) => void;
     readonly intounderlyingsource_pull: (a: number, b: any) => any;
     readonly ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__haeef4d57e6a88c91: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen__convert__closures_____invoke__h29f3221e742a74f6: (a: number, b: number, c: any, d: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h68ec937c7cebd819: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__ha7800a8575fd78d5: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hc6a33f57e9316770: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hd51a085c8f3dffa7: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h732d2251e9086dd9: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h069bff72c256f5f0: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hfe7f4cbcccf4f5d6: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__hfe1c0a6f1e8b05bc: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen__convert__closures_____invoke__h16b583695eaaa759: (a: number, b: number, c: any, d: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h09422128ca52abe5: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__he1a6edec8a7133be: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h9768ca95ee41dd2d: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h1b7d021b1c5dfc2e: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h478ee851fa3c1656: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h080f7a4b92422f09: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h838e0803cc6d1745: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;
