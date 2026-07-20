@@ -86,6 +86,10 @@ const settings = (over: Partial<Settings> = {}): Settings => ({
 const sessionRow = (title: RegExp): HTMLElement =>
   screen.getByRole("button", { name: title }).closest<HTMLElement>("[data-session-row]")!;
 
+const openArchive = (): void => {
+  fireEvent.click(screen.getByRole("button", { name: /View archived sessions/ }));
+};
+
 beforeEach(() => {
   vi.clearAllMocks();
   // zustand has no built-in reset; restore the pristine snapshot each test.
@@ -728,6 +732,8 @@ describe("Sidebar", () => {
 
     render(<Sidebar />);
     expect(screen.queryByRole("button", { name: "Delete session: Keep" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Remove/ })).not.toBeInTheDocument();
+    openArchive();
     fireEvent.click(screen.getByRole("button", { name: "Delete session: Remove" }));
     expect(screen.getByRole("dialog", { name: "Delete archived session?" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Delete forever" }));
@@ -744,6 +750,7 @@ describe("Sidebar", () => {
     });
 
     render(<Sidebar />);
+    openArchive();
 
     // Each delete control exposes an accessible name that names its target
     // session, so screen-reader users know which session a click would remove.
@@ -840,19 +847,19 @@ describe("Sidebar", () => {
       expect(screen.getByText("RUST · TOKIO")).toBeInTheDocument();
     });
 
-    it("surfaces the live session count with correct pluralization", () => {
+    it("surfaces the live active-session count with correct pluralization", () => {
       m.isTauri.mockReturnValue(false);
 
       // The decorative ◴ glyph is now an aria-hidden span, so the count text node
-      // reads e.g. " 0 SESSIONS"; match on the count text rather than the glyph.
+      // reads e.g. " 0 ACTIVE"; match on the count text rather than the glyph.
       useStore.setState({ sessions: [], activeId: null });
       const zero = render(<Sidebar />);
-      expect(zero.getByText(/0 SESSIONS/)).toBeInTheDocument();
+      expect(zero.getByText(/0 ACTIVE/)).toBeInTheDocument();
       zero.unmount();
 
       useStore.setState({ sessions: [session({ id: "a" })], activeId: "a" });
       const one = render(<Sidebar />);
-      expect(one.getByText(/1 SESSION/)).toBeInTheDocument();
+      expect(one.getByText(/1 ACTIVE/)).toBeInTheDocument();
       one.unmount();
 
       useStore.setState({
@@ -860,7 +867,7 @@ describe("Sidebar", () => {
         activeId: "a",
       });
       const many = render(<Sidebar />);
-      expect(many.getByText(/3 SESSIONS/)).toBeInTheDocument();
+      expect(many.getByText(/3 ACTIVE/)).toBeInTheDocument();
     });
 
     it("honestly reports whether the native core is attached", () => {
@@ -1126,7 +1133,7 @@ describe("Sidebar", () => {
       expect(screen.queryByRole("menu", { name: "Sort sessions" })).not.toBeInTheDocument();
     });
 
-    it("group → status renders Running / Idle / Archived section headers in order", () => {
+    it("group → status keeps archived chats out of the working status groups", () => {
       useStore.setState({
         sessions: [
           session({ id: "a", title: "Running one" }),
@@ -1142,12 +1149,12 @@ describe("Sidebar", () => {
 
       expect(screen.getByText("Running")).toBeInTheDocument();
       expect(screen.getByText("Idle")).toBeInTheDocument();
-      expect(screen.getByText("Archived")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /^Archived one/ })).not.toBeInTheDocument();
       // No folder UI in an automatic-grouping mode.
       expect(screen.queryByRole("button", { name: "New folder" })).not.toBeInTheDocument();
     });
 
-    it("orders concurrent activity before idle and archived sessions", () => {
+    it("orders concurrent activity before idle while archived sessions stay separate", () => {
       useStore.setState({
         sessions: [
           session({ id: "idle", title: "Idle chat" }),
@@ -1173,7 +1180,8 @@ describe("Sidebar", () => {
       const headers = [...document.querySelectorAll(".pc-group-head__label")].map(
         (node) => node.textContent,
       );
-      expect(headers).toEqual(["Needs attention", "Stopping", "Running", "Idle", "Archived"]);
+      expect(headers).toEqual(["Needs attention", "Stopping", "Running", "Idle"]);
+      expect(screen.queryByRole("button", { name: /^Archived chat/ })).not.toBeInTheDocument();
     });
 
     it("group → workspace buckets by the ⎇ label", () => {
@@ -1317,7 +1325,7 @@ describe("Sidebar", () => {
   });
 
   describe("archived rows + status indicators", () => {
-    it("archives a clean session from its row action and flips the control", async () => {
+    it("moves a clean session out of Sessions and restores it from Archive", async () => {
       useStore.setState({
         sessions: [session({ id: "a", title: "Keep" }), session({ id: "b", title: "Old chat" })],
         activeId: "a",
@@ -1327,13 +1335,19 @@ describe("Sidebar", () => {
       fireEvent.click(screen.getByRole("button", { name: "Archive session: Old chat" }));
 
       await waitFor(() => expect(useStore.getState().archivedIds).toEqual(["b"]));
-      // The control now offers the inverse action…
-      expect(
-        screen.getByRole("button", { name: "Unarchive session: Old chat" }),
-      ).toBeInTheDocument();
-      // …and the row is dimmed.
-      const row = screen.getByRole("button", { name: /^Old chat/ }).closest(".pc-row--archived");
-      expect(row).not.toBeNull();
+      expect(screen.queryByRole("button", { name: /^Old chat/ })).not.toBeInTheDocument();
+
+      openArchive();
+      expect(screen.getByRole("navigation", { name: "Archived session list" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Restore session: Old chat" })).toBeInTheDocument();
+      expect(sessionRow(/^Old chat/)).toHaveClass("pc-session-row--archive");
+
+      fireEvent.click(screen.getByRole("button", { name: "Restore session: Old chat" }));
+      await waitFor(() => expect(useStore.getState().archivedIds).toEqual([]));
+      expect(screen.getByText("Archive is empty")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Back to sessions" }));
+      expect(screen.getByRole("button", { name: /^Old chat/ })).toBeInTheDocument();
     });
 
     it("warns with branch-specific uncommitted work before archiving", async () => {
@@ -1395,10 +1409,13 @@ describe("Sidebar", () => {
       });
       const { container } = render(<Sidebar />);
 
-      // running ⇒ success dot; idle inactive ⇒ faint pip; archived ⇒ box glyph.
+      // The working view shows only live and idle indicators.
       expect(container.querySelector(".pc-dot--success")).not.toBeNull();
       expect(container.querySelector(".pc-dot--idle")).not.toBeNull();
-      expect(screen.getByText("▢")).toBeInTheDocument();
+      expect(screen.queryByRole("status", { name: "Session status: archived" })).toBeNull();
+
+      openArchive();
+      expect(screen.getByRole("status", { name: "Session status: archived" })).toBeInTheDocument();
     });
 
     it("shows the magenta accent dot for the open, non-streaming session", () => {
@@ -1828,7 +1845,7 @@ describe("Sidebar", () => {
       await waitFor(() => expect(useStore.getState().archivedIds).toEqual(["a"]));
     });
 
-    it("labels the archive action Unarchive for an archived session", () => {
+    it("labels the archive action Restore to Sessions for an archived session", () => {
       useStore.setState({
         sessions: [session({ id: "a", title: "Chat A" })],
         activeId: null,
@@ -1836,8 +1853,9 @@ describe("Sidebar", () => {
       });
       render(<Sidebar />);
 
+      openArchive();
       fireEvent.contextMenu(sessionRow(/^Chat A/));
-      expect(screen.getByRole("menuitem", { name: "Unarchive" })).toBeInTheDocument();
+      expect(screen.getByRole("menuitem", { name: "Restore to Sessions" })).toBeInTheDocument();
     });
 
     it("deletes the session from its context menu", async () => {
@@ -1849,6 +1867,7 @@ describe("Sidebar", () => {
       });
       render(<Sidebar />);
 
+      openArchive();
       fireEvent.contextMenu(sessionRow(/^Remove/));
       fireEvent.click(screen.getByRole("menuitem", { name: "Delete permanently" }));
       fireEvent.click(screen.getByRole("button", { name: "Delete forever" }));
@@ -1893,15 +1912,12 @@ describe("Sidebar", () => {
       });
       render(<Sidebar />);
 
-      fireEvent.contextMenu(
-        screen.getByRole("button", { name: /^Idle A/ }).closest("[draggable]")!,
-      );
+      openArchive();
+      fireEvent.contextMenu(sessionRow(/^Idle A/));
       expect(screen.getByRole("menuitem", { name: "Delete permanently" })).not.toHaveAttribute(
         "aria-disabled",
       );
-      fireEvent.contextMenu(
-        screen.getByRole("button", { name: /^Busy B/ }).closest("[draggable]")!,
-      );
+      fireEvent.contextMenu(sessionRow(/^Busy B/));
       expect(screen.getByRole("menuitem", { name: "Delete permanently" })).toHaveAttribute(
         "aria-disabled",
         "true",

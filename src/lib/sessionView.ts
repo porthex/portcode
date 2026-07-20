@@ -14,6 +14,21 @@ export interface SessionRunActivity {
   pendingPermission?: unknown | null;
 }
 
+/** Split the persisted session collection into the two sidebar destinations.
+ * Archive membership is presentation-only, so stale archived ids are harmless
+ * and simply do not appear in either returned collection. */
+export function partitionSessions(
+  sessions: readonly Session[],
+  archivedIds: ReadonlySet<string>,
+): { active: Session[]; archived: Session[] } {
+  const active: Session[] = [];
+  const archived: Session[] = [];
+  for (const session of sessions) {
+    (archivedIds.has(session.id) ? archived : active).push(session);
+  }
+  return { active, archived };
+}
+
 /** Basename of a workspace path, or "local" when none is set. Doubles as the
  *  `⎇` row label and the bucket key for `groupBy: "workspace"`. */
 export function workspaceLabel(workspace: string | null): string {

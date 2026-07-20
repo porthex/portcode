@@ -6,6 +6,7 @@ import { isTauri } from "../lib/ipc";
 import {
   buildSidebarRows,
   deriveStatus,
+  partitionSessions,
   sortSessions,
   workspaceLabel,
   type SidebarRow,
@@ -553,6 +554,10 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
 
   // Which sort/group popover is open (transient, instance-local). Only one at a time.
   const [menu, setMenu] = useState<"sort" | "group" | null>(null);
+  // Archive is a separate destination, never a status mixed into the working
+  // session list. Keeping this local makes the default destination predictably
+  // Sessions on every app launch while preserving all archive data in the store.
+  const [sidebarView, setSidebarView] = useState<"sessions" | "archive">("sessions");
   // Inline folder rename: the folder being edited + its draft name. A ref carries
   // an Escape "cancel" intent across the unmount→blur edge (the blur handler's
   // closure would otherwise still see itself as editing and commit).
@@ -604,6 +609,10 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   const { onContextMenu, menu: ctxMenu } = useContextMenu();
 
   const archived = useMemo(() => new Set(archivedIds), [archivedIds]);
+  const { active: activeSessions, archived: archivedSessions } = useMemo(
+    () => partitionSessions(sessions, archived),
+    [sessions, archived],
+  );
   const activityRuns = useMemo(
     () =>
       activeId && streaming && !runs[activeId]
@@ -614,19 +623,21 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   const { rows, visible } = useMemo(
     () =>
       buildSidebarRows({
-        sessions,
+        sessions: sidebarView === "archive" ? archivedSessions : activeSessions,
         activeId,
         streaming,
-        sortBy,
-        groupBy,
-        folders,
-        folderOf,
+        sortBy: sidebarView === "archive" ? "recent" : sortBy,
+        groupBy: sidebarView === "archive" ? "none" : groupBy,
+        folders: sidebarView === "archive" ? [] : folders,
+        folderOf: sidebarView === "archive" ? {} : folderOf,
         archived,
-        manualOrder,
+        manualOrder: sidebarView === "archive" ? [] : manualOrder,
         runs: activityRuns,
       }),
     [
-      sessions,
+      sidebarView,
+      activeSessions,
+      archivedSessions,
       activeId,
       streaming,
       sortBy,
@@ -670,7 +681,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
 
   // ── Inline session rename handlers ─────────────────────────────────────────
   const beginEdit = (s: Session) => {
-    if (!canRenameSession(s.id)) return;
+    if (sidebarView !== "sessions" || !canRenameSession(s.id)) return;
     editingRef.current = s.id;
     setEditingSessionId(s.id);
     setDraft(s.title);
@@ -779,7 +790,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
     if (!draggedId || draggedId === target.id) return;
     const statusOf = (id: string): SessionActivityStatus =>
       deriveStatus(id, activityRuns[id], archived);
-    const order = sortSessions(sessions, sortBy, statusOf, manualOrder)
+    const order = sortSessions(activeSessions, sortBy, statusOf, manualOrder)
       .map((s) => s.id)
       .filter((id) => id !== draggedId);
     const ti = order.indexOf(target.id);
@@ -872,22 +883,23 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   const sessionMenuItems = (s: Session): ContextMenuItem[] => {
     const busy = targetBusy(s.id);
     const inFolder = folderOf[s.id] ?? null;
-    const items: ContextMenuItem[] = [
-      {
+    const items: ContextMenuItem[] = [];
+    if (sidebarView === "sessions") {
+      items.push({
         label: "New chat",
         icon: <PlusGlyph />,
         onSelect: () => void newSession(),
         disabled: creatingSession,
-      },
-      {
-        label: archived.has(s.id) ? "Unarchive" : "Archive",
-        icon: <ArchiveIcon />,
-        onSelect: () => void requestArchive(s),
-        disabled: inspectingSessionId === s.id,
-      },
-    ];
+      });
+    }
+    items.push({
+      label: archived.has(s.id) ? "Restore to Sessions" : "Archive",
+      icon: <ArchiveIcon />,
+      onSelect: () => void requestArchive(s),
+      disabled: inspectingSessionId === s.id,
+    });
     // Move-to-folder section: only meaningful in the manual (folder) mode.
-    if (groupBy === "none" && folders.length > 0) {
+    if (sidebarView === "sessions" && groupBy === "none" && folders.length > 0) {
       let first = true;
       for (const f of folders) {
         items.push({
@@ -1067,7 +1079,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
     const isDragging = draggingId === s.id;
     // Reorder + folder DnD only applies in the manual ("none") mode; the auto
     // groupings derive their order, so rows aren't draggable there.
-    const reorderable = groupBy === "none";
+    const reorderable = sidebarView === "sessions" && groupBy === "none";
     // The ⎇ glyph names the real git branch when known (its true meaning); the
     // workspace folder rides alongside. Falls back to just the workspace when the
     // session isn't in a git repo.
@@ -1132,7 +1144,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         className={
           "pc-session-row group relative rounded-lg " +
           (active ? "pc-session-row--selected" : "pc-row") +
-          (isArchived ? " pc-row--archived" : "") +
+          (sidebarView === "archive" ? " pc-session-row--archive" : "") +
           (isDragging ? " pc-session-row--dragging" : "") +
           (dropHint?.id === s.id ? ` pc-drop-line pc-drop-line--${dropHint.place}` : "")
         }
@@ -1237,7 +1249,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
               </span>
             </button>
           )}
-          {canRenameSession(s.id) && editingSessionId !== s.id && (
+          {sidebarView === "sessions" && canRenameSession(s.id) && editingSessionId !== s.id && (
             <button
               onClick={() => beginEdit(s)}
               tabIndex={isTabStop ? 0 : -1}
@@ -1255,16 +1267,16 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
                 onClick={() => void requestArchive(s)}
                 disabled={inspectingSessionId === s.id}
                 tabIndex={isTabStop ? 0 : -1}
-                className={`ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-accent-2/10 hover:text-accent-2 group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none ${
-                  inspectingSessionId === s.id ? "cursor-wait opacity-50" : ""
-                }`}
-                aria-label={`${isArchived ? "Unarchive" : "Archive"} session: ${s.title}`}
+                className={`ml-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint transition-opacity hover:bg-accent-2/10 hover:text-accent-2 focus-visible:opacity-100 motion-reduce:transition-none ${
+                  sidebarView === "archive" ? "opacity-80" : "opacity-0 group-hover:opacity-100"
+                } ${inspectingSessionId === s.id ? "cursor-wait opacity-50" : ""}`}
+                aria-label={`${isArchived ? "Restore" : "Archive"} session: ${s.title}`}
                 aria-busy={inspectingSessionId === s.id || undefined}
                 title={
                   inspectingSessionId === s.id
                     ? "Checking worktree"
                     : isArchived
-                      ? "Unarchive"
+                      ? "Restore to Sessions"
                       : "Archive"
                 }
               >
@@ -1275,9 +1287,9 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
                   onClick={() => requestDelete(s)}
                   disabled={busy}
                   tabIndex={isTabStop ? 0 : -1}
-                  className={`ml-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint opacity-0 transition-opacity hover:bg-danger/10 hover:text-danger group-hover:opacity-100 focus-visible:opacity-100 motion-reduce:transition-none ${
-                    busy ? "cursor-not-allowed opacity-50" : ""
-                  }`}
+                  className={`ml-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded text-faint transition-opacity hover:bg-danger/10 hover:text-danger focus-visible:opacity-100 motion-reduce:transition-none ${
+                    sidebarView === "archive" ? "opacity-70" : "opacity-0 group-hover:opacity-100"
+                  } ${busy ? "cursor-not-allowed opacity-50" : ""}`}
                   aria-label={`Delete session: ${s.title}`}
                   title={busy ? "Finish or stop this session's work first" : "Delete permanently"}
                 >
@@ -1342,101 +1354,138 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         <NewSessionControl />
       </div>
 
-      {/* SESSIONS toolbar: keep identity/actions separate from the stateful view
-          controls so long group labels never escape the fixed-width sidebar. */}
-      <div className="relative px-3 pb-1.5 pt-1">
-        <div className="flex min-w-0 items-center gap-2">
-          <span className="font-mono text-[10.5px] uppercase tracking-[2px] text-faint">
-            Sessions
-          </span>
-          <span className="pc-count" aria-hidden="true">
-            {sessions.length}
-          </span>
-          {groupBy === "none" && (
-            <button
-              onClick={() => {
-                setMenu(null);
-                addFolder();
-              }}
-              aria-label="New folder"
-              title="New folder"
-              className="pc-sess-ctrl ml-auto"
+      {sidebarView === "sessions" ? (
+        /* Working sessions keep their organization tools. Archive is a sibling
+           destination, not another grouping/filter that can accidentally leak
+           old chats back into this list. */
+        <div className="relative px-3 pb-1.5 pt-1">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="font-mono text-[10.5px] uppercase tracking-[2px] text-faint">
+              Sessions
+            </span>
+            <span
+              className="pc-count"
+              aria-label={`${activeSessions.length} active ${activeSessions.length === 1 ? "session" : "sessions"}`}
             >
-              <NewFolderIcon />
+              {activeSessions.length}
+            </span>
+            {groupBy === "none" && (
+              <button
+                onClick={() => {
+                  setMenu(null);
+                  addFolder();
+                }}
+                aria-label="New folder"
+                title="New folder"
+                className="pc-sess-ctrl ml-auto"
+              >
+                <NewFolderIcon />
+              </button>
+            )}
+          </div>
+
+          <div
+            className="mt-1.5 grid min-w-0 grid-cols-2 gap-1.5"
+            role="group"
+            aria-label="Session organization controls"
+          >
+            <button
+              onClick={() => setMenu((m) => (m === "sort" ? null : "sort"))}
+              aria-haspopup="menu"
+              aria-expanded={menu === "sort"}
+              aria-label={`Sort sessions (${sortLabel})`}
+              title="Sort"
+              className={`pc-sess-ctrl pc-sess-ctrl--wide ${menu === "sort" || sortBy !== "recent" ? "pc-sess-ctrl--active" : ""}`}
+            >
+              <SortIcon />
+              <span className="pc-sess-ctrl__label">{sortLabel}</span>
             </button>
+            <button
+              onClick={() => setMenu((m) => (m === "group" ? null : "group"))}
+              aria-haspopup="menu"
+              aria-expanded={menu === "group"}
+              aria-label={`Group sessions (${groupLabel})`}
+              title="Group"
+              className={`pc-sess-ctrl pc-sess-ctrl--wide ${menu === "group" || groupBy !== "none" ? "pc-sess-ctrl--active" : ""}`}
+            >
+              <GroupIcon />
+              <span className="pc-sess-ctrl__label">{groupLabel}</span>
+            </button>
+          </div>
+
+          {menu !== null && (
+            <button
+              type="button"
+              aria-label="Close menu"
+              tabIndex={-1}
+              onClick={closeMenu}
+              className="fixed inset-0 z-[15] cursor-default"
+            />
+          )}
+          {menu === "sort" && (
+            <PopMenu
+              label="Sort sessions"
+              value={sortBy}
+              options={SORT_OPTIONS}
+              onPick={(v) => {
+                setSortBy(v);
+                closeMenu();
+              }}
+            />
+          )}
+          {menu === "group" && (
+            <PopMenu
+              label="Group sessions"
+              value={groupBy}
+              options={GROUP_OPTIONS}
+              onPick={(v) => {
+                setGroupBy(v);
+                closeMenu();
+              }}
+            />
           )}
         </div>
-
-        <div
-          className="mt-1.5 grid min-w-0 grid-cols-2 gap-1.5"
-          role="group"
-          aria-label="Session organization controls"
-        >
-          <button
-            onClick={() => setMenu((m) => (m === "sort" ? null : "sort"))}
-            aria-haspopup="menu"
-            aria-expanded={menu === "sort"}
-            aria-label={`Sort sessions (${sortLabel})`}
-            title="Sort"
-            className={`pc-sess-ctrl pc-sess-ctrl--wide ${menu === "sort" || sortBy !== "recent" ? "pc-sess-ctrl--active" : ""}`}
-          >
-            <SortIcon />
-            <span className="pc-sess-ctrl__label">{sortLabel}</span>
-          </button>
-          <button
-            onClick={() => setMenu((m) => (m === "group" ? null : "group"))}
-            aria-haspopup="menu"
-            aria-expanded={menu === "group"}
-            aria-label={`Group sessions (${groupLabel})`}
-            title="Group"
-            className={`pc-sess-ctrl pc-sess-ctrl--wide ${menu === "group" || groupBy !== "none" ? "pc-sess-ctrl--active" : ""}`}
-          >
-            <GroupIcon />
-            <span className="pc-sess-ctrl__label">{groupLabel}</span>
-          </button>
+      ) : (
+        <div className="px-3 pb-2 pt-1">
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setSidebarView("sessions")}
+              aria-label="Back to sessions"
+              title="Back to sessions"
+              className="pc-archive-back"
+            >
+              <BackIcon />
+            </button>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-[10.5px] uppercase tracking-[2px] text-accent-2">
+                  Archived
+                </span>
+                <span
+                  className="pc-count"
+                  aria-label={`${archivedSessions.length} archived ${archivedSessions.length === 1 ? "session" : "sessions"}`}
+                >
+                  {archivedSessions.length}
+                </span>
+              </div>
+              <p className="mt-0.5 truncate text-[10.5px] text-faint">Hidden from Sessions</p>
+            </div>
+          </div>
+          <div className="pc-archive-note">
+            <ArchiveIcon />
+            <span>Restore a chat to return it to your working list.</span>
+          </div>
         </div>
-
-        {menu !== null && (
-          // Full-viewport click-catcher: an outside click closes the open popover.
-          <button
-            type="button"
-            aria-label="Close menu"
-            tabIndex={-1}
-            onClick={closeMenu}
-            className="fixed inset-0 z-[15] cursor-default"
-          />
-        )}
-        {menu === "sort" && (
-          <PopMenu
-            label="Sort sessions"
-            value={sortBy}
-            options={SORT_OPTIONS}
-            onPick={(v) => {
-              setSortBy(v);
-              closeMenu();
-            }}
-          />
-        )}
-        {menu === "group" && (
-          <PopMenu
-            label="Group sessions"
-            value={groupBy}
-            options={GROUP_OPTIONS}
-            onPick={(v) => {
-              setGroupBy(v);
-              closeMenu();
-            }}
-          />
-        )}
-      </div>
+      )}
 
       {/* Session rows / folder tree */}
       <nav
-        aria-label="Session list"
+        aria-label={sidebarView === "archive" ? "Archived session list" : "Session list"}
         onKeyDown={onListKeyDown}
-        onContextMenu={onContextMenu(listMenuItems())}
+        onContextMenu={sidebarView === "sessions" ? onContextMenu(listMenuItems()) : undefined}
         onDragOver={
-          groupBy === "none"
+          sidebarView === "sessions" && groupBy === "none"
             ? (e) => {
                 e.preventDefault();
                 e.dataTransfer.dropEffect = "move";
@@ -1448,7 +1497,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
             : undefined
         }
         onDrop={
-          groupBy === "none"
+          sidebarView === "sessions" && groupBy === "none"
             ? (e) => {
                 // A drop that didn't land on a folder (folders stopPropagation)
                 // moves the chat back to the loose root.
@@ -1463,11 +1512,42 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         <span className="sr-only" role="status" aria-live="polite">
           {reorderAnnouncement}
         </span>
+        {sidebarView === "archive" && archivedSessions.length === 0 && (
+          <div className="pc-archive-empty" role="status">
+            <span className="pc-archive-empty__icon" aria-hidden="true">
+              <ArchiveIcon />
+            </span>
+            <span className="pc-archive-empty__title">Archive is empty</span>
+            <span className="pc-archive-empty__copy">
+              Chats you archive will leave Sessions and collect here.
+            </span>
+          </div>
+        )}
         {rows.map(renderRow)}
       </nav>
 
       {/* Footer */}
       <div className="border-t border-border p-3">
+        {sidebarView === "sessions" && (
+          <button
+            type="button"
+            onClick={() => {
+              setMenu(null);
+              setSidebarView("archive");
+            }}
+            aria-label={`View archived sessions (${archivedSessions.length})`}
+            className="pc-archive-nav"
+          >
+            <ArchiveIcon />
+            <span>Archived chats</span>
+            <span className="pc-count ml-auto" aria-hidden="true">
+              {archivedSessions.length}
+            </span>
+            <span className="pc-archive-nav__chevron" aria-hidden="true">
+              ›
+            </span>
+          </button>
+        )}
         <button
           onClick={() => setShowSettings(true)}
           aria-label="Settings"
@@ -1489,7 +1569,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         <div className="mt-2 flex items-center justify-between gap-1.5 px-2 font-mono text-[9px] text-faint">
           <span className="whitespace-nowrap">
             <span aria-hidden="true">◴</span>{" "}
-            {sessions.length === 1 ? "1 SESSION" : `${sessions.length} SESSIONS`}
+            {activeSessions.length === 1 ? "1 ACTIVE" : `${activeSessions.length} ACTIVE`}
           </span>
           <span className="truncate">RUST · TOKIO</span>
           <span className="whitespace-nowrap">
@@ -1515,6 +1595,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
  *  panel header, expand from here. */
 function SessionRail() {
   const sessions = useStore((s) => s.sessions);
+  const archivedIds = useStore((s) => s.archivedIds);
   const setShowSettings = useStore((s) => s.setShowSettings);
   const setSidebarCollapsed = useStore((s) => s.setSidebarCollapsed);
   const settings = useStore((s) => s.settings);
@@ -1524,6 +1605,10 @@ function SessionRail() {
   const openAIAccounts = useStore((s) => s.openAIAccounts);
   const openAIModelCatalogs = useStore((s) => s.openAIModelCatalogs);
   const activeId = useStore((s) => s.activeId);
+  const activeSessionCount = useMemo(() => {
+    const archived = new Set(archivedIds);
+    return sessions.filter((session) => !archived.has(session.id)).length;
+  }, [archivedIds, sessions]);
 
   const activeSession = sessions.find((session) => session.id === activeId);
   const activeModel = activeSession?.model ?? settings.model;
@@ -1576,10 +1661,10 @@ function SessionRail() {
       <NewSessionControl compact />
       <span
         className="pc-count"
-        title={`${sessions.length} ${sessions.length === 1 ? "session" : "sessions"}`}
-        aria-label={`${sessions.length} ${sessions.length === 1 ? "session" : "sessions"}`}
+        title={`${activeSessionCount} active ${activeSessionCount === 1 ? "session" : "sessions"}`}
+        aria-label={`${activeSessionCount} active ${activeSessionCount === 1 ? "session" : "sessions"}`}
       >
-        {sessions.length}
+        {activeSessionCount}
       </span>
       <div className="flex-1" />
       <button
@@ -1738,6 +1823,20 @@ function ExpandIcon() {
         d="M11 8l4 4-4 4"
         stroke="currentColor"
         strokeWidth="1.7"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function BackIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="m14 7-5 5 5 5"
+        stroke="currentColor"
+        strokeWidth="1.8"
         strokeLinecap="round"
         strokeLinejoin="round"
       />

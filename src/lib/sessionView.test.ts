@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import type { Session, SessionFolder } from "../types";
-import { buildSidebarRows, deriveStatus, sortSessions, workspaceLabel } from "./sessionView";
+import {
+  buildSidebarRows,
+  deriveStatus,
+  partitionSessions,
+  sortSessions,
+  workspaceLabel,
+} from "./sessionView";
 
 const session = (over: Partial<Session> = {}): Session => ({
   id: "s1",
@@ -22,6 +28,19 @@ const folder = (over: Partial<SessionFolder> = {}): SessionFolder => ({
 
 const noArchive = new Set<string>();
 const statusOfNone = () => "idle" as const;
+
+describe("partitionSessions", () => {
+  it("keeps archived chats out of the active collection without reordering either view", () => {
+    const one = session({ id: "one" });
+    const two = session({ id: "two" });
+    const three = session({ id: "three" });
+
+    const result = partitionSessions([one, two, three], new Set(["two", "stale-id"]));
+
+    expect(result.active.map((item) => item.id)).toEqual(["one", "three"]);
+    expect(result.archived.map((item) => item.id)).toEqual(["two"]);
+  });
+});
 
 describe("workspaceLabel", () => {
   it("returns 'local' for a null workspace", () => {
