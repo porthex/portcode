@@ -76,17 +76,17 @@
 }
 
 @theme {
-  /* ---- Surfaces (wet-asphalt blacks, blue-shifted) ---- */
-  --color-bg: #06070b;
-  --color-panel: #0a0c13;
-  --color-panel-2: #11141d;
-  --color-border: #1a2030;
-  --color-border-2: #232a3d;
+  /* ---- Surfaces (lifted wet-asphalt blacks, still blue-shifted) ---- */
+  --color-bg: #0a0c12;
+  --color-panel: #0f121b;
+  --color-panel-2: #171c29;
+  --color-border: #222a3c;
+  --color-border-2: #2d374e;
 
   /* ---- Text ---- */
   --color-fg: #e8ecf4;
-  --color-muted: #8a93a6;
-  --color-faint: #5d6679;
+  --color-muted: #98a2b5;
+  --color-faint: #6c778c;
 
   /* ---- Neon accents ---- */
   --color-accent: #ff2e7e; /* magenta — primary / you / active nav */
@@ -131,7 +131,7 @@ body {
   background:
     radial-gradient(900px 620px at 10% -8%, rgba(255, 46, 126, 0.13), transparent 60%),
     radial-gradient(950px 720px at 108% 112%, rgba(33, 230, 255, 0.13), transparent 55%),
-    linear-gradient(160deg, #080910, #05060a 55%, #070611);
+    linear-gradient(160deg, #0d1018, #090b12 55%, #0c0b18);
   color: var(--color-fg);
   /* `--font-ui` (IBM Plex Sans, set in @theme) is the primary UI/body font; the
      fallback chain keeps body text sane if the token is ever unset. */
@@ -156,7 +156,7 @@ body {
   height: 9px;
 }
 *::-webkit-scrollbar-track {
-  background: #06070b;
+  background: var(--color-bg);
 }
 *::-webkit-scrollbar-thumb {
   background: linear-gradient(var(--color-accent), var(--color-accent-2));
