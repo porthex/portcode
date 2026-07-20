@@ -1,3 +1,5 @@
+// Mirrors src-tauri/src/settings.rs::COMMITTED_DURABILITY_UNCONFIRMED_PREFIX.
+// Keep the two literals identical.
 export const SETTINGS_COMMITTED_DURABILITY_UNCONFIRMED_PREFIX =
   "SETTINGS_COMMITTED_DURABILITY_UNCONFIRMED:";
 

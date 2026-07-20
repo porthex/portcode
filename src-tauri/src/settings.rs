@@ -68,6 +68,9 @@ fn default_auto_update() -> bool {
     true
 }
 
+// Native half of the command-error contract mirrored by
+// src/lib/settingsPersistence.ts::SETTINGS_COMMITTED_DURABILITY_UNCONFIRMED_PREFIX.
+// Keep the two literals identical.
 pub(crate) const COMMITTED_DURABILITY_UNCONFIRMED_PREFIX: &str =
     "SETTINGS_COMMITTED_DURABILITY_UNCONFIRMED:";
 
@@ -269,6 +272,14 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".atomicwrite")
         })
+    }
+
+    #[test]
+    fn committed_durability_warning_keeps_the_frontend_prefix_contract() {
+        let error = SettingsSaveError::CommittedDurabilityUnconfirmed("sync failed".into());
+        assert!(error
+            .to_string()
+            .starts_with("SETTINGS_COMMITTED_DURABILITY_UNCONFIRMED:"));
     }
 
     #[test]

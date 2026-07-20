@@ -369,10 +369,10 @@ existing later gates and must not be inferred from this PR.
 ### Local verification — 2026-07-21
 
 - Frontend: Prettier, ESLint, TypeScript, desktop production build, web production
-  build, and E2E TypeScript all passed. Vitest coverage passed 57 files / 1,649
+  build, and E2E TypeScript all passed. Vitest coverage passed 57 files / 1,650
   tests at 96.18% statements, 97.43% functions, and 98.02% lines.
-- Rust: `cargo fmt --all -- --check`, strict workspace/all-target clippy, and 461
-  workspace tests passed (403 desktop core + 58 shared sync).
+- Rust: `cargo fmt --all -- --check`, strict workspace/all-target clippy, and 462
+  workspace tests passed (404 desktop core + 58 shared sync).
 - WASM: `portcode-sync` and `portcode-wasm` built for
   `wasm32-unknown-unknown`; strict target clippy passed; `wasm-pack 0.15.0`
   rebuilt the web package, and the locally generated package matched the

@@ -123,11 +123,8 @@ fn authoritative_remote_session_id(db: &Db, candidate: &str) -> Option<String> {
     if !public::valid_remote_identifier(candidate) {
         return None;
     }
-    db.list_sessions()
-        .ok()?
-        .into_iter()
-        .find(|session| session.id == candidate)
-        .map(|session| session.id)
+    db.require_session(candidate).ok()?;
+    Some(candidate.to_string())
 }
 
 fn normalize_remote_session_title(title: Option<&str>) -> Result<String, CommandRejectionCode> {

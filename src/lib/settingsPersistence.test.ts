@@ -6,6 +6,12 @@ import {
 } from "./settingsPersistence";
 
 describe("classifySettingsSaveFailure", () => {
+  it("keeps the native settings-error prefix contract", () => {
+    expect(SETTINGS_COMMITTED_DURABILITY_UNCONFIRMED_PREFIX).toBe(
+      "SETTINGS_COMMITTED_DURABILITY_UNCONFIRMED:",
+    );
+  });
+
   it("marks a coded post-commit durability warning for reconciliation", () => {
     expect(
       classifySettingsSaveFailure(
