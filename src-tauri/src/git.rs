@@ -110,8 +110,10 @@ fn git_command<S: AsRef<OsStr>>(workspace: &Path, args: &[S]) -> Result<Command,
     let executable =
         process_env::resolve_in_sanitized_path(OsStr::new(executable_name), ChildKind::ReadOnlyGit)
             .ok_or(Failure::Missing)?;
-    let mut command = Command::new(executable);
-    process_env::apply_to_tokio(&mut command, ChildKind::ReadOnlyGit);
+    // The packaged app is a Windows GUI process with no inherited console.
+    // Launching console-subsystem `git.exe` without this flag would allocate a
+    // visible console window for every Git probe (and every Review refresh).
+    let mut command = process_env::child_command(executable, ChildKind::ReadOnlyGit);
     command
         .arg("--no-pager")
         .arg("-c")

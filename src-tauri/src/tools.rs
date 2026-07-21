@@ -1152,8 +1152,8 @@ fn build_shell_command(
     workspace: &Path,
 ) -> Result<tokio::process::Command, String> {
     let (program, leading_args) = shell_invocation(shell)?;
-    let mut cmd = tokio::process::Command::new(program);
-    crate::process_env::apply_to_tokio(&mut cmd, crate::process_env::ChildKind::AgentShell);
+    let mut cmd =
+        crate::process_env::child_command(program, crate::process_env::ChildKind::AgentShell);
 
     #[cfg(windows)]
     if shell == "cmd" {
@@ -1172,21 +1172,9 @@ fn build_shell_command(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    // Windows: stop a console window from flashing open every time the agent runs a
-    // shell command. Spawning a console-subsystem exe (powershell/pwsh/cmd) from the
-    // GUI app otherwise allocates a new console; CREATE_NO_WINDOW suppresses it.
-    // `creation_flags` is tokio's own inherent (safe) method — no trait import — so
-    // this respects `unsafe_code = "deny"` and the cfg-gate compiles to nothing on
-    // Linux CI.
-    #[cfg(windows)]
-    hide_windows_console(&mut cmd);
+    // The central process boundary suppresses Windows console allocation while
+    // preserving the same command setup on other platforms.
     Ok(cmd)
-}
-
-#[cfg(windows)]
-fn hide_windows_console(command: &mut tokio::process::Command) {
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1233,15 +1221,13 @@ async fn terminate_windows_process_tree(process_id: Option<u32>) {
         return;
     }
 
-    let mut command = tokio::process::Command::new(taskkill);
+    let mut command = crate::process_env::hidden_command(taskkill);
     command
         .args(["/PID", &process_id.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    hide_windows_console(&mut command);
-
     let Ok(mut helper) = command.spawn() else {
         return;
     };
@@ -2392,7 +2378,7 @@ mod tests {
         );
         let root_script = encoded_powershell_command(&root_script);
 
-        let mut command = tokio::process::Command::new("powershell.exe");
+        let mut command = crate::process_env::hidden_command("powershell.exe");
         command
             .args([
                 "-NoProfile",
@@ -2404,7 +2390,6 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        hide_windows_console(&mut command);
         let child = command.spawn().expect("root PowerShell starts");
 
         let cancel = Arc::new(AtomicBool::new(false));

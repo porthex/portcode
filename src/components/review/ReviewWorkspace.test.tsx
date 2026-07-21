@@ -532,6 +532,53 @@ describe("ReviewWorkspace", () => {
     expect(screen.getByRole("button", { name: "Send to chat" })).toBeDisabled();
   });
 
+  it("refreshes a stale manifest before retrying the selected patch", async () => {
+    let current = manifest();
+    m.getGitReviewManifest.mockImplementation(async () => current);
+    m.getGitReviewFile.mockRejectedValueOnce(
+      new Error("The working tree changed. Refresh the review before opening this file."),
+    );
+
+    render(<ReviewWorkspace />);
+    expect(await screen.findByText(/working tree changed/i)).toBeInTheDocument();
+
+    current = manifest({ kind: "workingTree" }, { snapshotId: "snapshot-next" });
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() =>
+      expect(m.getGitReviewFile).toHaveBeenLastCalledWith(
+        { kind: "workingTree" },
+        "snapshot-next",
+        "src/App.tsx",
+      ),
+    );
+    expect(m.getGitReviewFile).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText(/working tree changed/i)).not.toBeInTheDocument();
+  });
+
+  it("clears comments when switching between identical workspace snapshots", async () => {
+    let repositoryRoot = "D:/Projects/portcode";
+    m.getGitReviewManifest.mockImplementation(async (scope) => manifest(scope, { repositoryRoot }));
+    await renderLoaded();
+    fireEvent.click(screen.getByRole("button", { name: "Comment on src/App.tsx head line 13" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Comment for src/App.tsx line 13" }), {
+      target: { value: "This comment belongs to the first clone." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add comment" }));
+    expect(screen.getByText("This comment belongs to the first clone.")).toBeInTheDocument();
+
+    repositoryRoot = "D:/Projects/portcode-copy";
+    act(() => {
+      useStore.setState({
+        settings: { ...useStore.getState().settings, workspace: repositoryRoot },
+      });
+    });
+
+    expect(await screen.findByTitle(repositoryRoot)).toBeInTheDocument();
+    expect(screen.queryByText("This comment belongs to the first clone.")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send to chat" })).toBeDisabled();
+  });
+
   it("shows initial, patch, and empty-scope failure states with retry", async () => {
     m.getGitReviewManifest.mockRejectedValueOnce(new Error("not a repository"));
     render(<ReviewWorkspace />);
@@ -697,6 +744,49 @@ describe("ReviewWorkspace", () => {
     act(() => vi.advanceTimersByTime(10_000));
     await act(async () => Promise.resolve());
     expect(m.getGitReviewManifest.mock.calls.length).toBeGreaterThan(afterTurn);
+  });
+
+  it("keeps the selected patch across unchanged lifecycle refreshes and reloads it for a new snapshot", async () => {
+    vi.useFakeTimers();
+    let snapshotId = "snapshot-workingTree";
+    m.getGitReviewManifest.mockImplementation(async (scope) => manifest(scope, { snapshotId }));
+
+    render(<ReviewWorkspace />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(m.getGitReviewFile).toHaveBeenCalledTimes(1);
+
+    act(() => window.dispatchEvent(new Event("focus")));
+    await act(async () => Promise.resolve());
+    act(() => vi.advanceTimersByTime(10_000));
+    await act(async () => Promise.resolve());
+
+    expect(m.getGitReviewManifest).toHaveBeenCalledTimes(3);
+    expect(m.getGitReviewFile).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh review" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(m.getGitReviewManifest).toHaveBeenCalledTimes(4);
+    expect(m.getGitReviewFile).toHaveBeenCalledTimes(2);
+
+    snapshotId = "snapshot-next";
+    act(() => window.dispatchEvent(new Event("focus")));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(m.getGitReviewFile).toHaveBeenCalledTimes(3);
+    expect(m.getGitReviewFile).toHaveBeenLastCalledWith(
+      { kind: "workingTree" },
+      "snapshot-next",
+      "src/App.tsx",
+    );
   });
 
   it("pauses hidden lifecycle refreshes and resumes without losing controller state", async () => {
