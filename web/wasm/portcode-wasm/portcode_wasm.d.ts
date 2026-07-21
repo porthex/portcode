@@ -54,7 +54,7 @@ export type Block = { type: "text"; text: string } | { type: "tool_use"; id: str
  * embed the separate projected [`PhoneStreamEvent`] type below.
  * (Was `crate::llm::StreamEvent`.)
  */
-export type StreamEvent = { type: "turn_start"; messageId: string; turnId?: string; startedAt?: number } | { type: "text_delta"; text: string } | { type: "tool_use"; id: string; name: string; input: Value } | { type: "tool_result"; id: string; output: string; isError: boolean } | { type: "permission_request"; id: string; tool: string; risk?: PermissionRisk; summary: string; input: Value; diff?: string } | { type: "usage"; inputTokens: number; outputTokens: number } | { type: "turn_end"; stopReason: string; receipt?: TurnReceipt } | { type: "error"; message: string; receipt?: TurnReceipt } | { type: "agent_started"; agentId: string; description: string; parentId?: string } | { type: "agent_progress"; agentId: string; step: number } | { type: "agent_finished"; agentId: string; status: string } | { type: "background_task_started"; id: string; command: string } | { type: "background_task_finished"; id: string; command: string; exitCode: number; output: string };
+export type StreamEvent = { type: "turn_start"; messageId: string; turnId?: string; startedAt?: number } | { type: "turn_phase"; turnId: string; phase: TurnPhase; at: number; revision?: number; status?: TurnStatus; stopReason?: string; agentDurationMs?: number; receiptExpected?: boolean } | { type: "text_delta"; text: string } | { type: "tool_use"; id: string; name: string; input: Value } | { type: "tool_result"; id: string; output: string; isError: boolean } | { type: "permission_request"; id: string; tool: string; risk?: PermissionRisk; summary: string; input: Value; diff?: string } | { type: "usage"; inputTokens: number; outputTokens: number } | { type: "turn_end"; stopReason: string; receipt?: TurnReceipt } | { type: "error"; message: string; receipt?: TurnReceipt } | { type: "agent_started"; agentId: string; description: string; parentId?: string } | { type: "agent_progress"; agentId: string; step: number } | { type: "agent_finished"; agentId: string; status: string } | { type: "background_task_started"; id: string; command: string } | { type: "background_task_finished"; id: string; command: string; exitCode: number; output: string };
 
 /**
  * Everything that crosses the encrypted channel, in both directions.
@@ -94,14 +94,27 @@ export interface TurnReceipt {
      * unknowable and fabricating a near-zero duration would be misleading.
      */
     durationMs?: number;
+    /**
+     * Agent work duration frozen before optional Git finalization. New clients
+     * prefer this over legacy `duration_ms`; old receipts simply omit it.
+     */
+    agentDurationMs?: number;
     changedFiles: TurnChangedFile[];
     changedFileCount: number;
     additions: number;
     deletions: number;
     filesTruncated: boolean;
+    changeState?: TurnChangeState;
     changeCertainty: TurnChangeCertainty;
     backgroundTasksRunning: boolean;
 }
+
+/**
+ * Non-terminal lifecycle milestones emitted to the local desktop UI. Phone
+ * Sync deliberately does not forward this additive event until a peer has
+ * negotiated support, because legacy Rust peers reject unknown enum variants.
+ */
+export type TurnPhase = "provider_started" | "agent_completed";
 
 /**
  * One end\'s high-water mark for a session: \"I already hold every message up to
@@ -254,6 +267,12 @@ export type CommandRejectionCode = "open_ai_account_selection_required" | "inval
  * event could be emitted.
  */
 export type TurnStatus = "completed" | "cancelled" | "error" | "interrupted";
+
+/**
+ * Whether Git attribution applies and whether a net delta is known. This is
+ * orthogonal to [`TurnChangeCertainty`], which only qualifies attribution.
+ */
+export type TurnChangeState = "not_applicable" | "none" | "changed" | "unknown";
 
 
 export class IntoUnderlyingByteSource {

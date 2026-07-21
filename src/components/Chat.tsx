@@ -224,7 +224,9 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
                           active: run.streaming,
                           startedAt: run.startedAt,
                           waiting: run.pendingPermission !== null,
-                          finalizing: run.finalizing,
+                          // Stop acknowledgement also uses `finalizing`, but the
+                          // response is complete only after streaming turns false.
+                          finalizing: run.finalizing && !run.streaming,
                         }
                       : undefined;
                   return (

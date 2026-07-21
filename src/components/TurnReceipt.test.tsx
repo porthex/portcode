@@ -57,17 +57,17 @@ describe("TurnReceipt strip", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Turn in progress");
     expect(screen.getByRole("status")).not.toHaveTextContent(/second|\d+s/i);
     const liveStrip = screen.getByText("Working").closest(".pc-turn-receipt__strip");
-    expect(liveStrip).toHaveAttribute("aria-label", "Turn is in progress");
+    expect(liveStrip).toHaveAttribute("aria-label", "Working, Turn is in progress");
 
     act(() => {
       vi.advanceTimersByTime(5_000);
     });
     expect(screen.getByText("5s")).toHaveAttribute("aria-hidden", "true");
     expect(screen.getByRole("status")).toHaveTextContent("Turn in progress");
-    expect(liveStrip).toHaveAttribute("aria-label", "Turn is in progress");
+    expect(liveStrip).toHaveAttribute("aria-label", "Working, Turn is in progress");
   });
 
-  it("uses Waiting and Finalizing lifecycle copy while retaining stable strip geometry", () => {
+  it("marks the response complete, freezes its timer, and retains stable strip geometry", () => {
     vi.useFakeTimers();
     vi.setSystemTime(12_000);
     const { rerender, container } = render(<TurnReceipt active startedAt={2_000} waiting />);
@@ -76,21 +76,138 @@ describe("TurnReceipt strip", () => {
     const strip = container.querySelector(".pc-turn-receipt__strip");
     expect(strip).toBeInTheDocument();
 
-    rerender(<TurnReceipt startedAt={2_000} finalizing />);
-    expect(screen.getByText("Finalizing")).toBeInTheDocument();
+    rerender(
+      <TurnReceipt
+        startedAt={2_000}
+        finalizing
+        receipt={receipt({
+          startedAt: 2_000,
+          completedAt: 9_000,
+          durationMs: 10_000,
+          agentDurationMs: 7_000,
+          changeCertainty: "unavailable",
+          changeState: "unknown",
+        })}
+      />,
+    );
+    expect(screen.getByText("Response complete · Checking file changes…")).toBeInTheDocument();
+    expect(screen.getByText("7s")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Response complete. Checking file changes.",
+    );
     expect(container.querySelector(".pc-turn-receipt__strip")).toBe(strip);
+
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(screen.getByText("7s")).toBeInTheDocument();
+  });
+
+  it("announces completion once when Git finalization is the terminal boundary", () => {
+    const provisional = receipt({
+      durationMs: 2_000,
+      agentDurationMs: 2_000,
+      changeCertainty: "unavailable",
+      changeState: "unknown",
+    });
+    const { rerender } = render(<TurnReceipt active startedAt={1_000} />);
+
+    rerender(<TurnReceipt finalizing startedAt={1_000} receipt={provisional} />);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Response complete. Checking file changes.",
+    );
+
+    rerender(
+      <TurnReceipt
+        receipt={receipt({
+          durationMs: 7_000,
+          agentDurationMs: 2_000,
+          changeState: "none",
+        })}
+      />,
+    );
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByText("2s")).toBeInTheDocument();
   });
 
   it.each([
-    ["completed", "Worked for", "Turn completed"],
-    ["cancelled", "Stopped after", "Turn stopped"],
-    ["error", "Failed after", "Turn failed"],
-    ["interrupted", "Interrupted after", "Turn interrupted"],
-  ] as const)("renders %s terminal copy", (status, visible, announced) => {
-    render(<TurnReceipt receipt={receipt({ status, durationMs: 62_000 })} />);
-    expect(screen.getByText(visible)).toBeInTheDocument();
-    expect(screen.getByText("1m 2s")).toHaveAttribute("aria-hidden", "true");
-    expect(screen.getByRole("status")).toHaveTextContent(announced);
+    ["completed", "Done in", "Done in 1m 2s, 1 minute 2 seconds elapsed, Turn completed"],
+    ["cancelled", "Stopped after", "Stopped after 1m 2s, 1 minute 2 seconds elapsed, Turn stopped"],
+    ["error", "Failed after", "Failed after 1m 2s, 1 minute 2 seconds elapsed, Turn failed"],
+    [
+      "interrupted",
+      "Interrupted after",
+      "Interrupted after 1m 2s, 1 minute 2 seconds elapsed, Turn interrupted",
+    ],
+  ] as const)(
+    "renders accessible %s terminal metadata without a live region",
+    (status, visible, label) => {
+      render(<TurnReceipt receipt={receipt({ status, durationMs: 62_000 })} />);
+      expect(screen.getByText(visible).closest(".pc-turn-receipt__strip")).toHaveAttribute(
+        "aria-label",
+        label,
+      );
+      expect(screen.getByText("1m 2s")).toHaveAttribute("aria-hidden", "true");
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    },
+  );
+
+  it("does not replay terminal announcements when settled history is mounted", () => {
+    render(
+      <>
+        <TurnReceipt receipt={receipt({ turnId: "turn-1" })} />
+        <TurnReceipt receipt={receipt({ turnId: "turn-2", status: "error" })} />
+      </>,
+    );
+
+    expect(screen.queryAllByRole("status")).toHaveLength(0);
+    expect(screen.getAllByLabelText(/Turn (completed|failed)/)).toHaveLength(2);
+  });
+
+  it.each([
+    ["completed", "Turn completed"],
+    ["cancelled", "Turn stopped"],
+    ["error", "Turn failed"],
+    ["interrupted", "Turn interrupted"],
+  ] as const)(
+    "announces a %s transition only for the same mounted live receipt",
+    (status, announcement) => {
+      const terminal = receipt({ status });
+      const { rerender } = render(<TurnReceipt active startedAt={1_000} />);
+      expect(screen.getByRole("status")).toHaveTextContent("Turn in progress");
+
+      rerender(<TurnReceipt receipt={terminal} />);
+      expect(screen.getByRole("status")).toHaveTextContent(announcement);
+
+      rerender(<TurnReceipt receipt={terminal} />);
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    },
+  );
+
+  it("gives hour-long terminal durations a speakable accessible name", () => {
+    render(<TurnReceipt receipt={receipt({ durationMs: 3_660_000 })} />);
+    expect(screen.getByText("Done in").closest(".pc-turn-receipt__strip")).toHaveAttribute(
+      "aria-label",
+      "Done in 1h 1m, 1 hour 1 minute elapsed, Turn completed",
+    );
+  });
+
+  it("prefers frozen response time over legacy end-to-end receipt time", () => {
+    render(<TurnReceipt receipt={receipt({ durationMs: 90_000, agentDurationMs: 5_000 })} />);
+    expect(screen.getByText("5s")).toBeInTheDocument();
+    expect(screen.queryByText("1m 30s")).not.toBeInTheDocument();
+  });
+
+  it("marks a settled success as quiet metadata while keeping exceptional states distinct", () => {
+    const { rerender, container } = render(<TurnReceipt receipt={receipt()} />);
+    const settled = container.querySelector(".pc-turn-receipt");
+    expect(settled).toHaveClass("pc-turn-receipt--completed");
+    expect(settled).toHaveAttribute("data-has-activity", "false");
+    expect(screen.queryByText("Worked for")).not.toBeInTheDocument();
+
+    rerender(<TurnReceipt receipt={receipt({ status: "error" })} />);
+    expect(container.querySelector(".pc-turn-receipt")).toHaveClass("pc-turn-receipt--error");
+    expect(screen.getByText("Failed after")).toBeInTheDocument();
   });
 
   it("does not invent a duration for a turn recovered after a process interruption", () => {
@@ -109,12 +226,20 @@ describe("TurnReceipt strip", () => {
     expect(screen.queryByText("Interrupted after")).not.toBeInTheDocument();
   });
 
+  it("keeps a duration-less completed receipt grammatical", () => {
+    render(<TurnReceipt receipt={receipt({ durationMs: undefined })} />);
+    expect(screen.getByText("Done")).toBeInTheDocument();
+    expect(screen.queryByText("Done in")).not.toBeInTheDocument();
+    expect(screen.queryByText("—")).not.toBeInTheDocument();
+  });
+
   it("only exposes a disclosure for observable activity and preserves manual state", () => {
     const activity = <button type="button">Inspect observable call</button>;
     const { rerender } = render(
       <TurnReceipt active startedAt={1_000} activity={activity} activityCount={1} />,
     );
     const toggle = screen.getByRole("button", { name: /expand work activity/i });
+    expect(toggle.closest(".pc-turn-receipt")).toHaveAttribute("data-has-activity", "true");
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     const stableDetails = screen.getByText("Inspect observable call").closest("[data-open]");
     expect(stableDetails).toHaveAttribute("data-open", "false");
@@ -129,9 +254,10 @@ describe("TurnReceipt strip", () => {
 
     // Terminal arrival must not surprise-collapse a disclosure the person opened.
     rerender(<TurnReceipt receipt={receipt()} activity={activity} activityCount={1} />);
-    expect(screen.getByRole("button", { name: /collapse work activity/i })).toHaveAttribute(
-      "aria-expanded",
-      "true",
+    const settledToggle = screen.getByRole("button", { name: /collapse work activity/i });
+    expect(settledToggle).toHaveAttribute("aria-expanded", "true");
+    expect(settledToggle).toHaveAccessibleName(
+      "Done in 1m 2s, 1 minute 2 seconds elapsed, Turn completed, collapse work activity",
     );
     expect(screen.getByText("Inspect observable call")).toBeInTheDocument();
   });
@@ -227,18 +353,21 @@ describe("TurnChangesCard", () => {
   });
 
   it.each([
-    ["ambiguous", "Changes may remain", "Attribution is ambiguous"],
-    ["unavailable", "Changes unavailable", "Git attribution unavailable"],
-  ] as const)(
-    "renders the %s provenance state without guessing files",
-    (certainty, title, note) => {
-      render(<TurnChangesCard receipt={receipt({ changeCertainty: certainty })} />);
-      expect(screen.getByText(title)).toBeInTheDocument();
-      expect(screen.getByText(note)).toBeInTheDocument();
-      expect(screen.queryByRole("list")).not.toBeInTheDocument();
-      expect(screen.queryByRole("button", { name: /review/i })).not.toBeInTheDocument();
-    },
-  );
+    ["exact", {}],
+    ["observed", {}],
+    ["ambiguous", {}],
+    ["unavailable", {}],
+    ["ambiguous", { status: "interrupted" as const }],
+    ["exact", { status: "cancelled" as const }],
+    ["exact", { status: "error" as const }],
+    ["exact", { backgroundTasksRunning: true }],
+    ["exact", { filesTruncated: true }],
+  ] as const)("does not invent a Git summary for an empty %s receipt", (certainty, extra) => {
+    const { container } = render(
+      <TurnChangesCard receipt={receipt({ changeCertainty: certainty, ...extra })} />,
+    );
+    expect(container).toBeEmptyDOMElement();
+  });
 
   it.each([
     ["exact", "Edited 1 file"],
@@ -257,6 +386,110 @@ describe("TurnChangesCard", () => {
     expect(screen.getByText(title)).toBeInTheDocument();
   });
 
+  it("uses listed files as evidence even when a stale count says zero", () => {
+    render(
+      <TurnChangesCard receipt={receipt({ changedFiles: [changedFile()], changedFileCount: 0 })} />,
+    );
+    expect(screen.getByText("Edited 1 file")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Review 1 changed file" })).toBeInTheDocument();
+  });
+
+  it.each(["none", "not_applicable"] as const)(
+    "suppresses contradictory positive evidence when change state is %s",
+    (changeState) => {
+      const { container } = render(
+        <TurnChangesCard
+          receipt={receipt({
+            changeState,
+            changedFiles: [changedFile()],
+            changedFileCount: 1,
+            additions: 4,
+            deletions: 1,
+          })}
+        />,
+      );
+      expect(container).toBeEmptyDOMElement();
+    },
+  );
+
+  it("does not show zero line totals or offer Review when Git capture is unavailable", () => {
+    render(
+      <TurnChangesCard
+        receipt={receipt({
+          changedFiles: [changedFile({ additions: 0, deletions: 0 })],
+          changedFileCount: 1,
+          changeCertainty: "unavailable",
+        })}
+      />,
+    );
+
+    expect(screen.getByText("Git changes could not be verified")).toBeInTheDocument();
+    expect(screen.getByText("Git attribution unavailable")).toBeInTheDocument();
+    expect(screen.queryByLabelText(/additions/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /review/i })).not.toBeInTheDocument();
+  });
+
+  it("does not present confirmed writes as a net delta when Git capture is incomplete", () => {
+    render(
+      <TurnChangesCard
+        receipt={receipt({
+          changedFileCount: 2,
+          filesTruncated: true,
+          changeCertainty: "unavailable",
+        })}
+      />,
+    );
+
+    expect(screen.getByText("Git changes could not be verified")).toBeInTheDocument();
+    expect(screen.queryByText(/At least 2 files changed/i)).not.toBeInTheDocument();
+    expect(screen.getByText("File list truncated")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /review/i })).not.toBeInTheDocument();
+  });
+
+  it("surfaces line-delta evidence even if the bounded file list is empty", () => {
+    render(<TurnChangesCard receipt={receipt({ additions: 3, deletions: 1 })} />);
+    expect(screen.getByText("File changes detected")).toBeInTheDocument();
+    expect(screen.getByLabelText("3 additions, 1 deletions")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /review/i })).not.toBeInTheDocument();
+  });
+
+  it.each([
+    [{ additions: 3, deletions: 0 }, "3 additions", "+3", "−0"],
+    [{ additions: 0, deletions: 2 }, "2 deletions", "−2", "+0"],
+  ] as const)(
+    "renders only a nonzero one-sided global total: %s",
+    (totals, accessible, visible, absent) => {
+      render(<TurnChangesCard receipt={receipt(totals)} />);
+      expect(screen.getByLabelText(accessible)).toBeInTheDocument();
+      expect(screen.getByText(visible)).toBeInTheDocument();
+      expect(screen.queryByText(absent)).not.toBeInTheDocument();
+      expect(screen.queryByLabelText(/0 (additions|deletions)/)).not.toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    [{ additions: 5, deletions: 0 }, "5 additions", "+5", "−0"],
+    [{ additions: 0, deletions: 4 }, "4 deletions", "−4", "+0"],
+  ] as const)(
+    "renders only a nonzero one-sided per-file total: %s",
+    (totals, accessible, visible, absent) => {
+      render(
+        <TurnChangesCard
+          receipt={receipt({
+            changedFiles: [changedFile(totals)],
+            changedFileCount: 1,
+            ...totals,
+          })}
+        />,
+      );
+      const row = screen.getByRole("listitem");
+      expect(within(row).getByLabelText(accessible)).toBeInTheDocument();
+      expect(within(row).getByText(visible)).toBeInTheDocument();
+      expect(within(row).queryByText(absent)).not.toBeInTheDocument();
+      expect(within(row).queryByLabelText(/0 (additions|deletions)/)).not.toBeInTheDocument();
+    },
+  );
+
   it("surfaces truncation, incomplete-turn provenance, and running background work", () => {
     render(
       <TurnChangesCard
@@ -269,9 +502,16 @@ describe("TurnChangesCard", () => {
         })}
       />,
     );
+    expect(screen.getByText("At least 8 files changed")).toBeInTheDocument();
     expect(screen.getByText("File list truncated")).toBeInTheDocument();
     expect(screen.getByText(/Background tasks are still running/)).toBeInTheDocument();
     expect(screen.getByText(/Changes may remain from an incomplete turn/)).toBeInTheDocument();
+  });
+
+  it("does not offer Review for a positive count without a listed manifest", () => {
+    render(<TurnChangesCard receipt={receipt({ changedFileCount: 2 })} />);
+    expect(screen.getByText("Edited 2 files")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /review/i })).not.toBeInTheDocument();
   });
 
   it("calls the explicit Review seam and falls back to a provider-neutral data event", () => {

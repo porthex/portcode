@@ -30,6 +30,12 @@ pub trait EventSink: Send + Sync {
     /// as the old `emit(app, channel, ev)` helpers: deliver to the desktop UI and
     /// mirror to a paired phone.
     fn emit(&self, channel: &str, ev: StreamEvent);
+
+    /// Emit a desktop-only additive event that legacy Phone Sync peers have not
+    /// negotiated. Test sinks default to recording it like any other event.
+    fn emit_local(&self, channel: &str, ev: StreamEvent) {
+        self.emit(channel, ev);
+    }
 }
 
 /// The production [`EventSink`]: forwards to `crate::sync::emit_event`, the
@@ -45,5 +51,9 @@ impl EventSink for AppEventSink {
     fn emit(&self, channel: &str, ev: StreamEvent) {
         // Canonical chokepoint: delivers to the desktop UI and mirrors to the phone.
         crate::sync::emit_event(&self.0, channel, ev);
+    }
+
+    fn emit_local(&self, channel: &str, ev: StreamEvent) {
+        crate::sync::emit_local_event(&self.0, channel, ev);
     }
 }

@@ -67,6 +67,10 @@ export type TurnStatus = "completed" | "cancelled" | "error" | "interrupted";
  */
 export type TurnChangeCertainty = "exact" | "observed" | "ambiguous" | "unavailable";
 
+/** Whether Git-shaped change evidence applies to this turn at all. Optional on
+ * receipts so older desktop/phone peers continue to decode and render safely. */
+export type TurnChangeState = "not_applicable" | "none" | "changed" | "unknown";
+
 /** One compact changed-file row persisted with a turn receipt. */
 export interface TurnChangedFile {
   path: string;
@@ -88,12 +92,17 @@ export interface TurnReceipt {
   completedAt: number;
   /** Omitted for startup-recovered interruptions whose actual end time is unknown. */
   durationMs?: number;
+  /** Response time frozen when provider/tool work ended. Unlike legacy
+   * `durationMs`, this never includes receipt/Git finalization. */
+  agentDurationMs?: number;
   changedFiles: TurnChangedFile[];
   changedFileCount: number;
   additions: number;
   deletions: number;
   filesTruncated: boolean;
   changeCertainty: TurnChangeCertainty;
+  /** Orthogonal applicability/delta state. Absent on legacy receipts. */
+  changeState?: TurnChangeState;
   /** True when commands launched by this turn were still alive at completion. */
   backgroundTasksRunning: boolean;
 }
@@ -218,6 +227,21 @@ export type StreamEvent =
       turnId?: string;
       /** Native wall-clock start. Optional only for legacy peers. */
       startedAt?: number;
+    }
+  | {
+      /** Additive desktop lifecycle signal. `turn_end`/`error` remain the
+       * authoritative receipt-ready events. Phone Sync capability-gates this
+       * variant so an older Rust peer never has to decode an unknown enum case. */
+      type: "turn_phase";
+      turnId: string;
+      phase: "provider_started" | "agent_completed";
+      at: number;
+      revision?: number;
+      status?: TurnStatus;
+      stopReason?: string;
+      agentDurationMs?: number;
+      /** False when no Git boundary is needed and terminal delivery is immediate. */
+      receiptExpected?: boolean;
     }
   | { type: "text_delta"; text: string }
   | { type: "tool_use"; id: string; name: ToolName; input: unknown }

@@ -617,7 +617,7 @@ describe("MessageView — turn receipt presentation", () => {
         turnPresentation={{ active: false, startedAt: 1_000, waiting: false, finalizing: true }}
       />,
     );
-    expect(strip).toHaveTextContent("Finalizing");
+    expect(strip).toHaveTextContent("Response complete · Checking file changes…");
   });
 
   it("keeps observable activity in the manual disclosure and the Markdown summary visible", () => {
@@ -668,6 +668,21 @@ describe("MessageView — turn receipt presentation", () => {
     expect(screen.getByText("Audit accessibility")).toBeInTheDocument();
     expect(screen.queryByText(/reasoning/i)).not.toBeInTheDocument();
     expect(container.querySelector(".pc-turn-agents__status")).toHaveTextContent("step 2");
+  });
+
+  it("omits Git chrome for a non-Git or failed-capture receipt with no change evidence", () => {
+    const { container } = render(
+      <MessageView
+        message={{
+          ...message("assistant", [{ kind: "text", text: "Opened the file manager." }]),
+          receipt: receipt({ changeCertainty: "unavailable" }),
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Opened the file manager.")).toBeInTheDocument();
+    expect(container.querySelector(".pc-turn-changes")).not.toBeInTheDocument();
+    expect(screen.queryByText(/changes unavailable/i)).not.toBeInTheDocument();
   });
 
   it("appends the compact change card after the assistant result and wires Review", () => {

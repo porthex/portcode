@@ -1,8 +1,9 @@
 #![cfg(desktop)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::Duration;
 
 use portcode_sync::wire::{TurnChangedFile, TurnReceipt};
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use similar::TextDiff;
 use tauri::State;
+use tokio::io::AsyncReadExt;
 
 use crate::{git, AppState};
 
@@ -19,12 +21,17 @@ const PATCH_CAP: usize = 2 * 1024 * 1024;
 const UNTRACKED_TEXT_CAP: u64 = 512 * 1024;
 const SNAPSHOT_FILE_CAP: u64 = 8 * 1024 * 1024;
 const SNAPSHOT_TOTAL_CAP: u64 = 32 * 1024 * 1024;
+const SNAPSHOT_HASH_FILE_CAP: u64 = 16 * 1024 * 1024;
+const SNAPSHOT_HASH_TOTAL_CAP: u64 = 32 * 1024 * 1024;
 const TURN_SNAPSHOT_ENTRY_CAP: usize = 1_000;
 const MAX_DIFF_LINES: usize = 4_000;
 const STALE_REVIEW_ERROR: &str =
     "The working tree changed. Refresh the review before opening this file.";
 const COMBINED_DIFF_ERROR: &str =
     "Combined merge diffs are not supported. Review the merge as a branch diff instead.";
+
+static TURN_CAPTURE_LOCKS: OnceLock<StdMutex<BTreeMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(
@@ -168,7 +175,21 @@ pub(crate) struct TurnWorkspaceSnapshot {
     pub snapshot_id: String,
     pub head_oid: Option<String>,
     pub entries: BTreeMap<String, TurnWorkspaceEntry>,
+    /// Current identities for explicitly written paths, including clean tracked
+    /// paths omitted by `git status`. This lets turn-relative comparison prove a
+    /// restore-to-preimage without another Git child or following unsafe links.
+    pub exact_paths: BTreeMap<String, TurnExactPathState>,
+    /// True when the bounded entry map may omit paths. Kept separate from the
+    /// broader `truncated` flag, which also covers complete membership with
+    /// content omitted under byte caps.
+    pub membership_truncated: bool,
     pub truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TurnExactPathState {
+    pub digest: Option<String>,
+    pub missing: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -469,16 +490,29 @@ async fn build_manifest(
     scope: GitReviewScope,
 ) -> Result<GitReviewManifest, String> {
     let context = repository_context(workspace).await?;
+    build_manifest_in_context(&context, scope).await
+}
+
+async fn build_manifest_in_context(
+    context: &RepositoryContext,
+    scope: GitReviewScope,
+) -> Result<GitReviewManifest, String> {
     let resolved = resolve_scope(&context.root, &scope).await?;
-    let head_oid = optional_oid(&context.root, "HEAD").await?;
+    let head_oid = match &resolved {
+        ResolvedScope::WorkingTree { head }
+        | ResolvedScope::Staged { head }
+        | ResolvedScope::Unstaged { head } => head.clone(),
+        ResolvedScope::Branch { head_oid, .. } => Some(head_oid.clone()),
+        ResolvedScope::Commit { .. } => optional_oid(&context.root, "HEAD").await?,
+    };
     let (mut files, mut metadata, mut metadata_truncated) = match &resolved {
         ResolvedScope::WorkingTree { .. }
         | ResolvedScope::Staged { .. }
-        | ResolvedScope::Unstaged { .. } => worktree_files(&context, &scope, &resolved).await?,
+        | ResolvedScope::Unstaged { .. } => worktree_files(context, &scope, &resolved).await?,
         ResolvedScope::Branch { base_oid, head_oid } => {
-            committed_files(&context, &[base_oid, head_oid], None).await?
+            committed_files(context, &[base_oid, head_oid], None).await?
         }
-        ResolvedScope::Commit { oid } => committed_files(&context, &[], Some(oid.as_str())).await?,
+        ResolvedScope::Commit { oid } => committed_files(context, &[], Some(oid.as_str())).await?,
     };
 
     if matches!(
@@ -519,18 +553,270 @@ async fn build_manifest(
 pub(crate) async fn capture_turn_workspace(
     workspace: &Path,
 ) -> Result<TurnWorkspaceSnapshot, String> {
+    let context = repository_context(workspace).await?;
+    let capture_lock = turn_capture_lock(&context.root);
+    let _capture = capture_lock.lock().await;
+    capture_turn_workspace_inner(&context, None).await
+}
+
+pub(crate) async fn capture_turn_workspace_with_paths(
+    workspace: &Path,
+    paths: &[PathBuf],
+) -> Result<TurnWorkspaceSnapshot, String> {
+    let context = repository_context(workspace).await?;
+    let capture_lock = turn_capture_lock(&context.root);
+    let _capture = capture_lock.lock().await;
+    let selected = exact_repository_paths(&context.root, workspace, paths)?;
+    capture_turn_workspace_inner(&context, Some(&selected)).await
+}
+
+/// Capture only receipt entries that intersect a bounded set of exact tool
+/// targets. Git metadata is still read in bulk for a consistent repository
+/// identity; the number of child processes is independent of the path count.
+pub(crate) async fn capture_turn_paths(
+    workspace: &Path,
+    paths: &[PathBuf],
+) -> Result<TurnWorkspaceSnapshot, String> {
+    let context = repository_context(workspace).await?;
+    let capture_lock = turn_capture_lock(&context.root);
+    let _capture = capture_lock.lock().await;
+    let selected = exact_repository_paths(&context.root, workspace, paths)?;
+    capture_turn_paths_inner(&context, &selected).await
+}
+
+fn turn_capture_lock(root: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    let locks = TURN_CAPTURE_LOCKS.get_or_init(|| StdMutex::new(BTreeMap::new()));
+    let mut locks = locks.lock().unwrap();
+    if let Some(lock) = locks.get(root).and_then(Weak::upgrade) {
+        return lock;
+    }
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(root.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
+/// Exact turns never need a whole-worktree manifest. Two scoped status reads and
+/// two bounded passes over only the selected files provide a race-checked terminal
+/// image in three Git children total including repository discovery.
+async fn capture_turn_paths_inner(
+    context: &RepositoryContext,
+    selected: &BTreeSet<String>,
+) -> Result<TurnWorkspaceSnapshot, String> {
+    let args = exact_status_args(selected);
+    let first_status = run_ok(&context.root, args.clone(), METADATA_CAP).await?;
+    let (first_entries, first_membership_truncated, first_truncated) =
+        scoped_turn_entries(&context.root, &first_status).await?;
+
+    let second_status = run_ok(&context.root, args, METADATA_CAP).await?;
+    let (entries, second_membership_truncated, second_truncated) =
+        scoped_turn_entries(&context.root, &second_status).await?;
+    let raced = first_status.stdout != second_status.stdout
+        || first_entries.len() != entries.len()
+        || first_entries.iter().any(|(path, first)| {
+            entries
+                .get(path)
+                .is_none_or(|second| first.fingerprint != second.fingerprint)
+        });
+
+    let mut snapshot_material = second_status.stdout.clone();
+    for (path, entry) in &entries {
+        snapshot_material.extend_from_slice(path.as_bytes());
+        snapshot_material.push(0);
+        snapshot_material.extend_from_slice(entry.fingerprint.as_bytes());
+        snapshot_material.push(0);
+    }
+    Ok(TurnWorkspaceSnapshot {
+        repository_root: context.root.to_string_lossy().into_owned(),
+        snapshot_id: digest_hex(&snapshot_material),
+        head_oid: porcelain_head_oid(&second_status.stdout),
+        entries,
+        exact_paths: BTreeMap::new(),
+        membership_truncated: first_membership_truncated || second_membership_truncated || raced,
+        truncated: first_truncated || second_truncated || raced,
+    })
+}
+
+fn exact_status_args(selected: &BTreeSet<String>) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("status"),
+        OsString::from("--porcelain=v2"),
+        OsString::from("--branch"),
+        OsString::from("-z"),
+        OsString::from("--untracked-files=all"),
+        OsString::from("--"),
+    ];
+    args.extend(
+        selected
+            .iter()
+            .map(|path| OsString::from(format!(":(literal){path}"))),
+    );
+    args
+}
+
+async fn scoped_turn_entries(
+    root: &Path,
+    status: &git::Output,
+) -> Result<(BTreeMap<String, TurnWorkspaceEntry>, bool, bool), String> {
+    let status_entries = parse_porcelain(&status.stdout)?;
+    let membership_truncated = status.truncated || status_entries.len() > TURN_SNAPSHOT_ENTRY_CAP;
+    let mut truncated = membership_truncated;
+    let mut total = 0_u64;
+    let mut hashed_total = 0_u64;
+    let mut entries = BTreeMap::new();
+    for status_entry in status_entries.into_iter().take(TURN_SNAPSHOT_ENTRY_CAP) {
+        let areas = entry_areas(&status_entry, &GitReviewScope::WorkingTree);
+        if areas.is_empty() {
+            continue;
+        }
+        let file = GitChangedFile {
+            path: status_entry.path,
+            old_path: status_entry.old_path,
+            status: status_entry.status,
+            areas,
+            additions: None,
+            deletions: None,
+            binary: false,
+        };
+        let (fingerprint, content, entry_truncated) = turn_entry_identity(
+            root,
+            &file,
+            Some(&status.stdout),
+            status.truncated,
+            &mut total,
+            &mut hashed_total,
+        )
+        .await;
+        truncated |= entry_truncated;
+        entries.insert(
+            file.path.clone(),
+            TurnWorkspaceEntry {
+                file,
+                fingerprint,
+                content,
+            },
+        );
+    }
+    Ok((entries, membership_truncated, truncated))
+}
+
+fn porcelain_head_oid(output: &[u8]) -> Option<String> {
+    output
+        .split(|byte| *byte == 0)
+        .find_map(|field| field.strip_prefix(b"# branch.oid "))
+        .and_then(|oid| std::str::from_utf8(oid).ok())
+        .filter(|oid| *oid != "(initial)")
+        .map(str::to_string)
+}
+
+async fn capture_exact_path_states(
+    root: &Path,
+    selected: Option<&BTreeSet<String>>,
+) -> (BTreeMap<String, TurnExactPathState>, bool) {
+    let Some(selected) = selected else {
+        return (BTreeMap::new(), false);
+    };
+    let mut states = BTreeMap::new();
+    let mut hashed_total = 0_u64;
+    let mut truncated = selected.len() > TURN_SNAPSHOT_ENTRY_CAP;
+    for path in selected.iter().take(TURN_SNAPSHOT_ENTRY_CAP) {
+        match inspect_untracked_path(root, path).await {
+            Ok(InspectedUntrackedPath::File(full, metadata)) if metadata.is_file() => {
+                let remaining = SNAPSHOT_HASH_TOTAL_CAP.saturating_sub(hashed_total);
+                let budget = remaining.min(SNAPSHOT_HASH_FILE_CAP);
+                let digest = if metadata.len() <= budget {
+                    match hash_file(&full, budget).await {
+                        Ok(Some((hash, bytes))) => {
+                            hashed_total = hashed_total.saturating_add(bytes);
+                            Some(hex_digest(&hash))
+                        }
+                        _ => {
+                            truncated = true;
+                            None
+                        }
+                    }
+                } else {
+                    truncated = true;
+                    None
+                };
+                states.insert(
+                    path.clone(),
+                    TurnExactPathState {
+                        digest,
+                        missing: false,
+                    },
+                );
+            }
+            Ok(InspectedUntrackedPath::File(_, _)) | Ok(InspectedUntrackedPath::Symlink(_, _)) => {
+                truncated = true;
+                states.insert(
+                    path.clone(),
+                    TurnExactPathState {
+                        digest: None,
+                        missing: false,
+                    },
+                );
+            }
+            Err(_) => {
+                let missing = tokio::fs::symlink_metadata(root.join(path))
+                    .await
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+                truncated |= !missing;
+                states.insert(
+                    path.clone(),
+                    TurnExactPathState {
+                        digest: None,
+                        missing,
+                    },
+                );
+            }
+        }
+    }
+    (states, truncated)
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    use std::fmt::Write as _;
+    for byte in bytes {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+async fn capture_turn_workspace_inner(
+    context: &RepositoryContext,
+    selected: Option<&BTreeSet<String>>,
+) -> Result<TurnWorkspaceSnapshot, String> {
     // Commands start in the configured workspace but can `cd` within its enclosing
     // repository. Capture the full worktree, not merely the configured subdirectory.
-    let context = repository_context(workspace).await?;
-    let manifest = build_manifest(&context.root, GitReviewScope::WorkingTree).await?;
+    let root_context = RepositoryContext {
+        root: context.root.clone(),
+        prefix: ".".into(),
+    };
+    let manifest = build_manifest_in_context(&root_context, GitReviewScope::WorkingTree).await?;
     let root = PathBuf::from(&manifest.repository_root);
+    let (index_identities, index_truncated) = match turn_index_identities(&root).await {
+        Ok(value) => value,
+        Err(_) => (BTreeMap::new(), true),
+    };
     let mut entries = BTreeMap::new();
     let mut total = 0_u64;
-    let mut truncated = manifest.truncated || manifest.files.len() > TURN_SNAPSHOT_ENTRY_CAP;
+    let mut hashed_total = 0_u64;
+    let matching_count = manifest.files.len();
+    let mut membership_truncated = manifest.truncated || matching_count > TURN_SNAPSHOT_ENTRY_CAP;
+    let mut truncated = membership_truncated || index_truncated;
 
     for file in manifest.files.iter().take(TURN_SNAPSHOT_ENTRY_CAP) {
-        let (fingerprint, content, entry_truncated) =
-            turn_entry_identity(&root, file, &mut total).await;
+        let (fingerprint, content, entry_truncated) = turn_entry_identity(
+            &root,
+            file,
+            index_identities.get(&file.path).map(Vec::as_slice),
+            index_truncated,
+            &mut total,
+            &mut hashed_total,
+        )
+        .await;
         truncated |= entry_truncated;
         entries.insert(
             file.path.clone(),
@@ -542,11 +828,17 @@ pub(crate) async fn capture_turn_workspace(
         );
     }
 
+    let (exact_paths, exact_truncated) = capture_exact_path_states(&root, selected).await;
+    truncated |= exact_truncated;
+
     // Entry hashing spans multiple filesystem reads. Detect an editor/agent race
     // across that window and degrade provenance instead of blessing a mixed image.
-    match build_manifest(&context.root, GitReviewScope::WorkingTree).await {
+    match build_manifest_in_context(&root_context, GitReviewScope::WorkingTree).await {
         Ok(current) if current.snapshot_id == manifest.snapshot_id => {}
-        _ => truncated = true,
+        _ => {
+            truncated = true;
+            membership_truncated = true;
+        }
     }
 
     Ok(TurnWorkspaceSnapshot {
@@ -554,38 +846,119 @@ pub(crate) async fn capture_turn_workspace(
         snapshot_id: manifest.snapshot_id,
         head_oid: manifest.head_oid,
         entries,
+        exact_paths,
+        membership_truncated,
         truncated,
     })
+}
+
+fn exact_repository_paths(
+    root: &Path,
+    workspace: &Path,
+    paths: &[PathBuf],
+) -> Result<BTreeSet<String>, String> {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut selected = BTreeSet::new();
+    for path in paths {
+        let full = if path.is_absolute() {
+            path.clone()
+        } else {
+            workspace.join(path)
+        };
+        let normalized = full.canonicalize().or_else(|_| {
+            let parent = full.parent().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+            })?;
+            let name = full.file_name().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no name")
+            })?;
+            parent.canonicalize().map(|parent| parent.join(name))
+        });
+        let normalized = normalized
+            .map_err(|_| "An exact write target could not be resolved safely.".to_string())?;
+        let relative = normalized.strip_prefix(&canonical_root).map_err(|_| {
+            "An exact write target is outside the workspace repository.".to_string()
+        })?;
+        selected.insert(relative.to_string_lossy().replace('\\', "/"));
+    }
+    Ok(selected)
+}
+
+/// Read every index stage in one process. The previous implementation launched
+/// `git ls-files --stage` once per dirty file, turning a 117-file worktree into
+/// hundreds of child processes across the two receipt boundaries.
+async fn turn_index_identities(root: &Path) -> Result<(BTreeMap<String, Vec<u8>>, bool), String> {
+    let output = run_ok(
+        root,
+        vec![
+            OsString::from("ls-files"),
+            OsString::from("--stage"),
+            OsString::from("--full-name"),
+            OsString::from("-z"),
+        ],
+        METADATA_CAP,
+    )
+    .await?;
+    let identities = parse_turn_index_identities(&output.stdout)?;
+    Ok((identities, output.truncated))
+}
+
+fn parse_turn_index_identities(output: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    if !output.is_empty() && !output.ends_with(&[0]) {
+        return Err("Git index metadata ended inside a record.".into());
+    }
+    let mut identities: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for record in output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let separator = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or("Git index metadata is missing its path separator.")?;
+        let metadata = strict_text(&record[..separator], "Git index metadata")?;
+        let fields: Vec<_> = metadata.split_ascii_whitespace().collect();
+        if fields.len() != 3
+            || fields[0].len() != 6
+            || !fields[0].bytes().all(|byte| byte.is_ascii_digit())
+            || !matches!(fields[1].len(), 40 | 64)
+            || !fields[1].bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !matches!(fields[2], "0" | "1" | "2" | "3")
+        {
+            return Err("Git index metadata has an invalid stage record.".into());
+        }
+        let path = strict_path(&record[separator + 1..])?;
+        if path.is_empty()
+            || Path::new(&path).is_absolute()
+            || Path::new(&path)
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err("Git index metadata contains an unsafe path.".into());
+        }
+        let identity = identities.entry(path).or_default();
+        identity.extend_from_slice(record);
+        identity.push(0);
+    }
+    Ok(identities)
 }
 
 async fn turn_entry_identity(
     root: &Path,
     file: &GitChangedFile,
+    index_identity: Option<&[u8]>,
+    index_truncated: bool,
     total: &mut u64,
+    hashed_total: &mut u64,
 ) -> (String, Option<Vec<u8>>, bool) {
     let mut material = serde_json::to_vec(file).unwrap_or_default();
-    let mut truncated = false;
+    let mut truncated = index_truncated;
 
     // The index identity is needed even when worktree bytes are unchanged (for
     // example, `git add`/`git reset` during an opaque command).
-    let index = run_ok(
-        root,
-        vec![
-            OsString::from("ls-files"),
-            OsString::from("--stage"),
-            OsString::from("-z"),
-            OsString::from("--"),
-            OsString::from(&file.path),
-        ],
-        64 * 1024,
-    )
-    .await;
-    match index {
-        Ok(output) => {
-            material.extend_from_slice(&output.stdout);
-            truncated |= output.truncated;
-        }
-        Err(_) => truncated = true,
+    match index_identity {
+        Some(identity) => material.extend_from_slice(identity),
+        None => material.extend_from_slice(b"(not-in-index)"),
     }
 
     let full = root.join(&file.path);
@@ -601,24 +974,81 @@ async fn turn_entry_identity(
         }
         return (digest_hex(&material), None, truncated);
     }
-    if !metadata.is_file()
-        || metadata.len() > SNAPSHOT_FILE_CAP
-        || total.saturating_add(metadata.len()) > SNAPSHOT_TOTAL_CAP
-    {
+    if !metadata.is_file() {
         truncated = true;
         return (digest_hex(&material), None, truncated);
     }
-    match tokio::fs::read(&full).await {
-        Ok(bytes) => {
-            material.extend_from_slice(&Sha256::digest(&bytes));
-            *total = total.saturating_add(metadata.len());
-            (digest_hex(&material), Some(bytes), truncated)
+    let retain_content = metadata.len() <= SNAPSHOT_FILE_CAP
+        && total.saturating_add(metadata.len()) <= SNAPSHOT_TOTAL_CAP
+        && hashed_total.saturating_add(metadata.len()) <= SNAPSHOT_HASH_TOTAL_CAP;
+    if retain_content {
+        match read_file_capped(&full, metadata.len()).await {
+            Ok(Some(bytes)) => {
+                material.extend_from_slice(&Sha256::digest(&bytes));
+                *total = total.saturating_add(metadata.len());
+                *hashed_total = hashed_total.saturating_add(bytes.len() as u64);
+                (digest_hex(&material), Some(bytes), truncated)
+            }
+            Ok(None) | Err(_) => {
+                truncated = true;
+                (digest_hex(&material), None, truncated)
+            }
         }
-        Err(_) => {
+    } else {
+        // Retention caps limit memory and line-count reconstruction, not identity.
+        // Stream the entire file into the fingerprint so same-size large/binary
+        // edits still compare differently across turn boundaries.
+        let remaining = SNAPSHOT_HASH_TOTAL_CAP.saturating_sub(*hashed_total);
+        let hash_budget = remaining.min(SNAPSHOT_HASH_FILE_CAP);
+        if metadata.len() > hash_budget {
             truncated = true;
-            (digest_hex(&material), None, truncated)
+            return (digest_hex(&material), None, truncated);
+        }
+        match hash_file(&full, hash_budget).await {
+            Ok(Some((hash, bytes_hashed))) => {
+                material.extend_from_slice(&hash);
+                *hashed_total = hashed_total.saturating_add(bytes_hashed);
+                truncated = true;
+                (digest_hex(&material), None, truncated)
+            }
+            Ok(None) | Err(_) => {
+                truncated = true;
+                (digest_hex(&material), None, truncated)
+            }
         }
     }
+}
+
+async fn read_file_capped(path: &Path, max_bytes: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let file = tokio::fs::File::open(path).await?;
+    let mut reader = file.take(max_bytes.saturating_add(1));
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await?;
+    if bytes.len() as u64 > max_bytes {
+        Ok(None)
+    } else {
+        Ok(Some(bytes))
+    }
+}
+
+async fn hash_file(path: &Path, max_bytes: u64) -> std::io::Result<Option<([u8; 32], u64)>> {
+    let file = tokio::fs::File::open(path).await?;
+    let mut file = file.take(max_bytes.saturating_add(1));
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > max_bytes {
+            return Ok(None);
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(Some((hash.finalize().into(), total)))
 }
 
 async fn append_worktree_fingerprints(
@@ -626,7 +1056,7 @@ async fn append_worktree_fingerprints(
     files: &[GitChangedFile],
     material: &mut Vec<u8>,
 ) -> bool {
-    let mut total = 0_u64;
+    let mut hashed_total = 0_u64;
     let mut truncated = false;
     for file in files.iter().filter(|file| {
         file.areas.contains(&GitChangeArea::Unstaged)
@@ -675,19 +1105,22 @@ async fn append_worktree_fingerprints(
             }
             continue;
         }
-        if !metadata.is_file()
-            || metadata.len() > SNAPSHOT_FILE_CAP
-            || total.saturating_add(metadata.len()) > SNAPSHOT_TOTAL_CAP
-        {
+        if !metadata.is_file() {
             truncated = true;
             continue;
         }
-        match tokio::fs::read(&full).await {
-            Ok(bytes) => {
-                material.extend_from_slice(&Sha256::digest(&bytes));
-                total = total.saturating_add(metadata.len());
+        let remaining = SNAPSHOT_HASH_TOTAL_CAP.saturating_sub(hashed_total);
+        let hash_budget = remaining.min(SNAPSHOT_HASH_FILE_CAP);
+        if metadata.len() > hash_budget {
+            truncated = true;
+            continue;
+        }
+        match hash_file(&full, hash_budget).await {
+            Ok(Some((hash, bytes_hashed))) => {
+                material.extend_from_slice(&hash);
+                hashed_total = hashed_total.saturating_add(bytes_hashed);
             }
-            Err(_) => truncated = true,
+            Ok(None) | Err(_) => truncated = true,
         }
     }
     truncated
@@ -1655,6 +2088,254 @@ mod tests {
     use super::*;
     use portcode_sync::wire::{TurnChangeCertainty, TurnStatus};
 
+    #[tokio::test]
+    async fn capped_binary_entry_hashes_same_size_content_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "portcode-turn-fingerprint-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("blob.bin");
+        let file = GitChangedFile {
+            path: "blob.bin".into(),
+            old_path: None,
+            status: GitChangeStatus::Modified,
+            areas: vec![GitChangeArea::Unstaged],
+            additions: None,
+            deletions: None,
+            binary: true,
+        };
+
+        std::fs::write(&path, [0, 1, 2, 3]).unwrap();
+        let mut first_total = SNAPSHOT_TOTAL_CAP;
+        let mut first_hashed = 0;
+        let (first, first_content, first_truncated) = turn_entry_identity(
+            &root,
+            &file,
+            None,
+            false,
+            &mut first_total,
+            &mut first_hashed,
+        )
+        .await;
+
+        std::fs::write(&path, [0, 1, 9, 3]).unwrap();
+        let mut second_total = SNAPSHOT_TOTAL_CAP;
+        let mut second_hashed = 0;
+        let (second, second_content, second_truncated) = turn_entry_identity(
+            &root,
+            &file,
+            None,
+            false,
+            &mut second_total,
+            &mut second_hashed,
+        )
+        .await;
+
+        assert!(first_truncated && second_truncated);
+        assert!(first_content.is_none() && second_content.is_none());
+        assert_eq!((first_hashed, second_hashed), (4, 4));
+        assert_ne!(first, second, "same-size binary edits must change identity");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_byte_rewrite_does_not_change_turn_entry_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "portcode-turn-noop-fingerprint-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("dirty.txt");
+        let file = GitChangedFile {
+            path: "dirty.txt".into(),
+            old_path: None,
+            status: GitChangeStatus::Modified,
+            areas: vec![GitChangeArea::Unstaged],
+            additions: Some(1),
+            deletions: Some(1),
+            binary: false,
+        };
+
+        std::fs::write(&path, b"same dirty bytes\n").unwrap();
+        let mut first_total = 0;
+        let mut first_hashed = 0;
+        let (first, _, _) = turn_entry_identity(
+            &root,
+            &file,
+            None,
+            false,
+            &mut first_total,
+            &mut first_hashed,
+        )
+        .await;
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, b"same dirty bytes\n").unwrap();
+        let mut second_total = 0;
+        let mut second_hashed = 0;
+        let (second, _, _) = turn_entry_identity(
+            &root,
+            &file,
+            None,
+            false,
+            &mut second_total,
+            &mut second_hashed,
+        )
+        .await;
+
+        assert_eq!(first, second, "mtime-only rewrites are not Git deltas");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn turn_snapshot_git_process_count_is_constant_for_many_dirty_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "portcode-turn-command-count-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let git_ok = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .expect("Git is required for receipt capture tests");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git_ok(&["init", "--quiet"]);
+        for index in 0..200 {
+            std::fs::write(root.join(format!("dirty-{index:03}.txt")), b"before\n").unwrap();
+        }
+        git_ok(&["add", "--all"]);
+        git_ok(&[
+            "-c",
+            "user.name=Portcode Tests",
+            "-c",
+            "user.email=tests@portcode.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ]);
+        let clean_path = root.join("dirty-199.txt");
+        let clean = capture_turn_workspace_with_paths(&root, &[clean_path])
+            .await
+            .unwrap();
+        assert!(clean.entries.is_empty());
+        let clean_digest = digest_hex(b"before\n");
+        assert_eq!(
+            clean.exact_paths["dirty-199.txt"].digest.as_deref(),
+            Some(clean_digest.as_str())
+        );
+        for index in 0..200 {
+            std::fs::write(root.join(format!("dirty-{index:03}.txt")), b"after\n").unwrap();
+        }
+
+        let (snapshot, command_count) =
+            crate::git::count_test_commands(capture_turn_workspace(&root)).await;
+        let snapshot = snapshot.unwrap();
+        assert_eq!(snapshot.entries.len(), 200);
+        assert!(
+            command_count <= 8,
+            "capture launched {command_count} Git children for 200 paths"
+        );
+
+        let selected = root.join("dirty-199.txt");
+        let (scoped, scoped_commands) =
+            crate::git::count_test_commands(capture_turn_paths(&root, &[selected])).await;
+        let scoped = scoped.unwrap();
+        assert_eq!(scoped.entries.len(), 1);
+        assert!(scoped.entries.contains_key("dirty-199.txt"));
+        assert!(
+            scoped_commands <= 3,
+            "scoped capture launched {scoped_commands} Git children"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_repository_capture_lock_is_exclusive() {
+        let root = PathBuf::from("same-repository-capture-lock");
+        let first_lock = turn_capture_lock(&root);
+        let second_lock = turn_capture_lock(&root);
+        assert!(Arc::ptr_eq(&first_lock, &second_lock));
+        let first = first_lock.lock().await;
+        let waiter = tokio::spawn(async move { second_lock.lock_owned().await });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!waiter.is_finished(), "same-repository captures overlapped");
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("second capture lock wakes")
+            .expect("capture lock task");
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn streaming_hash_stops_at_its_explicit_budget() {
+        let path = std::env::temp_dir().join(format!(
+            "portcode-turn-hash-budget-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, [0, 1, 2, 3, 4]).unwrap();
+
+        assert!(hash_file(&path, 4).await.unwrap().is_none());
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bulk_index_parser_preserves_all_stages_and_unusual_paths() {
+        let raw = b"100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0\tplain.txt\0\
+100644 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 1\tconflict.txt\0\
+100644 cccccccccccccccccccccccccccccccccccccccc 2\tconflict.txt\0\
+100644 dddddddddddddddddddddddddddddddddddddddd 0\ttab\tand\nnewline.txt\0";
+        let identities = parse_turn_index_identities(raw).unwrap();
+
+        assert_eq!(identities.len(), 3);
+        assert!(identities["conflict.txt"]
+            .windows(2)
+            .any(|window| window == b" 1"));
+        assert!(identities["conflict.txt"]
+            .windows(2)
+            .any(|window| window == b" 2"));
+        assert!(identities.contains_key("tab\tand\nnewline.txt"));
+    }
+
+    #[test]
+    fn bulk_index_parser_rejects_truncated_or_malformed_records() {
+        assert!(parse_turn_index_identities(
+            b"100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0\tcut-off.txt"
+        )
+        .is_err());
+        assert!(parse_turn_index_identities(b"record-without-tab\0").is_err());
+    }
+
+    #[test]
+    fn exact_path_filter_deduplicates_targets_and_rejects_escape() {
+        let root = std::env::temp_dir().join(format!(
+            "portcode-turn-exact-filter-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let target = root.join("nested").join("file.txt");
+        std::fs::write(&target, b"x").unwrap();
+
+        let selected =
+            exact_repository_paths(&root, &root, &[target.clone(), target.clone()]).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert!(selected.contains("nested/file.txt"));
+
+        let outside = root.with_extension("outside.txt");
+        std::fs::write(&outside, b"x").unwrap();
+        assert!(exact_repository_paths(&root, &root, std::slice::from_ref(&outside)).is_err());
+
+        std::fs::remove_file(outside).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn parses_porcelain_areas_renames_untracked_and_conflicts() {
         let raw = b"# branch.oid abc\0\
@@ -1936,11 +2617,13 @@ u UU N... 100644 100644 100644 100644 a a a src/conflict.rs\0\
             started_at: 1,
             completed_at: 1,
             duration_ms: None,
+            agent_duration_ms: None,
             changed_files: Vec::new(),
             changed_file_count: 0,
             additions: 0,
             deletions: 0,
             files_truncated: false,
+            change_state: None,
             change_certainty: TurnChangeCertainty::Unavailable,
             background_tasks_running: false,
         };

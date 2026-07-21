@@ -170,6 +170,14 @@ pub fn emit_event(app: &AppHandle, channel: &str, event: StreamEvent) {
     let _ = app.emit(channel, event);
 }
 
+/// Deliver an additive lifecycle event to the local desktop only. This is the
+/// compatibility bridge for event variants that legacy Rust Phone Sync peers
+/// cannot deserialize yet; authoritative TurnEnd/Error events still use
+/// [`emit_event`] and remain mirrored normally.
+pub fn emit_local_event(app: &AppHandle, channel: &str, event: StreamEvent) {
+    let _ = app.emit(channel, event);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -5,18 +5,57 @@
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use similar::TextDiff;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::tool_names;
+use crate::turn_receipt::{ExactWriteOutcome, MutationScope, MutationToken};
 use portcode_sync::wire::PermissionRisk;
+
+/// Permission-time evidence carried unchanged to the apply boundary. Most tools
+/// only need a display diff; first-class file tools also attach a hashed file
+/// precondition so the bytes being changed are the bytes the user approved.
+#[derive(Debug, Default)]
+pub struct ToolApproval {
+    pub diff: Option<String>,
+    file_precondition: Option<FilePrecondition>,
+}
+
+#[derive(Debug)]
+enum FilePrecondition {
+    Snapshot {
+        path: PathBuf,
+        state: FileStateDigest,
+    },
+    /// The preview could not establish a trustworthy preimage. An approved call
+    /// reports this error without attempting a write.
+    Unverifiable(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileStateDigest {
+    Missing,
+    Present([u8; 32]),
+}
+
+#[derive(Debug)]
+enum FilePreimage {
+    Missing,
+    Present(Vec<u8>),
+}
 
 pub struct ToolCtx {
     pub workspace: PathBuf,
+    /// Cancellation flag for the actor running this tool. Mutators recheck it at
+    /// their actual side-effect boundary, after any potentially slow preimage
+    /// read or command construction.
+    pub cancel: Option<Arc<AtomicBool>>,
     /// Root-turn provenance shared by the top-level agent and every subagent.
     /// Read-only/legacy contexts leave it absent.
     pub receipt: Option<Arc<crate::turn_receipt::TurnReceiptTracker>>,
@@ -38,10 +77,36 @@ impl ToolCtx {
     pub fn new(workspace: PathBuf) -> Self {
         Self {
             workspace,
+            cancel: None,
             receipt: None,
             spawner: None,
             background: None,
         }
+    }
+}
+
+fn ensure_mutation_not_cancelled(ctx: &ToolCtx) -> Result<(), String> {
+    if ctx
+        .cancel
+        .as_ref()
+        .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+    {
+        Err("Cancelled before the tool reached its mutation boundary.".into())
+    } else {
+        Ok(())
+    }
+}
+
+async fn wait_for_mutation_cancellation(cancel: Option<Arc<AtomicBool>>) {
+    let Some(cancel) = cancel else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -52,8 +117,15 @@ impl ToolCtx {
 /// builds and spawns the child; the runner ADOPTS it.
 pub trait BackgroundRunner: Send + Sync {
     /// Adopt an already-spawned background process, returning a short task id. The
-    /// runner waits for the child elsewhere and announces completion itself.
-    fn launch(&self, command: String, child: tokio::process::Child) -> String;
+    /// runner waits for the child elsewhere and announces completion itself. The
+    /// opaque mutation token was opened before spawn and stays alive in that waiter,
+    /// so a detached process remains part of the root turn's mutation interval.
+    fn launch(
+        &self,
+        command: String,
+        child: tokio::process::Child,
+        mutation: Option<MutationToken>,
+    ) -> String;
 }
 
 /// What the [`Task`] tool needs to launch a subagent, without knowing how a run
@@ -87,6 +159,17 @@ pub trait Tool: Send + Sync {
     /// registered tool cannot become ungated by omission.
     fn permission_risk(&self) -> Option<PermissionRisk>;
 
+    /// Mutating tools (write / edit / command) go through the permission gate.
+    fn mutating(&self) -> bool {
+        false
+    }
+    /// Receipt barrier required after permission is granted but before this tool
+    /// can run. Exact tools share the barrier without Git I/O; opaque tools make
+    /// the first caller establish the lazy workspace baseline.
+    fn mutation_scope(&self) -> Option<MutationScope> {
+        self.mutating().then_some(MutationScope::Exact)
+    }
+
     /// Short human-readable summary of a call, for the permission prompt. Takes
     /// `ctx` so a tool can resolve a path to its real destination (so an "ask"
     /// prompt can't be deceived by a benign-looking relative or symlinked path).
@@ -109,7 +192,29 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Build the complete permission artifact in one read. File tools override
+    /// this to bind their displayed diff to a concrete preimage; other tools keep
+    /// the legacy preview-only behavior.
+    async fn approval(&self, input: &Value, ctx: &ToolCtx) -> ToolApproval {
+        ToolApproval {
+            diff: self.preview(input, ctx).await,
+            file_precondition: None,
+        }
+    }
+
     async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String, String>;
+
+    /// Apply a permission-approved call. The default is unchanged; file tools
+    /// override this to revalidate their permission-time preimage immediately
+    /// before opening the mutation interval.
+    async fn run_approved(
+        &self,
+        input: Value,
+        ctx: &ToolCtx,
+        _approval: ToolApproval,
+    ) -> Result<String, String> {
+        self.run(input, ctx).await
+    }
 }
 
 pub struct Registry {
@@ -315,6 +420,80 @@ fn unified_diff(old: &str, new: &str) -> String {
     let mut ud = diff.unified_diff();
     ud.context_radius(3);
     ud.to_string()
+}
+
+fn exact_write_outcome(
+    existed: bool,
+    old_bytes: Option<&[u8]>,
+    new_bytes: &[u8],
+) -> ExactWriteOutcome {
+    if !existed {
+        ExactWriteOutcome::Changed
+    } else {
+        match old_bytes {
+            Some(old) if old == new_bytes => ExactWriteOutcome::Unchanged,
+            Some(_) => ExactWriteOutcome::Changed,
+            None => ExactWriteOutcome::Unknown,
+        }
+    }
+}
+
+fn preimage_digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+async fn read_file_preimage(path: &Path) -> Result<FilePreimage, String> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => Ok(FilePreimage::Present(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FilePreimage::Missing),
+        Err(error) => Err(format!("failed to read '{}': {error}", path.display())),
+    }
+}
+
+fn snapshot_precondition(path: PathBuf, preimage: &FilePreimage) -> FilePrecondition {
+    let state = match preimage {
+        FilePreimage::Missing => FileStateDigest::Missing,
+        FilePreimage::Present(bytes) => FileStateDigest::Present(preimage_digest(bytes)),
+    };
+    FilePrecondition::Snapshot { path, state }
+}
+
+fn validate_file_precondition(
+    expected: Option<&FilePrecondition>,
+    path: &Path,
+    current: &FilePreimage,
+) -> Result<(), String> {
+    let Some(expected) = expected else {
+        // Direct/internal tool calls that did not pass through the permission gate
+        // retain their existing behavior.
+        return Ok(());
+    };
+    let (expected_path, expected_state) = match expected {
+        FilePrecondition::Snapshot { path, state } => (path, state),
+        FilePrecondition::Unverifiable(reason) => {
+            return Err(format!(
+                "Cannot safely apply the approved change: {reason} Review and retry."
+            ));
+        }
+    };
+    let current_state = match current {
+        FilePreimage::Missing => FileStateDigest::Missing,
+        FilePreimage::Present(bytes) => FileStateDigest::Present(preimage_digest(bytes)),
+    };
+    if expected_path != path || *expected_state != current_state {
+        return Err(format!(
+            "'{}' changed after permission was granted. Review the new diff and retry; no write was attempted.",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn unverifiable_approval(error: String) -> ToolApproval {
+    ToolApproval {
+        diff: None,
+        file_precondition: Some(FilePrecondition::Unverifiable(error)),
+    }
 }
 
 /// Apply an `fs_edit` replacement to `content`, returning the updated text and
@@ -566,6 +745,89 @@ impl Tool for GrepTool {
 
 struct FsWrite;
 
+impl FsWrite {
+    async fn build_approval(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolApproval, String> {
+        let base = base_dir(ctx)?;
+        let p = str_arg(input, "path")?;
+        let content = str_arg(input, "content")?;
+        let full = resolve_for_write(&base, p)?;
+        let preimage = read_file_preimage(&full).await?;
+        let diff = match &preimage {
+            FilePreimage::Missing => Some(unified_diff("", content)),
+            FilePreimage::Present(bytes) => std::str::from_utf8(bytes)
+                .ok()
+                .map(|old| unified_diff(old, content)),
+        };
+        Ok(ToolApproval {
+            diff,
+            file_precondition: Some(snapshot_precondition(full, &preimage)),
+        })
+    }
+
+    async fn run_with_precondition(
+        &self,
+        input: Value,
+        ctx: &ToolCtx,
+        precondition: Option<FilePrecondition>,
+    ) -> Result<String, String> {
+        let base = base_dir(ctx)?;
+        let p = str_arg(&input, "path")?;
+        let content = str_arg(&input, "content")?;
+        let full = resolve_for_write(&base, p)?;
+        let preimage = read_file_preimage(&full).await?;
+        validate_file_precondition(precondition.as_ref(), &full, &preimage)?;
+
+        let (existed, old_bytes) = match &preimage {
+            FilePreimage::Missing => (false, None),
+            FilePreimage::Present(bytes) => (true, Some(bytes.as_slice())),
+        };
+        let write_outcome = exact_write_outcome(existed, old_bytes, content.as_bytes());
+        let old = old_bytes
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .unwrap_or_default();
+
+        ensure_mutation_not_cancelled(ctx)?;
+
+        // Identical bytes are a true no-op: do not rewrite the file (which would
+        // alter metadata) and do not enter the mutation ledger.
+        if write_outcome == ExactWriteOutcome::Unchanged {
+            return Ok(format!("Unchanged {p} ({} bytes)", content.len()));
+        }
+
+        // Open the exact interval immediately before the first possible side
+        // effect. Any error from here on drops the token as may-have-mutated.
+        let mutation = ctx.receipt.as_ref().map(|tracker| tracker.begin_exact());
+        if let Some(parent) = full.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("failed to create dirs for '{p}': {e}"))?;
+        }
+        tokio::fs::write(&full, content)
+            .await
+            .map_err(|e| format!("failed to write '{p}': {e}"))?;
+        if let Some(mutation) = mutation {
+            mutation.finish_exact(&full, old_bytes, content.as_bytes(), write_outcome);
+        }
+        if !existed {
+            Ok(format!("Created {p} ({} bytes)", content.len()))
+        } else {
+            match write_outcome {
+                ExactWriteOutcome::Changed => Ok(format!(
+                    "Updated {p} ({} bytes)\n\n{}",
+                    content.len(),
+                    truncate_chars(unified_diff(old, content), 8000)
+                )),
+                // Returned above before the mutation interval was opened.
+                ExactWriteOutcome::Unchanged => unreachable!("no-op returned before write"),
+                ExactWriteOutcome::Unknown => Ok(format!(
+                    "Wrote {p} ({} bytes; previous contents unavailable)",
+                    content.len()
+                )),
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for FsWrite {
     fn name(&self) -> &'static str {
@@ -587,6 +849,9 @@ impl Tool for FsWrite {
     fn permission_risk(&self) -> Option<PermissionRisk> {
         Some(PermissionRisk::Configurable)
     }
+    fn mutating(&self) -> bool {
+        true
+    }
     /// Show the RESOLVED absolute destination in the permission prompt, not the raw
     /// argument, so a benign-looking relative path (or one that traverses a symlink/
     /// junction) can't trick the user into approving a write outside the workspace.
@@ -606,55 +871,104 @@ impl Tool for FsWrite {
     /// proposed contents, without writing anything. `None` on bad args / a path
     /// that fails the sandbox resolution (the gate surfaces that anyway).
     async fn preview(&self, input: &Value, ctx: &ToolCtx) -> Option<String> {
-        let base = base_dir(ctx).ok()?;
-        let p = str_arg(input, "path").ok()?;
-        let content = str_arg(input, "content").ok()?;
-        let full = resolve_for_write(&base, p).ok()?;
-        let old = if full.exists() {
-            // Never present an unreadable existing file as an empty new file: that
-            // would hide a destructive overwrite in the permission preview.
-            tokio::fs::read_to_string(&full).await.ok()?
-        } else {
-            String::new()
-        };
-        Some(unified_diff(&old, content))
+        self.build_approval(input, ctx).await.ok()?.diff
+    }
+    async fn approval(&self, input: &Value, ctx: &ToolCtx) -> ToolApproval {
+        self.build_approval(input, ctx)
+            .await
+            .unwrap_or_else(unverifiable_approval)
     }
     async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String, String> {
-        let base = base_dir(ctx)?;
-        let p = str_arg(&input, "path")?;
-        let content = str_arg(&input, "content")?;
-        let full = resolve_for_write(&base, p)?;
-        let mutation = ctx.receipt.as_ref().map(|tracker| tracker.begin_exact());
-        let existed = full.exists();
-        let old = if existed {
-            tokio::fs::read_to_string(&full).await.unwrap_or_default()
-        } else {
-            String::new()
-        };
-        if let Some(parent) = full.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| format!("failed to create dirs for '{p}': {e}"))?;
-        }
-        tokio::fs::write(&full, content)
+        self.run_with_precondition(input, ctx, None).await
+    }
+    async fn run_approved(
+        &self,
+        input: Value,
+        ctx: &ToolCtx,
+        approval: ToolApproval,
+    ) -> Result<String, String> {
+        self.run_with_precondition(input, ctx, approval.file_precondition)
             .await
-            .map_err(|e| format!("failed to write '{p}': {e}"))?;
-        if let Some(mutation) = mutation {
-            mutation.finish_exact(&full, content.as_bytes());
-        }
-        if existed && old != content {
-            Ok(format!(
-                "Updated {p} ({} bytes)\n\n{}",
-                content.len(),
-                truncate_chars(unified_diff(&old, content), 8000)
-            ))
-        } else {
-            Ok(format!("Created {p} ({} bytes)", content.len()))
-        }
     }
 }
 
 struct FsEdit;
+
+impl FsEdit {
+    async fn build_approval(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolApproval, String> {
+        let base = base_dir(ctx)?;
+        let p = str_arg(input, "path")?;
+        let old = str_arg(input, "old_string")?;
+        let new = str_arg(input, "new_string")?;
+        let replace_all = input
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let full = resolve_existing(&base, p)?;
+        let preimage = read_file_preimage(&full).await?;
+        let bytes = match &preimage {
+            FilePreimage::Present(bytes) => bytes,
+            FilePreimage::Missing => return Err(format!("failed to read '{p}': file disappeared")),
+        };
+        let content = std::str::from_utf8(bytes)
+            .map_err(|_| format!("failed to read '{p}': file is not valid UTF-8"))?;
+        let (updated, _) = compute_edit(content, old, new, replace_all, p)?;
+        Ok(ToolApproval {
+            diff: Some(unified_diff(content, &updated)),
+            file_precondition: Some(snapshot_precondition(full, &preimage)),
+        })
+    }
+
+    async fn run_with_precondition(
+        &self,
+        input: Value,
+        ctx: &ToolCtx,
+        precondition: Option<FilePrecondition>,
+    ) -> Result<String, String> {
+        let base = base_dir(ctx)?;
+        let p = str_arg(&input, "path")?;
+        let old = str_arg(&input, "old_string")?;
+        let new = str_arg(&input, "new_string")?;
+        let replace_all = input
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let full = resolve_existing(&base, p)?;
+        let preimage = read_file_preimage(&full).await?;
+        validate_file_precondition(precondition.as_ref(), &full, &preimage)?;
+        let bytes = match &preimage {
+            FilePreimage::Present(bytes) => bytes,
+            FilePreimage::Missing => return Err(format!("failed to read '{p}': file disappeared")),
+        };
+        let content = std::str::from_utf8(bytes)
+            .map_err(|_| format!("failed to read '{p}': file is not valid UTF-8"))?;
+        let (updated, count) = compute_edit(content, old, new, replace_all, p)?;
+        ensure_mutation_not_cancelled(ctx)?;
+        if content == updated {
+            return Ok(format!("Unchanged {p} ({count} matching replacement(s))"));
+        }
+
+        // Reads, validation, and no-op detection above are side-effect free. Start
+        // provenance only at the write boundary.
+        let mutation = ctx.receipt.as_ref().map(|tracker| tracker.begin_exact());
+        tokio::fs::write(&full, &updated)
+            .await
+            .map_err(|e| format!("failed to write '{p}': {e}"))?;
+        if let Some(mutation) = mutation {
+            mutation.finish_exact(
+                &full,
+                Some(bytes.as_slice()),
+                updated.as_bytes(),
+                ExactWriteOutcome::Changed,
+            );
+        }
+        Ok(format!(
+            "Edited {p} ({count} replacement(s))\n\n{}",
+            truncate_chars(unified_diff(content, &updated), 8000)
+        ))
+    }
+}
 
 #[async_trait]
 impl Tool for FsEdit {
@@ -679,51 +993,32 @@ impl Tool for FsEdit {
     fn permission_risk(&self) -> Option<PermissionRisk> {
         Some(PermissionRisk::Configurable)
     }
+    fn mutating(&self) -> bool {
+        true
+    }
     /// Preview the edit as a diff without writing — exactly the change `run`
     /// would apply (both go through `compute_edit`). Returns `None` if anything
     /// the gate would surface as an error anyway (bad args, file missing,
     /// string not found) so the prompt falls back to the one-line summary.
     async fn preview(&self, input: &Value, ctx: &ToolCtx) -> Option<String> {
-        let base = base_dir(ctx).ok()?;
-        let p = str_arg(input, "path").ok()?;
-        let old = str_arg(input, "old_string").ok()?;
-        let new = str_arg(input, "new_string").ok()?;
-        let replace_all = input
-            .get("replace_all")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let full = resolve_existing(&base, p).ok()?;
-        let content = tokio::fs::read_to_string(&full).await.ok()?;
-        let (updated, _) = compute_edit(&content, old, new, replace_all, p).ok()?;
-        Some(unified_diff(&content, &updated))
+        self.build_approval(input, ctx).await.ok()?.diff
+    }
+    async fn approval(&self, input: &Value, ctx: &ToolCtx) -> ToolApproval {
+        self.build_approval(input, ctx)
+            .await
+            .unwrap_or_else(unverifiable_approval)
     }
     async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String, String> {
-        let base = base_dir(ctx)?;
-        let p = str_arg(&input, "path")?;
-        let old = str_arg(&input, "old_string")?;
-        let new = str_arg(&input, "new_string")?;
-        let replace_all = input
-            .get("replace_all")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let full = resolve_existing(&base, p)?;
-        let mutation = ctx.receipt.as_ref().map(|tracker| tracker.begin_exact());
-        let content = tokio::fs::read_to_string(&full)
+        self.run_with_precondition(input, ctx, None).await
+    }
+    async fn run_approved(
+        &self,
+        input: Value,
+        ctx: &ToolCtx,
+        approval: ToolApproval,
+    ) -> Result<String, String> {
+        self.run_with_precondition(input, ctx, approval.file_precondition)
             .await
-            .map_err(|e| format!("failed to read '{p}': {e}"))?;
-
-        let (updated, count) = compute_edit(&content, old, new, replace_all, p)?;
-        tokio::fs::write(&full, &updated)
-            .await
-            .map_err(|e| format!("failed to write '{p}': {e}"))?;
-        if let Some(mutation) = mutation {
-            mutation.finish_exact(&full, updated.as_bytes());
-        }
-        Ok(format!(
-            "Edited {p} ({count} replacement(s))\n\n{}",
-            truncate_chars(unified_diff(&content, &updated), 8000)
-        ))
     }
 }
 
@@ -884,11 +1179,189 @@ fn build_shell_command(
     // this respects `unsafe_code = "deny"` and the cfg-gate compiles to nothing on
     // Linux CI.
     #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    hide_windows_console(&mut cmd);
     Ok(cmd)
+}
+
+#[cfg(windows)]
+fn hide_windows_console(command: &mut tokio::process::Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ForegroundWaitError {
+    Cancelled,
+    TimedOut,
+    Failed(String),
+}
+
+impl std::fmt::Display for ForegroundWaitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("command cancelled"),
+            Self::TimedOut => formatter.write_str("command timed out after 120s"),
+            Self::Failed(error) => write!(formatter, "command failed: {error}"),
+        }
+    }
+}
+
+/// Ask Windows to terminate a process and every descendant while the root PID
+/// still exists. `Child::start_kill` only terminates the direct shell on Windows;
+/// a compiler, script, or other child could otherwise keep mutating files after
+/// the user pressed Stop.
+///
+/// `taskkill /T /F` is deliberately launched before the direct-child fallback:
+/// after the shell is gone, Windows may no longer be able to discover its tree.
+/// The helper is hidden and strictly bounded so a broken system utility cannot
+/// make Stop hang.
+#[cfg(windows)]
+async fn terminate_windows_process_tree(process_id: Option<u32>) {
+    const TREE_KILL_TIMEOUT: Duration = Duration::from_secs(2);
+    const HELPER_REAP_TIMEOUT: Duration = Duration::from_millis(250);
+
+    let Some(process_id) = process_id else {
+        return;
+    };
+    let Some(system_root) = std::env::var_os("SystemRoot") else {
+        return;
+    };
+    let taskkill = PathBuf::from(system_root)
+        .join("System32")
+        .join("taskkill.exe");
+    if !taskkill.is_file() {
+        return;
+    }
+
+    let mut command = tokio::process::Command::new(taskkill);
+    command
+        .args(["/PID", &process_id.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    hide_windows_console(&mut command);
+
+    let Ok(mut helper) = command.spawn() else {
+        return;
+    };
+    if tokio::time::timeout(TREE_KILL_TIMEOUT, helper.wait())
+        .await
+        .is_err()
+    {
+        let _ = helper.start_kill();
+        let _ = tokio::time::timeout(HELPER_REAP_TIMEOUT, helper.wait()).await;
+    }
+}
+
+#[cfg(not(windows))]
+async fn terminate_windows_process_tree(_process_id: Option<u32>) {}
+
+async fn kill_reap_and_abort_readers(
+    child: &mut tokio::process::Child,
+    process_id: Option<u32>,
+    stdout: &mut tokio::task::JoinHandle<std::io::Result<BoundedPipe>>,
+    stderr: &mut tokio::task::JoinHandle<std::io::Result<BoundedPipe>>,
+) {
+    // On Windows this must happen before `start_kill`, while the root PID still
+    // identifies its descendants. It is a no-op on other platforms.
+    terminate_windows_process_tree(process_id).await;
+    // `start_kill` does not consume the child, so `wait` below always reaps it.
+    // Abort the pipe readers too: a grandchild may have inherited those handles
+    // and otherwise keep cancellation waiting even after the shell itself died.
+    let _ = child.start_kill();
+    stdout.abort();
+    stderr.abort();
+    let _ = child.wait().await;
+    let _ = stdout.await;
+    let _ = stderr.await;
+}
+
+/// Wait for a foreground shell while remaining responsive to the run's Stop
+/// flag. Output is drained concurrently to avoid pipe backpressure. Cancellation
+/// and timeout both kill and reap the direct child before returning.
+async fn wait_for_foreground_child(
+    mut child: tokio::process::Child,
+    cancel: Option<Arc<AtomicBool>>,
+    timeout: Duration,
+) -> Result<BoundedShellOutput, ForegroundWaitError> {
+    let process_id = child.id();
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| ForegroundWaitError::Failed("child stdout was not piped".into()))?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| ForegroundWaitError::Failed("child stderr was not piped".into()))?;
+    let mut stdout = tokio::spawn(read_bounded_pipe(stdout_pipe, SHELL_PIPE_LIMIT));
+    let mut stderr = tokio::spawn(read_bounded_pipe(stderr_pipe, SHELL_PIPE_LIMIT));
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    let status = tokio::select! {
+        biased;
+        _ = wait_for_mutation_cancellation(cancel.clone()) => {
+            kill_reap_and_abort_readers(&mut child, process_id, &mut stdout, &mut stderr).await;
+            return Err(ForegroundWaitError::Cancelled);
+        }
+        _ = tokio::time::sleep_until(deadline) => {
+            kill_reap_and_abort_readers(&mut child, process_id, &mut stdout, &mut stderr).await;
+            return Err(ForegroundWaitError::TimedOut);
+        }
+        result = child.wait() => match result {
+            Ok(status) => status,
+            Err(error) => {
+                kill_reap_and_abort_readers(
+                    &mut child,
+                    process_id,
+                    &mut stdout,
+                    &mut stderr,
+                )
+                .await;
+                return Err(ForegroundWaitError::Failed(error.to_string()));
+            }
+        },
+    };
+
+    // A detached descendant can keep inherited stdout/stderr open after the
+    // direct shell exits, so the original timeout and cancellation still govern
+    // this output-drain phase.
+    let (stdout_result, stderr_result) = tokio::select! {
+        biased;
+        _ = wait_for_mutation_cancellation(cancel) => {
+            // The shell may already have exited while a descendant still owns
+            // its inherited pipes. Retain and try the original PID before
+            // abandoning those readers.
+            terminate_windows_process_tree(process_id).await;
+            stdout.abort();
+            stderr.abort();
+            let _ = (&mut stdout).await;
+            let _ = (&mut stderr).await;
+            return Err(ForegroundWaitError::Cancelled);
+        }
+        _ = tokio::time::sleep_until(deadline) => {
+            terminate_windows_process_tree(process_id).await;
+            stdout.abort();
+            stderr.abort();
+            let _ = (&mut stdout).await;
+            let _ = (&mut stderr).await;
+            return Err(ForegroundWaitError::TimedOut);
+        }
+        results = async { tokio::join!(&mut stdout, &mut stderr) } => results,
+    };
+
+    let stdout = stdout_result
+        .map_err(|error| ForegroundWaitError::Failed(error.to_string()))?
+        .map_err(|error| ForegroundWaitError::Failed(error.to_string()))?;
+    let stderr = stderr_result
+        .map_err(|error| ForegroundWaitError::Failed(error.to_string()))?
+        .map_err(|error| ForegroundWaitError::Failed(error.to_string()))?;
+
+    Ok(BoundedShellOutput {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn format_shell_parts(
@@ -1000,6 +1473,12 @@ impl Tool for Shell {
     fn permission_risk(&self) -> Option<PermissionRisk> {
         Some(PermissionRisk::Shell)
     }
+    fn mutating(&self) -> bool {
+        true
+    }
+    fn mutation_scope(&self) -> Option<MutationScope> {
+        Some(MutationScope::Opaque)
+    }
     async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<String, String> {
         let command = str_arg(&input, "command")?;
         let shell = input
@@ -1022,30 +1501,34 @@ impl Tool for Shell {
         } else {
             None
         };
-        let mutation = if background {
-            None
-        } else {
-            ctx.receipt.as_ref().map(|tracker| tracker.begin_opaque())
-        };
-
         let mut cmd = build_shell_command(command, shell, &ctx.workspace)?;
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("failed to start {shell}: {e}"))?;
+        ensure_mutation_not_cancelled(ctx)?;
+        // The barrier is already held by `gate_and_run`. Enter the opaque ledger
+        // at the last boundary before process creation; a successful spawn may
+        // mutate even if waiting later times out or fails.
+        let mutation = ctx.receipt.as_ref().map(|tracker| tracker.begin_opaque());
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(mutation) = mutation {
+                    mutation.finish_no_effect();
+                }
+                return Err(format!("failed to start {shell}: {error}"));
+            }
+        };
 
         if let Some(runner) = runner {
             // Hand the live child to the runner; it waits and reports completion.
-            let id = runner.launch(command.to_string(), child);
+            let id = runner.launch(command.to_string(), child, mutation);
             return Ok(format!(
                 "Started background task {id}: {command}\nIt runs without blocking; \
                  its result is reported when it finishes."
             ));
         }
 
-        let out = tokio::time::timeout(Duration::from_secs(120), wait_with_bounded_output(child))
+        let out = wait_for_foreground_child(child, ctx.cancel.clone(), Duration::from_secs(120))
             .await
-            .map_err(|_| "command timed out after 120s".to_string())?
-            .map_err(|e| format!("command failed: {e}"))?;
+            .map_err(|error| error.to_string())?;
         if let Some(mutation) = mutation {
             mutation.finish_observed();
         }
@@ -1299,6 +1782,298 @@ mod tests {
         std::fs::remove_dir_all(&workspace).ok();
     }
 
+    #[tokio::test]
+    async fn fs_write_same_bytes_reports_unchanged() {
+        let workspace = unique_temp_dir("noop_write");
+        let tracker = crate::turn_receipt::TurnReceiptTracker::new_with_account(
+            "noop-write".into(),
+            crate::db::now_ms(),
+            std::time::Instant::now(),
+            workspace.clone(),
+            None,
+        );
+        let mut ctx = ToolCtx::new(workspace.clone());
+        ctx.receipt = Some(tracker.clone());
+        let file = workspace.join("file.txt");
+        std::fs::write(&file, "same\n").unwrap();
+
+        let out = FsWrite
+            .run(json!({ "path": "file.txt", "content": "same\n" }), &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(out, "Unchanged file.txt (5 bytes)");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "same\n");
+        assert!(
+            !tracker.receipt_expected(),
+            "identical bytes must not enter the mutation ledger"
+        );
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_edit_same_replacement_is_a_no_effect_turn() {
+        let workspace = unique_temp_dir("noop_edit");
+        let tracker = crate::turn_receipt::TurnReceiptTracker::new_with_account(
+            "noop-edit".into(),
+            crate::db::now_ms(),
+            std::time::Instant::now(),
+            workspace.clone(),
+            None,
+        );
+        let mut ctx = ToolCtx::new(workspace.clone());
+        ctx.receipt = Some(tracker.clone());
+        let file = workspace.join("file.txt");
+        std::fs::write(&file, "same\n").unwrap();
+
+        let out = FsEdit
+            .run(
+                json!({
+                    "path": "file.txt",
+                    "old_string": "same",
+                    "new_string": "same"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out, "Unchanged file.txt (1 matching replacement(s))");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "same\n");
+        assert!(
+            !tracker.receipt_expected(),
+            "a semantic edit no-op must not enter the mutation ledger"
+        );
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_write_rejects_a_preimage_changed_after_approval() {
+        let workspace = unique_temp_dir("write_approval_toctou");
+        let tracker = crate::turn_receipt::TurnReceiptTracker::new_with_account(
+            "write-approval-toctou".into(),
+            crate::db::now_ms(),
+            std::time::Instant::now(),
+            workspace.clone(),
+            None,
+        );
+        let mut ctx = ToolCtx::new(workspace.clone());
+        ctx.receipt = Some(tracker.clone());
+        let file = workspace.join("file.txt");
+        std::fs::write(&file, "approved preimage\n").unwrap();
+        let input = json!({ "path": "file.txt", "content": "agent result\n" });
+        let approval = FsWrite.approval(&input, &ctx).await;
+
+        // Simulate an editor or another agent changing the file while the user is
+        // reading the permission prompt.
+        std::fs::write(&file, "external change\n").unwrap();
+        let error = FsWrite
+            .run_approved(input, &ctx, approval)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("changed after permission"), "got: {error}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "external change\n");
+        assert!(
+            !tracker.receipt_expected(),
+            "stale permission must abort before the mutation ledger"
+        );
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn fs_edit_rejects_a_preimage_changed_after_approval() {
+        let workspace = unique_temp_dir("edit_approval_toctou");
+        let tracker = crate::turn_receipt::TurnReceiptTracker::new_with_account(
+            "edit-approval-toctou".into(),
+            crate::db::now_ms(),
+            std::time::Instant::now(),
+            workspace.clone(),
+            None,
+        );
+        let mut ctx = ToolCtx::new(workspace.clone());
+        ctx.receipt = Some(tracker.clone());
+        let file = workspace.join("file.txt");
+        std::fs::write(&file, "value = 1\n").unwrap();
+        let input = json!({
+            "path": "file.txt",
+            "old_string": "1",
+            "new_string": "2"
+        });
+        let approval = FsEdit.approval(&input, &ctx).await;
+
+        std::fs::write(&file, "value = 10\n").unwrap();
+        let error = FsEdit
+            .run_approved(input, &ctx, approval)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("changed after permission"), "got: {error}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "value = 10\n");
+        assert!(
+            !tracker.receipt_expected(),
+            "stale permission must abort before the mutation ledger"
+        );
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_approval_wins_at_the_write_boundary() {
+        let workspace = unique_temp_dir("write_approval_cancel");
+        let tracker = crate::turn_receipt::TurnReceiptTracker::new_with_account(
+            "write-approval-cancel".into(),
+            crate::db::now_ms(),
+            std::time::Instant::now(),
+            workspace.clone(),
+            None,
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut ctx = ToolCtx::new(workspace.clone());
+        ctx.cancel = Some(cancel.clone());
+        ctx.receipt = Some(tracker.clone());
+        let file = workspace.join("file.txt");
+        std::fs::write(&file, "before\n").unwrap();
+        let input = json!({ "path": "file.txt", "content": "after\n" });
+        let approval = FsWrite.approval(&input, &ctx).await;
+
+        cancel.store(true, Ordering::Relaxed);
+        let error = FsWrite
+            .run_approved(input, &ctx, approval)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("Cancelled"), "got: {error}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "before\n");
+        assert!(
+            !tracker.receipt_expected(),
+            "pre-mutation cancellation must not enter the ledger"
+        );
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[tokio::test]
+    async fn exact_execution_permit_prevents_parallel_revalidate_then_clobber() {
+        let workspace = unique_temp_dir("parallel_exact_gate");
+        let tracker = crate::turn_receipt::TurnReceiptTracker::new_with_account(
+            "parallel-exact-gate".into(),
+            crate::db::now_ms(),
+            std::time::Instant::now(),
+            workspace.clone(),
+            None,
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let file = workspace.join("file.txt");
+        std::fs::write(&file, "shared preimage\n").unwrap();
+
+        let first_input = json!({ "path": "file.txt", "content": "first writer\n" });
+        let second_input = json!({ "path": "file.txt", "content": "second writer\n" });
+        let mut first_ctx = ToolCtx::new(workspace.clone());
+        first_ctx.cancel = Some(cancel.clone());
+        first_ctx.receipt = Some(tracker.clone());
+        let mut second_ctx = ToolCtx::new(workspace.clone());
+        second_ctx.cancel = Some(cancel.clone());
+        second_ctx.receipt = Some(tracker.clone());
+        let first_approval = FsWrite.approval(&first_input, &first_ctx).await;
+        let second_approval = FsWrite.approval(&second_input, &second_ctx).await;
+
+        // Production `gate_and_run` holds this permit across `run_approved`.
+        let first_permit = tracker
+            .prepare_mutation(MutationScope::Exact, cancel.as_ref())
+            .await
+            .unwrap();
+        let second_tracker = tracker.clone();
+        let second_cancel = cancel.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (acquired_tx, mut acquired_rx) = tokio::sync::oneshot::channel();
+        let second = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let _permit = second_tracker
+                .prepare_mutation(MutationScope::Exact, second_cancel.as_ref())
+                .await
+                .unwrap();
+            let _ = acquired_tx.send(());
+            FsWrite
+                .run_approved(second_input, &second_ctx, second_approval)
+                .await
+        });
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut acquired_rx)
+                .await
+                .is_err(),
+            "a second exact operation acquired while revalidate/write was active"
+        );
+
+        FsWrite
+            .run_approved(first_input, &first_ctx, first_approval)
+            .await
+            .unwrap();
+        drop(first_permit);
+        tokio::time::timeout(Duration::from_secs(2), &mut acquired_rx)
+            .await
+            .expect("queued exact operation acquires after release")
+            .unwrap();
+        let second_error = second.await.unwrap().unwrap_err();
+
+        assert!(
+            second_error.contains("changed after permission"),
+            "got: {second_error}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "first writer\n");
+
+        // The same execution gate also orders exact operations against opaque
+        // foreground work, not only against another first-class write.
+        let exact_permit = tracker
+            .prepare_mutation(MutationScope::Exact, cancel.as_ref())
+            .await
+            .unwrap();
+        let opaque_tracker = tracker.clone();
+        let opaque_cancel = cancel.clone();
+        let (opaque_started_tx, opaque_started_rx) = tokio::sync::oneshot::channel();
+        let opaque = tokio::spawn(async move {
+            let _ = opaque_started_tx.send(());
+            opaque_tracker
+                .prepare_mutation(MutationScope::Opaque, opaque_cancel.as_ref())
+                .await
+                .unwrap()
+        });
+        tokio::pin!(opaque);
+        opaque_started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut opaque)
+                .await
+                .is_err(),
+            "opaque operation acquired while exact execution was active"
+        );
+        drop(exact_permit);
+        tokio::time::timeout(Duration::from_secs(5), &mut opaque)
+            .await
+            .expect("queued opaque operation acquires after release")
+            .unwrap();
+
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn exact_write_outcome_requires_readable_old_bytes_for_positive_evidence() {
+        assert_eq!(
+            exact_write_outcome(false, None, b"new"),
+            ExactWriteOutcome::Changed
+        );
+        assert_eq!(
+            exact_write_outcome(true, Some(b"old"), b"new"),
+            ExactWriteOutcome::Changed
+        );
+        assert_eq!(
+            exact_write_outcome(true, Some(b"same"), b"same"),
+            ExactWriteOutcome::Unchanged
+        );
+        assert_eq!(
+            exact_write_outcome(true, None, b"possibly-same"),
+            ExactWriteOutcome::Unknown
+        );
+    }
+
     #[test]
     fn compute_edit_handles_single_all_and_error_cases() {
         let (out, n) = compute_edit("a b", "a", "X", false, "f").unwrap();
@@ -1481,6 +2256,14 @@ mod tests {
     }
 
     #[test]
+    fn receipt_scope_distinguishes_exact_opaque_and_read_only_tools() {
+        assert_eq!(FsWrite.mutation_scope(), Some(MutationScope::Exact));
+        assert_eq!(FsEdit.mutation_scope(), Some(MutationScope::Exact));
+        assert_eq!(Shell.mutation_scope(), Some(MutationScope::Opaque));
+        assert_eq!(FsRead.mutation_scope(), None);
+    }
+
+    #[test]
     fn build_shell_command_rejects_an_unknown_shell_and_accepts_known_ones() {
         // Propagates the shell_invocation error (no process is spawned here).
         assert!(build_shell_command("echo hi", "bash", Path::new(".")).is_err());
@@ -1498,6 +2281,164 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("not available"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn shell_spawn_failure_closes_opaque_guard_as_no_effect() {
+        let workspace = unique_temp_dir("spawn_failure");
+        let tracker = crate::turn_receipt::TurnReceiptTracker::new_with_account(
+            "spawn-failure".into(),
+            crate::db::now_ms(),
+            std::time::Instant::now(),
+            workspace.clone(),
+            None,
+        );
+        // A missing current directory makes process creation fail consistently
+        // after resolving the platform's default shell.
+        std::fs::remove_dir_all(&workspace).unwrap();
+        let mut ctx = ToolCtx::new(workspace);
+        ctx.receipt = Some(tracker.clone());
+
+        let err = Shell
+            .run(json!({ "command": "echo hi" }), &ctx)
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("failed to start"), "got: {err}");
+        assert!(
+            !tracker.receipt_expected(),
+            "a process that never spawned cannot be mutation evidence"
+        );
+    }
+
+    #[cfg(any(windows, unix))]
+    #[tokio::test]
+    async fn foreground_child_is_killed_and_reaped_promptly_on_cancel() {
+        let workspace = unique_temp_dir("foreground_cancel");
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = tokio::process::Command::new("ping");
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = { tokio::process::Command::new("sleep") };
+        #[cfg(unix)]
+        command.arg("30");
+        command
+            .current_dir(&workspace)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let child = command.spawn().expect("long-running test child starts");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            trigger.store(true, Ordering::Relaxed);
+        });
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            wait_for_foreground_child(child, Some(cancel), Duration::from_secs(60)),
+        )
+        .await
+        .expect("cancellation must not wait for the command timeout");
+
+        assert!(matches!(result, Err(ForegroundWaitError::Cancelled)));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "cancelled foreground process was not reaped promptly"
+        );
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    /// PowerShell's `-EncodedCommand` consumes UTF-16LE. Encoding the test
+    /// scripts avoids nested quote/space behavior changing what process tree is
+    /// actually launched on different Windows installations.
+    #[cfg(windows)]
+    fn encoded_powershell_command(script: &str) -> String {
+        use base64::Engine as _;
+
+        let bytes = script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn foreground_cancel_kills_descendant_before_it_can_write() {
+        let workspace = unique_temp_dir("foreground_descendant_cancel");
+        let ready = workspace.join("descendant-ready.txt");
+        let sentinel = workspace.join("descendant-survived.txt");
+        let ready_path = ready.to_string_lossy().replace('\'', "''");
+        let sentinel_path = sentinel.to_string_lossy().replace('\'', "''");
+
+        // The child waits long enough that cancellation deterministically lands
+        // first, then attempts a file write. The root shell publishes `ready`
+        // only after Start-Process returned a real descendant PID and remains
+        // alive in Wait-Process, preserving the process-tree relationship.
+        let child_script = format!(
+            "Start-Sleep -Milliseconds 1200; [IO.File]::WriteAllText('{sentinel_path}', 'survived')"
+        );
+        let child_script = encoded_powershell_command(&child_script);
+        let root_script = format!(
+            "$child = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand','{child_script}') -WindowStyle Hidden -PassThru; \
+             [IO.File]::WriteAllText('{ready_path}', [string]$child.Id); \
+             Wait-Process -Id $child.Id"
+        );
+        let root_script = encoded_powershell_command(&root_script);
+
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &root_script,
+            ])
+            .current_dir(&workspace)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        hide_windows_console(&mut command);
+        let child = command.spawn().expect("root PowerShell starts");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trigger = cancel.clone();
+        let ready_for_trigger = ready.clone();
+        let cancellation = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !ready_for_trigger.is_file() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("descendant did not publish readiness");
+            trigger.store(true, Ordering::Relaxed);
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_foreground_child(child, Some(cancel), Duration::from_secs(60)),
+        )
+        .await
+        .expect("tree cancellation must stay bounded");
+        cancellation.await.expect("cancellation trigger completed");
+        assert!(matches!(result, Err(ForegroundWaitError::Cancelled)));
+
+        // Wait beyond the descendant's scheduled write. If only the direct
+        // PowerShell was killed, the orphan creates this file and the assertion
+        // fails deterministically.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !sentinel.exists(),
+            "a foreground descendant survived Stop and wrote after cancellation"
+        );
+        std::fs::remove_dir_all(workspace).ok();
     }
 
     // `std::process::Output` can only be hand-built with a raw exit status on Unix,
@@ -1722,6 +2663,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(None));
         let ctx = ToolCtx {
             workspace: base(),
+            cancel: None,
             receipt: None,
             spawner: Some(Arc::new(RecordingSpawner { seen: seen.clone() })),
             background: None,
@@ -1760,6 +2702,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(None));
         let ctx = ToolCtx {
             workspace: base(),
+            cancel: None,
             receipt: None,
             spawner: Some(Arc::new(RecordingSpawner { seen: seen.clone() })),
             background: None,

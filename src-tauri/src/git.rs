@@ -1,9 +1,15 @@
 #![cfg(desktop)]
 
 use std::ffi::OsStr;
+#[cfg(test)]
+use std::future::Future;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -11,6 +17,20 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::process_env::{self, ChildKind};
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_COMMAND_COUNT: Arc<AtomicUsize>;
+}
+
+/// Count Git children launched by one async test scope without a process-global
+/// counter that would become flaky under Rust's parallel test runner.
+#[cfg(test)]
+pub(crate) async fn count_test_commands<F: Future>(future: F) -> (F::Output, usize) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let output = TEST_COMMAND_COUNT.scope(count.clone(), future).await;
+    (output, count.load(Ordering::Relaxed))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Failure {
@@ -35,6 +55,8 @@ pub async fn run<S: AsRef<OsStr>>(
     duration: Duration,
     max_stdout: usize,
 ) -> Result<Output, Failure> {
+    #[cfg(test)]
+    let _ = TEST_COMMAND_COUNT.try_with(|count| count.fetch_add(1, Ordering::Relaxed));
     let mut command = git_command(workspace, args)?;
     command
         .stdin(Stdio::null())

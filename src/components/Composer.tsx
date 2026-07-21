@@ -59,6 +59,9 @@ export function Composer() {
   const messageLoad = useStore((s) => (s.activeId ? s.messageLoads[s.activeId] : undefined));
   const setText = useStore((s) => s.setDraft);
   const streaming = useStore((s) => s.streaming);
+  const activeRun = useStore((s) => (s.activeId ? s.runs[s.activeId] : undefined));
+  const finalizing = activeRun?.finalizing ?? false;
+  const outcome = activeRun?.outcome ?? null;
   const composerPhase = useStore((s) => s.composerPhase);
   const activeTool = useStore((s) => s.activeTool);
   const send = useStore((s) => s.send);
@@ -156,7 +159,8 @@ export function Composer() {
       (messageLoad.phase === "error" && hasCachedMessages)),
   );
   const coldLoadError = Boolean(activeId && messageLoad?.phase === "error" && !hasCachedMessages);
-  const canSend = text.trim().length > 0 && !streaming && authenticated && historyReady;
+  const canSend =
+    text.trim().length > 0 && !streaming && !finalizing && authenticated && historyReady;
   // Armed cue (motor anticipation): a one-shot pulse the moment Send becomes
   // fireable. Seeded from the initial value so a restored draft doesn't pulse on
   // mount — only a genuine disabled→enabled transition arms it.
@@ -192,14 +196,18 @@ export function Composer() {
         ? { text: "loading conversationâ€¦", dot: "pc-dot pc-dot--cyan" }
         : !authenticated
           ? { text: authHint, dot: "pc-dot pc-dot--danger" }
-          : presenceFor(streaming, composerPhase, activeTool);
+          : finalizing && !streaming
+            ? { text: "response complete · checking file changes…", dot: "pc-dot--idle" }
+            : presenceFor(streaming, composerPhase, activeTool);
   const placeholder = !activeId
     ? "Create or select a chat to begin…"
     : streaming
       ? "Draft your next message while Portcode works…"
-      : settings.permissionMode === "plan"
-        ? "Describe what you want planned — files will stay untouched…"
-        : "Describe a task, ask a question, or give an instruction…";
+      : finalizing
+        ? "Draft your next message while Portcode checks file changes…"
+        : settings.permissionMode === "plan"
+          ? "Describe what you want planned — files will stay untouched…"
+          : "Describe a task, ask a question, or give an instruction…";
 
   // Keep the editor height in sync when the draft changes externally
   // (e.g. a file path inserted from the explorer, or switching sessions).
@@ -221,14 +229,14 @@ export function Composer() {
   // Never steal it from a permission button, picker, or another input, and never pop
   // the software keyboard on the phone. Drafting remains available during the run.
   useEffect(() => {
-    if (streaming || remoteMode) return;
+    if (streaming || finalizing || remoteMode) return;
     const el = ref.current;
     if (el?.isContentEditable && document.activeElement === document.body) el.focus();
-  }, [streaming, remoteMode]);
+  }, [streaming, finalizing, remoteMode]);
 
   const submit = async () => {
     const t = text;
-    if (!t.trim() || streaming || !authenticated || !historyReady) return;
+    if (!t.trim() || streaming || finalizing || !authenticated || !historyReady) return;
     setText("");
     // Collapse to the measured single-row height (a px target) so the declared
     // transition-[height] can ease the shrink; fall back to "auto" only if we
@@ -277,7 +285,7 @@ export function Composer() {
               <span
                 id="pc-composer-status"
                 role="status"
-                aria-live="polite"
+                aria-live={activeId && (streaming || finalizing || outcome) ? "off" : "polite"}
                 aria-atomic="true"
                 className="pc-composer-presence"
               >
@@ -327,22 +335,26 @@ export function Composer() {
                 aria-hidden={streaming || undefined}
                 className={`pc-send pc-action ${streaming ? "pc-action--hidden" : "pc-action--shown"}${armed ? " pc-armed" : ""}`}
                 title={
-                  coldLoadError
-                    ? "Retry loading this conversation before sending"
-                    : activeId && !historyReady
-                      ? "Wait for this conversation to load"
-                      : authenticated
-                        ? "Send (Enter)"
-                        : authHint
+                  finalizing
+                    ? "Finishing the change record before sending"
+                    : coldLoadError
+                      ? "Retry loading this conversation before sending"
+                      : activeId && !historyReady
+                        ? "Wait for this conversation to load"
+                        : authenticated
+                          ? "Send (Enter)"
+                          : authHint
                 }
                 aria-label={
-                  coldLoadError
-                    ? "Conversation failed to load"
-                    : activeId && !historyReady
-                      ? "Conversation is loading"
-                      : authenticated
-                        ? "Send message"
-                        : authHint
+                  finalizing
+                    ? "Send unlocks after file changes are checked"
+                    : coldLoadError
+                      ? "Conversation failed to load"
+                      : activeId && !historyReady
+                        ? "Conversation is loading"
+                        : authenticated
+                          ? "Send message"
+                          : authHint
                 }
               >
                 <svg width="17" height="17" viewBox="0 0 24 24" fill="none">
@@ -376,6 +388,8 @@ export function Composer() {
           {activeId ? (
             streaming ? (
               "Keep drafting · send unlocks when this run finishes"
+            ) : finalizing ? (
+              "Response complete · send unlocks after file check"
             ) : (
               <>
                 <kbd>Enter</kbd>

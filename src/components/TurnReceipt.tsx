@@ -58,10 +58,31 @@ export function TurnReceipt({
   const hasActivity = activityCount > 0 && activity != null;
   const toggleRef = useRef<HTMLButtonElement>(null);
   const detailsRef = useRef<HTMLDivElement>(null);
-  const now = useElapsedClock(active || finalizing, startedAt, receipt);
+  const lifecycleLive = active || finalizing;
+  const lifecycleWasLive = useRef(lifecycleLive);
+  const finalizingWasAnnounced = useRef(false);
+  const announceTerminal =
+    Boolean(receipt) &&
+    !lifecycleLive &&
+    lifecycleWasLive.current &&
+    !finalizingWasAnnounced.current;
+  useEffect(() => {
+    if (lifecycleLive) {
+      lifecycleWasLive.current = true;
+      if (finalizing) finalizingWasAnnounced.current = true;
+    } else if (receipt) {
+      lifecycleWasLive.current = false;
+      finalizingWasAnnounced.current = false;
+    }
+  }, [finalizing, lifecycleLive, receipt]);
+  // The visible response timer stops as soon as provider/tool work ends. A
+  // provisional receipt normally supplies the exact frozen duration; retaining
+  // the last live tick is the defensive fallback if that payload is absent.
+  const now = useElapsedClock(active && !finalizing, startedAt, receipt);
   const phase = visiblePhase({ receipt, active, waiting, finalizing, startedAt });
+  const announcePhase = lifecycleLive || announceTerminal;
   const durationMs = receipt
-    ? (receipt.durationMs ?? null)
+    ? (receipt.agentDurationMs ?? receipt.durationMs ?? null)
     : startedAt === null
       ? null
       : Math.max(0, now - startedAt);
@@ -81,10 +102,22 @@ export function TurnReceipt({
   if (!active && !finalizing && !receipt) return null;
 
   const action = hasActivity ? `${open ? "collapse" : "expand"} work activity` : null;
-  const accessibleLabel = [copy.accessible, action].filter(Boolean).join(", ");
+  const visibleAccessibleCopy = [copy.label, receipt && durationMs !== null ? copy.duration : null]
+    .filter(Boolean)
+    .join(" ");
+  const accessibleDuration =
+    receipt && durationMs !== null ? `${formatAccessibleDuration(durationMs)} elapsed` : null;
+  const accessibleLabel = [visibleAccessibleCopy, accessibleDuration, copy.accessible, action]
+    .filter(Boolean)
+    .join(", ");
 
   return (
-    <div className={`pc-turn-receipt pc-turn-receipt--${phase}`} data-phase={phase} aria-live="off">
+    <div
+      className={`pc-turn-receipt pc-turn-receipt--${phase}`}
+      data-phase={phase}
+      data-has-activity={hasActivity ? "true" : "false"}
+      aria-live="off"
+    >
       {hasActivity ? (
         <button
           ref={toggleRef}
@@ -98,17 +131,21 @@ export function TurnReceipt({
           <ReceiptStripContent phase={phase} copy={copy} open={open} />
         </button>
       ) : (
-        <div className="pc-turn-receipt__strip" aria-label={accessibleLabel}>
+        <div className="pc-turn-receipt__strip" role="group" aria-label={accessibleLabel}>
           <ReceiptStripContent phase={phase} copy={copy} />
         </div>
       )}
 
       {/* The visible timer is excluded from AT, so the transcript's parent live
-          region cannot announce a new number every second. This nested status
-          announces phase transitions only because its text omits elapsed time. */}
-      <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
-        {phaseAnnouncement(phase)}
-      </span>
+          region cannot announce a new number every second. Mount this nested
+          status while the lifecycle is live and for its same-mounted terminal
+          transition; settled history keeps its strip label without replaying
+          completion announcements on pagination. */}
+      {announcePhase && (
+        <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+          {phaseAnnouncement(phase)}
+        </span>
+      )}
 
       {hasActivity && (
         <div
@@ -152,9 +189,11 @@ function ReceiptStripContent({
         {phaseMark(phase)}
       </span>
       <span className="pc-turn-receipt__label">{copy.label}</span>
-      <span className="pc-turn-receipt__time" aria-hidden="true">
-        {copy.duration}
-      </span>
+      {copy.duration && (
+        <span className="pc-turn-receipt__time" aria-hidden="true">
+          {copy.duration}
+        </span>
+      )}
       {open !== undefined && (
         <span className="pc-turn-receipt__chevron" aria-hidden="true">
           {open ? "▾" : "▸"}
@@ -177,14 +216,14 @@ export function TurnChangesCard({
   const [expanded, setExpanded] = useState(false);
   const changedFiles = receipt.changedFiles;
   const reportedCount = Math.max(receipt.changedFileCount, changedFiles.length);
-  const showUnavailable = receipt.changeCertainty === "unavailable";
-  const showAmbiguous = receipt.changeCertainty === "ambiguous";
-  const shouldRender =
-    reportedCount > 0 ||
-    receipt.filesTruncated ||
-    showUnavailable ||
-    showAmbiguous ||
-    receipt.backgroundTasksRunning;
+  const hasLineChanges = receipt.additions > 0 || receipt.deletions > 0;
+  const hasChangeEvidence = reportedCount > 0 || hasLineChanges;
+  // Certainty, truncation, and background activity only qualify a delta that is
+  // already present; none of them proves that an otherwise empty turn touched a
+  // file. This also keeps legacy/synthetic non-Git `unavailable` receipts quiet.
+  const explicitlyNoChanges =
+    receipt.changeState === "none" || receipt.changeState === "not_applicable";
+  const shouldRender = hasChangeEvidence && !explicitlyNoChanges;
 
   const boundedFiles = useMemo(
     () => changedFiles.slice(0, expanded ? EXPANDED_FILE_LIMIT : INITIAL_FILE_LIMIT),
@@ -201,10 +240,13 @@ export function TurnChangesCard({
 
   if (!shouldRender) return null;
 
-  const title = changeCardTitle(receipt.changeCertainty, reportedCount);
+  const title = changeCardTitle(receipt.changeCertainty, reportedCount, receipt.filesTruncated);
+  const canReview = changedFiles.length > 0 && receipt.changeCertainty !== "unavailable";
   const reviewLabel =
     reportedCount > 0
-      ? `Review ${reportedCount} changed ${reportedCount === 1 ? "file" : "files"}`
+      ? `Review ${receipt.filesTruncated ? "at least " : ""}${reportedCount} changed ${
+          reportedCount === 1 ? "file" : "files"
+        }`
       : "Review workspace changes";
 
   const requestReview = () => {
@@ -230,18 +272,24 @@ export function TurnChangesCard({
           <div className="pc-turn-changes__title">{title}</div>
           <ChangeProvenance receipt={receipt} />
         </div>
-        <div
-          className="pc-turn-changes__totals"
-          aria-label={`${receipt.additions} additions, ${receipt.deletions} deletions`}
-        >
-          <span className="text-success" aria-hidden="true">
-            +{receipt.additions}
-          </span>
-          <span className="text-danger" aria-hidden="true">
-            −{receipt.deletions}
-          </span>
-        </div>
-        {reviewAvailable && reportedCount > 0 ? (
+        {hasLineChanges && (
+          <div
+            className="pc-turn-changes__totals"
+            aria-label={lineTotalsLabel(receipt.additions, receipt.deletions)}
+          >
+            {receipt.additions > 0 && (
+              <span className="text-success" aria-hidden="true">
+                +{receipt.additions}
+              </span>
+            )}
+            {receipt.deletions > 0 && (
+              <span className="text-danger" aria-hidden="true">
+                −{receipt.deletions}
+              </span>
+            )}
+          </div>
+        )}
+        {reviewAvailable && canReview ? (
           <button
             type="button"
             className="pc-turn-changes__review"
@@ -250,7 +298,7 @@ export function TurnChangesCard({
           >
             Review
           </button>
-        ) : !reviewAvailable && reportedCount > 0 ? (
+        ) : !reviewAvailable && canReview ? (
           <span className="pc-turn-changes__review-note">Review on desktop</span>
         ) : null}
       </div>
@@ -301,6 +349,7 @@ function ChangedFileRow({ file }: { file: TurnChangedFile }) {
     file.oldPath && (file.status === "renamed" || file.status === "copied")
       ? `${file.oldPath} → ${file.path}`
       : file.path;
+  const hasLineChanges = (file.additions ?? 0) > 0 || (file.deletions ?? 0) > 0;
   return (
     <li className="pc-turn-changes__file">
       <StatusGlyph status={file.status} />
@@ -313,19 +362,23 @@ function ChangedFileRow({ file }: { file: TurnChangedFile }) {
       <FileCertainty certainty={file.certainty} />
       {file.binary ? (
         <span className="pc-turn-changes__binary">binary</span>
-      ) : (
+      ) : hasLineChanges ? (
         <span
           className="pc-turn-changes__file-counts"
-          aria-label={`${file.additions ?? 0} additions, ${file.deletions ?? 0} deletions`}
+          aria-label={lineTotalsLabel(file.additions ?? 0, file.deletions ?? 0)}
         >
-          <span className="text-success" aria-hidden="true">
-            +{file.additions ?? 0}
-          </span>
-          <span className="text-danger" aria-hidden="true">
-            −{file.deletions ?? 0}
-          </span>
+          {(file.additions ?? 0) > 0 && (
+            <span className="text-success" aria-hidden="true">
+              +{file.additions}
+            </span>
+          )}
+          {(file.deletions ?? 0) > 0 && (
+            <span className="text-danger" aria-hidden="true">
+              −{file.deletions}
+            </span>
+          )}
         </span>
-      )}
+      ) : null}
     </li>
   );
 }
@@ -371,22 +424,33 @@ function ChangeProvenance({ receipt }: { receipt: TurnReceiptData }) {
 }
 
 function changeCardAccessibleLabel(title: string, receipt: TurnReceiptData) {
-  const parts = [title, `${receipt.additions} additions`, `${receipt.deletions} deletions`];
+  const parts = [title];
+  const totals = lineTotalsLabel(receipt.additions, receipt.deletions);
+  if (totals) parts.push(...totals.split(", "));
   if (receipt.changeCertainty !== "exact") parts.push(`${receipt.changeCertainty} attribution`);
   if (receipt.filesTruncated) parts.push("file list truncated");
   return parts.join(", ");
 }
 
-function changeCardTitle(certainty: TurnChangeCertainty, count: number) {
+function lineTotalsLabel(additions: number, deletions: number) {
+  const parts: string[] = [];
+  if (additions > 0) parts.push(`${additions} additions`);
+  if (deletions > 0) parts.push(`${deletions} deletions`);
+  return parts.join(", ");
+}
+
+function changeCardTitle(certainty: TurnChangeCertainty, count: number, filesTruncated: boolean) {
+  if (certainty === "unavailable") return "Git changes could not be verified";
+  if (count === 0) return "File changes detected";
   const files = `${count} ${count === 1 ? "file" : "files"}`;
-  if (certainty === "unavailable") return "Changes unavailable";
+  if (filesTruncated) return `At least ${files} changed`;
   if (certainty === "ambiguous") {
-    return count === 0 ? "Changes may remain" : `${files} changed while this turn ran`;
+    return `${files} changed while this turn ran`;
   }
   if (certainty === "observed") {
-    return count === 0 ? "No files changed during this turn" : `${files} changed during this turn`;
+    return `${files} changed during this turn`;
   }
-  return count === 0 ? "No files edited" : `Edited ${files}`;
+  return `Edited ${files}`;
 }
 
 function useElapsedClock(
@@ -414,7 +478,7 @@ function visiblePhase({
   TurnReceiptProps,
   "receipt" | "active" | "waiting" | "finalizing" | "startedAt"
 >): VisiblePhase {
-  if (finalizing && !receipt) return "finalizing";
+  if (finalizing) return "finalizing";
   if (active && waiting) return "waiting";
   if (active && startedAt === null) return "starting";
   if (active) return "working";
@@ -441,11 +505,15 @@ function phaseCopy(phase: VisiblePhase, durationMs: number | null): PhaseCopy {
         accessible: "Turn is waiting for approval",
       };
     case "finalizing":
-      return { label: "Finalizing", duration: formatted, accessible: "Turn is finalizing" };
+      return {
+        label: "Response complete · Checking file changes…",
+        duration: formatted,
+        accessible: "Response is complete and file changes are being checked",
+      };
     case "completed":
       return {
-        label: durationMs === null ? "Completed" : "Worked for",
-        duration: formatted,
+        label: durationMs === null ? "Done" : "Done in",
+        duration: durationMs === null ? "" : formatted,
         accessible: "Turn completed",
       };
     case "cancelled":
@@ -481,11 +549,26 @@ function formatDuration(durationMs: number | null): string {
   return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m ${seconds}s`;
 }
 
+function formatAccessibleDuration(durationMs: number): string {
+  if (durationMs < 1_000) return "less than 1 second";
+  const totalSeconds = Math.floor(durationMs / 1_000);
+  const seconds = totalSeconds % 60;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes === 0) return `${seconds} ${seconds === 1 ? "second" : "seconds"}`;
+  const minutes = totalMinutes % 60;
+  const hours = Math.floor(totalMinutes / 60);
+  const minuteCopy = `${minutes} ${minutes === 1 ? "minute" : "minutes"}`;
+  if (hours > 0) {
+    return `${hours} ${hours === 1 ? "hour" : "hours"} ${minuteCopy}`;
+  }
+  return `${minuteCopy} ${seconds} ${seconds === 1 ? "second" : "seconds"}`;
+}
+
 function phaseAnnouncement(phase: VisiblePhase) {
   if (phase === "starting") return "Turn started";
   if (phase === "working") return "Turn in progress";
   if (phase === "waiting") return "Turn is waiting for approval";
-  if (phase === "finalizing") return "Turn is finalizing";
+  if (phase === "finalizing") return "Response complete. Checking file changes.";
   if (phase === "completed") return "Turn completed";
   if (phase === "cancelled") return "Turn stopped";
   if (phase === "error") return "Turn failed";
@@ -493,7 +576,7 @@ function phaseAnnouncement(phase: VisiblePhase) {
 }
 
 function phaseMark(phase: VisiblePhase) {
-  if (phase === "completed") return "✓";
+  if (phase === "completed" || phase === "finalizing") return "✓";
   if (phase === "cancelled") return "■";
   if (phase === "error") return "!";
   if (phase === "interrupted") return "×";

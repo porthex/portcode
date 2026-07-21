@@ -76,8 +76,13 @@ interface RunState {
   turnId: string | null;
   /** Native start time when known; optimistic/client-observed before turn_start. */
   startedAt: number | null;
-  /** True only while Stop/watchdog is awaiting a terminal acknowledgement. */
+  /** A bounded terminal boundary is active: either Stop acknowledgement or
+   * post-response receipt/Git finalization. `streaming` distinguishes the two. */
   finalizing: boolean;
+  /** Response time frozen by `turn_phase:agent_completed`; excludes receipt work. */
+  agentDurationMs?: number | null;
+  /** Monotonic lifecycle revision. Optional for restored/legacy state. */
+  phaseRevision?: number;
   /** Last terminal receipt for this session's run, retained after streaming ends. */
   receipt: TurnReceipt | null;
   outcome: TurnStatus | null;
@@ -95,6 +100,8 @@ const EMPTY_RUN: RunState = {
   turnId: null,
   startedAt: null,
   finalizing: false,
+  agentDurationMs: null,
+  phaseRevision: 0,
   receipt: null,
   outcome: null,
   composerPhase: "idle",
@@ -618,19 +625,56 @@ const fallbackReceipt = (
   // for a turn this client actually observed from optimistic send or turn_start.
   if (!run?.turnId || run.startedAt === null) return null;
   const completedAt = now();
+  const agentDurationMs = run.agentDurationMs ?? Math.max(0, completedAt - run.startedAt);
   return {
     turnId: run.turnId,
     status,
     ...(stopReason ? { stopReason } : {}),
     startedAt: run.startedAt,
     completedAt,
-    durationMs: Math.max(0, completedAt - run.startedAt),
+    durationMs: agentDurationMs,
+    agentDurationMs,
     changedFiles: [],
     changedFileCount: 0,
     additions: 0,
     deletions: 0,
     filesTruncated: false,
     changeCertainty: "unavailable",
+    changeState: "unknown",
+    backgroundTasksRunning: (st.backgroundTasks[sessionId] ?? []).some(
+      (task) => task.status === "running",
+    ),
+  };
+};
+
+/** Provisional outcome facts carried by `agent_completed`. They stabilize the
+ * assistant bubble and freeze its timer while the authoritative receipt is still
+ * being assembled; `turn_end`/`error` replaces this object in place. */
+const receiptFromAgentCompletion = (
+  st: AppState,
+  sessionId: string,
+  event: Extract<StreamEvent, { type: "turn_phase" }>,
+): TurnReceipt | null => {
+  const run = st.runs[runKey(sessionId)];
+  if (!run?.turnId || run.turnId !== event.turnId || run.startedAt === null) return null;
+  const completedAt = Math.max(run.startedAt, event.at);
+  const agentDurationMs = Math.max(0, event.agentDurationMs ?? completedAt - run.startedAt);
+  const status = event.status ?? "completed";
+  return {
+    turnId: event.turnId,
+    status,
+    ...(event.stopReason ? { stopReason: event.stopReason } : {}),
+    startedAt: run.startedAt,
+    completedAt,
+    durationMs: agentDurationMs,
+    agentDurationMs,
+    changedFiles: [],
+    changedFileCount: 0,
+    additions: 0,
+    deletions: 0,
+    filesTruncated: false,
+    changeCertainty: "unavailable",
+    changeState: event.receiptExpected === false ? "none" : "unknown",
     backgroundTasksRunning: (st.backgroundTasks[sessionId] ?? []).some(
       (task) => task.status === "running",
     ),
@@ -692,8 +736,16 @@ const terminalizeTurnState = (
   // A native terminal can race with the cancel invoke resolving. Never let the
   // caller's subsequent optimistic fallback overwrite the authoritative receipt
   // that already landed during that acknowledgement window.
+  const nativeWithAgentDuration =
+    nativeReceipt &&
+    nativeReceipt.agentDurationMs === undefined &&
+    currentRun.agentDurationMs != null
+      ? { ...nativeReceipt, agentDurationMs: currentRun.agentDurationMs }
+      : nativeReceipt;
   const receipt =
-    nativeReceipt ?? currentRun.receipt ?? fallbackReceipt(st, sessionId, status, stopReason);
+    nativeWithAgentDuration ??
+    currentRun.receipt ??
+    fallbackReceipt(st, sessionId, status, stopReason);
   const turnId = receipt?.turnId ?? currentRun.turnId;
   const messages = patchTerminalTurnMessage(
     st.messages,
@@ -715,6 +767,9 @@ const terminalizeTurnState = (
       turnId,
       startedAt: receipt?.startedAt ?? currentRun.startedAt,
       finalizing: false,
+      agentDurationMs:
+        receipt?.agentDurationMs ?? currentRun.agentDurationMs ?? receipt?.durationMs ?? null,
+      phaseRevision: currentRun.phaseRevision ?? 0,
       receipt,
       outcome: receipt?.status ?? status,
       composerPhase: "idle",
@@ -883,6 +938,10 @@ const TURN_IDLE_TIMEOUT_MS = 150_000;
 // emitted its durable terminal receipt. Keep listening long enough for native
 // finalization, but bound the wait for legacy/mocked cores with no terminal event.
 const CANCEL_TERMINAL_GRACE_MS = 30_000;
+// `agent_completed` makes the response visibly complete before Git attribution is
+// ready. Native has a tighter capture budget; this client cap is the last-resort
+// guarantee that a lost terminal event cannot keep Send locked indefinitely.
+const RECEIPT_TERMINAL_GRACE_MS = 5_000;
 
 // Serialize model writes per session so two quick selections cannot reach SQLite
 // out of order (a slower first invoke completing last would otherwise survive reload).
@@ -2247,7 +2306,8 @@ export const useStore = create<AppState>((set, get) => ({
 
   async send(text) {
     const { activeId, streaming } = get();
-    if (!activeId || streaming || !text.trim()) return;
+    const activeRun = activeId ? get().runs[runKey(activeId)] : undefined;
+    if (!activeId || streaming || activeRun?.finalizing || !text.trim()) return;
     const messageLoad = get().messageLoads[activeId];
     if (messageLoad && messageLoad.phase !== "ready" && messageLoad.phase !== "refreshing") return;
 
@@ -2416,6 +2476,8 @@ export const useStore = create<AppState>((set, get) => ({
         turnId: provisionalTurnId,
         startedAt: optimisticStartedAt,
         finalizing: false,
+        agentDurationMs: null,
+        phaseRevision: 0,
         receipt: null,
         outcome: null,
       });
@@ -2492,6 +2554,8 @@ export const useStore = create<AppState>((set, get) => ({
           turnId: provisionalTurnId,
           startedAt: optimisticStartedAt,
           finalizing: false,
+          agentDurationMs: null,
+          phaseRevision: 0,
           receipt: null,
           outcome: null,
         }),
@@ -2525,12 +2589,12 @@ export const useStore = create<AppState>((set, get) => ({
     // authoritative source) rather than the active-session mirror — correct even
     // if the active session were to change out from under a long-running turn.
     const myKey = runKey(activeId);
-    const isStreaming = () => get().runs[myKey]?.streaming ?? false;
     let run: Awaited<ReturnType<typeof ipc.runAgent>> | null = null;
     let settled = false;
     let lastActivity = now();
     let watchdog: ReturnType<typeof setInterval> | null = null;
     let cancelTerminalTimer: ReturnType<typeof setTimeout> | null = null;
+    let receiptTerminalTimer: ReturnType<typeof setTimeout> | null = null;
     let watchdogCancelInFlight = false;
     let awaitingCancelTerminal = false;
     let observedTurnId = provisionalTurnId;
@@ -2550,6 +2614,10 @@ export const useStore = create<AppState>((set, get) => ({
       if (cancelTerminalTimer !== null) {
         clearTimeout(cancelTerminalTimer);
         cancelTerminalTimer = null;
+      }
+      if (receiptTerminalTimer !== null) {
+        clearTimeout(receiptTerminalTimer);
+        receiptTerminalTimer = null;
       }
       awaitingCancelTerminal = false;
       return true;
@@ -2589,11 +2657,14 @@ export const useStore = create<AppState>((set, get) => ({
     ) => {
       const eventTurnId = receipt?.turnId ?? observedTurnId;
       const current = get().runs[myKey];
-      const supersededByNewTurn =
-        awaitingCancelTerminal &&
-        current?.streaming === true &&
-        current.turnId !== null &&
-        current.turnId !== eventTurnId;
+      // `receiptExpected: false` unlocks immediately, so a quick follow-up can
+      // start before this listener receives its trailing authoritative terminal.
+      // Distinguish an authoritative replacement of this turn's provisional ID
+      // from a genuinely newer run, and never let the stale listener end that run.
+      const stillOwnsCurrentRun = nativeTurnIdKnown
+        ? current?.turnId === observedTurnId || current?.turnId === eventTurnId
+        : current?.turnId === provisionalTurnId || current?.turnId === eventTurnId;
+      const supersededByNewTurn = current?.turnId != null && !stillOwnsCurrentRun;
       stopRequestedSessions.delete(activeId);
       pendingTools.clear();
       settle();
@@ -2650,12 +2721,25 @@ export const useStore = create<AppState>((set, get) => ({
     };
 
     const onEvent = (e: StreamEvent) => {
+      // `receiptExpected: false` is terminal for this frontend listener. Native
+      // still persists/emits its authoritative TurnEnd, but the no-capture phase
+      // already carries every fact needed to unlock the UI. A hard callback guard
+      // protects tests and queued channel deliveries even before unlisten finishes.
+      if (settled) return;
       // Once cancellation is acknowledged, only this turn's terminal receipt is
       // relevant. Ignoring late deltas/turn_start also prevents this listener from
       // touching a fast follow-up turn during the bounded receipt grace window.
       if (awaitingCancelTerminal) {
-        if (e.type !== "turn_end" && e.type !== "error") return;
-        if (nativeTurnIdKnown && e.receipt && e.receipt.turnId !== observedTurnId) return;
+        const acknowledgedOutcome = e.type === "turn_phase" && e.phase === "agent_completed";
+        if (e.type !== "turn_end" && e.type !== "error" && !acknowledgedOutcome) return;
+        if (acknowledgedOutcome && e.turnId !== observedTurnId) return;
+        if (
+          nativeTurnIdKnown &&
+          (e.type === "turn_end" || e.type === "error") &&
+          e.receipt &&
+          e.receipt.turnId !== observedTurnId
+        )
+          return;
       }
       lastActivity = now();
       switch (e.type) {
@@ -2670,6 +2754,8 @@ export const useStore = create<AppState>((set, get) => ({
               turnId,
               startedAt,
               finalizing: false,
+              agentDurationMs: null,
+              phaseRevision: 0,
               receipt: null,
               outcome: null,
             }),
@@ -2682,6 +2768,73 @@ export const useStore = create<AppState>((set, get) => ({
               startedAt,
             ),
           }));
+          break;
+        }
+        case "turn_phase": {
+          const currentRun = get().runs[myKey];
+          if (!currentRun || currentRun.turnId !== e.turnId) break;
+          const previousRevision = currentRun.phaseRevision ?? 0;
+          if (e.revision !== undefined && e.revision <= previousRevision) break;
+          const phaseRevision = e.revision ?? previousRevision + 1;
+          if (e.phase === "provider_started") {
+            if (!currentRun.streaming || currentRun.composerPhase === "stopping") break;
+            clearSettleTimer(activeId);
+            setRun(set, activeId, { composerPhase: "thinking", phaseRevision });
+            break;
+          }
+
+          clearSettleTimer(activeId);
+          pendingTools.clear();
+          const status = e.status ?? "completed";
+          const toolOutput =
+            status === "cancelled" ? TOOL_INTERRUPTED_CANCELLED : TOOL_INTERRUPTED_ERROR;
+          set((st) => {
+            const run = st.runs[myKey];
+            if (!run || run.turnId !== e.turnId) return {};
+            const receipt = receiptFromAgentCompletion(st, activeId, e);
+            if (!receipt) return {};
+            const agentStatus: TerminalAgentStatus =
+              status === "completed" ? "ok" : status === "cancelled" ? "cancelled" : "error";
+            return {
+              messages: patchTerminalTurnMessage(
+                st.messages,
+                activeId,
+                e.turnId,
+                toolOutput,
+                receipt,
+              ),
+              agents: terminalizeRunningAgents(st.agents, activeId, agentStatus),
+              ...runPatch(st, activeId, {
+                streaming: false,
+                cancel: null,
+                pendingPermission: null,
+                finalizing: e.receiptExpected !== false,
+                agentDurationMs: receipt.agentDurationMs ?? receipt.durationMs ?? null,
+                phaseRevision,
+                receipt,
+                outcome: status,
+                composerPhase: "idle",
+                activeTool: null,
+                unseenOutcome: st.activeId !== activeId && status !== "completed" ? status : null,
+              }),
+            };
+          });
+
+          if (e.receiptExpected !== false) {
+            if (receiptTerminalTimer !== null) clearTimeout(receiptTerminalTimer);
+            receiptTerminalTimer = setTimeout(() => {
+              receiptTerminalTimer = null;
+              const run = get().runs[myKey];
+              if (!run?.finalizing || run.streaming || run.turnId !== e.turnId) return;
+              applyTerminalEvent(toolOutput, status, e.stopReason, run.receipt ?? undefined);
+            }, RECEIPT_TERMINAL_GRACE_MS);
+          } else {
+            // No Git boundary remains, so there is nothing for this per-run
+            // listener to finalize. Tear it down before Send can start a follow-up
+            // on the same session channel; the persisted TurnEnd is recovered on
+            // reload and the provisional receipt is already complete for this UI.
+            settle();
+          }
           break;
         }
         case "text_delta":
@@ -2777,10 +2930,14 @@ export const useStore = create<AppState>((set, get) => ({
 
     watchdog = setInterval(() => {
       // The turn already ended or was stopped elsewhere (e.g. Stop) — just clean up.
-      if (settled || !isStreaming()) {
+      const currentRun = get().runs[myKey];
+      if (settled || (!currentRun?.streaming && !currentRun?.finalizing)) {
         settle();
         return;
       }
+      // Provider/tool work is over. Receipt delivery has its own much shorter cap;
+      // never run the agent idle-cancel path against Git finalization.
+      if (currentRun.finalizing && !currentRun.streaming) return;
       // No event for the whole idle window → treat the turn as hung and recover, so
       // the composer can't stay disabled forever.
       if (now() - lastActivity < TURN_IDLE_TIMEOUT_MS) return;
@@ -4864,6 +5021,8 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
             turnId,
             startedAt,
             finalizing: false,
+            agentDurationMs: null,
+            phaseRevision: 0,
             receipt: null,
             outcome: null,
             composerPhase: previous.composerPhase === "received" ? "received" : "thinking",
