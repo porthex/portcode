@@ -144,12 +144,12 @@ describe("RemoteSessions — list", () => {
       sessions: [session({ model: "gpt-live", accountProfileId })],
       activeId: "s1",
       remoteConnected: true,
-      remoteError: "Choose a ChatGPT account on the desktop, then try again.",
+      remoteError: "Configure a default ChatGPT account on the desktop, then try again.",
     });
     render(<RemoteSessions />);
 
     expect(screen.getByRole("alert")).toHaveTextContent(
-      "Choose a ChatGPT account on the desktop, then try again.",
+      "Configure a default ChatGPT account on the desktop, then try again.",
     );
     expect(screen.getByRole("alert")).not.toHaveTextContent("ChatGPT account 1");
     expect(screen.getByRole("alert")).not.toHaveTextContent(accountProfileId);

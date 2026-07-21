@@ -6,7 +6,14 @@ import type { Session, SessionArchiveWarning } from "../types";
 export type SessionDialogState =
   | { kind: "archive"; session: Session; warning: SessionArchiveWarning }
   | { kind: "archiveError"; session: Session; message: string }
-  | { kind: "delete"; session: Session };
+  | { kind: "delete"; session: Session }
+  | {
+      kind: "accountSwitch";
+      session: Session;
+      currentAccountLabel: string;
+      nextAccountLabel: string;
+      message?: string;
+    };
 
 interface SessionActionDialogProps {
   state: SessionDialogState;
@@ -16,9 +23,9 @@ interface SessionActionDialogProps {
 }
 
 /**
- * A focused confirmation surface for the two lifecycle boundaries that deserve
- * friction: hiding a session with uncommitted work and permanently deleting an
- * already-archived transcript. Archive itself stays instant for clean worktrees.
+ * A focused confirmation surface for lifecycle boundaries that deserve friction:
+ * hiding dirty work, deleting an archived transcript, or continuing a started
+ * chat under a different account. Clean archives remain instant.
  */
 export function SessionActionDialog({
   state,
@@ -59,12 +66,15 @@ export function SessionActionDialog({
   const archive = state.kind === "archive" ? state.warning : null;
   const isDelete = state.kind === "delete";
   const isError = state.kind === "archiveError";
+  const isAccountSwitch = state.kind === "accountSwitch";
   const branch = archive?.branch ?? archive?.detachedHead ?? "detached HEAD";
   const title = isDelete
     ? "Delete archived session?"
-    : isError
-      ? "Couldn’t check the worktree"
-      : "Uncommitted work on this branch";
+    : isAccountSwitch
+      ? "Continue with another account?"
+      : isError
+        ? "Couldn’t check the worktree"
+        : "Uncommitted work on this branch";
 
   return createPortal(
     <div
@@ -82,12 +92,20 @@ export function SessionActionDialog({
         onKeyDown={onKeyDown}
         className="pc-session-dialog"
       >
-        <div className={`pc-session-dialog__icon ${isDelete ? "is-danger" : "is-warn"}`}>
-          <span aria-hidden="true">{isDelete ? "×" : "!"}</span>
+        <div
+          className={`pc-session-dialog__icon ${isDelete ? "is-danger" : isAccountSwitch ? "is-primary" : "is-warn"}`}
+        >
+          <span aria-hidden="true">{isDelete ? "×" : isAccountSwitch ? "↗" : "!"}</span>
         </div>
         <div className="min-w-0 flex-1">
           <div className="pc-eyebrow-mono mb-1 text-[9.5px]">
-            {isDelete ? "PERMANENT ACTION" : isError ? "ARCHIVE PAUSED" : "WORKTREE CHECK"}
+            {isDelete
+              ? "PERMANENT ACTION"
+              : isAccountSwitch
+                ? "NEW CHAT REQUIRED"
+                : isError
+                  ? "ARCHIVE PAUSED"
+                  : "WORKTREE CHECK"}
           </div>
           <h2 id={titleId} className="text-[16px] font-semibold text-fg">
             {title}
@@ -132,6 +150,28 @@ export function SessionActionDialog({
             </p>
           )}
 
+          {isAccountSwitch && (
+            <div
+              id={descriptionId}
+              className="mt-3 space-y-3 text-[12.5px] leading-[1.55] text-muted"
+            >
+              <p>
+                <strong className="text-fg">{state.session.title}</strong> already started with{" "}
+                <strong className="text-fg">{state.currentAccountLabel}</strong>. Its ChatGPT
+                account cannot change after the first message.
+              </p>
+              <p>
+                Continue with <strong className="text-fg">{state.nextAccountLabel}</strong> in a new
+                chat. This chat and its history will stay unchanged.
+              </p>
+              {state.message && (
+                <p role="alert" className="text-danger">
+                  {state.message}
+                </p>
+              )}
+            </div>
+          )}
+
           <div className="mt-5 flex justify-end gap-2">
             <button
               ref={cancelRef}
@@ -140,7 +180,7 @@ export function SessionActionDialog({
               onClick={onCancel}
               className="pc-session-dialog__button"
             >
-              {isDelete ? "Keep session" : "Cancel"}
+              {isDelete ? "Keep session" : isAccountSwitch ? "Keep this chat" : "Cancel"}
             </button>
             <button
               type="button"
@@ -152,9 +192,11 @@ export function SessionActionDialog({
                 ? "Working…"
                 : isDelete
                   ? "Delete forever"
-                  : isError
-                    ? "Try again"
-                    : "Archive anyway"}
+                  : isAccountSwitch
+                    ? "Continue in new chat"
+                    : isError
+                      ? "Try again"
+                      : "Archive anyway"}
             </button>
           </div>
         </div>

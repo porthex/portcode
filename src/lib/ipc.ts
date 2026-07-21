@@ -35,6 +35,7 @@ import type {
   UpdateInfo,
   WorkspaceSummary,
 } from "../types";
+import { providerForModel } from "../types";
 import {
   webOnPhoneSyncDisconnected,
   webOnPhoneSyncFrame,
@@ -509,19 +510,22 @@ export async function createSession(
   return mock.createSession(id, title, workspace, model, accountProfileId);
 }
 
-/** Pin a migrated OpenAI session once. Native code enforces the NULL-only CAS. */
+/** Select a session's ChatGPT account. Native code allows replacement only
+ * before the first durable turn and commits any compatible model fallback with it. */
 export async function pinSessionOpenAIAccount(
   sessionId: string,
   accountProfileId: string,
+  model?: string,
 ): Promise<Session> {
   if (isTauri()) {
     const { core } = await tauri();
     return core.invoke<Session>("pin_session_openai_account", {
       sessionId,
       accountProfileId,
+      model: model ?? null,
     });
   }
-  return mock.pinSessionOpenAIAccount(sessionId, accountProfileId);
+  return mock.pinSessionOpenAIAccount(sessionId, accountProfileId, model);
 }
 
 export async function renameSession(id: string, title: string): Promise<void> {
@@ -953,6 +957,7 @@ const mock = (() => {
   let openaiAccountSequence = 0;
   let openaiAccounts: OpenAIAccountSummary[] = [];
   const mockSessions = new Map<string, Session>();
+  const mockStartedSessions = new Set<string>();
   const openaiCatalogue: OpenAIModelCatalogRow[] = [
     {
       id: "gpt-5.6-sol",
@@ -1132,6 +1137,9 @@ const mock = (() => {
       accountProfileId?: string | null,
     ): Promise<Session> {
       const timestamp = Date.now();
+      if (providerForModel(model) === "openai" && !accountProfileId) {
+        throw new Error("Choose a default ChatGPT account before creating a GPT chat.");
+      }
       if (accountProfileId) {
         const account = openaiAccounts.find((candidate) => candidate.id === accountProfileId);
         if (!account || account.state !== "connected") {
@@ -1157,17 +1165,24 @@ const mock = (() => {
       mockSessions.set(id, session);
       return { ...session };
     },
-    async pinSessionOpenAIAccount(sessionId: string, accountProfileId: string): Promise<Session> {
+    async pinSessionOpenAIAccount(
+      sessionId: string,
+      accountProfileId: string,
+      model?: string,
+    ): Promise<Session> {
       const session = mockSessions.get(sessionId);
       if (!session) throw new Error("Session was not found.");
-      if (session.accountProfileId) {
-        throw new Error("This session is already pinned to a ChatGPT account.");
-      }
       const account = openaiAccounts.find((candidate) => candidate.id === accountProfileId);
       if (!account || account.state !== "connected") {
         throw new Error("Choose a connected ChatGPT account.");
       }
-      const pinned = { ...session, accountProfileId };
+      const started = mockStartedSessions.has(sessionId);
+      if (session.accountProfileId && session.accountProfileId !== accountProfileId && started) {
+        throw new Error(
+          "This conversation has already started. Continue with another ChatGPT account in a new chat.",
+        );
+      }
+      const pinned = { ...session, accountProfileId, model: model ?? session.model };
       mockSessions.set(sessionId, pinned);
       return { ...pinned };
     },
@@ -1387,8 +1402,9 @@ const mock = (() => {
       }
       throw new Error("Historical turn patches are unavailable in preview mode.");
     },
-    async runAgent(_sessionId: string, text: string, onEvent: (e: StreamEvent) => void) {
+    async runAgent(sessionId: string, text: string, onEvent: (e: StreamEvent) => void) {
       let cancelled = false;
+      mockStartedSessions.add(sessionId);
       (async () => {
         await delay(120);
         if (cancelled) return;

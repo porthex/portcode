@@ -186,9 +186,9 @@ interface AppState {
   openAIAccountsLoading: boolean;
   openAIAccountsError: string | null;
   openAIModelCatalogs: Record<string, OpenAIModelCatalogState>; // strictly profile-scoped
-  /** Compatibility/default view: the last-used connected profile's catalogue. */
+  /** Compatibility/default view: the Settings-selected profile's catalogue. */
   openAIModels: ModelInfo[];
-  /** UI preference only. Existing runs always resolve through Session.accountProfileId. */
+  /** Settings-managed default for new GPT chats. Existing chats stay session-pinned. */
   lastOpenAIAccountProfileId: string | null;
   phoneSync: PhoneSyncStatus | null; // phone sync device identity + paired devices
   pairingPayload: PairingPayload | null; // in-progress pairing code to display
@@ -327,8 +327,12 @@ interface AppState {
   loginWithOpenAI: () => Promise<void>;
   reconnectOpenAIAccount: (accountProfileId: string) => Promise<void>;
   removeOpenAIAccount: (accountProfileId: string) => Promise<void>;
+  setDefaultOpenAIAccount: (accountProfileId: string) => Promise<void>;
   loadOpenAIAccountModels: (accountProfileId: string, force?: boolean) => Promise<ModelInfo[]>;
-  pinSessionOpenAIAccount: (sessionId: string, accountProfileId: string) => Promise<void>;
+  pinSessionOpenAIAccount: (
+    sessionId: string,
+    accountProfileId: string,
+  ) => Promise<"selected" | "locked" | "error">;
   refreshPhoneSync: () => Promise<void>;
   beginPairing: () => Promise<void>;
   unpair: (publicKey: string) => Promise<void>;
@@ -1286,10 +1290,10 @@ const connectedOpenAIAccounts = (accounts: OpenAIAccountSummary[]) =>
 
 export const preferredOpenAIAccount = (
   accounts: OpenAIAccountSummary[],
-  lastUsed: string | null,
+  preferredId: string | null,
 ): OpenAIAccountSummary | undefined => {
   const connected = connectedOpenAIAccounts(accounts);
-  const explicitlyPreferred = connected.find((account) => account.id === lastUsed);
+  const explicitlyPreferred = connected.find((account) => account.id === preferredId);
   if (explicitlyPreferred) return explicitlyPreferred;
   return [...connected].sort(
     (left, right) =>
@@ -1476,6 +1480,18 @@ export const useStore = create<AppState>((set, get) => ({
         openAIAccounts,
         get().lastOpenAIAccountProfileId,
       );
+      // A transient registry read failure is not evidence that the user's chosen
+      // default disappeared. Retain it so a later successful refresh can reconcile
+      // against the authoritative connected profiles without silently switching MRU.
+      const defaultOpenAIAccountProfileId = openAIAccountDiscovery.error
+        ? get().lastOpenAIAccountProfileId
+        : (preferredAccount?.id ?? null);
+      if (
+        !openAIAccountDiscovery.error &&
+        defaultOpenAIAccountProfileId !== get().lastOpenAIAccountProfileId
+      ) {
+        writeStr("pc.lastOpenAIAccountProfileId", defaultOpenAIAccountProfileId);
+      }
       let openAIModelCatalogs: Record<string, OpenAIModelCatalogState> = {};
       let openAIModels = openAIAvailable && !preferredAccount ? OPENAI_FALLBACK_MODELS : [];
       if (openAIAvailable && preferredAccount && typeof ipc.openaiModels === "function") {
@@ -1513,10 +1529,6 @@ export const useStore = create<AppState>((set, get) => ({
       const preferredCatalog = preferredAccount
         ? openAIModelCatalogs[preferredAccount.id]
         : undefined;
-      // Keep the persisted provider/model intent intact. Startup may auto-create
-      // an OpenAI conversation only when the exact preferred-account catalogue
-      // proves that pair valid; failure, empty, or disjoint discovery is a visible
-      // recovery state, never an implicit Claude or first-row fallback.
       const startupOpenAIBlockReason =
         requestedProvider !== "openai"
           ? null
@@ -1526,14 +1538,12 @@ export const useStore = create<AppState>((set, get) => ({
             : openAIAccountDiscovery.error
               ? "Couldn't load ChatGPT accounts: " + openAIAccountDiscovery.error
               : !preferredAccount
-                ? "Add a ChatGPT account before creating an OpenAI session."
+                ? "Choose a default ChatGPT account in Settings before creating a GPT chat."
                 : preferredCatalog?.status !== "ready"
                   ? (preferredCatalog?.error ??
-                    "Load this ChatGPT account's models before creating a session.")
+                    "Load the default ChatGPT account's models before creating a GPT chat.")
                   : !preferredCatalog.models.some((candidate) => candidate.id === requestedModel)
-                    ? "Choose a model available to " +
-                      openAIAccountLabel(preferredAccount, openAIAccounts) +
-                      " before creating this session."
+                    ? "Choose a model available to the default ChatGPT account before creating a GPT chat."
                     : null;
       const model = requestedModel;
       const settings: Settings = {
@@ -1563,6 +1573,7 @@ export const useStore = create<AppState>((set, get) => ({
           openAIAccountsError: openAIAccountDiscovery.error,
           openAIModelCatalogs,
           openAIModels,
+          lastOpenAIAccountProfileId: defaultOpenAIAccountProfileId,
           phoneSync,
           drafts,
           usage,
@@ -1578,7 +1589,7 @@ export const useStore = create<AppState>((set, get) => ({
       if (loaded.length === 0) {
         const accountProfileId =
           providerForModel(settings.model, openAIModels) === "openai"
-            ? (preferredAccount?.id ?? null)
+            ? defaultOpenAIAccountProfileId
             : null;
         const optimistic = makeSession(settings.model, accountProfileId);
         const s = await ipc.createSession(
@@ -1598,6 +1609,7 @@ export const useStore = create<AppState>((set, get) => ({
           openAIAccountsError: openAIAccountDiscovery.error,
           openAIModelCatalogs,
           openAIModels,
+          lastOpenAIAccountProfileId: defaultOpenAIAccountProfileId,
           phoneSync,
           drafts,
           usage,
@@ -1632,6 +1644,7 @@ export const useStore = create<AppState>((set, get) => ({
         openAIAccountsError: openAIAccountDiscovery.error,
         openAIModelCatalogs,
         openAIModels,
+        lastOpenAIAccountProfileId: defaultOpenAIAccountProfileId,
         phoneSync,
         drafts,
         usage,
@@ -1846,7 +1859,7 @@ export const useStore = create<AppState>((set, get) => ({
         if (!selected) {
           set({
             showSettings: true,
-            openAIAuthError: "Add a ChatGPT account before creating an OpenAI session.",
+            openAIAuthError: "Choose a default ChatGPT account in Settings first.",
           });
           return;
         }
@@ -1902,11 +1915,7 @@ export const useStore = create<AppState>((set, get) => ({
         ...projectActiveRun({ activeId: s.id, runs: st.runs }),
       }));
       if (profileId) {
-        // This preference means "last successfully created", never merely the
-        // last account hovered or selected in a menu.
-        writeStr("pc.lastOpenAIAccountProfileId", profileId);
         set({
-          lastOpenAIAccountProfileId: profileId,
           openAIModels: modelsForOpenAIProfile(profileId, get().openAIModelCatalogs),
         });
       }
@@ -2234,7 +2243,7 @@ export const useStore = create<AppState>((set, get) => ({
             )
           : undefined;
         if (!activeSession.accountProfileId) {
-          set({ openAIAuthError: "Choose the ChatGPT account that owns this legacy session." });
+          set({ openAIAuthError: "Choose a default ChatGPT account in Settings before sending." });
           return;
         }
         if (!account || account.state !== "connected") {
@@ -3243,12 +3252,15 @@ export const useStore = create<AppState>((set, get) => ({
         Object.entries(get().openAIModelCatalogs).filter(([id]) => ids.has(id)),
       );
       const preferred = preferredOpenAIAccount(openAIAccounts, get().lastOpenAIAccountProfileId);
+      const defaultAccountProfileId = preferred?.id ?? null;
+      writeStr("pc.lastOpenAIAccountProfileId", defaultAccountProfileId);
       set({
         openAIAuthStatus,
         openAIAccounts,
         openAIAccountsLoading: false,
         openAIAccountsError: null,
         openAIModelCatalogs,
+        lastOpenAIAccountProfileId: defaultAccountProfileId,
         openAIModels:
           openAIAuthStatus.available === false
             ? []
@@ -3283,13 +3295,18 @@ export const useStore = create<AppState>((set, get) => ({
     }
     try {
       const account = await ipc.startOpenAIAccountLogin();
-      set((state) => ({
-        openAIAccounts: [
-          account,
-          ...state.openAIAccounts.filter((candidate) => candidate.id !== account.id),
-        ],
+      const nextAccounts = [
+        account,
+        ...get().openAIAccounts.filter((candidate) => candidate.id !== account.id),
+      ];
+      const defaultAccountProfileId =
+        preferredOpenAIAccount(nextAccounts, get().lastOpenAIAccountProfileId)?.id ?? null;
+      writeStr("pc.lastOpenAIAccountProfileId", defaultAccountProfileId);
+      set({
+        openAIAccounts: nextAccounts,
+        lastOpenAIAccountProfileId: defaultAccountProfileId,
         openAIReconnectMismatch: null,
-      }));
+      });
       await get().loadOpenAIAccountModels(account.id, true);
     } catch (err) {
       set({ openAIAuthError: errMessage(err) });
@@ -3307,14 +3324,49 @@ export const useStore = create<AppState>((set, get) => ({
         return;
       }
       const { account } = outcome;
-      set((state) => ({
-        openAIAccounts: state.openAIAccounts.map((candidate) =>
-          candidate.id === account.id ? account : candidate,
-        ),
-      }));
+      const nextAccounts = get().openAIAccounts.map((candidate) =>
+        candidate.id === account.id ? account : candidate,
+      );
+      const defaultAccountProfileId =
+        preferredOpenAIAccount(nextAccounts, get().lastOpenAIAccountProfileId)?.id ?? null;
+      writeStr("pc.lastOpenAIAccountProfileId", defaultAccountProfileId);
+      set({
+        openAIAccounts: nextAccounts,
+        lastOpenAIAccountProfileId: defaultAccountProfileId,
+      });
       await get().loadOpenAIAccountModels(account.id, true);
     } catch (err) {
       set({ openAIAuthError: errMessage(err) });
+    }
+  },
+
+  async setDefaultOpenAIAccount(accountProfileId) {
+    set({ openAIAuthError: null });
+    const account = get().openAIAccounts.find(
+      (candidate) => candidate.id === accountProfileId && candidate.state === "connected",
+    );
+    if (!account) {
+      set({ openAIAuthError: "Choose a connected ChatGPT account as the default." });
+      return;
+    }
+
+    writeStr("pc.lastOpenAIAccountProfileId", accountProfileId);
+    set({ lastOpenAIAccountProfileId: accountProfileId });
+    try {
+      const models = await get().loadOpenAIAccountModels(accountProfileId);
+      set({ openAIModels: models });
+      const current = get().settings;
+      if (current.provider === "openai" && !models.some((model) => model.id === current.model)) {
+        const fallback = models[0];
+        if (fallback) {
+          await get().updateSettings({
+            model: fallback.id,
+            reasoningEffort: fallback.defaultReasoningEffort,
+          });
+        }
+      }
+    } catch (error) {
+      set({ openAIAuthError: errMessage(error) });
     }
   },
 
@@ -3346,19 +3398,18 @@ export const useStore = create<AppState>((set, get) => ({
           );
         const openAIModelCatalogs = { ...state.openAIModelCatalogs };
         delete openAIModelCatalogs[accountProfileId];
-        const lastOpenAIAccountProfileId =
+        const retainedDefaultAccountProfileId =
           state.lastOpenAIAccountProfileId === accountProfileId
             ? null
             : state.lastOpenAIAccountProfileId;
-        if (lastOpenAIAccountProfileId === null) {
-          writeStr("pc.lastOpenAIAccountProfileId", null);
-        }
-        const preferred = preferredOpenAIAccount(openAIAccounts, lastOpenAIAccountProfileId);
+        const preferred = preferredOpenAIAccount(openAIAccounts, retainedDefaultAccountProfileId);
+        const nextDefaultAccountProfileId = preferred?.id ?? null;
+        writeStr("pc.lastOpenAIAccountProfileId", nextDefaultAccountProfileId);
         return {
           openAIAccounts,
           openAIAccountsError: discoveryError,
           openAIModelCatalogs,
-          lastOpenAIAccountProfileId,
+          lastOpenAIAccountProfileId: nextDefaultAccountProfileId,
           openAIModels: preferred
             ? modelsForOpenAIProfile(preferred.id, openAIModelCatalogs)
             : state.openAIAuthStatus?.available === false
@@ -3366,6 +3417,14 @@ export const useStore = create<AppState>((set, get) => ({
               : OPENAI_FALLBACK_MODELS,
         };
       });
+      const nextDefaultAccountProfileId = get().lastOpenAIAccountProfileId;
+      if (nextDefaultAccountProfileId) {
+        try {
+          await get().loadOpenAIAccountModels(nextDefaultAccountProfileId);
+        } catch (error) {
+          set({ openAIAuthError: errMessage(error) });
+        }
+      }
     } catch (err) {
       set({ openAIAuthError: errMessage(err) });
     }
@@ -3462,21 +3521,23 @@ export const useStore = create<AppState>((set, get) => ({
     const session = get().sessions.find((candidate) => candidate.id === sessionId);
     const account = get().openAIAccounts.find((candidate) => candidate.id === accountProfileId);
     const run = get().runs[runKey(sessionId)];
-    if (!session || session.accountProfileId) return;
+    if (!session) return "error";
+    if (session.accountProfileId === accountProfileId && account?.state === "connected") {
+      return "selected";
+    }
     if (run?.streaming || run?.finalizing || run?.pendingPermission) {
       set({ openAIAuthError: "Wait for this conversation's active turn to finish." });
-      return;
+      return "error";
     }
     if (!account || account.state !== "connected") {
       set({ openAIAuthError: "Choose a connected ChatGPT account." });
-      return;
+      return "error";
     }
     try {
       const models = await get().loadOpenAIAccountModels(accountProfileId);
-      if (!models.some((model) => model.id === session.model)) {
-        throw new Error("This session's model is not available to the selected ChatGPT account.");
-      }
-      let pinned = await ipc.pinSessionOpenAIAccount(sessionId, accountProfileId);
+      const selectedModel = models.find((model) => model.id === session.model) ?? models[0];
+      if (!selectedModel) throw new Error("This ChatGPT account has no compatible model.");
+      let pinned = await ipc.pinSessionOpenAIAccount(sessionId, accountProfileId, selectedModel.id);
       // Compatibility with a transitional native command that performed the CAS
       // but returned unit: reload and require authoritative confirmation.
       if (!pinned) {
@@ -3489,9 +3550,15 @@ export const useStore = create<AppState>((set, get) => ({
         sessions: state.sessions.map((candidate) =>
           candidate.id === sessionId ? { ...candidate, ...pinned } : candidate,
         ),
+        ...(state.lastOpenAIAccountProfileId === accountProfileId
+          ? { openAIModels: modelsForOpenAIProfile(accountProfileId, state.openAIModelCatalogs) }
+          : {}),
       }));
+      return "selected";
     } catch (error) {
-      set({ openAIAuthError: errMessage(error) });
+      const message = errMessage(error);
+      set({ openAIAuthError: message });
+      return message.includes("already started") ? "locked" : "error";
     }
   },
 
@@ -4438,7 +4505,7 @@ function remoteCommandRejectionMessage(code?: string, rawMessage?: string): stri
   if (message) return message;
   switch (code) {
     case "open_ai_account_selection_required":
-      return "Choose a ChatGPT account on the desktop, then try again.";
+      return "Configure a default ChatGPT account on the desktop, then try again.";
     case "invalid_desktop_configuration":
       return "Review the desktop account and model settings, then try again.";
     case "desktop_unavailable":

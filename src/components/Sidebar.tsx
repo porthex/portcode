@@ -12,7 +12,7 @@ import {
   type SidebarRow,
   type SessionActivityStatus,
 } from "../lib/sessionView";
-import { modelsForOpenAIProfile, preferredOpenAIAccount, useStore } from "../store/store";
+import { modelsForOpenAIProfile, useStore } from "../store/store";
 import {
   openAIAccountLabel,
   providerForModel,
@@ -47,423 +47,37 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/**
- * One account-aware creation surface shared by the full sidebar and collapsed
- * rail. The full form becomes a split control only when there is a meaningful
- * account choice; its primary half always stays the one-click last-used path.
- */
+/** Every creation surface shares this one trigger. GPT chats inherit the default
+ * ChatGPT account configured in Settings without exposing account controls here. */
 export function NewSessionControl({ compact = false }: { compact?: boolean }) {
-  const settings = useStore((state) => state.settings);
-  const openAIModels = useStore((state) => state.openAIModels);
-  const modelCatalogs = useStore((state) => state.openAIModelCatalogs);
-  const accounts = useStore((state) => state.openAIAccounts);
-  const accountsLoading = useStore((state) => state.openAIAccountsLoading);
-  const accountsError = useStore((state) => state.openAIAccountsError);
-  const capability = useStore((state) => state.openAIAuthStatus);
-  const lastUsed = useStore((state) => state.lastOpenAIAccountProfileId);
   const creating = useStore((state) => state.creatingSession);
   const remoteConnected = useStore((state) => state.remoteConnected);
   const newSession = useStore((state) => state.newSession);
-  const refreshAccounts = useStore((state) => state.refreshOpenAIStatus);
-  const loadModels = useStore((state) => state.loadOpenAIAccountModels);
-  const setShowSettings = useStore((state) => state.setShowSettings);
-  const [open, setOpen] = useState(false);
-  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
-  const [selectedModelId, setSelectedModelId] = useState("");
-  const [pendingAlternateCreate, setPendingAlternateCreate] = useState<{
-    accountId: string;
-    modelId: string;
-  } | null>(null);
-  const rootRef = useRef<HTMLDivElement>(null);
+  const disabled = creating || remoteConnected;
+  const label = remoteConnected ? "New session unavailable" : "New session";
 
-  const openAI = providerForModel(settings.model, openAIModels) === "openai";
-  const connected = accounts.filter((account) => account.state === "connected");
-  const preferred = preferredOpenAIAccount(connected, lastUsed);
-  const selected = connected.find((account) => account.id === selectedAccountId) ?? preferred;
-  const selectedId = selected?.id;
-  const selectedAccountIsConnected = Boolean(
-    selectedAccountId && connected.some((account) => account.id === selectedAccountId),
-  );
-  const selectedCatalog = selected ? modelCatalogs[selected.id] : undefined;
-  const selectedModels = selectedCatalog?.status === "ready" ? selectedCatalog.models : [];
-  const selectedModel =
-    selectedModels.find((model) => model.id === selectedModelId) ??
-    selectedModels.find((model) => model.id === settings.model) ??
-    selectedModels[0];
-  const unavailable = capability?.available === false;
-  const reconnectOnly = connected.length === 0 && accounts.length > 0;
-
-  useEffect(() => {
-    if (!openAI) return;
-    if (selectedAccountIsConnected) return;
-    setSelectedAccountId(preferred?.id ?? null);
-  }, [openAI, preferred?.id, selectedAccountId, selectedAccountIsConnected]);
-
-  useEffect(() => {
-    if (
-      !openAI ||
-      !selectedId ||
-      unavailable ||
-      remoteConnected ||
-      (selectedCatalog && selectedCatalog.status !== "idle")
-    ) {
-      return;
-    }
-    void loadModels(selectedId).catch(() => undefined);
-  }, [loadModels, openAI, remoteConnected, selectedId, selectedCatalog, unavailable]);
-
-  useEffect(() => {
-    if (!selectedId || selectedCatalog?.status !== "ready") {
-      if (selectedModelId) setSelectedModelId("");
-      return;
-    }
-    if (selectedCatalog.models.some((model) => model.id === selectedModelId)) return;
-    const next =
-      selectedCatalog.models.find((model) => model.id === settings.model) ??
-      selectedCatalog.models[0];
-    setSelectedModelId(next?.id ?? "");
-  }, [selectedId, selectedCatalog, selectedModelId, settings.model]);
-
-  useEffect(() => {
-    if (!pendingAlternateCreate) return;
-    // The zero-delay handoff runs after React commits the chosen account/model,
-    // so a disjoint-catalog fallback is visible before creation starts while the
-    // alternate-account path still costs only one additional selection.
-    const timer = window.setTimeout(() => {
-      const pending = pendingAlternateCreate;
-      setPendingAlternateCreate(null);
-      setOpen(false);
-      void newSession(pending.accountId, pending.modelId);
-    }, 0);
-    return () => window.clearTimeout(timer);
-  }, [newSession, pendingAlternateCreate]);
-
-  useEffect(() => {
-    if (!open) return;
-    const closeOnOutsidePress = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
-    };
-    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false);
-    };
-    document.addEventListener("pointerdown", closeOnOutsidePress);
-    document.addEventListener("keydown", closeOnEscape);
-    return () => {
-      document.removeEventListener("pointerdown", closeOnOutsidePress);
-      document.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [open]);
-
-  const baseTitle = creating ? "Creating a session…" : "New session";
-  if (!openAI) {
-    return (
-      <button
-        type="button"
-        onClick={() => void newSession()}
-        disabled={creating}
-        aria-label="New session"
-        title={baseTitle}
-        className={
-          compact
-            ? `pc-rail-btn pc-rail-btn--accent ${creating ? "cursor-not-allowed opacity-50" : ""}`
-            : `pc-newsession ${creating ? "cursor-not-allowed opacity-50" : ""}`
-        }
-      >
-        <span className={compact ? "text-[17px] leading-none" : "text-[15px] leading-none"}>+</span>
-        {!compact && "NEW SESSION"}
-      </button>
-    );
-  }
-
-  const creationBlockedReason = remoteConnected
-    ? "ChatGPT session creation is unavailable from paired devices in this release."
-    : unavailable
-      ? (capability?.unavailableReason ?? "ChatGPT subscription access is unavailable.")
-      : selected &&
-          (!selectedCatalog ||
-            selectedCatalog.status === "idle" ||
-            selectedCatalog.status === "loading")
-        ? "Loading this account's models…"
-        : selectedCatalog?.status === "error"
-          ? (selectedCatalog.error ?? "This account's model catalogue is unavailable.")
-          : selected && !selectedModel
-            ? "No compatible OpenAI models are available for this account."
-            : null;
-
-  if (compact) {
-    const compactModelsLoading = Boolean(
-      selected &&
-      (!selectedCatalog ||
-        selectedCatalog.status === "idle" ||
-        selectedCatalog.status === "loading"),
-    );
-    const compactModelsEmpty = Boolean(
-      selected && selectedCatalog?.status === "ready" && !selectedModel,
-    );
-    const compactDisabled =
-      creating ||
-      remoteConnected ||
-      (accountsLoading && accounts.length === 0) ||
-      compactModelsLoading ||
-      compactModelsEmpty;
-    const compactAction = () => {
-      if (remoteConnected) return;
-      if (unavailable || reconnectOnly) setShowSettings(true);
-      else if (accountsLoading && accounts.length === 0) return;
-      else if (accountsError && accounts.length === 0) void refreshAccounts();
-      else if (!selected) setShowSettings(true);
-      else if (selectedCatalog?.status === "error") {
-        void loadModels(selected.id, true).catch(() => undefined);
-      } else if (selectedModel) void newSession(selected.id, selectedModel.id);
-    };
-    const compactLabel = remoteConnected
-      ? "New session unavailable"
-      : accountsLoading && accounts.length === 0
-        ? "Loading ChatGPT accounts"
-        : accountsError && accounts.length === 0
-          ? "Retry ChatGPT accounts"
-          : unavailable
-            ? "Manage ChatGPT accounts"
-            : reconnectOnly
-              ? "Reconnect ChatGPT account"
-              : !selected
-                ? "Add ChatGPT account"
-                : selectedCatalog?.status === "error"
-                  ? "Retry ChatGPT models"
-                  : compactModelsLoading
-                    ? "Loading ChatGPT models"
-                    : compactModelsEmpty
-                      ? "No ChatGPT models available"
-                      : `New session with ${openAIAccountLabel(selected, accounts)}`;
-    return (
-      <button
-        type="button"
-        onClick={compactAction}
-        disabled={compactDisabled}
-        aria-label={compactLabel}
-        title={creationBlockedReason ?? compactLabel}
-        className={`pc-rail-btn pc-rail-btn--accent ${compactDisabled ? "cursor-not-allowed opacity-50" : ""}`}
-      >
-        <span className="text-[17px] leading-none">+</span>
-      </button>
-    );
-  }
-
-  if (!selected) {
-    const registryFailed = Boolean(accountsError);
-    const actionLabel = remoteConnected
-      ? "CHATGPT CREATION UNAVAILABLE"
-      : accountsLoading
-        ? "LOADING CHATGPT ACCOUNTS…"
-        : registryFailed
-          ? "RETRY CHATGPT ACCOUNTS"
-          : unavailable
-            ? "MANAGE CHATGPT ACCOUNTS"
-            : reconnectOnly
-              ? "RECONNECT CHATGPT ACCOUNT"
-              : "ADD CHATGPT ACCOUNT";
-    const accessibleLabel = remoteConnected
-      ? "ChatGPT creation unavailable"
-      : accountsLoading
-        ? "Loading ChatGPT accounts"
-        : registryFailed
-          ? "Retry ChatGPT accounts"
-          : unavailable
-            ? "Manage ChatGPT accounts"
-            : reconnectOnly
-              ? "Reconnect ChatGPT account"
-              : "Add ChatGPT account";
-    const action = () => {
-      if (registryFailed) void refreshAccounts();
-      else if (!remoteConnected && !accountsLoading) setShowSettings(true);
-    };
-    return (
-      <div className="pc-newsession-recovery" role="status">
-        <button
-          type="button"
-          onClick={action}
-          disabled={creating || remoteConnected || accountsLoading}
-          aria-label={accessibleLabel}
-          title={
-            remoteConnected
-              ? (creationBlockedReason ?? undefined)
-              : registryFailed
-                ? (accountsError ?? undefined)
-                : reconnectOnly
-                  ? "Reconnect a saved ChatGPT profile in Settings"
-                  : "Manage ChatGPT accounts in Settings"
-          }
-          className={`pc-newsession ${creating || remoteConnected || accountsLoading ? "cursor-not-allowed opacity-50" : ""}`}
-        >
-          <span className="text-[15px] leading-none">+</span>
-          {actionLabel}
-        </button>
-        {registryFailed && accounts.length > 0 && (
-          <button
-            type="button"
-            className="pc-newsession-recovery__manage"
-            onClick={() => setShowSettings(true)}
-          >
-            Manage saved accounts
-          </button>
-        )}
-      </div>
-    );
-  }
-
-  const split = true;
-  const accountLabel = openAIAccountLabel(selected, accounts);
-  const selectedModelLabel =
-    selectedModel?.label ??
-    (selectedCatalog?.status === "error" ? "MODEL UNAVAILABLE" : "LOADING MODELS…");
-  const modelAdjusted = Boolean(selectedModel && selectedModel.id !== settings.model);
   return (
-    <div ref={rootRef} className="pc-newsession-split">
-      <button
-        type="button"
-        onClick={() => selectedModel && void newSession(selected.id, selectedModel.id)}
-        disabled={creating || Boolean(creationBlockedReason)}
-        aria-label={`New session with ${accountLabel}`}
-        title={
-          creationBlockedReason ?? `${baseTitle} with ${accountLabel} using ${selectedModelLabel}`
-        }
-        className={`pc-newsession pc-newsession-split__primary ${creating || creationBlockedReason ? "cursor-not-allowed opacity-50" : ""}`}
-      >
-        <span className="text-[15px] leading-none">+</span>
-        <span className="pc-newsession-choice">
-          <span className="min-w-0 truncate">NEW SESSION</span>
-          <span className="pc-newsession-choice__row">
-            <span>ACCOUNT</span>
-            <strong>{accountLabel}</strong>
-          </span>
-          <span className="pc-newsession-choice__row">
-            <span>MODEL</span>
-            <strong>
-              {selectedModelLabel}
-              {modelAdjusted ? " · ACCOUNT DEFAULT" : ""}
-            </strong>
-          </span>
-        </span>
-      </button>
-      {split && (
-        <button
-          type="button"
-          aria-label="Choose ChatGPT account and model for new session"
-          aria-haspopup="menu"
-          aria-expanded={open}
-          disabled={creating || remoteConnected || unavailable}
-          onClick={() => setOpen((current) => !current)}
-          className="pc-newsession-split__menu"
-          title="Choose the ChatGPT account and model"
-        >
-          ▾
-        </button>
-      )}
-      {open && split && (
-        <div className="pc-newsession-menu" role="menu" aria-label="ChatGPT accounts">
-          <div className="pc-newsession-menu__heading">CREATE WITH</div>
-          {accounts.map((account) => {
-            const enabled = account.state === "connected";
-            const label = openAIAccountLabel(account, accounts);
-            return (
-              <button
-                key={account.id}
-                type="button"
-                role="menuitem"
-                disabled={!enabled || creating || pendingAlternateCreate !== null}
-                onClick={async () => {
-                  if (account.id === selected.id) {
-                    setOpen(false);
-                    return;
-                  }
-                  const previousModelId = selectedModel?.id ?? settings.model;
-                  setSelectedAccountId(account.id);
-                  setSelectedModelId("");
-                  setOpen(true);
-                  try {
-                    const cached = modelCatalogs[account.id];
-                    const models =
-                      cached?.status === "ready" ? cached.models : await loadModels(account.id);
-                    const model =
-                      models.find((candidate) => candidate.id === previousModelId) ?? models[0];
-                    if (!model) return;
-                    setSelectedModelId(model.id);
-                    setPendingAlternateCreate({ accountId: account.id, modelId: model.id });
-                  } catch {
-                    // The profile-scoped catalogue state already carries the
-                    // actionable error and Retry control; keep the menu open.
-                  }
-                }}
-                className="pc-newsession-menu__item"
-              >
-                <span className={`pc-dot ${enabled ? "pc-dot--success" : "pc-dot--warn"}`} />
-                <span className="min-w-0 flex-1 truncate text-left">{label}</span>
-                <span>
-                  {account.tier?.replace(/^ChatGPT\s+/i, "") ?? account.state.replace(/_/g, " ")}
-                </span>
-                {account.id === selected.id && <span aria-hidden="true">✓</span>}
-              </button>
-            );
-          })}
-          {selectedCatalog?.status === "ready" && selectedModels.length > 0 && (
-            <label className="pc-newsession-menu__model">
-              <span>MODEL FOR {accountLabel.toLocaleUpperCase()}</span>
-              <select
-                aria-label="Model for new ChatGPT session"
-                value={selectedModel?.id ?? ""}
-                onChange={(event) => setSelectedModelId(event.target.value)}
-              >
-                {selectedModels.map((model) => (
-                  <option key={model.id} value={model.id}>
-                    {model.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-          )}
-          {selectedCatalog?.status === "loading" && (
-            <div className="pc-newsession-menu__empty" role="status">
-              Loading account models…
-            </div>
-          )}
-          {selectedCatalog?.status === "error" && (
-            <div className="pc-newsession-menu__error" role="alert">
-              <span>{selectedCatalog.error ?? "Model catalogue unavailable"}</span>
-              <button
-                type="button"
-                onClick={() => void loadModels(selected.id, true).catch(() => undefined)}
-              >
-                Retry models
-              </button>
-            </div>
-          )}
-          {pendingAlternateCreate && selectedModel && (
-            <div className="pc-newsession-menu__pending" role="status" aria-live="polite">
-              Creating with {accountLabel} using {selectedModel.label}…
-            </div>
-          )}
-          {accountsError && (
-            <div className="pc-newsession-menu__error" role="alert">
-              <span>Account refresh failed</span>
-              <button type="button" onClick={() => void refreshAccounts()}>
-                Retry
-              </button>
-            </div>
-          )}
-          <button
-            type="button"
-            role="menuitem"
-            onClick={() => {
-              setOpen(false);
-              setShowSettings(true);
-            }}
-            className="pc-newsession-menu__manage"
-          >
-            Manage accounts…
-          </button>
-        </div>
-      )}
-    </div>
+    <button
+      type="button"
+      onClick={() => void newSession()}
+      disabled={disabled}
+      aria-label={label}
+      title={
+        remoteConnected
+          ? "New conversations must be created on the paired desktop in this release."
+          : creating
+            ? "Creating a session…"
+            : "New session"
+      }
+      className={
+        compact
+          ? `pc-rail-btn pc-rail-btn--accent ${disabled ? "cursor-not-allowed opacity-50" : ""}`
+          : `pc-newsession ${disabled ? "cursor-not-allowed opacity-50" : ""}`
+      }
+    >
+      <span className={compact ? "text-[17px] leading-none" : "text-[15px] leading-none"}>+</span>
+      {!compact && "NEW SESSION"}
+    </button>
   );
 }
 
@@ -544,7 +158,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         ? `Using ${openAIAccountLabel(activeAccount, openAIAccounts)}`
         : activeSession?.accountProfileId
           ? "This ChatGPT account needs attention"
-          : "Choose the ChatGPT account for this legacy session"
+          : "Choose a default ChatGPT account in Settings"
       : signedInClaude
         ? "Signed in with Claude"
         : settings.apiKeySet
@@ -867,7 +481,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
     try {
       if (action.kind === "archive") {
         await toggleArchived(action.session.id, true);
-      } else {
+      } else if (action.kind === "delete") {
         await deleteSession(action.session.id);
       }
       closeSessionDialog();
@@ -1103,7 +717,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
             ? openAIAccountsError
               ? "account unavailable"
               : "removed account"
-            : "account not chosen"
+            : "default account pending"
         : null;
     const rowEl = (
       <div
@@ -1629,7 +1243,7 @@ function SessionRail() {
         ? `Using ${openAIAccountLabel(activeAccount, openAIAccounts)}`
         : activeSession?.accountProfileId
           ? "This ChatGPT account needs attention"
-          : "Choose the ChatGPT account for this legacy session"
+          : "Choose a default ChatGPT account in Settings"
       : oauthStatus?.signedIn
         ? "Signed in with Claude"
         : settings.apiKeySet

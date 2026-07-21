@@ -307,6 +307,7 @@ describe("Tauri command serialization", () => {
     expect(invoke).toHaveBeenCalledWith("pin_session_openai_account", {
       sessionId: "legacy",
       accountProfileId: "00000000-0000-4000-8000-000000000001",
+      model: null,
     });
     expect(invoke).toHaveBeenCalledWith("rename_session", { id: "s1", title: "Renamed" });
     expect(invoke).toHaveBeenCalledWith("update_session_model", {
@@ -1060,7 +1061,7 @@ describe("browser fallback (no Tauri core)", () => {
     await expect(ipc.openaiModels(account.id)).resolves.toHaveLength(3);
   });
 
-  it("browser sessions enforce account-scoped creation and null-only legacy pinning", async () => {
+  it("browser sessions allow account selection until a conversation starts", async () => {
     const { ipc } = await load();
     const unknownProfileId = "00000000-0000-4000-8000-000000000099";
 
@@ -1084,20 +1085,37 @@ describe("browser fallback (no Tauri core)", () => {
     expect(await ipc.listSessions()).toContainEqual(created);
     expect((await ipc.listOpenAIAccounts())[0].lastUsedAt).toEqual(expect.any(Number));
 
-    const legacy = await ipc.createSession("legacy", "Legacy", null, "gpt-5.6-sol", null);
-    const pinned = await ipc.pinSessionOpenAIAccount(legacy.id, account.id);
-    expect(pinned.accountProfileId).toBe(account.id);
-    await expect(ipc.pinSessionOpenAIAccount(legacy.id, account.id)).rejects.toThrow(
-      /already pinned/i,
+    await expect(
+      ipc.createSession("missing-default", "Missing default", null, "gpt-5.6-sol", null),
+    ).rejects.toThrow(/default ChatGPT account/i);
+    await expect(ipc.pinSessionOpenAIAccount(created.id, account.id)).resolves.toMatchObject({
+      accountProfileId: account.id,
+    });
+    const secondAccount = await ipc.startOpenAIAccountLogin();
+    await expect(
+      ipc.pinSessionOpenAIAccount(created.id, secondAccount.id, "gpt-5.6-terra"),
+    ).resolves.toMatchObject({
+      accountProfileId: secondAccount.id,
+      model: "gpt-5.6-terra",
+    });
+    await ipc.runAgent(created.id, "start the chat", () => undefined);
+    await expect(ipc.pinSessionOpenAIAccount(created.id, account.id)).rejects.toThrow(
+      /already started.*new chat/i,
     );
     await expect(ipc.pinSessionOpenAIAccount("missing", account.id)).rejects.toThrow(/not found/i);
 
-    const unpinned = await ipc.createSession("unpinned", "Unpinned", null, "gpt-5.6-sol", null);
+    const removedAccountSession = await ipc.createSession(
+      "removed-account",
+      "Removed account",
+      null,
+      "gpt-5.6-sol",
+      account.id,
+    );
     await ipc.removeOpenAIAccount(account.id);
     await expect(
       ipc.createSession("removed", "Removed", null, "gpt-5.6-sol", account.id),
     ).rejects.toThrow(/connected ChatGPT account/i);
-    await expect(ipc.pinSessionOpenAIAccount(unpinned.id, account.id)).rejects.toThrow(
+    await expect(ipc.pinSessionOpenAIAccount(removedAccountSession.id, account.id)).rejects.toThrow(
       /connected ChatGPT account/i,
     );
     await expect(ipc.reconnectOpenAIAccount(unknownProfileId)).rejects.toThrow(/not found/i);

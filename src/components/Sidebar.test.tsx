@@ -278,396 +278,88 @@ describe("Sidebar", () => {
     expect(st.sessions[0].id).toBe(st.activeId);
   });
 
-  describe("ChatGPT account-aware new session control", () => {
-    const model = {
-      id: "gpt-live",
-      label: "GPT Live",
-      provider: "openai" as const,
-      reasoningEfforts: ["medium" as const],
-      defaultReasoningEffort: "medium" as const,
-    };
-
-    const seed = (accounts: OpenAIAccountSummary[]) => {
-      const catalogs = Object.fromEntries(
-        accounts
-          .filter((account) => account.state === "connected")
-          .map((account) => [
-            account.id,
-            { status: "ready" as const, models: [model], error: null },
-          ]),
-      );
+  describe("default-account new session control", () => {
+    it("keeps account details out of the control and assigns the configured default", async () => {
+      const connected = openAIAccount();
+      const model = {
+        id: "gpt-live",
+        label: "GPT Live",
+        provider: "openai" as const,
+        reasoningEfforts: ["high" as const],
+        defaultReasoningEffort: "high" as const,
+      };
+      const removed = openAIAccount({
+        id: "00000000-0000-4000-8000-000000000002",
+        accountLabel: "removed@chatgpt.test",
+        state: "removed",
+        expiresAt: null,
+      });
       useStore.setState({
         sessions: [session({ id: "old" })],
         activeId: "old",
-        settings: settings({ provider: "openai", model: model.id }),
-        openAIAuthStatus: {
-          signedIn: accounts.some((account) => account.state === "connected"),
-          expiresAt: null,
-          account: null,
-          tier: null,
-          available: true,
-        },
-        openAIAccounts: accounts,
-        openAIModelCatalogs: catalogs,
+        settings: settings({ provider: "openai", model: "gpt-live" }),
+        openAIAccounts: [connected, removed],
         openAIModels: [model],
+        openAIModelCatalogs: {
+          [connected.id]: { status: "ready", models: [model], error: null },
+        },
+        lastOpenAIAccountProfileId: connected.id,
       });
-    };
 
-    it("creates with the only connected profile in one click", async () => {
-      const account = openAIAccount();
-      seed([account]);
-      render(<Sidebar />);
+      const { container } = render(<Sidebar />);
+      expect(screen.getByRole("button", { name: "New session" })).toBeInTheDocument();
+      expect(container).not.toHaveTextContent(connected.accountLabel!);
+      expect(container).not.toHaveTextContent(removed.accountLabel!);
+      expect(
+        screen.queryByRole("button", { name: /Choose ChatGPT account.*new session/i }),
+      ).not.toBeInTheDocument();
 
-      fireEvent.click(
-        screen.getByRole("button", { name: `New session with ${account.accountLabel}` }),
-      );
+      fireEvent.click(screen.getByRole("button", { name: "New session" }));
 
-      await waitFor(() => expect(m.createSession).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(m.createSession).toHaveBeenCalledOnce());
       expect(m.createSession).toHaveBeenCalledWith(
         expect.any(String),
         "New chat",
         null,
-        model.id,
-        account.id,
+        "gpt-live",
+        connected.id,
       );
+      expect(useStore.getState().sessions[0].accountProfileId).toBe(connected.id);
     });
 
-    it("uses the last confirmed profile on the main action and one extra click for alternatives", async () => {
-      const first = openAIAccount();
-      const second = openAIAccount({
-        id: "00000000-0000-4000-8000-000000000002",
-        accountLabel: "two@chatgpt.test",
-      });
-      seed([first, second]);
-      useStore.setState({ lastOpenAIAccountProfileId: second.id });
-      render(<Sidebar />);
-
-      expect(
-        screen.getByRole("button", { name: "New session with two@chatgpt.test" }),
-      ).toBeInTheDocument();
-      fireEvent.click(
-        screen.getByRole("button", {
-          name: "Choose ChatGPT account and model for new session",
-        }),
-      );
-      fireEvent.click(screen.getByRole("menuitem", { name: /one@chatgpt\.test/i }));
-
-      await waitFor(() => expect(m.createSession).toHaveBeenCalledTimes(1));
-      expect(m.createSession.mock.calls[0][4]).toBe(first.id);
-    });
-
-    it("never changes an existing session badge when New Session selection and MRU change", async () => {
-      const first = openAIAccount();
-      const second = openAIAccount({
-        id: "00000000-0000-4000-8000-000000000002",
-        accountLabel: "two@chatgpt.test",
-      });
-      seed([first, second]);
-      useStore.setState({
-        sessions: [
-          session({
-            id: "pinned-existing",
-            title: "Pinned existing",
-            model: model.id,
-            accountProfileId: first.id,
-          }),
-        ],
-        activeId: "pinned-existing",
-        lastOpenAIAccountProfileId: first.id,
-      });
-      render(<Sidebar />);
-
-      expect(screen.getByTitle("ChatGPT account: one@chatgpt.test")).toBeInTheDocument();
-      fireEvent.click(
-        screen.getByRole("button", {
-          name: "Choose ChatGPT account and model for new session",
-        }),
-      );
-      fireEvent.click(screen.getByRole("menuitem", { name: /two@chatgpt\.test/i }));
-
-      await waitFor(() => expect(m.createSession).toHaveBeenCalledTimes(1));
-      expect(useStore.getState().lastOpenAIAccountProfileId).toBe(second.id);
-      expect(
-        useStore.getState().sessions.find((item) => item.id === "pinned-existing")
-          ?.accountProfileId,
-      ).toBe(first.id);
-      expect(screen.getByTitle("ChatGPT account: one@chatgpt.test")).toBeInTheDocument();
-    });
-
-    it("uses backend account recency when no local successful-create preference exists", () => {
-      const older = openAIAccount({ lastUsedAt: 100 });
-      const newer = openAIAccount({
-        id: "00000000-0000-4000-8000-000000000002",
-        accountLabel: "recent@chatgpt.test",
-        lastUsedAt: 200,
-      });
-      seed([older, newer]);
-      useStore.setState({ lastOpenAIAccountProfileId: null });
-      render(<Sidebar />);
-
-      expect(
-        screen.getByRole("button", { name: "New session with recent@chatgpt.test" }),
-      ).toBeInTheDocument();
-    });
-
-    it("distinguishes true zero, loading, and capability-off recovery states", () => {
-      seed([]);
-      const view = render(<Sidebar />);
-
-      fireEvent.click(screen.getByRole("button", { name: "Add ChatGPT account" }));
-      expect(useStore.getState().showSettings).toBe(true);
-      expect(m.createSession).not.toHaveBeenCalled();
-
-      useStore.setState({ showSettings: false, openAIAccountsLoading: true });
-      view.rerender(<Sidebar />);
-      expect(screen.getByRole("button", { name: "Loading ChatGPT accounts" })).toBeDisabled();
-      expect(screen.getByText(/LOADING CHATGPT ACCOUNTS/)).toBeInTheDocument();
-
-      useStore.setState({
-        openAIAccountsLoading: false,
-        openAIAuthStatus: {
-          signedIn: false,
-          expiresAt: null,
-          account: null,
-          tier: null,
-          available: false,
-          unavailableReason: "Disabled in this build",
-        },
-      });
-      view.rerender(<Sidebar />);
-      const manage = screen.getByRole("button", { name: "Manage ChatGPT accounts" });
-      expect(manage).toBeEnabled();
-      expect(screen.getByText("MANAGE CHATGPT ACCOUNTS")).toBeInTheDocument();
-      fireEvent.click(manage);
-      expect(useStore.getState().showSettings).toBe(true);
-    });
-
-    it("offers Retry for discovery failure and Manage/Reconnect for saved profiles", () => {
-      const refresh = vi.fn(async () => {});
-      seed([]);
-      useStore.setState({
-        openAIAccountsError: "registry locked",
-        refreshOpenAIStatus: refresh,
-      });
-      const view = render(<Sidebar />);
-
-      fireEvent.click(screen.getByRole("button", { name: "Retry ChatGPT accounts" }));
-      expect(refresh).toHaveBeenCalledOnce();
-
-      const removed = openAIAccount({ state: "reconnect_required", expiresAt: null });
-      useStore.setState({
-        openAIAccounts: [removed],
-        openAIAccountsError: null,
-        showSettings: false,
-      });
-      view.rerender(<Sidebar />);
-      fireEvent.click(screen.getByRole("button", { name: "Reconnect ChatGPT account" }));
-      expect(useStore.getState().showSettings).toBe(true);
-
-      useStore.setState({ showSettings: false, openAIAccountsError: "registry stale" });
-      view.rerender(<Sidebar />);
-      expect(screen.getByRole("button", { name: "Retry ChatGPT accounts" })).toBeInTheDocument();
-      fireEvent.click(screen.getByRole("button", { name: "Manage saved accounts" }));
-      expect(useStore.getState().showSettings).toBe(true);
-    });
-
-    it("surfaces registry refresh errors without disabling a known connected profile", () => {
+    it("uses the default from the collapsed rail too", async () => {
       const account = openAIAccount();
-      const refresh = vi.fn(async () => {});
-      seed([account]);
-      useStore.setState({
-        openAIAccountsError: "registry locked",
-        refreshOpenAIStatus: refresh,
-      });
-      render(<Sidebar />);
-
-      fireEvent.click(
-        screen.getByRole("button", {
-          name: "Choose ChatGPT account and model for new session",
-        }),
-      );
-      expect(screen.getByRole("alert")).toHaveTextContent("Account refresh failed");
-      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-      expect(refresh).toHaveBeenCalledOnce();
-    });
-
-    it("shows a disjoint-account model fallback before the alternate selection creates", async () => {
-      const first = openAIAccount();
-      const second = openAIAccount({
-        id: "00000000-0000-4000-8000-000000000002",
-        accountLabel: "two@chatgpt.test",
-      });
-      const alternateModel = {
-        ...model,
-        id: "gpt-alternate",
-        label: "GPT Alternate",
+      const model = {
+        id: "gpt-live",
+        label: "GPT Live",
+        provider: "openai" as const,
+        reasoningEfforts: ["high" as const],
+        defaultReasoningEffort: "high" as const,
       };
-      seed([first, second]);
       useStore.setState({
-        lastOpenAIAccountProfileId: first.id,
+        settings: settings({ provider: "openai", model: "gpt-live" }),
+        openAIAccounts: [account],
+        openAIModels: [model],
         openAIModelCatalogs: {
-          [first.id]: { status: "ready", models: [model], error: null },
-          [second.id]: { status: "ready", models: [alternateModel], error: null },
+          [account.id]: { status: "ready", models: [model], error: null },
         },
+        lastOpenAIAccountProfileId: account.id,
       });
-      render(<Sidebar />);
-
-      fireEvent.click(
-        screen.getByRole("button", {
-          name: "Choose ChatGPT account and model for new session",
-        }),
-      );
-      fireEvent.click(screen.getByRole("menuitem", { name: /two@chatgpt\.test/i }));
-
-      expect(screen.getByLabelText("Model for new ChatGPT session")).toHaveValue(alternateModel.id);
-      expect(
-        screen.getByText(/Creating with two@chatgpt\.test using GPT Alternate/),
-      ).toBeInTheDocument();
-      expect(m.createSession).not.toHaveBeenCalled();
-
-      await waitFor(() => expect(m.createSession).toHaveBeenCalledTimes(1));
-      expect(m.createSession.mock.calls[0].slice(3)).toEqual([alternateModel.id, second.id]);
-      expect(m.saveSettings).not.toHaveBeenCalled();
-    });
-
-    it("exposes the scoped model choice and uses it on the primary action", async () => {
-      const account = openAIAccount();
-      const secondModel = { ...model, id: "gpt-second", label: "GPT Second" };
-      seed([account]);
-      useStore.setState({
-        openAIModelCatalogs: {
-          [account.id]: { status: "ready", models: [model, secondModel], error: null },
-        },
-      });
-      render(<Sidebar />);
-
-      fireEvent.click(
-        screen.getByRole("button", {
-          name: "Choose ChatGPT account and model for new session",
-        }),
-      );
-      fireEvent.change(screen.getByLabelText("Model for new ChatGPT session"), {
-        target: { value: secondModel.id },
-      });
-      fireEvent.click(screen.getByRole("button", { name: "New session with one@chatgpt.test" }));
-
-      await waitFor(() => expect(m.createSession).toHaveBeenCalledOnce());
-      expect(m.createSession.mock.calls[0].slice(3)).toEqual([secondModel.id, account.id]);
-    });
-
-    it("retries a failed scoped model catalogue instead of offering stale choices", () => {
-      const account = openAIAccount();
-      const loadModels = vi.fn(async () => [model]);
-      seed([account]);
-      useStore.setState({
-        openAIModelCatalogs: {
-          [account.id]: { status: "error", models: [model], error: "catalogue offline" },
-        },
-        loadOpenAIAccountModels: loadModels,
-      });
-      render(<Sidebar />);
-
-      expect(
-        screen.getByRole("button", { name: "New session with one@chatgpt.test" }),
-      ).toBeDisabled();
-      fireEvent.click(
-        screen.getByRole("button", {
-          name: "Choose ChatGPT account and model for new session",
-        }),
-      );
-      expect(screen.queryByLabelText("Model for new ChatGPT session")).not.toBeInTheDocument();
-      expect(screen.getByRole("alert")).toHaveTextContent("catalogue offline");
-      fireEvent.click(screen.getByRole("button", { name: "Retry models" }));
-      expect(loadModels).toHaveBeenCalledWith(account.id, true);
-    });
-
-    it("disambiguates duplicate account labels without rendering either profile id", () => {
-      const first = openAIAccount({ accountLabel: null, createdAt: 1 });
-      const second = openAIAccount({
-        id: "00000000-0000-4000-8000-000000000002",
-        accountLabel: null,
-        createdAt: 2,
-      });
-      seed([first, second]);
-      const { container } = render(<Sidebar />);
-
-      expect(
-        screen.getByRole("button", { name: "New session with ChatGPT account 1" }),
-      ).toBeInTheDocument();
-      fireEvent.click(
-        screen.getByRole("button", {
-          name: "Choose ChatGPT account and model for new session",
-        }),
-      );
-      expect(screen.getByRole("menuitem", { name: /ChatGPT account 1/i })).toBeInTheDocument();
-      expect(screen.getByRole("menuitem", { name: /ChatGPT account 2/i })).toBeInTheDocument();
-      expect(container).not.toHaveTextContent(first.id);
-      expect(container).not.toHaveTextContent(second.id);
-    });
-
-    it("keeps the collapsed-rail account default as a one-click create", async () => {
-      const account = openAIAccount();
-      seed([account]);
       render(<NewSessionControl compact />);
 
-      fireEvent.click(screen.getByRole("button", { name: "New session with one@chatgpt.test" }));
+      fireEvent.click(screen.getByRole("button", { name: "New session" }));
 
       await waitFor(() => expect(m.createSession).toHaveBeenCalledOnce());
-      expect(m.createSession.mock.calls[0].slice(3)).toEqual([model.id, account.id]);
+      expect(m.createSession.mock.calls[0].slice(3)).toEqual(["gpt-live", account.id]);
     });
 
-    it("keeps compact loading, Retry, Reconnect, and model-error recovery honest", () => {
-      const refresh = vi.fn(async () => {});
-      seed([]);
-      useStore.setState({ openAIAccountsLoading: true, refreshOpenAIStatus: refresh });
-      const view = render(<NewSessionControl compact />);
-      expect(screen.getByRole("button", { name: "Loading ChatGPT accounts" })).toBeDisabled();
+    it("disables creation while the paired desktop owns session creation", () => {
+      useStore.setState({ remoteConnected: true });
+      render(<NewSessionControl />);
 
-      useStore.setState({ openAIAccountsLoading: false, openAIAccountsError: "registry locked" });
-      view.rerender(<NewSessionControl compact />);
-      fireEvent.click(screen.getByRole("button", { name: "Retry ChatGPT accounts" }));
-      expect(refresh).toHaveBeenCalledOnce();
-
-      useStore.setState({
-        openAIAccountsError: null,
-        openAIAccounts: [openAIAccount({ state: "reconnect_required", expiresAt: null })],
-        showSettings: false,
-      });
-      view.rerender(<NewSessionControl compact />);
-      fireEvent.click(screen.getByRole("button", { name: "Reconnect ChatGPT account" }));
-      expect(useStore.getState().showSettings).toBe(true);
-
-      const connected = openAIAccount();
-      const loadModels = vi.fn(async () => [model]);
-      useStore.setState({
-        openAIAccounts: [connected],
-        openAIModelCatalogs: {
-          [connected.id]: { status: "error", models: [], error: "catalogue offline" },
-        },
-        loadOpenAIAccountModels: loadModels,
-      });
-      view.rerender(<NewSessionControl compact />);
-      fireEvent.click(screen.getByRole("button", { name: "Retry ChatGPT models" }));
-      expect(loadModels).toHaveBeenCalledWith(connected.id, true);
-
-      useStore.setState({
-        openAIModelCatalogs: {
-          [connected.id]: { status: "loading", models: [], error: null },
-        },
-      });
-      view.rerender(<NewSessionControl compact />);
-      expect(screen.getByRole("button", { name: "Loading ChatGPT models" })).toBeDisabled();
-
-      useStore.setState({
-        openAIModelCatalogs: {
-          [connected.id]: { status: "ready", models: [], error: null },
-        },
-      });
-      view.rerender(<NewSessionControl compact />);
-      expect(screen.getByRole("button", { name: "No ChatGPT models available" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "New session unavailable" })).toBeDisabled();
     });
   });
-
   it("selects a session when its title is clicked", async () => {
     useStore.setState({
       sessions: [session({ id: "a", title: "First" }), session({ id: "b", title: "Second" })],
