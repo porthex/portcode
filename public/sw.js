@@ -12,7 +12,7 @@
 // This file is shipped verbatim to the browser (it is NOT bundled or type-checked);
 // the testable registration helper lives in src/lib/webClientLifecycle.ts.
 
-const CACHE = "portcode-shell-v1";
+const CACHE = "portcode-shell-v2";
 
 // The minimal shell. Hashed JS/CSS assets are cached on demand by the fetch handler
 // (their names change per build, so we can't list them here); these are the stable
@@ -111,7 +111,7 @@ self.addEventListener("push", (event) => {
     // Non-JSON / empty payload — keep the generic copy.
   }
 
-  const options = { body, icon: "/icon-192.png", badge: "/icon-192.png" };
+  const options = { body, icon: "/icon-192.png?v=2", badge: "/icon-192.png?v=2" };
   // `tag` (when present) collapses duplicate notifications for the same event.
   if (tag !== undefined) options.tag = tag;
 

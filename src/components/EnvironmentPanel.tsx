@@ -279,14 +279,14 @@ export function EnvironmentPanelTrigger({
           window.requestAnimationFrame(() => closeRef.current?.focus());
         }
       }}
-      className={`flex h-[31px] max-w-[210px] items-center gap-2 rounded-[7px] border px-2.5 font-mono text-[10px] outline-none transition-[background-color,border-color,box-shadow,color] duration-150 motion-reduce:transition-none ${
+      className={`pc-environment-trigger flex h-[31px] max-w-[210px] items-center gap-2 rounded-[7px] border px-2.5 font-mono text-[10px] outline-none transition-[background-color,border-color,box-shadow,color] duration-150 motion-reduce:transition-none ${
         open
           ? "border-accent-2/55 bg-accent-2/12 text-fg shadow-[0_0_18px_rgba(33,230,255,0.12)]"
           : "border-border-2 bg-panel-2/80 text-muted hover:border-accent-2/35 hover:text-fg"
       } focus-visible:border-accent-2/70 focus-visible:ring-2 focus-visible:ring-accent-2/15`}
     >
       <span
-        className={`pc-dot ${
+        className={`pc-environment-trigger__health pc-dot ${
           agentSummary.failed > 0
             ? "bg-danger"
             : agentSummary.running > 0
@@ -295,12 +295,14 @@ export function EnvironmentPanelTrigger({
         }`}
         aria-hidden="true"
       />
-      <span className="hidden max-w-[72px] truncate text-fg min-[900px]:inline">
+      <span className="pc-environment-trigger__repository max-w-[72px] truncate text-fg">
         {repositoryName}
       </span>
-      <span className="max-w-[82px] truncate text-accent-2">⑂ {head}</span>
+      <span className="pc-environment-trigger__branch max-w-[82px] truncate text-accent-2">
+        ⑂ {head}
+      </span>
       <span
-        className={`min-w-5 rounded-full px-1.5 py-0.5 text-center text-[9px] ${
+        className={`pc-environment-trigger__count min-w-5 rounded-full px-1.5 py-0.5 text-center text-[9px] ${
           agentSummary.failed > 0 ? "bg-danger/10 text-danger" : "bg-accent-2/10 text-accent-2"
         }`}
       >
@@ -308,7 +310,7 @@ export function EnvironmentPanelTrigger({
       </span>
       <span
         aria-hidden="true"
-        className={`text-[9px] text-faint transition-transform duration-300 ease-out motion-reduce:transition-none ${open ? "rotate-180" : ""}`}
+        className={`pc-environment-trigger__chevron text-[9px] text-faint transition-transform duration-300 ease-out motion-reduce:transition-none ${open ? "rotate-180" : ""}`}
       >
         ▾
       </span>

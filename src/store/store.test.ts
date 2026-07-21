@@ -380,7 +380,7 @@ describe("init", () => {
     expect(m.saveSettings).not.toHaveBeenCalled();
   });
 
-  it("keeps a disjoint persisted OpenAI choice visible and does not auto-create", async () => {
+  it("opens Settings instead of creating when the persisted model is disjoint from the default account", async () => {
     const account = openAIAccount();
     m.getSettings.mockResolvedValue({
       ...DEFAULT_SETTINGS,
@@ -417,7 +417,8 @@ describe("init", () => {
       sessions: [],
       activeId: null,
       showSettings: true,
-      openAIAuthError: "Choose a model available to one@chatgpt.test before creating this session.",
+      openAIAuthError:
+        "Choose a model available to the default ChatGPT account before creating a GPT chat.",
     });
     expect(m.saveSettings).not.toHaveBeenCalled();
   });
@@ -426,7 +427,7 @@ describe("init", () => {
     ["failed", new Error("catalogue offline"), "catalogue offline"],
     ["empty", [], "This account returned no compatible OpenAI models."],
   ])(
-    "keeps startup recoverable without auto-creating when the preferred OpenAI catalogue is %s",
+    "keeps catalogue failure visible and opens Settings when discovery is %s",
     async (_case, catalogueResult, expectedError) => {
       const account = openAIAccount();
       m.getSettings.mockResolvedValue({
@@ -620,7 +621,7 @@ describe("newSession", () => {
       t: "command_rejected",
       request_id: first.request_id,
       code: "open_ai_account_selection_required",
-      message: "Choose a ChatGPT account on the desktop, then try again.",
+      message: "Configure a default ChatGPT account on the desktop, then try again.",
     });
 
     expect(m.createSession).not.toHaveBeenCalled();
@@ -628,7 +629,7 @@ describe("newSession", () => {
       creatingSession: false,
       remoteConnected: true,
       remoteVerified: true,
-      remoteError: "Choose a ChatGPT account on the desktop, then try again.",
+      remoteError: "Configure a default ChatGPT account on the desktop, then try again.",
     });
 
     useStore.getState().clearRemoteError();
@@ -743,13 +744,13 @@ describe("newSession", () => {
     await useStore.getState().newSession(account.id);
     expect(useStore.getState()).toMatchObject({
       showSettings: true,
-      openAIAuthError: "Add a ChatGPT account before creating an OpenAI session.",
+      openAIAuthError: "Choose a default ChatGPT account in Settings first.",
       creatingSession: false,
     });
     expect(m.createSession).not.toHaveBeenCalled();
   });
 
-  it("routes bare OpenAI creation to registry recovery before claiming an account is missing", async () => {
+  it("blocks GPT chat creation while the account registry is unavailable", async () => {
     useStore.setState({
       settings: { ...DEFAULT_SETTINGS, model: "gpt-5.6-sol", provider: "openai" },
       openAIAccounts: [],
@@ -769,7 +770,7 @@ describe("newSession", () => {
     });
   });
 
-  it("uses the exact visible account-compatible model for no-arg creation", async () => {
+  it("uses the configured default account for no-arg OpenAI creation", async () => {
     const account = openAIAccount();
     const models: ModelInfo[] = [
       {
@@ -795,6 +796,7 @@ describe("newSession", () => {
         [account.id]: { status: "ready", models: [...models], error: null },
       },
       openAIModels: [...models],
+      lastOpenAIAccountProfileId: account.id,
     });
 
     await useStore.getState().newSession();
@@ -814,7 +816,7 @@ describe("newSession", () => {
     expect(useStore.getState().settings.model).toBe("gpt-live");
   });
 
-  it("routes disjoint no-arg OpenAI creation to visible recovery instead of models[0]", async () => {
+  it("blocks a model that the default account does not advertise", async () => {
     const account = openAIAccount();
     const models: ModelInfo[] = [
       {
@@ -840,6 +842,7 @@ describe("newSession", () => {
         [account.id]: { status: "ready", models, error: null },
       },
       openAIModels: models,
+      lastOpenAIAccountProfileId: account.id,
     });
 
     await useStore.getState().newSession();
@@ -4133,6 +4136,82 @@ describe("OpenAI account registry and scoped catalogues", () => {
     expect(useStore.getState().openAIAuthError).toBe("credential delete failed");
   });
 
+  it("promotes another connected account when the default account is removed", async () => {
+    const current = openAIAccount({ accountLabel: "current@chatgpt.test" });
+    const fallback = openAIAccount({
+      id: "00000000-0000-4000-8000-000000000002",
+      accountLabel: "fallback@chatgpt.test",
+    });
+    const removed = { ...current, state: "removed" as const, expiresAt: null };
+    const models = liveModels();
+    useStore.setState({
+      openAIAuthStatus: signedIn,
+      openAIAccounts: [current, fallback],
+      openAIModelCatalogs: {
+        [current.id]: { status: "ready", models, error: null },
+        [fallback.id]: { status: "ready", models, error: null },
+      },
+      openAIModels: models,
+      lastOpenAIAccountProfileId: current.id,
+    });
+    m.listOpenAIAccounts.mockResolvedValue([removed, fallback]);
+
+    await useStore.getState().removeOpenAIAccount(current.id);
+
+    expect(useStore.getState()).toMatchObject({
+      openAIAccounts: [removed, fallback],
+      lastOpenAIAccountProfileId: fallback.id,
+      openAIModels: models,
+    });
+  });
+
+  it("changes the Settings-managed default and reconciles an incompatible GPT model", async () => {
+    const first = openAIAccount({ accountLabel: "first@chatgpt.test" });
+    const second = openAIAccount({
+      id: "00000000-0000-4000-8000-000000000002",
+      accountLabel: "second@chatgpt.test",
+    });
+    const firstModels = liveModels();
+    const secondModels: ModelInfo[] = [
+      {
+        id: "gpt-second",
+        label: "GPT Second",
+        provider: "openai",
+        reasoningEfforts: ["low", "high"],
+        defaultReasoningEffort: "high",
+      },
+    ];
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS, provider: "openai", model: firstModels[0].id },
+      openAIAuthStatus: signedIn,
+      openAIAccounts: [first, second],
+      openAIModelCatalogs: {
+        [first.id]: { status: "ready", models: firstModels, error: null },
+        [second.id]: { status: "ready", models: secondModels, error: null },
+      },
+      openAIModels: firstModels,
+      lastOpenAIAccountProfileId: first.id,
+    });
+
+    await useStore.getState().setDefaultOpenAIAccount(second.id);
+
+    expect(useStore.getState()).toMatchObject({
+      lastOpenAIAccountProfileId: second.id,
+      openAIModels: secondModels,
+      settings: { model: "gpt-second", reasoningEffort: "high" },
+    });
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      model: "gpt-second",
+      reasoningEffort: "high",
+    });
+
+    await useStore.getState().setDefaultOpenAIAccount("missing-profile");
+    expect(useStore.getState().lastOpenAIAccountProfileId).toBe(second.id);
+    expect(useStore.getState().openAIAuthError).toBe(
+      "Choose a connected ChatGPT account as the default.",
+    );
+  });
+
   it("fails profile catalogue loads closed and reuses a confirmed cache", async () => {
     const account = openAIAccount();
     const missingProfileId = "00000000-0000-4000-8000-000000000099";
@@ -4189,7 +4268,7 @@ describe("OpenAI account registry and scoped catalogues", () => {
     });
   });
 
-  it("pins new sessions to the explicitly selected profile and remembers only confirmed creates", async () => {
+  it("pins explicit new sessions without changing the Settings-managed default", async () => {
     const account = openAIAccount();
     const models = [
       {
@@ -4219,7 +4298,7 @@ describe("OpenAI account registry and scoped catalogues", () => {
       account.id,
     );
     expect(useStore.getState().sessions[0].accountProfileId).toBe(account.id);
-    expect(useStore.getState().lastOpenAIAccountProfileId).toBe(account.id);
+    expect(useStore.getState().lastOpenAIAccountProfileId).toBeNull();
 
     const previous = openAIAccount({ id: "00000000-0000-4000-8000-000000000002" });
     useStore.setState({ lastOpenAIAccountProfileId: previous.id });
@@ -4309,7 +4388,7 @@ describe("OpenAI account registry and scoped catalogues", () => {
     expect(useStore.getState().messages[legacy.id]).toEqual([existing]);
   });
 
-  it("blocks unsafe legacy pin attempts and requires native confirmation", async () => {
+  it("blocks unsafe account selection, uses a visible compatible fallback, and requires native confirmation", async () => {
     const account = openAIAccount();
     const legacy = session({ model: "gpt-live", accountProfileId: null });
     useStore.setState({
@@ -4355,15 +4434,17 @@ describe("OpenAI account registry and scoped catalogues", () => {
       openAIAuthError: null,
     });
     await useStore.getState().pinSessionOpenAIAccount(legacy.id, account.id);
-    expect(useStore.getState().openAIAuthError).toMatch(/model is not available/i);
-    expect(m.pinSessionOpenAIAccount).not.toHaveBeenCalled();
+    expect(useStore.getState().openAIAuthError).toBeNull();
+    expect(m.pinSessionOpenAIAccount).toHaveBeenCalledWith(legacy.id, account.id, "gpt-other");
 
     useStore.setState({
+      sessions: [legacy],
       openAIModelCatalogs: {
         [account.id]: { status: "ready", models: liveModels(), error: null },
       },
       openAIAuthError: null,
     });
+    m.pinSessionOpenAIAccount.mockClear();
     m.pinSessionOpenAIAccount.mockResolvedValueOnce(legacy);
     await useStore.getState().pinSessionOpenAIAccount(legacy.id, account.id);
     expect(useStore.getState().openAIAuthError).toMatch(/did not confirm/i);

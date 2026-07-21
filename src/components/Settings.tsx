@@ -64,6 +64,7 @@ const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
       "OpenAI models",
       "GPT models",
       "OpenAI default model",
+      "Default ChatGPT account",
       "Reasoning level",
       "OpenAI subscription",
       "ChatGPT sign in",
@@ -147,6 +148,7 @@ const SETTINGS_TARGET_IDS: Record<string, string> = {
   "OpenAI models": "pc-setting-openai-model",
   "GPT models": "pc-setting-openai-model",
   "OpenAI default model": "pc-setting-openai-model",
+  "Default ChatGPT account": "pc-setting-openai",
   "Reasoning level": "pc-setting-openai-reasoning",
   "OpenAI subscription": "pc-setting-openai",
   "ChatGPT sign in": "pc-setting-openai",
@@ -225,6 +227,7 @@ export function SettingsPanel() {
   const loginWithOpenAI = useStore((s) => s.loginWithOpenAI);
   const reconnectOpenAIAccount = useStore((s) => s.reconnectOpenAIAccount);
   const removeOpenAIAccount = useStore((s) => s.removeOpenAIAccount);
+  const setDefaultOpenAIAccount = useStore((s) => s.setDefaultOpenAIAccount);
   const refreshOpenAIStatus = useStore((s) => s.refreshOpenAIStatus);
 
   const ambientRain = useStore((s) => s.ambientRain);
@@ -1037,6 +1040,38 @@ export function SettingsPanel() {
                         </div>
                       ) : (
                         <>
+                          {defaultOpenAIAccount && (
+                            <div className="mb-3 rounded-lg border border-border bg-panel-2 px-3 py-3">
+                              <label className="mb-1.5 block text-[12.5px] font-medium text-fg">
+                                Default ChatGPT account
+                              </label>
+                              <SelectMenu
+                                label="Default ChatGPT account"
+                                value={defaultOpenAIAccount.id}
+                                onChange={(next) => void setDefaultOpenAIAccount(next)}
+                                disabled={connectedOpenAIAccounts.length < 2}
+                                className="w-full"
+                                buttonClassName="px-3 py-2.5 text-[12.5px]"
+                                groups={[
+                                  {
+                                    id: "default-chatgpt-account",
+                                    options: connectedOpenAIAccounts.map((account) => ({
+                                      value: account.id,
+                                      label: `${openAIAccountLabel(account, openAIAccounts)}${
+                                        account.tier
+                                          ? ` · ${account.tier.replace(/^ChatGPT\s+/i, "")}`
+                                          : ""
+                                      }`,
+                                    })),
+                                  },
+                                ]}
+                              />
+                              <p className="mt-1.5 text-[11px] text-faint">
+                                New GPT chats use this account. Existing chats keep the account they
+                                started with.
+                              </p>
+                            </div>
+                          )}
                           {reconnectOnlyOpenAI && (
                             <div className="pc-openai-capability-notice" role="status">
                               <strong>No connected ChatGPT account</strong>
@@ -1074,6 +1109,9 @@ export function SettingsPanel() {
                                           {account.tier.replace(/^ChatGPT\s+/i, "")}
                                         </span>
                                       )}
+                                      {account.id === defaultOpenAIAccount?.id && (
+                                        <span className="pc-openai-account-tier">Default</span>
+                                      )}
                                     </div>
                                     <small>
                                       {stateLabel}
@@ -1083,37 +1121,37 @@ export function SettingsPanel() {
                                     </small>
                                   </div>
                                   <div className="pc-openai-account-row__actions">
-                                    {confirmingRemoval ? (
-                                      <>
-                                        <button
-                                          type="button"
-                                          onClick={() => setPendingOpenAIRemoval(null)}
-                                          disabled={removing}
-                                        >
-                                          Cancel
-                                        </button>
-                                        <button
-                                          type="button"
-                                          className="is-danger"
-                                          onClick={() => void removeOpenAI(account.id)}
-                                          disabled={removing}
-                                          aria-label={`Confirm remove ${displayLabel}`}
-                                        >
-                                          {removing ? "Removing…" : "Confirm remove"}
-                                        </button>
-                                      </>
-                                    ) : (
-                                      <>
-                                        {!connected && openAIAvailable && (
+                                    {!connected && openAIAvailable && (
+                                      <button
+                                        type="button"
+                                        onClick={() => void reconnectOpenAI(account.id)}
+                                        disabled={openAIAccountAction !== null}
+                                        aria-label={`Reconnect ${displayLabel}`}
+                                      >
+                                        {reconnecting ? "Reconnecting…" : "Reconnect"}
+                                      </button>
+                                    )}
+                                    {account.state !== "removed" &&
+                                      (confirmingRemoval ? (
+                                        <>
                                           <button
                                             type="button"
-                                            onClick={() => void reconnectOpenAI(account.id)}
-                                            disabled={openAIAccountAction !== null}
-                                            aria-label={`Reconnect ${displayLabel}`}
+                                            onClick={() => setPendingOpenAIRemoval(null)}
+                                            disabled={removing}
                                           >
-                                            {reconnecting ? "Reconnecting…" : "Reconnect"}
+                                            Cancel
                                           </button>
-                                        )}
+                                          <button
+                                            type="button"
+                                            className="is-danger"
+                                            onClick={() => void removeOpenAI(account.id)}
+                                            disabled={removing}
+                                            aria-label={`Confirm remove ${displayLabel}`}
+                                          >
+                                            {removing ? "Removing…" : "Confirm remove"}
+                                          </button>
+                                        </>
+                                      ) : (
                                         <button
                                           type="button"
                                           onClick={() => setPendingOpenAIRemoval(account.id)}
@@ -1122,8 +1160,7 @@ export function SettingsPanel() {
                                         >
                                           Remove
                                         </button>
-                                      </>
-                                    )}
+                                      ))}
                                   </div>
                                 </div>
                               );

@@ -242,6 +242,17 @@ pub enum LegacySessionAccountPin {
     SessionChanged { current: SessionRunConfig },
 }
 
+/// Result of atomically selecting an OpenAI account/model pair for a session.
+/// A session may be reassigned until its first durable message or receipt; once
+/// started, the persisted account remains immutable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionAccountSelection {
+    Selected,
+    AlreadySelected,
+    Locked { current: SessionRunConfig },
+    SessionChanged { current: SessionRunConfig },
+}
+
 fn to_ui_block(b: &Block) -> Option<UiBlock> {
     match b {
         Block::Text { text } => Some(UiBlock::Text { text: text.clone() }),
@@ -957,6 +968,77 @@ impl Db {
         };
         transaction.commit()?;
         Ok(result)
+    }
+
+    /// Atomically commit the account and model that will own an OpenAI session.
+    /// Existing attributed sessions can change only while they have no durable
+    /// history. A legacy un-attributed session may still be assigned once so old
+    /// chats remain recoverable after this rule is introduced.
+    pub fn select_session_openai_account_if_config(
+        &self,
+        id: &str,
+        account_profile_id: &str,
+        model: &str,
+        expected: &SessionRunConfig,
+    ) -> rusqlite::Result<SessionAccountSelection> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        let current = transaction
+            .query_row(
+                "SELECT model, account_profile_id FROM sessions WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(SessionRunConfig {
+                        model: row.get(0)?,
+                        account_profile_id: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+
+        if current != *expected {
+            transaction.commit()?;
+            return Ok(SessionAccountSelection::SessionChanged { current });
+        }
+        if current.account_profile_id.as_deref() == Some(account_profile_id)
+            && current.model.as_deref() == Some(model)
+        {
+            transaction.commit()?;
+            return Ok(SessionAccountSelection::AlreadySelected);
+        }
+
+        let started = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM messages WHERE session_id = ?1
+                UNION ALL
+                SELECT 1 FROM turn_receipts WHERE session_id = ?1
+             )",
+            params![id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if started && current.account_profile_id.is_some() {
+            transaction.commit()?;
+            return Ok(SessionAccountSelection::Locked { current });
+        }
+
+        let updated = transaction.execute(
+            "UPDATE sessions
+             SET account_profile_id = ?2, model = ?3
+             WHERE id = ?1 AND model IS ?4 AND account_profile_id IS ?5",
+            params![
+                id,
+                account_profile_id,
+                model,
+                expected.model.as_deref(),
+                expected.account_profile_id.as_deref()
+            ],
+        )?;
+        if updated != 1 {
+            return Err(rusqlite::Error::StatementChangedRows(updated));
+        }
+        transaction.commit()?;
+        Ok(SessionAccountSelection::Selected)
     }
 
     pub(crate) fn require_session(&self, id: &str) -> rusqlite::Result<()> {
@@ -2510,6 +2592,81 @@ mod tests {
                 model: Some("claude-opus-4-8".into()),
                 account_profile_id: None,
             }
+        );
+    }
+
+    #[test]
+    fn account_selection_can_change_only_before_a_pinned_session_starts() {
+        let db = mem_db();
+        db.create_session_with_account(
+            "empty",
+            "Empty",
+            None,
+            Some("gpt-first"),
+            Some("profile-a"),
+            1,
+        )
+        .unwrap();
+        let empty_config = db.session_run_config("empty").unwrap();
+        assert_eq!(
+            db.select_session_openai_account_if_config(
+                "empty",
+                "profile-b",
+                "gpt-fallback",
+                &empty_config,
+            )
+            .unwrap(),
+            SessionAccountSelection::Selected
+        );
+        assert_eq!(
+            db.session_run_config("empty").unwrap(),
+            SessionRunConfig {
+                model: Some("gpt-fallback".into()),
+                account_profile_id: Some("profile-b".into()),
+            }
+        );
+
+        db.append_message("empty", &text("first message"), 2);
+        let started_config = db.session_run_config("empty").unwrap();
+        assert_eq!(
+            db.select_session_openai_account_if_config(
+                "empty",
+                "profile-c",
+                "gpt-next",
+                &started_config,
+            )
+            .unwrap(),
+            SessionAccountSelection::Locked {
+                current: started_config.clone(),
+            }
+        );
+        assert_eq!(db.session_run_config("empty").unwrap(), started_config);
+    }
+
+    #[test]
+    fn unattributed_legacy_history_can_be_assigned_once() {
+        let db = mem_db();
+        db.create_session("legacy-history", "Legacy", None, Some("gpt-live"), 1)
+            .unwrap();
+        db.append_message("legacy-history", &text("kept history"), 2);
+        let before = db.session_run_config("legacy-history").unwrap();
+
+        assert_eq!(
+            db.select_session_openai_account_if_config(
+                "legacy-history",
+                "profile-a",
+                "gpt-live",
+                &before,
+            )
+            .unwrap(),
+            SessionAccountSelection::Selected
+        );
+        assert_eq!(
+            db.session_run_config("legacy-history")
+                .unwrap()
+                .account_profile_id
+                .as_deref(),
+            Some("profile-a")
         );
     }
 

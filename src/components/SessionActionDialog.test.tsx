@@ -101,4 +101,30 @@ describe("SessionActionDialog", () => {
     fireEvent.mouseDown(screen.getByRole("dialog").parentElement!);
     expect(idleCancel).toHaveBeenCalledTimes(1);
   });
+
+  it("offers a new chat when a started conversation cannot change accounts", () => {
+    const onCancel = vi.fn();
+    const onConfirm = vi.fn();
+    render(
+      <SessionActionDialog
+        state={{
+          kind: "accountSwitch",
+          session,
+          currentAccountLabel: "one@chatgpt.test",
+          nextAccountLabel: "two@chatgpt.test",
+        }}
+        onCancel={onCancel}
+        onConfirm={onConfirm}
+      />,
+    );
+
+    const dialog = screen.getByRole("dialog", { name: "Continue with another account?" });
+    expect(dialog).toHaveTextContent("cannot change after the first message");
+    expect(dialog).toHaveTextContent(/this chat and its history will stay unchanged/i);
+    expect(screen.getByRole("button", { name: "Keep this chat" })).toHaveFocus();
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue in new chat" }));
+    expect(onConfirm).toHaveBeenCalledOnce();
+    expect(onCancel).not.toHaveBeenCalled();
+  });
 });

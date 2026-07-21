@@ -970,7 +970,7 @@ describe("Composer OpenAI auth and reasoning", () => {
     defaultReasoningEffort: "high",
   };
 
-  it("blocks an unpinned legacy session and routes zero accounts to Settings", () => {
+  it("routes an unassigned GPT session to Settings without an account prompt above the composer", () => {
     useStore.setState({
       sessions: [session({ model: "gpt-live" })],
       activeId: "a",
@@ -983,59 +983,16 @@ describe("Composer OpenAI auth and reasoning", () => {
 
     expect(
       screen.getByRole("button", {
-        name: "Choose the ChatGPT account for this legacy session",
+        name: "Choose a default ChatGPT account in Settings to send",
       }),
     ).toBeDisabled();
-    expect(screen.getByText("Choose a ChatGPT account before continuing")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Add ChatGPT account" }));
+    expect(screen.queryByRole("group", { name: "Choose ChatGPT account" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("combobox", { name: "ChatGPT account for this conversation" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Manage ChatGPT" }));
     expect(useStore.getState().showSettings).toBe(true);
   });
-
-  it("distinguishes account loading, discovery failure, and reconnect-only recovery", () => {
-    const legacy = session({ model: "gpt-live", accountProfileId: null });
-    const refresh = vi.fn(async () => {});
-    useStore.setState({
-      sessions: [legacy],
-      activeId: legacy.id,
-      openAIModels: [openAIModel],
-      settings: { ...DEFAULT_SETTINGS, provider: "openai", model: "gpt-live" },
-      openAIAuthStatus: {
-        signedIn: false,
-        expiresAt: null,
-        account: null,
-        tier: null,
-        available: true,
-      },
-      openAIAccounts: [],
-      openAIAccountsLoading: true,
-      refreshOpenAIStatus: refresh,
-    });
-    const view = render(<Composer />);
-
-    expect(screen.getByText("Loading ChatGPT accounts")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^Loading/ })).toBeDisabled();
-
-    useStore.setState({
-      openAIAccountsLoading: false,
-      openAIAccountsError: "registry locked",
-    });
-    view.rerender(<Composer />);
-    expect(screen.getByText(/load ChatGPT accounts/)).toBeInTheDocument();
-    expect(screen.getByText("registry locked")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Retry account discovery" }));
-    expect(refresh).toHaveBeenCalledOnce();
-
-    useStore.setState({
-      openAIAccountsError: null,
-      openAIAccounts: [openAIAccount({ state: "reconnect_required", expiresAt: null })],
-      showSettings: false,
-    });
-    view.rerender(<Composer />);
-    expect(screen.getByText("Reconnect a ChatGPT account before continuing")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Reconnect ChatGPT account" }));
-    expect(useStore.getState().showSettings).toBe(true);
-  });
-
   it("fails closed and removes OpenAI choices when this build disables the capability", () => {
     useStore.setState({
       sessions: [session({ model: "gpt-live" })],
@@ -1101,6 +1058,40 @@ describe("Composer OpenAI auth and reasoning", () => {
     expect(screen.getByRole("option", { name: "High" })).toHaveAttribute("aria-selected", "true");
     fireEvent.click(screen.getByRole("option", { name: "Minimal" }));
     expect(m.saveSettings).toHaveBeenCalledWith({ reasoningEffort: "minimal" });
+  });
+
+  it("places the multi-account selector beside the model control", () => {
+    const first = openAIAccount();
+    const second = openAIAccount({
+      id: "00000000-0000-4000-8000-000000000002",
+      accountLabel: "two@chatgpt.test",
+      tier: "ChatGPT Team",
+    });
+    useStore.setState({
+      sessions: [session({ model: "gpt-live", accountProfileId: first.id })],
+      activeId: "a",
+      openAIModels: [openAIModel],
+      openAIAccounts: [first, second],
+      openAIModelCatalogs: {
+        [first.id]: { status: "ready", models: [openAIModel], error: null },
+        [second.id]: { status: "ready", models: [openAIModel], error: null },
+      },
+      settings: { ...DEFAULT_SETTINGS, provider: "openai", model: "gpt-live" },
+    });
+    render(<Composer />);
+
+    const controls = screen.getByRole("group", { name: "Turn controls" });
+    const modelPicker = screen.getByRole("button", { name: "Model, effort, and speed" });
+    const accountPicker = screen.getByRole("combobox", {
+      name: "ChatGPT account for this chat",
+    });
+    expect(controls).toContainElement(modelPicker);
+    expect(controls).toContainElement(accountPicker);
+    expect(modelPicker.compareDocumentPosition(accountPicker)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(accountPicker).toHaveTextContent("one@chatgpt.test");
+    expect(screen.queryByText("Which ChatGPT account owns this conversation?")).toBeNull();
   });
 
   it("limits a pinned ChatGPT conversation's model picker to that provider", () => {
@@ -1186,17 +1177,17 @@ describe("Composer OpenAI auth and reasoning", () => {
 
     expect(
       screen.getByRole("button", {
-        name: "Choose the ChatGPT account for this legacy session",
+        name: "Choose a default ChatGPT account in Settings to send",
       }),
     ).toBeDisabled();
     expect(
       screen
         .getAllByRole("status")
-        .some((status) => status.textContent?.includes("Choose the ChatGPT account")),
+        .some((status) => status.textContent?.includes("Choose a default ChatGPT account")),
     ).toBe(true);
   });
 
-  it("requires explicit confirmation even when only one account can own a legacy session", async () => {
+  it("silently assigns the configured default to an unassigned legacy GPT session", async () => {
     const account = openAIAccount();
     const legacy = session({ model: "gpt-live", accountProfileId: null });
     useStore.setState({
@@ -1207,6 +1198,7 @@ describe("Composer OpenAI auth and reasoning", () => {
       openAIModelCatalogs: {
         [account.id]: { status: "ready", models: [openAIModel], error: null },
       },
+      lastOpenAIAccountProfileId: account.id,
       openAIAuthStatus: {
         signedIn: true,
         expiresAt: null,
@@ -1221,26 +1213,25 @@ describe("Composer OpenAI auth and reasoning", () => {
     });
     render(<Composer />);
 
-    expect(screen.getByRole("group", { name: "Choose ChatGPT account" })).toHaveTextContent(
-      "one@chatgpt.test",
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Use one@chatgpt.test" }));
-
     await waitFor(() => expect(useStore.getState().sessions[0].accountProfileId).toBe(account.id));
-    expect(m.pinSessionOpenAIAccount).toHaveBeenCalledWith(legacy.id, account.id);
+    expect(m.pinSessionOpenAIAccount).toHaveBeenCalledWith(legacy.id, account.id, "gpt-live");
+    expect(screen.queryByRole("group", { name: "Choose ChatGPT account" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("combobox", { name: "ChatGPT account for this conversation" }),
+    ).not.toBeInTheDocument();
   });
 
-  it("pins a legacy session to the explicitly selected account when several are connected", async () => {
+  it("keeps an existing GPT session on its assigned account when the default changes", () => {
     const first = openAIAccount();
     const second = openAIAccount({
       id: "00000000-0000-4000-8000-000000000002",
       accountLabel: "two@chatgpt.test",
       tier: "ChatGPT Team",
     });
-    const legacy = session({ model: "gpt-live", accountProfileId: null });
+    const existing = session({ model: "gpt-live", accountProfileId: first.id });
     useStore.setState({
-      sessions: [legacy],
-      activeId: legacy.id,
+      sessions: [existing],
+      activeId: existing.id,
       openAIModels: [openAIModel],
       openAIAccounts: [first, second],
       openAIModelCatalogs: {
@@ -1254,55 +1245,13 @@ describe("Composer OpenAI auth and reasoning", () => {
         tier: null,
         available: true,
       },
-      lastOpenAIAccountProfileId: first.id,
-    });
-    m.pinSessionOpenAIAccount.mockImplementation(async (_sessionId, accountProfileId) => ({
-      ...legacy,
-      accountProfileId,
-    }));
-    render(<Composer />);
-
-    fireEvent.click(
-      screen.getByRole("combobox", { name: "ChatGPT account for this conversation" }),
-    );
-    fireEvent.click(screen.getByRole("option", { name: /two@chatgpt\.test/i }));
-    fireEvent.click(screen.getByRole("button", { name: "Use two@chatgpt.test" }));
-
-    await waitFor(() => expect(useStore.getState().sessions[0].accountProfileId).toBe(second.id));
-    expect(m.pinSessionOpenAIAccount).toHaveBeenCalledWith(legacy.id, second.id);
-  });
-
-  it("preselects backend MRU for a legacy session when no local preference exists", () => {
-    const older = openAIAccount({ lastUsedAt: 100 });
-    const newer = openAIAccount({
-      id: "00000000-0000-4000-8000-000000000002",
-      accountLabel: "recent@chatgpt.test",
-      lastUsedAt: 200,
-    });
-    const legacy = session({ model: "gpt-live", accountProfileId: null });
-    useStore.setState({
-      sessions: [legacy],
-      activeId: legacy.id,
-      openAIModels: [openAIModel],
-      openAIAccounts: [older, newer],
-      openAIModelCatalogs: {
-        [older.id]: { status: "ready", models: [openAIModel], error: null },
-        [newer.id]: { status: "ready", models: [openAIModel], error: null },
-      },
-      openAIAuthStatus: {
-        signedIn: true,
-        expiresAt: null,
-        account: null,
-        tier: null,
-        available: true,
-      },
-      lastOpenAIAccountProfileId: null,
+      lastOpenAIAccountProfileId: second.id,
     });
     render(<Composer />);
 
-    expect(
-      screen.getByRole("combobox", { name: "ChatGPT account for this conversation" }),
-    ).toHaveValue(newer.id);
+    expect(m.pinSessionOpenAIAccount).not.toHaveBeenCalled();
+    expect(useStore.getState().sessions[0].accountProfileId).toBe(first.id);
+    expect(screen.queryByRole("group", { name: "Choose ChatGPT account" })).not.toBeInTheDocument();
   });
 
   it("keeps a removed account's session readable without exposing the local UUID", () => {
@@ -1326,10 +1275,8 @@ describe("Composer OpenAI auth and reasoning", () => {
     });
     render(<Composer />);
 
-    expect(
-      screen.getByText(/This conversation.*ChatGPT account is unavailable/),
-    ).toBeInTheDocument();
-    expect(screen.getByText("ChatGPT account 1")).toBeInTheDocument();
+    expect(screen.getByText("This session's ChatGPT account is unavailable")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Manage ChatGPT" })).toBeInTheDocument();
     expect(screen.queryByText(removed.id)).not.toBeInTheDocument();
     expect(textarea()).toHaveTextContent("history remains");
   });

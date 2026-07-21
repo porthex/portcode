@@ -7,7 +7,7 @@
         "title": "Portcode",
         "width": 1200,
         "height": 800,
-        "minWidth": 760,
+        "minWidth": 900,
         "minHeight": 500,
         "resizable": true,
         "fullscreen": false,

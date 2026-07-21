@@ -430,9 +430,9 @@ function EmptyState() {
         ? activeSession?.accountProfileId
           ? "Reconnect this chat's ChatGPT account to start"
           : activeSession
-            ? "Choose a ChatGPT account for this legacy chat"
+            ? "Choose a default ChatGPT account in Settings to start"
             : connectedOpenAIAccountCount > 0
-              ? "Choose a ChatGPT account when starting a new chat"
+              ? "New GPT chats use your default ChatGPT account"
               : "Add a ChatGPT account to start"
         : "Sign in with Claude or add an API key to start";
   return (

@@ -798,6 +798,197 @@ input[type="radio"]:not(:disabled) {
 }
 
 /* =========================================================================
+   FRAMELESS WINDOW CHROME
+   The desktop-main container is the useful measurement here: opening the
+   sidebar or file rail changes the toolbar's actual room without changing the
+   viewport, so viewport media queries cannot keep this surface stable.
+   ========================================================================= */
+.pc-desktop-main {
+  container-name: desktop-main;
+  container-type: inline-size;
+}
+
+/* Six pixels are easy to catch; only the two-pixel signal trace reads visually.
+   The split magenta/cyan registration line echoes the Portcode mark without
+   turning the top edge into a decorative banner. */
+.pc-window-drag-rail {
+  position: relative;
+  z-index: 60;
+  width: 100%;
+  height: 6px;
+  flex: 0 0 6px;
+  cursor: grab;
+  user-select: none;
+  background: linear-gradient(180deg, #060810 0%, #080a12 100%);
+  border-bottom: 1px solid rgba(57, 69, 94, 0.28);
+}
+.pc-window-drag-rail::before {
+  content: "";
+  position: absolute;
+  inset: 1px 0 auto;
+  height: 2px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 46, 126, 0.08) 3%,
+    rgba(255, 46, 126, 0.62) 17%,
+    rgba(255, 46, 126, 0.12) 35%,
+    rgba(33, 230, 255, 0.12) 54%,
+    rgba(33, 230, 255, 0.68) 78%,
+    rgba(33, 230, 255, 0.08) 96%,
+    transparent 100%
+  );
+  box-shadow:
+    0 0 8px rgba(255, 46, 126, 0.14),
+    0 0 10px rgba(33, 230, 255, 0.16);
+}
+.pc-window-drag-rail::after {
+  content: "";
+  position: absolute;
+  inset: 3px 18% auto;
+  height: 1px;
+  opacity: 0.34;
+  background: repeating-linear-gradient(
+    90deg,
+    transparent 0 47px,
+    rgba(116, 137, 173, 0.5) 47px 48px
+  );
+}
+.pc-window-drag-rail:active {
+  cursor: grabbing;
+}
+
+.pc-titlebar__breadcrumb {
+  flex: 1 1 12rem;
+}
+.pc-titlebar__account-pill {
+  width: fit-content;
+  height: 31px;
+  min-width: 0;
+  max-width: 10.5rem;
+  flex: 0 1 auto;
+  gap: 5px;
+  padding-block: 0;
+  border-radius: 7px;
+  letter-spacing: 0.08em;
+}
+.pc-titlebar__account-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pc-titlebar__actions > .pc-pill {
+  height: 31px;
+  padding-block: 0;
+  border-radius: 7px;
+}
+.pc-titlebar__actions > *,
+.pc-environment-trigger,
+.pc-window-control {
+  flex: none;
+}
+
+@container desktop-main (max-width: 1020px) {
+  .pc-titlebar__review {
+    width: 31px;
+    justify-content: center;
+    padding-inline: 0;
+  }
+  .pc-titlebar__review-label,
+  .pc-titlebar__palette-label,
+  .pc-environment-trigger__repository {
+    display: none;
+  }
+  .pc-titlebar__palette {
+    padding-inline: 8px;
+  }
+  .pc-titlebar__account-pill {
+    max-width: 9rem;
+  }
+}
+
+@container desktop-main (max-width: 820px) {
+  .pc-titlebar,
+  .pc-titlebar__leading,
+  .pc-titlebar__actions {
+    gap: 8px;
+  }
+  .pc-titlebar__palette,
+  .pc-titlebar__product {
+    display: none;
+  }
+  .pc-titlebar__account-pill {
+    max-width: 7.5rem;
+  }
+}
+
+@container desktop-main (max-width: 660px) {
+  .pc-titlebar {
+    gap: 5px;
+    padding-inline: 8px;
+  }
+  .pc-titlebar__leading,
+  .pc-titlebar__actions {
+    gap: 5px;
+  }
+  .pc-titlebar__breadcrumb {
+    max-width: 8rem;
+    flex-basis: 6rem;
+  }
+  .pc-titlebar__actions > .pc-pill {
+    width: 26px;
+    height: 26px;
+    justify-content: center;
+    gap: 0;
+    padding: 0;
+    overflow: hidden;
+    font-size: 0;
+    letter-spacing: 0;
+  }
+  .pc-environment-trigger {
+    width: 48px;
+    justify-content: center;
+    gap: 5px;
+    padding-inline: 6px;
+  }
+  .pc-environment-trigger__branch,
+  .pc-environment-trigger__chevron {
+    display: none;
+  }
+  .pc-environment-trigger__count {
+    min-width: 16px;
+    padding-inline: 3px;
+  }
+  .pc-titlebar__account-pill {
+    max-width: 6.75rem;
+    gap: 5px;
+    padding-inline: 7px;
+  }
+  .pc-window-controls {
+    margin-right: -8px;
+  }
+  .pc-window-control {
+    width: 40px;
+  }
+}
+
+@container desktop-main (max-width: 500px) {
+  .pc-titlebar__breadcrumb {
+    display: none;
+  }
+  .pc-titlebar__account-pill {
+    max-width: 6.25rem;
+  }
+  .pc-environment-trigger {
+    width: 44px;
+  }
+  .pc-window-control {
+    width: 36px;
+  }
+}
+
+/* =========================================================================
    PILLS + DOTS
    ========================================================================= */
 .pc-pill {
@@ -3906,6 +4097,11 @@ button.pc-turn-receipt__strip:focus-visible {
   border: 1px solid rgba(255, 176, 46, 0.42);
   background: rgba(255, 176, 46, 0.1);
 }
+.pc-session-dialog__icon.is-primary {
+  color: var(--color-accent-2);
+  border: 1px solid rgba(33, 230, 255, 0.4);
+  background: rgba(33, 230, 255, 0.1);
+}
 .pc-session-dialog__icon.is-danger {
   color: var(--color-danger);
   border: 1px solid rgba(255, 77, 87, 0.42);
@@ -4037,56 +4233,6 @@ button.pc-turn-receipt__strip:focus-visible {
   background: linear-gradient(180deg, rgba(10, 12, 19, 0.88), rgba(7, 9, 14, 0.98));
   box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.14);
 }
-.pc-openai-session-gate {
-  display: flex;
-  width: 100%;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  margin-bottom: 8px;
-  padding: 10px 12px;
-  border: 1px solid rgba(255, 176, 46, 0.36);
-  border-radius: 10px;
-  background: linear-gradient(100deg, rgba(255, 176, 46, 0.09), rgba(12, 14, 22, 0.96));
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
-}
-.pc-openai-session-gate > div > strong,
-.pc-openai-session-gate > div > span {
-  display: block;
-}
-.pc-openai-session-gate > div > strong {
-  color: var(--color-fg);
-  font-size: 12px;
-}
-.pc-openai-session-gate > div > span {
-  margin-top: 2px;
-  color: var(--color-muted);
-  font-size: 10.5px;
-}
-.pc-openai-session-gate > button {
-  flex-shrink: 0;
-  padding: 7px 10px;
-  border: 1px solid rgba(33, 230, 255, 0.35);
-  border-radius: 8px;
-  background: rgba(33, 230, 255, 0.08);
-  color: var(--color-accent-2);
-  font-size: 11px;
-}
-.pc-openai-session-gate > button:hover:not(:disabled) {
-  background: rgba(33, 230, 255, 0.14);
-}
-.pc-openai-session-gate > button:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
-}
-.pc-openai-session-gate__account {
-  color: var(--color-accent-2) !important;
-  font-family: var(--font-mono);
-}
-.pc-openai-session-gate__error {
-  color: var(--color-danger) !important;
-}
-
 /* Select popovers size to their content but never escape a narrow WebView. */
 .pc-select-popover {
   width: max-content;
@@ -4502,6 +4648,30 @@ button.pc-turn-receipt__strip:focus-visible {
 .pc-run-setup__trigger:disabled {
   cursor: not-allowed;
   opacity: 0.5;
+}
+.pc-session-account-switcher {
+  width: clamp(136px, 15vw, 188px);
+}
+.pc-session-account-switcher__select {
+  width: 100%;
+  min-width: 0;
+}
+.pc-composer-account-trigger {
+  min-height: 30px;
+  border-color: rgba(35, 42, 61, 0.88);
+  border-radius: 8px;
+  padding: 4px 7px 4px 9px;
+  background: rgba(15, 18, 28, 0.72);
+  font-size: 11px;
+  font-weight: 600;
+}
+.pc-composer-account-trigger:hover,
+.pc-composer-account-trigger[aria-expanded="true"] {
+  border-color: rgba(33, 230, 255, 0.42);
+  background: rgba(20, 24, 36, 0.92);
+}
+.pc-composer-account-trigger[aria-expanded="true"] {
+  box-shadow: 0 0 0 2px rgba(33, 230, 255, 0.07);
 }
 .pc-run-setup__model {
   min-width: 0;
@@ -4956,7 +5126,8 @@ button.pc-turn-receipt__strip:focus-visible {
     padding: 9px;
   }
   .pc-composer-field--permission,
-  .pc-run-setup {
+  .pc-run-setup,
+  .pc-session-account-switcher {
     flex: 1 1 150px;
     width: auto;
     max-width: none;
