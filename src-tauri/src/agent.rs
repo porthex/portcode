@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use futures_util::stream::StreamExt;
-use portcode_sync::wire::TurnStatus;
+use portcode_sync::wire::{TurnPhase, TurnReceipt, TurnStatus};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -679,15 +679,7 @@ pub async fn run(
         started,
         workspace,
         account_profile_id,
-    )
-    .await;
-    let placeholder = receipt_tracker.interrupted_placeholder();
-    if let Err(error) = db.save_pending_turn_receipt(&session_id, &turn_id, &placeholder) {
-        // The pre-capture unavailable row is already durable; retain it rather than
-        // aborting an otherwise safe turn because the richer placeholder lost a race.
-        eprintln!("turn-receipt: failed to update captured placeholder: {error}");
-    }
-
+    );
     // Plan mode swaps in the read-only registry + plan steer; every other mode
     // uses the default run. Both the desktop `run_agent` command and the phone's
     // Run command funnel through `run`, so this single check covers both paths.
@@ -729,15 +721,56 @@ pub async fn run(
         Ok(reason) => (TurnStatus::Completed, Some(reason.clone())),
         Err(_) => (TurnStatus::Error, None),
     };
-    let completed = receipt_tracker.complete(status, stop_reason).await;
-    if let Err(error) = db.save_turn_receipt(
+    // Persist the agent outcome before optional Git finalization. A crash from
+    // this point forward must preserve Completed/Stopped/Failed rather than
+    // relabelling a delivered answer as process-interrupted on restart.
+    let (agent_checkpoint, receipt_expected) =
+        receipt_tracker.seal_agent_outcome(status, stop_reason.clone());
+    match db.try_save_pending_turn_receipt_fast(&session_id, &turn_id, &agent_checkpoint) {
+        Ok(true) => {}
+        Ok(false) => {
+            // The initial interrupted row remains durable. Completion metadata
+            // must not queue behind unrelated DB work before exposing the answer.
+            eprintln!("turn-receipt: skipped contended agent-terminal checkpoint");
+        }
+        Err(error) => {
+            eprintln!("turn-receipt: failed to save agent-terminal checkpoint: {error}");
+        }
+    }
+    sink.emit_local(
+        &channel,
+        StreamEvent::TurnPhase {
+            turn_id: turn_id.clone(),
+            phase: TurnPhase::AgentCompleted,
+            at: agent_checkpoint.completed_at,
+            revision: Some(1),
+            status: Some(status),
+            stop_reason: stop_reason.clone(),
+            agent_duration_ms: agent_checkpoint.agent_duration_ms,
+            receipt_expected: Some(receipt_expected),
+        },
+    );
+
+    let mut completed = receipt_tracker.complete(status, stop_reason).await;
+    let terminal_saved = match db.try_save_turn_receipt_fast(
         &session_id,
         &turn_id,
         &completed.receipt,
         completed.repository_root.as_deref(),
         completed.terminal_snapshot_id.as_deref(),
     ) {
-        eprintln!("turn-receipt: failed to persist terminal receipt: {error}");
+        Ok(true) => true,
+        Ok(false) => {
+            eprintln!("turn-receipt: skipped contended terminal receipt persistence");
+            false
+        }
+        Err(error) => {
+            eprintln!("turn-receipt: failed to persist terminal receipt: {error}");
+            false
+        }
+    };
+    if !terminal_saved {
+        make_receipt_non_reviewable(&mut completed.receipt);
     }
 
     match result {
@@ -756,6 +789,14 @@ pub async fn run(
             },
         ),
     }
+}
+
+/// Historical Review requires the terminal receipt and snapshot anchor to have
+/// been saved atomically. If persistence fails, retain the visible counts/totals
+/// but remove the bounded file manifest so the emitted receipt cannot offer a
+/// Review action that is guaranteed to fail on lookup.
+fn make_receipt_non_reviewable(receipt: &mut TurnReceipt) {
+    receipt.changed_files.clear();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -853,6 +894,7 @@ async fn run_inner(
             None
         };
     let mut ctx = ToolCtx::new(workspace);
+    ctx.cancel = Some(cancel.clone());
     ctx.receipt = Some(receipt_tracker.clone());
     ctx.spawner = spawner;
     // Attach a background runner only when this run exposes `run_command` (plan mode's
@@ -893,7 +935,9 @@ async fn run_inner(
     // The interactive run is its own session: agent output, permission prompts,
     // and usage all flow on the same `agent://{session}` channel, and every
     // message persists to the session.
-    let outcome = run_loop_core(
+    // `run_loop_core` is a large state machine. Heap-pin it so concurrent roots
+    // and nested agents do not place multiple copies on a 2 MiB Windows stack.
+    let outcome = Box::pin(run_loop_core(
         sink.as_ref(),
         http,
         provider.as_ref(),
@@ -917,7 +961,7 @@ async fn run_inner(
             session_id,
             turn_id,
         },
-    )
+    ))
     .await?;
     Ok(outcome.stop_reason)
 }
@@ -1388,10 +1432,15 @@ async fn gate_and_run(
     input: &Value,
     cancelled: &mut bool,
 ) -> (String, bool) {
+    let mutating = tool.mutating();
+    let approval = if mutating {
+        Some(Box::new(tool.approval(input, ctx).await))
+    } else {
+        None
+    };
     let decision = if let Some(risk) = tool.permission_risk() {
         // Compute the pre-apply diff (write_file/edit_file) so the prompt can show the
         // change BEFORE it's written.
-        let diff = tool.preview(input, ctx).await;
         let _prompt = ask_lock.lock().await;
         permissions::gate(
             sink,
@@ -1405,7 +1454,7 @@ async fn gate_and_run(
             risk,
             &tool.summarize(input, ctx),
             input,
-            diff,
+            approval.as_ref().and_then(|approval| approval.diff.clone()),
         )
         .await
     } else {
@@ -1420,10 +1469,57 @@ async fn gate_and_run(
             }
             (output.to_string(), is_error)
         }
-        None => match tool.run(input.clone(), ctx).await {
-            Ok(out) => (out, false),
-            Err(err) => (err, true),
-        },
+        None => {
+            // Permission alone is not the mutation boundary. Every approved
+            // mutator first joins the root execution barrier; the first opaque
+            // command establishes its lazy Git baseline there, while exact tools
+            // enter with zero capture. Holding the exclusive permit across
+            // `tool.run` serializes exact revalidate/write boundaries with other
+            // exact and foreground opaque operations.
+            let _receipt_permit = match (tool.mutation_scope(), ctx.receipt.as_ref()) {
+                (Some(scope), Some(tracker)) => {
+                    match tracker.prepare_mutation(scope, cancel.as_ref()).await {
+                        Ok(permit) => Some(permit),
+                        Err(crate::turn_receipt::PrepareMutationError::Cancelled) => {
+                            *cancelled = true;
+                            return (CANCELLED_TOOL_RESULT.to_string(), true);
+                        }
+                    }
+                }
+                _ => None,
+            };
+
+            // Stop may arrive while an opaque baseline is being prepared. The
+            // permit makes the workspace boundary safe; this second check makes
+            // cancellation authoritative before the tool can produce a side
+            // effect.
+            if cancel.load(Ordering::Relaxed) {
+                *cancelled = true;
+                return (CANCELLED_TOOL_RESULT.to_string(), true);
+            }
+
+            // Keep read-only/delegation calls on their original direct path. Only
+            // mutators need the extra approval artifact; avoiding an unnecessary
+            // async wrapper here also keeps deeply nested subagent stacks bounded.
+            let result = if mutating {
+                tool.run_approved(
+                    input.clone(),
+                    ctx,
+                    *approval.expect("mutating tools always build an approval artifact"),
+                )
+                .await
+            } else {
+                tool.run(input.clone(), ctx).await
+            };
+            if cancel.load(Ordering::Relaxed) {
+                *cancelled = true;
+                return (CANCELLED_TOOL_RESULT.to_string(), true);
+            }
+            match result {
+                Ok(out) => (out, false),
+                Err(err) => (err, true),
+            }
+        }
     }
 }
 
@@ -1660,6 +1756,7 @@ impl tools::Spawner for AgentSpawner {
         };
         let ctx = ToolCtx {
             workspace: self.workspace.clone(),
+            cancel: Some(child_cancel.clone()),
             receipt: Some(self.receipt_tracker.clone()),
             spawner: child_spawner,
             // Subagents run `run_command` in the foreground (no background runner) in this
@@ -1677,7 +1774,7 @@ impl tools::Spawner for AgentSpawner {
             }],
         }];
 
-        let result = run_loop_core(
+        let result = Box::pin(run_loop_core(
             self.sink.as_ref(),
             &self.http,
             self.provider.as_ref(),
@@ -1697,7 +1794,7 @@ impl tools::Spawner for AgentSpawner {
             &ctx,
             messages,
             &Persist::Ephemeral,
-        )
+        ))
         .await;
 
         // ALWAYS announce completion and deregister, on success OR error, so the
@@ -1714,11 +1811,8 @@ impl tools::Spawner for AgentSpawner {
 
         // The subagent's final assistant text IS its answer to the launching agent.
         let outcome = result?;
-        Ok(subagent_answer(
-            &spec.description,
-            &outcome.final_text,
-            &outcome.stop_reason,
-        ))
+        let answer = subagent_answer(&spec.description, &outcome.final_text, &outcome.stop_reason);
+        Ok(answer)
     }
 }
 
@@ -1736,6 +1830,53 @@ struct BackgroundLauncher {
     session_channel: String,
     session_id: String,
     receipt_tracker: Arc<crate::turn_receipt::TurnReceiptTracker>,
+}
+
+/// Keeps both halves of background receipt state balanced on every exit path.
+/// Normal process completion closes the opaque interval as observed; waiter
+/// failure or cancellation drops the token as uncertain. In either case the
+/// running counter is decremented, including when a session Stop aborts the
+/// waiter future before its body reaches explicit cleanup.
+struct BackgroundReceiptGuard {
+    tracker: Arc<crate::turn_receipt::TurnReceiptTracker>,
+    mutation: Option<crate::turn_receipt::MutationToken>,
+    running: bool,
+}
+
+impl BackgroundReceiptGuard {
+    fn new(
+        tracker: Arc<crate::turn_receipt::TurnReceiptTracker>,
+        mutation: Option<crate::turn_receipt::MutationToken>,
+    ) -> Self {
+        tracker.background_started();
+        Self {
+            tracker,
+            mutation,
+            running: true,
+        }
+    }
+
+    fn finish_observed(mut self) {
+        if let Some(mutation) = self.mutation.take() {
+            mutation.finish_observed();
+        }
+        self.tracker.background_finished();
+        self.running = false;
+    }
+}
+
+impl Drop for BackgroundReceiptGuard {
+    fn drop(&mut self) {
+        if !self.running {
+            return;
+        }
+        // Dropping an unfinished token records may-have-mutated before the
+        // background counter closes. This is the conservative outcome for a
+        // failed wait or an aborted/kill-on-drop process.
+        drop(self.mutation.take());
+        self.tracker.background_finished();
+        self.running = false;
+    }
 }
 
 /// Spawn a background task's off-thread waiter and register it (so a session-wide
@@ -1770,9 +1911,14 @@ fn spawn_background_task<F>(
 }
 
 impl tools::BackgroundRunner for BackgroundLauncher {
-    fn launch(&self, command: String, child: tokio::process::Child) -> String {
+    fn launch(
+        &self,
+        command: String,
+        child: tokio::process::Child,
+        mutation: Option<crate::turn_receipt::MutationToken>,
+    ) -> String {
         let id = Uuid::new_v4().to_string();
-        self.receipt_tracker.background_started();
+        let receipt = BackgroundReceiptGuard::new(self.receipt_tracker.clone(), mutation);
         // Announce the launch right away so the UI can show it as running.
         self.sink.emit(
             &self.session_channel,
@@ -1787,7 +1933,6 @@ impl tools::BackgroundRunner for BackgroundLauncher {
         let channel = self.session_channel.clone();
         let task_id = id.clone();
         let task_command = command.clone();
-        let receipt_tracker = self.receipt_tracker.clone();
         // The waiter owns the child (kill_on_drop), so aborting this task kills the
         // process — which is exactly what `background::cancel_session` does on Stop.
         // `spawn_background_task` registers the entry BEFORE this body can run, so a
@@ -1799,13 +1944,23 @@ impl tools::BackgroundRunner for BackgroundLauncher {
             &self.session_id,
             &command,
             async move {
-                let (exit_code, output) = match tools::wait_with_bounded_output(child).await {
-                    Ok(out) => (
-                        out.status.code().unwrap_or(-1),
-                        tools::format_bounded_shell_output(&out),
-                    ),
-                    Err(e) => (-1, format!("background command failed: {e}")),
-                };
+                let (exit_code, output, wait_observed) =
+                    match tools::wait_with_bounded_output(child).await {
+                        Ok(out) => (
+                            out.status.code().unwrap_or(-1),
+                            tools::format_bounded_shell_output(&out),
+                            true,
+                        ),
+                        Err(e) => (-1, format!("background command failed: {e}"), false),
+                    };
+                if wait_observed {
+                    receipt.finish_observed();
+                } else {
+                    // A wait error cannot prove what the spawned process did.
+                    // Dropping records uncertainty while balancing the running
+                    // count before any terminal receipt can race with event I/O.
+                    drop(receipt);
+                }
                 sink.emit(
                     &channel,
                     StreamEvent::BackgroundTaskFinished {
@@ -1815,7 +1970,6 @@ impl tools::BackgroundRunner for BackgroundLauncher {
                         output,
                     },
                 );
-                receipt_tracker.background_finished();
                 background::finish(&bg, &task_id);
             },
         );
@@ -1828,10 +1982,10 @@ mod tests {
     use super::{
         admit_run, assistant_text, background, batch_cancelled, canonicalize_tool_history,
         child_can_spawn, derive_title, ensure_openai_account_unchanged, finish_status,
-        is_terminal_auth_error, precheck_outcome, reassemble_results, resolve_system_prompt,
-        run_loop_core, session_of, spawn_background_task, spawn_status, step_limit_exceeded,
-        subagent_answer, subagent_label, tool_result_block, tool_result_event, AgentConfig,
-        AgentSpawner, Block, Cancels, ChatMessage, Db, Decision, LoopOutcome,
+        is_terminal_auth_error, make_receipt_non_reviewable, precheck_outcome, reassemble_results,
+        resolve_system_prompt, run_loop_core, session_of, spawn_background_task, spawn_status,
+        step_limit_exceeded, subagent_answer, subagent_label, tool_result_block, tool_result_event,
+        AgentConfig, AgentSpawner, Block, Cancels, ChatMessage, Db, Decision, LoopOutcome,
         OpenAiRefreshTransport, OpenAiRunAuth, Persist, RunAuthContext, RunReservation,
         StreamEvent, CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS, MAX_PARALLEL_AGENTS,
         MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
@@ -1845,6 +1999,10 @@ mod tests {
     use crate::settings::Settings;
     use crate::tool_names;
     use crate::tools::ToolCtx;
+    use portcode_sync::wire::{
+        TurnChangeCertainty, TurnChangeState, TurnChangedFile, TurnFileStatus, TurnReceipt,
+        TurnStatus,
+    };
     use serde_json::Value;
     use std::collections::{BTreeMap, HashMap};
     use std::path::{Path, PathBuf};
@@ -1864,6 +2022,44 @@ mod tests {
 
     fn text_block(t: &str) -> Block {
         Block::Text { text: t.into() }
+    }
+
+    #[test]
+    fn persistence_failure_removes_only_the_reviewable_file_manifest() {
+        let mut receipt = TurnReceipt {
+            turn_id: "turn".into(),
+            account_profile_id: None,
+            status: TurnStatus::Completed,
+            stop_reason: Some("end_turn".into()),
+            started_at: 1,
+            completed_at: 2,
+            duration_ms: Some(1),
+            agent_duration_ms: Some(1),
+            changed_files: vec![TurnChangedFile {
+                path: "src/lib.rs".into(),
+                old_path: None,
+                status: TurnFileStatus::Modified,
+                additions: Some(4),
+                deletions: Some(2),
+                binary: false,
+                certainty: TurnChangeCertainty::Exact,
+            }],
+            changed_file_count: 1,
+            additions: 4,
+            deletions: 2,
+            files_truncated: false,
+            change_state: Some(TurnChangeState::Changed),
+            change_certainty: TurnChangeCertainty::Exact,
+            background_tasks_running: false,
+        };
+
+        make_receipt_non_reviewable(&mut receipt);
+
+        assert!(receipt.changed_files.is_empty());
+        assert_eq!(receipt.changed_file_count, 1);
+        assert_eq!(receipt.additions, 4);
+        assert_eq!(receipt.deletions, 2);
+        assert_eq!(receipt.change_certainty, TurnChangeCertainty::Exact);
     }
 
     #[derive(Default)]
@@ -2334,14 +2530,14 @@ mod tests {
             Instant::now(),
             workspace.clone(),
             auth.account_profile_id().map(str::to_string),
-        )
-        .await;
+        );
         let registry = if delegates {
             crate::tools::default_registry()
         } else {
             crate::tools::read_only_registry()
         };
         let mut ctx = ToolCtx::new(workspace.clone());
+        ctx.cancel = Some(cancel.clone());
         ctx.receipt = Some(receipt_tracker.clone());
         if delegates {
             ctx.spawner = Some(Arc::new(AgentSpawner {
@@ -2367,7 +2563,7 @@ mod tests {
             role: "user".into(),
             content: vec![text_block(prompt)],
         }];
-        run_loop_core(
+        Box::pin(run_loop_core(
             sink.as_ref(),
             &http,
             provider.as_ref(),
@@ -2387,7 +2583,7 @@ mod tests {
             &ctx,
             messages,
             &Persist::Ephemeral,
-        )
+        ))
         .await
     }
 

@@ -119,6 +119,8 @@ const runState = (
     turnId: string | null;
     startedAt: number | null;
     finalizing: boolean;
+    agentDurationMs: number | null;
+    phaseRevision: number;
     receipt: TurnReceipt | null;
     outcome: TurnStatus | null;
     composerPhase: "idle" | "received" | "thinking" | "stopping";
@@ -132,6 +134,8 @@ const runState = (
   turnId: null,
   startedAt: null,
   finalizing: false,
+  agentDurationMs: null,
+  phaseRevision: 0,
   receipt: null,
   outcome: null,
   composerPhase: "idle" as const,
@@ -1744,6 +1748,269 @@ describe("send", () => {
       outcome: "completed",
     });
     expect(dispose).toHaveBeenCalledOnce();
+  });
+
+  it("freezes the completed response while Git finalizes, then replaces provisional facts", async () => {
+    const dispose = vi.fn();
+    let emit!: (event: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose };
+    });
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: { a: [] },
+    });
+
+    await useStore.getState().send("change it");
+    emit({
+      type: "turn_start",
+      messageId: "native-message",
+      turnId: "native-turn",
+      startedAt: 100,
+    });
+    emit({ type: "text_delta", text: "Done." });
+    emit({
+      type: "turn_phase",
+      turnId: "native-turn",
+      phase: "agent_completed",
+      at: 1_600,
+      revision: 2,
+      status: "completed",
+      agentDurationMs: 1_500,
+      receiptExpected: true,
+    });
+
+    let st = useStore.getState();
+    expect(st.streaming).toBe(false);
+    expect(st.runs.a).toMatchObject({
+      streaming: false,
+      finalizing: true,
+      cancel: null,
+      pendingPermission: null,
+      turnId: "native-turn",
+      agentDurationMs: 1_500,
+      phaseRevision: 2,
+      outcome: "completed",
+      composerPhase: "idle",
+    });
+    expect(st.messages.a[1].receipt).toMatchObject({
+      turnId: "native-turn",
+      agentDurationMs: 1_500,
+      changeState: "unknown",
+      changeCertainty: "unavailable",
+      changedFileCount: 0,
+    });
+    expect(dispose).not.toHaveBeenCalled();
+
+    // The store enforces the same boundary as the disabled Composer button.
+    await useStore.getState().send("too soon");
+    expect(m.runAgent).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().messages.a).toHaveLength(2);
+
+    const nativeReceipt = turnReceipt({
+      turnId: "native-turn",
+      completedAt: 4_600,
+      durationMs: 4_500,
+      changedFiles: [
+        {
+          path: "src/changed.ts",
+          status: "modified",
+          additions: 3,
+          deletions: 1,
+          binary: false,
+          certainty: "exact",
+        },
+      ],
+      changedFileCount: 1,
+      additions: 3,
+      deletions: 1,
+      changeState: "changed",
+    });
+    emit({ type: "turn_end", stopReason: "end_turn", receipt: nativeReceipt });
+
+    st = useStore.getState();
+    expect(st.runs.a.finalizing).toBe(false);
+    expect(st.runs.a.receipt).toMatchObject({
+      durationMs: 4_500,
+      agentDurationMs: 1_500,
+      changeState: "changed",
+      changedFileCount: 1,
+    });
+    expect(st.messages.a[1].receipt).toEqual(st.runs.a.receipt);
+    expect(dispose).toHaveBeenCalledOnce();
+  });
+
+  it("unlocks immediately without Git work and ignores the old listener after a quick follow-up", async () => {
+    const emits: Array<(event: StreamEvent) => void> = [];
+    const disposes: Array<ReturnType<typeof vi.fn>> = [];
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      emits.push(onEvent);
+      const dispose = vi.fn();
+      disposes.push(dispose);
+      return { cancel: vi.fn(async () => {}), dispose };
+    });
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: { a: [] },
+    });
+
+    await useStore.getState().send("just answer");
+    emits[0]({
+      type: "turn_start",
+      messageId: "first-message",
+      turnId: "first-turn",
+      startedAt: 100,
+    });
+    emits[0]({
+      type: "turn_phase",
+      turnId: "first-turn",
+      phase: "agent_completed",
+      at: 500,
+      revision: 1,
+      status: "completed",
+      agentDurationMs: 400,
+      receiptExpected: false,
+    });
+
+    expect(useStore.getState().runs.a).toMatchObject({
+      streaming: false,
+      finalizing: false,
+      outcome: "completed",
+      agentDurationMs: 400,
+    });
+    expect(useStore.getState().messages.a[1].receipt).toMatchObject({
+      changeState: "none",
+      changedFileCount: 0,
+    });
+    expect(disposes[0]).toHaveBeenCalledOnce();
+
+    await useStore.getState().send("follow up");
+    expect(m.runAgent).toHaveBeenCalledTimes(2);
+    const secondTurnId = useStore.getState().runs.a.turnId;
+    const secondAssistantId = useStore.getState().messages.a[3].id;
+    expect(secondTurnId).not.toBe("first-turn");
+    expect(useStore.getState().runs.a.streaming).toBe(true);
+
+    // Adversarially invoke the already-disposed callback with the next turn's
+    // session-channel traffic. Neither identity reconciliation nor a delta may
+    // leak through the stale closure, even if unlisten had a queued delivery.
+    emits[0]({
+      type: "turn_start",
+      messageId: "second-native-message",
+      turnId: "second-native-turn",
+      startedAt: 600,
+    });
+    emits[0]({ type: "text_delta", text: "stale duplicate" });
+    expect(useStore.getState().runs.a.turnId).toBe(secondTurnId);
+    expect(useStore.getState().messages.a[3]).toMatchObject({
+      id: secondAssistantId,
+      turnId: secondTurnId,
+      blocks: [],
+    });
+
+    const firstReceipt = turnReceipt({
+      turnId: "first-turn",
+      startedAt: 100,
+      completedAt: 500,
+      durationMs: 400,
+      changeState: "none",
+    });
+    emits[0]({ type: "turn_end", stopReason: "end_turn", receipt: firstReceipt });
+
+    const afterStaleTerminal = useStore.getState();
+    expect(afterStaleTerminal.runs.a).toMatchObject({
+      streaming: true,
+      turnId: secondTurnId,
+      outcome: null,
+    });
+    expect(afterStaleTerminal.messages.a[1].receipt).toMatchObject({ turnId: "first-turn" });
+    expect(afterStaleTerminal.messages.a[3].receipt).toBeUndefined();
+    expect(disposes[0]).toHaveBeenCalledOnce();
+
+    // The live listener remains the sole owner of follow-up events.
+    emits[1]({
+      type: "turn_start",
+      messageId: "second-native-message",
+      turnId: "second-native-turn",
+      startedAt: 600,
+    });
+    emits[1]({ type: "text_delta", text: "fresh response" });
+    expect(useStore.getState().messages.a[3]).toMatchObject({
+      id: "second-native-message",
+      turnId: "second-native-turn",
+      blocks: [{ kind: "text", text: "fresh response" }],
+    });
+    emits[1]({ type: "turn_end", stopReason: "end_turn" });
+    expect(useStore.getState().runs.a.streaming).toBe(false);
+    expect(disposes[1]).toHaveBeenCalledOnce();
+  });
+
+  it("ignores stale phase revisions and bounds a lost final receipt", async () => {
+    vi.useFakeTimers();
+    try {
+      const dispose = vi.fn();
+      let emit!: (event: StreamEvent) => void;
+      m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+        emit = onEvent;
+        return { cancel: vi.fn(async () => {}), dispose };
+      });
+      useStore.setState({
+        sessions: [session({ id: "a" })],
+        activeId: "a",
+        messages: { a: [] },
+      });
+
+      await useStore.getState().send("finish safely");
+      emit({
+        type: "turn_start",
+        messageId: "native-turn",
+        turnId: "native-turn",
+        startedAt: 100,
+      });
+      emit({
+        type: "turn_phase",
+        turnId: "native-turn",
+        phase: "provider_started",
+        at: 110,
+        revision: 2,
+      });
+      emit({
+        type: "turn_phase",
+        turnId: "native-turn",
+        phase: "agent_completed",
+        at: 300,
+        revision: 1,
+        receiptExpected: true,
+      });
+      expect(useStore.getState().runs.a.streaming).toBe(true);
+      expect(useStore.getState().runs.a.phaseRevision).toBe(2);
+
+      emit({
+        type: "turn_phase",
+        turnId: "native-turn",
+        phase: "agent_completed",
+        at: 700,
+        revision: 3,
+        agentDurationMs: 600,
+        receiptExpected: true,
+      });
+      expect(useStore.getState().runs.a.finalizing).toBe(true);
+      expect(dispose).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(useStore.getState().runs.a).toMatchObject({
+        streaming: false,
+        finalizing: false,
+        outcome: "completed",
+        agentDurationMs: 600,
+      });
+      expect(dispose).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps listening and locked after Stop until the native cancellation receipt arrives", async () => {

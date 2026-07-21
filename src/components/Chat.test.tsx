@@ -238,20 +238,33 @@ describe("Chat transcript", () => {
     expect(screen.getByText("Waiting for approval")).toBeInTheDocument();
     expect(container.querySelectorAll(".pc-turn-receipt")).toHaveLength(1);
 
+    const provisional = receipt({
+      startedAt: 1_000,
+      completedAt: 3_500,
+      durationMs: 2_500,
+      agentDurationMs: 2_500,
+      changeCertainty: "unavailable",
+      changeState: "unknown",
+    });
     act(() => {
       useStore.setState({
         streaming: false,
+        messages: {
+          s1: [userMessage("m1", "make the change"), { ...assistantMessage, receipt: provisional }],
+        },
         runs: {
           s1: {
             streaming: false,
             cancel: null,
             pendingPermission: null,
             turnId: "turn-1",
-            startedAt: Date.now() - 2_500,
+            startedAt: 1_000,
             finalizing: true,
-            receipt: null,
-            outcome: null,
-            composerPhase: "stopping",
+            agentDurationMs: 2_500,
+            phaseRevision: 2,
+            receipt: provisional,
+            outcome: "completed",
+            composerPhase: "idle",
             activeTool: null,
             unseenOutcome: null,
           },
@@ -259,8 +272,11 @@ describe("Chat transcript", () => {
       });
     });
 
-    expect(screen.getByText("Finalizing")).toBeInTheDocument();
+    expect(screen.getByText("Response complete · Checking file changes…")).toBeInTheDocument();
     expect(screen.queryByText("Waiting for approval")).toBeNull();
+    expect(screen.getByRole("log")).toHaveAttribute("aria-busy", "false");
+    expect(container.querySelector(".pc-stop")).toHaveAttribute("aria-hidden", "true");
+    expect(container.querySelectorAll('[role="status"][aria-live="polite"]')).toHaveLength(1);
   });
 
   it("opens the persisted turn review from a completed receipt", () => {

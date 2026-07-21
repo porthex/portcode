@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::llm::{Block, ChatMessage};
-use portcode_sync::wire::{TurnChangeCertainty, TurnReceipt, TurnStatus};
+use portcode_sync::wire::{TurnChangeCertainty, TurnChangeState, TurnReceipt, TurnStatus};
 
 /// How many of the most-recent messages per session the desktop ships in a single
 /// catch-up [`SyncFrame::MessageDelta`](crate::sync::protocol::SyncFrame). Bounds
@@ -397,12 +397,28 @@ pub struct Db {
     conn: Mutex<Connection>,
 }
 
+const DEFAULT_DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Completion receipts are optional metadata and must never make a delivered
+/// assistant answer wait behind unrelated database work. Canonical messages keep
+/// the normal retry budget; receipt checkpoint/final writes use this short,
+/// best-effort budget instead.
+const RECEIPT_DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+
+// `turn_receipts.terminal` predates the agent-terminal checkpoint. Keep `1` as
+// the only UI-visible terminal value for backward compatibility, and use `2` as
+// an internal durable checkpoint. An explicit state is important here: startup
+// recovery must never guess whether the model finished from optional receipt
+// fields that an older build may have populated differently.
+const RECEIPT_STATE_PENDING: i64 = 0;
+const RECEIPT_STATE_TERMINAL: i64 = 1;
+const RECEIPT_STATE_AGENT_TERMINAL: i64 = 2;
+
 impl Db {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
         // Retry briefly on a transient lock instead of failing a write instantly —
         // a swallowed write used to look like a successful persist.
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(DEFAULT_DB_BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(
@@ -588,8 +604,9 @@ impl Db {
     }
 
     /// Earlier receipt builds had no explicit pending state and every stored row
-    /// was terminal. Preserve those rows as terminal during the additive migration;
-    /// new pending writes always set `terminal = 0` explicitly.
+    /// was terminal. Preserve those rows as terminal during the additive migration.
+    /// New rows use 0 for an in-flight turn, 2 for a known agent outcome awaiting
+    /// optional receipt finalization, and 1 for an immutable visible receipt.
     fn migrate_add_receipt_terminal(conn: &Connection) -> rusqlite::Result<()> {
         let mut stmt = conn.prepare("PRAGMA table_info(turn_receipts)")?;
         let has_terminal = stmt
@@ -641,38 +658,62 @@ impl Db {
     /// is unknowable, so duration remains omitted; `completed_at` records recovery
     /// time, not a fabricated crash time.
     fn recover_pending_turn_receipts(conn: &Connection, recovered_at: i64) -> rusqlite::Result<()> {
-        let pending: Vec<(String, String)> = {
-            let mut stmt =
-                conn.prepare("SELECT turn_id, receipt_json FROM turn_receipts WHERE terminal = 0")?;
-            let rows = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .filter_map(|row| row.ok())
-                .collect();
-            rows
+        let pending: Vec<(String, String, i64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT turn_id, receipt_json, terminal
+                 FROM turn_receipts WHERE terminal <> ?1",
+            )?;
+            let rows = stmt.query_map(params![RECEIPT_STATE_TERMINAL], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
         };
-        for (turn_id, json) in pending {
+        for (turn_id, json, persistence_state) in pending {
             let Ok(mut receipt) = serde_json::from_str::<TurnReceipt>(&json) else {
                 // A corrupt pending row must not retry forever or leak through a
                 // future join. Mark it terminal; typed reads will continue to hide it.
                 conn.execute(
-                    "UPDATE turn_receipts SET terminal = 1 WHERE turn_id = ?1",
-                    params![turn_id],
+                    "UPDATE turn_receipts SET terminal = ?2 WHERE turn_id = ?1",
+                    params![turn_id, RECEIPT_STATE_TERMINAL],
                 )?;
                 continue;
             };
-            receipt.status = TurnStatus::Interrupted;
-            receipt.stop_reason = Some("process_interrupted".into());
-            receipt.completed_at = recovered_at.max(receipt.started_at);
-            receipt.duration_ms = None;
+            let agent_outcome_known = persistence_state == RECEIPT_STATE_AGENT_TERMINAL
+                && !matches!(receipt.status, TurnStatus::Interrupted);
+            if agent_outcome_known {
+                // The provider/tool loop had already reached and durably saved an
+                // outcome; only optional Git receipt finalization was interrupted.
+                // Preserve the delivered result instead of relabelling it as a
+                // process interruption on restart.
+                receipt.duration_ms = receipt.agent_duration_ms;
+                receipt.change_state = Some(TurnChangeState::Unknown);
+            } else {
+                receipt.status = TurnStatus::Interrupted;
+                receipt.stop_reason = Some("process_interrupted".into());
+                receipt.completed_at = recovered_at.max(receipt.started_at);
+                receipt.duration_ms = None;
+                receipt.agent_duration_ms = None;
+                receipt.change_state = Some(TurnChangeState::Unknown);
+            }
+            receipt.changed_files.clear();
+            receipt.changed_file_count = 0;
+            receipt.additions = 0;
+            receipt.deletions = 0;
+            receipt.files_truncated = false;
             receipt.change_certainty = TurnChangeCertainty::Unavailable;
             receipt.background_tasks_running = false;
             let recovered_json = serde_json::to_string(&receipt)
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             conn.execute(
                 "UPDATE turn_receipts
-                 SET receipt_json = ?2, completed_at = ?3, terminal = 1
+                 SET receipt_json = ?2, completed_at = ?3, terminal = ?4
                  WHERE turn_id = ?1",
-                params![turn_id, recovered_json, receipt.completed_at],
+                params![
+                    turn_id,
+                    recovered_json,
+                    receipt.completed_at,
+                    RECEIPT_STATE_TERMINAL
+                ],
             )?;
         }
         Ok(())
@@ -1126,7 +1167,33 @@ impl Db {
         message_id: &str,
         receipt: &TurnReceipt,
     ) -> rusqlite::Result<()> {
-        self.save_turn_receipt_state(session_id, message_id, receipt, None, None, false)
+        self.save_turn_receipt_state(
+            session_id,
+            message_id,
+            receipt,
+            None,
+            None,
+            RECEIPT_STATE_PENDING,
+        )
+    }
+
+    /// Best-effort completion checkpoint that never queues behind another local
+    /// DB user and gives an external SQLite writer only a very small busy budget.
+    /// `Ok(false)` means the local connection was already in use.
+    pub fn try_save_pending_turn_receipt_fast(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        receipt: &TurnReceipt,
+    ) -> rusqlite::Result<bool> {
+        self.try_save_turn_receipt_state_fast(
+            session_id,
+            message_id,
+            receipt,
+            None,
+            None,
+            RECEIPT_STATE_AGENT_TERMINAL,
+        )
     }
 
     /// Insert or replace the immutable terminal receipt and make it visible to all
@@ -1145,7 +1212,27 @@ impl Db {
             receipt,
             repository_root,
             terminal_snapshot_id,
-            true,
+            RECEIPT_STATE_TERMINAL,
+        )
+    }
+
+    /// Best-effort terminal receipt persistence for the post-answer hot path.
+    /// See [`Self::try_save_pending_turn_receipt_fast`].
+    pub fn try_save_turn_receipt_fast(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        receipt: &TurnReceipt,
+        repository_root: Option<&str>,
+        terminal_snapshot_id: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        self.try_save_turn_receipt_state_fast(
+            session_id,
+            message_id,
+            receipt,
+            repository_root,
+            terminal_snapshot_id,
+            RECEIPT_STATE_TERMINAL,
         )
     }
 
@@ -1156,11 +1243,78 @@ impl Db {
         receipt: &TurnReceipt,
         repository_root: Option<&str>,
         terminal_snapshot_id: Option<&str>,
-        terminal: bool,
+        persistence_state: i64,
     ) -> rusqlite::Result<()> {
         let json = serde_json::to_string(receipt)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         let conn = self.conn.lock().unwrap();
+        Self::write_turn_receipt_state(
+            &conn,
+            session_id,
+            message_id,
+            receipt,
+            repository_root,
+            terminal_snapshot_id,
+            persistence_state,
+            &json,
+        )
+    }
+
+    fn try_save_turn_receipt_state_fast(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        receipt: &TurnReceipt,
+        repository_root: Option<&str>,
+        terminal_snapshot_id: Option<&str>,
+        persistence_state: i64,
+    ) -> rusqlite::Result<bool> {
+        let json = serde_json::to_string(receipt)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let Ok(conn) = self.conn.try_lock() else {
+            return Ok(false);
+        };
+        let previous_busy_timeout = Self::current_busy_timeout(&conn)?;
+        conn.busy_timeout(RECEIPT_DB_BUSY_TIMEOUT)?;
+        let write = Self::write_turn_receipt_state(
+            &conn,
+            session_id,
+            message_id,
+            receipt,
+            repository_root,
+            terminal_snapshot_id,
+            persistence_state,
+            &json,
+        );
+        // Restore before propagating a write failure. Otherwise one contended
+        // optional receipt could silently leave canonical message writes with the
+        // 50 ms best-effort budget instead of their configured retry budget.
+        let restore = conn.busy_timeout(previous_busy_timeout);
+        match (write, restore) {
+            (Ok(()), Ok(())) => Ok(true),
+            (Err(write_error), _) => Err(write_error),
+            (Ok(()), Err(restore_error)) => Err(restore_error),
+        }
+    }
+
+    fn current_busy_timeout(conn: &Connection) -> rusqlite::Result<std::time::Duration> {
+        let milliseconds = conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))?;
+        let milliseconds = u64::try_from(milliseconds)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, milliseconds))?;
+        Ok(std::time::Duration::from_millis(milliseconds))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_turn_receipt_state(
+        conn: &Connection,
+        session_id: &str,
+        message_id: &str,
+        receipt: &TurnReceipt,
+        repository_root: Option<&str>,
+        terminal_snapshot_id: Option<&str>,
+        persistence_state: i64,
+        json: &str,
+    ) -> rusqlite::Result<()> {
         conn.execute(
             "INSERT INTO turn_receipts (
                  turn_id, session_id, message_id, receipt_json,
@@ -1179,7 +1333,8 @@ impl Db {
                  completed_at = excluded.completed_at,
                  terminal = excluded.terminal,
                  anchor_seq = COALESCE(turn_receipts.anchor_seq, excluded.anchor_seq)
-             WHERE turn_receipts.terminal = 0",
+             WHERE turn_receipts.terminal = 0
+                OR (turn_receipts.terminal = 2 AND excluded.terminal IN (1, 2))",
             params![
                 receipt.turn_id,
                 session_id,
@@ -1190,7 +1345,7 @@ impl Db {
                 terminal_snapshot_id,
                 receipt.started_at,
                 receipt.completed_at,
-                if terminal { 1_i64 } else { 0_i64 },
+                persistence_state,
             ],
         )?;
         Ok(())
@@ -1994,11 +2149,13 @@ mod tests {
             started_at: 2,
             completed_at: 9,
             duration_ms: Some(7),
+            agent_duration_ms: Some(7),
             changed_files: Vec::new(),
             changed_file_count: 0,
             additions: 0,
             deletions: 0,
             files_truncated: false,
+            change_state: Some(TurnChangeState::None),
             change_certainty: TurnChangeCertainty::Exact,
             background_tasks_running: false,
         }
@@ -2769,6 +2926,9 @@ mod tests {
             Some("snap-b"),
         )
         .unwrap();
+        assert!(db
+            .try_save_pending_turn_receipt_fast("a", "immutable-turn", &conflicting)
+            .unwrap());
 
         let stored = db.get_turn_receipt("immutable-turn").unwrap();
         assert_eq!(stored.account_profile_id.as_deref(), Some("profile-a"));
@@ -2825,7 +2985,158 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovers_pending_receipt_as_unknown_duration_interruption() {
+    fn fast_receipt_persistence_never_waits_for_the_local_db_mutex() {
+        let db = mem_db();
+        db.create_session("a", "A", None, None, 1).unwrap();
+        let receipt = receipt("contended-turn");
+        let held = db.conn.lock().unwrap();
+        let started = std::time::Instant::now();
+
+        let checkpoint_saved = db
+            .try_save_pending_turn_receipt_fast("a", "contended-turn", &receipt)
+            .unwrap();
+        let terminal_saved = db
+            .try_save_turn_receipt_fast("a", "contended-turn", &receipt, None, None)
+            .unwrap();
+
+        assert!(!checkpoint_saved);
+        assert!(!terminal_saved);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "best-effort receipt persistence queued behind the DB mutex"
+        );
+        drop(held);
+        assert!(db
+            .try_save_pending_turn_receipt_fast("a", "contended-turn", &receipt)
+            .unwrap());
+        let checkpoint_state: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT terminal FROM turn_receipts WHERE turn_id = 'contended-turn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkpoint_state, RECEIPT_STATE_AGENT_TERMINAL);
+        assert!(db.get_turn_receipt("contended-turn").is_none());
+
+        // A delayed/retried initial placeholder may not erase the durable model
+        // outcome before finalization or crash recovery.
+        let mut stale_placeholder = receipt.clone();
+        stale_placeholder.status = TurnStatus::Interrupted;
+        stale_placeholder.duration_ms = None;
+        stale_placeholder.agent_duration_ms = None;
+        db.save_pending_turn_receipt("a", "contended-turn", &stale_placeholder)
+            .unwrap();
+        let (state_after_stale_write, json_after_stale_write): (i64, String) = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT terminal, receipt_json FROM turn_receipts
+                 WHERE turn_id = 'contended-turn'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state_after_stale_write, RECEIPT_STATE_AGENT_TERMINAL);
+        assert_eq!(
+            serde_json::from_str::<TurnReceipt>(&json_after_stale_write).unwrap(),
+            receipt
+        );
+
+        assert!(db
+            .try_save_turn_receipt_fast("a", "contended-turn", &receipt, None, None)
+            .unwrap());
+        assert_eq!(
+            db.get_turn_receipt("contended-turn").unwrap().receipt,
+            receipt
+        );
+    }
+
+    #[test]
+    fn fast_receipt_persistence_bounds_external_locks_and_restores_busy_timeout() {
+        let path = std::env::temp_dir().join(format!(
+            "portcode_contended_receipt_{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Db::open(&path).unwrap();
+        db.create_session("a", "A", None, None, 1).unwrap();
+
+        // Use a non-default value so the assertion proves the prior connection
+        // configuration is restored, rather than merely set to a constant.
+        let configured_timeout = std::time::Duration::from_millis(1_337);
+        db.conn
+            .lock()
+            .unwrap()
+            .busy_timeout(configured_timeout)
+            .unwrap();
+
+        let blocker = Connection::open(&path).unwrap();
+        blocker.busy_timeout(std::time::Duration::ZERO).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let receipt = receipt("externally-contended-turn");
+        let started = std::time::Instant::now();
+        db.try_save_pending_turn_receipt_fast("a", "externally-contended-turn", &receipt)
+            .expect_err("the external writer should hold SQLite's write lock");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "checkpoint persistence used the canonical multi-second busy timeout"
+        );
+        assert_eq!(
+            Db::current_busy_timeout(&db.conn.lock().unwrap()).unwrap(),
+            configured_timeout
+        );
+        blocker.execute_batch("COMMIT").unwrap();
+
+        assert!(db
+            .try_save_pending_turn_receipt_fast("a", "externally-contended-turn", &receipt)
+            .unwrap());
+        assert_eq!(
+            Db::current_busy_timeout(&db.conn.lock().unwrap()).unwrap(),
+            configured_timeout
+        );
+
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        db.try_save_turn_receipt_fast("a", "externally-contended-turn", &receipt, None, None)
+            .expect_err("the external writer should also bound terminal persistence");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "terminal persistence used the canonical multi-second busy timeout"
+        );
+        assert_eq!(
+            Db::current_busy_timeout(&db.conn.lock().unwrap()).unwrap(),
+            configured_timeout
+        );
+        blocker.execute_batch("COMMIT").unwrap();
+
+        assert!(db
+            .try_save_turn_receipt_fast("a", "externally-contended-turn", &receipt, None, None,)
+            .unwrap());
+        assert_eq!(
+            db.get_turn_receipt("externally-contended-turn")
+                .unwrap()
+                .receipt,
+            receipt
+        );
+
+        drop(blocker);
+        drop(db);
+        for candidate in [
+            path.clone(),
+            PathBuf::from(format!("{}-wal", path.display())),
+            PathBuf::from(format!("{}-shm", path.display())),
+        ] {
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
+
+    #[test]
+    fn startup_recovers_initial_pending_state_as_unknown_duration_interruption() {
         let path = std::env::temp_dir().join(format!(
             "portcode_pending_receipt_{}.sqlite",
             uuid::Uuid::new_v4()
@@ -2835,8 +3146,23 @@ mod tests {
             db.create_session("a", "A", None, None, 1).unwrap();
             db.try_append_message_for_turn("a", Some("crashed-turn"), &text("working"), 2)
                 .unwrap();
-            db.save_pending_turn_receipt("a", "crashed-turn", &receipt("crashed-turn"))
+            // Persistence state, not optional JSON field shape, is authoritative.
+            // This deliberately looks completed so the test catches a regression
+            // to inferring the checkpoint from `agent_duration_ms`.
+            let placeholder = receipt("crashed-turn");
+            db.save_pending_turn_receipt("a", "crashed-turn", &placeholder)
                 .unwrap();
+            let persistence_state: i64 = db
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT terminal FROM turn_receipts WHERE turn_id = 'crashed-turn'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(persistence_state, RECEIPT_STATE_PENDING);
             assert!(db.get_turn_receipt("crashed-turn").is_none());
         }
 
@@ -2850,6 +3176,8 @@ mod tests {
             Some("process_interrupted")
         );
         assert_eq!(record.receipt.duration_ms, None);
+        assert_eq!(record.receipt.agent_duration_ms, None);
+        assert_eq!(record.receipt.change_state, Some(TurnChangeState::Unknown));
         assert_eq!(
             record.receipt.change_certainty,
             TurnChangeCertainty::Unavailable
@@ -2872,6 +3200,63 @@ mod tests {
     // Invariants protected here (ruflo tester, Phase 0 review): full pull,
     // strictly-greater boundary, up-to-date emptiness, ascending order, and
     // per-session isolation.
+
+    #[test]
+    fn startup_preserves_agent_outcome_when_only_receipt_finalization_crashed() {
+        let path = std::env::temp_dir().join(format!(
+            "portcode_agent_terminal_receipt_{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let db = Db::open(&path).unwrap();
+            db.create_session("a", "A", None, None, 1).unwrap();
+            let mut checkpoint = receipt("completed-before-git");
+            checkpoint.status = TurnStatus::Completed;
+            checkpoint.stop_reason = Some("end_turn".into());
+            checkpoint.completed_at = 9;
+            checkpoint.duration_ms = Some(7);
+            checkpoint.agent_duration_ms = Some(7);
+            checkpoint.change_state = Some(TurnChangeState::Unknown);
+            assert!(db
+                .try_save_pending_turn_receipt_fast("a", "completed-before-git", &checkpoint,)
+                .unwrap());
+            let persistence_state: i64 = db
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT terminal FROM turn_receipts
+                     WHERE turn_id = 'completed-before-git'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(persistence_state, RECEIPT_STATE_AGENT_TERMINAL);
+        }
+
+        let recovered = Db::open(&path).unwrap();
+        let receipt = recovered
+            .get_turn_receipt("completed-before-git")
+            .expect("known agent outcome should become a visible degraded receipt")
+            .receipt;
+        assert_eq!(receipt.status, TurnStatus::Completed);
+        assert_eq!(receipt.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(receipt.agent_duration_ms, Some(7));
+        assert_eq!(receipt.duration_ms, Some(7));
+        assert_eq!(receipt.change_state, Some(TurnChangeState::Unknown));
+        assert!(receipt.changed_files.is_empty());
+        assert_eq!(receipt.changed_file_count, 0);
+        assert_eq!(receipt.change_certainty, TurnChangeCertainty::Unavailable);
+
+        drop(recovered);
+        for candidate in [
+            path.clone(),
+            PathBuf::from(format!("{}-wal", path.display())),
+            PathBuf::from(format!("{}-shm", path.display())),
+        ] {
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
 
     #[test]
     fn ui_messages_terminalizes_an_unmatched_historical_tool_after_reload() {

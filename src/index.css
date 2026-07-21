@@ -1166,6 +1166,16 @@ input[type="radio"]:not(:disabled) {
   background: rgba(10, 12, 18, 0.62);
   overflow: hidden;
 }
+.pc-turn-receipt--completed,
+.pc-turn-receipt--finalizing {
+  border-color: transparent;
+  background: transparent;
+}
+.pc-turn-receipt--completed[data-has-activity="false"],
+.pc-turn-receipt--finalizing[data-has-activity="false"] {
+  width: fit-content;
+  max-width: 100%;
+}
 .pc-turn-receipt__strip {
   display: grid;
   grid-template-columns: 12px minmax(0, 1fr) minmax(7ch, auto) 12px;
@@ -1181,6 +1191,24 @@ input[type="radio"]:not(:disabled) {
   font-size: 11px;
   line-height: 1;
   text-align: left;
+}
+.pc-turn-receipt--completed .pc-turn-receipt__strip {
+  grid-template-columns: 10px auto auto 10px;
+  justify-content: start;
+  column-gap: 5px;
+  min-height: 24px;
+  padding: 0 3px;
+  color: var(--color-muted);
+  font-size: 10.5px;
+}
+.pc-turn-receipt--finalizing .pc-turn-receipt__strip {
+  grid-template-columns: 10px minmax(0, auto) auto 10px;
+  justify-content: start;
+  column-gap: 6px;
+  min-height: 28px;
+  padding: 0 3px;
+  color: var(--color-muted);
+  font-size: 10.5px;
 }
 button.pc-turn-receipt__strip {
   cursor: pointer;
@@ -1199,8 +1227,7 @@ button.pc-turn-receipt__strip:focus-visible {
 }
 .pc-turn-receipt--starting .pc-turn-receipt__state-mark,
 .pc-turn-receipt--working .pc-turn-receipt__state-mark,
-.pc-turn-receipt--waiting .pc-turn-receipt__state-mark,
-.pc-turn-receipt--finalizing .pc-turn-receipt__state-mark {
+.pc-turn-receipt--waiting .pc-turn-receipt__state-mark {
   animation: pc-turn-state-pulse 1.25s ease-in-out infinite;
 }
 .pc-turn-receipt--waiting .pc-turn-receipt__state-mark,
@@ -1209,6 +1236,11 @@ button.pc-turn-receipt__strip:focus-visible {
 }
 .pc-turn-receipt--completed .pc-turn-receipt__state-mark {
   color: var(--color-success);
+  opacity: 0.72;
+}
+.pc-turn-receipt--finalizing .pc-turn-receipt__state-mark {
+  color: var(--color-muted);
+  opacity: 0.8;
 }
 .pc-turn-receipt--error .pc-turn-receipt__state-mark,
 .pc-turn-receipt--interrupted .pc-turn-receipt__state-mark {
@@ -1226,6 +1258,12 @@ button.pc-turn-receipt__strip:focus-visible {
   font-variant-numeric: tabular-nums;
   text-align: right;
   white-space: nowrap;
+}
+.pc-turn-receipt--completed .pc-turn-receipt__time,
+.pc-turn-receipt--finalizing .pc-turn-receipt__time {
+  min-width: 0;
+  color: inherit;
+  text-align: left;
 }
 .pc-turn-receipt__chevron {
   color: #778196;

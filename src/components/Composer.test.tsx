@@ -8,6 +8,7 @@ import {
   type ComposerPhase,
   type OpenAIAccountSummary,
   type Session,
+  type TurnReceipt,
   type Usage,
 } from "../types";
 
@@ -44,11 +45,32 @@ const run = (over: Partial<(typeof initial.runs)[string]> = {}): (typeof initial
   turnId: null,
   startedAt: null,
   finalizing: false,
+  agentDurationMs: null,
+  phaseRevision: 0,
   receipt: null,
   outcome: null,
   composerPhase: "idle",
   activeTool: null,
   unseenOutcome: null,
+  ...over,
+});
+
+const receipt = (over: Partial<TurnReceipt> = {}): TurnReceipt => ({
+  turnId: "turn-1",
+  status: "completed",
+  stopReason: "end_turn",
+  startedAt: 1_000,
+  completedAt: 3_000,
+  durationMs: 2_000,
+  agentDurationMs: 2_000,
+  changedFiles: [],
+  changedFileCount: 0,
+  additions: 0,
+  deletions: 0,
+  filesTruncated: false,
+  changeCertainty: "unavailable",
+  changeState: "unknown",
+  backgroundTasksRunning: false,
   ...over,
 });
 
@@ -151,6 +173,69 @@ describe("Composer rich editor", () => {
     expect(textarea().closest(".pc-neon-frame")).toHaveAttribute("aria-busy", "true");
     act(() => useStore.setState({ drafts: { a: "next thought" } }));
     await waitFor(() => expect(textarea()).toHaveTextContent("next thought"));
+  });
+
+  it("keeps drafting open but locks Send only while the response change record finalizes", () => {
+    const provisional = receipt();
+    useStore.setState({
+      activeId: "a",
+      sessions: [session()],
+      drafts: { a: "next request" },
+      streaming: false,
+      runs: {
+        a: run({
+          turnId: "turn-1",
+          startedAt: 1_000,
+          finalizing: true,
+          agentDurationMs: 2_000,
+          phaseRevision: 2,
+          receipt: provisional,
+          outcome: "completed",
+        }),
+      },
+    });
+    render(<Composer />);
+
+    expect(textarea()).toBeEnabled();
+    expect(textarea()).toHaveTextContent("next request");
+    expect(textarea()).toHaveAttribute(
+      "aria-placeholder",
+      "Draft your next message while Portcode checks file changes…",
+    );
+    expect(textarea().closest(".pc-neon-frame")).toHaveAttribute("aria-busy", "false");
+
+    const lockedSend = screen.getByRole("button", {
+      name: "Send unlocks after file changes are checked",
+    });
+    expect(lockedSend).toBeVisible();
+    expect(lockedSend).toBeDisabled();
+    expect(lockedSend).toHaveAttribute("tabindex", "0");
+    expect(lockedSend).toHaveAttribute("title", "Finishing the change record before sending");
+    expect(stopButton()).toHaveAttribute("aria-hidden", "true");
+    expect(stopButton()).toHaveAttribute("tabindex", "-1");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "response complete · checking file changes…",
+    );
+    expect(screen.getByRole("status")).toHaveAttribute("aria-live", "off");
+    expect(
+      screen.getByText("Response complete · send unlocks after file check"),
+    ).toBeInTheDocument();
+
+    act(() => {
+      useStore.setState({
+        runs: {
+          a: run({
+            turnId: "turn-1",
+            startedAt: 1_000,
+            receipt: receipt({ changeCertainty: "exact", changeState: "none" }),
+            outcome: "completed",
+          }),
+        },
+      });
+    });
+
+    expect(sendButton()).toBeEnabled();
+    expect(textarea()).toHaveTextContent("next request");
   });
 
   it("disables the input when there is no active session to draft into", () => {

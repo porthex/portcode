@@ -217,6 +217,10 @@ pub fn project_event(event: &StreamEvent) -> PhoneStreamEvent {
             turn_id: turn_id.as_deref().map(public_identifier),
             started_at: *started_at,
         },
+        // TurnPhase is currently a desktop-local additive event. It must never
+        // be projected as a legacy phone event until capability negotiation is
+        // implemented; fail closed if this boundary is called directly.
+        StreamEvent::TurnPhase { .. } => PhoneStreamEvent::Unknown,
         StreamEvent::TextDelta { text } => PhoneStreamEvent::TextDelta {
             text: bounded_public_text(text, MAX_LIVE_TEXT_BYTES),
         },
@@ -680,7 +684,8 @@ impl PhoneEventProjector {
 mod tests {
     use super::*;
     use portcode_sync::wire::{
-        PermissionRisk, TurnChangeCertainty, TurnChangedFile, TurnFileStatus, TurnStatus,
+        PermissionRisk, TurnChangeCertainty, TurnChangeState, TurnChangedFile, TurnFileStatus,
+        TurnPhase, TurnStatus,
     };
     use serde_json::json;
 
@@ -695,6 +700,7 @@ mod tests {
             started_at: 1,
             completed_at: 2,
             duration_ms: Some(1),
+            agent_duration_ms: Some(1),
             changed_files: vec![TurnChangedFile {
                 path: format!("C:/Users/private/work/{SECRET}/file.rs"),
                 old_path: Some("/home/private/old.rs".into()),
@@ -708,6 +714,7 @@ mod tests {
             additions: 1,
             deletions: 2,
             files_truncated: false,
+            change_state: Some(TurnChangeState::Changed),
             change_certainty: TurnChangeCertainty::Exact,
             background_tasks_running: false,
         }
@@ -721,6 +728,16 @@ mod tests {
                 message_id: format!("message-{SECRET}"),
                 turn_id: Some(format!("turn-{SECRET}")),
                 started_at: Some(1),
+            },
+            StreamEvent::TurnPhase {
+                turn_id: format!("turn-{SECRET}"),
+                phase: TurnPhase::AgentCompleted,
+                at: 2,
+                revision: Some(1),
+                status: Some(TurnStatus::Completed),
+                stop_reason: Some(format!("future-{SECRET}")),
+                agent_duration_ms: Some(1),
+                receipt_expected: Some(false),
             },
             StreamEvent::TextDelta {
                 text: format!("hello {SECRET}"),

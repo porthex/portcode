@@ -83,6 +83,17 @@ pub enum TurnStatus {
     Interrupted,
 }
 
+/// Non-terminal lifecycle milestones emitted to the local desktop UI. Phone
+/// Sync deliberately does not forward this additive event until a peer has
+/// negotiated support, because legacy Rust peers reject unknown enum variants.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPhase {
+    ProviderStarted,
+    AgentCompleted,
+}
+
 /// How confidently a receipt can attribute an observed file delta to the turn.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(target_arch = "wasm32", derive(Tsify))]
@@ -92,6 +103,18 @@ pub enum TurnChangeCertainty {
     Observed,
     Ambiguous,
     Unavailable,
+}
+
+/// Whether Git attribution applies and whether a net delta is known. This is
+/// orthogonal to [`TurnChangeCertainty`], which only qualifies attribution.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(rename_all = "snake_case")]
+pub enum TurnChangeState {
+    NotApplicable,
+    None,
+    Changed,
+    Unknown,
 }
 
 /// Git-shaped status used by the immutable, bounded changed-file summary.
@@ -147,11 +170,17 @@ pub struct TurnReceipt {
     /// unknowable and fabricating a near-zero duration would be misleading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Agent work duration frozen before optional Git finalization. New clients
+    /// prefer this over legacy `duration_ms`; old receipts simply omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_duration_ms: Option<u64>,
     pub changed_files: Vec<TurnChangedFile>,
     pub changed_file_count: u64,
     pub additions: u64,
     pub deletions: u64,
     pub files_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_state: Option<TurnChangeState>,
     pub change_certainty: TurnChangeCertainty,
     pub background_tasks_running: bool,
 }
@@ -197,6 +226,37 @@ pub enum StreamEvent {
         turn_id: Option<String>,
         #[serde(rename = "startedAt", default, skip_serializing_if = "Option::is_none")]
         started_at: Option<i64>,
+    },
+    /// Desktop-local lifecycle milestone. The production event sink emits this
+    /// without mirroring it to legacy Phone Sync peers; TurnEnd/Error remains the
+    /// authoritative, backwards-compatible receipt-ready event.
+    TurnPhase {
+        #[serde(rename = "turnId")]
+        turn_id: String,
+        phase: TurnPhase,
+        at: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<TurnStatus>,
+        #[serde(
+            rename = "stopReason",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        stop_reason: Option<String>,
+        #[serde(
+            rename = "agentDurationMs",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        agent_duration_ms: Option<u64>,
+        #[serde(
+            rename = "receiptExpected",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        receipt_expected: Option<bool>,
     },
     TextDelta {
         text: String,
@@ -624,6 +684,8 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(receipt.account_profile_id, None);
+        assert_eq!(receipt.agent_duration_ms, None);
+        assert_eq!(receipt.change_state, None);
         assert!(serde_json::to_value(&receipt)
             .unwrap()
             .get("accountProfileId")
@@ -768,5 +830,33 @@ mod tests {
         let legacy: StreamEvent = serde_json::from_value(serde_json::to_value(public).unwrap())
             .expect("legacy StreamEvent shape remains decodable");
         assert!(matches!(legacy, StreamEvent::ToolResult { .. }));
+    }
+
+    #[test]
+    fn local_turn_phase_uses_additive_camel_case_fields() {
+        let event = StreamEvent::TurnPhase {
+            turn_id: "turn-1".into(),
+            phase: TurnPhase::AgentCompleted,
+            at: 99,
+            revision: Some(2),
+            status: Some(TurnStatus::Completed),
+            stop_reason: Some("end_turn".into()),
+            agent_duration_ms: Some(42),
+            receipt_expected: Some(true),
+        };
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            json!({
+                "type": "turn_phase",
+                "turnId": "turn-1",
+                "phase": "agent_completed",
+                "at": 99,
+                "revision": 2,
+                "status": "completed",
+                "stopReason": "end_turn",
+                "agentDurationMs": 42,
+                "receiptExpected": true
+            })
+        );
     }
 }
