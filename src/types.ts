@@ -822,10 +822,10 @@ export interface UpdateInfo {
   date: string | null;
 }
 
-/** Which release feed this build follows. Portcode ships a single public
- *  `stable` channel (the rolling `staging` pre-release feed was retired).
- *  Returned by `update_channel`. */
-export type UpdateChannel = "stable";
+/** Which signed release feed this build follows. Stable builds consume normal
+ *  releases; beta builds consume the rolling tester manifest. Returned by
+ *  `update_channel`. */
+export type UpdateChannel = "beta" | "stable";
 
 // ── Phone Sync ────────────────────────────────────────────────────────────────
 

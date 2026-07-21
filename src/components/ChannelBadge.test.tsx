@@ -19,11 +19,24 @@ describe("ChannelBadge", () => {
     expect(pill).toHaveClass("pc-pill", "pc-pill--accent");
   });
 
+  it("shows a BETA pill in the tester build", () => {
+    vi.stubEnv("VITE_PORTCODE_CHANNEL", "beta");
+    render(<ChannelBadge />);
+    const pill = screen.getByText("BETA");
+    expect(pill).toBeInTheDocument();
+    expect(pill).toHaveClass("pc-pill", "pc-pill--warn");
+    expect(pill).toHaveAttribute(
+      "title",
+      "Beta build — receives tester releases from the beta update channel",
+    );
+  });
+
   it("renders nothing in the normal build", () => {
     vi.stubEnv("VITE_PORTCODE_CHANNEL", "stable");
     const { container } = render(<ChannelBadge />);
     expect(container).toBeEmptyDOMElement();
     expect(screen.queryByText("DEV")).not.toBeInTheDocument();
+    expect(screen.queryByText("BETA")).not.toBeInTheDocument();
   });
 
   it("renders nothing when the channel flag is absent (real production build)", () => {

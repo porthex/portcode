@@ -21,11 +21,14 @@
 use tauri::Emitter;
 use tauri_plugin_updater::UpdaterExt;
 
-/// The release channel. Portcode ships a single `"stable"` channel: all builds
-/// follow GitHub's `releases/latest` redirect. (The retired staging/pre-release
-/// update feed used to override this; it no longer exists.)
+/// The release channel selected at compile time. Stable is the safe default;
+/// only the dedicated beta build script enables `beta-channel`.
 pub fn channel() -> &'static str {
-    "stable"
+    if cfg!(feature = "beta-channel") {
+        "beta"
+    } else {
+        "stable"
+    }
 }
 
 /// Update metadata handed to the frontend. camelCase to match the TS client.
@@ -45,12 +48,14 @@ pub(crate) struct UpdateInfo {
     date: Option<String>,
 }
 
-/// Build the updater. The stable channel uses GitHub's `releases/latest`
-/// redirect, which resolves to the most recent published, non-prerelease
-/// Release. We set the endpoint at runtime (rather than in `tauri.conf.json`) so
-/// the manifest URL lives next to the channel logic it depends on.
+/// Build the updater with the endpoint for the compiled channel. Both manifests
+/// are signed by the same configured trust root; only the feed changes.
 fn build_updater(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
-    let endpoint = "https://github.com/porthex/portcode/releases/latest/download/latest.json";
+    let endpoint = if cfg!(feature = "beta-channel") {
+        "https://github.com/porthex/portcode/releases/download/beta/latest.json"
+    } else {
+        "https://github.com/porthex/portcode/releases/latest/download/latest.json"
+    };
     // `reqwest::Url` IS `url::Url` (single `url` version in the lock), and reqwest
     // is already a direct dependency — so we get a correctly-typed endpoint without
     // adding `url` as a new dep.
@@ -128,8 +133,21 @@ pub fn update_relaunch(app: tauri::AppHandle) {
     app.restart();
 }
 
-/// Report the release channel so the UI can adjust copy. Always `"stable"`.
+/// Report the release channel so the UI can adjust copy.
 #[tauri::command]
 pub fn update_channel() -> &'static str {
     channel()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::channel;
+
+    #[test]
+    fn reports_the_compiled_release_channel() {
+        #[cfg(feature = "beta-channel")]
+        assert_eq!(channel(), "beta");
+        #[cfg(not(feature = "beta-channel"))]
+        assert_eq!(channel(), "stable");
+    }
 }

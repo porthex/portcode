@@ -1,25 +1,29 @@
 /**
  * Which build channel this bundle was compiled for.
  *
- * `dev` is the **self-dev build** — the one you run while working ON Portcode.
- * It carries its own separate data directory (history + settings) and shows a
- * visible "DEV" marker so you never confuse it with your everyday app. Anything
- * else is the normal `stable` build.
+ * `dev` is the self-dev build; `beta` is the tester build promoted from `main`.
+ * Both have separate app identities and visible markers so they can run next to
+ * the normal `stable` app without sharing state or being mistaken for it.
  *
  * Driven by the `VITE_PORTCODE_CHANNEL` env var, which the `*:self` scripts set
  * via Vite's `selfdev` mode (see `.env.selfdev`). Read at call time (not at
  * module load) so tests can stub the env with `vi.stubEnv`.
  */
-export type Channel = "dev" | "stable";
+export type Channel = "beta" | "dev" | "stable";
 
-/** Resolve the active build channel. Defaults to `stable` for any value that
- *  isn't exactly `"dev"`, so an unset/garbage flag can never masquerade as the
- *  self-dev build. */
+/** Resolve the active build channel. Unknown or missing flags default to stable,
+ *  so a production build can never masquerade as beta or self-dev. */
 export function channel(): Channel {
-  return import.meta.env.VITE_PORTCODE_CHANNEL === "dev" ? "dev" : "stable";
+  const value = import.meta.env.VITE_PORTCODE_CHANNEL;
+  return value === "beta" || value === "dev" ? value : "stable";
 }
 
 /** True only in the self-dev build. */
 export function isSelfDev(): boolean {
   return channel() === "dev";
+}
+
+/** True only in the tester-facing beta build. */
+export function isBeta(): boolean {
+  return channel() === "beta";
 }

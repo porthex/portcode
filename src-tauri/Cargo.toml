@@ -14,6 +14,13 @@ publish = false
 name = "portcode_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+default = []
+# Selected only by `pnpm app:build:beta`. The beta Tauri config supplies the
+# separate app identity and updater endpoint; this feature reports that channel
+# through the native command surface.
+beta-channel = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
