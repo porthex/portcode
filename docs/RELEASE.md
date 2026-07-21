@@ -320,11 +320,18 @@ points at the most recent **published, non-prerelease** release.
 
 ## 7a. In-app auto-update behaviour
 
-Portcode ships a **single `stable` update channel**: every build reads its
-updater manifest from
-`https://github.com/<org>/<repo>/releases/latest/download/latest.json`, which
-resolves to the most recent **published, non-prerelease** Release. (A rolling
-`staging` pre-release feed once existed; it has been retired.)
+Portcode ships two isolated update channels:
+
+- **Stable** is built from `release` and reads
+  `https://github.com/<org>/<repo>/releases/latest/download/latest.json`, which
+  resolves to the newest published, non-prerelease Release.
+- **Beta** is promoted from a selected green `main` commit by `beta.yml`. The
+  separate `Portcode Beta` app reads
+  `https://github.com/<org>/<repo>/releases/download/beta/latest.json`, a rolling
+  signed manifest that points to an immutable `vX.Y.Z-beta.N` prerelease.
+
+The two apps use different Tauri identifiers and data directories, so testers
+can install Beta alongside Stable. See [`BETA_RELEASE.md`](BETA_RELEASE.md).
 
 Auto-update is **ON by default** (Claude Code parity) and can be toggled in
 **Settings**:

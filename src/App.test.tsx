@@ -258,6 +258,21 @@ describe("App layout", () => {
     });
   });
 
+  it("checks the beta feed when the beta desktop app mounts", async () => {
+    vi.stubEnv("VITE_PORTCODE_CHANNEL", "beta");
+    m.isTauri.mockReturnValue(true);
+    m.getUpdateChannel.mockResolvedValue("beta");
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(m.onUpdaterEvent).toHaveBeenCalledTimes(1);
+      expect(m.getUpdateChannel).toHaveBeenCalledTimes(1);
+      expect(m.checkForUpdate).toHaveBeenCalledTimes(1);
+      expect(useStore.getState().updateChannel).toBe("beta");
+    });
+  });
+
   it("folds native updater events into store progress and tears down the listener", async () => {
     m.isTauri.mockReturnValue(true);
     const off = vi.fn();

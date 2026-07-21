@@ -6709,6 +6709,14 @@ describe("auto-update", () => {
       expect(useStore.getState().updateChannel).toBe("stable");
     });
 
+    it("stores the beta channel reported by the core", async () => {
+      m.getUpdateChannel.mockResolvedValue("beta");
+
+      await useStore.getState().loadUpdateChannel();
+
+      expect(useStore.getState().updateChannel).toBe("beta");
+    });
+
     it("keeps the default channel when the command is unavailable", async () => {
       m.getUpdateChannel.mockRejectedValue(new Error("unknown command"));
 

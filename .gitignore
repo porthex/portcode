@@ -27,6 +27,7 @@ crates/portcode-wasm/pkg
 !.env.example
 !.env.*.example
 !.env.selfdev
+!.env.beta
 
 # Local agent/server configuration may contain credentials or machine paths.
 .mcp.json

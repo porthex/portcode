@@ -1,0 +1,269 @@
+name: Beta (Windows)
+
+# Publishes a tester-facing Windows prerelease from a selected green `main` SHA.
+# The immutable vX.Y.Z-beta.N release holds the installer and signatures; the
+# rolling `beta` prerelease holds only latest.json so installed beta builds have
+# a fixed updater endpoint. Stable releases and their updater feed are untouched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Beta SemVer without the leading v (for example 5.1.0-beta.1)
+        required: true
+        default: 5.1.0-beta.1
+        type: string
+      require_authenticode:
+        description: Fail unless Azure Trusted Signing credentials are configured
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: beta-windows
+  cancel-in-progress: false
+
+jobs:
+  beta:
+    name: Build, sign, and publish Windows beta
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    environment: Release
+    env:
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TS_ENDPOINT: ${{ secrets.AZURE_TS_ENDPOINT }}
+      AZURE_TS_ACCOUNT: ${{ secrets.AZURE_TS_ACCOUNT }}
+      AZURE_TS_CERT_PROFILE: ${{ secrets.AZURE_TS_CERT_PROFILE }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+      VITE_SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+      SENTRY_ENVIRONMENT: beta
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v7
+
+      - name: Validate channel and signing inputs
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.version }}"
+          if ($version -notmatch '^\d+\.\d+\.\d+-beta\.\d+$') {
+            throw "Expected version like 5.1.0-beta.1; got '$version'"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw "TAURI_SIGNING_PRIVATE_KEY is required: beta updater artifacts must be signed"
+          }
+          $hasAuthenticode = -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID) -and
+            -not [string]::IsNullOrWhiteSpace($env:AZURE_TS_ENDPOINT)
+          if ("${{ inputs.require_authenticode }}" -eq "true" -and -not $hasAuthenticode) {
+            throw "Trusted Windows signing was required, but Azure Trusted Signing secrets are absent"
+          }
+
+      - name: Enable Corepack (pnpm)
+        run: corepack enable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Materialize pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Stamp beta version
+        id: version
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.version }}"
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/stamp-beta-version.ps1 -Version $version
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=v$version" >> $env:GITHUB_OUTPUT
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Supply-chain audit (cargo-deny)
+        run: cargo deny --manifest-path src-tauri/Cargo.toml --all-features check
+
+      - name: Build Portcode Beta (Tauri to NSIS)
+        run: pnpm app:build:beta
+
+      - name: Locate installer
+        id: artifact
+        shell: pwsh
+        run: |
+          $dir = "src-tauri/target/release/bundle/nsis"
+          $exe = Get-ChildItem -Path $dir -Filter *-setup.exe -ErrorAction Stop | Select-Object -First 1
+          if (-not $exe) { throw "No NSIS installer found under $dir" }
+          "path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
+          "name=$($exe.Name)" >> $env:GITHUB_OUTPUT
+          "dir=$dir" >> $env:GITHUB_OUTPUT
+
+      - name: Azure Trusted Signing (Authenticode)
+        if: env.AZURE_CLIENT_ID != '' && env.AZURE_TS_ENDPOINT != ''
+        uses: Azure/trusted-signing-action@v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_CERT_PROFILE }}
+          files-folder: ${{ steps.artifact.outputs.dir }}
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify Authenticode state
+        id: authenticode
+        shell: pwsh
+        run: |
+          $signature = Get-AuthenticodeSignature "${{ steps.artifact.outputs.path }}"
+          $hasCredentials = -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID) -and
+            -not [string]::IsNullOrWhiteSpace($env:AZURE_TS_ENDPOINT)
+          if ($hasCredentials -and $signature.Status -ne "Valid") {
+            throw "Azure signing ran, but Authenticode status is $($signature.Status)"
+          }
+          $signed = $signature.Status -eq "Valid"
+          "signed=$($signed.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "status=$($signature.Status)" >> $env:GITHUB_OUTPUT
+          if (-not $signed) {
+            Write-Host "::warning title=No trusted publisher signature::Installer is updater-signed but not Authenticode-signed ($($signature.Status))."
+          }
+
+      - name: Sign updater artifact (Ed25519)
+        shell: pwsh
+        run: pnpm tauri signer sign "${{ steps.artifact.outputs.path }}"
+
+      - name: Compute checksum and updater manifest
+        shell: pwsh
+        run: |
+          $exe = "${{ steps.artifact.outputs.path }}"
+          $name = "${{ steps.artifact.outputs.name }}"
+          $dir = "${{ steps.artifact.outputs.dir }}"
+          $version = "${{ steps.version.outputs.version }}"
+          $tag = "${{ steps.version.outputs.tag }}"
+          if (-not (Test-Path "$exe.sig")) { throw "Expected updater signature $exe.sig" }
+
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $exe).Hash.ToLowerInvariant()
+          "$hash  $name" | Set-Content -Encoding ascii "$dir/SHA256SUMS.txt"
+
+          $signature = (Get-Content "$exe.sig" -Raw).Trim()
+          $encodedName = [Uri]::EscapeDataString($name)
+          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/$encodedName"
+          $manifest = [ordered]@{
+            version = $version
+            notes = "Portcode Beta $version from main ${{ github.sha }}"
+            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{ signature = $signature; url = $url }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8 "$dir/latest.json"
+
+      - name: Generate CycloneDX SBOM
+        shell: pwsh
+        env:
+          FETCH_LICENSE: "false"
+        run: |
+          npx -y @cyclonedx/cdxgen@12.6.0 -r -o portcode-beta.cdx.json `
+            --project-name portcode-beta --project-version "${{ steps.version.outputs.version }}" .
+          $bom = Get-Content portcode-beta.cdx.json -Raw | ConvertFrom-Json
+          if ($bom.bomFormat -ne "CycloneDX") { throw "Invalid SBOM" }
+
+      - name: Publish immutable beta prerelease
+        id: publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $version = "${{ steps.version.outputs.version }}"
+          $dir = "${{ steps.artifact.outputs.dir }}"
+          $notes = @"
+          Portcode Beta $version
+
+          Built from main commit `${{ github.sha }}`.
+          Updater signature: Ed25519 verified by Portcode.
+          Authenticode: ${{ steps.authenticode.outputs.status }}.
+
+          This is a tester prerelease. It installs separately from Stable and follows only the beta updater feed.
+          "@
+          $notes | Set-Content -Encoding utf8 beta-notes.md
+          $assets = @(
+            "${{ steps.artifact.outputs.path }}",
+            "${{ steps.artifact.outputs.path }}.sig",
+            "$dir/SHA256SUMS.txt",
+            "$dir/latest.json",
+            "portcode-beta.cdx.json"
+          )
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @assets --clobber
+          } else {
+            gh release create $tag @assets --title "Portcode Beta $version" `
+              --notes-file beta-notes.md --prerelease --target "${{ github.sha }}"
+          }
+          $releaseUrl = gh release view $tag --json url --jq .url
+          "url=$releaseUrl" >> $env:GITHUB_OUTPUT
+
+      - name: Refresh rolling beta updater manifest
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $manifest = "${{ steps.artifact.outputs.dir }}/latest.json"
+          $notes = "Latest manifest: ${{ steps.version.outputs.tag }} from main ${{ github.sha }}"
+          gh release view beta *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload beta $manifest --clobber
+            gh release edit beta --title "Portcode Beta Channel" --notes $notes --prerelease
+          } else {
+            gh release create beta $manifest --title "Portcode Beta Channel" `
+              --notes $notes --prerelease --target "${{ github.sha }}"
+          }
+
+      - name: Upload workflow artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: portcode-beta-windows-${{ inputs.version }}
+          if-no-files-found: warn
+          path: |
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/nsis/*.sig
+            src-tauri/target/release/bundle/nsis/SHA256SUMS.txt
+            src-tauri/target/release/bundle/nsis/latest.json
+            portcode-beta.cdx.json
+
+      - name: Publish summary
+        shell: pwsh
+        run: |
+          @"
+          ## Portcode Beta ${{ steps.version.outputs.version }}
+
+          - Release: ${{ steps.publish.outputs.url }}
+          - Commit: `${{ github.sha }}`
+          - Updater signature: present
+          - Authenticode: ${{ steps.authenticode.outputs.status }}
+          - Channel manifest: https://github.com/${{ github.repository }}/releases/download/beta/latest.json
+          "@ >> $env:GITHUB_STEP_SUMMARY

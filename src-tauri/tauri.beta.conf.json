@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Portcode Beta",
+  "identifier": "dev.porthex.portcode.beta",
+  "build": {
+    "beforeDevCommand": "pnpm dev:beta",
+    "beforeBuildCommand": "pnpm build:beta"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Portcode Beta",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 760,
+        "minHeight": 500,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": false,
+        "theme": "Dark"
+      }
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://github.com/porthex/portcode/releases/download/beta/latest.json"]
+    }
+  }
+}
