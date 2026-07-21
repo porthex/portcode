@@ -1,6 +1,9 @@
 # Git Diff Reviewer Design
 
-Status: Phase 1 implemented; AI review lifecycle and Git handoff remain planned
+Status: Phase 1 implemented; receipt-backed Last agent turn manifests are available,
+while durable historical patch bytes, AI review lifecycle, and Git handoff remain planned.
+Delivery priority lives in [`docs/ROADMAP.md`](ROADMAP.md); this file is the durable
+product, data, safety, and test contract.
 
 ## Decision
 
@@ -108,7 +111,10 @@ Support these typed targets:
 - **Unstaged**: working tree against index.
 - **Branch…**: current `HEAD` against the merge base of a local or remote branch enumerated from the native workspace repository. The UI uses the shared inline Portcode `SelectMenu`; it never accepts a free-form branch name or opens an operating-system select popup.
 - **Commit…**: one commit or an explicit ref range.
-- **Last agent turn**: later phase, after Portcode records a reliable pre-turn baseline for agent-touched files.
+- **Last agent turn**: available from receipt-backed turn manifests and snapshot
+  identities. File summaries remain valid, but exact historical line patches must
+  report unavailable until immutable patch bytes are persisted; never regenerate
+  an old patch from the current working tree.
 
 The toolbar must show the resolved comparison, for example `merge-base(origin/main) → HEAD`, not only the friendly scope label.
 
@@ -390,7 +396,7 @@ Reuse the Environment panel's queued-request pattern so overlapping refreshes co
 ### Phase 3 — deeper review and Git handoff
 
 - Verified multi-agent Deep review with cost/scope disclosure.
-- Reliable Last agent turn snapshots.
+- Durable immutable patch bytes and retention for the existing Last agent turn scope.
 - Stage/unstage by file and hunk with snapshot preconditions.
 - Commit/push/PR handoff only after the local review workflow is proven.
 

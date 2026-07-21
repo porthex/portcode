@@ -1,8 +1,9 @@
 # Repo Mode — Plan
 
-> Status: **Proposal / design**. Connect a GitHub account, open a repo as a persistent
-> local workspace, and run the Portcode agent against it — "like Claude Code, but native,
-> instant, structural, and private."
+> Status: **Proposal requiring re-grounding before implementation**. The current
+> tree has moved beyond several assumptions in the original design. Priority and
+> dependencies live in [`ROADMAP.md`](ROADMAP.md); this document preserves the
+> product concept, security constraints, and decisions that still need owners.
 >
 > This document synthesizes four design tracks (UX, backend/data-model, differentiation,
 > security) against the current codebase and the competitive landscape. Per-track detail
@@ -20,7 +21,7 @@ cloud agent **cannot copy without ceasing to be a cloud agent**:
 
 1. **Instant + persistent** — clone to local disk once; the workspace, the code graph, and
    the session history persist. Reopening is instant. No re-clone, no re-index, no setup.
-2. **Structural understanding** — the committed `graphify` knowledge graph (god nodes,
+2. **Structural understanding** — optional, Git-ignored local `graphify` output (god nodes,
    community detection, cross-file relationships) is a _third path_ between Cursor's
    embeddings (stale + uploaded) and Claude Code's pure agentic grep (slow on big repos):
    local, structured, free, always-fresh.
@@ -38,21 +39,21 @@ and secrets on your machine, following you across your own devices._
 
 Repo Mode builds on real assets and fills real gaps. Key files:
 
-| Area        | Today                                                                                                                                                                          | Gap for Repo Mode                                                              |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
-| Auth        | `oauth.rs` — loopback PKCE S256, **Anthropic only**                                                                                                                            | No GitHub auth (greenfield)                                                    |
-| Secrets     | `secrets.rs` — OS-keychain vault, 4 accounts                                                                                                                                   | Add a `github` account (5th)                                                   |
-| Persistence | `db.rs` — SQLite, WAL, append-only message log; `sessions.workspace` is a nullable path; `migrate_add_confirmed` is the additive-migration idiom                               | No `workspaces` table; no repo metadata                                        |
-| FS tools    | `tools.rs` — `fs_read/write/edit/glob/grep`, sandboxed via `resolve_for_write`/`resolve_existing` with canonicalization (`:88-180`)                                            | No git tools; sandbox must rebind to repo root                                 |
-| Shell       | `tools.rs:541-645` — `current_dir` set, **inherits full env**, 120s timeout                                                                                                    | No env scrub (token-leak risk); no OS confinement                              |
-| Agent loop  | `agent.rs` — system prompt at `:57-77`, workspace resolution `:255-268`, dispatch `:369-405`, token refresh `:108-156`                                                         | No repo-context injection                                                      |
-| Permissions | `permissions.rs` — single global `allow/deny/ask`; gate only on `mutating()` tools                                                                                             | No per-action risk tiers                                                       |
-| Sync        | `sync/` — iroh QUIC + Noise XX/KK, SAS-confirmed pairing, `messages_since` log replication; **`emit_event` mirrors every `StreamEvent` (incl. tool output) to a paired phone** | No workspace frames; tool output is a token-exfil channel that needs redaction |
-| Git         | **None anywhere** (no `git2`, no shelling to `git`)                                                                                                                            | Entire git engine is greenfield                                                |
+| Area        | Today                                                                                                                     | Gap for Repo Mode                                                                  |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Auth        | Anthropic and OpenAI OAuth paths use loopback PKCE S256                                                                   | No GitHub auth or product-approved GitHub App/token model                          |
+| Secrets     | Provider credentials use the OS-keychain vault                                                                            | No least-privilege GitHub credential account or storage contract                   |
+| Persistence | `db.rs` uses SQLite/WAL and sessions can carry a workspace path                                                           | No first-class workspace/repository model                                          |
+| FS tools    | File tools are workspace-sandboxed and reject canonical paths outside the root                                            | No Repo Mode binding lifecycle or repository-metadata write policy                 |
+| Shell       | Child processes use a reviewed default-deny environment, bounded output, and the workspace as `current_dir`               | No OS sandbox or Repo Mode-specific process/credential contract                    |
+| Agent loop  | The agent resolves a workspace and dispatches tools                                                                       | No bounded, untrusted-framed repository context contract                           |
+| Permissions | Persisted modes/rules exist; protected Shell actions have an unconditional per-call Ask floor                             | No typed high-risk Git/install actions or Repo Mode action policy                  |
+| Sync        | Phone Sync uses redacted, byte-bounded public DTOs for live events and catch-up                                           | No workspace frames or repository-binding synchronization                          |
+| Git         | A hardened read-only Git runner and Review Workspace expose status, manifests, patches, snapshots, and turn-scoped review | No clone/workspace lifecycle, GitHub auth, or guarded stage/commit/push/PR handoff |
 
-**Back-compat is free:** every schema change is additive (new tables + a nullable
-`sessions.workspace_id` FK). Path-based sessions keep working untouched; users who never
-connect GitHub see no behavior change.
+Backwards compatibility is a design requirement, not an assumption. Any new
+workspace schema and binding lifecycle must prove migration, downgrade, and
+path-based-session behavior before implementation.
 
 ---
 
@@ -296,6 +297,12 @@ Containment, not detection.
 
 ## 7. Phased build order
 
+> **Do not execute this phase order yet.** First complete the roadmap's Repo Mode
+> re-grounding item: reuse the existing read-only Git/Review and release-security
+> boundaries, resolve the GitHub credential model, and turn every Phase 0 control
+> into an executable test. The sequence below is a dependency sketch, not an
+> approved delivery schedule.
+
 - **Phase 0 — Safety bootstrap (blocks all workspace execution).** Land and test **M1, M2,
   and M8 first**: canonical repo-root binding, unconditional outside-root read refusal, and
   the generic `.git/**` write block plus audited libgit2 allowlist/hook neutralization. Clone,
@@ -305,8 +312,10 @@ Containment, not detection.
   first checkout, so repository hooks never execute during workspace creation.
 - **Phase 1 — Auth + read-only GitHub (no disk writes).** `secrets.rs` github account →
   `github_auth.rs` → `github.rs` (list repos/branches/user) → connect screen + repo picker.
-- **Phase 2 — Git engine + clone + workspace model.** `git2` (vendored, Schannel); `git.rs`
-  clone/status/log/branch; `workspaces` tables + `sessions.workspace_id` migration;
+- **Phase 2 — Clone + workspace model.** Extend the existing hardened Git boundary;
+  decide explicitly whether any libgit2 dependency is justified instead of creating a
+  second Git architecture. Add clone/status/log/branch support, `workspaces` tables +
+  `sessions.workspace_id` migration;
   per-device `workspace_bindings` state; `clone_repo` with progress; workspace switcher;
   graphify build-on-clone. This phase cannot clone or checkout until Phase 0's controls pass.
 - **Phase 3 — Agent integration.** Repo-context injection (lazy, capped, untrusted-framed);

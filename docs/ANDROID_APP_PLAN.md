@@ -1,5 +1,9 @@
 # Portcode Android App — Implementation Plan
 
+> **Document role:** shipped remote-client architecture plus the remaining
+> acceptance/release runbook. Cross-project priority lives in
+> [`docs/ROADMAP.md`](ROADMAP.md); completed PR history belongs in Git.
+>
 > Status: **remote client implemented; device/release acceptance pending.** The
 > Tauri Android scaffold, mobile/desktop capability split, sync-client commands,
 > remote-mode UI, and QR pairing surface are in the tree. Android CI builds a
@@ -61,47 +65,12 @@ out of scope.
 
 ---
 
-## 2. Build blockers — RESOLVED: the app now cross-compiles for Android
+## 2. Android build and capability boundary
 
-> **🚀 LANDMARK (probe run #2, 2026-06-21, GREEN):** with the single real blocker
-> below fixed (PR #37), **the entire unmodified app cross-compiles for
-> `aarch64-linux-android`** — `tauri android build --apk --debug` succeeds in CI
-> (~7 min) and produces a debug APK. **`openssl-sys` was the _only_ actual build
-> blocker.** The items I'd predicted (keyring, agent/tools/shell — the §2.1 table)
-> turned out **not** to block compilation at all; they are _architecture_ concerns,
-> not build errors. The platform split was therefore implemented as a product and
-> security boundary rather than a cross-compile fix. The CI probe (§5) uploads a
-> debug APK artifact when the build succeeds.
-
-### 2.0 Blocker #1 — `openssl-sys` native cross-compile (✅ FIXED in #37)
-
-```
-error: failed to run custom build command for `openssl-sys v0.9.117`
-  Could not find openssl via pkg-config: pkg-config has not been configured to
-  support cross-compilation. … $TARGET = aarch64-linux-android
-```
-
-`reqwest`'s **`native-tls`** feature pulled `native-tls → openssl-sys`, the native
-OpenSSL **C** library — which can't cross-compile for Android without an OpenSSL
-sysroot. `reqwest` is shared by **our dep _and_ `iroh` _and_ `tauri`** (feature
-unification), so the fix had to drop `native-tls` from the **unified** graph.
-**Fix (shipped, PR #37):** switch `reqwest` to pure-Rust **rustls** (the feature is
-`rustls`, _not_ `rustls-tls`, in reqwest 0.13). `cargo tree` confirmed openssl-sys is
-gone for the android target; the Windows + Linux Rust jobs confirm the desktop still
-builds + tests pass.
-
-> **Cost note — `aws-lc-sys`:** rustls 0.23's default provider is **aws-lc-rs**,
-> which builds a C/asm crate on every target. It compiles everywhere (CI has
-> cmake/NASM) but **adds ~7 min to the Windows Rust job**. A future tweak if that
-> tax is unwanted: reqwest `rustls-no-provider` + install the **ring** provider
-> (`rustls::crypto::ring::default_provider().install_default()` at `lib.rs` setup) —
-> ring is already in-tree via iroh/quinn, lighter, and needs no cmake. Non-urgent.
-
-### 2.1 NON-blockers — these compile fine (architecture concerns, not build errors)
-
-The probe proved the predicted items below did **not** block cross-compilation.
-The product split has since landed, so this table records the implemented
-resolution rather than an open to-do list.
+The app cross-compiles for `aarch64-linux-android` in CI and produces a debug APK.
+The dependency graph uses Rustls rather than `openssl-sys`, and target gating keeps
+desktop-only capabilities out of the Android build. Git history retains the resolved
+cross-compilation investigation; this document records only the current boundary.
 
 | Concern                                         | Implemented resolution                                                                                       |
 | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
@@ -110,7 +79,9 @@ resolution rather than an open to-do list.
 | Mobile identity persistence                     | Mobile uses the app-private mobile persistence path rather than the Windows credential backend               |
 | Windows-only dependencies                       | Target gating keeps Windows-only crates out of the Android target                                            |
 
-The **sync protocol core is already cross-platform** (`sync/{protocol,noise,transport,session,pairing,mod}.rs` use only iroh/snow/tokio/serde/base64) — it compiles for android as-is. That's the big win: the hard part (the encrypted session protocol) is reusable on the phone unchanged.
+The sync protocol core remains cross-platform, so Android reuses the audited
+transport, Noise, pairing, framing, and session behavior rather than maintaining a
+second mobile protocol.
 
 ---
 
@@ -177,46 +148,23 @@ and path-filtered pull-request triggers:
 
 ---
 
-## 7. Suggested increment order (each CI-verifiable where noted)
+## 7. Remaining correctness, acceptance, and release gates
 
-1. **Client session loop** in `sync/session.rs` — ✅ **DONE (#34)**: `run_client_recv`
-   - `send_command` (the recv-live + send-command duals) + in-memory-channel tests.
-2. **`PairingPayload` carries the iroh node addr** — ✅ **DONE (#35)**: `begin_pairing`
-   fills it from the persisted node key; JSON round-trip test.
-3. **`android-build` CI job** (§5) — ✅ **DONE (#36)**: a non-blocking probe that
-   captured the real blockers (and proved openssl-sys was the only one).
-4. **Drop the `openssl-sys` blocker** (reqwest → rustls) — ✅ **DONE (#37)**. With
-   this, **the whole app cross-compiles for Android** (probe green). Architecture-neutral.
-5. **Platform split** (§2.1) — ✅ **IMPLEMENTED**: desktop-only capability cluster
-   excluded from mobile; mobile run path registers the sync-client commands.
-6. **Remote-mode `ipc.ts` + QR pairing UI** (§4) — ✅ **IMPLEMENTED** with mobile
-   platform detection, native scanning, remote shell, and automated tests.
-7. **Permission-decision delivery** — ⏳ **OPEN CORRECTNESS GATE**: add a desktop
-   receipt/ack plus idempotent client replay so a link drop after enqueue cannot
-   clear the phone prompt while leaving the desktop permission gate pending.
-8. **On-device acceptance** — ⏳ **NEXT GATE**: install the debug APK, pair with a
-   real desktop through the relay/network path, verify SAS, run/cancel/permission
-   flows (including a forced link drop during a permission response), background/
-   lock, resume/reconnect, and catch up without loss.
-9. **Signing + push** (owner / later phases).
+Run these in the order tracked by [`docs/ROADMAP.md`](ROADMAP.md):
 
----
+1. **Permission-decision delivery:** add a desktop receipt/ack plus idempotent
+   client replay so a link drop after enqueue cannot clear the phone prompt while
+   leaving the desktop permission gate pending.
+2. **Physical-device acceptance:** install the debug APK, pair with a real desktop
+   through the relay/network path, verify SAS, exercise run/cancel/permission
+   flows—including a forced link drop during a permission response—then verify
+   background/lock, resume/reconnect, and catch-up without loss.
+3. **Release signing and distribution:** configure the owner-held Android signing
+   identity, make the release build reproducible, and verify the distributable on
+   a clean device.
+4. **Push/wake:** choose FCM and store ownership before treating notification wake
+   behavior as scheduled work.
 
-### Progress log
-
-- ✅ `tauri android init` scaffold (#34) + client primitives + toolchain verified
-  (SDK / NDK 27 / JDK 17 / rust android targets).
-- ✅ Pairing payload carries the iroh node address (#35).
-- ✅ Non-blocking Android cross-compile probe (#36) → **confirmed `openssl-sys` was the
-  sole build blocker** (the predicted source-level ones don't block compilation).
-- ✅ `reqwest` → rustls (#37): **the app now cross-compiles for Android**; the probe is
-  green and uploads a debug APK artifact on every run.
-- ✅ Platform split, mobile sync commands, remote-mode UI, and QR pairing surface landed.
-- ⏳ **Next:** implement permission receipt/replay, then complete increment 8
-  physical-device and background/resume acceptance before release signing,
-  distribution, and push/wake work.
-
-The protocol foundation being already cross-platform + merged, plus the now-unblocked
-Android cross-compile, is what makes the rest tractable — the phone reuses the hard,
-tested crypto/transport/session code unchanged. The remaining work is real-device
-validation and production release infrastructure, not the client architecture.
+The remaining work is correctness evidence, device acceptance, and production
+release infrastructure, not the remote-client architecture. Record device model,
+Android version, network/relay, latency, and reconnect results here when the gate runs.

@@ -166,8 +166,10 @@ Mitigations, all required before launch:
   origin), `object-src 'none'`, `base-uri 'none'`. This is the primary XSS
   defense; pinned in `vercel.json` (no COOP/COEP needed — the wasm is
   single-threaded, no `SharedArrayBuffer`).
-- **Subresource Integrity (SRI) on the wasm** and the JS glue, so a tampered
-  CDN/build artifact cannot be substituted for the audited bundle.
+- **Same-origin content-hashed WASM and JS assets** with immutable cache headers.
+  True integrity metadata for the dynamically imported WASM module is not yet
+  implemented and remains a pre-launch hardening gate; a normal script-tag SRI
+  attribute does not cover the current dynamic `import()` path.
 - **No third-party scripts.** The PWA ships its own first-party code only — no
   analytics, no tag managers, no external script injection. This keeps the CSP
   allowlist tight and removes the most common XSS entry point.
