@@ -36,6 +36,23 @@ const RUNTIME_DISABLE_ENV: &str = "PORTCODE_DISABLE_OPENAI_SUBSCRIPTION";
 pub(crate) const DIRECT_SUBSCRIPTION_DISABLED_MESSAGE: &str =
     "Direct ChatGPT subscription access is disabled in this Portcode build or by runtime policy. Use another configured provider, or ask the build owner to enable the reviewed integration.";
 
+// A tester beta that silently compiles out its primary authentication path is
+// unusable. Keep the normal release default fail-closed, but make the dedicated
+// beta channel fail at compile time unless its workflow opts in explicitly.
+#[cfg(all(feature = "beta-channel", not(debug_assertions)))]
+const BETA_OPENAI_ENABLE: &str = env!(
+    "PORTCODE_ENABLE_OPENAI_SUBSCRIPTION",
+    "release beta builds require PORTCODE_ENABLE_OPENAI_SUBSCRIPTION=1"
+);
+
+#[cfg(all(feature = "beta-channel", not(debug_assertions)))]
+const _: () = {
+    let value = BETA_OPENAI_ENABLE.as_bytes();
+    if value.len() != 1 || value[0] != b'1' {
+        panic!("release beta builds require PORTCODE_ENABLE_OPENAI_SUBSCRIPTION=1");
+    }
+};
+
 fn explicit_enable(value: Option<&str>) -> bool {
     value.is_some_and(|value| {
         ["1", "true", "yes", "on"]
@@ -958,6 +975,12 @@ mod tests {
         assert!(direct_subscription_enabled_for(false, Some("1"), None));
         assert!(direct_subscription_enabled_for(false, Some("TRUE"), None));
         assert!(!direct_subscription_enabled_for(false, Some("0"), None));
+    }
+
+    #[cfg(all(feature = "beta-channel", not(debug_assertions)))]
+    #[test]
+    fn beta_release_build_enables_chatgpt_subscription() {
+        assert!(direct_subscription_enabled());
     }
 
     #[test]
