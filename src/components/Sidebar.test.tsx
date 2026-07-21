@@ -118,6 +118,7 @@ describe("Sidebar", () => {
 
     // The Neon-Noir redesign renders the wordmark uppercase and the eyebrow as
     // "PORTHEX · v0.3.1-α" in a single text node; match accordingly.
+    expect(screen.getByRole("img", { name: "Portcode logo" })).toBeInTheDocument();
     expect(screen.getByText("PORTCODE")).toBeInTheDocument();
     expect(screen.getByText(/PORTHEX/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "New session" })).toBeInTheDocument();
