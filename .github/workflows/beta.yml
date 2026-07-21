@@ -112,6 +112,13 @@ jobs:
           $dir = "src-tauri/target/release/bundle/nsis"
           $exe = Get-ChildItem -Path $dir -Filter *-setup.exe -ErrorAction Stop | Select-Object -First 1
           if (-not $exe) { throw "No NSIS installer found under $dir" }
+          # GitHub release assets normalize spaces in uploaded filenames. Rename
+          # before signing so the updater manifest and published asset URL agree.
+          $assetName = $exe.Name -replace '\s+', '-'
+          if ($assetName -ne $exe.Name) {
+            Rename-Item -LiteralPath $exe.FullName -NewName $assetName
+            $exe = Get-Item -LiteralPath (Join-Path $dir $assetName)
+          }
           "path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
           "name=$($exe.Name)" >> $env:GITHUB_OUTPUT
           "dir=$dir" >> $env:GITHUB_OUTPUT
