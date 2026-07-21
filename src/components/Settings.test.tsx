@@ -260,6 +260,10 @@ describe("SettingsPanel — structure", () => {
   it("routes plan-limit searches to the combined usage panel", () => {
     renderPanel();
 
+    expect(document.querySelector("#pc-setting-plan-usage .pc-plan-usage")).toHaveClass(
+      "pc-plan-usage--compact",
+    );
+
     fireEvent.change(screen.getByRole("searchbox", { name: "Find a setting" }), {
       target: { value: "weekly limit" },
     });

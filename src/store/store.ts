@@ -169,6 +169,8 @@ const IDLE_UPDATE: UpdateState = { phase: "idle", info: null, progress: null, er
 interface AppState {
   sessions: Session[];
   activeId: string | null;
+  /** Local-only new-chat shell. It becomes durable on the first send. */
+  pendingSession: Session | null;
   messages: Record<string, Message[]>; // sessionId -> messages
   messageLoads: Record<string, MessageLoadState>;
   // Per-session scroll-up pagination state (remote mode). `hasMore` is whether the
@@ -965,8 +967,10 @@ const enqueueSessionModelWrite = (sessionId: string, model: string): Promise<voi
 const stopRequestedSessions = new Set<string>();
 let pendingRemoteCreateRequestId: string | null = null;
 let pendingRemoteCreateTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingRemoteFirstMessage: { draftId: string; body: string } | null = null;
 const clearPendingRemoteCreate = (): void => {
   pendingRemoteCreateRequestId = null;
+  pendingRemoteFirstMessage = null;
   if (pendingRemoteCreateTimer !== null) clearTimeout(pendingRemoteCreateTimer);
   pendingRemoteCreateTimer = null;
 };
@@ -1395,6 +1399,7 @@ function makeSession(model: string, accountProfileId: string | null = null): Ses
 export const useStore = create<AppState>((set, get) => ({
   sessions: [],
   activeId: null,
+  pendingSession: null,
   messages: {},
   messageLoads: {},
   messagePaging: {},
@@ -1638,6 +1643,7 @@ export const useStore = create<AppState>((set, get) => ({
           usage,
           sessions: [],
           activeId: null,
+          pendingSession: null,
           messages: {},
           showSettings: true,
           initError: null,
@@ -1650,14 +1656,7 @@ export const useStore = create<AppState>((set, get) => ({
           providerForModel(settings.model, openAIModels) === "openai"
             ? defaultOpenAIAccountProfileId
             : null;
-        const optimistic = makeSession(settings.model, accountProfileId);
-        const s = await ipc.createSession(
-          optimistic.id,
-          optimistic.title,
-          optimistic.workspace,
-          optimistic.model,
-          optimistic.accountProfileId,
-        );
+        const pendingSession = makeSession(settings.model, accountProfileId);
         set((st) => ({
           settings,
           oauthStatus,
@@ -1672,21 +1671,21 @@ export const useStore = create<AppState>((set, get) => ({
           phoneSync,
           drafts,
           usage,
-          sessions: [s],
-          activeId: s.id,
-          messages: { [s.id]: [] },
+          sessions: [],
+          activeId: pendingSession.id,
+          pendingSession,
+          messages: { [pendingSession.id]: [] },
           messageLoads: {
             ...st.messageLoads,
-            [s.id]: { ...idleMessageLoad(), phase: "ready", loadedAt: now() },
+            [pendingSession.id]: { ...idleMessageLoad(), phase: "ready", loadedAt: now() },
           },
           initError: null,
           // Keep the active-run mirror consistent with the newly active session
           // (idle here — a fresh session has no run).
-          ...projectActiveRun({ activeId: s.id, runs: st.runs }),
+          ...projectActiveRun({ activeId: pendingSession.id, runs: st.runs }),
         }));
         // Subscribe a persistent background-task listener so a task launched in
         // this session is tracked even after its turn's per-turn listener is gone.
-        void ensureBackgroundListener(s.id);
         return;
       }
       // Old DB rows predate per-session model (null/absent) — coalesce to the
@@ -1709,6 +1708,7 @@ export const useStore = create<AppState>((set, get) => ({
         usage,
         sessions,
         activeId,
+        pendingSession: null,
         initError: null,
         // Keep the active-run mirror consistent with the activated session.
         ...projectActiveRun({ activeId, runs: st.runs }),
@@ -1723,6 +1723,10 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async retryInit() {
+    if (get().pendingSession) {
+      set({ initError: null });
+      return;
+    }
     set({ initError: null });
     await get().init();
   },
@@ -1856,36 +1860,31 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async newSession(accountProfileId, modelId) {
-    // Re-entry guard (mirrors connectRemote's remoteConnecting): createSession is
-    // async, so two fast clicks would both pass the streaming check and each create
-    // a distinct empty session. The synchronous set() below makes the second
-    // same-tick call bail, so only one create runs.
+    // Guard async account/catalog preparation and the remote create handshake.
     if (get().creatingSession) return;
     set({ creatingSession: true });
-    // Remote mode: the agent-side `create_session` command is desktop-only (the
-    // local Tauri invoke isn't registered on the phone and would reject as an
-    // unhandled rejection). Route through the link instead and let the desktop's
-    // authoritative `session_list` frame reconcile + activate the new session,
-    // rather than optimistically inserting a phantom local one the desktop never
-    // knows about (and that send() couldn't run a turn in).
+    // Remote mode also opens a local-only shell. Its first send creates the
+    // desktop-owned session, waits for acknowledgement, then runs the turn.
     if (get().remoteConnected) {
-      const requestId = uid();
-      pendingRemoteCreateRequestId = requestId;
-      if (pendingRemoteCreateTimer !== null) clearTimeout(pendingRemoteCreateTimer);
-      pendingRemoteCreateTimer = setTimeout(() => {
-        if (pendingRemoteCreateRequestId !== requestId) return;
-        clearPendingRemoteCreate();
-        useStore.setState({
+      const pendingSession = makeSession(modelId ?? get().settings.model, null);
+      set((st) => {
+        const drafts = { ...st.drafts };
+        if (st.pendingSession) delete drafts[st.pendingSession.id];
+        return {
+          pendingSession,
+          activeId: pendingSession.id,
+          drafts,
+          messages: { ...st.messages, [pendingSession.id]: [] },
+          messageLoads: {
+            ...st.messageLoads,
+            [pendingSession.id]: { ...idleMessageLoad(), phase: "ready", loadedAt: now() },
+          },
           creatingSession: false,
-          remoteError: "Creating the conversation timed out. Please try again.",
-        });
-      }, 15_000);
-      await get().sendRemoteCommand({ cmd: "create_session", request_id: requestId });
-      if (get().remoteDropped) {
-        if (pendingRemoteCreateRequestId === requestId) clearPendingRemoteCreate();
-        set({ creatingSession: false });
-      }
-      set({ showSidebar: false });
+          showSidebar: false,
+          remoteChatOpen: true,
+          ...projectActiveRun({ activeId: pendingSession.id, runs: st.runs }),
+        };
+      });
       return;
     }
     try {
@@ -1942,27 +1941,18 @@ export const useStore = create<AppState>((set, get) => ({
         }
       }
 
-      const optimistic = makeSession(model, profileId);
-      const created = await ipc.createSession(
-        optimistic.id,
-        optimistic.title,
-        optimistic.workspace,
-        optimistic.model,
-        optimistic.accountProfileId,
-      );
-      if (!created || created.id !== optimistic.id) {
-        throw new Error("The native core did not confirm the new session.");
+      const s = makeSession(model, profileId);
+      const priorPendingId = get().pendingSession?.id;
+      if (priorPendingId) {
+        set((st) => {
+          const drafts = { ...st.drafts };
+          delete drafts[priorPendingId];
+          writeJSON("pc.drafts", drafts);
+          return { drafts };
+        });
       }
-      if (profileId && created.accountProfileId !== profileId) {
-        throw new Error("The native core did not preserve the selected ChatGPT account.");
-      }
-      const s: Session = {
-        ...created,
-        model: created.model ?? model,
-        accountProfileId: created.accountProfileId ?? profileId,
-      };
       set((st) => ({
-        sessions: [s, ...st.sessions],
+        pendingSession: s,
         activeId: s.id,
         messages: { ...st.messages, [s.id]: [] },
         messageLoads: {
@@ -1970,6 +1960,7 @@ export const useStore = create<AppState>((set, get) => ({
           [s.id]: { ...idleMessageLoad(), phase: "ready", loadedAt: now() },
         },
         showSidebar: false, // close the mobile drawer on navigation
+        initError: null,
         // A brand-new session has no run yet → the mirror projects to idle.
         ...projectActiveRun({ activeId: s.id, runs: st.runs }),
       }));
@@ -1978,8 +1969,6 @@ export const useStore = create<AppState>((set, get) => ({
           openAIModels: modelsForOpenAIProfile(profileId, get().openAIModelCatalogs),
         });
       }
-      // Track background tasks launched in the new session from the moment it exists.
-      void ensureBackgroundListener(s.id);
     } catch (err) {
       // A failed create (locked DB / core not ready) must surface instead of being a
       // swallowed unhandled rejection — callers use bare `onClick={newSession}` /
@@ -1993,11 +1982,16 @@ export const useStore = create<AppState>((set, get) => ({
   async selectSession(id) {
     // Switch immediately and project the target's independent run before history I/O.
     set((st) => {
+      const drafts = { ...st.drafts };
+      if (st.pendingSession) delete drafts[st.pendingSession.id];
+      writeJSON("pc.drafts", drafts);
       const runs = st.runs[runKey(id)]?.unseenOutcome
         ? { ...st.runs, [runKey(id)]: { ...st.runs[runKey(id)], unseenOutcome: null } }
         : st.runs;
       return {
         activeId: id,
+        pendingSession: null,
+        drafts,
         showSidebar: false, // close the mobile drawer on navigation
         runs,
         ...projectActiveRun({ activeId: id, runs }),
@@ -2206,7 +2200,27 @@ export const useStore = create<AppState>((set, get) => ({
       (!activeRun && (get().streaming || get().pendingPermission))
     )
       return;
-    const activeSession = activeId ? get().sessions.find((s) => s.id === activeId) : undefined;
+    const pendingSession =
+      activeId && get().pendingSession?.id === activeId ? get().pendingSession : null;
+    let activeSession =
+      pendingSession ?? (activeId ? get().sessions.find((s) => s.id === activeId) : undefined);
+    if (
+      pendingSession &&
+      !pendingSession.accountProfileId &&
+      providerForModel(model, get().openAIModels) === "openai"
+    ) {
+      const account = preferredOpenAIAccount(
+        get().openAIAccounts,
+        get().lastOpenAIAccountProfileId,
+      );
+      if (!account) {
+        set({ settingsError: "Choose a default ChatGPT account in Settings first." });
+        return;
+      }
+      activeSession = { ...pendingSession, accountProfileId: account.id };
+    } else if (pendingSession && providerForModel(model, get().openAIModels) !== "openai") {
+      activeSession = { ...pendingSession, accountProfileId: null };
+    }
     const activeOpenAIModels = modelsForOpenAIProfile(
       activeSession?.accountProfileId,
       get().openAIModelCatalogs,
@@ -2219,10 +2233,22 @@ export const useStore = create<AppState>((set, get) => ({
         });
         return;
       }
-    } else if (providerForModel(model, activeOpenAIModels) === "openai") {
+    } else if (!pendingSession && providerForModel(model, activeOpenAIModels) === "openai") {
       set({
         settingsError:
           "Choose an account for this legacy conversation before selecting an OpenAI model.",
+      });
+      return;
+    }
+    if (pendingSession && activeId && activeSession) {
+      set({ pendingSession: { ...activeSession, model }, settingsError: null });
+      await get().updateSettings({
+        model,
+        reasoningEffort: reasoningEffortForModel(
+          model,
+          get().settings.reasoningEffort,
+          activeOpenAIModels,
+        ),
       });
       return;
     }
@@ -2289,7 +2315,9 @@ export const useStore = create<AppState>((set, get) => ({
     // but keep the client honest too: never clear a draft or append an optimistic
     // message for an unpinned/removed/reconnect-required OpenAI profile. Remote
     // mode delegates this check to the credential-owning desktop.
-    const activeSession = get().sessions.find((session) => session.id === activeId);
+    const pendingSession = get().pendingSession?.id === activeId ? get().pendingSession : null;
+    const activeSession =
+      pendingSession ?? get().sessions.find((session) => session.id === activeId);
     if (!get().remoteConnected && activeSession) {
       const sessionModels = modelsForOpenAIProfile(
         activeSession.accountProfileId,
@@ -2321,6 +2349,86 @@ export const useStore = create<AppState>((set, get) => ({
     // Trim once so the stored user bubble and the forwarded command match the
     // derived (trimmed) title — a padded draft otherwise renders odd blank lines.
     const body = text.trim();
+
+    // A blank New chat is only local navigation state. Persist it immediately
+    // before the first turn, keeping empty sessions out of history and SQLite.
+    if (pendingSession && get().remoteConnected) {
+      if (get().creatingSession) return;
+      const requestId = uid();
+      set({ creatingSession: true });
+      pendingRemoteCreateRequestId = requestId;
+      pendingRemoteFirstMessage = { draftId: pendingSession.id, body };
+      if (pendingRemoteCreateTimer !== null) clearTimeout(pendingRemoteCreateTimer);
+      pendingRemoteCreateTimer = setTimeout(() => {
+        if (pendingRemoteCreateRequestId !== requestId) return;
+        const queued = pendingRemoteFirstMessage;
+        clearPendingRemoteCreate();
+        useStore.setState((st) => ({
+          creatingSession: false,
+          remoteError: "Creating the conversation timed out. Please try again.",
+          drafts: queued ? { ...st.drafts, [queued.draftId]: queued.body } : st.drafts,
+        }));
+      }, 15_000);
+      await get().sendRemoteCommand({ cmd: "create_session", request_id: requestId });
+      if (get().remoteDropped && pendingRemoteCreateRequestId === requestId) {
+        const queued = pendingRemoteFirstMessage;
+        clearPendingRemoteCreate();
+        set((st) => ({
+          creatingSession: false,
+          drafts: queued ? { ...st.drafts, [queued.draftId]: queued.body } : st.drafts,
+        }));
+      }
+      return;
+    }
+    if (pendingSession && !get().remoteConnected) {
+      set({ creatingSession: true });
+      try {
+        const created = await ipc.createSession(
+          pendingSession.id,
+          pendingSession.title,
+          pendingSession.workspace,
+          pendingSession.model,
+          pendingSession.accountProfileId,
+        );
+        if (!created || created.id !== pendingSession.id) {
+          throw new Error("The native core did not confirm the new session.");
+        }
+        if (
+          pendingSession.accountProfileId &&
+          created.accountProfileId !== pendingSession.accountProfileId
+        ) {
+          throw new Error("The native core did not preserve the selected ChatGPT account.");
+        }
+        const session: Session = {
+          ...created,
+          model: created.model ?? pendingSession.model,
+          accountProfileId: created.accountProfileId ?? pendingSession.accountProfileId,
+        };
+        set((st) => ({
+          sessions: [session, ...st.sessions.filter((item) => item.id !== session.id)],
+          pendingSession: null,
+          creatingSession: false,
+        }));
+        if (session.accountProfileId) {
+          writeStr("pc.lastOpenAIAccountProfileId", session.accountProfileId);
+          set({
+            lastOpenAIAccountProfileId: session.accountProfileId,
+            openAIModels: modelsForOpenAIProfile(
+              session.accountProfileId,
+              get().openAIModelCatalogs,
+            ),
+          });
+        }
+        void ensureBackgroundListener(session.id);
+      } catch (err) {
+        set((st) => ({
+          creatingSession: false,
+          initError: errMessage(err),
+          drafts: { ...st.drafts, [activeId]: body },
+        }));
+        return;
+      }
+    }
 
     // Close the open loop: the message is on its way, so clear this session's draft
     // everywhere — the in-memory map, the optimistic mirror, and (immediately,
@@ -3281,6 +3389,15 @@ export const useStore = create<AppState>((set, get) => ({
 
   setDraft(v) {
     const id = get().activeId;
+    if (id && get().pendingSession?.id === id) {
+      set((st) => {
+        const drafts = { ...st.drafts };
+        if (v) drafts[id] = v;
+        else delete drafts[id];
+        return { drafts };
+      });
+      return;
+    }
     if (!id) return; // no active session → nowhere to key the draft
     set((st) => {
       const drafts = { ...st.drafts };
@@ -3865,9 +3982,10 @@ export const useStore = create<AppState>((set, get) => ({
           // point at the first reported session (or null).
           const ids = frame.sessions.map((s) => s.id);
           const activeId =
-            st.activeId && ids.includes(st.activeId)
+            st.pendingSession?.id ??
+            (st.activeId && ids.includes(st.activeId)
               ? st.activeId
-              : (frame.sessions[0]?.id ?? null);
+              : (frame.sessions[0]?.id ?? null));
           return {
             sessions: frame.sessions,
             activeId,
@@ -3885,20 +4003,31 @@ export const useStore = create<AppState>((set, get) => ({
           };
         });
         break;
-      case "session_created":
+      case "session_created": {
+        const matchesRequest = pendingRemoteCreateRequestId === frame.request_id;
+        const queued = matchesRequest ? pendingRemoteFirstMessage : null;
+        if (matchesRequest) clearPendingRemoteCreate();
         set((st) => {
           const session = frame.session;
           const sessions = [session, ...st.sessions.filter((item) => item.id !== session.id)];
-          const matchesRequest = pendingRemoteCreateRequestId === frame.request_id;
-          if (matchesRequest) clearPendingRemoteCreate();
           if (!matchesRequest) return { sessions };
           const runs = st.runs;
+          const messages = { ...st.messages };
+          const messageLoads = { ...st.messageLoads };
+          const drafts = { ...st.drafts };
+          if (queued) {
+            delete messages[queued.draftId];
+            delete messageLoads[queued.draftId];
+            delete drafts[queued.draftId];
+          }
           return {
             sessions,
             activeId: session.id,
-            messages: { ...st.messages, [session.id]: [] },
+            pendingSession: null,
+            drafts,
+            messages: { ...messages, [session.id]: [] },
             messageLoads: {
-              ...st.messageLoads,
+              ...messageLoads,
               [session.id]: { ...idleMessageLoad(), phase: "ready", loadedAt: now() },
             },
             creatingSession: false,
@@ -3906,7 +4035,9 @@ export const useStore = create<AppState>((set, get) => ({
             ...projectActiveRun({ activeId: session.id, runs }),
           };
         });
+        if (queued) void get().send(queued.body);
         break;
+      }
       case "command_rejected": {
         const pendingRequestId = pendingRemoteCreateRequestId;
         // The hub broadcasts frames to every paired phone. A rejection belongs
@@ -3914,11 +4045,13 @@ export const useStore = create<AppState>((set, get) => ({
         // nonmatching ids are both ignored—even while idle—so another client's
         // malformed create cannot contaminate this phone's UI.
         if (pendingRequestId === null || frame.request_id !== pendingRequestId) break;
+        const queued = pendingRemoteFirstMessage;
         clearPendingRemoteCreate();
-        set({
+        set((st) => ({
           creatingSession: false,
           remoteError: remoteCommandRejectionMessage(frame.code, frame.message),
-        });
+          drafts: queued ? { ...st.drafts, [queued.draftId]: queued.body } : st.drafts,
+        }));
         break;
       }
       case "message_delta":
@@ -4115,6 +4248,7 @@ export const useStore = create<AppState>((set, get) => ({
       // the UI can leave the dead session and offer a reconnect. A user-initiated
       // disconnect tears this listener down first, so it can't misfire as a drop.
       unlistenDrop = await ipc.onPhoneSyncDisconnected(() => {
+        const queued = pendingRemoteFirstMessage;
         clearPendingRemoteCreate();
         clearRemoteCancelTerminalTimer();
         // The turn is dead when the channel drops — clear turn state too, not just
@@ -4129,6 +4263,7 @@ export const useStore = create<AppState>((set, get) => ({
           remoteDropped: true,
           remoteChatOpen: false,
           creatingSession: false,
+          drafts: queued ? { ...st.drafts, [queued.draftId]: queued.body } : st.drafts,
           // The channel is dead — every remote-driven run is gone.
           runs: {},
           // ...and pagination cursors are stale; the reconnect's catch-up reseeds them.
@@ -4358,6 +4493,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async disconnectRemote() {
+    const queued = pendingRemoteFirstMessage;
     clearPendingRemoteCreate();
     clearRemoteCancelTerminalTimer();
     clearRemoteWatchdog(); // user-initiated teardown — the turn is over
@@ -4388,6 +4524,7 @@ export const useStore = create<AppState>((set, get) => ({
       remoteConnecting: false,
       remoteChatOpen: false,
       creatingSession: false,
+      drafts: queued ? { ...st.drafts, [queued.draftId]: queued.body } : st.drafts,
       // The turn is over — don't strand a stuck composer; drop every run too.
       runs: {},
       // Pagination cursors belong to the torn-down session; clear them.

@@ -379,7 +379,11 @@ function TitleBar({
   environmentOpen: boolean;
   onEnvironmentOpenChange: (open: boolean) => void;
 }) {
-  const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
+  const session = useStore(
+    (s) =>
+      s.sessions.find((x) => x.id === s.activeId) ??
+      (s.pendingSession?.id === s.activeId ? s.pendingSession : undefined),
+  );
   const openAIAccounts = useStore((s) => s.openAIAccounts);
   const openAIAccountsError = useStore((s) => s.openAIAccountsError);
   const openAIModelCatalogs = useStore((s) => s.openAIModelCatalogs);

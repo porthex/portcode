@@ -20,7 +20,10 @@ import { SessionAccountSwitcher } from "./SessionAccountSwitcher";
 /** Read the active session's model, falling back to the global default. */
 function useActiveModel(): string {
   return useStore((s) => {
-    const sess = s.activeId ? s.sessions.find((x) => x.id === s.activeId) : undefined;
+    const sess = s.activeId
+      ? (s.sessions.find((x) => x.id === s.activeId) ??
+        (s.pendingSession?.id === s.activeId ? s.pendingSession : undefined))
+      : undefined;
     return sess?.model ?? s.settings.model;
   });
 }
@@ -70,7 +73,10 @@ export function Composer() {
   const remoteConnected = useStore((s) => s.remoteConnected);
   const activeModel = useActiveModel();
   const activeSession = useStore((s) =>
-    s.activeId ? s.sessions.find((session) => session.id === s.activeId) : undefined,
+    s.activeId
+      ? (s.sessions.find((session) => session.id === s.activeId) ??
+        (s.pendingSession?.id === s.activeId ? s.pendingSession : undefined))
+      : undefined,
   );
   const openAIModels = useStore((s) =>
     modelsForOpenAIProfile(activeSession?.accountProfileId, s.openAIModelCatalogs, s.openAIModels),
@@ -469,14 +475,18 @@ function ModelSetupPicker() {
   const activeId = useStore((s) => s.activeId);
   const activeAccountProfileId = useStore((s) =>
     s.activeId
-      ? (s.sessions.find((candidate) => candidate.id === s.activeId)?.accountProfileId ?? null)
+      ? ((
+          s.sessions.find((candidate) => candidate.id === s.activeId) ??
+          (s.pendingSession?.id === s.activeId ? s.pendingSession : undefined)
+        )?.accountProfileId ?? null)
       : null,
   );
   const streaming = useStore((s) => s.streaming);
   const remoteMode = useStore((s) => s.remoteMode);
   const openAIModels = useStore((s) => {
     const session = s.activeId
-      ? s.sessions.find((candidate) => candidate.id === s.activeId)
+      ? (s.sessions.find((candidate) => candidate.id === s.activeId) ??
+        (s.pendingSession?.id === s.activeId ? s.pendingSession : undefined))
       : undefined;
     return modelsForOpenAIProfile(session?.accountProfileId, s.openAIModelCatalogs, s.openAIModels);
   });
@@ -803,7 +813,8 @@ function UsageMeter() {
   const model = useActiveModel();
   const openAIModels = useStore((s) => {
     const session = s.activeId
-      ? s.sessions.find((candidate) => candidate.id === s.activeId)
+      ? (s.sessions.find((candidate) => candidate.id === s.activeId) ??
+        (s.pendingSession?.id === s.activeId ? s.pendingSession : undefined))
       : undefined;
     return modelsForOpenAIProfile(session?.accountProfileId, s.openAIModelCatalogs, s.openAIModels);
   });

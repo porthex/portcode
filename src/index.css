@@ -3096,6 +3096,15 @@ button.pc-turn-receipt__strip:focus-visible {
 .pc-plan-usage--compact .pc-plan-usage__note {
   display: none;
 }
+.pc-settings-group--usage .pc-plan-usage--compact .pc-plan-usage__grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.pc-settings-group--usage .pc-plan-usage--compact .pc-plan-card__header {
+  border-bottom-color: rgba(133, 148, 178, 0.08);
+}
+.pc-settings-group--usage .pc-plan-usage--compact .pc-plan-card__windows {
+  padding-bottom: 2px;
+}
 .pc-settings-group__label {
   padding: 0 0 12px;
   border-bottom: 1px solid var(--color-border);
@@ -3328,6 +3337,9 @@ button.pc-turn-receipt__strip:focus-visible {
   .pc-settings-system-grid,
   .pc-provider-grid,
   .pc-plan-usage__grid {
+    grid-template-columns: 1fr;
+  }
+  .pc-settings-group--usage .pc-plan-usage--compact .pc-plan-usage__grid {
     grid-template-columns: 1fr;
   }
   .pc-provider-card--wide {

@@ -233,13 +233,13 @@ beforeEach(() => {
 });
 
 describe("init", () => {
-  it("creates a first session when the backend has none", async () => {
+  it("opens an unpersisted new-chat shell when the backend has no sessions", async () => {
     await useStore.getState().init();
 
     const st = useStore.getState();
-    expect(m.createSession).toHaveBeenCalledTimes(1);
-    expect(st.sessions).toHaveLength(1);
-    expect(st.activeId).toBe(st.sessions[0].id);
+    expect(m.createSession).not.toHaveBeenCalled();
+    expect(st.sessions).toEqual([]);
+    expect(st.pendingSession?.id).toBe(st.activeId);
     expect(st.messages[st.activeId!]).toEqual([]);
   });
 
@@ -318,8 +318,9 @@ describe("init", () => {
 
     const st = useStore.getState();
     expect(st.initError).toBeNull();
-    expect(st.sessions).toHaveLength(1);
-    expect(m.createSession).toHaveBeenCalledTimes(1);
+    expect(st.sessions).toEqual([]);
+    expect(st.pendingSession?.id).toBe(st.activeId);
+    expect(m.createSession).not.toHaveBeenCalled();
   });
 
   it("clears a prior initError on a later successful init", async () => {
@@ -357,25 +358,18 @@ describe("init", () => {
 
     await useStore.getState().init();
 
-    expect(m.createSession).toHaveBeenCalledWith(
-      expect.any(String),
-      "New chat",
-      null,
-      "gpt-account-default",
-      account.id,
-    );
+    expect(m.createSession).not.toHaveBeenCalled();
     expect(useStore.getState()).toMatchObject({
       settings: {
         model: "gpt-account-default",
         provider: "openai",
         reasoningEffort: "high",
       },
-      sessions: [
-        expect.objectContaining({
-          model: "gpt-account-default",
-          accountProfileId: account.id,
-        }),
-      ],
+      sessions: [],
+      pendingSession: expect.objectContaining({
+        model: "gpt-account-default",
+        accountProfileId: account.id,
+      }),
     });
     expect(m.saveSettings).not.toHaveBeenCalled();
   });
@@ -481,16 +475,36 @@ describe("init", () => {
 });
 
 describe("newSession", () => {
-  it("prepends a fresh session and makes it active", async () => {
+  it("opens a fresh unpersisted chat and makes it active", async () => {
     useStore.setState({ sessions: [session({ id: "old" })] });
 
     await useStore.getState().newSession();
 
     const st = useStore.getState();
-    expect(m.createSession).toHaveBeenCalledTimes(1);
-    expect(st.sessions).toHaveLength(2);
-    expect(st.sessions[0].id).toBe(st.activeId);
+    expect(m.createSession).not.toHaveBeenCalled();
+    expect(st.sessions).toHaveLength(1);
+    expect(st.pendingSession?.id).toBe(st.activeId);
     expect(st.messages[st.activeId!]).toEqual([]);
+  });
+
+  it("persists the pending chat immediately before its first turn", async () => {
+    useStore.setState({ sessions: [session({ id: "old" })], activeId: "old" });
+
+    await useStore.getState().newSession();
+    const pendingId = useStore.getState().activeId!;
+    expect(m.createSession).not.toHaveBeenCalled();
+
+    await useStore.getState().send("first message");
+
+    expect(m.createSession).toHaveBeenCalledWith(
+      pendingId,
+      "New chat",
+      null,
+      DEFAULT_SETTINGS.model,
+      null,
+    );
+    expect(useStore.getState().pendingSession).toBeNull();
+    expect(useStore.getState().sessions[0].id).toBe(pendingId);
   });
 
   it("initializes the new session's model from the last-used settings.model", async () => {
@@ -502,15 +516,8 @@ describe("newSession", () => {
     await useStore.getState().newSession();
 
     const st = useStore.getState();
-    expect(st.sessions[0].model).toBe("claude-haiku-4-5-20251001");
-    // The chosen model is persisted with the new session row.
-    expect(m.createSession).toHaveBeenCalledWith(
-      st.sessions[0].id,
-      "New chat",
-      null,
-      "claude-haiku-4-5-20251001",
-      null,
-    );
+    expect(st.pendingSession?.model).toBe("claude-haiku-4-5-20251001");
+    expect(m.createSession).not.toHaveBeenCalled();
   });
 
   it("closes the mobile session drawer", async () => {
@@ -519,7 +526,7 @@ describe("newSession", () => {
     expect(useStore.getState().showSidebar).toBe(false);
   });
 
-  it("creates and selects a new session while another session keeps running", async () => {
+  it("opens a pending chat while another session keeps running", async () => {
     useStore.setState({
       streaming: true,
       sessions: [session({ id: "a" })],
@@ -529,38 +536,27 @@ describe("newSession", () => {
 
     await useStore.getState().newSession();
 
-    expect(m.createSession).toHaveBeenCalledOnce();
+    expect(m.createSession).not.toHaveBeenCalled();
     expect(useStore.getState().activeId).not.toBe("a");
-    expect(useStore.getState().sessions).toHaveLength(2);
+    expect(useStore.getState().sessions).toHaveLength(1);
+    expect(useStore.getState().pendingSession?.id).toBe(useStore.getState().activeId);
     expect(useStore.getState().runs.a.streaming).toBe(true);
   });
 
-  it("re-entry guard: a rapid double-call creates exactly one session", async () => {
-    // createSession is async; the synchronous creatingSession lock must make the
-    // second same-tick call bail so two fast clicks (or Ctrl+N + click) can't create
-    // two orphan empty sessions.
-    let release!: () => void;
-    m.createSession.mockImplementationOnce(
-      (id, title, workspace, model = DEFAULT_SETTINGS.model, accountProfileId = null) =>
-        new Promise<Session>((resolve) => {
-          release = () => resolve(session({ id, title, workspace, model, accountProfileId }));
-        }),
-    );
+  it("a rapid double-call still leaves only one pending chat", async () => {
     useStore.setState({ sessions: [session({ id: "old" })] });
 
     const first = useStore.getState().newSession();
-    // Second call lands while the first create is still in flight.
     const second = useStore.getState().newSession();
-
-    release();
     await Promise.all([first, second]);
 
-    expect(m.createSession).toHaveBeenCalledTimes(1);
-    expect(useStore.getState().sessions).toHaveLength(2); // old + one new, not two new
-    expect(useStore.getState().creatingSession).toBe(false); // lock released
+    expect(m.createSession).not.toHaveBeenCalled();
+    expect(useStore.getState().sessions).toHaveLength(1);
+    expect(useStore.getState().pendingSession?.id).toBe(useStore.getState().activeId);
+    expect(useStore.getState().creatingSession).toBe(false);
   });
 
-  it("routes through the remote command (not the desktop-only local create) when connected", async () => {
+  it("creates the desktop-owned remote session only on first send", async () => {
     // On the phone the agent-side create_session is desktop-only; calling the local
     // Tauri invoke would reject. newSession must forward a `create_session` command
     // and let the desktop's session_list frame reconcile — not optimistically insert
@@ -568,6 +564,12 @@ describe("newSession", () => {
     useStore.setState({ remoteConnected: true, sessions: [session({ id: "old" })] });
 
     await useStore.getState().newSession();
+
+    expect(m.phoneSyncSendCommand).not.toHaveBeenCalled();
+    expect(useStore.getState().pendingSession?.id).toBe(useStore.getState().activeId);
+    expect(useStore.getState().creatingSession).toBe(false);
+
+    await useStore.getState().send("hello desktop");
 
     expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({
       cmd: "create_session",
@@ -600,7 +602,15 @@ describe("newSession", () => {
       activeId: "created",
       creatingSession: false,
       remoteChatOpen: true,
+      pendingSession: null,
     });
+    await vi.waitFor(() =>
+      expect(m.phoneSyncSendCommand).toHaveBeenCalledWith({
+        cmd: "run",
+        session_id: "created",
+        text: "hello desktop",
+      }),
+    );
   });
 
   it("stays connected after a correlated desktop rejection and can retry successfully", async () => {
@@ -613,6 +623,7 @@ describe("newSession", () => {
     });
 
     await useStore.getState().newSession();
+    await useStore.getState().send("first attempt");
     const first = m.phoneSyncSendCommand.mock.calls[0][0] as Extract<
       RemoteCommand,
       { cmd: "create_session" }
@@ -634,6 +645,7 @@ describe("newSession", () => {
 
     useStore.getState().clearRemoteError();
     await useStore.getState().newSession();
+    await useStore.getState().send("retry attempt");
     const second = m.phoneSyncSendCommand.mock.calls[1][0] as Extract<
       RemoteCommand,
       { cmd: "create_session" }
@@ -656,6 +668,7 @@ describe("newSession", () => {
     useStore.setState({ remoteConnected: true, remoteVerified: true });
 
     await useStore.getState().newSession();
+    await useStore.getState().send("hello");
     const request = m.phoneSyncSendCommand.mock.calls[0][0] as Extract<
       RemoteCommand,
       { cmd: "create_session" }
@@ -690,6 +703,7 @@ describe("newSession", () => {
     useStore.setState({ remoteConnected: true, remoteVerified: true });
 
     await useStore.getState().newSession();
+    await useStore.getState().send("hello");
     const request = m.phoneSyncSendCommand.mock.calls[0][0] as Extract<
       RemoteCommand,
       { cmd: "create_session" }
@@ -802,14 +816,8 @@ describe("newSession", () => {
     await useStore.getState().newSession();
 
     expect(m.saveSettings).not.toHaveBeenCalled();
-    expect(m.createSession).toHaveBeenCalledWith(
-      expect.any(String),
-      "New chat",
-      null,
-      "gpt-live",
-      account.id,
-    );
-    expect(useStore.getState().sessions[0]).toMatchObject({
+    expect(m.createSession).not.toHaveBeenCalled();
+    expect(useStore.getState().pendingSession).toMatchObject({
       model: "gpt-live",
       accountProfileId: account.id,
     });
@@ -896,7 +904,7 @@ describe("newSession", () => {
     });
   });
 
-  it("requires authoritative create identity and account confirmation", async () => {
+  it("requires authoritative identity and account confirmation on first send", async () => {
     const account = openAIAccount();
     const models: ModelInfo[] = [
       {
@@ -928,12 +936,14 @@ describe("newSession", () => {
     );
 
     await useStore.getState().newSession(account.id);
+    await useStore.getState().send("hello");
     expect(useStore.getState().initError).toBe("The native core did not confirm the new session.");
 
     m.createSession.mockImplementationOnce(async (id, title, workspace, model) =>
       session({ id, title, workspace, model, accountProfileId: null }),
     );
     await useStore.getState().newSession(account.id);
+    await useStore.getState().send("hello");
     expect(useStore.getState().initError).toBe(
       "The native core did not preserve the selected ChatGPT account.",
     );
@@ -949,37 +959,92 @@ describe("newSession", () => {
       });
 
       await useStore.getState().newSession();
+      const pendingId = useStore.getState().activeId;
+      await useStore.getState().send("hello");
       expect(useStore.getState().creatingSession).toBe(true);
 
       await vi.advanceTimersByTimeAsync(15_000);
 
       expect(useStore.getState()).toMatchObject({
-        activeId: "old",
+        activeId: pendingId,
         creatingSession: false,
         remoteError: "Creating the conversation timed out. Please try again.",
       });
+      expect(useStore.getState().drafts[pendingId!]).toBe("hello");
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("surfaces a local create rejection instead of an unhandled rejection", async () => {
+  it("surfaces a first-send create rejection instead of an unhandled rejection", async () => {
     // The local path now wraps createSession in try/catch so a reject (locked DB /
     // core not ready) lands in the visible error surface rather than escaping as an
     // unhandled promise rejection (callers use bare onClick / void).
     m.createSession.mockRejectedValueOnce(new Error("db locked"));
     useStore.setState({ sessions: [session({ id: "old" })] });
 
-    await expect(useStore.getState().newSession()).resolves.toBeUndefined();
+    await useStore.getState().newSession();
+    await expect(useStore.getState().send("keep this draft")).resolves.toBeUndefined();
 
     const st = useStore.getState();
     expect(st.initError).toBe("db locked");
     expect(st.sessions).toHaveLength(1); // no phantom session on failure
     expect(st.creatingSession).toBe(false); // lock released
+    expect(st.drafts[st.activeId!]).toBe("keep this draft");
   });
 });
 
 describe("setSessionModel", () => {
+  it("updates a pending chat in memory and persists its chosen account only on first send", async () => {
+    await useStore.getState().newSession();
+    const pendingId = useStore.getState().activeId!;
+
+    await useStore.getState().setSessionModel("gpt-live");
+    expect(useStore.getState().settingsError).toBe(
+      "Choose a default ChatGPT account in Settings first.",
+    );
+
+    const account = openAIAccount();
+    const accountModel = {
+      id: "gpt-live",
+      label: "GPT Live",
+      provider: "openai" as const,
+      reasoningEfforts: ["high" as const],
+      defaultReasoningEffort: "high" as const,
+    };
+    useStore.setState({
+      openAIAccounts: [account],
+      openAIModels: [accountModel],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: [accountModel], error: null },
+      },
+      lastOpenAIAccountProfileId: account.id,
+      settingsError: null,
+    });
+
+    await useStore.getState().setSessionModel(accountModel.id);
+    expect(useStore.getState().pendingSession).toMatchObject({
+      id: pendingId,
+      model: accountModel.id,
+      accountProfileId: account.id,
+    });
+    expect(m.updateSessionModel).not.toHaveBeenCalled();
+
+    await useStore.getState().setSessionModel("claude-sonnet-4-6");
+    expect(useStore.getState().pendingSession).toMatchObject({
+      id: pendingId,
+      model: "claude-sonnet-4-6",
+      accountProfileId: null,
+    });
+
+    await useStore.getState().setSessionModel(accountModel.id);
+    await useStore.getState().send("create this chat");
+
+    expect(useStore.getState().pendingSession).toBeNull();
+    expect(useStore.getState().lastOpenAIAccountProfileId).toBe(account.id);
+    expect(localStorage.getItem("pc.lastOpenAIAccountProfileId")).toBe(account.id);
+  });
+
   it.each([
     ["a streaming turn", { streaming: true }],
     ["remote mode", { remoteMode: true }],
@@ -1432,7 +1497,7 @@ describe("deleteSession", () => {
       });
   });
 
-  it("spawns a fresh session when the last one is deleted", async () => {
+  it("opens a pending new chat when the last session is deleted", async () => {
     useStore.setState({
       sessions: [session({ id: "a" })],
       activeId: "a",
@@ -1443,9 +1508,10 @@ describe("deleteSession", () => {
     await useStore.getState().deleteSession("a");
 
     const st = useStore.getState();
-    expect(st.sessions).toHaveLength(1);
-    expect(st.sessions[0].id).not.toBe("a");
-    expect(m.createSession).toHaveBeenCalledTimes(1);
+    expect(st.sessions).toEqual([]);
+    expect(st.pendingSession?.id).toBe(st.activeId);
+    expect(st.pendingSession?.id).not.toBe("a");
+    expect(m.createSession).not.toHaveBeenCalled();
   });
 
   it("lazily loads the surviving active session's history when it wasn't cached", async () => {
@@ -3840,7 +3906,8 @@ describe("OpenAI account registry and scoped catalogues", () => {
 
     const state = useStore.getState();
     expect(state.initError).toBeNull();
-    expect(state.sessions).toHaveLength(1);
+    expect(state.sessions).toEqual([]);
+    expect(state.pendingSession?.id).toBe(state.activeId);
     expect(state.openAIAccounts).toEqual([]);
     expect(state.openAIAccountsError).toBe("credential registry is locked");
   });
@@ -4290,20 +4357,15 @@ describe("OpenAI account registry and scoped catalogues", () => {
 
     await useStore.getState().newSession(account.id);
 
-    expect(m.createSession).toHaveBeenCalledWith(
-      expect.any(String),
-      "New chat",
-      null,
-      "gpt-live",
-      account.id,
-    );
-    expect(useStore.getState().sessions[0].accountProfileId).toBe(account.id);
+    expect(m.createSession).not.toHaveBeenCalled();
+    expect(useStore.getState().pendingSession?.accountProfileId).toBe(account.id);
     expect(useStore.getState().lastOpenAIAccountProfileId).toBeNull();
 
     const previous = openAIAccount({ id: "00000000-0000-4000-8000-000000000002" });
     useStore.setState({ lastOpenAIAccountProfileId: previous.id });
     m.createSession.mockRejectedValueOnce(new Error("database locked"));
     await useStore.getState().newSession(account.id);
+    await useStore.getState().send("hello");
     expect(useStore.getState().lastOpenAIAccountProfileId).toBe(previous.id);
   });
 
@@ -6656,11 +6718,13 @@ describe("background shell tasks (background-tasks panel)", () => {
     expect(m.subscribeSessionEvents).toHaveBeenCalledWith("bgt-init-2", expect.any(Function));
   });
 
-  it("subscribes a background listener for a newly created session", async () => {
+  it("subscribes a background listener after a pending session is first sent", async () => {
     useStore.setState({ sessions: [], activeId: null, messages: {} });
     await useStore.getState().newSession();
     const newId = useStore.getState().activeId;
     expect(newId).toBeTruthy();
+    expect(m.subscribeSessionEvents).not.toHaveBeenCalledWith(newId, expect.any(Function));
+    await useStore.getState().send("hello");
     expect(m.subscribeSessionEvents).toHaveBeenCalledWith(newId, expect.any(Function));
   });
 

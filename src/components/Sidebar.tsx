@@ -137,7 +137,10 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   const setSidebarCollapsed = useStore((s) => s.setSidebarCollapsed);
 
   const signedInClaude = !!oauthStatus?.signedIn;
-  const activeSession = sessions.find((session) => session.id === activeId);
+  const pendingSession = useStore((s) => s.pendingSession);
+  const activeSession =
+    sessions.find((session) => session.id === activeId) ??
+    (pendingSession?.id === activeId ? pendingSession : undefined);
   const activeModel = activeSession?.model ?? settings.model;
   const activeModels = modelsForOpenAIProfile(
     activeSession?.accountProfileId,
@@ -1224,7 +1227,10 @@ function SessionRail() {
     return sessions.filter((session) => !archived.has(session.id)).length;
   }, [archivedIds, sessions]);
 
-  const activeSession = sessions.find((session) => session.id === activeId);
+  const pendingSession = useStore((s) => s.pendingSession);
+  const activeSession =
+    sessions.find((session) => session.id === activeId) ??
+    (pendingSession?.id === activeId ? pendingSession : undefined);
   const activeModel = activeSession?.model ?? settings.model;
   const activeProvider = providerForModel(
     activeModel,

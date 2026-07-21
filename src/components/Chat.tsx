@@ -388,7 +388,10 @@ function EmptyState() {
   const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
   const openAIAccountsError = useStore((s) => s.openAIAccountsError);
   const activeSession = useStore((s) =>
-    s.activeId ? s.sessions.find((session) => session.id === s.activeId) : undefined,
+    s.activeId
+      ? (s.sessions.find((session) => session.id === s.activeId) ??
+        (s.pendingSession?.id === s.activeId ? s.pendingSession : undefined))
+      : undefined,
   );
   const openAIModels = useStore((s) =>
     modelsForOpenAIProfile(activeSession?.accountProfileId, s.openAIModelCatalogs, s.openAIModels),
@@ -403,7 +406,10 @@ function EmptyState() {
   );
   const settings = useStore((s) => s.settings);
   const activeModel = useStore((s) => {
-    const session = s.activeId ? s.sessions.find((item) => item.id === s.activeId) : undefined;
+    const session = s.activeId
+      ? (s.sessions.find((item) => item.id === s.activeId) ??
+        (s.pendingSession?.id === s.activeId ? s.pendingSession : undefined))
+      : undefined;
     return session?.model ?? s.settings.model;
   });
   const setShowSettings = useStore((s) => s.setShowSettings);
