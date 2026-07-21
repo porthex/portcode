@@ -82,11 +82,47 @@ enum ValuePolicy {
     AbsolutePath,
 }
 
+/// Construct an app-owned child with the reviewed environment and Windows
+/// no-console policy applied together. Production callers should use this
+/// boundary instead of constructing `Command` directly.
+pub(crate) fn child_command<S: AsRef<OsStr>>(program: S, kind: ChildKind) -> Command {
+    let mut command = hidden_command(program);
+    apply_to_tokio(&mut command, kind);
+    command
+}
+
+/// Construct a helper that must inherit the host environment but still must
+/// not allocate a visible console from the packaged Windows GUI application.
+pub(crate) fn hidden_command<S: AsRef<OsStr>>(program: S) -> Command {
+    let command = Command::new(program);
+    #[cfg(windows)]
+    let command = {
+        let mut command = command;
+        hide_windows_console(&mut command);
+        command
+    };
+    command
+}
+
 /// Clears a Tokio child process environment and installs only the reviewed
 /// variables for `kind`.
-pub(crate) fn apply_to_tokio(command: &mut Command, kind: ChildKind) {
+fn apply_to_tokio(command: &mut Command, kind: ChildKind) {
     command.env_clear();
     command.envs(sanitized_environment(kind));
+}
+
+/// Prevent console-subsystem children from allocating a visible window when
+/// Portcode is running as a packaged Windows GUI application.
+#[cfg(windows)]
+fn hide_windows_console(command: &mut Command) {
+    command.creation_flags(windows_no_console_creation_flags());
+}
+
+#[cfg(any(windows, test))]
+const fn windows_no_console_creation_flags() -> u32 {
+    // CREATE_NO_WINDOW from WinBase.h. Tokio exposes a safe inherent setter,
+    // which keeps this compatible with the crate's `unsafe_code = "deny"`.
+    0x0800_0000
 }
 
 pub(crate) fn sanitized_environment(kind: ChildKind) -> Vec<(OsString, OsString)> {
@@ -243,7 +279,7 @@ fn resolve_in_environment_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::BTreeMap, path::PathBuf};
+    use std::{collections::BTreeMap, fs, path::PathBuf};
 
     fn as_map(values: Vec<(OsString, OsString)>) -> BTreeMap<OsString, OsString> {
         values.into_iter().collect()
@@ -255,6 +291,53 @@ mod tests {
         } else {
             PathBuf::from(format!("/{name}"))
         }
+    }
+
+    #[test]
+    fn no_console_policy_uses_create_no_window() {
+        assert_eq!(windows_no_console_creation_flags(), 0x0800_0000);
+    }
+
+    #[test]
+    fn production_children_use_the_central_process_boundary() {
+        let mut pending = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        let mut violations = Vec::new();
+
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory).expect("Rust source directory must be readable") {
+                let path = entry.expect("source entry must be readable").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension() != Some(OsStr::new("rs"))
+                    || path.file_name() == Some(OsStr::new("process_env.rs"))
+                {
+                    continue;
+                }
+
+                let source = fs::read_to_string(&path).expect("Rust source must be UTF-8");
+                let test_module = source
+                    .find("#[cfg(test)]\nmod tests")
+                    .or_else(|| source.find("#[cfg(test)]\r\nmod tests"));
+                let production = test_module.map_or(source.as_str(), |index| &source[..index]);
+                if production.contains("Command::new(") {
+                    violations.push(
+                        path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                            .unwrap_or(&path)
+                            .display()
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "production child processes must use process_env::child_command or \
+             process_env::hidden_command; direct constructors found in: {}",
+            violations.join(", ")
+        );
     }
 
     #[test]

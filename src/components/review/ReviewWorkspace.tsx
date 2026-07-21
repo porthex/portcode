@@ -98,6 +98,7 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
   const [patchLoading, setPatchLoading] = useState(false);
   const [manifestError, setManifestError] = useState<string | null>(null);
   const [patchError, setPatchError] = useState<string | null>(null);
+  const [patchRetry, setPatchRetry] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
   const [comments, setComments] = useState<ReviewComment[]>([]);
   const [filePatchHashes, setFilePatchHashes] = useState(() => new Map<string, string>());
@@ -110,6 +111,7 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
   const manifestBusy = useRef(false);
   const manifestQueued = useRef(false);
   const patchRequest = useRef(0);
+  const patchReloadQueued = useRef(false);
   const branchRequest = useRef(0);
   const previousTerminalReceiptKey = useRef(terminalReceiptKey);
   const previousActive = useRef(active);
@@ -120,8 +122,9 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
   const reviewTargetRef = useRef(reviewTarget);
   reviewTargetRef.current = reviewTarget;
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (reloadSelectedPatch = false) => {
     if (!mountedRef.current || !activeRef.current) return;
+    if (reloadSelectedPatch) patchReloadQueued.current = true;
     if (manifestBusy.current) {
       manifestQueued.current = true;
       setRefreshing(true);
@@ -183,6 +186,12 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
       if (mountedRef.current && activeRef.current) {
         setManifestLoading(false);
         setRefreshing(false);
+        if (patchReloadQueued.current) {
+          patchReloadQueued.current = false;
+          setPatchRetry((current) => current + 1);
+        }
+      } else {
+        patchReloadQueued.current = false;
       }
     }
   }, []);
@@ -219,6 +228,7 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
       manifestRequest.current += 1;
       manifestQueued.current = false;
       patchRequest.current += 1;
+      patchReloadQueued.current = false;
     };
   }, []);
 
@@ -228,6 +238,7 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
     // request and is deliberately excluded from this generation counter.
     manifestRequest.current += 1;
     patchRequest.current += 1;
+    patchReloadQueued.current = false;
     manifestRef.current = null;
     setManifest(null);
     setSelectedPath(null);
@@ -238,6 +249,14 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
     setTurnPatchesAvailable(true);
     if (activeRef.current) void refresh();
   }, [refresh, reviewTarget, scope, workspace]);
+
+  useEffect(() => {
+    // Snapshot IDs intentionally omit the repository path. Do not let comments
+    // or observed patch hashes from one clone attach inside another clone that
+    // happens to have identical contents.
+    setComments([]);
+    setFilePatchHashes(new Map());
+  }, [workspace]);
 
   useEffect(() => {
     branchRequest.current += 1;
@@ -276,6 +295,7 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
       manifestRequest.current += 1;
       manifestQueued.current = false;
       patchRequest.current += 1;
+      patchReloadQueued.current = false;
       setManifestLoading(false);
       setPatchLoading(false);
       setRefreshing(false);
@@ -290,9 +310,11 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
     previousTerminalReceiptKey.current = terminalReceiptKey;
   }, [active, isTurnReview, terminalReceiptKey, refresh]);
 
+  const manifestSnapshotId = manifest?.snapshotId ?? null;
+
   useEffect(() => {
     if (!active) return;
-    if (!manifest || !selectedPath) {
+    if (!manifestSnapshotId || !selectedPath) {
       setPatch(null);
       return;
     }
@@ -309,7 +331,7 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
                 "The changed-file summary is available, but this turn did not retain an immutable line patch.",
               ),
             )
-        : ipc.getGitReviewFile(scope, manifest.snapshotId, selectedPath);
+        : ipc.getGitReviewFile(scope, manifestSnapshotId, selectedPath);
     void patchPromise
       .then((next) => {
         if (request === patchRequest.current) {
@@ -330,7 +352,15 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
     return () => {
       patchRequest.current += 1;
     };
-  }, [active, manifest, reviewTarget, scope, selectedPath, turnPatchesAvailable]);
+  }, [
+    active,
+    manifestSnapshotId,
+    patchRetry,
+    reviewTarget,
+    scope,
+    selectedPath,
+    turnPatchesAvailable,
+  ]);
 
   const groups = useMemo(() => groupFiles(manifest), [manifest]);
   const branchGroups = useMemo(
@@ -427,7 +457,9 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
               type="button"
               aria-label="Refresh review"
               onClick={() => {
-                void refresh();
+                // A user-requested refresh also revalidates the selected patch.
+                // Background lifecycle refreshes deliberately do not.
+                void refresh(true);
                 if (scopeKind === "branch") void loadBranches();
               }}
               disabled={refreshing}
@@ -582,7 +614,7 @@ export function ReviewWorkspace({ active = true }: { active?: boolean }) {
                   Loading patch…
                 </div>
               ) : patchError ? (
-                <ReviewError message={patchError} onRetry={() => void refresh()} compact />
+                <ReviewError message={patchError} onRetry={() => void refresh(true)} compact />
               ) : patch?.binary ? (
                 <div className="grid min-h-48 place-items-center px-6 text-center">
                   <div>
