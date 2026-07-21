@@ -129,20 +129,19 @@ describe("SessionAccountSwitcher", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Continue in new chat" }));
 
-    await waitFor(() => expect(useStore.getState().sessions).toHaveLength(2));
+    await waitFor(() =>
+      expect(useStore.getState().pendingSession).toMatchObject({
+        model: model.id,
+        accountProfileId: second.id,
+      }),
+    );
+    expect(useStore.getState().sessions).toHaveLength(1);
     expect(
       useStore.getState().sessions.find((candidate) => candidate.id === session.id),
     ).toMatchObject({
       accountProfileId: first.id,
     });
-    expect(useStore.getState().sessions[0].accountProfileId).toBe(second.id);
-    expect(m.createSession).toHaveBeenCalledWith(
-      expect.any(String),
-      "New chat",
-      null,
-      model.id,
-      second.id,
-    );
+    expect(m.createSession).not.toHaveBeenCalled();
   });
 
   it("does not render account controls when there is only one connected account", () => {

@@ -364,7 +364,8 @@ describe("running commands", () => {
     // default highlight is the first command: "New chat"
     fireEvent.keyDown(input(), { key: "Enter" });
 
-    await vi.waitFor(() => expect(m.createSession).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(useStore.getState().pendingSession).not.toBeNull());
+    expect(m.createSession).not.toHaveBeenCalled();
     expect(useStore.getState().showPalette).toBe(false);
   });
 
@@ -409,14 +410,13 @@ describe("running commands", () => {
 
     fireEvent.keyDown(input(), { key: "Enter" });
 
-    await vi.waitFor(() => expect(m.createSession).toHaveBeenCalledOnce());
-    expect(m.createSession).toHaveBeenCalledWith(
-      expect.any(String),
-      "New chat",
-      null,
-      model.id,
-      accountProfileId,
+    await vi.waitFor(() =>
+      expect(useStore.getState().pendingSession).toMatchObject({
+        model: model.id,
+        accountProfileId,
+      }),
     );
+    expect(m.createSession).not.toHaveBeenCalled();
     expect(useStore.getState().showPalette).toBe(false);
   });
 
