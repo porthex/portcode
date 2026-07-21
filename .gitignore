@@ -1,5 +1,18 @@
 # deps
 node_modules
+
+# Project documentation and planning artifacts are local-only.
+/docs/
+# Keep common planning-document names local even when created elsewhere.
+[Pp][Ll][Aa][Nn].md
+*_[Pp][Ll][Aa][Nn].md
+*-[Pp][Ll][Aa][Nn].md
+[Rr][Oo][Aa][Dd][Mm][Aa][Pp].md
+*_[Rr][Oo][Aa][Dd][Mm][Aa][Pp].md
+*-[Rr][Oo][Aa][Dd][Mm][Aa][Pp].md
+*_[Dd][Ee][Ss][Ii][Gg][Nn].md
+*-[Dd][Ee][Ss][Ii][Gg][Nn].md
+
 # build output
 dist
 dist-ssr
