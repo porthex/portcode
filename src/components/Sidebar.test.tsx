@@ -259,7 +259,7 @@ describe("Sidebar", () => {
     expect(inactiveRow).toHaveClass("pc-row");
   });
 
-  it("creates a new session when NEW SESSION is clicked", async () => {
+  it("opens a pending new chat when NEW SESSION is clicked", async () => {
     useStore.setState({
       sessions: [session({ id: "a", title: "Existing" })],
       activeId: "a",
@@ -272,11 +272,10 @@ describe("Sidebar", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(m.createSession).toHaveBeenCalledTimes(1);
+    expect(m.createSession).not.toHaveBeenCalled();
     const st = useStore.getState();
-    expect(st.sessions).toHaveLength(2);
-    // freshly created session is prepended and made active
-    expect(st.sessions[0].id).toBe(st.activeId);
+    expect(st.sessions).toHaveLength(1);
+    expect(st.pendingSession?.id).toBe(st.activeId);
   });
 
   describe("default-account new session control", () => {
@@ -317,15 +316,13 @@ describe("Sidebar", () => {
 
       fireEvent.click(screen.getByRole("button", { name: "New session" }));
 
-      await waitFor(() => expect(m.createSession).toHaveBeenCalledOnce());
-      expect(m.createSession).toHaveBeenCalledWith(
-        expect.any(String),
-        "New chat",
-        null,
-        "gpt-live",
-        connected.id,
+      await waitFor(() =>
+        expect(useStore.getState().pendingSession).toMatchObject({
+          model: "gpt-live",
+          accountProfileId: connected.id,
+        }),
       );
-      expect(useStore.getState().sessions[0].accountProfileId).toBe(connected.id);
+      expect(m.createSession).not.toHaveBeenCalled();
     });
 
     it("uses the default from the collapsed rail too", async () => {
@@ -350,8 +347,13 @@ describe("Sidebar", () => {
 
       fireEvent.click(screen.getByRole("button", { name: "New session" }));
 
-      await waitFor(() => expect(m.createSession).toHaveBeenCalledOnce());
-      expect(m.createSession.mock.calls[0].slice(3)).toEqual(["gpt-live", account.id]);
+      await waitFor(() =>
+        expect(useStore.getState().pendingSession).toMatchObject({
+          model: "gpt-live",
+          accountProfileId: account.id,
+        }),
+      );
+      expect(m.createSession).not.toHaveBeenCalled();
     });
 
     it("disables creation while the paired desktop owns session creation", () => {
@@ -1141,7 +1143,7 @@ describe("Sidebar", () => {
       expect(screen.getByRole("button", { name: /Sort sessions/ })).toBeInTheDocument();
     });
 
-    it("creates a session from the rail's + button", async () => {
+    it("opens a pending chat from the rail's + button", async () => {
       useStore.setState({ sessions: [], activeId: null, sidebarCollapsed: true });
       render(<Sidebar />);
 
@@ -1149,7 +1151,8 @@ describe("Sidebar", () => {
       await Promise.resolve();
       await Promise.resolve();
 
-      expect(m.createSession).toHaveBeenCalledTimes(1);
+      expect(m.createSession).not.toHaveBeenCalled();
+      expect(useStore.getState().pendingSession?.id).toBe(useStore.getState().activeId);
     });
 
     it("opens settings from the rail's gear", () => {
@@ -1493,7 +1496,9 @@ describe("Sidebar", () => {
 
       fireEvent.contextMenu(sessionRow(/^Chat A/));
       fireEvent.click(screen.getByRole("menuitem", { name: "New chat" }));
-      await waitFor(() => expect(m.createSession).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(useStore.getState().pendingSession).not.toBeNull());
+      const firstPendingId = useStore.getState().pendingSession!.id;
+      expect(m.createSession).not.toHaveBeenCalled();
 
       fireEvent.contextMenu(screen.getByText("Work").closest(".pc-row")!);
       fireEvent.click(screen.getByRole("menuitem", { name: "New folder" }));
@@ -1505,7 +1510,8 @@ describe("Sidebar", () => {
 
       fireEvent.contextMenu(screen.getByRole("navigation", { name: "Session list" }));
       fireEvent.click(screen.getByRole("menuitem", { name: "New chat" }));
-      await waitFor(() => expect(m.createSession).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(useStore.getState().pendingSession?.id).not.toBe(firstPendingId));
+      expect(m.createSession).not.toHaveBeenCalled();
     });
 
     it("opens a session menu with the common actions on right-click", () => {

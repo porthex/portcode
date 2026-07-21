@@ -1233,7 +1233,7 @@ export function SettingsPanel() {
                 <SettingsSectionHeader
                   eyebrow="PLAN ALLOWANCE"
                   title="Plan usage"
-                  description="See the included allowance reported by Claude and GPT in one place. Percentages use one shared meaning: capacity remaining."
+                  description="Claude and GPT allowance at a glance."
                   status={sectionStatus.usage}
                   statusTone={signedIn || signedInOpenAI ? "success" : "cyan"}
                   tone="cyan"
@@ -1242,7 +1242,7 @@ export function SettingsPanel() {
                   id="pc-setting-plan-usage"
                   className="pc-settings-group pc-settings-group--usage"
                 >
-                  <PlanUsagePanel />
+                  <PlanUsagePanel compact />
                 </div>
               </section>
 

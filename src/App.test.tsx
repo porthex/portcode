@@ -333,21 +333,23 @@ describe("App layout", () => {
     m.isTauri.mockReturnValue(true);
 
     render(<App />);
-    await waitFor(() => expect(useStore.getState().sessions).toHaveLength(1));
+    await waitFor(() => expect(useStore.getState().pendingSession).not.toBeNull());
 
     expect(m.onUpdaterEvent).not.toHaveBeenCalled();
     expect(m.getUpdateChannel).not.toHaveBeenCalled();
     expect(m.checkForUpdate).not.toHaveBeenCalled();
   });
 
-  it("runs init() on mount: creates a first session and renders the core shell", async () => {
+  it("runs init() on mount: opens a pending new chat and renders the core shell", async () => {
     render(<App />);
 
     // The real init() resolves through the mocked IPC and, with no existing
     // sessions, creates exactly one.
     await waitFor(() => {
-      expect(useStore.getState().sessions).toHaveLength(1);
+      expect(useStore.getState().pendingSession).not.toBeNull();
     });
+    expect(useStore.getState().sessions).toEqual([]);
+    expect(m.createSession).not.toHaveBeenCalled();
 
     expect(screen.getByTestId("sidebar")).toBeInTheDocument();
     expect(screen.getByTestId("chat")).toBeInTheDocument();
@@ -437,7 +439,7 @@ describe("App layout", () => {
     const unlisten = vi.fn();
     const { unmount } = render(<App />);
     // Let init() settle so its async setState can't race the teardown assertion.
-    await waitFor(() => expect(useStore.getState().sessions).toHaveLength(1));
+    await waitFor(() => expect(useStore.getState().pendingSession).not.toBeNull());
     useStore.setState({ remoteUnlisten: unlisten });
 
     unmount();
@@ -1000,12 +1002,14 @@ describe("global keyboard shortcuts", () => {
 
   it("Meta+N starts a new session", async () => {
     render(<App />);
-    await waitFor(() => expect(useStore.getState().sessions).toHaveLength(1));
+    await waitFor(() => expect(useStore.getState().pendingSession).not.toBeNull());
     const firstId = useStore.getState().activeId;
 
     fireEvent.keyDown(window, { key: "n", metaKey: true });
 
-    await waitFor(() => expect(useStore.getState().sessions).toHaveLength(2));
+    await waitFor(() => expect(useStore.getState().activeId).not.toBe(firstId));
+    expect(useStore.getState().sessions).toEqual([]);
+    expect(m.createSession).not.toHaveBeenCalled();
     expect(useStore.getState().activeId).not.toBe(firstId);
   });
 
@@ -1101,14 +1105,13 @@ describe("global keyboard shortcuts", () => {
 
     fireEvent.keyDown(window, { key: "n", ctrlKey: true });
 
-    await waitFor(() => expect(m.createSession).toHaveBeenCalledOnce());
-    expect(m.createSession).toHaveBeenCalledWith(
-      expect.any(String),
-      "New chat",
-      null,
-      model.id,
-      accountProfileId,
+    await waitFor(() =>
+      expect(useStore.getState().pendingSession).toMatchObject({
+        model: model.id,
+        accountProfileId,
+      }),
     );
+    expect(m.createSession).not.toHaveBeenCalled();
   });
 
   it("Ctrl+, opens settings", () => {
