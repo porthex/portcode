@@ -238,6 +238,7 @@ export default function App() {
         />
       ) : (
         <>
+          {isTauri() && <WindowDragRail />}
           {/* In-app auto-update notice (desktop only in practice; self-gates on its
               phase and renders nothing while idle). Sits above the other banners. */}
           <UpdateBanner />
@@ -262,7 +263,7 @@ export default function App() {
                 <FileExplorer />
               </div>
             </div>
-            <main className="flex min-w-0 flex-1 flex-col">
+            <main className="pc-desktop-main flex min-w-0 flex-1 flex-col">
               <EnvironmentPanelProvider open={environmentOpen} onOpenChange={setEnvironmentOpen}>
                 <TitleBar
                   fileToggleRef={fileToggleRef}
@@ -353,6 +354,20 @@ function RemoteShell({
   );
 }
 
+/** A dependable full-width grab target for the frameless desktop window. The
+ * visible signal is intentionally thinner than its hit area, so it reads as a
+ * Portcode accent rather than a second toolbar. */
+function WindowDragRail() {
+  return (
+    <div
+      data-testid="window-drag-rail"
+      data-tauri-drag-region="deep"
+      className="pc-window-drag-rail"
+      aria-hidden="true"
+    />
+  );
+}
+
 function TitleBar({
   fileToggleRef,
   filesVisible,
@@ -391,16 +406,16 @@ function TitleBar({
   return (
     <header
       data-tauri-drag-region={isTauri() ? "deep" : undefined}
-      className="relative z-40 flex h-[46px] shrink-0 items-center justify-between border-b border-border bg-panel/70 px-3.5 backdrop-blur-sm"
+      className="pc-titlebar relative z-40 flex h-[46px] shrink-0 items-center justify-between gap-3 border-b border-border bg-panel/70 px-3.5 backdrop-blur-sm"
     >
-      <div className="flex min-w-0 items-center gap-2.5">
+      <div className="pc-titlebar__leading flex min-w-0 flex-1 items-center gap-2.5">
         <button
           ref={fileToggleRef}
           onClick={toggleFiles}
           aria-label="Toggle file explorer (Ctrl+B)"
           aria-pressed={filesVisible}
           title="Toggle file explorer (Ctrl+B)"
-          className={`flex h-[30px] w-[30px] items-center justify-center rounded-[7px] border transition-[background-color,border-color,box-shadow,color] duration-150 motion-reduce:transition-none ${
+          className={`pc-titlebar__file-toggle flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[7px] border transition-[background-color,border-color,box-shadow,color] duration-150 motion-reduce:transition-none ${
             filesVisible
               ? "border-accent-2/50 bg-accent-2/12 text-accent-2 shadow-[0_0_14px_rgba(33,230,255,0.25)]"
               : "border-border-2 bg-panel-2/60 text-muted hover:border-accent-2/30 hover:text-accent-2"
@@ -415,15 +430,17 @@ function TitleBar({
             />
           </svg>
         </button>
-        <span className="truncate font-mono text-[12px] text-muted">
-          portcode<span className="text-faint"> / </span>
+        <span className="pc-titlebar__breadcrumb min-w-0 truncate font-mono text-[12px] text-muted">
+          <span className="pc-titlebar__product">
+            portcode<span className="text-faint"> / </span>
+          </span>
           <span className="text-fg">
             {workspaceSurface === "review" ? "Review changes" : (session?.title ?? "New chat")}
           </span>
         </span>
         {sessionUsesOpenAI && (
           <span
-            className={`pc-pill ${openAIAccount?.state === "connected" ? "pc-pill--success" : "pc-pill--warn"}`}
+            className={`pc-titlebar__account-pill pc-pill ${openAIAccount?.state === "connected" ? "pc-pill--success" : "pc-pill--warn"}`}
             title={
               openAIAccount
                 ? `ChatGPT account: ${openAIAccountLabel(openAIAccount, openAIAccounts)}`
@@ -438,20 +455,22 @@ function TitleBar({
               className={`pc-dot ${openAIAccount?.state === "connected" ? "pc-dot--success" : "pc-dot--warn"}`}
               aria-hidden="true"
             />
-            {openAIAccount
-              ? openAIAccountLabel(openAIAccount, openAIAccounts)
-              : session.accountProfileId
-                ? openAIAccountsError
-                  ? "ACCOUNT UNAVAILABLE"
-                  : "ACCOUNT REMOVED"
-                : "ACCOUNT NEEDED"}
+            <span className="pc-titlebar__account-label">
+              {openAIAccount
+                ? openAIAccountLabel(openAIAccount, openAIAccounts)
+                : session.accountProfileId
+                  ? openAIAccountsError
+                    ? "ACCOUNT UNAVAILABLE"
+                    : "ACCOUNT REMOVED"
+                  : "ACCOUNT NEEDED"}
+            </span>
           </span>
         )}
       </div>
-      <div className="flex shrink-0 items-center gap-2.5">
+      <div className="pc-titlebar__actions flex shrink-0 items-center gap-2">
         <ChannelBadge />
         {!isTauri() && (
-          <span className="pc-pill pc-pill--warn">
+          <span className="pc-titlebar__preview pc-pill pc-pill--warn">
             <span className="pc-dot pc-dot--warn" />
             PREVIEW MODE
           </span>
@@ -464,14 +483,14 @@ function TitleBar({
             if (workspaceSurface === "review") setWorkspaceSurface("chat");
             else openWorkspaceReview();
           }}
-          className={`flex h-[31px] items-center gap-1.5 rounded-[7px] border px-2.5 font-mono text-[10px] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-accent-2/20 ${
+          className={`pc-titlebar__review flex h-[31px] items-center gap-1.5 rounded-[7px] border px-2.5 font-mono text-[10px] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-accent-2/20 ${
             workspaceSurface === "review"
               ? "border-accent-2/55 bg-accent-2/12 text-accent-2"
               : "border-border-2 bg-panel-2/80 text-muted hover:border-accent-2/35 hover:text-fg"
           }`}
         >
           <span aria-hidden="true">±</span>
-          <span className="hidden min-[980px]:inline">
+          <span className="pc-titlebar__review-label">
             {workspaceSurface === "review" ? "Chat" : "Review"}
           </span>
         </button>
@@ -482,9 +501,10 @@ function TitleBar({
           onClick={() => setShowPalette(true)}
           aria-label="Open command palette (Ctrl+K)"
           title="Command palette (Ctrl+K)"
-          className="flex items-center gap-1.5 rounded-md border border-border-2 bg-panel-2/80 px-2.5 py-1 font-mono text-[11px] text-muted transition-colors hover:border-accent/50 hover:text-accent"
+          className="pc-titlebar__palette flex h-[31px] items-center gap-1.5 rounded-md border border-border-2 bg-panel-2/80 px-2.5 font-mono text-[11px] text-muted transition-colors hover:border-accent/50 hover:text-accent"
         >
-          Ctrl K <span className="text-faint">palette</span>
+          <span className="pc-titlebar__palette-shortcut">Ctrl K</span>{" "}
+          <span className="pc-titlebar__palette-label text-faint">palette</span>
         </button>
         {isTauri() && <WindowControls />}
       </div>
@@ -502,14 +522,14 @@ function WindowControls() {
   };
 
   return (
-    <div className="-mr-3.5 -my-2.5 ml-1 flex h-[46px] self-center border-l border-border-2/70">
+    <div className="pc-window-controls -mr-3.5 -my-2.5 flex h-[46px] self-center border-l border-border-2/70">
       <button
         type="button"
         data-tauri-drag-region={false}
         aria-label="Minimize window"
         title="Minimize"
         onClick={() => run("minimize")}
-        className="flex h-full w-11 items-center justify-center text-muted transition-colors hover:bg-panel-2 hover:text-fg"
+        className="pc-window-control flex h-full w-11 items-center justify-center text-muted transition-colors hover:bg-panel-2 hover:text-fg"
       >
         <svg aria-hidden="true" width="11" height="11" viewBox="0 0 11 11" fill="none">
           <path d="M1 5.5h9" stroke="currentColor" strokeWidth="1.2" />
@@ -521,7 +541,7 @@ function WindowControls() {
         aria-label="Maximize or restore window"
         title="Maximize or restore"
         onClick={() => run("toggleMaximize")}
-        className="flex h-full w-11 items-center justify-center text-muted transition-colors hover:bg-panel-2 hover:text-fg"
+        className="pc-window-control flex h-full w-11 items-center justify-center text-muted transition-colors hover:bg-panel-2 hover:text-fg"
       >
         <svg aria-hidden="true" width="11" height="11" viewBox="0 0 11 11" fill="none">
           <rect
@@ -540,7 +560,7 @@ function WindowControls() {
         aria-label="Close window"
         title="Close"
         onClick={() => run("close")}
-        className="flex h-full w-11 items-center justify-center text-muted transition-colors hover:bg-danger/85 hover:text-white"
+        className="pc-window-control flex h-full w-11 items-center justify-center text-muted transition-colors hover:bg-danger/85 hover:text-white"
       >
         <svg aria-hidden="true" width="11" height="11" viewBox="0 0 11 11" fill="none">
           <path d="m1.5 1.5 8 8m0-8-8 8" stroke="currentColor" strokeWidth="1.2" />
