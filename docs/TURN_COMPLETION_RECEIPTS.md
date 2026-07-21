@@ -38,8 +38,8 @@ The desktop path now implements the corrective behavior that prompted this revis
   receipts no longer render `Changes unavailable`.
 
 Verification completed for this checkpoint includes the full frontend coverage run
-(57 files, 1,662 tests; 96.24% statements, 98.08% lines, 97.76% functions), frontend
-type-checking and linting, 402 desktop-core library tests, 56 sync-library tests, the full
+(57 files, 1,687 tests; 96.10% statements, 98.02% lines, 97.39% functions), frontend
+type-checking and linting, 448 desktop-core library tests, 56 sync-library tests, the full
 Rust workspace test run, formatting, and Clippy with warnings denied. Native coverage added
 with the implementation includes a deterministic 200-dirty-file fixture that asserts full
 capture stays within eight Git children, plus parser, exact-path, mutation-gating,
