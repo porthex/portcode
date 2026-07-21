@@ -1013,7 +1013,7 @@ describe("Chat EmptyState auth affordance", () => {
     expect(screen.queryByText("Add a ChatGPT account to start")).toBeNull();
   });
 
-  it("distinguishes new, legacy, and removed-account OpenAI empty states", () => {
+  it("distinguishes default, legacy-unassigned, and removed-account OpenAI empty states", () => {
     const accountProfileId = "00000000-0000-4000-8000-000000000001";
     const account = {
       id: accountProfileId,
@@ -1042,9 +1042,7 @@ describe("Chat EmptyState auth affordance", () => {
       settings: { ...initial.settings, provider: "openai", model: "gpt-5.6-sol" },
     });
     const view = render(<Chat />);
-    expect(
-      screen.getByText("Choose a ChatGPT account when starting a new chat"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("New GPT chats use your default ChatGPT account")).toBeInTheDocument();
 
     act(() =>
       useStore.setState({
@@ -1054,7 +1052,9 @@ describe("Chat EmptyState auth affordance", () => {
       }),
     );
     view.rerender(<Chat />);
-    expect(screen.getByText("Choose a ChatGPT account for this legacy chat")).toBeInTheDocument();
+    expect(
+      screen.getByText("Choose a default ChatGPT account in Settings to start"),
+    ).toBeInTheDocument();
 
     act(() =>
       useStore.setState({

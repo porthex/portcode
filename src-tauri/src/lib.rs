@@ -1109,42 +1109,52 @@ fn pin_session_openai_account(
     state: State<AppState>,
     session_id: String,
     account_profile_id: String,
+    model: Option<String>,
 ) -> Result<SessionRow, String> {
     let settings = settings_snapshot(&state)?;
     let run_config = state
         .db
         .session_run_config(&session_id)
         .map_err(|error| format!("Session is unavailable: {error}"))?;
-    let effective_model = effective_session_model(&settings, run_config.model.as_deref())?;
+    let effective_model =
+        effective_session_model(&settings, model.as_deref().or(run_config.model.as_deref()))?;
     if llm::provider_name_for_model(&effective_model)? != "openai" {
         return Err("Only an OpenAI conversation can be pinned to a ChatGPT account.".into());
     }
     let account = validate_model_account(&state, &effective_model, Some(&account_profile_id))?
         .expect("OpenAI validation always returns a profile lease");
 
+    // Share the admission mutex while committing the account/model pair. A run
+    // either reserves first (and selection is rejected) or reads the fully
+    // committed selection after this guard is released.
+    let run_guard = state.cancels.lock().unwrap();
+    if run_guard.contains_key(&session_id)
+        || background::has_session(&state.background, &session_id)
+    {
+        return Err("Wait for this conversation's active work to finish.".into());
+    }
     match state
         .db
-        .pin_legacy_session_account_if_config(
+        .select_session_openai_account_if_config(
             &session_id,
             account.id.as_str(),
+            &effective_model,
             &run_config,
-            Some(&effective_model),
         )
         .map_err(|error| error.to_string())?
     {
-        db::LegacySessionAccountPin::Pinned | db::LegacySessionAccountPin::AlreadyPinnedSame => {}
-        db::LegacySessionAccountPin::Conflict { .. } => {
-            return Err(
-                "This conversation is already pinned to a different ChatGPT account.".into(),
-            );
+        db::SessionAccountSelection::Selected | db::SessionAccountSelection::AlreadySelected => {}
+        db::SessionAccountSelection::Locked { .. } => {
+            return Err("This conversation has already started. Continue with another ChatGPT account in a new chat.".into());
         }
-        db::LegacySessionAccountPin::SessionChanged { .. } => {
+        db::SessionAccountSelection::SessionChanged { .. } => {
             return Err(
-                "This conversation's model or account changed while it was being pinned. Review it and retry."
+                "This conversation's model or account changed while the selection was saving. Review it and retry."
                     .into(),
             );
         }
     }
+    drop(run_guard);
     let persisted = state
         .db
         .session_run_config(&session_id)
@@ -1153,10 +1163,7 @@ fn pin_session_openai_account(
     if llm::provider_name_for_model(&persisted_model)? != "openai"
         || persisted.account_profile_id.as_deref() != Some(account.id.as_str())
     {
-        return Err(
-            "The conversation changed while its ChatGPT account was being pinned. Review it before sending."
-                .into(),
-        );
+        return Err("The conversation changed while its ChatGPT account was being saved. Review it before sending.".into());
     }
     if state
         .openai_accounts

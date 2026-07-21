@@ -4059,6 +4059,11 @@ button.pc-turn-receipt__strip:focus-visible {
   border: 1px solid rgba(255, 176, 46, 0.42);
   background: rgba(255, 176, 46, 0.1);
 }
+.pc-session-dialog__icon.is-primary {
+  color: var(--color-accent-2);
+  border: 1px solid rgba(33, 230, 255, 0.4);
+  background: rgba(33, 230, 255, 0.1);
+}
 .pc-session-dialog__icon.is-danger {
   color: var(--color-danger);
   border: 1px solid rgba(255, 77, 87, 0.42);
@@ -4190,56 +4195,6 @@ button.pc-turn-receipt__strip:focus-visible {
   background: linear-gradient(180deg, rgba(10, 12, 19, 0.88), rgba(7, 9, 14, 0.98));
   box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.14);
 }
-.pc-openai-session-gate {
-  display: flex;
-  width: 100%;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  margin-bottom: 8px;
-  padding: 10px 12px;
-  border: 1px solid rgba(255, 176, 46, 0.36);
-  border-radius: 10px;
-  background: linear-gradient(100deg, rgba(255, 176, 46, 0.09), rgba(12, 14, 22, 0.96));
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
-}
-.pc-openai-session-gate > div > strong,
-.pc-openai-session-gate > div > span {
-  display: block;
-}
-.pc-openai-session-gate > div > strong {
-  color: var(--color-fg);
-  font-size: 12px;
-}
-.pc-openai-session-gate > div > span {
-  margin-top: 2px;
-  color: var(--color-muted);
-  font-size: 10.5px;
-}
-.pc-openai-session-gate > button {
-  flex-shrink: 0;
-  padding: 7px 10px;
-  border: 1px solid rgba(33, 230, 255, 0.35);
-  border-radius: 8px;
-  background: rgba(33, 230, 255, 0.08);
-  color: var(--color-accent-2);
-  font-size: 11px;
-}
-.pc-openai-session-gate > button:hover:not(:disabled) {
-  background: rgba(33, 230, 255, 0.14);
-}
-.pc-openai-session-gate > button:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
-}
-.pc-openai-session-gate__account {
-  color: var(--color-accent-2) !important;
-  font-family: var(--font-mono);
-}
-.pc-openai-session-gate__error {
-  color: var(--color-danger) !important;
-}
-
 /* Select popovers size to their content but never escape a narrow WebView. */
 .pc-select-popover {
   width: max-content;
@@ -4655,6 +4610,30 @@ button.pc-turn-receipt__strip:focus-visible {
 .pc-run-setup__trigger:disabled {
   cursor: not-allowed;
   opacity: 0.5;
+}
+.pc-session-account-switcher {
+  width: clamp(136px, 15vw, 188px);
+}
+.pc-session-account-switcher__select {
+  width: 100%;
+  min-width: 0;
+}
+.pc-composer-account-trigger {
+  min-height: 30px;
+  border-color: rgba(35, 42, 61, 0.88);
+  border-radius: 8px;
+  padding: 4px 7px 4px 9px;
+  background: rgba(15, 18, 28, 0.72);
+  font-size: 11px;
+  font-weight: 600;
+}
+.pc-composer-account-trigger:hover,
+.pc-composer-account-trigger[aria-expanded="true"] {
+  border-color: rgba(33, 230, 255, 0.42);
+  background: rgba(20, 24, 36, 0.92);
+}
+.pc-composer-account-trigger[aria-expanded="true"] {
+  box-shadow: 0 0 0 2px rgba(33, 230, 255, 0.07);
 }
 .pc-run-setup__model {
   min-width: 0;
@@ -5109,7 +5088,8 @@ button.pc-turn-receipt__strip:focus-visible {
     padding: 9px;
   }
   .pc-composer-field--permission,
-  .pc-run-setup {
+  .pc-run-setup,
+  .pc-session-account-switcher {
     flex: 1 1 150px;
     width: auto;
     max-width: none;

@@ -489,6 +489,51 @@ describe("SettingsPanel — OpenAI subscription", () => {
     expect(screen.getByText(/Models for recent@chatgpt\.test/)).toBeInTheDocument();
   });
 
+  it("changes the default ChatGPT account in Settings without changing existing chats", async () => {
+    const model = MODELS.find((candidate) => candidate.provider === "openai")!;
+    const first = openAIAccount({ accountLabel: "first@chatgpt.test" });
+    const second = openAIAccount({
+      id: "00000000-0000-4000-8000-000000000002",
+      accountLabel: "second@chatgpt.test",
+      tier: "ChatGPT Team",
+    });
+    const existingSession = {
+      id: "existing",
+      title: "Existing chat",
+      workspace: null,
+      model: model.id,
+      accountProfileId: first.id,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    useStore.setState({
+      sessions: [existingSession],
+      openAIAccounts: [first, second],
+      lastOpenAIAccountProfileId: first.id,
+      openAIModels: [model],
+      openAIModelCatalogs: {
+        [first.id]: { status: "ready", models: [model], error: null },
+        [second.id]: { status: "ready", models: [model], error: null },
+      },
+    });
+    renderPanel({ provider: "openai", model: model.id });
+
+    const picker = screen.getByLabelText("Default ChatGPT account");
+    expect(picker).toHaveValue(first.id);
+    expect(
+      screen.getByText(/New GPT chats use this account\. Existing chats keep the account/),
+    ).toBeInTheDocument();
+
+    fireEvent.click(picker);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("option", { name: /second@chatgpt\.test/i }));
+      await Promise.resolve();
+    });
+
+    expect(useStore.getState().lastOpenAIAccountProfileId).toBe(second.id);
+    expect(useStore.getState().sessions[0].accountProfileId).toBe(first.id);
+  });
+
   it("adds a ChatGPT profile and refreshes only its live model catalogue", async () => {
     renderPanel();
 
@@ -530,6 +575,9 @@ describe("SettingsPanel — OpenAI subscription", () => {
     expect(screen.getAllByText("returning@chatgpt.test").length).toBeGreaterThan(0);
     expect(screen.getByText(/Removed .* history retained/)).toBeInTheDocument();
     expect(screen.queryByText(removed.id)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Remove returning@chatgpt.test" }),
+    ).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Reconnect returning@chatgpt.test" }));
     await act(async () => {
       await Promise.resolve();
@@ -659,6 +707,7 @@ describe("SettingsPanel — OpenAI subscription", () => {
     expect(m.removeOpenAIAccount).toHaveBeenCalledWith(connected.id);
     expect(useStore.getState().openAIAccounts).toEqual([removed]);
     expect(screen.getByText(/Removed .* history retained/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Remove you@openai.com" })).not.toBeInTheDocument();
   });
 
   it("shows and persists only supported reasoning levels for the selected OpenAI model", async () => {
