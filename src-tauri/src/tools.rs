@@ -2293,14 +2293,14 @@ mod tests {
             workspace.clone(),
             None,
         );
-        // A missing current directory makes process creation fail consistently,
-        // whether or not the selected shell executable exists on the host.
+        // A missing current directory makes process creation fail consistently
+        // after resolving the platform's default shell.
         std::fs::remove_dir_all(&workspace).unwrap();
         let mut ctx = ToolCtx::new(workspace);
         ctx.receipt = Some(tracker.clone());
 
         let err = Shell
-            .run(json!({ "command": "echo hi", "shell": "cmd" }), &ctx)
+            .run(json!({ "command": "echo hi" }), &ctx)
             .await
             .unwrap_err();
 
