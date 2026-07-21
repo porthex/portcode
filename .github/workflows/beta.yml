@@ -41,6 +41,9 @@ jobs:
       AZURE_TS_CERT_PROFILE: ${{ secrets.AZURE_TS_CERT_PROFILE }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      # Release builds fail closed unless the reviewed ChatGPT subscription
+      # transport is explicitly enabled at Rust compile time.
+      PORTCODE_ENABLE_OPENAI_SUBSCRIPTION: "1"
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
       VITE_SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
       SENTRY_ENVIRONMENT: beta
@@ -58,6 +61,9 @@ jobs:
           }
           if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
             throw "TAURI_SIGNING_PRIVATE_KEY is required: beta updater artifacts must be signed"
+          }
+          if ($env:PORTCODE_ENABLE_OPENAI_SUBSCRIPTION -ne "1") {
+            throw "Beta builds must enable the reviewed ChatGPT subscription integration"
           }
           $hasAuthenticode = -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID) -and
             -not [string]::IsNullOrWhiteSpace($env:AZURE_TS_ENDPOINT)
@@ -104,6 +110,11 @@ jobs:
 
       - name: Build Portcode Beta (Tauri to NSIS)
         run: pnpm app:build:beta
+
+      - name: Verify compiled ChatGPT subscription capability
+        run: >-
+          cargo test --manifest-path src-tauri/Cargo.toml --release
+          --features beta-channel beta_release_build_enables_chatgpt_subscription --lib
 
       - name: Locate installer
         id: artifact

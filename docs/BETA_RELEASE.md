@@ -36,6 +36,11 @@ an updater manifest without that signature. Authenticode is independently
 verified and reported in the release notes; when the corresponding workflow
 input is enabled, missing Azure credentials fail the build.
 
+Beta builds explicitly enable the reviewed ChatGPT subscription integration at
+compile time. The Rust `beta-channel` release configuration also has a compile
+guard, so removing that workflow opt-in fails the build instead of publishing a
+beta with account connections disabled.
+
 ## Roll forward
 
 Do not replace an existing version with different bytes. Fix the problem on
