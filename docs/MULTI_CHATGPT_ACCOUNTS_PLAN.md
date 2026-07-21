@@ -1,16 +1,18 @@
 # Multiple ChatGPT subscription accounts — plan
 
-- Status: implementation in progress
+- Status: shipped in PRs #130 and #138
 - Scope: ChatGPT subscription accounts only
-- Primary outcome: choose an account quickly when creating a session
-- Mid-session switching: researched and intentionally deferred from V1
+- Primary outcome: choose the account inside an empty chat, beside the model picker
+- Started-chat switching: opens a new chat with the selected account
 - Research date: 2026-07-20
 - Related reference: [`OPENAI_SUBSCRIPTION_INTEGRATION.md`](OPENAI_SUBSCRIPTION_INTEGRATION.md)
 
 This plan adds multiple ChatGPT subscription accounts without turning provider
 authentication into global mutable state. Each session is pinned to one local
-account profile. The common path remains short: press New Session, accept the
-last-used account or choose another one, and start working.
+account profile. Every GPT chat starts with the default account from Settings.
+When more than one account is connected, the user can choose another account in
+the empty chat before sending its first message. Once a chat has started, its
+account is immutable; choosing another account offers to continue in a new chat.
 
 In this document, “ChatGPT account” means a ChatGPT subscription sign-in used by
 Portcode's existing OpenAI subscription transport. It does not mean an OpenAI
@@ -22,15 +24,15 @@ Platform API key, API credits, or a generic multi-provider account.
    display-safe account summaries to the frontend.
 2. Add an opaque local `accountProfileId` to every new session. Never resolve a
    run through a global “active account.”
-3. Put account selection in the New Session flow, preselected to the last-used
-   account. Keep account management in Settings.
+3. Keep the home and New Chat surfaces account-free. Apply the default account
+   from Settings, and show the account selector beside the model picker only
+   inside an empty GPT chat when there is a meaningful choice.
 4. Freeze the selected account for the complete lifetime of every active turn,
    including retries, token refreshes, and tool-loop model calls.
-5. Keep a session pinned to its original account in V1. Do not silently switch
-   accounts on authentication failure, quota exhaustion, or model mismatch.
-6. Treat cross-account continuation as a separate feature. The preferred future
-   flow creates a linked session with a user-visible handoff rather than
-   transferring hidden reasoning or silently replaying the full transcript.
+5. Keep a started session pinned to its original account. A switch attempt shows
+   a confirmation and creates a new chat under the requested account. Never
+   silently switch on authentication failure, quota exhaustion, or model mismatch.
+6. Do not copy the old transcript or hidden reasoning into the newly created chat.
 7. Removing an account deletes credential material but retains a non-secret
    tombstone so existing sessions can reconnect to the same local profile safely.
 8. V1 fails closed for remote OpenAI session creation until Phone Sync negotiates
@@ -40,8 +42,10 @@ Platform API key, API credits, or a generic multi-provider account.
 
 - Let a user add, inspect, reconnect, and remove multiple ChatGPT subscription
   accounts.
-- Make choosing an account for a new session take no more than one additional
-  click when changing away from the last-used account.
+- Provide one connected default account, configurable in Settings.
+- Let users with multiple connected accounts change the account inside an empty
+  GPT chat before the first message.
+- Keep account controls out of the home and New Chat surfaces.
 - Guarantee that concurrent sessions can use different accounts without
   influencing one another.
 - Keep tokens, refresh credentials, and remote ChatGPT account IDs out of React
@@ -58,8 +62,8 @@ Platform API key, API credits, or a generic multi-provider account.
 
 - Claude or other provider accounts.
 - OpenAI Platform API keys.
-- Switching the account of an existing session.
 - Switching accounts during an active turn.
+- Mutating the pinned account of a chat that already has a durable message.
 - Automatically using another account when quota is exhausted.
 - Merging billing, quota, or usage across accounts.
 - Copying Codex threads or moving Portcode conversation ownership to OpenAI.
@@ -102,6 +106,8 @@ Settings gains a **ChatGPT accounts** section with:
 - Subscription tier when available.
 - Connection state: connected, reconnect required, removed, or unavailable.
 - **Add account**, **Reconnect**, and **Remove** actions.
+- One connected account marked as the default, with an action to change the
+  default when more than one connected account exists.
 
 Adding an account starts the existing browser OAuth flow. Login remains globally
 serialized because only one loopback authorization flow should own the callback
@@ -123,42 +129,41 @@ the identity binding is a separate future action.
 Removal must be rejected while that profile has an active run. This avoids
 credential disappearance halfway through refresh or retry handling.
 
-### New Session flow
+The **Remove** action is shown only for connected or reconnectable profiles. Once
+removal succeeds, the stale action disappears immediately. If the removed profile
+was the default, another connected profile becomes the default. Empty chats that
+referenced the removed profile reconcile to the remaining connected default;
+started chats retain their historical profile reference and require reconnection.
 
-The Sidebar New Session surface is the canonical entry point. `Composer` edits
-the active session and must not own creation-time account selection. A reusable
-`NewSessionControl` supplies the same guarded resolver to the full Sidebar,
-collapsed rail, Ctrl/Cmd+N, command palette, and empty-composer recovery path.
-For OpenAI with multiple connected accounts it is a compact split control:
+### In-session account selection
 
-```text
-New session
-Account   personal@example.com · Plus      ▾
-Model     <account-compatible model>        ▾
-```
+New Chat creates an empty, in-memory session and applies the default ChatGPT
+account from Settings. The home screen, Sidebar New Chat action, collapsed rail,
+Ctrl/Cmd+N, command palette, and other creation entry points do not show an
+account prompt or picker.
 
-Behavior:
+Inside an empty GPT chat, `Composer` places the account selector next to the model
+selector. Behavior:
 
-1. If exactly one account is connected, it is preselected and New Session stays
-   a one-click action.
-2. If several accounts are connected, the most recently used account is
-   preselected. Opening the selector and choosing another account creates the
-   session with that profile.
-3. If no account is connected, the selector presents **Add ChatGPT account** and
-   does not create an unusable OpenAI session.
-4. Changing the account refreshes the model choices for that account.
-5. If the previously selected model is unavailable, Portcode visibly selects the
-   account catalog's default before session creation. It must not change the model
-   after a run begins.
-6. Double clicks and repeated keyboard submission still produce exactly one
-   session, preserving the existing `creatingSession` guard.
-7. Loading, registry failure, zero-account, and reconnect-only states are
-   distinct. An error or empty model response must never be reinterpreted as a
-   valid fallback catalog.
+1. With exactly one connected account, the default is used and the selector is
+   hidden because there is no alternative.
+2. With several connected accounts, the default is preselected and the user can
+   choose another account before the first durable message.
+3. Changing the account also changes the visible model catalog to that account's
+   catalog. If the prior model is unavailable, Portcode visibly selects a valid
+   model before the first send.
+4. The native pin command is authoritative and permits the change only while the
+   session has no durable messages and no active turn.
+5. After the first message, a switch attempt never mutates the current chat. A
+   confirmation dialog offers to continue in a new empty chat using the selected
+   account and a compatible model.
+6. If the selected account is removed, unavailable, or reconnect-required, the
+   current history stays readable and the UI offers the appropriate Settings or
+   reconnection path; it never silently borrows another account for a started chat.
+7. Loading, registry failure, zero-account, and reconnect-only states remain
+   distinct. An error or empty model response is never treated as a valid catalog.
 
-The session header and sidebar detail surface show a small account label so users
-can tell which quota and workspace govern the conversation. Tokens and the raw
-remote account ID never appear in the UI.
+Tokens and the raw remote account ID never appear in the UI.
 
 ### Existing and legacy sessions
 
@@ -363,39 +368,49 @@ interface OpenAIAccountSummary {
 }
 ```
 
-The store may remember `lastOpenAIAccountProfileId` as a UI preference. It must
-never use that value to execute an existing session; execution always reads the
-session's pinned profile.
+The store persists `lastOpenAIAccountProfileId` as the user's default account.
+Settings is the authoritative UI for changing it. The value seeds new empty GPT
+chats but never changes a started session; execution always reads the session's
+pinned profile.
 
-Change `newSession()` so the selected profile is supplied deliberately to
-`createSession`. Keep selection and session creation in one guarded operation so
-an account removal or rapid repeated click cannot produce a partially initialized
-session.
+`newSession()` creates an empty in-memory session using that default. The session
+is materialized only on first send. Account changes before that boundary go
+through the native compare-and-set pin command so account removal, another window,
+or a concurrent first send cannot produce a partially initialized session.
 
 ### Components
 
 Keep the surface small:
 
-- Add a reusable `NewSessionControl` to
-  [`src/components/Sidebar.tsx`](../src/components/Sidebar.tsx), including the
-  collapsed rail, and route every keyboard/palette/fallback creation entry point
-  through the same store resolver.
 - Extend the ChatGPT sign-in area in
   [`src/components/Settings.tsx`](../src/components/Settings.tsx) into an account
-  list.
+  list with a visible default and default-selection action.
+- Add `SessionAccountSwitcher` beside the model selector in
+  [`src/components/Composer.tsx`](../src/components/Composer.tsx). Hide it when
+  fewer than two accounts are connected unless the pinned account is unavailable.
+- Route a locked switch through `SessionActionDialog`, which offers to create a
+  new chat for the selected account without altering the current chat.
 - Use explicit loading, registry-error, zero-connected, and reconnect-only states;
   errors never collapse to an empty connected-account list.
-- Add a compact account badge to the active session chrome; avoid placing account
-  management actions there.
-- Resolve authorization and badges from the active session's pinned profile, not
-  the last-used creation preference.
+- Remove successful accounts from actionable Settings rows immediately so a stale
+  **Remove** button cannot remain visible.
+- Resolve authorization and account labels from the active session's pinned
+  profile, not the default-account preference.
 
 No dedicated account-management route, routing rules editor, or automatic quota
 balancer is needed.
 
-## Mid-session switching research
+## Started-chat switching boundary
 
-### Feasibility
+### Implemented behavior
+
+An account switch attempted after the first durable message is rejected by the
+native session pin command. The UI explains that the existing chat cannot change
+accounts and offers to create a new empty chat under the selected account. The old
+chat, workspace, and files remain intact; conversation history and hidden provider
+state are not copied.
+
+### Full-history feasibility
 
 Switching between completed turns is technically possible in Portcode without
 losing visible conversation or files:
@@ -436,10 +451,10 @@ multi-account registry. Portcode must own account selection rather than depend o
 an undocumented OpenAI-side switch. See
 [Codex App Server](https://developers.openai.com/codex/app-server/).
 
-### Recommended follow-up: handoff fork
+### Possible follow-up: handoff fork
 
-After V1 is stable, add **Continue with another account…** as an explicit
-between-turn operation that creates a linked session:
+If users later need contextual continuation rather than today's safe new-chat
+flow, add an explicit linked-session handoff:
 
 - Same workspace and branch.
 - New session ID pinned to the selected account.
@@ -494,7 +509,7 @@ background activity is active.
 - Keep the direct subscription transport isolated because it is not documented as
   a stable general-purpose third-party API boundary.
 
-## Implementation phases
+## Implementation phases (completed)
 
 ### Phase 0 — Registry refactor with one-account behavior
 
@@ -522,19 +537,21 @@ current OpenAI tests pass through the new registry.
 Exit criterion: two mock accounts can coexist, refresh independently, and produce
 requests with their own bearer token and `ChatGPT-Account-ID` header.
 
-### Phase 2 — Session pinning and fast selection
+### Phase 2 — Session pinning and in-chat selection
 
 - Add the nullable session database column and TypeScript field.
-- Extend local session creation with the selected profile ID and fail closed for
+- Seed local empty sessions with the default profile ID and fail closed for
   unnegotiated remote OpenAI creation.
-- Add the New Session account selector and last-used preselection.
+- Add the empty-chat account selector beside the model selector.
+- Lock the account after the first durable message and route later switch attempts
+  to a confirmed new-chat flow.
 - Resolve every run through the session's pinned profile.
 - Add account labels to session chrome and the reconnect-required state.
 - Cover legacy-session pinning explicitly.
 
-Exit criterion: Account A and Account B can run concurrent sessions, changing the
-New Session selection affects neither existing session, and there is no global
-credential lookup in the run path.
+Exit criterion: Account A and Account B can run concurrent sessions, changing an
+empty chat affects no started session, and there is no global credential lookup in
+the run path.
 
 ### Phase 3 — Hardening and release
 
@@ -582,7 +599,7 @@ couple it to the account-registry migration or session-picker release.
 - Terminal refresh failure invalidates only the selected profile.
 - `create_session` persists the selected profile ID.
 - Legacy session pinning requires confirmation or selection as specified.
-- A run continues using its original profile when the last-used account changes.
+- A run continues using its original profile when the default account changes.
 - A missing or changed remote account ID during refresh persists and sends
   nothing, aborts the turn, and quarantines only that profile.
 - Removal/run/model/usage admission races are linearizable.
@@ -593,22 +610,28 @@ couple it to the account-registry migration or session-picker release.
 
 ### Frontend
 
-- One connected account keeps New Session one-click.
-- Multiple accounts preselect the last-used profile.
-- Choosing another account passes the correct ID to session creation.
-- Rapid repeated creation still creates one session.
+- One connected account is the default and does not render a redundant selector.
+- Settings can change the default when multiple accounts are connected.
+- New Chat and the home screen do not render account selection.
+- Multiple accounts show the default profile beside the model picker in an empty
+  GPT chat.
+- Choosing another account before the first message pins the correct ID and uses
+  that account's model catalog.
+- Choosing another account after the first message leaves the current chat
+  unchanged and offers a compatible new chat.
+- Rapid repeated creation or confirmation still creates one session.
 - No-account state routes to Add Account.
 - Loading, registry error, zero-account, and reconnect-only states remain
   distinguishable and accessible.
 - Removed or expired account leaves history readable and shows reconnect UI.
 - Account selection updates the available model list.
-- Existing session account badges do not change when the New Session selection
-  changes.
+- Existing sessions do not change when the default account changes.
 - Settings add/reconnect/remove actions preserve loading and error states.
+- A removed profile no longer renders a stale **Remove** action.
 - Capability-off Settings still lists accounts and exposes Remove while hiding
   login/reconnect/run controls.
 - Ctrl/Cmd+N, command palette, full Sidebar, collapsed rail, and composer fallback
-  all use the same guarded resolver.
+  all create an account-prompt-free empty chat through the same guarded resolver.
 - Legacy pin confirmation occurs before draft clearing or optimistic message state.
 - No token or remote account ID appears in serialized store state.
 
@@ -629,16 +652,23 @@ couple it to the account-registry migration or session-picker release.
 ## Acceptance checklist
 
 - [x] A user can connect at least two ChatGPT subscription accounts.
-- [x] New Session clearly shows which account will be used.
-- [x] The last-used account is preselected.
-- [x] Selecting another account takes one additional interaction.
+- [x] One connected account is always the default, and Settings can change the
+      default when alternatives exist.
+- [x] Home and New Chat surfaces do not show an account prompt.
+- [x] An empty GPT chat shows account selection beside the model selector only
+      when multiple accounts are connected or the pinned account is unavailable.
+- [x] Selecting another account before the first message takes one interaction.
+- [x] Selecting another account after the first message preserves the current
+      chat and offers to continue in a new chat.
 - [x] Every new OpenAI session persists a local account profile ID.
-- [x] Existing sessions never change account when the New Session selection
-      changes.
+- [x] Existing started sessions never change account when the default or another
+      empty chat's selection changes.
 - [x] Every turn, retry, and refresh uses one immutable account identity.
 - [x] Root and every nested/parallel subagent use that same immutable identity.
 - [x] Account-specific model catalogs and quota snapshots stay isolated.
 - [x] Removing an account never deletes session history.
+- [x] Removing an account removes its stale **Remove** action and reconciles the
+      default/empty-chat selection safely.
 - [x] Removing then reconnecting the same remote identity revives the exact local
       profile; reconnecting a different identity does not mutate it.
 - [x] No automatic quota-based or error-based account switching exists.
@@ -691,11 +721,12 @@ The feature should be reversible without database surgery:
 
 ## Final recommendation
 
-Ship multiple ChatGPT accounts and fast account selection as a session-creation
-feature first. Keep the account pinned for the session. This delivers the main
-value with a small, testable state model.
+The shipped contract uses a Settings-owned default and session-scoped account
+selection. New Chat remains a clean one-click action. Users with alternatives can
+change the account beside the model picker while the chat is empty; the first
+durable message locks that account.
 
-Mid-session continuation is possible between completed turns because Portcode
-owns the conversation and workspace locally, but it crosses authentication and
-data-governance boundaries. Implement it later as an explicit linked-session
-handoff; do not make it a silent credential toggle.
+After that boundary, Portcode offers a new empty chat for the requested account
+instead of changing credentials in place. A future linked-session handoff may add
+an explicit, sanitized context transfer, but it must never become a silent
+credential toggle.
