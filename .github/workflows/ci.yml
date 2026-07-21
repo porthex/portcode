@@ -302,7 +302,9 @@ jobs:
   #     contributors must rebuild + commit locally; the `wasm` freshness gate tells
   #     them so). Never runs on main/release (the freshness gate guards those).
   #   * Only does work when a wasm crate actually changed in the PR (cheap skip
-  #     otherwise) so unrelated PRs don't pay a wasm rebuild.
+  #     otherwise) so unrelated PRs don't pay a wasm rebuild. Cargo.lock is
+  #     included because dependency updates can change the generated glue even
+  #     when neither wasm crate manifest changed.
   #   * Commits only when the DETERMINISTIC glue (.js/.d.ts contract) drifts; the
   #     non-bit-reproducible `_bg.wasm` binary is bundled into that same commit but
   #     never the sole trigger — so a noisy binary rebuild can't cause a commit loop.
@@ -323,15 +325,15 @@ jobs:
           ref: ${{ github.head_ref }}
           fetch-depth: 0
 
-      - name: Detect whether a wasm crate changed in this PR
+      - name: Detect whether a wasm crate or lockfile changed in this PR
         id: changed
         run: |
           if git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD \
-               -- crates/portcode-wasm crates/portcode-sync | grep -q .; then
+               -- Cargo.lock crates/portcode-wasm crates/portcode-sync | grep -q .; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "no wasm-crate changes in this PR — skipping the artifact rebuild."
+            echo "no wasm-crate or lockfile changes in this PR — skipping the artifact rebuild."
           fi
 
       - name: Install LLVM clang
