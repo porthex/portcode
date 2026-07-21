@@ -730,6 +730,11 @@ describe("TitleBar", () => {
     expect((await screen.findAllByText("one@chatgpt.test")).length).toBeGreaterThan(0);
     expect(container).toHaveTextContent("one@chatgpt.test");
     expect(container).not.toHaveTextContent(accountProfileId);
+    const titlebarAccount = screen.getByRole("banner").querySelector(".pc-titlebar__account-pill");
+    expect(titlebarAccount).toHaveAttribute("title", "ChatGPT account: one@chatgpt.test");
+    expect(titlebarAccount?.querySelector(".pc-titlebar__account-label")).toHaveTextContent(
+      "one@chatgpt.test",
+    );
   });
 
   it.each(["ready", "absent", "loading", "error"] as const)(
@@ -872,6 +877,7 @@ describe("TitleBar", () => {
     render(<App />);
 
     expect(screen.getByText("PREVIEW MODE")).toBeInTheDocument();
+    expect(screen.queryByTestId("window-drag-rail")).not.toBeInTheDocument();
   });
 
   it("hides the preview-mode badge when running inside Tauri", () => {
@@ -910,6 +916,11 @@ describe("TitleBar", () => {
     expect(nativeWindow.minimize).toHaveBeenCalledOnce();
     expect(nativeWindow.toggleMaximize).toHaveBeenCalledOnce();
     expect(nativeWindow.close).toHaveBeenCalledOnce();
+    expect(screen.getByTestId("window-drag-rail")).toHaveClass("pc-window-drag-rail");
+    expect(screen.getByTestId("window-drag-rail")).toHaveAttribute(
+      "data-tauri-drag-region",
+      "deep",
+    );
     expect(screen.getByText("New chat").closest("header")).toHaveAttribute(
       "data-tauri-drag-region",
       "deep",
