@@ -940,7 +940,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
         data-tauri-drag-region={isTauri() ? "deep" : undefined}
         className="flex h-[56px] shrink-0 items-center gap-2.5 px-5"
       >
-        <div className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-lg border border-accent/60 bg-gradient-to-br from-accent/30 to-accent-2/25 shadow-[0_0_14px_rgba(255,46,126,0.4)]">
+        <div className="flex h-[30px] w-[30px] shrink-0 items-center justify-center overflow-hidden rounded-lg border border-white/10 bg-[#050914] shadow-[0_0_14px_rgba(255,46,126,0.22)]">
           <Logo />
         </div>
         <div className="flex min-w-0 flex-col">
@@ -1260,7 +1260,7 @@ function SessionRail() {
         data-tauri-drag-region={isTauri() ? "deep" : undefined}
         className="flex h-[46px] w-full shrink-0 items-center justify-center"
       >
-        <div className="flex h-[30px] w-[30px] items-center justify-center rounded-lg border border-accent/60 bg-gradient-to-br from-accent/30 to-accent-2/25 shadow-[0_0_14px_rgba(255,46,126,0.4)]">
+        <div className="flex h-[30px] w-[30px] items-center justify-center overflow-hidden rounded-lg border border-white/10 bg-[#050914] shadow-[0_0_14px_rgba(255,46,126,0.22)]">
           <Logo />
         </div>
       </div>
@@ -1388,15 +1388,14 @@ function relativeTime(ts: number): string {
 
 function Logo() {
   return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-      <path
-        d="M7 9l3 3-3 3M13 15h4"
-        stroke="var(--color-accent-hi)"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
+    <img
+      src="/icon-192.png"
+      alt="Portcode logo"
+      width="30"
+      height="30"
+      draggable={false}
+      className="h-full w-full select-none object-cover"
+    />
   );
 }
 
