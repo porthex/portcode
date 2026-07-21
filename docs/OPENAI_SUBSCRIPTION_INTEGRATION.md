@@ -1,6 +1,9 @@
 # OpenAI subscription integration
 
-- Status: architecture and protocol reference
+- Status: implementation landed behind a release gate; catalog caching, bounded
+  transient retries, compatibility telemetry, and broad-release approval remain
+- Document role: architecture/protocol/security reference; delivery priority lives
+  in [`docs/ROADMAP.md`](ROADMAP.md)
 - Research date: 2026-07-18
 - OpenAI Codex source snapshot: [`23899f7cb63a1510e53fddd68740dfc325853e3b`](https://github.com/openai/codex/commit/23899f7cb63a1510e53fddd68740dfc325853e3b)
 
@@ -415,6 +418,19 @@ Do not depend on:
 - Platform `previous_response_id` semantics when using the stateless ChatGPT transport.
 
 ## Implementation slices
+
+The current tree implements the provider/UI, credentials, authenticated catalog
+fetch, core Responses transport, and ordered reasoning/tool persistence. The
+following hardening claims are **not yet complete** and must not be inferred from
+the presence of the provider:
+
+- ETag plus last-known-good catalog caching; the current failure path falls back
+  directly to a versioned static catalog.
+- Bounded, cancellation-aware retry/backoff for 429/5xx responses; 401 refresh is
+  implemented, but other transient response failures currently return immediately.
+- Compatibility telemetry and the external product/legal/OpenAI approval checkpoint.
+
+The ordered queue and release gate are tracked in [`docs/ROADMAP.md`](ROADMAP.md).
 
 1. **Domain/UI:** add provider identity, dynamic model catalog, reasoning effort, account status, and normalized error/rate-limit states without changing the agent loop.
 2. **Credentials:** add provider-tagged OpenAI credentials, fixed-port PKCE login, claim parsing, atomic refresh rotation, single-flight 401 recovery, and logout.

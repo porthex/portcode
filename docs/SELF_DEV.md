@@ -1,11 +1,14 @@
 # Self-dev mode
 
+> **Document role:** operational guide for the implemented Phase 1 workflow.
+> Delivery priority for any follow-up belongs in [`ROADMAP.md`](ROADMAP.md).
+
 Self-dev mode is how you **build Portcode while living inside Portcode** — the
 fastest way to find real bugs is to use the app all day as you change it.
 
 This document covers **Phase 1**, which is shippable today and adds no risk to
-the normal app. Phase 2 (the automatic, gated build-promotion supervisor) is
-sketched at the bottom but intentionally **not** built yet.
+the normal app. The automatic build-promotion supervisor is not built and is
+deferred in the roadmap.
 
 > **Why not "two synced instances that auto-swap on every change"?**
 > That was the original idea. A multi-agent feasibility study found it isn't
@@ -103,20 +106,10 @@ updater bootstrap.
 
 ---
 
-## Phase 2 (roadmap — not built yet)
+## Deferred supervisor concept
 
-When a meaningful **Rust** change is ready to validate, a small supervisor
-(`scripts/self-dev.*`) would promote it safely, blue-green style:
-
-1. **Snapshot** the stable `portcode.db` (after a WAL checkpoint).
-2. **Build** the candidate, then **health-gate** it (`pnpm test` + `cargo test`).
-3. **Promote** only on green; keep the previous binary at a fixed path so a
-   broken candidate **auto-rolls-back**.
-4. **Sequential, not concurrent** (shared login and sync state must not be accessed
-   concurrently): close stable → build → gate → relaunch as the new
-   stable.
-
-Prerequisite safety for Phase 2 (because the agent can edit Portcode's own
-source): a **protected-paths denylist** in `tools.rs::resolve_for_write` so a
-single approved write can't silently neuter `permissions.rs` / `secrets.rs` /
-`oauth.rs` / `sync/` / `.github/`.
+A sequential blue-green supervisor with database snapshots, health gates,
+rollback, separated runtime identity, and protected-path controls remains a
+possible follow-up. It is intentionally not a near-term commitment; its place
+and prerequisites are tracked only in the roadmap. Phase 1 above remains the
+operational truth.

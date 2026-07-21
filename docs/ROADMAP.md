@@ -31,14 +31,14 @@ external acceptance. This snapshot uses explicit evidence states instead.
 | iOS/web client                  | **Scaffolded; correctness blockers found**           | Reconnect, key persistence, permission ack/replay, lifecycle/cursors, relay/PWA CI      |
 | OpenAI subscription integration | **Transport implemented**                            | Per-profile hardening, catalog cache, retries, local telemetry, broad-release approval  |
 | Git Review workspace            | **Phase 1 implemented**                              | Large-diff UX, structured read-only review, persistence, Fix handoff                    |
-| Turn completion receipts        | **Lifecycle implemented**                            | Terminal immutability repair, patch blobs, retention, exact historical anchors          |
+| Turn completion receipts        | **Corrective Phase 1 merged in PR #139**             | Durable patch blobs, retention, and exact historical anchors                            |
 | Self-dev mode                   | **Deferred from this execution**                     | Optional Phase 2 remains deliberately unscheduled                                       |
 | Repo Mode                       | **Proposal only**                                    | Re-grounding, one Git engine, GitHub auth decision, executable security bootstrap       |
 | iOS connection spike            | **Harness only**                                     | No recorded physical-device go/no-go result                                             |
 
-The retired parity tracker was **57% complete as a checklist**, but it was not a
-coherent feature. It remains historical only; its unfinished items are represented
-in the queue or the explicitly deferred list below.
+The retired parity tracker was a partial implementation log, not a coherent feature.
+Its unfinished items are represented in the queue or the explicitly deferred list
+below, and Git history retains its completed-build evidence without a second roadmap.
 
 ## Ordered work queue
 
@@ -50,15 +50,25 @@ required device, credential, or owner decision is available.
 
 ### Executable now
 
-1. **Multiple ChatGPT accounts (P0) — complete in
+1. **Turn completion receipts corrective Phase 1 (P0) — complete in
+   [PR #139](https://github.com/porthex/portcode/pull/139).**
+   Remove eager Git capture from read-only turns, classify and gate mutating tools,
+   replace per-path Git subprocesses with bounded bulk capture, and separate agent
+   completion from receipt readiness.
+   - **Dependency:** existing receipt lifecycle and Git snapshot implementation.
+   - **Evidence:** the mutation, constant-process, two-second finalization,
+     crash-recovery, remote-compatibility, UX, and cross-platform CI gates in
+     [`TURN_COMPLETION_RECEIPTS.md`](TURN_COMPLETION_RECEIPTS.md) passed before merge.
+2. **Multiple ChatGPT accounts (P0) — complete in
    [PR #130](https://github.com/porthex/portcode/pull/130).** Singleton OpenAI
    subscription state is now represented by crash-safe native profiles; every
    OpenAI session and completed turn is pinned to one profile; identity is
    immutable through root/subagents; and account selection/management is shipped.
+   Session-scoped selection and started-chat locking were completed in PR #138.
    - **Dependency:** existing direct-subscription transport and capability gate.
    - **Evidence:** the plan's migration, identity, concurrency, UX, redaction,
      Rust, frontend-coverage, PR CI, and merge acceptance is green.
-2. **Release security baseline (P0) — complete in
+3. **Release security baseline (P0) — complete in
    [PR #131](https://github.com/porthex/portcode/pull/131).** Scrub shell
    subprocess environments to a reviewed allowlist; project phone-bound
    `StreamEvent` data through a bounded, default-deny schema with credential
@@ -70,57 +80,58 @@ required device, credential, or owner decision is available.
    - **Deferred:** permission-response acknowledgement and idempotent replay
      remain in the Android/iOS correctness plans; physical-device,
      live-provider, and signing evidence remain external gates.
-3. **Deterministic desktop acceptance (P0).** Exercise session → mocked turn →
+4. **Deterministic desktop acceptance (P0).** Exercise session → mocked turn →
    permission → tool → persistence → process restart, including explicit
    interrupted-run behavior.
    - **Dependency:** release security baseline.
    - **Done when:** the path is deterministic in CI and failure output identifies
      the broken boundary.
-4. **Android protocol and security correctness (P0).** Repair initial Hello/
+5. **Android protocol and security correctness (P0).** Repair initial Hello/
    catch-up, remove credential-management commands from the mobile boundary,
    persist trust only after SAS verification, add acknowledged/idempotent replay
    for permission decisions across link loss, and make Android CI mandatory.
    - **Dependency:** release security baseline.
    - **Done when:** production client catch-up and capability-boundary regression
      tests pass before physical-device acceptance is claimed.
-5. **iOS/web protocol and security correctness (P0).** Standardize reconnect
+6. **iOS/web protocol and security correctness (P0).** Standardize reconnect
    handshakes, persist the browser private identity only after SAS verification,
    make lifecycle redial and durable cursors real, replay unacknowledged permission
    decisions idempotently, and add web/PWA CI gates.
    - **Dependency:** release security baseline.
    - **Done when:** reconnect, lifecycle, cursor, relay, and browser security tests
      pass before physical-device acceptance is claimed.
-6. **OpenAI transport hardening (P1).** Add a last-known-good/ETag model catalog,
+7. **OpenAI transport hardening (P1).** Add a last-known-good/ETag model catalog,
    bounded cancellation-aware 429/5xx retry behavior, compatibility telemetry,
    and evidence for the existing release kill switch. Keep broad release disabled
    until product/legal review and OpenAI contact are complete.
    - **Dependency:** release security baseline.
    - **Done when:** the hardening rows in the integration test matrix pass and the
      release-enable decision is documented.
-7. **Git Review Phase 2 (P1).** Land large-diff virtualization/navigation first,
+8. **Git Review Phase 2 (P1).** Land large-diff virtualization/navigation first,
    then structured findings, evidence/severity filters, snapshot persistence,
    Fix selected, and focused re-check.
    - **Dependency:** the landed Phase 1 Review Workspace.
    - **Done when:** read-only AI review is trustworthy on a large diff without
      exposing mutating tools.
-8. **Conversation continuity (P1).** Specify and implement context compaction
+9. **Conversation continuity (P1).** Specify and implement context compaction
    first, then conversation fork and checkpoint/rewind semantics.
    - **Dependency:** provider-neutral conversation-state contract.
    - **Done when:** restart, provider-switch, and tool-history behavior are covered
      before any UI claims continuity.
-9. **Durable historical patches (P1).** Store immutable historical patch bytes
-   with a bounded retention policy and exact old-snapshot anchors. Defer richer
-   history navigation and rollback until usage justifies them.
-   - **Dependency:** turn receipts and snapshot identities already in the tree.
-   - **Done when:** Last agent turn review never reconstructs an old patch from the
-     live working tree.
-10. **Local Git handoff (P2).** Add stage/unstage and commit only after Review
+10. **Durable historical patches (P1).** Store immutable historical patch bytes
+    with a bounded retention policy and exact old-snapshot anchors. Defer richer
+    history navigation and rollback until usage justifies them.
+    - **Dependency:** corrective receipt Phase 1 gates and snapshot identities.
+    - **Done when:** Last agent turn review never reconstructs an old patch from the
+      live working tree.
+
+11. **Local Git handoff (P2).** Add stage/unstage and commit only after Review
     snapshot preconditions are proven; add push/PR handoff last.
     - **Dependency:** Git Review Phase 2 and durable snapshot handling.
     - **Done when:** stale hashes fail closed and no second Git architecture is
       introduced for Repo Mode.
 
-11. **Re-ground Repo Mode before build (P2).** Rewrite its current-state model
+12. **Re-ground Repo Mode before build (P2).** Rewrite its current-state model
     around the existing `git.rs`, `git_review.rs`, permission modes, and optional
     Git-ignored Graphify output; then resolve GitHub App/token decisions and pass
     its security Phase 0 before estimating implementation.
@@ -128,7 +139,7 @@ required device, credential, or owner decision is available.
     - **Done when:** the plan describes the current tree and every security bootstrap
       control has an executable test.
 
-12. **Unsigned release-candidate rehearsal (P0).** Exercise packaging, updater
+13. **Unsigned release-candidate rehearsal (P0).** Exercise packaging, updater
     artifacts, checksums/SBOM, install/launch, uninstall, prior-version update,
     and corrupted-signature rejection without production signing credentials.
     - **Dependency:** every executable product/security plan above plus

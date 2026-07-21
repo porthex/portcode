@@ -1,5 +1,9 @@
 # Phase 0 — iOS proof-of-connection spike (THROWAWAY)
 
+> **Document role:** temporary device-acceptance runbook. Its execution priority
+> is tracked in [`docs/ROADMAP.md`](../../docs/ROADMAP.md); retain this directory
+> until the physical-device result is recorded, then delete the whole spike.
+
 > This directory is a **throwaway, standalone spike**. It is intentionally
 > separate from the product crates (`src-tauri/`) and the main frontend — it is
 > not part of any Cargo workspace and cannot affect the main build. Its only job

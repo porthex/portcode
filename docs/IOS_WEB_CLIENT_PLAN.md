@@ -1,5 +1,10 @@
 # iOS Web Client Plan — Phone Sync over iroh-in-the-browser (Vercel PWA)
 
+> **Document role:** browser/WASM architecture and the authoritative real-device
+> acceptance matrix. Cross-project priority lives in
+> [`docs/ROADMAP.md`](ROADMAP.md); the numbered §5.x contracts remain stable because
+> source, CI, security, and relay documentation cite them.
+>
 > **Status:** Implementation landed; real-device acceptance is still open. The
 > workspace split, browser iroh transport, WASM wrapper, static PWA, scanner,
 > durable pairing state, and reconnect-on-resume lifecycle are in the tree and
@@ -493,9 +498,10 @@ on the desktop** and the phone is a resumable mirror.
 - **Fail-closed command parsing** (`parse_decision`, existing) still treats any
   unknown permission decision as Deny.
 - **New surface to threat-model:** browser storage (IndexedDB key exfiltration
-  via XSS) — mitigate with a strict CSP on the Vercel app, Subresource Integrity
-  on the wasm, and no third-party script injection. Document this in
-  `SECURITY.md` before launch.
+  via XSS). The current mitigation is same-origin content-hashed assets, a strict
+  CSP, and no third-party script injection. True integrity metadata for the
+  dynamically imported WASM module is **not implemented** and remains a launch
+  hardening item; dynamic `import()` cannot use a normal script-tag SRI attribute.
 
 ---
 
@@ -510,8 +516,9 @@ on the desktop** and the phone is a resumable mirror.
     Recommended: GH Actions job produces `portcode_wasm` package; Vercel's build
     consumes the prebuilt files. (`{"github":{"enabled":false}}` if we want Vercel
     to deploy only, not build Rust.)
-- **No COOP/COEP headers** (single-threaded wasm, no SharedArrayBuffer). Add a
-  strict **CSP** + cache headers + SRI on the wasm instead.
+- **No COOP/COEP headers** (single-threaded wasm, no SharedArrayBuffer). Keep the
+  strict **CSP**, same-origin content-hashed assets, and immutable cache headers;
+  add true WASM integrity metadata when the build emits a supported preload path.
 - **Brotli** is automatic on Vercel's CDN (~40–55% of raw wasm on the wire).
 - A `vercel.json` pins headers (CSP, `Cross-Origin-Resource-Policy`, immutable
   caching for hashed assets, `application/wasm` is served correctly by default).
@@ -524,15 +531,16 @@ Portcode gates **frontend coverage on `main`/`release`** (`pnpm test:coverage`).
 New frontend code **must** ship with tests in the same change (per `CLAUDE.md`).
 
 - **Rust (`portcode-sync`):** unit tests move with the code (the existing
-  `protocol`/`noise`/`session` tests). Add wasm-target build verification in CI
-  (`cargo build --target wasm32-unknown-unknown` + `wasm-pack test --headless`
-  for the Noise round-trip). Rust tests run in CI.
+  `protocol`/`noise`/`session` tests). CI currently builds and lints the WASM
+  target, runs `wasm-pack build`, and checks the committed artifact for freshness.
+  A headless `wasm-pack test` Noise round-trip remains to be added.
 - **Frontend:** the reused store/components and the WASM adapter, scanner,
   install gate, storage, and reconnect/visibility wiring have matching Vitest
   coverage. Keep those tests hermetic and extend them with each behavior change,
   including permission-response ack/replay across forced disconnects.
-- **E2E (wdio):** add a browser-mode smoke that pairs against a headless desktop
-  - local relay and exercises connect → command → frame → background → resume.
+- **E2E (wdio):** the browser-mode smoke is still missing. Add a path that pairs
+  against a headless desktop/local relay and exercises connect → command → frame
+  → background → resume.
 - **iOS on-device:** the Phase 0 spike and a manual pre-launch checklist
   (install, pair, background/lock for >30s, resume, push tap) — there is no CI
   for real iOS Safari lifecycle behaviour.
