@@ -54,6 +54,10 @@ ${StrLoc}
 !define UNINSTALLERICON "{{uninstaller_icon}}"
 !define UNINSTALLERHEADERIMAGE "{{uninstaller_header_image}}"
 !define MAINBINARYNAME "{{main_binary_name}}"
+; Beta builds used portcode.exe before receiving their own main binary name.
+; Keep this explicit legacy identity so an update can repair installs whose
+; registry already says portcode-beta.exe while an old binary/shortcut remains.
+!define PORTCODE_LEGACY_BETA_BINARY "portcode.exe"
 !define MAINBINARYSRCPATH "{{main_binary_path}}"
 !define BUNDLEID "{{bundle_id}}"
 !define COPYRIGHT "{{copyright}}"
@@ -1493,10 +1497,55 @@ Section Install
     !insertmacro NSIS_HOOK_PREINSTALL
   !endif
 
+  ; Capture the previous identity before overwriting the uninstall metadata.
+  ; Updates must close every executable they are about to replace or remove.
+  ClearErrors
+  ReadRegStr $OldMainBinaryName SHCTX "${UNINSTKEY}" "MainBinaryName"
+  ${If} ${Errors}
+    StrCpy $OldMainBinaryName ""
+    ClearErrors
+  ${EndIf}
+
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+  ${If} $OldMainBinaryName != ""
+  ${AndIf} $OldMainBinaryName != "${MAINBINARYNAME}.exe"
+  ${AndIf} ${FileExists} "$INSTDIR\$OldMainBinaryName"
+    !insertmacro CheckIfAppIsRunning "$OldMainBinaryName" "${PRODUCTNAME}"
+  ${EndIf}
+  ; A prior update may already have replaced MainBinaryName in the registry while
+  ; leaving beta.3/beta.4's portcode.exe and its desktop shortcut behind.
+  ${If} "${MAINBINARYNAME}.exe" != "${PORTCODE_LEGACY_BETA_BINARY}"
+  ${AndIf} $OldMainBinaryName != "${PORTCODE_LEGACY_BETA_BINARY}"
+  ${AndIf} ${FileExists} "$INSTDIR\${PORTCODE_LEGACY_BETA_BINARY}"
+    !insertmacro CheckIfAppIsRunning "${PORTCODE_LEGACY_BETA_BINARY}" "${PRODUCTNAME}"
+  ${EndIf}
 
   ; Copy main executable
   File "${MAINBINARYSRCPATH}"
+
+  ; Never leave an obsolete beta executable launchable after a successful
+  ; upgrade. CheckIfAppIsRunning above makes these immediate deletes reliable;
+  ; if another process still holds a file, fail the install instead of quietly
+  ; scheduling deletion for a reboot and exposing two beta versions meanwhile.
+  ${If} $OldMainBinaryName != ""
+  ${AndIf} $OldMainBinaryName != "${MAINBINARYNAME}.exe"
+  ${AndIf} ${FileExists} "$INSTDIR\$OldMainBinaryName"
+    ClearErrors
+    Delete "$INSTDIR\$OldMainBinaryName"
+    ${If} ${Errors}
+      MessageBox MB_ICONSTOP "Setup could not remove the previous ${PRODUCTNAME} executable ($OldMainBinaryName). Close it and run setup again."
+      Abort
+    ${EndIf}
+  ${EndIf}
+  ${If} "${MAINBINARYNAME}.exe" != "${PORTCODE_LEGACY_BETA_BINARY}"
+  ${AndIf} ${FileExists} "$INSTDIR\${PORTCODE_LEGACY_BETA_BINARY}"
+    ClearErrors
+    Delete "$INSTDIR\${PORTCODE_LEGACY_BETA_BINARY}"
+    ${If} ${Errors}
+      MessageBox MB_ICONSTOP "Setup could not remove the legacy ${PRODUCTNAME} executable (${PORTCODE_LEGACY_BETA_BINARY}). Close it and run setup again."
+      Abort
+    ${EndIf}
+  ${EndIf}
 
   ; Copy resources
   {{#each resources_dirs}}
@@ -1538,15 +1587,6 @@ Section Install
     WriteRegStr SHCTX "${UNINSTKEY}" $MultiUser.InstallMode 1
   !endif
 
-  ; Remove old main binary if it doesn't match new main binary name
-  ReadRegStr $OldMainBinaryName SHCTX "${UNINSTKEY}" "MainBinaryName"
-  ${If} $OldMainBinaryName != ""
-  ${AndIf} $OldMainBinaryName != "${MAINBINARYNAME}.exe"
-    ; beta.3 and earlier used portcode.exe. If it is still locked, finish the
-    ; one-time name migration after reboot without touching stable Portcode.
-    Delete /REBOOTOK "$INSTDIR\$OldMainBinaryName"
-  ${EndIf}
-
   ; Save current MAINBINARYNAME for future updates
   WriteRegStr SHCTX "${UNINSTKEY}" "MainBinaryName" "${MAINBINARYNAME}.exe"
 
@@ -1575,6 +1615,11 @@ Section Install
   !insertmacro MUI_STARTMENU_WRITE_BEGIN Application
     Call CreateOrUpdateStartMenuShortcut
   !insertmacro MUI_STARTMENU_WRITE_END
+
+  ; Existing owned shortcuts are upgrade state, not a new-shortcut preference.
+  ; Repair them on every install mode, including an ordinary GUI update whose
+  ; finish page intentionally omits the "Create a desktop shortcut" checkbox.
+  Call MigrateExistingDesktopShortcut
 
   ; Create desktop shortcut for silent and passive installers
   ; because finish page will be skipped
@@ -1633,10 +1678,23 @@ Section Uninstall
   !endif
 
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+  ${If} "${MAINBINARYNAME}.exe" != "${PORTCODE_LEGACY_BETA_BINARY}"
+  ${AndIf} ${FileExists} "$INSTDIR\${PORTCODE_LEGACY_BETA_BINARY}"
+    !insertmacro CheckIfAppIsRunning "${PORTCODE_LEGACY_BETA_BINARY}" "${PRODUCTNAME}"
+  ${EndIf}
 
   ; Delete the app directory and its content from disk
   ; Copy main executable
   Delete "$INSTDIR\${MAINBINARYNAME}.exe"
+  ${If} "${MAINBINARYNAME}.exe" != "${PORTCODE_LEGACY_BETA_BINARY}"
+  ${AndIf} ${FileExists} "$INSTDIR\${PORTCODE_LEGACY_BETA_BINARY}"
+    ClearErrors
+    Delete "$INSTDIR\${PORTCODE_LEGACY_BETA_BINARY}"
+    ${If} ${Errors}
+      MessageBox MB_ICONSTOP "Uninstall could not remove the legacy ${PRODUCTNAME} executable (${PORTCODE_LEGACY_BETA_BINARY}). Close it and try again."
+      Abort
+    ${EndIf}
+  ${EndIf}
 
   ; Delete resources
   {{#each resources}}
@@ -1691,6 +1749,21 @@ Section Uninstall
       !insertmacro UnpinShortcut "$SMPROGRAMS\${PRODUCTNAME}.lnk"
       Delete "$SMPROGRAMS\${PRODUCTNAME}.lnk"
     ${EndIf}
+    ${If} "${MAINBINARYNAME}.exe" != "${PORTCODE_LEGACY_BETA_BINARY}"
+      !insertmacro IsShortcutTarget "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$INSTDIR\${PORTCODE_LEGACY_BETA_BINARY}"
+      Pop $0
+      ${If} $0 = 1
+        !insertmacro UnpinShortcut "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk"
+        Delete "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk"
+        RMDir "$SMPROGRAMS\$AppStartMenuFolder"
+      ${EndIf}
+      !insertmacro IsShortcutTarget "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$INSTDIR\${PORTCODE_LEGACY_BETA_BINARY}"
+      Pop $0
+      ${If} $0 = 1
+        !insertmacro UnpinShortcut "$SMPROGRAMS\${PRODUCTNAME}.lnk"
+        Delete "$SMPROGRAMS\${PRODUCTNAME}.lnk"
+      ${EndIf}
+    ${EndIf}
 
     ; Remove desktop shortcuts
     !insertmacro IsShortcutTarget "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
@@ -1698,6 +1771,14 @@ Section Uninstall
     ${If} $0 = 1
       !insertmacro UnpinShortcut "$DESKTOP\${PRODUCTNAME}.lnk"
       Delete "$DESKTOP\${PRODUCTNAME}.lnk"
+    ${EndIf}
+    ${If} "${MAINBINARYNAME}.exe" != "${PORTCODE_LEGACY_BETA_BINARY}"
+      !insertmacro IsShortcutTarget "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${PORTCODE_LEGACY_BETA_BINARY}"
+      Pop $0
+      ${If} $0 = 1
+        !insertmacro UnpinShortcut "$DESKTOP\${PRODUCTNAME}.lnk"
+        Delete "$DESKTOP\${PRODUCTNAME}.lnk"
+      ${EndIf}
     ${EndIf}
   ${EndIf}
 
@@ -1769,18 +1850,41 @@ Function CreateOrUpdateStartMenuShortcut
   ; migrate old shortcuts to target the new MAINBINARYNAME
   StrCpy $R0 0
 
-  !insertmacro IsShortcutTarget "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$INSTDIR\$OldMainBinaryName"
-  Pop $0
-  ${If} $0 = 1
-    !insertmacro SetShortcutTarget "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
-    StrCpy $R0 1
+  ${If} $OldMainBinaryName != ""
+    !insertmacro IsShortcutTarget "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$INSTDIR\$OldMainBinaryName"
+    Pop $0
+    ${If} $0 = 1
+      !insertmacro SetShortcutTarget "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
+      !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk"
+      StrCpy $R0 1
+    ${EndIf}
+
+    !insertmacro IsShortcutTarget "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$INSTDIR\$OldMainBinaryName"
+    Pop $0
+    ${If} $0 = 1
+      !insertmacro SetShortcutTarget "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
+      !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\${PRODUCTNAME}.lnk"
+      StrCpy $R0 1
+    ${EndIf}
   ${EndIf}
 
-  !insertmacro IsShortcutTarget "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$INSTDIR\$OldMainBinaryName"
-  Pop $0
-  ${If} $0 = 1
-    !insertmacro SetShortcutTarget "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
-    StrCpy $R0 1
+  ; The uninstall registry may already name the current binary even though a
+  ; shortcut from beta.3/beta.4 still names the known legacy executable.
+  ${If} "${MAINBINARYNAME}.exe" != "${PORTCODE_LEGACY_BETA_BINARY}"
+    !insertmacro IsShortcutTarget "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$INSTDIR\${PORTCODE_LEGACY_BETA_BINARY}"
+    Pop $0
+    ${If} $0 = 1
+      !insertmacro SetShortcutTarget "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
+      !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk"
+      StrCpy $R0 1
+    ${EndIf}
+    !insertmacro IsShortcutTarget "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$INSTDIR\${PORTCODE_LEGACY_BETA_BINARY}"
+    Pop $0
+    ${If} $0 = 1
+      !insertmacro SetShortcutTarget "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
+      !insertmacro SetLnkAppUserModelId "$SMPROGRAMS\${PRODUCTNAME}.lnk"
+      StrCpy $R0 1
+    ${EndIf}
   ${EndIf}
 
   ${If} $R0 = 1
@@ -1806,13 +1910,33 @@ Function CreateOrUpdateStartMenuShortcut
   !endif
 FunctionEnd
 
+Function MigrateExistingDesktopShortcut
+  StrCpy $R0 0
+  ${If} $OldMainBinaryName != ""
+    !insertmacro IsShortcutTarget "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\$OldMainBinaryName"
+    Pop $0
+    ${If} $0 = 1
+      !insertmacro SetShortcutTarget "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
+      !insertmacro SetLnkAppUserModelId "$DESKTOP\${PRODUCTNAME}.lnk"
+      StrCpy $R0 1
+    ${EndIf}
+  ${EndIf}
+  ${If} "${MAINBINARYNAME}.exe" != "${PORTCODE_LEGACY_BETA_BINARY}"
+    !insertmacro IsShortcutTarget "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${PORTCODE_LEGACY_BETA_BINARY}"
+    Pop $0
+    ${If} $0 = 1
+      !insertmacro SetShortcutTarget "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
+      !insertmacro SetLnkAppUserModelId "$DESKTOP\${PRODUCTNAME}.lnk"
+      StrCpy $R0 1
+    ${EndIf}
+  ${EndIf}
+FunctionEnd
+
 Function CreateOrUpdateDesktopShortcut
-  ; We used to use product name as MAINBINARYNAME
-  ; migrate old shortcuts to target the new MAINBINARYNAME
-  !insertmacro IsShortcutTarget "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\$OldMainBinaryName"
-  Pop $0
-  ${If} $0 = 1
-    !insertmacro SetShortcutTarget "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
+  ; Migrate first; creating a new shortcut remains governed by update mode and
+  ; the user's explicit shortcut preference below.
+  Call MigrateExistingDesktopShortcut
+  ${If} $R0 = 1
     Return
   ${EndIf}
 
