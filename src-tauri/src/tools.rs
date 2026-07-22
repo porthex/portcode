@@ -1060,31 +1060,6 @@ async fn read_bounded_pipe(
     Ok(BoundedPipe { bytes, truncated })
 }
 
-/// Wait for a piped child while draining stdout and stderr concurrently with a
-/// fixed retained prefix. Dropping this future drops the kill-on-drop child.
-pub(crate) async fn wait_with_bounded_output(
-    mut child: tokio::process::Child,
-) -> std::io::Result<BoundedShellOutput> {
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| std::io::Error::other("child stdout was not piped"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| std::io::Error::other("child stderr was not piped"))?;
-    let (status, stdout, stderr) = tokio::join!(
-        child.wait(),
-        read_bounded_pipe(stdout, SHELL_PIPE_LIMIT),
-        read_bounded_pipe(stderr, SHELL_PIPE_LIMIT),
-    );
-    Ok(BoundedShellOutput {
-        status: status?,
-        stdout: stdout?,
-        stderr: stderr?,
-    })
-}
-
 #[cfg(windows)]
 fn default_shell() -> &'static str {
     "powershell"
@@ -1184,6 +1159,12 @@ enum ForegroundWaitError {
     Failed(String),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BackgroundWaitError {
+    Cancelled,
+    Failed(String),
+}
+
 impl std::fmt::Display for ForegroundWaitError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1261,6 +1242,77 @@ async fn kill_reap_and_abort_readers(
     let _ = child.wait().await;
     let _ = stdout.await;
     let _ = stderr.await;
+}
+
+/// Wait for a background shell while draining both pipes. A session Stop is an
+/// explicit signal, not a waiter abort: cancellation therefore follows the same
+/// process-tree termination, reader shutdown, and direct-child reap path used by
+/// foreground commands before returning a terminal outcome.
+pub(crate) async fn wait_for_background_child(
+    mut child: tokio::process::Child,
+    mut cancelled: crate::background::Cancellation,
+) -> Result<BoundedShellOutput, BackgroundWaitError> {
+    let process_id = child.id();
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| BackgroundWaitError::Failed("child stdout was not piped".into()))?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| BackgroundWaitError::Failed("child stderr was not piped".into()))?;
+    let mut stdout = tokio::spawn(read_bounded_pipe(stdout_pipe, SHELL_PIPE_LIMIT));
+    let mut stderr = tokio::spawn(read_bounded_pipe(stderr_pipe, SHELL_PIPE_LIMIT));
+
+    let status = tokio::select! {
+        biased;
+        _ = &mut cancelled => {
+            kill_reap_and_abort_readers(&mut child, process_id, &mut stdout, &mut stderr).await;
+            return Err(BackgroundWaitError::Cancelled);
+        }
+        result = child.wait() => match result {
+            Ok(status) => status,
+            Err(error) => {
+                kill_reap_and_abort_readers(
+                    &mut child,
+                    process_id,
+                    &mut stdout,
+                    &mut stderr,
+                )
+                .await;
+                return Err(BackgroundWaitError::Failed(error.to_string()));
+            }
+        },
+    };
+
+    // A detached descendant may keep inherited pipes open after the shell exits.
+    // Continue watching Stop while readers drain so cancellation still terminates
+    // the Windows tree and never leaves the terminal event waiting indefinitely.
+    let (stdout_result, stderr_result) = tokio::select! {
+        biased;
+        _ = &mut cancelled => {
+            terminate_windows_process_tree(process_id).await;
+            stdout.abort();
+            stderr.abort();
+            let _ = (&mut stdout).await;
+            let _ = (&mut stderr).await;
+            return Err(BackgroundWaitError::Cancelled);
+        }
+        results = async { tokio::join!(&mut stdout, &mut stderr) } => results,
+    };
+
+    let stdout = stdout_result
+        .map_err(|error| BackgroundWaitError::Failed(error.to_string()))?
+        .map_err(|error| BackgroundWaitError::Failed(error.to_string()))?;
+    let stderr = stderr_result
+        .map_err(|error| BackgroundWaitError::Failed(error.to_string()))?
+        .map_err(|error| BackgroundWaitError::Failed(error.to_string()))?;
+
+    Ok(BoundedShellOutput {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Wait for a foreground shell while remaining responsive to the run's Stop

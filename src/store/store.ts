@@ -974,6 +974,32 @@ const stopRequestedSessions = new Set<string>();
 let pendingRemoteCreateRequestId: string | null = null;
 let pendingRemoteCreateTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingRemoteFirstMessage: { draftId: string; body: string } | null = null;
+// `remoteConnecting` is the public re-entry lock; this generation is the actual
+// async owner. It stays current after a successful dial so the listeners captured
+// by that attempt can reject frames after a disconnect or replacement connection.
+let remoteConnectGeneration = 0;
+let currentRemoteConnectGeneration: number | null = null;
+// An explicit teardown may land while the native dial/listener setup is pending.
+// Remember that one abandoned owner so, if no replacement has started, it can close
+// the native session that finished opening after the user's disconnect.
+let abortedRemoteConnectGeneration: number | null = null;
+// Native owns one phone-client slot. Serialize only the native dial itself so an
+// abandoned slow invoke cannot install its session after a replacement dial. Listener
+// registration remains outside this gate, so a hung subscription never blocks retry.
+let remoteNativeDialGate: Promise<void> = Promise.resolve();
+const withRemoteNativeDialLock = async <T>(dial: () => Promise<T>): Promise<T> => {
+  const prior = remoteNativeDialGate;
+  let release!: () => void;
+  remoteNativeDialGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await prior;
+  try {
+    return await dial();
+  } finally {
+    release();
+  }
+};
 const clearPendingRemoteCreate = (): void => {
   pendingRemoteCreateRequestId = null;
   pendingRemoteFirstMessage = null;
@@ -2322,6 +2348,9 @@ export const useStore = create<AppState>((set, get) => ({
     // message for an unpinned/removed/reconnect-required OpenAI profile. Remote
     // mode delegates this check to the credential-owning desktop.
     const pendingSession = get().pendingSession?.id === activeId ? get().pendingSession : null;
+    // The first send persists a pending local chat before starting its turn. Keep
+    // a second Enter inside that await window from issuing another create/run.
+    if (pendingSession && get().creatingSession) return;
     const activeSession =
       pendingSession ?? get().sessions.find((session) => session.id === activeId);
     if (!get().remoteConnected && activeSession) {
@@ -2359,7 +2388,6 @@ export const useStore = create<AppState>((set, get) => ({
     // A blank New chat is only local navigation state. Persist it immediately
     // before the first turn, keeping empty sessions out of history and SQLite.
     if (pendingSession && get().remoteConnected) {
-      if (get().creatingSession) return;
       const requestId = uid();
       set({ creatingSession: true });
       pendingRemoteCreateRequestId = requestId;
@@ -3124,25 +3152,28 @@ export const useStore = create<AppState>((set, get) => ({
         ...terminalizeTurnState(st, activeId, TOOL_INTERRUPTED_CANCELLED, "cancelled", "cancelled"),
       }));
     } catch (err) {
+      // The cancel promise can reject after a terminal event (and even after a
+      // follow-up turn starts). The captured cancel handle is the ownership token:
+      // never relabel or annotate whatever run owns this session now.
+      const failedRun = get().runs[runKey(activeId)];
+      if (!failedRun?.streaming || failedRun.cancel !== c) return;
       stopRequestedSessions.delete(activeId);
-      setRun(set, activeId, { finalizing: false });
       // The backend may still be executing. Retain the cancel handle + streaming
       // lock, keep listening for a real terminal event, and make uncertainty visible.
-      set((st) => ({
-        messages: patchTurnMessage(
-          st.messages,
-          activeId,
-          st.runs[runKey(activeId)]?.turnId,
-          (message) => ({
+      set((st) => {
+        const run = st.runs[runKey(activeId)];
+        if (!run?.streaming || run.cancel !== c) return {};
+        return {
+          messages: patchTurnMessage(st.messages, activeId, run.turnId, (message) => ({
             ...message,
             blocks: appendText(
               message.blocks,
               `\n\n**Stop could not be confirmed:** ${errMessage(err)}. The agent may still be running.`,
             ),
-          }),
-        ),
-        ...runPatch(st, activeId, { composerPhase: "thinking" }),
-      }));
+          })),
+          ...runPatch(st, activeId, { finalizing: false, composerPhase: "thinking" }),
+        };
+      });
     }
   },
 
@@ -3176,6 +3207,9 @@ export const useStore = create<AppState>((set, get) => ({
       ? (get().runs[runKey(sessionId)]?.pendingPermission ?? get().pendingPermission)
       : get().runs[runKey(sessionId)]?.pendingPermission;
     if (!p) return;
+    const permissionRun = get().runs[runKey(sessionId)];
+    const permissionTurnId = permissionRun?.turnId ?? null;
+    const permissionStartedAt = permissionRun?.startedAt ?? null;
     const permissionId = legacy ? p.id : String(permissionOrAlways ?? "");
     const decision = legacy ? sessionOrDecision : decisionArg;
     const always = legacy ? Boolean(permissionOrAlways) : alwaysArg;
@@ -3232,7 +3266,25 @@ export const useStore = create<AppState>((set, get) => ({
       : get().runs[runKey(sessionId)]?.pendingPermission;
     if (latest && latest.id !== permissionId) return;
     setRun(set, sessionId, { pendingPermission: null });
-    await ipc.resolvePermission(permissionId, decision);
+    try {
+      await ipc.resolvePermission(permissionId, decision);
+    } catch {
+      // A failed local invoke leaves the native gate pending. Restore only the
+      // prompt we cleared, while that exact turn is still live and no successor
+      // prompt has claimed the slot. The action intentionally settles for UI callers.
+      set((st) => {
+        const run = st.runs[runKey(sessionId)];
+        if (
+          !run?.streaming ||
+          run.turnId !== permissionTurnId ||
+          run.startedAt !== permissionStartedAt ||
+          run.pendingPermission !== null
+        ) {
+          return {};
+        }
+        return runPatch(st, sessionId, { pendingPermission: p });
+      });
+    }
   },
 
   setShowSettings(v) {
@@ -3954,6 +4006,10 @@ export const useStore = create<AppState>((set, get) => ({
     clearRemoteWatchdog(); // user-initiated teardown — the turn is over
     const wasConnected = get().remoteConnected;
     const unlisten = get().remoteUnlisten;
+    if (get().remoteConnecting && currentRemoteConnectGeneration !== null) {
+      abortedRemoteConnectGeneration = currentRemoteConnectGeneration;
+    }
+    currentRemoteConnectGeneration = null;
     // Mirror disconnectRemote's teardown: flip the connection flags FIRST (before the
     // async reject) so no command is dispatched onto the closing channel, forget the
     // remembered pairing, and clear turn state. Then mark the pairing rejected.
@@ -3970,9 +4026,8 @@ export const useStore = create<AppState>((set, get) => ({
       remoteRejectReason: null,
       lastPairingQr: null,
       remoteUnlisten: null,
-      // Doubles as an abort sentinel for an in-flight connectRemote dial (same as
-      // disconnectRemote): a dial resolving after this sees remoteConnecting false
-      // and bails before registering listeners.
+      // Release the public re-entry lock too. The generation above is the ownership
+      // guard that prevents a late dial/listener continuation from reviving this link.
       remoteConnecting: false,
       remoteChatOpen: false,
       runs: {},
@@ -4152,6 +4207,9 @@ export const useStore = create<AppState>((set, get) => ({
         // "rejected on the other device" notice. Tear down like a disconnect: clear
         // connection/verification/SAS, stop the idle watchdog, and unsubscribe.
         clearRemoteWatchdog();
+        // Invalidate both callbacks captured by this connection before tearing down
+        // their subscription; an already-queued frame must not mutate rejected state.
+        currentRemoteConnectGeneration = null;
         const unlisten = get().remoteUnlisten;
         if (unlisten) unlisten();
         // Forget the remembered desktop — a rejected pairing must not offer one-tap
@@ -4193,6 +4251,9 @@ export const useStore = create<AppState>((set, get) => ({
     // orphaning one subscription that keeps double-feeding applyFrame. Serialize so
     // only one dial runs at a time.
     if (get().remoteConnecting) return;
+    const connectGeneration = ++remoteConnectGeneration;
+    currentRemoteConnectGeneration = connectGeneration;
+    const ownsConnection = () => currentRemoteConnectGeneration === connectGeneration;
     clearPendingRemoteCreate();
     set({ remoteConnecting: true });
     // Clean reconnect: tear down any prior subscriptions before dialing so a second
@@ -4215,6 +4276,9 @@ export const useStore = create<AppState>((set, get) => ({
     clearSettleTimer();
     set((st) => ({
       ...terminalizeAllRunningTurns(st, TOOL_INTERRUPTED_ERROR, "error"),
+      // The old channel is no longer routable once its listeners are removed. This
+      // matters on resume, where stale persisted flags can still look connected.
+      remoteConnected: false,
       remoteUnlisten: null,
       remoteError: null,
       remoteVerified: false,
@@ -4239,30 +4303,86 @@ export const useStore = create<AppState>((set, get) => ({
     }));
     let unlistenFrame: (() => void) | null = null;
     let unlistenDrop: (() => void) | null = null;
+    const cleanupOwnListeners = () => {
+      const drop = unlistenDrop;
+      const frame = unlistenFrame;
+      unlistenDrop = null;
+      unlistenFrame = null;
+      drop?.();
+      frame?.();
+    };
+    const cleanupAbortedConnection = async () => {
+      cleanupOwnListeners();
+      // An explicit disconnect already closed the channel once. If this abandoned
+      // owner finished opening it late, close it again only when no replacement owns
+      // the shared native channel.
+      if (
+        abortedRemoteConnectGeneration !== connectGeneration ||
+        currentRemoteConnectGeneration !== null
+      ) {
+        return;
+      }
+      abortedRemoteConnectGeneration = null;
+      await ipc.phoneSyncDisconnect().catch(() => {});
+    };
     try {
       // `verified` doubles as the reconnect flag: a pre-verified dial is a
       // remembered-desktop reconnect, which binds an empty handshake prologue to
       // match the desktop's closed pairing window. A fresh (unverified) dial is a
       // first pairing and binds the QR nonce.
-      const info = await ipc.phoneSyncConnect(qr, verified);
-      // A disconnectRemote that landed mid-dial cleared remoteConnecting as an abort
-      // sentinel. Honor it: bail BEFORE registering the frame/drop listeners (so no
-      // orphaned subscription is ever created) and tear down the native session the
-      // dial just opened, otherwise connectRemote's success set() would silently
-      // override the user's explicit disconnect and resurrect a connection they ended.
-      // (unlistenFrame/unlistenDrop are still null here — they're only created below —
-      // so there is nothing to unsubscribe, just the native channel to close.)
-      if (!get().remoteConnecting) {
+      const info = await withRemoteNativeDialLock(async () => {
+        // This attempt may have been replaced while it waited behind an older native
+        // dial. In that case it never touched the singleton slot and can just leave.
+        if (!ownsConnection()) return null;
+        let connected: Awaited<ReturnType<typeof ipc.phoneSyncConnect>>;
+        try {
+          connected = await ipc.phoneSyncConnect(qr, verified);
+        } catch (error) {
+          if (ownsConnection()) throw error;
+          // A native invoke may fail after partially installing its singleton slot.
+          // Clean a stale attempt before releasing the dial lock to its replacement.
+          if (abortedRemoteConnectGeneration === connectGeneration) {
+            abortedRemoteConnectGeneration = null;
+          }
+          await ipc.phoneSyncDisconnect().catch(() => {});
+          return null;
+        }
+        if (ownsConnection()) return connected;
+
+        // A replacement dial cannot enter the native call until this lock releases,
+        // so the just-installed slot still belongs to this abandoned attempt and is
+        // safe to close. This prevents a late A from overwriting queued replacement B.
+        if (abortedRemoteConnectGeneration === connectGeneration) {
+          abortedRemoteConnectGeneration = null;
+        }
         await ipc.phoneSyncDisconnect().catch(() => {});
+        return null;
+      });
+      if (info === null) return;
+      // Every await is an ownership boundary: disconnect + reconnect can replace
+      // this attempt while native setup is suspended.
+      if (!ownsConnection()) {
+        await cleanupAbortedConnection();
         return;
       }
       // Subscribe only after a successful dial; route every frame through
       // get().applyFrame so the latest action closure folds against live state.
-      unlistenFrame = await ipc.onPhoneSyncFrame((f) => get().applyFrame(f));
+      unlistenFrame = await ipc.onPhoneSyncFrame((f) => {
+        if (!ownsConnection()) return;
+        get().applyFrame(f);
+      });
+      if (!ownsConnection()) {
+        await cleanupAbortedConnection();
+        return;
+      }
       // Detect an UNEXPECTED drop (desktop closed the channel / network dropped) so
       // the UI can leave the dead session and offer a reconnect. A user-initiated
       // disconnect tears this listener down first, so it can't misfire as a drop.
       unlistenDrop = await ipc.onPhoneSyncDisconnected(() => {
+        if (!ownsConnection()) return;
+        // Invalidate both callbacks first, then unsubscribe only this attempt.
+        currentRemoteConnectGeneration = null;
+        cleanupOwnListeners();
         const queued = pendingRemoteFirstMessage;
         clearPendingRemoteCreate();
         clearRemoteCancelTerminalTimer();
@@ -4276,6 +4396,8 @@ export const useStore = create<AppState>((set, get) => ({
           remoteConnected: false,
           remoteVerified: false,
           remoteDropped: true,
+          remoteUnlisten: null,
+          remoteConnecting: false,
           remoteChatOpen: false,
           creatingSession: false,
           drafts: queued ? { ...st.drafts, [queued.draftId]: queued.body } : st.drafts,
@@ -4290,6 +4412,10 @@ export const useStore = create<AppState>((set, get) => ({
           activeTool: null,
         }));
       });
+      if (!ownsConnection()) {
+        await cleanupAbortedConnection();
+        return;
+      }
       // Remember the desktop across launches (public payload — no secret).
       writeStr("pc.lastPairingQr", qr);
       set({
@@ -4307,19 +4433,25 @@ export const useStore = create<AppState>((set, get) => ({
         remoteError: null,
         remoteDropped: false,
         lastPairingQr: qr,
-        remoteUnlisten: () => {
-          unlistenFrame?.();
-          unlistenDrop?.();
-        },
+        remoteUnlisten: cleanupOwnListeners,
       });
     } catch (err) {
       // A listener may have registered before a later step threw (e.g. the dial
       // succeeded but onPhoneSyncDisconnected rejected). Tear down any partial
       // subscription AND the native session so nothing leaks. phoneSyncDisconnect
       // is idempotent — a no-op when the dial itself failed.
-      unlistenDrop?.();
-      unlistenFrame?.();
+      cleanupOwnListeners();
+      if (!ownsConnection()) {
+        await cleanupAbortedConnection();
+        return;
+      }
       await ipc.phoneSyncDisconnect().catch(() => {});
+      if (!ownsConnection()) {
+        if (abortedRemoteConnectGeneration === connectGeneration) {
+          abortedRemoteConnectGeneration = null;
+        }
+        return;
+      }
       set({
         remoteConnected: false,
         remoteSas: null,
@@ -4329,9 +4461,9 @@ export const useStore = create<AppState>((set, get) => ({
         remoteError: errMessage(err),
       });
     } finally {
-      // Release the re-entry lock whether the dial succeeded or failed, so a later
-      // connect can proceed.
-      set({ remoteConnecting: false });
+      // A stale finally must not make a newer in-flight connect look idle and admit
+      // a third dial.
+      if (ownsConnection()) set({ remoteConnecting: false });
     }
   },
 
@@ -4516,6 +4648,10 @@ export const useStore = create<AppState>((set, get) => ({
     clearRemoteWatchdog(); // user-initiated teardown — the turn is over
     clearSettleTimer();
     const unlisten = get().remoteUnlisten;
+    if (get().remoteConnecting && currentRemoteConnectGeneration !== null) {
+      abortedRemoteConnectGeneration = currentRemoteConnectGeneration;
+    }
+    currentRemoteConnectGeneration = null;
     // Flip the connection flags FIRST, before the async teardown. `remoteConnected`
     // is the routing source of truth for send/stop/resolvePermission, so clearing it
     // up front guarantees no command is dispatched onto the closing channel while
@@ -4532,12 +4668,9 @@ export const useStore = create<AppState>((set, get) => ({
       remoteDropped: false,
       lastPairingQr: null,
       remoteUnlisten: null,
-      // Doubles as an abort sentinel for an in-flight connectRemote dial: a dial that
-      // resolves after this re-reads remoteConnecting, sees false, and bails before
-      // registering its frame/drop listeners (instead of overriding this disconnect
-      // and leaking the about-to-register subscriptions onto a torn-down channel).
-      // connectRemote's own finally clears this in steady state, so this is a no-op
-      // when no dial is in flight.
+      // Release the public re-entry lock synchronously. The generation invalidation
+      // above prevents the abandoned attempt from installing listeners, writing
+      // success/error state, or clearing a replacement attempt's lock.
       remoteConnecting: false,
       remoteChatOpen: false,
       creatingSession: false,
