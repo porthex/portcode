@@ -11,6 +11,13 @@ Rules:
 
 ## Testing & coverage
 
+**Mandatory for every implementation session:** Every behavior-changing code, configuration, installer, workflow, or script change must add or update automated tests in the same change. Bug fixes must include a regression test that exercises the failure when feasible. Do not mark work complete or hand it off until the relevant tests pass.
+
+- Frontend changes require matching `*.test.ts(x)` coverage and a passing `pnpm test:coverage` run.
+- Rust changes require focused inline or integration tests and a passing `cargo test --workspace` run.
+- Script, installer, workflow, and behavioral configuration changes require an appropriate deterministic test or static validation test.
+- Only non-executable documentation, asset-only, formatting-only, or metadata-only changes are exempt. Explicitly state the exemption in the handoff. Behavior-changing code has no test-free exception.
+
 Portcode enforces a **frontend coverage gate on `main`/`release`**: the `Coverage` CI job runs `pnpm test:coverage` against the thresholds in `vitest.config.ts` (statements / lines / functions — branch coverage is intentionally not gated). Coverage on `main`/`release` must stay at or above the threshold, or **`main` goes red**.
 
 When you add or change **frontend** code (`src/`):
