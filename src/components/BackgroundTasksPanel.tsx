@@ -18,6 +18,7 @@ export function BackgroundTasksPanel() {
   if (!tasks || tasks.length === 0) return null;
 
   const running = tasks.filter((t) => t.status === "running").length;
+  const failed = tasks.filter((t) => t.status === "error").length;
 
   return (
     <section
@@ -26,12 +27,16 @@ export function BackgroundTasksPanel() {
     >
       <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 text-[11px] uppercase tracking-wide text-faint">
         <span
-          className={`pc-dot ${running > 0 ? "pc-dot--ring" : "pc-dot--success"}`}
+          className={`pc-dot ${
+            running > 0 ? "pc-dot--ring" : failed > 0 ? "bg-danger" : "pc-dot--success"
+          }`}
           aria-hidden="true"
         />
         {running > 0
           ? `${running} background task${running === 1 ? "" : "s"} running`
-          : `${tasks.length} background task${tasks.length === 1 ? "" : "s"}`}
+          : failed > 0
+            ? `${failed} background task${failed === 1 ? "" : "s"} failed`
+            : `${tasks.length} background task${tasks.length === 1 ? "" : "s"}`}
       </div>
       <ul className="max-h-40 overflow-auto">
         {tasks.map((t) => (

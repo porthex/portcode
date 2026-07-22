@@ -286,6 +286,8 @@ fn batch_cancelled(prev_cancelled: bool, cancel_flag: bool) -> bool {
 /// because the user pressed Stop. Anthropic requires a result for every tool_use,
 /// so we post this (as an error) rather than dropping the block.
 const CANCELLED_TOOL_RESULT: &str = "Cancelled: the user stopped the turn before this tool ran.";
+const CANCELLED_SUBAGENT_RESULT: &str =
+    "Cancelled: the user stopped the subagent before it finished.";
 
 fn system_prompt(workspace: &Path) -> String {
     format!(
@@ -1415,6 +1417,29 @@ fn precheck_outcome(decision: Decision, cancelled_now: bool) -> Option<(&'static
     }
 }
 
+/// Wait for the run-wide permission-prompt lock without making a cancelled
+/// caller wait behind another outstanding prompt. The lock future stays pinned
+/// across polls so a live caller keeps its place in Tokio's fair mutex queue.
+async fn acquire_ask_lock<'a>(
+    ask_lock: &'a tokio::sync::Mutex<()>,
+    cancel: &AtomicBool,
+) -> Option<tokio::sync::MutexGuard<'a, ()>> {
+    let lock = ask_lock.lock();
+    tokio::pin!(lock);
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        tokio::select! {
+            guard = &mut lock => {
+                return (!cancel.load(Ordering::Relaxed)).then_some(guard);
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+    }
+}
+
 /// Gate (when explicitly classified as mutating/protected) and run ONE tool call,
 /// returning `(output, is_error)`. Sets
 /// `*cancelled` if a Stop landed during the gate or right before the tool ran.
@@ -1448,7 +1473,10 @@ async fn gate_and_run(
         // change BEFORE it's written. Permission rules are intentionally read only
         // after this run's prompt lock is acquired: an "Always allow" save can then
         // release one prompt and be observed by every queued sibling/subagent call.
-        let _prompt = ask_lock.lock().await;
+        let Some(_prompt) = acquire_ask_lock(ask_lock, cancel.as_ref()).await else {
+            *cancelled = true;
+            return (CANCELLED_TOOL_RESULT.to_string(), true);
+        };
         let live_rules = live_settings.lock().unwrap().rules.clone();
         permissions::gate(
             sink,
@@ -1550,6 +1578,20 @@ fn subagent_answer(description: &str, final_text: &str, stop_reason: &str) -> St
         )
     } else {
         trimmed.to_string()
+    }
+}
+
+/// Convert a finished child loop into the parent tool's result. Cancellation is
+/// always an error, even if the child produced partial assistant text first.
+fn subagent_result(description: &str, outcome: &LoopOutcome) -> Result<String, String> {
+    if outcome.stop_reason == "cancelled" {
+        Err(CANCELLED_SUBAGENT_RESULT.to_string())
+    } else {
+        Ok(subagent_answer(
+            description,
+            &outcome.final_text,
+            &outcome.stop_reason,
+        ))
     }
 }
 
@@ -1821,17 +1863,19 @@ impl tools::Spawner for AgentSpawner {
         );
         agents::finish(&self.agents, &agent_id);
 
-        // The subagent's final assistant text IS its answer to the launching agent.
+        // Only a completed subagent's final assistant text is an answer. A Stop
+        // must remain a tool error to the parent even if the child emitted partial
+        // text before cancellation. Keep this check after the lifecycle event and
+        // deregistration above so cancelled children still clean up as cancelled.
         let outcome = result?;
-        let answer = subagent_answer(&spec.description, &outcome.final_text, &outcome.stop_reason);
-        Ok(answer)
+        subagent_result(&spec.description, &outcome)
     }
 }
 
 /// Launches and tracks background `run_command` calls. Owns the process lifecycle:
 /// it announces the launch, waits for the child
 /// off-thread, reports completion on the session channel, and registers the
-/// waiter's abort handle so a session Stop can kill it.
+/// waiter's cancellation signal so a session Stop can ask it to cleanly terminate.
 #[derive(Clone)]
 struct BackgroundLauncher {
     sink: Arc<dyn EventSink>,
@@ -1847,8 +1891,7 @@ struct BackgroundLauncher {
 /// Keeps both halves of background receipt state balanced on every exit path.
 /// Normal process completion closes the opaque interval as observed; waiter
 /// failure or cancellation drops the token as uncertain. In either case the
-/// running counter is decremented, including when a session Stop aborts the
-/// waiter future before its body reaches explicit cleanup.
+/// running counter is decremented before the terminal event is emitted.
 struct BackgroundReceiptGuard {
     tracker: Arc<crate::turn_receipt::TurnReceiptTracker>,
     mutation: Option<crate::turn_receipt::MutationToken>,
@@ -1884,42 +1927,29 @@ impl Drop for BackgroundReceiptGuard {
         }
         // Dropping an unfinished token records may-have-mutated before the
         // background counter closes. This is the conservative outcome for a
-        // failed wait or an aborted/kill-on-drop process.
+        // failed wait or a cancelled process.
         drop(self.mutation.take());
         self.tracker.background_finished();
         self.running = false;
     }
 }
 
-/// Spawn a background task's off-thread waiter and register it (so a session-wide
-/// Stop can abort it) such that the registry entry is inserted BEFORE the waiter's
-/// `body` is allowed to run. Without this ordering a body that finishes instantly
-/// (a fast command) could call `background::finish` — a map remove — before the
-/// matching `background::register` insert lands, leaving a stale entry that nothing
-/// ever removes (the waiter has already exited). `body` performs the work — wait
-/// for the child, report completion — and MUST end by calling
-/// `background::finish(bg, id)`.
-fn spawn_background_task<F>(
+/// Register a background task before spawning its off-thread waiter. The body
+/// receives the registry's one-shot cancellation signal. This ordering prevents a
+/// fast body from removing its entry before the matching insert lands. The body
+/// MUST clean up its receipt, emit its terminal event, and then deregister itself.
+fn spawn_background_task<F, Fut>(
     bg: &background::Background,
     id: &str,
     session_id: &str,
     command: &str,
     body: F,
 ) where
-    F: std::future::Future<Output = ()> + Send + 'static,
+    F: FnOnce(background::Cancellation) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    // A one-shot gate: the waiter blocks at `notified()` until we release it AFTER
-    // registering. `notify_one()` stores a permit even when it runs before the
-    // waiter reaches `notified()`, so the gate is race-free regardless of which
-    // side (caller vs. spawned waiter) gets there first.
-    let registered = Arc::new(tokio::sync::Notify::new());
-    let gate = registered.clone();
-    let handle = tokio::spawn(async move {
-        gate.notified().await;
-        body.await;
-    });
-    background::register(bg, id, session_id, command, handle.abort_handle());
-    registered.notify_one();
+    let cancelled = background::register(bg, id, session_id, command);
+    tokio::spawn(body(cancelled));
 }
 
 impl tools::BackgroundRunner for BackgroundLauncher {
@@ -1945,25 +1975,28 @@ impl tools::BackgroundRunner for BackgroundLauncher {
         let channel = self.session_channel.clone();
         let task_id = id.clone();
         let task_command = command.clone();
-        // The waiter owns the child (kill_on_drop), so aborting this task kills the
-        // process — which is exactly what `background::cancel_session` does on Stop.
-        // `spawn_background_task` registers the entry BEFORE this body can run, so a
-        // command that finishes instantly can't remove its entry before the matching
-        // insert lands (which would otherwise leak a stale registry entry).
+        // The waiter owns child cleanup and is explicitly signalled by session Stop.
+        // Registration lands before this body can run, so a fast command cannot
+        // remove its entry before the matching insert.
         spawn_background_task(
             &self.background,
             &id,
             &self.session_id,
             &command,
-            async move {
+            move |cancelled| async move {
                 let (exit_code, output, wait_observed) =
-                    match tools::wait_with_bounded_output(child).await {
+                    match tools::wait_for_background_child(child, cancelled).await {
                         Ok(out) => (
                             out.status.code().unwrap_or(-1),
                             tools::format_bounded_shell_output(&out),
                             true,
                         ),
-                        Err(e) => (-1, format!("background command failed: {e}"), false),
+                        Err(tools::BackgroundWaitError::Cancelled) => {
+                            (-1, "Background command cancelled.".to_string(), false)
+                        }
+                        Err(tools::BackgroundWaitError::Failed(error)) => {
+                            (-1, format!("background command failed: {error}"), false)
+                        }
                     };
                 if wait_observed {
                     receipt.finish_observed();
@@ -1994,13 +2027,14 @@ mod tests {
     use super::{
         admit_run, assistant_text, background, batch_cancelled, canonicalize_tool_history,
         child_can_spawn, derive_title, ensure_openai_account_unchanged, finish_status,
-        is_terminal_auth_error, make_receipt_non_reviewable, precheck_outcome, reassemble_results,
-        resolve_system_prompt, run_loop_core, session_of, spawn_background_task, spawn_status,
-        step_limit_exceeded, subagent_answer, subagent_label, tool_result_block, tool_result_event,
-        AgentConfig, AgentSpawner, Block, Cancels, ChatMessage, Db, Decision, LoopOutcome,
+        gate_and_run, is_terminal_auth_error, make_receipt_non_reviewable, precheck_outcome,
+        reassemble_results, resolve_system_prompt, run_loop_core, session_of,
+        spawn_background_task, spawn_status, step_limit_exceeded, subagent_answer, subagent_label,
+        subagent_result, tool_result_block, tool_result_event, AgentConfig, AgentSpawner,
+        BackgroundLauncher, Block, Cancels, ChatMessage, Db, Decision, LoopOutcome,
         OpenAiRefreshTransport, OpenAiRunAuth, Persist, RunAuthContext, RunReservation,
-        StreamEvent, CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS, MAX_PARALLEL_AGENTS,
-        MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
+        StreamEvent, CANCELLED_SUBAGENT_RESULT, CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS,
+        MAX_PARALLEL_AGENTS, MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
     };
     use crate::events::EventSink;
     use crate::llm::{LlmProvider, OpenAiProvider};
@@ -2010,7 +2044,7 @@ mod tests {
     use crate::secrets::{Credential, OpenAiOAuthTokens, SecretStore, SecretStoreError};
     use crate::settings::Settings;
     use crate::tool_names;
-    use crate::tools::ToolCtx;
+    use crate::tools::{BackgroundRunner, ToolCtx};
     use portcode_sync::wire::{
         TurnChangeCertainty, TurnChangeState, TurnChangedFile, TurnFileStatus, TurnReceipt,
         TurnStatus,
@@ -2018,9 +2052,10 @@ mod tests {
     use serde_json::Value;
     use std::collections::{BTreeMap, HashMap};
     use std::path::{Path, PathBuf};
+    use std::process::Stdio;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -2239,6 +2274,20 @@ mod tests {
 
     impl EventSink for IsolationSink {
         fn emit(&self, _channel: &str, _event: StreamEvent) {}
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<(String, StreamEvent)>>,
+    }
+
+    impl EventSink for RecordingSink {
+        fn emit(&self, channel: &str, event: StreamEvent) {
+            self.events
+                .lock()
+                .unwrap()
+                .push((channel.to_string(), event));
+        }
     }
 
     fn request_prompt(body: &Value) -> Option<String> {
@@ -3185,16 +3234,22 @@ mod tests {
         let seen_body = seen_registered.clone();
         let id = "task-1".to_string();
         let id_body = id.clone();
-        spawn_background_task(&bg, &id, "sess-1", "echo hi", async move {
-            // The gate guarantees the entry is registered before we get here — even
-            // though this body does no real awaiting before finishing.
-            seen_body.store(
-                bg_body.lock().unwrap().contains_key(&id_body),
-                Ordering::SeqCst,
-            );
-            background::finish(&bg_body, &id_body);
-            let _ = tx.send(());
-        });
+        spawn_background_task(
+            &bg,
+            &id,
+            "sess-1",
+            "echo hi",
+            move |_cancelled| async move {
+                // The gate guarantees the entry is registered before we get here — even
+                // though this body does no real awaiting before finishing.
+                seen_body.store(
+                    bg_body.lock().unwrap().contains_key(&id_body),
+                    Ordering::SeqCst,
+                );
+                background::finish(&bg_body, &id_body);
+                let _ = tx.send(());
+            },
+        );
 
         rx.await.unwrap();
         assert!(
@@ -3205,6 +3260,207 @@ mod tests {
             bg.lock().unwrap().is_empty(),
             "no stale entry may leak after the body finishes"
         );
+    }
+
+    #[cfg(any(windows, unix))]
+    #[tokio::test]
+    async fn cancelling_background_child_reaps_emits_once_and_balances_receipt() {
+        let workspace = std::env::temp_dir().join(format!(
+            "portcode-background-cancel-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = crate::process_env::hidden_command("ping.exe");
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = tokio::process::Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        command
+            .current_dir(&workspace)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let child = command
+            .spawn()
+            .expect("long-running background child starts");
+
+        let sink = Arc::new(RecordingSink::default());
+        let bg = background::new();
+        let tracker = crate::turn_receipt::TurnReceiptTracker::new_with_account(
+            "background-cancel".into(),
+            crate::db::now_ms(),
+            Instant::now(),
+            workspace.clone(),
+            None,
+        );
+        let launcher = BackgroundLauncher {
+            sink: sink.clone(),
+            background: bg.clone(),
+            session_channel: "agent://background-test".into(),
+            session_id: "background-test".into(),
+            receipt_tracker: tracker.clone(),
+        };
+        let command_label = "long-running test child".to_string();
+        let id = launcher.launch(command_label.clone(), child, Some(tracker.begin_opaque()));
+
+        assert!(background::has_session(&bg, "background-test"));
+        assert_eq!(background::cancel_session(&bg, "background-test"), 1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let finished = sink.events.lock().unwrap().iter().any(|(_, event)| {
+                    matches!(event, StreamEvent::BackgroundTaskFinished { id: event_id, .. } if event_id == &id)
+                });
+                if finished && !background::has_session(&bg, "background-test") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Stop must reap the child, emit a terminal event, and deregister");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let events = sink.events.lock().unwrap().clone();
+        assert!(events.iter().any(|(channel, event)| {
+            channel == "agent://background-test"
+                && matches!(
+                    event,
+                    StreamEvent::BackgroundTaskStarted { id: event_id, command }
+                        if event_id == &id && command == &command_label
+                )
+        }));
+        let terminal = events
+            .iter()
+            .filter_map(|(channel, event)| match event {
+                StreamEvent::BackgroundTaskFinished {
+                    id: event_id,
+                    command,
+                    exit_code,
+                    output,
+                } if event_id == &id => Some((channel, command, exit_code, output)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 1, "cancellation emits exactly one finish");
+        assert_eq!(terminal[0].0, "agent://background-test");
+        assert_eq!(terminal[0].1, &command_label);
+        assert_eq!(*terminal[0].2, -1);
+        assert_eq!(terminal[0].3, "Background command cancelled.");
+
+        let (checkpoint, _) =
+            tracker.seal_agent_outcome(TurnStatus::Cancelled, Some("cancelled".into()));
+        assert!(
+            !checkpoint.background_tasks_running,
+            "cancellation must balance the receipt's running counter before finish"
+        );
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[cfg(windows)]
+    fn encoded_background_powershell(script: &str) -> String {
+        use base64::Engine as _;
+
+        let bytes = script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn background_cancel_kills_descendant_before_terminal_event() {
+        let workspace = std::env::temp_dir().join(format!(
+            "portcode-background-descendant-cancel-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let ready = workspace.join("descendant-ready.txt");
+        let sentinel = workspace.join("descendant-survived.txt");
+        let ready_path = ready.to_string_lossy().replace('\'', "''");
+        let sentinel_path = sentinel.to_string_lossy().replace('\'', "''");
+
+        let child_script = format!(
+            "Start-Sleep -Milliseconds 1200; [IO.File]::WriteAllText('{sentinel_path}', 'survived')"
+        );
+        let child_script = encoded_background_powershell(&child_script);
+        let root_script = format!(
+            "$child = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand','{child_script}') -WindowStyle Hidden -PassThru; \
+             [IO.File]::WriteAllText('{ready_path}', [string]$child.Id); \
+             Wait-Process -Id $child.Id"
+        );
+        let root_script = encoded_background_powershell(&root_script);
+        let mut command = crate::process_env::hidden_command("powershell.exe");
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &root_script,
+            ])
+            .current_dir(&workspace)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let child = command.spawn().expect("root PowerShell starts");
+
+        let sink = Arc::new(RecordingSink::default());
+        let bg = background::new();
+        let tracker = crate::turn_receipt::TurnReceiptTracker::new_with_account(
+            "background-descendant-cancel".into(),
+            crate::db::now_ms(),
+            Instant::now(),
+            workspace.clone(),
+            None,
+        );
+        let launcher = BackgroundLauncher {
+            sink: sink.clone(),
+            background: bg.clone(),
+            session_channel: "agent://background-descendant-test".into(),
+            session_id: "background-descendant-test".into(),
+            receipt_tracker: tracker,
+        };
+        let id = launcher.launch("descendant test".into(), child, None);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant did not publish readiness");
+        assert_eq!(
+            background::cancel_session(&bg, "background-descendant-test"),
+            1
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let finished = sink.events.lock().unwrap().iter().any(|(_, event)| {
+                    matches!(event, StreamEvent::BackgroundTaskFinished { id: event_id, .. } if event_id == &id)
+                });
+                if finished && !background::has_session(&bg, "background-descendant-test") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("tree cancellation must emit and deregister within the bound");
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !sentinel.exists(),
+            "a background descendant survived Stop and wrote after cancellation"
+        );
+        std::fs::remove_dir_all(workspace).ok();
     }
 
     #[test]
@@ -3286,6 +3542,20 @@ mod tests {
         assert!(note.contains("without a text summary"));
         assert!(note.contains("audit deps"));
         assert!(note.contains("cancelled"));
+    }
+
+    #[test]
+    fn cancelled_subagent_is_a_tool_error_even_with_partial_text() {
+        let outcome = LoopOutcome {
+            stop_reason: "cancelled".into(),
+            final_text: "partial work that must not look successful".into(),
+        };
+
+        assert_eq!(
+            subagent_result("audit deps", &outcome),
+            Err(CANCELLED_SUBAGENT_RESULT.to_string())
+        );
+        assert_eq!(spawn_status(&Ok(outcome)), "cancelled");
     }
 
     #[test]
@@ -3493,6 +3763,54 @@ mod tests {
             assert!(is_error);
             assert!(!sets_cancelled);
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_call_does_not_wait_for_a_held_permission_prompt_lock() {
+        let settings = Settings::default();
+        let live_settings = Arc::new(Mutex::new(settings.clone()));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let ask_lock = tokio::sync::Mutex::new(());
+        let held_prompt = ask_lock.lock().await;
+        let registry = crate::tools::default_registry();
+        let tool = registry
+            .find(tool_names::RUN_COMMAND)
+            .expect("the default registry includes run_command");
+        let ctx = ToolCtx::new(std::env::temp_dir());
+        let input = serde_json::json!({ "command": "must-not-run" });
+        let mut cancelled = false;
+
+        let call = gate_and_run(
+            &IsolationSink,
+            "agent://queued-cancel",
+            &settings,
+            &live_settings,
+            &pending,
+            &cancel,
+            &ask_lock,
+            tool,
+            &ctx,
+            &input,
+            &mut cancelled,
+        );
+        let stop = async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            cancel.store(true, Ordering::Relaxed);
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(call, stop)
+        })
+        .await
+        .expect("cancellation must release a caller still queued behind ask_lock");
+
+        assert_eq!(result, (CANCELLED_TOOL_RESULT.to_string(), true));
+        assert!(cancelled);
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "a cancelled queued caller must not open a second permission prompt"
+        );
+        drop(held_prompt);
     }
 
     #[test]

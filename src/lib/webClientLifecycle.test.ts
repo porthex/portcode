@@ -121,7 +121,10 @@ const flush = () => Promise.resolve();
 
 describe("startWebClientLifecycle — reconnect on resume", () => {
   it("reconnects on resume when there is a remembered QR and no live session", async () => {
-    const { store, reconnectRemote } = makeFakeStore({ lastPairingQr: "QR-1" });
+    const { store, reconnectRemote, set } = makeFakeStore({ lastPairingQr: "QR-1" });
+    reconnectRemote.mockImplementation(async () => {
+      set({ remoteConnected: true, remoteVerified: true });
+    });
     const storage = makeFakeStorage();
     const w = makeWatchStub();
     const t = makeTimerStub();
@@ -137,6 +140,57 @@ describe("startWebClientLifecycle — reconnect on resume", () => {
     w.resume();
     await flush();
     expect(reconnectRemote).toHaveBeenCalledTimes(1);
+    expect(t.scheduled).toHaveLength(0);
+    stop();
+  });
+
+  it("backs off and retries when reconnect resolves but remains disconnected", async () => {
+    const { store, reconnectRemote } = makeFakeStore({ lastPairingQr: "QR-1" });
+    const w = makeWatchStub();
+    const t = makeTimerStub();
+    const stop = startWebClientLifecycle({
+      store,
+      storage: makeFakeStorage(),
+      watch: w.watch,
+      setTimeoutFn: t.setTimeoutFn,
+      clearTimeoutFn: t.clearTimeoutFn,
+    });
+
+    w.resume();
+    await flush();
+    await flush();
+    expect(reconnectRemote).toHaveBeenCalledTimes(1);
+    expect(t.scheduled).toHaveLength(1);
+
+    t.scheduled[0].cb();
+    await flush();
+    await flush();
+    expect(reconnectRemote).toHaveBeenCalledTimes(2);
+    expect(t.scheduled).toHaveLength(2);
+    stop();
+  });
+
+  it("backs off when reconnect resolves connected but still unverified", async () => {
+    const { store, reconnectRemote } = makeFakeStore({
+      lastPairingQr: "QR-1",
+      remoteConnected: true,
+      remoteVerified: false,
+    });
+    const w = makeWatchStub();
+    const t = makeTimerStub();
+    const stop = startWebClientLifecycle({
+      store,
+      storage: makeFakeStorage(),
+      watch: w.watch,
+      setTimeoutFn: t.setTimeoutFn,
+      clearTimeoutFn: t.clearTimeoutFn,
+    });
+
+    w.resume();
+    await flush();
+    await flush();
+    expect(reconnectRemote).toHaveBeenCalledTimes(1);
+    expect(t.scheduled).toHaveLength(1);
     stop();
   });
 
@@ -162,6 +216,67 @@ describe("startWebClientLifecycle — reconnect on resume", () => {
     stop();
   });
 
+  it("forces one fresh reconnect after hide even when stale flags still look live", async () => {
+    const { store, reconnectRemote } = makeFakeStore({
+      lastPairingQr: "QR-1",
+      remoteConnected: true,
+      remoteVerified: true,
+    });
+    const w = makeWatchStub();
+    const t = makeTimerStub();
+    const stop = startWebClientLifecycle({
+      store,
+      storage: makeFakeStorage(),
+      watch: w.watch,
+      setTimeoutFn: t.setTimeoutFn,
+      clearTimeoutFn: t.clearTimeoutFn,
+    });
+
+    w.hide();
+    w.resume();
+    await flush();
+    expect(reconnectRemote).toHaveBeenCalledTimes(1);
+
+    // The hide marker was consumed by the fresh verified dial. A normal duplicate
+    // resume (e.g. pageshow after visibilitychange) must remain a no-op.
+    w.resume();
+    await flush();
+    expect(reconnectRemote).toHaveBeenCalledTimes(1);
+    expect(t.scheduled).toHaveLength(0);
+    stop();
+  });
+
+  it("keeps forcing a fresh socket when the first post-hide reconnect rejects", async () => {
+    const { store, reconnectRemote } = makeFakeStore({
+      lastPairingQr: "QR-1",
+      remoteConnected: true,
+      remoteVerified: true,
+    });
+    reconnectRemote.mockRejectedValue(new Error("desktop still asleep"));
+    const w = makeWatchStub();
+    const t = makeTimerStub();
+    const stop = startWebClientLifecycle({
+      store,
+      storage: makeFakeStorage(),
+      watch: w.watch,
+      setTimeoutFn: t.setTimeoutFn,
+      clearTimeoutFn: t.clearTimeoutFn,
+    });
+
+    w.hide();
+    w.resume();
+    await flush();
+    await flush();
+    expect(reconnectRemote).toHaveBeenCalledTimes(1);
+    expect(t.scheduled).toHaveLength(1);
+
+    t.scheduled[0].cb();
+    await flush();
+    await flush();
+    expect(reconnectRemote).toHaveBeenCalledTimes(2);
+    stop();
+  });
+
   it("does NOT reconnect on resume when there is no remembered desktop", async () => {
     const { store, reconnectRemote } = makeFakeStore({ lastPairingQr: null });
     const w = makeWatchStub();
@@ -180,7 +295,7 @@ describe("startWebClientLifecycle — reconnect on resume", () => {
     stop();
   });
 
-  it("does NOT dial when a connect is already in flight (remoteConnecting)", async () => {
+  it("does not stack a dial while one is in flight, but keeps a retry pending", async () => {
     const { store, reconnectRemote } = makeFakeStore({
       lastPairingQr: "QR-1",
       remoteConnecting: true,
@@ -197,8 +312,9 @@ describe("startWebClientLifecycle — reconnect on resume", () => {
 
     w.resume();
     await flush();
-    // The controller started but its connect() short-circuits (resolves) without dialing.
+    await flush();
     expect(reconnectRemote).not.toHaveBeenCalled();
+    expect(t.scheduled).toHaveLength(1);
     stop();
   });
 

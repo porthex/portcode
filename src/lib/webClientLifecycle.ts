@@ -246,21 +246,46 @@ export function startWebClientLifecycle(opts: WebClientLifecycleOptions = {}): (
   }
 
   // ── Reconnect-on-resume ───────────────────────────────────────────────────────
+  // A browser can freeze JS before the socket's drop callback updates the store.
+  // Remember that boundary explicitly: the first resume after a hide must re-dial
+  // even when remoteConnected/remoteVerified are stale `true`. We consume the flag
+  // when the forced dial STARTS (not after its await), so a second hide during that
+  // await cannot be erased by the older attempt settling late.
+  let needsFreshSocketAfterHide = false;
+
   // The connect attempt the controller drives: re-dial the remembered desktop, but
   // only when there IS a remembered desktop and we are not already live/connecting.
-  // Resolves (no-op success) when there's nothing to do, so the controller idles.
+  // A dial is successful only when the resulting store state is live AND verified;
+  // reconnectRemote intentionally swallows transport errors, so checking its resolved
+  // state here is what keeps the controller backing off after a silent failure.
   const controller = createReconnectController({
     connect: async () => {
       const s = store.getState();
       const qr = s.lastPairingQr ?? rememberedQr;
-      // Nothing remembered, or a session is already live / a dial is in flight →
-      // nothing to reconnect. Resolve so the controller stops retrying.
-      if (!qr || isVerifiedLive(s) || s.remoteConnecting) return;
+      // Nothing remembered, or an ordinary resume found a verified live session →
+      // nothing to reconnect. A post-hide resume deliberately bypasses the live check.
+      if (!qr || (!needsFreshSocketAfterHide && isVerifiedLive(s))) return;
+      // Another dial may have begun outside this controller. Keep the retry loop alive
+      // so it can verify that outcome (or re-dial after it fails) without stacking dials.
+      if (s.remoteConnecting) throw new Error("Remote reconnect is already in progress");
       // Ensure the QR is in the store before dialing: `reconnectRemote()` reads only
       // `store.lastPairingQr`, so on a cold launch where it's still empty (and the QR
       // came from the durable `rememberedQr`), hydrate it first or the dial no-ops.
       if (!s.lastPairingQr) s.hydrateRememberedQr(qr);
-      await store.getState().reconnectRemote();
+
+      const forcedAfterHide = needsFreshSocketAfterHide;
+      needsFreshSocketAfterHide = false;
+      try {
+        await store.getState().reconnectRemote();
+      } catch (error) {
+        // A rejected forced dial did not replace the stale socket. Retain the force
+        // requirement so the backoff retry cannot accept stale live flags as success.
+        if (forcedAfterHide) needsFreshSocketAfterHide = true;
+        throw error;
+      }
+      if (!isVerifiedLive(store.getState())) {
+        throw new Error("Remote reconnect resolved without a verified live session");
+      }
     },
     setTimeoutFn: opts.setTimeoutFn,
     clearTimeoutFn: opts.clearTimeoutFn,
@@ -273,11 +298,14 @@ export function startWebClientLifecycle(opts: WebClientLifecycleOptions = {}): (
       if (typeof navigator !== "undefined" && "onLine" in navigator) {
         store.getState().setOnline(navigator.onLine);
       }
-      // Only kick the reconnect loop if there's a remembered desktop and we're not
-      // already live. start() is idempotent while running, so repeated resume signals
-      // (visible + pageshow firing together) don't stack dials.
+      // Only kick the reconnect loop if there's a remembered desktop and the session
+      // is absent/unverified, OR a preceding hide made even live-looking flags stale.
+      // start() is idempotent while running, so repeated resume signals (visible +
+      // pageshow firing together) don't stack dials.
       const s = store.getState();
-      if ((s.lastPairingQr ?? rememberedQr) && !isVerifiedLive(s)) controller.start();
+      if ((s.lastPairingQr ?? rememberedQr) && (needsFreshSocketAfterHide || !isVerifiedLive(s))) {
+        controller.start();
+      }
     },
     onHide: () => {
       // We're being suspended; the socket is as good as dead. We don't proactively
@@ -285,6 +313,7 @@ export function startWebClientLifecycle(opts: WebClientLifecycleOptions = {}): (
       // side on its timeout) — but we stop any in-flight reconnect loop so it can't
       // burn retries against a frozen JS context, and a resume will restart it fresh.
       controller.stop();
+      needsFreshSocketAfterHide = true;
     },
   });
 
