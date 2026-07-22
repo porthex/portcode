@@ -4235,6 +4235,43 @@ button.pc-turn-receipt__strip:focus-visible {
 }
 
 /* =========================================================================
+   RESIZABLE EXPLORER SPLITTERS
+   A nine-pixel hit area surrounds a quiet one-pixel divider. The control spans
+   the panel edge so it remains easy to catch without adding visible chrome.
+   ========================================================================= */
+.pc-panel-resizer {
+  position: absolute;
+  z-index: 35;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 9px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.pc-panel-resizer > span {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 2px;
+  background: transparent;
+  transition:
+    background-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+.pc-panel-resizer:hover > span,
+.pc-panel-resizer:focus-visible > span {
+  background: var(--color-accent-2);
+  box-shadow: 0 0 10px rgba(33, 230, 255, 0.72);
+}
+.pc-panel-resizer:focus-visible {
+  outline: 1px solid rgba(33, 230, 255, 0.72);
+  outline-offset: -3px;
+  box-shadow: none;
+}
+
+/* =========================================================================
    COMPOSER — drafting cockpit + state-bearing perimeter
    ========================================================================= */
 .pc-composer-dock {

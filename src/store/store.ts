@@ -162,6 +162,13 @@ export interface UpdateState {
 
 const IDLE_UPDATE: UpdateState = { phase: "idle", info: null, progress: null, error: null };
 
+interface TranscriptScrollRequest {
+  id: string;
+  sessionId: string;
+  kind: "latest" | "newTurn";
+  targetMessageId?: string;
+}
+
 interface AppState {
   sessions: Session[];
   activeId: string | null;
@@ -247,6 +254,10 @@ interface AppState {
   // The message a ⌘K search result asked to reveal; the Chat transcript scrolls it
   // into view, then clears it (see jumpToMessage / clearScrollTarget). Null at rest.
   scrollTargetId: string | null;
+  // One-shot navigation intent for transcript positioning. Session selection asks
+  // for the latest message; an accepted send asks Chat to place that new user turn
+  // at the top with a response runway beneath it.
+  transcriptScrollRequest: TranscriptScrollRequest | null;
   crashReporting: boolean | null; // opt-in crash/error reporting; null = not yet asked (show first-run prompt)
   cancel: (() => Promise<void>) | null;
   pendingPermission: PendingPermission | null;
@@ -319,6 +330,7 @@ interface AppState {
   searchMessages: (query: string) => Promise<SearchHit[]>;
   jumpToMessage: (sessionId: string, messageId: string) => Promise<void>;
   clearScrollTarget: () => void;
+  clearTranscriptScrollRequest: (id: string) => void;
   setAmbientRain: (v: boolean) => void;
   setScanlines: (v: boolean) => void;
   setUiScale: (n: number) => void;
@@ -1454,6 +1466,7 @@ export const useStore = create<AppState>((set, get) => ({
   composerPhase: "idle",
   activeTool: null,
   scrollTargetId: null,
+  transcriptScrollRequest: null,
   crashReporting: readTriPref("pc.crashReporting"),
   cancel: null,
   pendingPermission: null,
@@ -2000,6 +2013,7 @@ export const useStore = create<AppState>((set, get) => ({
         drafts,
         showSidebar: false, // close the mobile drawer on navigation
         runs,
+        transcriptScrollRequest: { id: uid(), sessionId: id, kind: "latest" },
         ...projectActiveRun({ activeId: id, runs }),
       };
     });
@@ -2061,6 +2075,10 @@ export const useStore = create<AppState>((set, get) => ({
 
   clearScrollTarget() {
     set({ scrollTargetId: null });
+  },
+
+  clearTranscriptScrollRequest(id) {
+    set((st) => (st.transcriptScrollRequest?.id === id ? { transcriptScrollRequest: null } : {}));
   },
 
   async deleteSession(id) {
@@ -2569,6 +2587,12 @@ export const useStore = create<AppState>((set, get) => ({
         messages: {
           ...st.messages,
           [activeId]: [...msgs, userMsg, assistant],
+        },
+        transcriptScrollRequest: {
+          id: uid(),
+          sessionId: activeId,
+          kind: "newTurn",
+          targetMessageId: userMsg.id,
         },
         // Each turn's agents panel starts empty; this turn's subagents repopulate it.
         agents: { ...st.agents, [activeId]: [] },
@@ -4375,6 +4399,12 @@ export const useStore = create<AppState>((set, get) => ({
               userMsg,
               ...(assistant ? [assistant] : []),
             ],
+          },
+          transcriptScrollRequest: {
+            id: uid(),
+            sessionId: session_id,
+            kind: "newTurn",
+            targetMessageId: userMsg.id,
           },
         };
       });

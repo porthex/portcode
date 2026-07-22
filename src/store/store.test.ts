@@ -1234,11 +1234,18 @@ describe("selectSession", () => {
     await useStore.getState().selectSession("b");
     expect(useStore.getState().activeId).toBe("b");
     expect(useStore.getState().messages["b"]).toEqual([msg]);
+    expect(useStore.getState().transcriptScrollRequest).toMatchObject({
+      sessionId: "b",
+      kind: "latest",
+    });
+    const firstRequestId = useStore.getState().transcriptScrollRequest?.id;
 
-    // Cached now — a re-select must not refetch.
+    // Cached now — a re-select must not refetch, but it must issue a fresh Latest
+    // request so clicking the active row still returns the viewport to the bottom.
     m.getMessages.mockClear();
     await useStore.getState().selectSession("b");
     expect(m.getMessages).not.toHaveBeenCalled();
+    expect(useStore.getState().transcriptScrollRequest?.id).not.toBe(firstRequestId);
   });
 
   it("commits selection + cold loading state before history resolves", async () => {
@@ -1720,6 +1727,11 @@ describe("send", () => {
     expect(st.streaming).toBe(true);
     expect(st.messages.a).toHaveLength(2);
     expect(st.messages.a[0].role).toBe("user");
+    expect(st.transcriptScrollRequest).toMatchObject({
+      sessionId: "a",
+      kind: "newTurn",
+      targetMessageId: st.messages.a[0].id,
+    });
     expect(st.sessions[0].title).toBe("Refactor the parser"); // derived from first message
     expect(m.runAgent).toHaveBeenCalledWith("a", "Refactor the parser", expect.any(Function));
 
@@ -2327,6 +2339,11 @@ describe("send", () => {
       role: "assistant",
       turnId: expect.any(String),
       blocks: [],
+    });
+    expect(st.transcriptScrollRequest).toMatchObject({
+      sessionId: "a",
+      kind: "newTurn",
+      targetMessageId: st.messages.a[0].id,
     });
   });
 

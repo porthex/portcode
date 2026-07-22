@@ -498,6 +498,97 @@ describe("Chat children", () => {
   });
 });
 
+describe("Chat session and new-turn positioning", () => {
+  it("jumps to the latest message before paint when the active session changes", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session({ id: "s1" }), session({ id: "s2" })],
+      messages: { s1: [userMessage("a1", "first session")] },
+      streaming: false,
+    });
+    render(<Chat />);
+    const scroller = screen.getByTestId("chat-transcript-scroll");
+    Object.defineProperty(scroller, "scrollHeight", { value: 1200, configurable: true });
+    scroller.scrollTop = 40;
+
+    act(() =>
+      useStore.setState({
+        activeId: "s2",
+        messages: {
+          ...useStore.getState().messages,
+          s2: [userMessage("b1", "older"), userMessage("b2", "latest")],
+        },
+      }),
+    );
+
+    expect(scroller.scrollTop).toBe(1200);
+    expect(screen.getByText("latest")).toBeInTheDocument();
+  });
+
+  it("reselecting the active session requests Latest again", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "one"), userMessage("m2", "two")] },
+      streaming: false,
+    });
+    render(<Chat />);
+    const scroller = screen.getByTestId("chat-transcript-scroll");
+    Object.defineProperty(scroller, "scrollHeight", { value: 800, configurable: true });
+    scroller.scrollTop = 100;
+
+    act(() =>
+      useStore.setState({
+        transcriptScrollRequest: { id: "latest-1", sessionId: "s1", kind: "latest" },
+      }),
+    );
+
+    expect(scroller.scrollTop).toBe(800);
+    expect(useStore.getState().transcriptScrollRequest).toBeNull();
+  });
+
+  it("moves a newly sent user turn to the top with a viewport-height runway", () => {
+    const assistant: Message = {
+      id: "assistant-new",
+      role: "assistant",
+      blocks: [],
+      createdAt: 3,
+      turnId: "turn-new",
+    };
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("old", "old context")] },
+      streaming: false,
+    });
+    render(<Chat />);
+    const scroller = screen.getByTestId("chat-transcript-scroll");
+    Object.defineProperty(scroller, "clientHeight", { value: 300, configurable: true });
+    Object.defineProperty(scroller, "scrollHeight", { value: 900, configurable: true });
+
+    const nextUser = { ...userMessage("new-user", "new prompt"), turnId: "turn-new" };
+    act(() =>
+      useStore.setState({
+        messages: { s1: [userMessage("old", "old context"), nextUser, assistant] },
+        streaming: true,
+        transcriptScrollRequest: {
+          id: "new-turn-1",
+          sessionId: "s1",
+          kind: "newTurn",
+          targetMessageId: "new-user",
+        },
+      }),
+    );
+
+    const currentTurn = screen.getByTestId("chat-current-turn");
+    expect(currentTurn).toHaveStyle({ minHeight: "252px" });
+    expect(currentTurn).toContainElement(screen.getByText("new prompt"));
+    expect(currentTurn).not.toContainElement(screen.getByText("old context"));
+    expect(scroller.scrollTop).toBe(900);
+    expect(useStore.getState().transcriptScrollRequest).toBeNull();
+  });
+});
+
 describe("Chat scroll-to-search-result", () => {
   const origScroll = Element.prototype.scrollIntoView;
   afterEach(() => {
