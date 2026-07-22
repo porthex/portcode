@@ -836,14 +836,15 @@ const patchBackgroundTasks = (
   [sessionId]: fn(tasks[sessionId] ?? []),
 });
 
-// Add a newly-started task, preserving launch order; replace on a duplicate id
-// (defensive against a re-delivered started event) rather than listing it twice.
+// Add a newly-started task, preserving launch order. A duplicate start may refresh
+// a still-running row, but it must never regress an already-terminal task back to
+// running when lifecycle events are replayed or delivered out of order.
 const startBackgroundTask = (
   list: BackgroundTaskInfo[],
   info: BackgroundTaskInfo,
 ): BackgroundTaskInfo[] =>
   list.some((t) => t.id === info.id)
-    ? list.map((t) => (t.id === info.id ? info : t))
+    ? list.map((t) => (t.id === info.id && t.status === "running" ? info : t))
     : [...list, info];
 
 // Fold one background-task StreamEvent into a session's task list. Shared by the

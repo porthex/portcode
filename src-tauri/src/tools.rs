@@ -1090,6 +1090,20 @@ fn default_shell() -> &'static str {
     "powershell"
 }
 
+#[cfg(windows)]
+const POWERSHELL_LEADING_ARGS: &[&str] = &[
+    "-NoProfile",
+    "-NonInteractive",
+    // Windows package managers commonly install both `.ps1` and `.cmd` shims.
+    // PowerShell prefers the script shim, so a machine with the default Restricted
+    // policy otherwise rejects ordinary commands such as `npm`, `pnpm`, and `npx`.
+    // This override is process-scoped; centrally managed MachinePolicy/UserPolicy
+    // still wins, and the shell tool's existing permission boundary is unchanged.
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+];
+
 #[cfg(not(windows))]
 fn default_shell() -> &'static str {
     "sh"
@@ -1111,18 +1125,13 @@ fn shell_invocation(shell: &str) -> Result<(PathBuf, &'static [&'static str]), S
                 .join("WindowsPowerShell")
                 .join("v1.0")
                 .join("powershell.exe"),
-            &["-NoProfile", "-NonInteractive", "-Command"],
+            POWERSHELL_LEADING_ARGS,
         )),
         "pwsh" => crate::process_env::resolve_in_sanitized_path(
             std::ffi::OsStr::new("pwsh.exe"),
             crate::process_env::ChildKind::AgentShell,
         )
-        .map(|path| {
-            (
-                path,
-                &["-NoProfile", "-NonInteractive", "-Command"] as &'static [&'static str],
-            )
-        })
+        .map(|path| (path, POWERSHELL_LEADING_ARGS))
         .ok_or_else(|| "PowerShell 7 (pwsh.exe) was not found in the reviewed PATH".to_string()),
         "cmd" => Ok((
             system_root.join("System32").join("cmd.exe"),
@@ -1415,11 +1424,13 @@ impl Tool for Shell {
         {
             "Run a shell command in the workspace. Defaults to PowerShell (Windows PowerShell 5.1, \
          powershell.exe); set `shell` to \"pwsh\" for PowerShell 7+ or \"cmd\" for the legacy \
-         Windows command prompt. PowerShell and cmd differ in quoting, path, and exit-code \
-         semantics, so write the command for the shell you select. Returns combined stdout/stderr \
-         and the exit code. Set `background: true` for a long-running command (server, build, \
-         watcher): it returns immediately with a task id and reports its result when it finishes, \
-         instead of blocking."
+         Windows command prompt. PowerShell uses a process-scoped execution-policy override so \
+         standard package-manager shims work; an enforced enterprise policy can still require an \
+         explicit `.cmd` shim or the cmd shell. PowerShell and cmd differ in quoting, path, and \
+         exit-code semantics, so write the command for the shell you select. Returns combined \
+         stdout/stderr and the exit code. Set `background: true` for a long-running command \
+         (server, build, watcher): it returns immediately with a task id and reports its result \
+         when it finishes, instead of blocking."
         }
         #[cfg(not(windows))]
         {
@@ -2194,7 +2205,10 @@ mod tests {
         let (prog, args) = shell_invocation("powershell").unwrap();
         assert!(prog.is_absolute());
         assert!(prog.ends_with("WindowsPowerShell/v1.0/powershell.exe"));
-        assert!(args.contains(&"-NonInteractive"));
+        assert_eq!(args, POWERSHELL_LEADING_ARGS);
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-ExecutionPolicy", "Bypass"]));
         let (cprog, cargs) = shell_invocation("cmd").unwrap();
         assert!(cprog.is_absolute());
         assert!(cprog.ends_with("System32/cmd.exe"));

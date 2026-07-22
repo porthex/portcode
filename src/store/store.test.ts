@@ -1767,10 +1767,14 @@ describe("send", () => {
     expect(useStore.getState().pendingPermission?.diff).toBe("-a\n+b\n");
 
     // turn_end clears streaming + any pending prompt
+    useStore.setState({
+      backgroundTasks: { a: [{ id: "bg-1", command: "watch", status: "running" }] },
+    });
     emit({ type: "turn_end", stopReason: "end_turn" });
     st = useStore.getState();
     expect(st.streaming).toBe(false);
     expect(st.pendingPermission).toBeNull();
+    expect(st.messages.a[1].receipt?.backgroundTasksRunning).toBe(true);
   });
 
   it("reconciles both optimistic bubbles to native turn identity and attaches its receipt", async () => {
@@ -1899,6 +1903,7 @@ describe("send", () => {
       sessions: [session({ id: "a" })],
       activeId: "a",
       messages: { a: [] },
+      backgroundTasks: { a: [{ id: "bg-1", command: "watch", status: "running" }] },
     });
 
     await useStore.getState().send("change it");
@@ -1939,6 +1944,7 @@ describe("send", () => {
       changeState: "unknown",
       changeCertainty: "unavailable",
       changedFileCount: 0,
+      backgroundTasksRunning: true,
     });
     expect(dispose).not.toHaveBeenCalled();
 
@@ -5336,7 +5342,9 @@ describe("remote client", () => {
       live({ type: "text_delta", text: "Hello " });
       live({ type: "text_delta", text: "world" });
       live({ type: "tool_use", id: "t1", name: "fs_read", input: { path: "x" } });
+      expect(useStore.getState().activeTool).toBe("fs_read");
       live({ type: "tool_result", id: "t1", output: "ok", isError: false });
+      expect(useStore.getState().activeTool).toBeNull();
 
       const blocks = useStore.getState().messages.s1[0].blocks;
       expect(blocks).toEqual([
@@ -5354,6 +5362,27 @@ describe("remote client", () => {
       });
 
       expect(useStore.getState().messages.s1).toBeUndefined();
+    });
+
+    it("ignores a delta when the current turn's assistant row is missing", () => {
+      seedTurn("s1", "a1");
+      const userOnly = [
+        {
+          id: "u1",
+          role: "user" as const,
+          blocks: [{ kind: "text" as const, text: "hi" }],
+          createdAt: 1,
+        },
+      ];
+      useStore.setState({ messages: { s1: userOnly } });
+
+      useStore.getState().applyFrame({
+        t: "live",
+        session_id: "s1",
+        event: { type: "text_delta", text: "lost" },
+      });
+
+      expect(useStore.getState().messages.s1).toEqual(userOnly);
     });
 
     it("permission_request surfaces a pending prompt (with its diff) for the active session", () => {
@@ -6571,9 +6600,11 @@ describe("live subagents (agents panel)", () => {
 
     emit({ type: "agent_started", agentId: "g1", description: "first" });
     emit({ type: "agent_started", agentId: "g2", description: "second", parentId: "g1" });
+    emit({ type: "agent_started", agentId: "g1", description: "first-again" });
 
     const a = useStore.getState().agents.a;
     expect(a.map((x) => x.id)).toEqual(["g1", "g2"]);
+    expect(a[0].description).toBe("first-again");
     expect(a[1].parentId).toBe("g1");
   });
 
@@ -6717,7 +6748,7 @@ describe("background shell tasks (background-tasks panel)", () => {
     });
   });
 
-  it("keeps multiple tasks in launch order and replaces a duplicate start", () => {
+  it("keeps multiple tasks in launch order and replaces a duplicate running start", () => {
     useStore.setState({ activeId: "a", backgroundTasks: {} });
     const f = useStore.getState().applyFrame;
     f(bgFrame("a", { type: "background_task_started", id: "t1", command: "first" }));
@@ -6726,6 +6757,25 @@ describe("background shell tasks (background-tasks panel)", () => {
     const t = useStore.getState().backgroundTasks.a;
     expect(t.map((x) => x.id)).toEqual(["t1", "t2"]);
     expect(t[0].command).toBe("first-again");
+  });
+
+  it("does not regress a finished task when a delayed start is replayed", () => {
+    useStore.setState({ activeId: "a", backgroundTasks: {} });
+    const f = useStore.getState().applyFrame;
+    f(
+      bgFrame("a", {
+        type: "background_task_finished",
+        id: "t1",
+        command: "build",
+        exitCode: 2,
+        output: "boom",
+      }),
+    );
+    f(bgFrame("a", { type: "background_task_started", id: "t1", command: "build" }));
+
+    expect(useStore.getState().backgroundTasks.a).toEqual([
+      { id: "t1", command: "build", status: "error", exitCode: 2, output: "boom" },
+    ]);
   });
 
   it("upserts a finished event whose start it never saw", () => {
