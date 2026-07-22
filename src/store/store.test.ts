@@ -1310,6 +1310,130 @@ describe("selectSession", () => {
     expect(useStore.getState().messages.b.map((message) => message.id)).toEqual(["cached", "live"]);
   });
 
+  it("keeps cached older turns before a refreshed newest-page tail", async () => {
+    const olderUser: Message = {
+      id: "older-user",
+      role: "user",
+      blocks: [],
+      createdAt: 1,
+      turnId: "older-turn",
+    };
+    const olderAssistant: Message = {
+      id: "older-assistant",
+      role: "assistant",
+      blocks: [],
+      createdAt: 2,
+      turnId: "older-turn",
+    };
+    const latestUser: Message = {
+      id: "latest-user",
+      role: "user",
+      blocks: [],
+      createdAt: 3,
+      turnId: "latest-turn",
+    };
+    const liveAssistant: Message = {
+      id: "latest-assistant",
+      role: "assistant",
+      blocks: [],
+      createdAt: 4,
+      turnId: "latest-turn",
+    };
+    useStore.setState({
+      sessions: [session({ id: "b" })],
+      messages: { b: [olderUser, olderAssistant, latestUser, liveAssistant] },
+      messageLoads: {
+        b: {
+          phase: "ready",
+          loadedAt: 0,
+          lastAccessedAt: 0,
+          requestId: 1,
+          error: null,
+          nextCursor: null,
+          loadingOlder: false,
+        },
+      },
+    });
+    // A long active turn can consume the entire bounded newest page. Its still-live
+    // assistant row exists only in memory while the cached completed turn is older
+    // than the page boundary.
+    m.getMessagePage.mockResolvedValueOnce({ messages: [latestUser], nextCursor: "older-page" });
+
+    await useStore.getState().hydrateMessages("b");
+
+    expect(useStore.getState().messages.b.map((message) => message.id)).toEqual([
+      "older-user",
+      "older-assistant",
+      "latest-user",
+      "latest-assistant",
+    ]);
+  });
+
+  it("keeps a disjoint refresh and its paging cursor atomic", async () => {
+    const held: Message = { id: "held", role: "user", blocks: [], createdAt: 1 };
+    const fetched: Message = { id: "fetched", role: "user", blocks: [], createdAt: 2 };
+    useStore.setState({
+      sessions: [session({ id: "b" })],
+      messages: { b: [held] },
+      messageLoads: {
+        b: {
+          phase: "ready",
+          loadedAt: 0,
+          lastAccessedAt: 0,
+          requestId: 1,
+          error: null,
+          nextCursor: "held-cursor",
+          loadingOlder: false,
+        },
+      },
+    });
+    m.getMessagePage.mockResolvedValueOnce({
+      messages: [fetched],
+      nextCursor: "fetched-cursor",
+    });
+
+    await useStore.getState().hydrateMessages("b", { force: true });
+
+    const state = useStore.getState();
+    expect(state.messages.b).toEqual([held]);
+    expect(state.messageLoads.b).toMatchObject({
+      phase: "ready",
+      loadedAt: 0,
+      nextCursor: "held-cursor",
+    });
+  });
+
+  it("keeps current-only rows between refresh anchors in place", async () => {
+    const first: Message = { id: "first", role: "user", blocks: [], createdAt: 1 };
+    const live: Message = { id: "live", role: "assistant", blocks: [], createdAt: 2 };
+    const last: Message = { id: "last", role: "user", blocks: [], createdAt: 3 };
+    useStore.setState({
+      sessions: [session({ id: "b" })],
+      messages: { b: [first, live, last] },
+      messageLoads: {
+        b: {
+          phase: "ready",
+          loadedAt: 0,
+          lastAccessedAt: 0,
+          requestId: 1,
+          error: null,
+          nextCursor: "held-cursor",
+          loadingOlder: false,
+        },
+      },
+    });
+    m.getMessagePage.mockResolvedValueOnce({
+      messages: [first, last],
+      nextCursor: "fetched-cursor",
+    });
+
+    await useStore.getState().hydrateMessages("b", { force: true });
+
+    const state = useStore.getState();
+    expect(state.messages.b).toEqual([first, live, last]);
+    expect(state.messageLoads.b.nextCursor).toBe("held-cursor");
+  });
+
   it("prepends an older desktop page and advances its opaque cursor", async () => {
     const newest: Message = { id: "new", role: "assistant", blocks: [], createdAt: 2 };
     const older: Message = { id: "old", role: "user", blocks: [], createdAt: 1 };
