@@ -2550,6 +2550,62 @@ describe("send", () => {
     expect(useStore.getState().streaming).toBe(false);
   });
 
+  it("keeps a no-capture failed turn subscribed until the authoritative error arrives", async () => {
+    const dispose = vi.fn();
+    let emit!: (e: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose };
+    });
+    useStore.setState({ sessions: [session({ id: "a" })], activeId: "a", messages: { a: [] } });
+
+    await useStore.getState().send("start a swarm");
+    emit({ type: "turn_start", messageId: "native-turn", turnId: "native-turn", startedAt: 100 });
+    emit({
+      type: "turn_phase",
+      turnId: "native-turn",
+      phase: "agent_completed",
+      at: 350,
+      revision: 1,
+      status: "error",
+      agentDurationMs: 250,
+      receiptExpected: false,
+    });
+
+    expect(dispose).not.toHaveBeenCalled();
+    expect(useStore.getState().runs.a).toMatchObject({
+      streaming: false,
+      finalizing: true,
+      outcome: "error",
+    });
+
+    const receipt = turnReceipt({
+      turnId: "native-turn",
+      status: "error",
+      stopReason: undefined,
+      changeState: "not_applicable",
+    });
+    emit({
+      type: "error",
+      message: "OpenAI response was rejected (HTTP 400). Please retry.",
+      receipt,
+    });
+
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(useStore.getState().runs.a).toMatchObject({
+      streaming: false,
+      finalizing: false,
+      outcome: "error",
+      receipt,
+    });
+    expect(useStore.getState().messages.a[1].blocks).toEqual([
+      {
+        kind: "text",
+        text: "\n\n**Error:** OpenAI response was rejected (HTTP 400). Please retry.",
+      },
+    ]);
+  });
+
   it.each([
     [
       "HTTP 429",

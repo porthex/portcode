@@ -2613,6 +2613,7 @@ u UU N... 100644 100644 100644 100644 a a a src/conflict.rs\0\
             turn_id: "pending-review".into(),
             account_profile_id: None,
             status: TurnStatus::Interrupted,
+            failure: None,
             stop_reason: None,
             started_at: 1,
             completed_at: 1,

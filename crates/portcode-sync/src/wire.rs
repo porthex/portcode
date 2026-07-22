@@ -83,6 +83,31 @@ pub enum TurnStatus {
     Interrupted,
 }
 
+/// Bounded, reload-safe diagnostics for a failed root turn. This deliberately
+/// contains only operational metadata: never prompts, tool inputs/results,
+/// credentials, provider response bodies, or absolute paths.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(rename_all = "camelCase")]
+pub struct TurnFailure {
+    /// Stable local classification such as `provider_http` or `provider_timeout`.
+    pub code: String,
+    /// User-safe, secret-scrubbed summary, bounded by the desktop before storage.
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    /// Number and serialized byte size of persisted transcript messages supplied
+    /// to the failing root run. These are diagnostics, not token estimates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_messages: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_bytes: Option<u64>,
+}
+
 /// Non-terminal lifecycle milestones emitted to the local desktop UI. Phone
 /// Sync deliberately does not forward this additive event until a peer has
 /// negotiated support, because legacy Rust peers reject unknown enum variants.
@@ -161,6 +186,10 @@ pub struct TurnReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_profile_id: Option<String>,
     pub status: TurnStatus,
+    /// Present only for failed turns. Optional for additive compatibility with
+    /// receipts written by older desktop and phone builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<TurnFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     pub started_at: i64,

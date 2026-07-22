@@ -210,6 +210,56 @@ describe("TurnReceipt strip", () => {
     expect(screen.getByText("Failed after")).toBeInTheDocument();
   });
 
+  it("renders durable, bounded failure diagnostics after a reload", () => {
+    render(
+      <TurnReceipt
+        receipt={receipt({
+          status: "error",
+          stopReason: undefined,
+          failure: {
+            code: "provider_http",
+            message: "OpenAI response was rejected (HTTP 400). Please retry.",
+            provider: "openai",
+            model: "gpt-5.6-sol",
+            httpStatus: 400,
+            transcriptMessages: 161,
+            transcriptBytes: 1_709_912,
+          },
+        })}
+      />,
+    );
+
+    expect(
+      screen.getByText("OpenAI response was rejected (HTTP 400). Please retry."),
+    ).toBeVisible();
+    expect(screen.getByLabelText("Failure diagnostics")).toHaveTextContent(
+      "Diagnostic: provider http · openai / gpt-5.6-sol · HTTP 400 · 161 transcript messages · 1.63 MiB transcript",
+    );
+  });
+
+  it.each([
+    [512, "512 B"],
+    [128 * 1024, "128.0 KiB"],
+  ])(
+    "formats %s-byte transcript diagnostics without hiding the failure",
+    (transcriptBytes, copy) => {
+      render(
+        <TurnReceipt
+          receipt={receipt({
+            status: "error",
+            failure: {
+              code: "agent_error",
+              message: "The turn failed safely.",
+              transcriptBytes,
+            },
+          })}
+        />,
+      );
+
+      expect(screen.getByLabelText("Failure diagnostics")).toHaveTextContent(`${copy} transcript`);
+    },
+  );
+
   it("does not invent a duration for a turn recovered after a process interruption", () => {
     render(
       <TurnReceipt

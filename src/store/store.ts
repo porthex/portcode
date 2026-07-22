@@ -2736,8 +2736,9 @@ export const useStore = create<AppState>((set, get) => ({
     ) => {
       const eventTurnId = receipt?.turnId ?? observedTurnId;
       const current = get().runs[myKey];
-      // `receiptExpected: false` unlocks immediately, so a quick follow-up can
-      // start before this listener receives its trailing authoritative terminal.
+      // A successful `receiptExpected: false` turn unlocks immediately, so a
+      // quick follow-up can start before this listener receives its trailing
+      // authoritative terminal. Failed turns now remain subscribed through Error.
       // Distinguish an authoritative replacement of this turn's provisional ID
       // from a genuinely newer run, and never let the stale listener end that run.
       const stillOwnsCurrentRun = nativeTurnIdKnown
@@ -2800,10 +2801,10 @@ export const useStore = create<AppState>((set, get) => ({
     };
 
     const onEvent = (e: StreamEvent) => {
-      // `receiptExpected: false` is terminal for this frontend listener. Native
-      // still persists/emits its authoritative TurnEnd, but the no-capture phase
-      // already carries every fact needed to unlock the UI. A hard callback guard
-      // protects tests and queued channel deliveries even before unlisten finishes.
+      // `receiptExpected: false` means no Git finalization is needed; it does NOT
+      // replace the authoritative TurnEnd/Error. Successful no-capture turns may
+      // unlock immediately, but failed turns must keep this listener until Error
+      // delivers the actionable provider/lifecycle message.
       if (settled) return;
       // Once cancellation is acknowledged, only this turn's terminal receipt is
       // relevant. Ignoring late deltas/turn_start also prevents this listener from
@@ -2887,7 +2888,7 @@ export const useStore = create<AppState>((set, get) => ({
                 streaming: false,
                 cancel: null,
                 pendingPermission: null,
-                finalizing: e.receiptExpected !== false,
+                finalizing: e.receiptExpected !== false || status === "error",
                 agentDurationMs: receipt.agentDurationMs ?? receipt.durationMs ?? null,
                 phaseRevision,
                 receipt,
@@ -2899,7 +2900,7 @@ export const useStore = create<AppState>((set, get) => ({
             };
           });
 
-          if (e.receiptExpected !== false) {
+          if (e.receiptExpected !== false || status === "error") {
             if (receiptTerminalTimer !== null) clearTimeout(receiptTerminalTimer);
             receiptTerminalTimer = setTimeout(() => {
               receiptTerminalTimer = null;
@@ -2987,7 +2988,7 @@ export const useStore = create<AppState>((set, get) => ({
               e.receipt?.status ?? "error",
               e.receipt?.stopReason,
               e.receipt,
-              `\n\n**Error:** ${errorMessage}`,
+              e.receipt?.failure ? undefined : `\n\n**Error:** ${errorMessage}`,
             );
           }
           break;

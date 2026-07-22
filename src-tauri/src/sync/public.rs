@@ -696,6 +696,7 @@ mod tests {
             turn_id: "turn-1".into(),
             account_profile_id: Some("profile-private".into()),
             status: TurnStatus::Completed,
+            failure: None,
             stop_reason: Some("end_turn".into()),
             started_at: 1,
             completed_at: 2,

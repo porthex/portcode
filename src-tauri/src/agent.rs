@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use futures_util::stream::StreamExt;
-use portcode_sync::wire::{TurnPhase, TurnReceipt, TurnStatus};
+use portcode_sync::wire::{TurnFailure, TurnPhase, TurnReceipt, TurnStatus};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -32,6 +32,52 @@ type Cancels = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 
 fn openai_account_error(error: OpenAiAccountError) -> String {
     error.user_message().to_string()
+}
+
+/// Build the durable diagnostic attached to a failed root turn. Only bounded,
+/// secret-scrubbed operational metadata is retained; transcript contents are
+/// measured and immediately discarded.
+fn turn_failure_diagnostic(db: &Db, session_id: &str, model: &str, message: &str) -> TurnFailure {
+    let transcript = db.load_chat_messages(session_id);
+    let transcript_messages = u64::try_from(transcript.len()).ok();
+    let transcript_bytes = serde_json::to_vec(&transcript)
+        .ok()
+        .and_then(|bytes| u64::try_from(bytes.len()).ok());
+    let http_status = provider_http_status(message);
+    let lower = message.to_ascii_lowercase();
+    let code = if http_status.is_some() {
+        "provider_http"
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "provider_timeout"
+    } else if lower.contains("stream") {
+        "provider_stream"
+    } else if lower.contains("maximum of") && lower.contains("steps") {
+        "agent_step_limit"
+    } else if lower.contains("failed to save") || lower.contains("durable turn") {
+        "persistence"
+    } else {
+        "agent_error"
+    };
+
+    TurnFailure {
+        code: code.into(),
+        message: crate::scrub::redact_secrets_bounded(message, 512),
+        provider: llm::provider_name_for_model(model).ok().map(str::to_owned),
+        model: Some(crate::scrub::redact_secrets_bounded(model, 120)),
+        http_status,
+        transcript_messages,
+        transcript_bytes,
+    }
+}
+
+fn provider_http_status(message: &str) -> Option<u16> {
+    let marker = "HTTP ";
+    let start = message.find(marker)? + marker.len();
+    let digits: String = message[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
 }
 
 /// A synchronous same-session reservation acquired before an async turn is
@@ -721,11 +767,16 @@ pub async fn run(
         Ok(reason) => (TurnStatus::Completed, Some(reason.clone())),
         Err(_) => (TurnStatus::Error, None),
     };
+    let failure = result
+        .as_ref()
+        .err()
+        .map(|message| turn_failure_diagnostic(&db, &session_id, &auth.model, message));
     // Persist the agent outcome before optional Git finalization. A crash from
     // this point forward must preserve Completed/Stopped/Failed rather than
     // relabelling a delivered answer as process-interrupted on restart.
-    let (agent_checkpoint, receipt_expected) =
+    let (mut agent_checkpoint, receipt_expected) =
         receipt_tracker.seal_agent_outcome(status, stop_reason.clone());
+    agent_checkpoint.failure = failure.clone();
     match db.try_save_pending_turn_receipt_fast(&session_id, &turn_id, &agent_checkpoint) {
         Ok(true) => {}
         Ok(false) => {
@@ -752,6 +803,7 @@ pub async fn run(
     );
 
     let mut completed = receipt_tracker.complete(status, stop_reason).await;
+    completed.receipt.failure = failure;
     let terminal_saved = match db.try_save_turn_receipt_fast(
         &session_id,
         &turn_id,
@@ -1997,9 +2049,9 @@ mod tests {
         is_terminal_auth_error, make_receipt_non_reviewable, precheck_outcome, reassemble_results,
         resolve_system_prompt, run_loop_core, session_of, spawn_background_task, spawn_status,
         step_limit_exceeded, subagent_answer, subagent_label, tool_result_block, tool_result_event,
-        AgentConfig, AgentSpawner, Block, Cancels, ChatMessage, Db, Decision, LoopOutcome,
-        OpenAiRefreshTransport, OpenAiRunAuth, Persist, RunAuthContext, RunReservation,
-        StreamEvent, CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS, MAX_PARALLEL_AGENTS,
+        turn_failure_diagnostic, AgentConfig, AgentSpawner, Block, Cancels, ChatMessage, Db,
+        Decision, LoopOutcome, OpenAiRefreshTransport, OpenAiRunAuth, Persist, RunAuthContext,
+        RunReservation, StreamEvent, CANCELLED_TOOL_RESULT, MAX_AGENT_STEPS, MAX_PARALLEL_AGENTS,
         MAX_SUBAGENT_DEPTH, SUBAGENT_STEER,
     };
     use crate::events::EventSink;
@@ -2042,6 +2094,7 @@ mod tests {
             turn_id: "turn".into(),
             account_profile_id: None,
             status: TurnStatus::Completed,
+            failure: None,
             stop_reason: Some("end_turn".into()),
             started_at: 1,
             completed_at: 2,
@@ -2072,6 +2125,37 @@ mod tests {
         assert_eq!(receipt.additions, 4);
         assert_eq!(receipt.deletions, 2);
         assert_eq!(receipt.change_certainty, TurnChangeCertainty::Exact);
+    }
+
+    #[test]
+    fn failed_turn_diagnostic_is_bounded_secret_free_and_counts_only_metadata() {
+        let db = Db::open(Path::new(":memory:")).expect("in-memory db");
+        db.create_session("session", "Session", None, Some("gpt-5.6-sol"), 1)
+            .unwrap();
+        db.append_message(
+            "session",
+            &ChatMessage {
+                role: "user".into(),
+                content: vec![text_block("private transcript content")],
+            },
+            2,
+        );
+
+        let failure = turn_failure_diagnostic(
+            &db,
+            "session",
+            "gpt-5.6-sol",
+            "OpenAI response was rejected (HTTP 400); sk-ant-secret1234567890",
+        );
+
+        assert_eq!(failure.code, "provider_http");
+        assert_eq!(failure.provider.as_deref(), Some("openai"));
+        assert_eq!(failure.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(failure.http_status, Some(400));
+        assert_eq!(failure.transcript_messages, Some(1));
+        assert!(failure.transcript_bytes.is_some_and(|bytes| bytes > 0));
+        assert!(!failure.message.contains("sk-ant-secret"));
+        assert!(!failure.message.contains("private transcript content"));
     }
 
     #[derive(Default)]

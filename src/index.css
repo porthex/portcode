@@ -1460,6 +1460,26 @@ button.pc-turn-receipt__strip:focus-visible {
   color: #778196;
   text-align: center;
 }
+.pc-turn-receipt__failure {
+  display: grid;
+  gap: 5px;
+  border-top: 1px solid rgba(255, 77, 87, 0.2);
+  padding: 9px 12px 10px 32px;
+  background: rgba(255, 77, 87, 0.055);
+}
+.pc-turn-receipt__failure-message {
+  color: #ff9aa1;
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.pc-turn-receipt__failure-meta {
+  color: #8d96a8;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
 .pc-turn-receipt__details-grid {
   display: grid;
   grid-template-rows: 0fr;

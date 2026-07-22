@@ -49,6 +49,31 @@ export interface SessionRow {
 export type Block = { type: "text"; text: string } | { type: "tool_use"; id: string; name: string; input: Value } | { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean } | { type: "reasoning"; model?: string; id?: string; encrypted_content?: string; summary?: Value[] };
 
 /**
+ * Bounded, reload-safe diagnostics for a failed root turn. This deliberately
+ * contains only operational metadata: never prompts, tool inputs/results,
+ * credentials, provider response bodies, or absolute paths.
+ */
+export interface TurnFailure {
+    /**
+     * Stable local classification such as `provider_http` or `provider_timeout`.
+     */
+    code: string;
+    /**
+     * User-safe, secret-scrubbed summary, bounded by the desktop before storage.
+     */
+    message: string;
+    provider?: string;
+    model?: string;
+    httpStatus?: number;
+    /**
+     * Number and serialized byte size of persisted transcript messages supplied
+     * to the failing root run. These are diagnostics, not token estimates.
+     */
+    transcriptMessages?: number;
+    transcriptBytes?: number;
+}
+
+/**
  * Events streamed to the frontend. Tagged + camelCased to match `StreamEvent`
  * in `src/types.ts`. This is the rich internal desktop event; Phone Sync frames
  * embed the separate projected [`PhoneStreamEvent`] type below.
@@ -85,6 +110,11 @@ export interface TurnReceipt {
      */
     accountProfileId?: string;
     status: TurnStatus;
+    /**
+     * Present only for failed turns. Optional for additive compatibility with
+     * receipts written by older desktop and phone builds.
+     */
+    failure?: TurnFailure;
     stopReason?: string;
     startedAt: number;
     completedAt: number;
@@ -426,15 +456,15 @@ export interface InitOutput {
     readonly intounderlyingsource_cancel: (a: number) => void;
     readonly intounderlyingsource_pull: (a: number, b: any) => any;
     readonly ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__haeef4d57e6a88c91: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen__convert__closures_____invoke__h29f3221e742a74f6: (a: number, b: number, c: any, d: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h68ec937c7cebd819: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h57b4aa5ba5f8eab8: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hc6a33f57e9316770: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hd51a085c8f3dffa7: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h732d2251e9086dd9: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h069bff72c256f5f0: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hfe7f4cbcccf4f5d6: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__hfe1c0a6f1e8b05bc: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen__convert__closures_____invoke__h16b583695eaaa759: (a: number, b: number, c: any, d: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h09422128ca52abe5: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__hdbc11045f7dc48e5: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h9768ca95ee41dd2d: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h1b7d021b1c5dfc2e: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h478ee851fa3c1656: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h080f7a4b92422f09: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h838e0803cc6d1745: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;
