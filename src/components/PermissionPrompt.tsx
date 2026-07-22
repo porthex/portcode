@@ -2,7 +2,6 @@ import { useEffect, useRef } from "react";
 
 import { toolLabel } from "../lib/toolNames";
 import { useStore } from "../store/store";
-import { permissionRiskRequiresOneShot } from "../types";
 
 export function PermissionPrompt() {
   const activeId = useStore((s) => s.activeId);
@@ -56,9 +55,8 @@ export function PermissionPrompt() {
   };
 
   const label = toolLabel(pending.tool);
-  const protectedAction = permissionRiskRequiresOneShot(pending.risk);
   const remoteApproval = remoteMode || remoteConnected;
-  const rememberable = !remoteApproval && !protectedAction;
+  const rememberable = !remoteApproval;
 
   return (
     <div role="alert" className="pc-gate px-6 py-3.5">
@@ -80,11 +78,9 @@ export function PermissionPrompt() {
           </span>
         </div>
         {pending.diff && pending.diff.trim() && <DiffView diff={pending.diff} />}
-        {!rememberable && (
+        {remoteApproval && (
           <p className="text-[11.5px] leading-relaxed text-muted">
-            {remoteApproval
-              ? "Remote approvals apply once. Change persistent permission rules on the desktop."
-              : "This protected action requires one-time approval. Auto, Bypass, and saved rules cannot skip it."}
+            Remote approvals apply once. Change persistent permission rules on the desktop.
           </p>
         )}
         <div className="flex flex-wrap gap-[9px]">

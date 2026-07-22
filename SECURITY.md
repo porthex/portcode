@@ -83,12 +83,11 @@ The executable controls behind this policy are specified and tested in the
 [`Release security baseline`](docs/RELEASE_SECURITY_BASELINE_PLAN.md). The most
 important guarantees and limits are:
 
-- **Protected actions cannot inherit a remembered allow.** `run_command` is a
-  protected Shell action and requires one approval per call. Auto, Bypass,
-  legacy `allow`, wildcard rules, command-prefix rules, and historical shell
-  rules cannot lower it below Ask. Plan mode and cancellation are hard denies.
-  The same structural floor is reserved for typed dependency installation,
-  high-risk Git, and unknown future protected actions.
+- **Implicit permission modes stay conservative; explicit opt-outs are honored.**
+  Auto and the legacy default policy cannot silently allow protected Shell,
+  dependency-install, high-risk Git, or unknown actions. A user can deliberately
+  persist an Allow rule with “Always allow”, while Bypass explicitly skips the
+  permission gate and all rules. Plan mode and cancellation remain hard denies.
 - **Agent children start from a default-deny environment.** Portcode clears the
   inherited environment for agent shells and its native read-only Git process,
   then adds only reviewed exact-name variables. Ambient API/registry tokens,

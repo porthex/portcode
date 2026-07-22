@@ -204,7 +204,8 @@ export interface SessionFolder {
 /**
  * Security classification supplied by the native tool registry. Missing is a
  * legacy peer and therefore means `configurable`; any unknown future value is
- * protected and must remain one-shot.
+ * protected from implicit Auto/default allows unless the user explicitly saves
+ * an allow rule or enables Bypass.
  */
 export type PermissionRisk =
   | "configurable"
@@ -213,10 +214,6 @@ export type PermissionRisk =
   | "highRiskGit"
   | "unknown"
   | (string & Record<never, never>);
-
-export function permissionRiskRequiresOneShot(risk?: PermissionRisk): boolean {
-  return risk !== undefined && risk !== "configurable";
-}
 
 /** Events streamed from the core during an agent run. */
 export type StreamEvent =
@@ -437,9 +434,9 @@ export type ToolPolicy = "allow" | "ask" | "deny";
 
 /**
  * The permission MODE — the coarse default behaviour of the gate. Mirrors the
- * Rust `PermissionMode`. `auto` and `bypass` loosen configurable mutations, but
- * protected actions always require one-time approval. Both remain opt-in and
- * the quick-cycle covers only the safe trio.
+ * Rust `PermissionMode`. `auto` loosens configurable mutations while protected
+ * actions still ask unless explicitly allowed. `bypass` skips the gate entirely.
+ * Both remain opt-in and the quick-cycle covers only the safe trio.
  */
 export type PermissionMode = "default" | "acceptEdits" | "plan" | "auto" | "bypass";
 
@@ -453,9 +450,8 @@ export const DANGER_MODES: PermissionMode[] = ["auto", "bypass"];
 /**
  * A per-tool / per-command permission rule. Mirrors the Rust `Rule`. Evaluated
  * before the mode default, first match wins. `command` is a literal terminal
- * command prefix, so anything chained after it also matches. Historical command
- * Allow rules remain readable, but the native protected-action floor overrides
- * them with one-time approval.
+ * command prefix, so anything chained after it also matches. Explicit Allow
+ * rules are user-approved exceptions and apply to protected actions too.
  */
 export interface Rule {
   tool: ToolName | "*";

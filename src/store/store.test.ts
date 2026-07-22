@@ -1761,7 +1761,7 @@ describe("send", () => {
     expect(st.pendingPermission).toBeNull();
   });
 
-  it("reconciles the optimistic assistant to native turn identity and attaches its receipt", async () => {
+  it("reconciles both optimistic bubbles to native turn identity and attaches its receipt", async () => {
     const dispose = vi.fn();
     let emit!: (e: StreamEvent) => void;
     m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
@@ -1803,6 +1803,7 @@ describe("send", () => {
     const st = useStore.getState();
     expect(provisionalId).not.toBe("native-message");
     expect(st.messages.a).toHaveLength(2);
+    expect(st.messages.a[0]).toMatchObject({ role: "user", turnId: "native-turn" });
     expect(st.messages.a[1]).toMatchObject({
       id: "native-message",
       turnId: "native-turn",
@@ -1817,6 +1818,62 @@ describe("send", () => {
       outcome: "completed",
     });
     expect(dispose).toHaveBeenCalledOnce();
+  });
+
+  it("does not append old user bubbles again when a stopped turn is hydrated", async () => {
+    let emit!: (event: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: { a: [] },
+    });
+
+    await useStore.getState().send("stop this task");
+    emit({
+      type: "turn_start",
+      messageId: "stopped-turn",
+      turnId: "stopped-turn",
+      startedAt: 100,
+    });
+    const receipt = turnReceipt({
+      turnId: "stopped-turn",
+      status: "cancelled",
+      stopReason: "cancelled",
+    });
+    emit({ type: "turn_end", stopReason: "cancelled", receipt });
+
+    m.getMessagePage.mockResolvedValueOnce({
+      messages: [
+        {
+          id: "persisted-user-row",
+          role: "user",
+          blocks: [{ kind: "text", text: "stop this task" }],
+          createdAt: 101,
+          turnId: "stopped-turn",
+        },
+        {
+          id: "stopped-turn",
+          role: "assistant",
+          blocks: [],
+          createdAt: 100,
+          turnId: "stopped-turn",
+          receipt,
+        },
+      ],
+      nextCursor: null,
+    });
+
+    await useStore.getState().hydrateMessages("a", { force: true });
+
+    const messages = useStore.getState().messages.a;
+    expect(messages).toHaveLength(2);
+    expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+    expect(messages.filter((message) => message.role === "user")).toHaveLength(1);
+    expect(messages[1].receipt).toEqual(receipt);
   });
 
   it("freezes the completed response while Git finalizes, then replaces provisional facts", async () => {
@@ -2878,11 +2935,15 @@ describe("stop", () => {
 
       let st = useStore.getState();
       expect(st.runs.s1).toMatchObject({ streaming: true, turnId: "new-turn" });
-      expect(st.messages.s1.find((message) => message.turnId === "old-turn")?.receipt).toEqual(
-        oldReceipt,
-      );
       expect(
-        st.messages.s1.find((message) => message.turnId === "new-turn")?.receipt,
+        st.messages.s1.find(
+          (message) => message.role === "assistant" && message.turnId === "old-turn",
+        )?.receipt,
+      ).toEqual(oldReceipt);
+      expect(
+        st.messages.s1.find(
+          (message) => message.role === "assistant" && message.turnId === "new-turn",
+        )?.receipt,
       ).toBeUndefined();
 
       const newReceipt = turnReceipt({ turnId: "new-turn" });
@@ -2893,9 +2954,11 @@ describe("stop", () => {
       });
       st = useStore.getState();
       expect(st.streaming).toBe(false);
-      expect(st.messages.s1.find((message) => message.turnId === "new-turn")?.receipt).toEqual(
-        newReceipt,
-      );
+      expect(
+        st.messages.s1.find(
+          (message) => message.role === "assistant" && message.turnId === "new-turn",
+        )?.receipt,
+      ).toEqual(newReceipt);
     } finally {
       vi.useRealTimers();
     }
@@ -2954,7 +3017,7 @@ describe("resolvePermission", () => {
   });
 
   it.each(["shell", "dependencyInstall", "highRiskGit", "unknown", "futureRisk"] as const)(
-    "refuses to remember %s approval while still resolving the one-shot gate",
+    "remembers a scoped %s approval after resolving the current gate",
     async (risk) => {
       useStore.setState({
         pendingPermission: {
@@ -2969,7 +3032,9 @@ describe("resolvePermission", () => {
       await useStore.getState().resolvePermission("allow", true);
 
       expect(m.resolvePermission).toHaveBeenCalledWith(`protected-${risk}`, "allow");
-      expect(m.saveSettings).not.toHaveBeenCalled();
+      expect(m.saveSettings).toHaveBeenCalledWith({
+        rules: [{ tool: "run_command", command: "echo safe", decision: "allow" }],
+      });
       expect(useStore.getState().pendingPermission).toBeNull();
     },
   );
@@ -3047,9 +3112,10 @@ describe("resolvePermission", () => {
     expect(m.saveSettings).not.toHaveBeenCalled();
   });
 
-  it("answers the gate FIRST and persists allow-always after (ordered)", async () => {
-    // The backend gate must be answered before the best-effort policy save, so a
-    // failing save can never strand the prompt or leave the gate unanswered.
+  it("persists allow-always before releasing the gate so this task sees it (ordered)", async () => {
+    // Queued native prompts read live rules as soon as this gate is released, so
+    // the scoped save must complete first. updateSettings absorbs a save failure,
+    // ensuring the one-shot gate is still answered in that case.
     const calls: string[] = [];
     m.resolvePermission.mockImplementationOnce(async () => {
       calls.push("resolve");
@@ -3064,12 +3130,12 @@ describe("resolvePermission", () => {
 
     await useStore.getState().resolvePermission("allow", true);
 
-    expect(calls).toEqual(["resolve", "save"]);
+    expect(calls).toEqual(["save", "resolve"]);
   });
 
   it("still answers the gate and clears the prompt when the policy save rejects", async () => {
-    // saveSettings now runs AFTER the gate is answered, so its rejection can't
-    // strand the banner or leave the backend gate unanswered.
+    // updateSettings converts the rejection into settingsError and settles, then
+    // resolvePermission still releases the current request as a one-shot Allow.
     m.saveSettings.mockRejectedValueOnce(new Error("disk full"));
     useStore.setState({
       pendingPermission: { id: "p1", tool: "fs_edit", summary: "x", input: {} },

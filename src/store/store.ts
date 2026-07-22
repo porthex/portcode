@@ -47,7 +47,6 @@ import {
   OPENAI_FALLBACK_MODELS,
   normalizeOpenAIModels,
   openAIAccountLabel,
-  permissionRiskRequiresOneShot,
   providerForModel,
   reasoningEffortForModel,
 } from "../types";
@@ -117,14 +116,11 @@ const runKey = (sessionId: string): string => sessionId;
 
 // Build the scoped allow-RULE that "Always allow" adds, instead of flipping the
 // global policy to allow-everything. A legacy peer without risk can still scope a
-// command to that exact text; current protected command requests return null.
-// Other configurable tools are scoped by tool. Historical names are normalized
-// before persistence so new settings never extend the legacy vocabulary.
-const scopedAllowRule = (p: PendingPermission): Rule | null => {
-  // This guard is deliberately independent from the prompt UI. A stale client,
-  // forged call, or future surface cannot persist an Allow for protected or
-  // unknown actions. Missing risk remains configurable for legacy peers.
-  if (permissionRiskRequiresOneShot(p.risk)) return null;
+// command to that exact text. Other tools are scoped by tool. Historical names
+// are normalized before persistence so new settings never extend the legacy
+// vocabulary. The native gate treats this explicit user choice differently from
+// an implicit Auto/default allow, so remembered protected approvals are effective.
+const scopedAllowRule = (p: PendingPermission): Rule => {
   const tool = canonicalToolName(p.tool);
   if (isCommandToolName(p.tool)) {
     const command = (p.input as { command?: unknown } | null)?.command;
@@ -555,7 +551,10 @@ function findTurnMessage(
   );
 }
 
-/** Replace a provisional/local identity with the native turn_start identity. */
+/** Replace a provisional/local identity with the native turn_start identity.
+ * Both optimistic rows share the provisional turn id, so reconcile the user
+ * bubble with its assistant. Otherwise a later hydration sees the persisted user
+ * row as a different message and appends the optimistic echo again. */
 function reconcileTurnMessage(
   messages: Record<string, Message[]>,
   sessionId: string,
@@ -575,8 +574,15 @@ function reconcileTurnMessage(
         message.id === messageId),
   );
   if (index < 0) return messages;
-  const updated = [...current];
-  updated[index] = { ...current[index], id: messageId, turnId, createdAt: startedAt };
+  const updated = current.map((message, messageIndex) => {
+    if (messageIndex === index) {
+      return { ...message, id: messageId, turnId, createdAt: startedAt };
+    }
+    if (previousTurnId && message.turnId === previousTurnId) {
+      return { ...message, turnId };
+    }
+    return message;
+  });
   return { ...messages, [sessionId]: updated };
 }
 
@@ -2527,6 +2533,7 @@ export const useStore = create<AppState>((set, get) => ({
       role: "user",
       blocks: [{ kind: "text", text: body }],
       createdAt: now(),
+      turnId: provisionalTurnId,
     };
     const assistant: Message = {
       id: provisionalTurnId,
@@ -3202,22 +3209,30 @@ export const useStore = create<AppState>((set, get) => ({
       ? (get().runs[runKey(sessionId)]?.pendingPermission ?? get().pendingPermission)
       : get().runs[runKey(sessionId)]?.pendingPermission;
     if (current && current.id !== permissionId) return;
-    // Answer the backend gate FIRST (and clear the banner), so a later
-    // best-effort policy save can't strand the prompt or leave the gate
-    // unanswered if updateSettings rejects.
-    setRun(set, sessionId, { pendingPermission: null });
-    await ipc.resolvePermission(permissionId, decision);
+    // Persist an "Always allow" scope before releasing the backend gate. Native
+    // reads permission policy live between serialized prompts, so queued calls in
+    // this same task immediately observe the new rule instead of prompting again.
+    // updateSettings handles failures internally and always settles, after which
+    // this request is still resolved as a one-shot Allow.
     if (always && decision === "allow") {
-      // "Always allow" adds a scoped rule for a configurable tool instead of
-      // flipping the global policy. Protected/unknown requests return null.
+      // "Always allow" adds a scoped rule instead of flipping the global policy.
+      // Commands retain their command scope; other prompts retain their tool scope.
       const rule = scopedAllowRule(p);
-      if (!rule) return;
       const rules = get().settings.rules;
       const nextRules = rulesWithEffectiveAllow(rules, rule);
       if (nextRules !== rules) {
         await get().updateSettings({ rules: nextRules });
       }
     }
+    // The settings save above crossed an async boundary. Re-check identity before
+    // clearing or answering so an impossible-but-defensive superseding request is
+    // never resolved by a stale click.
+    const latest = legacy
+      ? (get().runs[runKey(sessionId)]?.pendingPermission ?? get().pendingPermission)
+      : get().runs[runKey(sessionId)]?.pendingPermission;
+    if (latest && latest.id !== permissionId) return;
+    setRun(set, sessionId, { pendingPermission: null });
+    await ipc.resolvePermission(permissionId, decision);
   },
 
   setShowSettings(v) {
@@ -4332,11 +4347,13 @@ export const useStore = create<AppState>((set, get) => ({
     // identity; message_delta catch-up later replaces the whole list.
     if (command.cmd === "run") {
       const { session_id, text } = command;
+      const provisionalTurnId = get().runs[runKey(session_id)]?.turnId ?? undefined;
       const userMsg: Message = {
         id: uid(),
         role: "user",
         blocks: [{ kind: "text", text }],
         createdAt: now(),
+        ...(provisionalTurnId ? { turnId: provisionalTurnId } : {}),
       };
       set((st) => {
         const run = st.runs[runKey(session_id)];

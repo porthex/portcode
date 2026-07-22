@@ -84,7 +84,7 @@ describe("PermissionPrompt", () => {
   });
 
   it.each(["shell", "dependencyInstall", "highRiskGit", "unknown", "futureRisk"] as const)(
-    "makes %s approvals one-shot and hides Always allow",
+    "offers Always allow for a local %s approval",
     (risk) => {
       useStore.setState({
         pendingPermission: pending({ tool: "run_command", risk, summary: "echo safe" }),
@@ -93,9 +93,8 @@ describe("PermissionPrompt", () => {
       render(<PermissionPrompt />);
 
       expect(screen.getByRole("button", { name: "Allow" })).toBeInTheDocument();
-      expect(screen.queryByRole("button", { name: "Always allow" })).not.toBeInTheDocument();
-      expect(screen.getByText(/requires one-time approval/i)).toBeInTheDocument();
-      expect(screen.getByText(/Auto, Bypass, and saved rules cannot skip it/i)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Always allow" })).toBeInTheDocument();
+      expect(screen.queryByText(/requires one-time approval/i)).not.toBeInTheDocument();
     },
   );
 

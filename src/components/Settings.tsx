@@ -1880,28 +1880,28 @@ const PERM_TOOLS = ["write_file", "edit_file", "run_command", "*"] as const;
 const MODE_INFO: Record<PermissionMode, { label: string; hint: string }> = {
   default: {
     label: "Default",
-    hint: "Use the policy below for configurable actions; protected actions always ask once.",
+    hint: "Use the policy below; protected actions ask unless an Allow rule matches.",
   },
   acceptEdits: {
     label: "Accept edits",
-    hint: "Auto-allow file changes; protected actions always ask once.",
+    hint: "Auto-allow file changes; protected actions ask unless an Allow rule matches.",
   },
   plan: { label: "Plan", hint: "Read-only — deny every mutating tool." },
   auto: {
     label: "Auto",
-    hint: "Auto-allow configurable actions; protected actions always ask once.",
+    hint: "Auto-allow configurable actions; protected actions ask unless explicitly allowed.",
   },
   bypass: {
     label: "Bypass",
-    hint: "Skip prompts and rules for configurable actions; protected actions always ask once.",
+    hint: "Skip every permission prompt and rule, including commands and protected actions.",
   },
 };
 const MODE_ORDER: PermissionMode[] = ["default", "acceptEdits", "plan", "auto", "bypass"];
 
 /**
  * The permission mode + per-tool/command rule editor. auto/bypass require an
- * explicit danger acknowledgment to engage. New command Allow rules are blocked;
- * the core also enforces that protected actions can only be approved one time.
+ * explicit danger acknowledgment to engage. New command Allow rules are created
+ * by the in-context Always allow action rather than this broad prefix editor.
  */
 function PermissionSettings() {
   const settings = useStore((s) => s.settings);
@@ -2050,9 +2050,11 @@ function PermissionSettings() {
           className="mt-2 rounded-lg border border-danger/50 bg-danger/10 p-2.5 text-[11.5px] text-danger"
         >
           <p>
-            ⚠ <strong className="capitalize">{MODE_INFO[confirmMode].label}</strong> lets the agent
-            run configurable mutations without asking. Commands and other protected actions still
-            require one-time approval. Only enable it if you trust the task.
+            ⚠ <strong className="capitalize">{MODE_INFO[confirmMode].label}</strong>{" "}
+            {confirmMode === "bypass"
+              ? "lets the agent run every mutation without prompts and ignores permission rules."
+              : "lets the agent run configurable mutations without asking; protected actions still ask unless an Allow rule matches."}{" "}
+            Only enable it if you trust the task.
           </p>
           <div className="mt-2 flex gap-2">
             <button
@@ -2103,8 +2105,8 @@ function PermissionSettings() {
           >
             <p>
               ⚠ <strong>Allow by default</strong> lets every unmatched configurable action run
-              without asking. Protected actions still require one-time approval. Use specific rules
-              when possible.
+              without asking. Protected actions still ask unless an explicit Allow rule matches. Use
+              specific rules when possible.
             </p>
             <div className="mt-2 flex gap-2">
               <button
@@ -2131,11 +2133,11 @@ function PermissionSettings() {
 
       <div id="pc-setting-tool-rules" className="mt-3">
         <div className="mb-1 text-[11px] text-faint">
-          Rules — first match wins; protected one-time approval is enforced last
+          Rules — first match wins; explicit Allow rules remember approved scopes
         </div>
         {rules.length === 0 ? (
           <p className="text-[11px] text-faint">
-            No rules yet. The mode above applies to configurable tools; protected actions ask once.
+            No rules yet. Protected actions ask unless Bypass is enabled.
           </p>
         ) : (
           <ul className="flex flex-col gap-1">
@@ -2158,9 +2160,6 @@ function PermissionSettings() {
                   >
                     → {r.decision}
                   </span>
-                  {r.decision === "allow" && isCommandToolName(r.tool) ? (
-                    <span className="ml-1 text-warn">(overridden: asks every time)</span>
-                  ) : null}
                 </span>
                 <button
                   type="button"
@@ -2235,13 +2234,13 @@ function PermissionSettings() {
         </div>
         {overBroadAllow && (
           <p role="alert" className="mt-1.5 text-[11px] text-danger">
-            ⚠ This allow rule matches every configurable tool. Protected actions still ask once.
-            Prefer a specific tool.
+            ⚠ This allow rule matches every gated tool, including protected actions. Prefer a
+            specific tool.
           </p>
         )}
         <p className="mt-1.5 text-[11px] text-faint">
-          Command prefixes scope Ask or Deny rules. Historical shell Allow rules remain visible for
-          compatibility, but mandatory approval overrides them.
+          Command prefixes scope Ask or Deny rules here. “Always allow” can add a scoped command
+          Allow rule directly from a prompt.
         </p>
         <p className="mt-1 text-[11px] text-faint">
           Read-only browsing and delegated tasks never require permission rules.

@@ -8,6 +8,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $resolvedRoot = (Resolve-Path -LiteralPath $Root).Path
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 function ProjectPath([string]$RelativePath) {
   Join-Path $resolvedRoot $RelativePath
@@ -18,49 +19,32 @@ $tauriPath = ProjectPath "src-tauri/tauri.conf.json"
 $cargoPath = ProjectPath "src-tauri/Cargo.toml"
 $lockPath = ProjectPath "Cargo.lock"
 
-$package = Get-Content -LiteralPath $packagePath -Raw | ConvertFrom-Json
-$package.version = $Version
-$package | ConvertTo-Json -Depth 20 | Set-Content -Encoding utf8 -LiteralPath $packagePath
-
-$tauri = Get-Content -LiteralPath $tauriPath -Raw | ConvertFrom-Json
-$tauri.version = $Version
-$tauri | ConvertTo-Json -Depth 20 | Set-Content -Encoding utf8 -LiteralPath $tauriPath
-
-$cargoLines = Get-Content -LiteralPath $cargoPath
-$cargoStamped = $false
-$inPackage = $false
-for ($i = 0; $i -lt $cargoLines.Count; $i++) {
-  if ($cargoLines[$i] -eq "[package]") {
-    $inPackage = $true
-    continue
-  }
-  if ($inPackage -and $cargoLines[$i] -match '^version\s*=') {
-    $cargoLines[$i] = "version = `"$Version`""
-    $cargoStamped = $true
-    break
-  }
+function StampVersion([string]$Path, [string]$Pattern, [string]$Label) {
+  $content = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+  $matcher = New-Object System.Text.RegularExpressions.Regex(
+    $Pattern,
+    [System.Text.RegularExpressions.RegexOptions]::Multiline
+  )
+  if (-not $matcher.IsMatch($content)) { throw "Could not find $Label version in $Path" }
+  $updated = $matcher.Replace(
+    $content,
+    { param($match) $match.Groups[1].Value + $Version + $match.Groups[2].Value },
+    1
+  )
+  [System.IO.File]::WriteAllText($Path, $updated, $utf8NoBom)
 }
-if (-not $cargoStamped) { throw "Could not find [package].version in $cargoPath" }
-$cargoLines | Set-Content -Encoding utf8 -LiteralPath $cargoPath
 
-$lockLines = Get-Content -LiteralPath $lockPath
-$lockStamped = $false
-for ($i = 0; $i -lt $lockLines.Count - 1; $i++) {
-  if ($lockLines[$i] -eq 'name = "portcode"' -and $lockLines[$i + 1] -match '^version\s*=') {
-    $lockLines[$i + 1] = "version = `"$Version`""
-    $lockStamped = $true
-    break
-  }
-}
-if (-not $lockStamped) { throw "Could not find the portcode package in $lockPath" }
-$lockLines | Set-Content -Encoding utf8 -LiteralPath $lockPath
+StampVersion $packagePath '^(\s*"version"\s*:\s*")[^"]+("\s*,?\s*)$' "package.json"
+StampVersion $tauriPath '^(\s*"version"\s*:\s*")[^"]+("\s*,?\s*)$' "tauri.conf.json"
+StampVersion $cargoPath '(^\[package\][\s\S]*?^version\s*=\s*")[^"]+(")' "Cargo package"
+StampVersion $lockPath '(^\[\[package\]\]\r?\nname = "portcode"\r?\nversion\s*=\s*")[^"]+(")' "Cargo.lock package"
 
-$packageVersion = (Get-Content -LiteralPath $packagePath -Raw | ConvertFrom-Json).version
-$tauriVersion = (Get-Content -LiteralPath $tauriPath -Raw | ConvertFrom-Json).version
+$packageVersion = ([System.IO.File]::ReadAllText($packagePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json).version
+$tauriVersion = ([System.IO.File]::ReadAllText($tauriPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json).version
 $cargoVersion = (Select-String -LiteralPath $cargoPath -Pattern '^version\s*=\s*"([^"]+)"' |
     Select-Object -First 1).Matches[0].Groups[1].Value
 $lockVersion = $null
-$lockLines = Get-Content -LiteralPath $lockPath
+$lockLines = [System.IO.File]::ReadAllLines($lockPath, [System.Text.Encoding]::UTF8)
 for ($i = 0; $i -lt $lockLines.Count - 1; $i++) {
   if ($lockLines[$i] -eq 'name = "portcode"' -and $lockLines[$i + 1] -match '^version\s*=\s*"([^"]+)"') {
     $lockVersion = $Matches[1]

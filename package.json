@@ -22,6 +22,7 @@
     "app:build:self": "tauri build --config src-tauri/tauri.dev.conf.json",
     "app:dev:beta": "tauri dev --config src-tauri/tauri.beta.conf.json --features beta-channel",
     "app:build:beta": "tauri build --config src-tauri/tauri.beta.conf.json --features beta-channel",
+    "app:bundle:beta": "tauri bundle --config src-tauri/tauri.beta.conf.json --features beta-channel --bundles nsis --no-sign",
     "watch:rust": "cd src-tauri && bacon",
     "lint": "eslint .",
     "format": "prettier --write .",

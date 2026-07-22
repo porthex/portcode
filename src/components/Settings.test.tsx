@@ -1299,7 +1299,7 @@ describe("SettingsPanel — default tool permission", () => {
       screen.getByText(/every unmatched configurable action.*without asking/i),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/Protected actions still require one-time approval/i),
+      screen.getByText(/Protected actions still ask unless an explicit Allow rule matches/i),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Enable default Allow" }));
     expect(m.saveSettings).toHaveBeenCalledWith({ defaultPolicy: "allow" });
@@ -1377,7 +1377,7 @@ describe("SettingsPanel — permission modes & rules", () => {
     expect(m.saveSettings).not.toHaveBeenCalled();
     const confirm = screen.getByRole("button", { name: /Enable Auto/i });
     expect(screen.getByRole("alert")).toHaveTextContent(
-      /Commands and other protected actions still require one-time approval/i,
+      /protected actions still ask unless an Allow rule matches/i,
     );
 
     // Confirming engages the mode.
@@ -1398,6 +1398,17 @@ describe("SettingsPanel — permission modes & rules", () => {
     });
 
     expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("warns that Bypass skips every prompt and ignores permission rules", async () => {
+    renderPanel({ permissionMode: "default" });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Bypass/i }));
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(/every mutation without prompts/i);
+    expect(screen.getByRole("alert")).toHaveTextContent(/ignores permission rules/i);
   });
 
   it("adds a per-tool rule through ipc.saveSettings", async () => {
@@ -1421,15 +1432,15 @@ describe("SettingsPanel — permission modes & rules", () => {
     expect(screen.getByRole("option", { name: "deny" })).toBeInTheDocument();
   });
 
-  it("warns when a wildcard Allow would match every configurable tool", () => {
+  it("warns when a wildcard Allow would match every gated tool", () => {
     renderPanel();
     fireEvent.click(screen.getByLabelText("Rule tool"));
     fireEvent.click(screen.getByRole("option", { name: "Any tool" }));
     fireEvent.click(screen.getByLabelText("Rule decision"));
     fireEvent.click(screen.getByRole("option", { name: "allow" }));
 
-    expect(screen.getByRole("alert")).toHaveTextContent(/every configurable tool/i);
-    expect(screen.getByRole("alert")).toHaveTextContent(/Protected actions still ask once/i);
+    expect(screen.getByRole("alert")).toHaveTextContent(/every gated tool/i);
+    expect(screen.getByRole("alert")).toHaveTextContent(/including protected actions/i);
   });
 
   it("renders a historical rule with a friendly label and removes it", async () => {
@@ -1445,11 +1456,11 @@ describe("SettingsPanel — permission modes & rules", () => {
     expect(m.saveSettings).toHaveBeenCalledWith({ rules: [] });
   });
 
-  it("marks a historical shell Allow as overridden and lets the user remove it", async () => {
+  it("shows an effective historical shell Allow and lets the user remove it", async () => {
     renderPanel({ rules: [{ tool: "shell", command: "git ", decision: "allow" }] });
 
     expect(screen.getAllByText("Run command").length).toBeGreaterThan(0);
-    expect(screen.getByText(/overridden: asks every time/i)).toBeInTheDocument();
+    expect(screen.queryByText(/overridden: asks every time/i)).not.toBeInTheDocument();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Remove rule 1" }));
@@ -1473,7 +1484,7 @@ describe("SettingsPanel — permission modes & rules", () => {
     // The form defaults to Run command + ask; the stored equivalent says allow.
     renderPanel({ rules: [{ tool: "shell", decision: "allow" }] });
 
-    expect(screen.getByText(/overridden: asks every time/i)).toBeInTheDocument();
+    expect(screen.queryByText(/overridden: asks every time/i)).not.toBeInTheDocument();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Add rule" }));

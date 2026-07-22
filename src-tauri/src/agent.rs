@@ -876,6 +876,7 @@ async fn run_inner(
                 // Freeze the resolved per-session model/provider/effort so children
                 // inherit this run, not a possibly different global default.
                 run_settings: snapshot.clone(),
+                live_settings: settings.clone(),
                 auth: auth.clone(),
                 pending: pending.clone(),
                 agents: agents.clone(),
@@ -942,6 +943,7 @@ async fn run_inner(
         http,
         provider.as_ref(),
         &snapshot,
+        settings,
         cred,
         refresh_lock,
         openai_refresh.as_ref(),
@@ -1058,6 +1060,7 @@ async fn run_loop_core(
     http: &reqwest::Client,
     provider: &dyn llm::LlmProvider,
     snapshot: &Settings,
+    live_settings: &Arc<Mutex<Settings>>,
     mut cred: Credential,
     refresh_lock: &tokio::sync::Mutex<()>,
     openai_refresh: &dyn OpenAiRefreshTransport,
@@ -1264,6 +1267,7 @@ async fn run_loop_core(
                             sink,
                             session_channel,
                             snapshot,
+                            live_settings,
                             pending,
                             cancel,
                             ask_lock,
@@ -1424,6 +1428,7 @@ async fn gate_and_run(
     sink: &dyn EventSink,
     session_channel: &str,
     snapshot: &Settings,
+    live_settings: &Arc<Mutex<Settings>>,
     pending: &Pending,
     cancel: &Arc<AtomicBool>,
     ask_lock: &tokio::sync::Mutex<()>,
@@ -1440,13 +1445,16 @@ async fn gate_and_run(
     };
     let decision = if let Some(risk) = tool.permission_risk() {
         // Compute the pre-apply diff (write_file/edit_file) so the prompt can show the
-        // change BEFORE it's written.
+        // change BEFORE it's written. Permission rules are intentionally read only
+        // after this run's prompt lock is acquired: an "Always allow" save can then
+        // release one prompt and be observed by every queued sibling/subagent call.
         let _prompt = ask_lock.lock().await;
+        let live_rules = live_settings.lock().unwrap().rules.clone();
         permissions::gate(
             sink,
             session_channel,
             snapshot.permission_mode,
-            &snapshot.rules,
+            &live_rules,
             &snapshot.default_policy,
             pending,
             cancel,
@@ -1663,6 +1671,9 @@ struct AgentSpawner {
     provider: Arc<dyn llm::LlmProvider>,
     openai_refresh: Arc<dyn OpenAiRefreshTransport>,
     run_settings: Settings,
+    /// Shared policy state. Model/workspace/auth stay frozen in `run_settings`,
+    /// while explicit Always-allow rules must take effect during the current run.
+    live_settings: Arc<Mutex<Settings>>,
     /// Immutable model/profile selection inherited from the owning root run.
     /// Children never reload a process-global OpenAI credential.
     auth: RunAuthContext,
@@ -1779,6 +1790,7 @@ impl tools::Spawner for AgentSpawner {
             &self.http,
             self.provider.as_ref(),
             &snapshot,
+            &self.live_settings,
             cred,
             &self.refresh_lock,
             self.openai_refresh.as_ref(),
@@ -2536,6 +2548,7 @@ mod tests {
         } else {
             crate::tools::read_only_registry()
         };
+        let live_settings = Arc::new(Mutex::new(settings.clone()));
         let mut ctx = ToolCtx::new(workspace.clone());
         ctx.cancel = Some(cancel.clone());
         ctx.receipt = Some(receipt_tracker.clone());
@@ -2546,6 +2559,7 @@ mod tests {
                 provider: provider.clone(),
                 openai_refresh: openai_refresh.clone(),
                 run_settings: settings.clone(),
+                live_settings: live_settings.clone(),
                 auth: auth.clone(),
                 pending: pending.clone(),
                 agents,
@@ -2568,6 +2582,7 @@ mod tests {
             &http,
             provider.as_ref(),
             &settings,
+            &live_settings,
             auth.credential.clone(),
             refresh_lock.as_ref(),
             openai_refresh.as_ref(),

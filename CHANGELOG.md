@@ -60,17 +60,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Markdown now formats during streaming, active exploration uses present-tense
-  wording, and interrupted tools or agents no longer remain visibly running.
+  wording, interrupted tools or agents no longer remain visibly running, and a
+  stopped turn can no longer duplicate cached user messages during hydration.
 - Hardened run cancellation, credential refresh, permission-rule ordering,
   session model persistence, remote teardown, and workspace Git inspection.
 - Aligned remote push-registration protocol handling and hardened partial-turn
   cancellation, secret scrubbing, file-edit previews, telemetry consent,
   pairing/reconnect controls, and remote-client lifecycle cleanup.
-- Protected shell actions can no longer bypass one-shot approval through Auto,
-  Bypass, legacy rules, or remembered phone decisions; pre-commit settings failures
-  preserve the live policy while post-commit durability uncertainty is reconciled
-  explicitly; and Phone Sync no longer forwards raw desktop tool payloads or account
-  attribution.
+- Auto and legacy defaults cannot implicitly approve protected shell actions;
+  Bypass now skips every prompt as advertised, while explicit desktop “Always
+  allow” choices persist scoped rules and take effect during the current task.
+  Pre-commit settings failures preserve the live policy while post-commit
+  durability uncertainty is reconciled explicitly; and Phone Sync no longer
+  forwards raw desktop tool payloads or account attribution.
 
 ## [0.1.0] - 2026-06-19
 

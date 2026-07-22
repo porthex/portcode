@@ -409,11 +409,14 @@ export function Composer() {
   );
 }
 const MODE_PRESENTATION: Record<PermissionMode, { label: string; detail: string }> = {
-  default: { label: "Ask", detail: "protected actions always ask once" },
-  acceptEdits: { label: "Edits allowed", detail: "edits skip prompts; protected actions ask" },
+  default: { label: "Ask", detail: "protected actions ask unless explicitly allowed" },
+  acceptEdits: {
+    label: "Edits allowed",
+    detail: "edits skip prompts; protected actions follow saved rules",
+  },
   plan: { label: "Plan only", detail: "no files will change" },
-  auto: { label: "Auto configurable", detail: "protected actions still ask once" },
-  bypass: { label: "Bypass configurable", detail: "protected actions still ask once" },
+  auto: { label: "Auto configurable", detail: "protected actions ask unless explicitly allowed" },
+  bypass: { label: "Bypass all", detail: "no permission prompts" },
 };
 
 /** Every desktop permission mode in one explicit, provider-native dropdown. */
