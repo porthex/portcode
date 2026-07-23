@@ -7,27 +7,23 @@ import {
   type ReactNode,
 } from "react";
 import { QRCodeSVG } from "qrcode.react";
-import { modelsForOpenAIProfile, preferredOpenAIAccount, useStore } from "../store/store";
+import { modelsForOpenAIProfile, useStore } from "../store/store";
 import {
-  ANTHROPIC_MODELS,
   DANGER_MODES,
   modelInfo,
   openAIAccountLabel,
   providerForModel,
+  reasoningEffortForModel,
   reasoningEffortLabel,
   type PairingPayload,
   type PairingRequest,
   type PermissionMode,
-  type Rule,
-  type ToolPolicy,
 } from "../types";
 import * as ipc from "../lib/ipc";
-import { isCommandToolName, toolLabel, toolNamesEquivalent } from "../lib/toolNames";
 import { SelectMenu } from "./SelectMenu";
 import { PlanUsagePanel } from "./PlanUsagePanel";
 
-type SettingsSectionId =
-  "claude" | "openai" | "usage" | "permissions" | "interface" | "system" | "devices";
+type SettingsSectionId = "openai" | "usage" | "permissions" | "interface" | "system" | "devices";
 
 interface SettingsSectionMeta {
   id: SettingsSectionId;
@@ -40,22 +36,6 @@ interface SettingsSectionMeta {
 
 const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
   {
-    id: "claude",
-    label: "Claude",
-    eyebrow: "Anthropic",
-    description: "Claude models and Anthropic credentials.",
-    items: [
-      "Claude models",
-      "Claude default model",
-      "Claude subscription",
-      "Sign in with Claude",
-      "Anthropic API key",
-      "Claude API key",
-      "Credential Manager",
-    ],
-    desktopOnly: true,
-  },
-  {
     id: "openai",
     label: "OpenAI / GPT",
     eyebrow: "OpenAI",
@@ -64,7 +44,7 @@ const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
       "OpenAI models",
       "GPT models",
       "OpenAI default model",
-      "Default ChatGPT account",
+      "Codex authentication",
       "Reasoning level",
       "OpenAI subscription",
       "ChatGPT sign in",
@@ -76,10 +56,9 @@ const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
     id: "usage",
     label: "Plan usage",
     eyebrow: "Allowance",
-    description: "Included Claude and GPT plan limits with local reset times.",
+    description: "Codex plan limits and local reset times.",
     items: [
       "Plan usage",
-      "Claude usage",
       "GPT usage",
       "Codex limits",
       "Current session limit",
@@ -94,16 +73,7 @@ const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
     label: "Permissions",
     eyebrow: "Safety gate",
     description: "Control what the agent can do without asking.",
-    items: [
-      "Permission mode",
-      "Default policy",
-      "Accept edits",
-      "Plan mode",
-      "Auto mode",
-      "Bypass mode",
-      "Tool rules",
-      "Command prefix",
-    ],
+    items: ["Permission mode", "Accept edits", "Plan mode", "Auto mode", "Bypass mode"],
     desktopOnly: true,
   },
   {
@@ -138,23 +108,15 @@ const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
 ];
 
 const SETTINGS_TARGET_IDS: Record<string, string> = {
-  "Claude models": "pc-setting-claude-model",
-  "Claude default model": "pc-setting-claude-model",
-  "Claude subscription": "pc-setting-claude",
-  "Sign in with Claude": "pc-setting-claude",
-  "Anthropic API key": "pc-setting-anthropic-api-key",
-  "Claude API key": "pc-setting-anthropic-api-key",
-  "Credential Manager": "pc-setting-anthropic-api-key",
   "OpenAI models": "pc-setting-openai-model",
   "GPT models": "pc-setting-openai-model",
   "OpenAI default model": "pc-setting-openai-model",
-  "Default ChatGPT account": "pc-setting-openai",
+  "Codex authentication": "pc-setting-openai",
   "Reasoning level": "pc-setting-openai-reasoning",
   "OpenAI subscription": "pc-setting-openai",
   "ChatGPT sign in": "pc-setting-openai",
   "OpenAI API keys": "pc-setting-openai-auth-note",
   "Plan usage": "pc-setting-plan-usage",
-  "Claude usage": "pc-setting-plan-usage",
   "GPT usage": "pc-setting-plan-usage",
   "Codex limits": "pc-setting-plan-usage",
   "Current session limit": "pc-setting-plan-usage",
@@ -162,13 +124,10 @@ const SETTINGS_TARGET_IDS: Record<string, string> = {
   "Reset time": "pc-setting-plan-usage",
   "Remaining usage": "pc-setting-plan-usage",
   "Permission mode": "pc-setting-permission-mode",
-  "Default policy": "pc-setting-default-policy",
   "Accept edits": "pc-setting-permission-mode",
   "Plan mode": "pc-setting-permission-mode",
   "Auto mode": "pc-setting-permission-mode",
   "Bypass mode": "pc-setting-permission-mode",
-  "Tool rules": "pc-setting-tool-rules",
-  "Command prefix": "pc-setting-tool-rules",
   "Typing animation": "pc-setting-typing",
   "Neon rain": "pc-setting-rain",
   Scanlines: "pc-setting-scanlines",
@@ -208,26 +167,20 @@ function matchingSettingNames(section: SettingsSectionMeta, query: string) {
 export function SettingsPanel() {
   const settings = useStore((s) => s.settings);
   const updateSettings = useStore((s) => s.updateSettings);
+  const updateDefaultOpenAISettings = useStore((s) => s.updateDefaultOpenAISettings);
   const setShowSettings = useStore((s) => s.setShowSettings);
   const settingsError = useStore((s) => s.settingsError);
   const pairingError = useStore((s) => s.pairingError);
-  const oauthStatus = useStore((s) => s.oauthStatus);
-  const oauthError = useStore((s) => s.oauthError);
-  const loginWithClaude = useStore((s) => s.loginWithClaude);
-  const logoutClaude = useStore((s) => s.logoutClaude);
   const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
   const openAIAuthError = useStore((s) => s.openAIAuthError);
-  const openAIReconnectMismatch = useStore((s) => s.openAIReconnectMismatch);
   const openAIModels = useStore((s) => s.openAIModels);
   const openAIAccounts = useStore((s) => s.openAIAccounts);
   const openAIAccountsLoading = useStore((s) => s.openAIAccountsLoading);
   const openAIAccountsError = useStore((s) => s.openAIAccountsError);
   const openAIModelCatalogs = useStore((s) => s.openAIModelCatalogs);
-  const lastOpenAIAccountProfileId = useStore((s) => s.lastOpenAIAccountProfileId);
   const loginWithOpenAI = useStore((s) => s.loginWithOpenAI);
   const reconnectOpenAIAccount = useStore((s) => s.reconnectOpenAIAccount);
   const removeOpenAIAccount = useStore((s) => s.removeOpenAIAccount);
-  const setDefaultOpenAIAccount = useStore((s) => s.setDefaultOpenAIAccount);
   const refreshOpenAIStatus = useStore((s) => s.refreshOpenAIStatus);
 
   const ambientRain = useStore((s) => s.ambientRain);
@@ -261,7 +214,6 @@ export function SettingsPanel() {
   const [saving, setSaving] = useState(false);
   const [savedKey, setSavedKey] = useState(false);
   const [keyError, setKeyError] = useState<string | null>(null);
-  const [signingIn, setSigningIn] = useState(false);
   const [signingInOpenAI, setSigningInOpenAI] = useState(false);
   const [openAIAccountAction, setOpenAIAccountAction] = useState<string | null>(null);
   const [pendingOpenAIRemoval, setPendingOpenAIRemoval] = useState<string | null>(null);
@@ -275,21 +227,16 @@ export function SettingsPanel() {
   const navigationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [activeSection, setActiveSection] = useState<SettingsSectionId>(
-    remoteMode ? "interface" : "claude",
+    remoteMode ? "interface" : "openai",
   );
 
-  const signedIn = !!oauthStatus?.signedIn;
-  const connectedOpenAIAccounts = openAIAccounts.filter((account) => account.state === "connected");
+  const codexAccount =
+    openAIAccounts.find((account) => account.id === "codex-primary") ?? openAIAccounts[0];
+  const connectedOpenAIAccounts = codexAccount?.state === "connected" ? [codexAccount] : [];
   const signedInOpenAI = connectedOpenAIAccounts.length > 0;
-  const reconnectOnlyOpenAI = openAIAccounts.length > 0 && connectedOpenAIAccounts.length === 0;
+  const reconnectOnlyOpenAI = Boolean(codexAccount && !signedInOpenAI);
   const openAIAvailable = openAIAuthStatus?.available !== false;
-  const reconnectMismatchAccount = openAIAccounts.find(
-    (account) => account.id === openAIReconnectMismatch?.accountProfileId,
-  );
-  const defaultOpenAIAccount = preferredOpenAIAccount(
-    connectedOpenAIAccounts,
-    lastOpenAIAccountProfileId,
-  );
+  const defaultOpenAIAccount = connectedOpenAIAccounts[0];
   const defaultOpenAIModels = modelsForOpenAIProfile(
     defaultOpenAIAccount?.id,
     openAIModelCatalogs,
@@ -297,17 +244,17 @@ export function SettingsPanel() {
   );
   const selectedModel = modelInfo(settings.model, defaultOpenAIModels);
   const selectedProvider = providerForModel(settings.model, defaultOpenAIModels);
-  const claudeModelValue = selectedProvider === "anthropic" ? settings.model : "choose-claude";
   const openAIModelValue = selectedProvider === "openai" ? settings.model : "choose-openai";
   const reasoningEfforts =
     selectedProvider === "openai" ? (selectedModel?.reasoningEfforts ?? []) : [];
+  const selectedReasoningEffort = reasoningEffortForModel(
+    settings.model,
+    settings.reasoningEffort,
+    defaultOpenAIModels,
+  );
   const availableSections = useMemo(
     () =>
-      SETTINGS_SECTIONS.filter(
-        (section) =>
-          !(remoteMode && section.desktopOnly) &&
-          (openAIAvailable || openAIAccounts.length > 0 || section.id !== "openai"),
-      ).map((section) => {
+      SETTINGS_SECTIONS.filter((section) => !(remoteMode && section.desktopOnly)).map((section) => {
         if (section.id === "openai" && reasoningEfforts.length === 0) {
           return {
             ...section,
@@ -324,7 +271,7 @@ export function SettingsPanel() {
         }
         return section;
       }),
-    [openAIAccounts.length, openAIAvailable, reasoningEfforts.length, remoteMode],
+    [reasoningEfforts.length, remoteMode],
   );
   const visibleSections = useMemo(
     () => availableSections.filter((section) => matchesSettingsQuery(section, searchQuery)),
@@ -343,10 +290,9 @@ export function SettingsPanel() {
     return null;
   }, [searchQuery, visibleSections]);
   const sectionStatus: Record<SettingsSectionId, string> = {
-    claude: `${selectedProvider === "anthropic" ? "default" : "available"} · ${signedIn ? "signed in" : settings.apiKeySet ? "key stored" : "not connected"}`,
-    openai: `${selectedProvider === "openai" ? "default" : "available"} · ${connectedOpenAIAccounts.length} account${connectedOpenAIAccounts.length === 1 ? "" : "s"}`,
-    usage: `${Number(signedIn) + connectedOpenAIAccounts.length} connected account${Number(signedIn) + connectedOpenAIAccounts.length === 1 ? "" : "s"}`,
-    permissions: `${settings.permissionMode} · ${settings.rules.length} rule${settings.rules.length === 1 ? "" : "s"}`,
+    openai: `${selectedProvider === "openai" ? "default" : "available"} · ${signedInOpenAI ? "Codex connected" : "Codex not connected"}`,
+    usage: signedInOpenAI ? "Codex connected" : "Codex not connected",
+    permissions: settings.permissionMode,
     interface: `${Math.round(uiScale * 100)}% · ${ambientRain || scanlines ? "effects on" : "effects off"}`,
     system: remoteMode
       ? `reports ${crashReporting === true ? "on" : "off"}`
@@ -472,37 +418,17 @@ export function SettingsPanel() {
     setSaving(true);
     try {
       setKeyError(null);
-      await ipc.setApiKey(apiKey.trim());
-      // The credential write is the commit point. Drop the raw secret before any
-      // follow-up work, then refresh the derived apiKeySet flag from the native
-      // credential store. A read failure cannot roll the committed credential
-      // back, so keep the UI conservative and mark the key present locally.
+      const status = await ipc.loginCodexApiKey(apiKey.trim());
       setApiKey("");
-      try {
-        useStore.setState({ settings: await ipc.getSettings() });
-      } catch {
-        useStore.setState((state) => ({
-          settings: { ...state.settings, apiKeySet: true },
-        }));
-      }
+      useStore.setState({ openAIAuthStatus: status, openAIAuthError: null });
+      await refreshOpenAIStatus();
       setSavedKey(true);
       if (savedTimer.current !== null) clearTimeout(savedTimer.current);
       savedTimer.current = setTimeout(() => setSavedKey(false), 1800);
     } catch (err) {
-      // Only the credential write itself can fail this operation. Until it
-      // succeeds, retain the typed value so the user can retry.
       setKeyError(err instanceof Error ? err.message : String(err));
     } finally {
       setSaving(false);
-    }
-  };
-
-  const signIn = async () => {
-    setSigningIn(true);
-    try {
-      await loginWithClaude();
-    } finally {
-      setSigningIn(false);
     }
   };
 
@@ -534,7 +460,7 @@ export function SettingsPanel() {
     }
   };
 
-  const saveLabel = savedKey ? "Saved" : saving ? "…" : settings.apiKeySet ? "Replace" : "Save";
+  const saveLabel = savedKey ? "Connected" : saving ? "…" : "Use API key";
 
   return (
     <div
@@ -680,193 +606,6 @@ export function SettingsPanel() {
             )}
 
             <div className="pc-settings-sections">
-              {/* CLAUDE */}
-              <section
-                id="pc-settings-claude"
-                ref={(node) => {
-                  sectionRefs.current.claude = node;
-                }}
-                className={`pc-settings-section ${
-                  remoteMode || !visibleSectionIds.has("claude") ? "hidden" : ""
-                }`}
-                onFocusCapture={() => setActiveSection("claude")}
-              >
-                <SettingsSectionHeader
-                  eyebrow="ANTHROPIC"
-                  title="Claude"
-                  description="Claude models, Claude account access, and the Anthropic API key live here—nothing in this section is sent to OpenAI."
-                  status={sectionStatus.claude}
-                  statusTone={signedIn || settings.apiKeySet ? "success" : "cyan"}
-                  tone="violet"
-                />
-                <div className="pc-settings-group pc-provider-section pc-provider-section--claude">
-                  <ProviderBanner
-                    provider="claude"
-                    vendor="Anthropic"
-                    title="Claude"
-                    active={selectedProvider === "anthropic"}
-                    model={selectedProvider === "anthropic" ? selectedModel?.label : undefined}
-                  />
-                  <div className="pc-provider-grid">
-                    <div id="pc-setting-claude-model" className="pc-provider-card">
-                      <div className="pc-provider-card__heading">
-                        <span>Model</span>
-                        <span>CLAUDE ONLY</span>
-                      </div>
-                      <label
-                        htmlFor="pc-settings-claude-model"
-                        className="mb-1.5 block text-[12.5px] font-medium text-fg"
-                      >
-                        Claude model for new sessions
-                      </label>
-                      <SelectMenu
-                        id="pc-settings-claude-model"
-                        label="Claude model for new sessions"
-                        value={claudeModelValue}
-                        onChange={(next) => void updateSettings({ model: next })}
-                        className="w-full"
-                        buttonClassName="px-3 py-2.5 text-[12.5px]"
-                        groups={[
-                          {
-                            id: "claude-models",
-                            options: [
-                              {
-                                value: "choose-claude",
-                                label: "Choose a Claude model…",
-                                disabled: true,
-                              },
-                              ...ANTHROPIC_MODELS.map((model) => ({
-                                value: model.id,
-                                label: model.label,
-                              })),
-                            ],
-                          },
-                        ]}
-                      />
-                      <p className="mt-1.5 text-[11px] text-faint">
-                        Choosing a Claude model makes Anthropic the default for new chats.
-                      </p>
-                    </div>
-
-                    <div id="pc-setting-claude" className="pc-provider-card">
-                      <div className="pc-provider-card__heading">
-                        <span>Account</span>
-                        <span>CLAUDE PRO / MAX</span>
-                      </div>
-                      <h3>Claude subscription</h3>
-                      {signedIn ? (
-                        <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-panel-2 px-3 py-2.5">
-                          <div className="min-w-0 text-[12.5px]">
-                            <div className="flex items-center gap-1.5">
-                              <span className="pc-dot pc-dot--success" />
-                              <span className="min-w-0 truncate text-fg">
-                                Signed in{oauthStatus?.account ? ` as ${oauthStatus.account}` : ""}
-                              </span>
-                              {oauthStatus?.tier && (
-                                <span
-                                  title={oauthStatus.tier}
-                                  className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wider shadow-sm ${
-                                    /max/i.test(oauthStatus.tier)
-                                      ? "bg-gradient-to-r from-amber-300 to-amber-500 text-black"
-                                      : "bg-gradient-to-r from-violet-400 to-indigo-500 text-white"
-                                  }`}
-                                >
-                                  {oauthStatus.tier.replace(/^Claude\s+/, "")}
-                                </span>
-                              )}
-                            </div>
-                            {oauthStatus?.expiresAt != null && (
-                              <div className="mt-0.5 text-[11px] text-muted">
-                                Access expires {formatExpiry(oauthStatus.expiresAt)}
-                              </div>
-                            )}
-                          </div>
-                          <button
-                            type="button"
-                            aria-label="Log out of Claude"
-                            onClick={() => void logoutClaude()}
-                            className="shrink-0 rounded-lg border border-border bg-panel px-3 py-2 text-[12.5px] text-muted hover:text-fg"
-                          >
-                            Log out
-                          </button>
-                        </div>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={() => void signIn()}
-                          disabled={signingIn}
-                          className="pc-btn-accent w-full px-3 py-2.5 text-[12.5px] disabled:opacity-30"
-                        >
-                          {signingIn ? "Signing in…" : "Sign in with Claude"}
-                        </button>
-                      )}
-                      {oauthError && (
-                        <p className="mt-1.5 text-[11px] text-danger" role="alert">
-                          Sign-in failed: {oauthError}
-                        </p>
-                      )}
-                      <p className="mt-1.5 text-[11px] text-faint">
-                        Uses your eligible Claude subscription instead of API billing.
-                      </p>
-                    </div>
-
-                    <div
-                      id="pc-setting-anthropic-api-key"
-                      className="pc-provider-card pc-provider-card--wide"
-                    >
-                      <div className="pc-provider-card__heading">
-                        <span>API credential</span>
-                        <span>ANTHROPIC ONLY</span>
-                      </div>
-                      <label
-                        htmlFor="pc-settings-apikey"
-                        className="mb-1.5 block text-[12.5px] font-medium text-fg"
-                      >
-                        Anthropic API key
-                      </label>
-                      <div className="flex gap-2">
-                        <input
-                          id="pc-settings-apikey"
-                          type="password"
-                          value={apiKey}
-                          onChange={(e) => {
-                            setApiKey(e.target.value);
-                            // Clear a stale "Couldn't save key" as the user corrects it.
-                            if (keyError) setKeyError(null);
-                          }}
-                          placeholder={settings.apiKeySet ? "••••••••  (replace)" : "sk-ant-…"}
-                          className="flex-1 rounded-lg border border-border bg-panel-2 px-3 py-2.5 font-mono text-[12.5px] text-muted outline-none transition-colors focus:border-accent/50 select-text"
-                        />
-                        <button
-                          ref={saveBtnRef}
-                          type="button"
-                          onClick={() => void saveKey()}
-                          disabled={saving || !apiKey.trim()}
-                          className="pc-btn-accent px-4 py-2.5 text-[12.5px] disabled:opacity-30"
-                        >
-                          {saveLabel}
-                        </button>
-                      </div>
-                      {keyError && (
-                        <p className="mt-1.5 text-[11px] text-danger" role="alert">
-                          Couldn't save key: {keyError}
-                        </p>
-                      )}
-                      <span role="status" aria-live="polite" className="sr-only">
-                        {savedKey ? "Anthropic API key saved" : ""}
-                      </span>
-                      <p className="mt-1.5 text-[11px] text-faint">
-                        {signedIn
-                          ? "Optional while signed in with Claude. Subscription access takes priority."
-                          : settings.apiKeySet
-                            ? "An Anthropic key is stored in Windows Credential Manager."
-                            : "Stored in Windows Credential Manager and used only for Claude requests."}
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              </section>
-
               {/* OPENAI */}
               <section
                 id="pc-settings-openai"
@@ -881,7 +620,7 @@ export function SettingsPanel() {
                 <SettingsSectionHeader
                   eyebrow="OPENAI"
                   title="GPT / Codex"
-                  description="OpenAI models, ChatGPT account access, and reasoning controls stay separate from Claude credentials."
+                  description="OpenAI models, Codex authentication, and reasoning controls live here."
                   status={sectionStatus.openai}
                   statusTone={signedInOpenAI ? "success" : "cyan"}
                 />
@@ -910,7 +649,7 @@ export function SettingsPanel() {
                         id="pc-settings-openai-model"
                         label="OpenAI model for new sessions"
                         value={openAIModelValue}
-                        onChange={(next) => void updateSettings({ model: next })}
+                        onChange={(next) => void updateDefaultOpenAISettings({ model: next })}
                         disabled={
                           !openAIAvailable ||
                           !defaultOpenAIAccount ||
@@ -965,8 +704,10 @@ export function SettingsPanel() {
                         <SelectMenu
                           id="pc-settings-reasoning"
                           label="Reasoning level"
-                          value={settings.reasoningEffort}
-                          onChange={(next) => void updateSettings({ reasoningEffort: next })}
+                          value={selectedReasoningEffort}
+                          onChange={(next) =>
+                            void updateDefaultOpenAISettings({ reasoningEffort: next })
+                          }
                           className="w-full"
                           buttonClassName="px-3 py-2.5 text-[12.5px]"
                           groups={[
@@ -992,10 +733,10 @@ export function SettingsPanel() {
                     <div id="pc-setting-openai" className="pc-provider-card pc-provider-card--wide">
                       <div className="pc-provider-card__heading">
                         <span>Authentication</span>
-                        <span>CHATGPT SUBSCRIPTION</span>
+                        <span>ONE CODEX SLOT</span>
                       </div>
                       <div className="flex items-center justify-between gap-3">
-                        <h3>ChatGPT accounts</h3>
+                        <h3>Codex authentication</h3>
                         {openAIAvailable && (
                           <button
                             type="button"
@@ -1003,7 +744,11 @@ export function SettingsPanel() {
                             disabled={signingInOpenAI || openAIAccountAction !== null}
                             className="pc-settings-action"
                           >
-                            {signingInOpenAI ? "Adding…" : "+ Add account"}
+                            {signingInOpenAI
+                              ? "Connecting…"
+                              : codexAccount
+                                ? "Switch to ChatGPT"
+                                : "Sign in with ChatGPT"}
                           </button>
                         )}
                       </div>
@@ -1013,75 +758,42 @@ export function SettingsPanel() {
                           <span>
                             {openAIAuthStatus?.unavailableReason ??
                               "ChatGPT subscription access is unavailable in this build."}
-                            {openAIAccounts.length > 0
+                            {codexAccount
                               ? " Existing credentials can still be removed below."
                               : ""}
                           </span>
                         </div>
                       )}
-                      {openAIAccountsLoading && openAIAccounts.length === 0 ? (
+                      {openAIAccountsLoading && !codexAccount ? (
                         <div className="pc-openai-account-empty" role="status">
-                          Loading ChatGPT accounts…
+                          Loading Codex authentication…
                         </div>
-                      ) : openAIAccountsError && openAIAccounts.length === 0 ? (
+                      ) : openAIAccountsError && !codexAccount ? (
                         <div className="pc-openai-account-empty" role="alert">
-                          <strong>Couldn’t load ChatGPT accounts</strong>
+                          <strong>Couldn’t load Codex authentication</strong>
                           <span>{openAIAccountsError}</span>
                           <button type="button" onClick={() => void refreshOpenAIStatus()}>
                             Retry account discovery
                           </button>
                         </div>
-                      ) : openAIAccounts.length === 0 ? (
+                      ) : !codexAccount ? (
                         <div className="pc-openai-account-empty">
-                          <strong>No ChatGPT accounts connected</strong>
+                          <strong>Codex is not connected</strong>
                           <span>
-                            Add an eligible ChatGPT subscription account to create GPT chats.
+                            Sign in with ChatGPT or use an OpenAI Platform API key below. Either
+                            choice becomes this device’s Codex authentication.
                           </span>
                         </div>
                       ) : (
                         <>
-                          {defaultOpenAIAccount && (
-                            <div className="mb-3 rounded-lg border border-border bg-panel-2 px-3 py-3">
-                              <label className="mb-1.5 block text-[12.5px] font-medium text-fg">
-                                Default ChatGPT account
-                              </label>
-                              <SelectMenu
-                                label="Default ChatGPT account"
-                                value={defaultOpenAIAccount.id}
-                                onChange={(next) => void setDefaultOpenAIAccount(next)}
-                                disabled={connectedOpenAIAccounts.length < 2}
-                                className="w-full"
-                                buttonClassName="px-3 py-2.5 text-[12.5px]"
-                                groups={[
-                                  {
-                                    id: "default-chatgpt-account",
-                                    options: connectedOpenAIAccounts.map((account) => ({
-                                      value: account.id,
-                                      label: `${openAIAccountLabel(account, openAIAccounts)}${
-                                        account.tier
-                                          ? ` · ${account.tier.replace(/^ChatGPT\s+/i, "")}`
-                                          : ""
-                                      }`,
-                                    })),
-                                  },
-                                ]}
-                              />
-                              <p className="mt-1.5 text-[11px] text-faint">
-                                New GPT chats use this account. Existing chats keep the account they
-                                started with.
-                              </p>
-                            </div>
-                          )}
                           {reconnectOnlyOpenAI && (
                             <div className="pc-openai-capability-notice" role="status">
-                              <strong>No connected ChatGPT account</strong>
-                              <span>
-                                Reconnect a saved profile below; history remains readable.
-                              </span>
+                              <strong>Codex needs authentication</strong>
+                              <span>Reconnect below; existing history remains readable.</span>
                             </div>
                           )}
-                          <div className="pc-openai-account-list" aria-label="ChatGPT accounts">
-                            {openAIAccounts.map((account) => {
+                          <div className="pc-openai-account-list" aria-label="Codex authentication">
+                            {[codexAccount].map((account) => {
                               const reconnecting =
                                 openAIAccountAction === `reconnect:${account.id}`;
                               const removing = openAIAccountAction === `remove:${account.id}`;
@@ -1108,9 +820,6 @@ export function SettingsPanel() {
                                         <span className="pc-openai-account-tier">
                                           {account.tier.replace(/^ChatGPT\s+/i, "")}
                                         </span>
-                                      )}
-                                      {account.id === defaultOpenAIAccount?.id && (
-                                        <span className="pc-openai-account-tier">Default</span>
                                       )}
                                     </div>
                                     <small>
@@ -1146,9 +855,9 @@ export function SettingsPanel() {
                                             className="is-danger"
                                             onClick={() => void removeOpenAI(account.id)}
                                             disabled={removing}
-                                            aria-label={`Confirm remove ${displayLabel}`}
+                                            aria-label={`Confirm sign out ${displayLabel}`}
                                           >
-                                            {removing ? "Removing…" : "Confirm remove"}
+                                            {removing ? "Signing out…" : "Confirm sign out"}
                                           </button>
                                         </>
                                       ) : (
@@ -1156,9 +865,9 @@ export function SettingsPanel() {
                                           type="button"
                                           onClick={() => setPendingOpenAIRemoval(account.id)}
                                           disabled={openAIAccountAction !== null}
-                                          aria-label={`Remove ${displayLabel}`}
+                                          aria-label={`Sign out ${displayLabel}`}
                                         >
-                                          Remove
+                                          Sign out
                                         </button>
                                       ))}
                                   </div>
@@ -1166,32 +875,9 @@ export function SettingsPanel() {
                               );
                             })}
                           </div>
-                          {openAIReconnectMismatch && (
-                            <div className="pc-openai-capability-notice" role="alert">
-                              <strong>Different ChatGPT account detected</strong>
-                              <span>
-                                {openAIReconnectMismatch.message} The original profile
-                                {reconnectMismatchAccount && (
-                                  <>
-                                    {" ("}
-                                    {openAIAccountLabel(reconnectMismatchAccount, openAIAccounts)}
-                                    {")"}
-                                  </>
-                                )}{" "}
-                                was unchanged.
-                              </span>
-                              <button
-                                type="button"
-                                onClick={() => void signInOpenAI()}
-                                disabled={signingInOpenAI || openAIAccountAction !== null}
-                              >
-                                {signingInOpenAI ? "Adding…" : "Add as separate account"}
-                              </button>
-                            </div>
-                          )}
                         </>
                       )}
-                      {openAIAccountsError && openAIAccounts.length > 0 && (
+                      {openAIAccountsError && codexAccount && (
                         <div className="pc-openai-accounts-error" role="alert">
                           <span>Couldn’t refresh accounts: {openAIAccountsError}</span>
                           <button type="button" onClick={() => void refreshOpenAIStatus()}>
@@ -1201,17 +887,50 @@ export function SettingsPanel() {
                       )}
                       {openAIAuthError && (
                         <p className="mt-1.5 text-[11px] text-danger" role="alert">
-                          ChatGPT accounts: {openAIAuthError}
+                          Codex authentication: {openAIAuthError}
                         </p>
                       )}
                       <p className="mt-1.5 text-[11px] text-faint">
-                        Uses models included with your eligible ChatGPT subscription.
+                        ChatGPT subscription and OpenAI Platform API-key modes use the same bundled
+                        Codex engine. Only billing and authentication differ. Switching modes
+                        replaces the current Codex authentication on this device.
                       </p>
                       <div id="pc-setting-openai-auth-note" className="pc-provider-boundary">
-                        <strong>OpenAI API keys are not used by this integration.</strong>
+                        <strong>Or use an OpenAI Platform API key</strong>
                         <span>
-                          OpenAI authenticates through ChatGPT sign-in. Your Anthropic key is never
-                          sent to OpenAI.
+                          The key is handed directly to Codex and is never stored by Portcode. Using
+                          it replaces the current ChatGPT authentication for this device.
+                        </span>
+                        <div className="mt-2 flex gap-2">
+                          <input
+                            id="pc-settings-openai-api-key"
+                            type="password"
+                            value={apiKey}
+                            onChange={(event) => {
+                              setApiKey(event.target.value);
+                              if (keyError) setKeyError(null);
+                            }}
+                            placeholder="sk-…"
+                            aria-label="OpenAI Platform API key"
+                            className="flex-1 rounded-lg border border-border bg-panel-2 px-3 py-2.5 font-mono text-[12.5px] text-muted outline-none transition-colors focus:border-accent/50 select-text"
+                          />
+                          <button
+                            ref={saveBtnRef}
+                            type="button"
+                            onClick={() => void saveKey()}
+                            disabled={saving || !apiKey.trim()}
+                            className="pc-btn-accent px-4 py-2.5 text-[12.5px] disabled:opacity-30"
+                          >
+                            {saveLabel}
+                          </button>
+                        </div>
+                        {keyError && (
+                          <span className="mt-1.5 text-[11px] text-danger" role="alert">
+                            API-key sign-in failed: {keyError}
+                          </span>
+                        )}
+                        <span role="status" aria-live="polite" className="sr-only">
+                          {savedKey ? "OpenAI API key connected" : ""}
                         </span>
                       </div>
                     </div>
@@ -1233,9 +952,9 @@ export function SettingsPanel() {
                 <SettingsSectionHeader
                   eyebrow="PLAN ALLOWANCE"
                   title="Plan usage"
-                  description="Claude and GPT allowance at a glance."
+                  description="Codex allowance and reset windows from the active OpenAI account."
                   status={sectionStatus.usage}
-                  statusTone={signedIn || signedInOpenAI ? "success" : "cyan"}
+                  statusTone={signedInOpenAI ? "success" : "cyan"}
                   tone="cyan"
                 />
                 <div
@@ -1529,7 +1248,7 @@ function ProviderBanner({
   active,
   model,
 }: {
-  provider: "claude" | "openai";
+  provider: "openai";
   vendor: string;
   title: string;
   active: boolean;
@@ -1538,7 +1257,7 @@ function ProviderBanner({
   return (
     <div className={`pc-provider-banner pc-provider-banner--${provider}`}>
       <div className="pc-provider-mark" aria-hidden="true">
-        {provider === "claude" ? "C" : "O"}
+        O
       </div>
       <div className="pc-provider-banner__copy">
         <span>{vendor}</span>
@@ -1585,12 +1304,6 @@ function SettingsSectionHeader({
 
 function SettingsGlyph({ id }: { id: SettingsSectionId }) {
   const paths: Record<SettingsSectionId, ReactNode> = {
-    claude: (
-      <>
-        <circle cx="12" cy="12" r="3" />
-        <path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1m0-12.8-2.1 2.1m-8.6 8.6-2.1 2.1" />
-      </>
-    ),
     openai: (
       <>
         <path d="M8.2 4.6A5.1 5.1 0 0 1 17 8.1a5.1 5.1 0 0 1-1.3 9.8 5.1 5.1 0 0 1-8.8-3.5A5.1 5.1 0 0 1 8.2 4.6Z" />
@@ -1872,36 +1585,30 @@ function ScaleRow({
   );
 }
 
-// Only tools that can reach the permission gate belong here. Read-only and
-// delegation rules would never fire, so offering them would imply protection
-// the core does not need or apply.
-const PERM_TOOLS = ["write_file", "edit_file", "run_command", "*"] as const;
-
 const MODE_INFO: Record<PermissionMode, { label: string; hint: string }> = {
   default: {
     label: "Default",
-    hint: "Use the policy below; protected actions ask unless an Allow rule matches.",
+    hint: "Codex policy: untrusted approvals · workspace-write sandbox.",
   },
   acceptEdits: {
     label: "Accept edits",
-    hint: "Auto-allow file changes; protected actions ask unless an Allow rule matches.",
+    hint: "Codex policy: on-request approvals · workspace-write sandbox.",
   },
-  plan: { label: "Plan", hint: "Read-only — deny every mutating tool." },
+  plan: { label: "Plan", hint: "Codex policy: never ask · read-only sandbox." },
   auto: {
     label: "Auto",
-    hint: "Auto-allow configurable actions; protected actions ask unless explicitly allowed.",
+    hint: "Codex policy: auto-review · on-request approvals · workspace-write sandbox.",
   },
   bypass: {
     label: "Bypass",
-    hint: "Skip every permission prompt and rule, including commands and protected actions.",
+    hint: "Codex policy: never ask · danger-full-access sandbox.",
   },
 };
 const MODE_ORDER: PermissionMode[] = ["default", "acceptEdits", "plan", "auto", "bypass"];
 
 /**
- * The permission mode + per-tool/command rule editor. auto/bypass require an
- * explicit danger acknowledgment to engage. New command Allow rules are created
- * by the in-context Always allow action rather than this broad prefix editor.
+ * Codex approval/sandbox mode selector. Auto and bypass require an explicit
+ * danger acknowledgment before the native engine receives the broader policy.
  */
 function PermissionSettings() {
   const settings = useStore((s) => s.settings);
@@ -1915,13 +1622,8 @@ function PermissionSettings() {
   // hidden (the phone observes the active mode via the HUD but doesn't edit it).
   const remoteMode = useStore((s) => s.remoteMode);
   const mode = settings.permissionMode;
-  const rules = settings.rules;
 
   const [confirmMode, setConfirmMode] = useState<PermissionMode | null>(null);
-  const [confirmPolicy, setConfirmPolicy] = useState<ToolPolicy | null>(null);
-  const [ruleTool, setRuleTool] = useState("run_command");
-  const [ruleCommand, setRuleCommand] = useState("");
-  const [ruleDecision, setRuleDecision] = useState<ToolPolicy>("ask");
 
   const pickMode = (m: PermissionMode) => {
     if (permissionModeLocked) return;
@@ -1936,60 +1638,6 @@ function PermissionSettings() {
   useEffect(() => {
     if (permissionModeLocked) setConfirmMode(null);
   }, [permissionModeLocked]);
-
-  const pickPolicy = (policy: ToolPolicy) => {
-    if (policy === "allow") {
-      setConfirmPolicy(policy);
-      return;
-    }
-    setConfirmPolicy(null);
-    void updateSettings({ defaultPolicy: policy });
-  };
-
-  // A wildcard Allow still loosens every configurable action, so warn loudly.
-  const overBroadAllow = ruleDecision === "allow" && ruleTool === "*";
-
-  const addRule = () => {
-    // Independent from the decision picker: stale state or a future UI refactor
-    // still cannot create a new shell Allow rule.
-    if (isCommandToolName(ruleTool) && ruleDecision === "allow") return;
-    const command = isCommandToolName(ruleTool) && ruleCommand.trim() ? ruleCommand : undefined;
-    const rule: Rule = command
-      ? { tool: ruleTool, command, decision: ruleDecision }
-      : { tool: ruleTool, decision: ruleDecision };
-    const sameScope = (candidate: Rule) =>
-      toolNamesEquivalent(candidate.tool, rule.tool) && candidate.command === rule.command;
-    const existing = rules.find(sameScope);
-    if (existing?.decision === rule.decision) return;
-
-    const retained = rules.filter((candidate) => !sameScope(candidate));
-    const shadows = (candidate: Rule) => {
-      if (candidate.command !== undefined) {
-        return (
-          rule.command !== undefined &&
-          (candidate.tool === "*" || toolNamesEquivalent(candidate.tool, rule.tool)) &&
-          rule.command.startsWith(candidate.command)
-        );
-      }
-      return candidate.tool === "*" || toolNamesEquivalent(candidate.tool, rule.tool);
-    };
-    const shadowingIndex = retained.findIndex(shadows);
-    const insertionIndex = shadowingIndex === -1 ? retained.length : shadowingIndex;
-    const nextRules = [
-      ...retained.slice(0, insertionIndex),
-      rule,
-      ...retained.slice(insertionIndex),
-    ];
-
-    // Rules are first-match. A newly added rule must precede a broad wildcard or
-    // tool/prefix rule that would otherwise shadow it. Broad rules stay after
-    // existing exceptions, and replacing a scope never leaves an inert duplicate.
-    void updateSettings({ rules: nextRules });
-    setRuleCommand("");
-  };
-
-  const removeRule = (i: number) =>
-    void updateSettings({ rules: rules.filter((_, idx) => idx !== i) });
 
   return (
     <div className={remoteMode ? "hidden" : undefined}>
@@ -2052,8 +1700,8 @@ function PermissionSettings() {
           <p>
             ⚠ <strong className="capitalize">{MODE_INFO[confirmMode].label}</strong>{" "}
             {confirmMode === "bypass"
-              ? "lets the agent run every mutation without prompts and ignores permission rules."
-              : "lets the agent run configurable mutations without asking; protected actions still ask unless an Allow rule matches."}{" "}
+              ? "gives Codex danger-full-access without approval prompts."
+              : "lets Codex work in the workspace-write sandbox with on-request approvals and automatic review."}{" "}
             Only enable it if you trust the task.
           </p>
           <div className="mt-2 flex gap-2">
@@ -2077,175 +1725,6 @@ function PermissionSettings() {
           </div>
         </div>
       )}
-
-      <div id="pc-setting-default-policy" className="mt-3">
-        <div className="mb-1 text-[11px] text-faint">
-          Default-mode policy for configurable actions (used when the mode is Default)
-        </div>
-        <div className="flex gap-2">
-          {(["allow", "ask", "deny"] as ToolPolicy[]).map((p) => (
-            <button
-              key={p}
-              type="button"
-              onClick={() => pickPolicy(p)}
-              className={`flex-1 rounded-lg border px-3 py-2 text-[12.5px] capitalize transition-colors ${
-                settings.defaultPolicy === p
-                  ? "border-accent-2/50 bg-accent-2/10 text-accent-2"
-                  : "border-border bg-panel-2 text-muted hover:border-accent-2/40"
-              }`}
-            >
-              {p}
-            </button>
-          ))}
-        </div>
-        {confirmPolicy === "allow" && (
-          <div
-            role="alert"
-            className="mt-2 rounded-lg border border-danger/50 bg-danger/10 p-2.5 text-[11.5px] text-danger"
-          >
-            <p>
-              ⚠ <strong>Allow by default</strong> lets every unmatched configurable action run
-              without asking. Protected actions still ask unless an explicit Allow rule matches. Use
-              specific rules when possible.
-            </p>
-            <div className="mt-2 flex gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  void updateSettings({ defaultPolicy: "allow" });
-                  setConfirmPolicy(null);
-                }}
-                className="rounded border border-danger/60 bg-danger/15 px-2.5 py-1 text-danger"
-              >
-                Enable default Allow
-              </button>
-              <button
-                type="button"
-                onClick={() => setConfirmPolicy(null)}
-                className="rounded border border-border bg-panel-2 px-2.5 py-1 text-muted"
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
-
-      <div id="pc-setting-tool-rules" className="mt-3">
-        <div className="mb-1 text-[11px] text-faint">
-          Rules — first match wins; explicit Allow rules remember approved scopes
-        </div>
-        {rules.length === 0 ? (
-          <p className="text-[11px] text-faint">
-            No rules yet. Protected actions ask unless Bypass is enabled.
-          </p>
-        ) : (
-          <ul className="flex flex-col gap-1">
-            {rules.map((r, i) => (
-              <li
-                key={`${r.tool}|${r.command ?? ""}|${r.decision}`}
-                className="flex items-center justify-between gap-2 rounded border border-border bg-panel-2 px-2 py-1 text-[11.5px]"
-              >
-                <span className="min-w-0 truncate font-mono">
-                  <span className="text-fg">{r.tool === "*" ? "Any tool" : toolLabel(r.tool)}</span>
-                  {r.command ? <span className="text-muted"> “{r.command}”</span> : null}{" "}
-                  <span
-                    className={
-                      r.decision === "allow"
-                        ? "text-accent-2"
-                        : r.decision === "deny"
-                          ? "text-danger"
-                          : "text-warn"
-                    }
-                  >
-                    → {r.decision}
-                  </span>
-                </span>
-                <button
-                  type="button"
-                  onClick={() => removeRule(i)}
-                  aria-label={`Remove rule ${i + 1}`}
-                  className="shrink-0 px-1 text-muted hover:text-danger"
-                >
-                  ×
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-
-        <div className="mt-2 flex flex-wrap items-center gap-2">
-          <SelectMenu
-            label="Rule tool"
-            value={ruleTool}
-            onChange={(next) => {
-              setRuleTool(next);
-              if (isCommandToolName(next) && ruleDecision === "allow") {
-                setRuleDecision("ask");
-              }
-            }}
-            placement="top"
-            className="w-[136px]"
-            buttonClassName="px-2 py-1.5 font-mono text-[11.5px]"
-            groups={[
-              {
-                id: "tools",
-                label: "Agent tools",
-                options: PERM_TOOLS.map((tool) => ({
-                  value: tool,
-                  label: tool === "*" ? "Any tool" : toolLabel(tool),
-                })),
-              },
-            ]}
-          />
-          {isCommandToolName(ruleTool) && (
-            <input
-              aria-label="Command prefix"
-              value={ruleCommand}
-              onChange={(e) => setRuleCommand(e.target.value)}
-              placeholder="command prefix (e.g. git )"
-              className="min-w-0 flex-1 rounded border border-border bg-panel-2 px-2 py-1 text-[11.5px] text-fg"
-            />
-          )}
-          <SelectMenu
-            label="Rule decision"
-            value={ruleDecision}
-            onChange={(next) => setRuleDecision(next as ToolPolicy)}
-            placement="top"
-            className="w-[96px]"
-            buttonClassName="px-2 py-1.5 text-[11.5px] capitalize"
-            groups={[
-              {
-                id: "decisions",
-                options: (isCommandToolName(ruleTool)
-                  ? (["ask", "deny"] as ToolPolicy[])
-                  : (["allow", "ask", "deny"] as ToolPolicy[])
-                ).map((decision) => ({ value: decision, label: decision })),
-              },
-            ]}
-          />
-          <button
-            type="button"
-            onClick={addRule}
-            className="rounded border border-accent-2/50 bg-accent-2/10 px-2.5 py-1 text-[11.5px] text-accent-2"
-          >
-            Add rule
-          </button>
-        </div>
-        {overBroadAllow && (
-          <p role="alert" className="mt-1.5 text-[11px] text-danger">
-            ⚠ This allow rule matches every gated tool, including protected actions. Prefer a
-            specific tool.
-          </p>
-        )}
-        <p className="mt-1.5 text-[11px] text-faint">
-          Command prefixes scope Ask or Deny rules here. “Always allow” can add a scoped command
-          Allow rule directly from a prompt.
-        </p>
-        <p className="mt-1 text-[11px] text-faint">
-          Read-only browsing and delegated tasks never require permission rules.
-        </p>
-      </div>
     </div>
   );
 }

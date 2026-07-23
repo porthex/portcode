@@ -4,7 +4,13 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import App from "./App";
 import { useStore } from "./store/store";
-import { DEFAULT_SETTINGS, type OpenAIModelCatalogState } from "./types";
+import {
+  DEFAULT_SETTINGS,
+  OPENAI_FALLBACK_MODELS,
+  type OpenAIAccountSummary,
+  type OpenAIModelCatalogRow,
+  type OpenAIModelCatalogState,
+} from "./types";
 import * as ipc from "./lib/ipc";
 import { getInstallState } from "./lib/installGate";
 
@@ -146,10 +152,6 @@ vi.mock("./lib/ipc", () => ({
   // store.init() hydrates per-session drafts + cumulative usage on mount.
   getDrafts: vi.fn(),
   getAllUsage: vi.fn(),
-  // store.init() restores subscription sign-in via ipc.oauthStatus() on mount.
-  oauthStatus: vi.fn(),
-  startOauthLogin: vi.fn(),
-  oauthLogout: vi.fn(),
   openaiOauthStatus: vi.fn(),
   listOpenAIAccounts: vi.fn(),
   openaiModels: vi.fn(),
@@ -173,6 +175,23 @@ vi.mock("./lib/ipc", () => ({
 const m = vi.mocked(ipc);
 const currentWindow = vi.mocked(getCurrentWindow);
 const initialState = useStore.getState();
+const CODEX_PRIMARY_ACCOUNT: OpenAIAccountSummary = {
+  id: "codex-primary",
+  accountLabel: "OpenAI Platform API key",
+  tier: null,
+  expiresAt: null,
+  state: "connected",
+  createdAt: 1,
+  updatedAt: 1,
+  lastUsedAt: 1,
+};
+const CODEX_PRIMARY_MODEL_ROWS: OpenAIModelCatalogRow[] = OPENAI_FALLBACK_MODELS.map((model) => ({
+  id: model.id,
+  label: model.label,
+  reasoningEfforts: model.reasoningEfforts ?? ["medium"],
+  defaultReasoningEffort: model.defaultReasoningEffort ?? "medium",
+  serviceTiers: model.serviceTiers ?? [],
+}));
 
 beforeEach(() => {
   vi.unstubAllEnvs();
@@ -204,15 +223,15 @@ beforeEach(() => {
   m.getMessages.mockResolvedValue([]);
   m.getDrafts.mockResolvedValue([]);
   m.getAllUsage.mockResolvedValue([]);
-  m.oauthStatus.mockResolvedValue({ signedIn: false, expiresAt: null, account: null, tier: null });
   m.openaiOauthStatus.mockResolvedValue({
-    signedIn: false,
+    signedIn: true,
     expiresAt: null,
-    account: null,
+    account: CODEX_PRIMARY_ACCOUNT.accountLabel,
     tier: null,
+    available: true,
   });
-  m.openaiModels.mockResolvedValue([]);
-  m.listOpenAIAccounts.mockResolvedValue([]);
+  m.openaiModels.mockResolvedValue(CODEX_PRIMARY_MODEL_ROWS);
+  m.listOpenAIAccounts.mockResolvedValue([CODEX_PRIMARY_ACCOUNT]);
   m.getPlanUsage.mockImplementation(async (provider) => ({
     provider,
     plan: null,
@@ -733,7 +752,7 @@ describe("TitleBar", () => {
     expect(container).toHaveTextContent("one@chatgpt.test");
     expect(container).not.toHaveTextContent(accountProfileId);
     const titlebarAccount = screen.getByRole("banner").querySelector(".pc-titlebar__account-pill");
-    expect(titlebarAccount).toHaveAttribute("title", "ChatGPT account: one@chatgpt.test");
+    expect(titlebarAccount).toHaveAttribute("title", "Codex authentication: one@chatgpt.test");
     expect(titlebarAccount?.querySelector(".pc-titlebar__account-label")).toHaveTextContent(
       "one@chatgpt.test",
     );
@@ -976,6 +995,8 @@ describe("TitleBar", () => {
     expect(palette).toBeInTheDocument();
     expect(palette).toHaveTextContent("Ctrl K palette");
     expect(palette).not.toHaveTextContent("⌘");
+    fireEvent.click(palette);
+    expect(useStore.getState().showPalette).toBe(true);
   });
 });
 

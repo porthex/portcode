@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Per-target credential storage.
 //!
 //! On **Windows** secrets are backed by the Windows Credential Manager (via the

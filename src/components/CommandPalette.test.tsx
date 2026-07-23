@@ -3,7 +3,12 @@ import { render, screen, fireEvent } from "@testing-library/react";
 
 import { CommandPalette } from "./CommandPalette";
 import { useStore } from "../store/store";
-import { ANTHROPIC_MODELS, DEFAULT_SETTINGS, MODELS } from "../types";
+import {
+  DEFAULT_SETTINGS,
+  MODELS,
+  OPENAI_FALLBACK_MODELS,
+  type OpenAIAccountSummary,
+} from "../types";
 
 // The palette is a thin keyboard-driven view over the real store: each command
 // dispatches a store action, some of which reach the IPC bridge (newSession ->
@@ -29,6 +34,16 @@ import * as ipc from "../lib/ipc";
 
 const m = vi.mocked(ipc);
 const initialState = useStore.getState();
+const CODEX_PRIMARY_ACCOUNT: OpenAIAccountSummary = {
+  id: "codex-primary",
+  accountLabel: "OpenAI Platform API key",
+  tier: null,
+  expiresAt: null,
+  state: "connected",
+  createdAt: 1,
+  updatedAt: 1,
+  lastUsedAt: 1,
+};
 
 // Fixed (non-model) command count, see CommandPalette.tsx.
 const FIXED_COMMANDS = 5;
@@ -49,6 +64,29 @@ beforeEach(() => {
   vi.clearAllMocks();
   // zustand has no reset; restore a pristine store between tests.
   useStore.setState(initialState, true);
+  // Most palette tests exercise command discovery/navigation rather than auth.
+  // Seed the backend's single Codex credential slot so the OpenAI default can
+  // create a chat; auth-specific arrangements still replace this state inline.
+  useStore.setState({
+    settings: DEFAULT_SETTINGS,
+    openAIAuthStatus: {
+      signedIn: true,
+      expiresAt: null,
+      account: CODEX_PRIMARY_ACCOUNT.accountLabel,
+      tier: null,
+      available: true,
+    },
+    openAIAccounts: [CODEX_PRIMARY_ACCOUNT],
+    openAIModels: OPENAI_FALLBACK_MODELS,
+    openAIModelCatalogs: {
+      "codex-primary": {
+        status: "ready",
+        models: OPENAI_FALLBACK_MODELS,
+        error: null,
+      },
+    },
+    lastOpenAIAccountProfileId: "codex-primary",
+  });
 
   m.getSettings.mockResolvedValue(DEFAULT_SETTINGS);
   m.listSessions.mockResolvedValue([]);
@@ -95,7 +133,7 @@ describe("visibility", () => {
     expect(input()).toBeInTheDocument();
     expect(commandButtons()).toHaveLength(TOTAL_COMMANDS);
     expect(screen.getByText("New chat")).toBeInTheDocument();
-    expect(screen.getByText("Model: Claude Opus 4.8")).toBeInTheDocument();
+    expect(screen.getByText("Model: GPT-5.6 Terra")).toBeInTheDocument();
     // hint labels render for commands that declare one
     expect(screen.getByText("Ctrl+N")).toBeInTheDocument();
     expect(screen.getByRole("dialog", { name: "Command palette" })).not.toHaveTextContent("⌘");
@@ -106,7 +144,7 @@ describe("visibility", () => {
     render(<CommandPalette />);
 
     expect(commandButtons()).toHaveLength(FIXED_COMMANDS);
-    expect(screen.queryByText("Model: Claude Opus 4.8")).not.toBeInTheDocument();
+    expect(screen.queryByText("Model: GPT-5.6 Terra")).not.toBeInTheDocument();
   });
 
   it("omits local model commands when the desktop owns a remote chat", () => {
@@ -114,16 +152,15 @@ describe("visibility", () => {
     render(<CommandPalette />);
 
     expect(commandButtons()).toHaveLength(REMOTE_FIXED_COMMANDS);
-    expect(screen.queryByText("Model: Claude Opus 4.8")).not.toBeInTheDocument();
+    expect(screen.queryByText("Model: GPT-5.6 Terra")).not.toBeInTheDocument();
   });
 
-  it("uses the live model catalogue when OpenAI models are unavailable", () => {
+  it("omits model commands when the Codex catalogue is unavailable", () => {
     useStore.setState({ showPalette: true, openAIModels: [] });
     render(<CommandPalette />);
 
-    expect(commandButtons()).toHaveLength(FIXED_COMMANDS + ANTHROPIC_MODELS.length);
-    expect(screen.getByText("Model: Claude Opus 4.8")).toBeInTheDocument();
-    expect(screen.queryByText(/^Model: GPT/)).not.toBeInTheDocument();
+    expect(commandButtons()).toHaveLength(FIXED_COMMANDS);
+    expect(screen.queryByText(/^Model:/)).not.toBeInTheDocument();
   });
 
   it("offers only the pinned ChatGPT account's models for an account-owned chat", () => {
@@ -263,7 +300,7 @@ describe("filtering", () => {
 
     const buttons = commandButtons();
     expect(buttons).toHaveLength(MODELS.length);
-    expect(screen.getByText("Model: Claude Sonnet 4.6")).toBeInTheDocument();
+    expect(screen.getByText("Model: GPT-5.6 Terra")).toBeInTheDocument();
     expect(screen.queryByText("New chat")).toBeNull();
   });
 
@@ -420,16 +457,30 @@ describe("running commands", () => {
     expect(useStore.getState().showPalette).toBe(false);
   });
 
-  it("Enter on a model command persists the model via updateSettings", async () => {
+  it("Enter on an OpenAI model command persists the model via updateSettings", async () => {
+    useStore.setState({
+      activeId: "draft",
+      pendingSession: {
+        id: "draft",
+        title: "New chat",
+        workspace: null,
+        branch: null,
+        model: DEFAULT_SETTINGS.model,
+        accountProfileId: "codex-primary",
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    });
     open();
     render(<CommandPalette />);
 
-    fireEvent.change(input(), { target: { value: "haiku" } });
+    fireEvent.change(input(), { target: { value: "luna" } });
     fireEvent.keyDown(input(), { key: "Enter" });
 
     await vi.waitFor(() =>
       expect(m.saveSettings).toHaveBeenCalledWith({
-        model: "claude-haiku-4-5-20251001",
+        model: "gpt-5.6-luna",
+        provider: "openai",
         reasoningEffort: "medium",
       }),
     );
@@ -546,7 +597,8 @@ describe("message search", () => {
           id: "s2",
           title: "Old chat",
           workspace: null,
-          model: "claude-opus-4-8",
+          model: "gpt-5.6-terra",
+          accountProfileId: "codex-primary",
           createdAt: 1,
           updatedAt: 1,
         },

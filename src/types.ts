@@ -291,6 +291,28 @@ export type StreamEvent =
       command: string;
       exitCode: number;
       output: string;
+    }
+  /** Desktop-only, lossless app-server activity. The normalized variants above
+   * still drive chat state; this keeps every known/unknown Codex event visible. */
+  | {
+      type: "codex_event";
+      sequence: number;
+      method: string;
+      params: unknown;
+      requestId?: unknown;
+      threadId?: string;
+      turnId?: string;
+      itemId?: string;
+      emittedAtMs: number;
+    }
+  /** Desktop-only app-server request whose response is richer than a binary
+   * permission decision. The method-specific params stay lossless so newer
+   * Codex fields can be rendered without changing the transport first. */
+  | {
+      type: "codex_request";
+      id: string;
+      method: string;
+      params: unknown;
     };
 
 /** Terminal/live state of a subagent in the agents panel. */
@@ -333,6 +355,38 @@ export interface PendingPermission {
   input: unknown;
   /** Pre-apply unified diff for file tools; absent for commands/other. */
   diff?: string;
+}
+
+/** A structured request currently waiting for the user on one Codex thread. */
+export interface PendingCodexRequest {
+  id: string;
+  method: string;
+  params: unknown;
+}
+
+/** Exact response envelopes accepted by the supported app-server requests. */
+export type CodexRequestResponse =
+  | {
+      answers: Record<string, { answers: string[] }>;
+    }
+  | {
+      action: "accept" | "decline" | "cancel";
+      content?: unknown;
+    };
+
+/** Lossless activity from the real Codex app-server. Normalized StreamEvent
+ * variants continue to drive the familiar chat UI; this record powers the full
+ * inspectable activity timeline and safely retains unknown future methods. */
+export interface CodexActivityEvent {
+  sequence: number;
+  sessionId: string;
+  threadId: string;
+  turnId?: string | null;
+  itemId?: string | null;
+  method: string;
+  params: unknown;
+  requestId?: unknown;
+  emittedAtMs: number;
 }
 
 export interface DirEntry {
@@ -481,7 +535,6 @@ export interface Settings {
   reasoningEffort: ReasoningEffort;
   /** OpenAI response processing tier. Fast requests priority processing. */
   responseSpeed: ResponseSpeed;
-  apiKeySet: boolean;
   /** Legacy global policy; the `default` mode's fallthrough (back-compat). */
   defaultPolicy: ToolPolicy;
   workspace: string | null;
@@ -496,11 +549,10 @@ export interface Settings {
 }
 
 export const DEFAULT_SETTINGS: Settings = {
-  provider: "anthropic",
-  model: "claude-opus-4-8",
+  provider: "openai",
+  model: "gpt-5.6-terra",
   reasoningEffort: "medium",
   responseSpeed: "standard",
-  apiKeySet: false,
   defaultPolicy: "ask",
   workspace: null,
   // Keep the core chat path immediate by default. The decode effect remains an
@@ -512,21 +564,9 @@ export const DEFAULT_SETTINGS: Settings = {
   autoUpdate: true,
 };
 
-/**
- * Anthropic subscription (Claude Pro/Max) OAuth status. Mirrors the Rust
- * core's `OAuthStatus` serde model. `expiresAt` is a unix timestamp in
- * SECONDS (null when not signed in / unknown).
- */
-export interface OAuthStatus {
-  signedIn: boolean;
-  expiresAt: number | null;
-  /** Signed-in account email (from the OAuth profile); null if unknown. */
-  account: string | null;
-  /** Plan-tier display label, e.g. "Claude Max" / "Claude Pro"; null if unknown. */
-  tier: string | null;
-}
-
-/** Providers backed by Portcode's native agent runtimes. */
+/** Provider identity stored by older sessions/settings. New runnable state is
+ * always `openai`; `anthropic` remains only so legacy rows can be decoded and
+ * rendered without lying about their historical model. */
 export type ProviderId = "anthropic" | "openai";
 
 /** One provider-reported subscription quota window. `usedPercent` is normalized
@@ -575,7 +615,8 @@ export function reasoningEffortLabel(effort: ReasoningEffort): string {
   );
 }
 
-/** ChatGPT subscription auth state, intentionally distinct from Claude OAuth. */
+/** Authentication state for the bundled Codex engine's single credential slot.
+ * The active mode may be ChatGPT subscription OAuth or an OpenAI Platform key. */
 export interface OpenAIAuthStatus {
   signedIn: boolean;
   expiresAt: number | null;
@@ -587,12 +628,13 @@ export interface OpenAIAuthStatus {
   unavailableReason?: string | null;
 }
 
-/** Display-safe connection state for one native ChatGPT credential profile. */
+/** Display-safe connection state for the native Codex credential slot. */
 export type OpenAIAccountState = "connected" | "reconnect_required" | "unavailable" | "removed";
 
 /**
- * Display-only ChatGPT account data returned across IPC. `id` is an opaque local
- * UUID; it is never the provider's remote account identifier. All optional native
+ * Display-only Codex authentication data returned across IPC. Current builds use
+ * the stable local id `codex-primary`; migrated rows may still contain older local
+ * ids. It is never the provider's remote account identifier. All optional native
  * metadata is represented as `null`, matching serde's `Option` encoding.
  */
 export interface OpenAIAccountSummary {
@@ -606,9 +648,8 @@ export interface OpenAIAccountSummary {
   lastUsedAt: number | null;
 }
 
-/** Result of reconnecting one exact saved profile. An identity mismatch is a
- * safe, non-mutating outcome: native credentials for the original profile remain
- * untouched and the UI may offer a separate add-account flow. */
+/** Result of reconnecting the Codex slot. The mismatch branch is retained only
+ * to decode responses from older multi-account native builds. */
 export type OpenAIReconnectOutcome =
   | { status: "reconnected"; account: OpenAIAccountSummary }
   | { status: "identity_mismatch"; message: string };
@@ -650,11 +691,20 @@ export function openAIAccountLabel(
 }
 
 /** Row returned by the native `openai_models` catalogue command. */
+export interface OpenAIModelServiceTier {
+  /** Exact app-server tier id sent back in `serviceTier`. */
+  id: string;
+  name: string;
+  description: string;
+}
+
 export interface OpenAIModelCatalogRow {
   id: string;
   label: string;
   reasoningEfforts: ReasoningEffort[];
   defaultReasoningEffort: ReasoningEffort;
+  /** Catalog-driven processing tiers. An empty list means Standard-only. */
+  serviceTiers?: OpenAIModelServiceTier[];
 }
 
 /** A single selectable model, tagged with the provider that serves it. */
@@ -664,6 +714,7 @@ export interface ModelInfo {
   provider: ProviderId;
   reasoningEfforts?: ReasoningEffort[];
   defaultReasoningEffort?: ReasoningEffort;
+  serviceTiers?: OpenAIModelServiceTier[];
 }
 
 /** A provider and the models it offers — the unit the picker groups by. */
@@ -673,20 +724,33 @@ export interface ProviderGroup {
   models: ModelInfo[];
 }
 
-/** Provider-grouped catalogue: static Claude models plus OpenAI live/fallback rows. */
+/** Read-only labels for historical Claude rows. Never add these to a runnable
+ * picker; Portcode no longer ships an Anthropic engine. */
 export const ANTHROPIC_MODELS: ModelInfo[] = [
   { id: "claude-opus-4-8", label: "Claude Opus 4.8", provider: "anthropic" },
   { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: "anthropic" },
   { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5", provider: "anthropic" },
 ];
 
-const OPENAI_FALLBACK_REASONING: ReasoningEffort[] = [
-  "none",
+const OPENAI_FALLBACK_REASONING_WITH_ULTRA: ReasoningEffort[] = [
   "low",
   "medium",
   "high",
   "xhigh",
   "max",
+  "ultra",
+];
+
+const OPENAI_FALLBACK_REASONING_WITH_MAX: ReasoningEffort[] = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+const OPENAI_FALLBACK_FAST_TIER: OpenAIModelServiceTier[] = [
+  { id: "priority", name: "Fast", description: "1.5x speed, more usage" },
 ];
 
 /** Offline-safe choices used until the signed-in Codex catalogue arrives. */
@@ -695,22 +759,25 @@ export const OPENAI_FALLBACK_MODELS: ModelInfo[] = [
     id: "gpt-5.6-sol",
     label: "GPT-5.6 Sol",
     provider: "openai",
-    reasoningEfforts: OPENAI_FALLBACK_REASONING,
-    defaultReasoningEffort: "medium",
+    reasoningEfforts: OPENAI_FALLBACK_REASONING_WITH_ULTRA,
+    defaultReasoningEffort: "low",
+    serviceTiers: OPENAI_FALLBACK_FAST_TIER,
   },
   {
     id: "gpt-5.6-terra",
     label: "GPT-5.6 Terra",
     provider: "openai",
-    reasoningEfforts: OPENAI_FALLBACK_REASONING,
+    reasoningEfforts: OPENAI_FALLBACK_REASONING_WITH_ULTRA,
     defaultReasoningEffort: "medium",
+    serviceTiers: OPENAI_FALLBACK_FAST_TIER,
   },
   {
     id: "gpt-5.6-luna",
     label: "GPT-5.6 Luna",
     provider: "openai",
-    reasoningEfforts: OPENAI_FALLBACK_REASONING,
+    reasoningEfforts: OPENAI_FALLBACK_REASONING_WITH_MAX,
     defaultReasoningEffort: "medium",
+    serviceTiers: OPENAI_FALLBACK_FAST_TIER,
   },
 ];
 
@@ -718,13 +785,47 @@ export const OPENAI_FALLBACK_MODELS: ModelInfo[] = [
 export function normalizeOpenAIModels(rows: OpenAIModelCatalogRow[] = []): ModelInfo[] {
   const normalized = rows
     .filter((row) => row.id.trim() !== "")
-    .map<ModelInfo>((row) => ({
-      id: row.id,
-      label: row.label || row.id,
-      provider: "openai",
-      reasoningEfforts: [...new Set(row.reasoningEfforts ?? [])],
-      defaultReasoningEffort: row.defaultReasoningEffort || "medium",
-    }));
+    .map<ModelInfo>((row) => {
+      const id = row.id.trim();
+      const reasoningEfforts = [
+        ...new Set((row.reasoningEfforts ?? []).map((effort) => effort.trim()).filter(Boolean)),
+      ];
+      const advertisedDefault = row.defaultReasoningEffort?.trim();
+      const serviceTiers = row.serviceTiers
+        ? [
+            ...new Map(
+              row.serviceTiers
+                .flatMap((tier) => {
+                  const tierId = tier.id.trim();
+                  if (!tierId) return [];
+                  return [
+                    {
+                      id: tierId,
+                      name: tier.name.trim() || tierId,
+                      description: tier.description.trim(),
+                    },
+                  ];
+                })
+                .map((tier) => [tier.id, tier] as const),
+            ).values(),
+          ]
+        : undefined;
+      const defaultReasoningEffort =
+        (advertisedDefault && reasoningEfforts.includes(advertisedDefault)
+          ? advertisedDefault
+          : undefined) ??
+        (reasoningEfforts.includes("medium") ? "medium" : reasoningEfforts[0]) ??
+        advertisedDefault ??
+        "medium";
+      return {
+        id,
+        label: row.label.trim() || id,
+        provider: "openai",
+        reasoningEfforts,
+        defaultReasoningEffort,
+        ...(serviceTiers ? { serviceTiers } : {}),
+      };
+    });
   const live = [...new Map(normalized.map((model) => [model.id, model])).values()];
   return live;
 }
@@ -735,44 +836,57 @@ export function mergeOpenAIModels(rows: OpenAIModelCatalogRow[] = []): ModelInfo
   return live.length > 0 ? live : OPENAI_FALLBACK_MODELS;
 }
 
+/** Resolve the Fast tier exactly as advertised by Codex's live model catalogue. */
+export function fastServiceTierForModel(
+  model: ModelInfo | undefined,
+): OpenAIModelServiceTier | undefined {
+  return model?.serviceTiers?.find(
+    (tier) => tier.name.toLowerCase() === "fast" || tier.id.toLowerCase() === "priority",
+  );
+}
+
+export function modelSupportsFast(model: ModelInfo | undefined): boolean {
+  return fastServiceTierForModel(model) !== undefined;
+}
+
 export function providerGroups(
   openAIModels: ModelInfo[] = OPENAI_FALLBACK_MODELS,
 ): ProviderGroup[] {
-  return [
-    { id: "anthropic", label: "Anthropic · Claude", models: ANTHROPIC_MODELS },
-    { id: "openai", label: "OpenAI · ChatGPT subscription", models: openAIModels },
-  ];
+  return [{ id: "openai", label: "OpenAI · Codex", models: openAIModels }];
 }
 
 export const PROVIDERS: ProviderGroup[] = providerGroups();
 
 /**
- * Flat list of every model across all providers. Derived from PROVIDERS so the
- * grouped catalogue stays the single source of truth. Each element carries the
- * extra `provider` field, which is backward-compatible with `{id,label}` uses.
+ * Flat list of runnable Codex models. Historical Claude labels intentionally do
+ * not appear here.
  */
 export const MODELS: ModelInfo[] = PROVIDERS.flatMap((p) => p.models);
 
 export function modelCatalog(openAIModels: ModelInfo[] = OPENAI_FALLBACK_MODELS): ModelInfo[] {
-  return [...ANTHROPIC_MODELS, ...openAIModels];
+  return [...openAIModels];
 }
 
 export function modelInfo(
   id: string,
   openAIModels: ModelInfo[] = OPENAI_FALLBACK_MODELS,
 ): ModelInfo | undefined {
-  return modelCatalog(openAIModels).find((model) => model.id === id);
+  return (
+    modelCatalog(openAIModels).find((model) => model.id === id) ??
+    ANTHROPIC_MODELS.find((model) => model.id === id)
+  );
 }
 
-/** Resolve provider from catalogue first, with a conservative unknown-slug fallback. */
+/** Resolve historical Claude IDs precisely; route every unknown/future model to
+ * Codex so an unrecognized slug can never revive the retired Anthropic path. */
 export function providerForModel(
   id: string,
   openAIModels: ModelInfo[] = OPENAI_FALLBACK_MODELS,
 ): ProviderId {
   const known = modelInfo(id, openAIModels);
   if (known) return known.provider;
-  if (/^(gpt-|o\d|codex-|openai-)/i.test(id)) return "openai";
-  return "anthropic";
+  if (/^claude-/i.test(id)) return "anthropic";
+  return "openai";
 }
 
 /** Pick a supported effort, preferring the model's advertised default. */
@@ -782,12 +896,13 @@ export function reasoningEffortForModel(
   openAIModels: ModelInfo[] = OPENAI_FALLBACK_MODELS,
 ): ReasoningEffort {
   const model = modelInfo(id, openAIModels);
+  if (!model || model.provider !== "openai") return current;
   const supported = model?.reasoningEfforts ?? [];
-  if (supported.length === 0 || supported.includes(current)) return current;
+  if (supported.includes(current)) return current;
   if (model?.defaultReasoningEffort && supported.includes(model.defaultReasoningEffort)) {
     return model.defaultReasoningEffort;
   }
-  return supported[0] ?? current;
+  return supported[0] ?? model.defaultReasoningEffort ?? "medium";
 }
 
 export interface Usage {
@@ -1024,7 +1139,7 @@ export type SyncFrame =
   // `reason` is an optional human-readable note; absent/null when none was given.
   | { t: "pairing_reject"; reason?: string | null };
 
-// Anthropic list prices, USD per million tokens (input / output).
+// Historical Anthropic list prices, retained only to display cost for old rows.
 export const MODEL_PRICING: Record<string, { in: number; out: number }> = {
   "claude-opus-4-8": { in: 5, out: 25 },
   "claude-sonnet-4-6": { in: 3, out: 15 },

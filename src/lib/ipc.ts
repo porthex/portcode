@@ -2,6 +2,8 @@
 // back to an in-browser mock so the UI is fully runnable via `vite` alone.
 
 import type {
+  CodexActivityEvent,
+  CodexRequestResponse,
   ConnectInfo,
   DirEntry,
   DraftEntry,
@@ -11,7 +13,6 @@ import type {
   GitReviewManifest,
   GitReviewScope,
   Message,
-  OAuthStatus,
   OpenAIAccountSummary,
   OpenAIAuthStatus,
   OpenAIModelCatalogRow,
@@ -19,7 +20,6 @@ import type {
   PairingPayload,
   PairingRequest,
   PlanUsageSnapshot,
-  ProviderId,
   PhoneSyncStatus,
   RemoteCommand,
   SearchHit,
@@ -35,7 +35,7 @@ import type {
   UpdateInfo,
   WorkspaceSummary,
 } from "../types";
-import { providerForModel } from "../types";
+import { DEFAULT_SETTINGS, providerForModel } from "../types";
 import {
   webOnPhoneSyncDisconnected,
   webOnPhoneSyncFrame,
@@ -97,51 +97,26 @@ export async function getSettings(): Promise<Settings> {
   return mock.getSettings();
 }
 
+function codexSettingsPatch(settings: Partial<Settings>): Partial<Settings> {
+  const patch = { ...settings };
+  if (patch.provider === "anthropic") patch.provider = "openai";
+  if (patch.model && providerForModel(patch.model) !== "openai") {
+    patch.model = DEFAULT_SETTINGS.model;
+    patch.provider = "openai";
+  }
+  return patch;
+}
+
 export async function saveSettings(s: Partial<Settings>): Promise<Settings> {
+  const settings = codexSettingsPatch(s);
   if (isTauri()) {
     const { core } = await tauri();
-    return core.invoke<Settings>("save_settings", { settings: s });
+    return core.invoke<Settings>("save_settings", { settings });
   }
-  return mock.saveSettings(s);
+  return mock.saveSettings(settings);
 }
 
-export async function setApiKey(key: string): Promise<void> {
-  if (isTauri()) {
-    const { core } = await tauri();
-    await core.invoke("set_api_key", { key });
-    return;
-  }
-  return mock.setApiKey(key);
-}
-
-// ── Subscription OAuth (Claude Pro/Max) ───────────────────────────────────────
-
-export async function startOauthLogin(): Promise<OAuthStatus> {
-  if (isTauri()) {
-    const { core } = await tauri();
-    return core.invoke<OAuthStatus>("start_oauth_login");
-  }
-  return mock.startOauthLogin();
-}
-
-export async function oauthStatus(): Promise<OAuthStatus> {
-  if (isTauri()) {
-    const { core } = await tauri();
-    return core.invoke<OAuthStatus>("oauth_status");
-  }
-  return mock.oauthStatus();
-}
-
-export async function oauthLogout(): Promise<void> {
-  if (isTauri()) {
-    const { core } = await tauri();
-    await core.invoke("oauth_logout");
-    return;
-  }
-  return mock.oauthLogout();
-}
-
-// ── ChatGPT subscription OAuth + live Codex model catalogue ─────────────────
+// ── Codex authentication + live model catalogue ─────────────────────────────
 
 /** Runtime allowlist for the only ChatGPT account fields permitted to cross into
  * React state. TypeScript annotations do not erase accidental native/mock extras,
@@ -171,6 +146,23 @@ export async function openaiOauthStatus(): Promise<OpenAIAuthStatus> {
     return core.invoke<OpenAIAuthStatus>("openai_oauth_status");
   }
   return mock.openaiOauthStatus();
+}
+
+/** Authenticate the same bundled Codex engine with an OpenAI Platform API key.
+ * The key is handed directly to native app-server login and is never stored in
+ * frontend state. */
+export async function loginCodexApiKey(apiKey: string): Promise<OpenAIAuthStatus> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<OpenAIAuthStatus>("codex_login_api_key", { apiKey });
+  }
+  return mock.loginCodexApiKey(apiKey);
+}
+
+/** @deprecated Use {@link loginCodexApiKey}. Kept as a source-compatible alias
+ * so an older frontend cannot route a Platform key around the Codex engine. */
+export async function setApiKey(key: string): Promise<void> {
+  await loginCodexApiKey(key);
 }
 
 /** Display-safe summaries for every locally stored ChatGPT credential profile. */
@@ -219,9 +211,9 @@ export async function openaiModels(accountProfileId: string): Promise<OpenAIMode
   return mock.openaiModels(accountProfileId);
 }
 
-/** Live included-plan quota windows for one signed-in subscription provider. */
+/** Live quota windows for the bundled Codex engine's active OpenAI credential. */
 export async function getPlanUsage(
-  provider: ProviderId,
+  provider: "openai",
   accountProfileId?: string | null,
 ): Promise<PlanUsageSnapshot> {
   if (isTauri()) {
@@ -457,13 +449,31 @@ export async function onPhoneSyncDisconnected(cb: () => void): Promise<Unlisten>
   return mock.onPhoneSyncDisconnected(cb);
 }
 
-export async function resolvePermission(id: string, decision: "allow" | "deny"): Promise<void> {
+export async function resolvePermission(
+  id: string,
+  decision: "allow" | "deny",
+  forSession = false,
+): Promise<void> {
   if (isTauri()) {
     const { core } = await tauri();
-    await core.invoke("resolve_permission", { id, decision });
+    await core.invoke("resolve_permission", { id, decision, forSession });
     return;
   }
-  return mock.resolvePermission(id, decision);
+  return mock.resolvePermission(id, decision, forSession);
+}
+
+/** Answer a structured Codex app-server request. Unlike permission approvals,
+ * the response envelope is method-specific and is forwarded without reshaping. */
+export async function resolveCodexRequest(
+  id: string,
+  response: CodexRequestResponse,
+): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("resolve_codex_request", { id, response });
+    return;
+  }
+  return mock.resolveCodexRequest(id, response);
 }
 
 // ── Crash reporting consent (mirror to the Rust host) ─────────────────────────
@@ -573,6 +583,17 @@ export async function getMessages(sessionId: string): Promise<Message[]> {
     return core.invoke<Message[]>("get_messages", { sessionId });
   }
   return [];
+}
+
+/** Read the newest durable raw app-server activity for one Portcode session.
+ * Browser/phone shells never receive this desktop-private diagnostic stream. */
+export async function getCodexActivity(
+  sessionId: string,
+  limit = 500,
+): Promise<CodexActivityEvent[]> {
+  if (!isTauri()) return [];
+  const { core } = await tauri();
+  return core.invoke<CodexActivityEvent[]>("get_codex_activity", { sessionId, limit });
 }
 
 /** Load one display-ready page of persisted history. Cursor null/undefined loads
@@ -929,23 +950,13 @@ function previewReviewManifest(scope: GitReviewScope): GitReviewManifest {
   };
 }
 
-const mock = (() => {
-  let settings: Settings = {
-    provider: "anthropic",
-    model: "claude-opus-4-8",
-    reasoningEffort: "medium",
-    responseSpeed: "standard",
-    apiKeySet: false,
-    defaultPolicy: "ask",
-    workspace: null,
-    typingAnimation: true,
-    permissionMode: "default",
-    rules: [],
-    autoUpdate: true,
-  };
+const PRIMARY_CODEX_ACCOUNT_ID = "codex-primary";
 
-  // Fake subscription-auth state so the sign-in UX is testable without Tauri.
-  let oauth: OAuthStatus = { signedIn: false, expiresAt: null, account: null, tier: null };
+const mock = (() => {
+  let settings: Settings = { ...DEFAULT_SETTINGS, rules: [...DEFAULT_SETTINGS.rules] };
+
+  // One fake Codex credential slot, matching the native app-server. Signing in
+  // with ChatGPT or a Platform key replaces this same slot.
   let openaiOauth: OpenAIAuthStatus = {
     signedIn: false,
     expiresAt: null,
@@ -954,28 +965,29 @@ const mock = (() => {
     available: true,
     unavailableReason: null,
   };
-  let openaiAccountSequence = 0;
   let openaiAccounts: OpenAIAccountSummary[] = [];
   const mockSessions = new Map<string, Session>();
-  const mockStartedSessions = new Set<string>();
   const openaiCatalogue: OpenAIModelCatalogRow[] = [
     {
       id: "gpt-5.6-sol",
       label: "GPT-5.6 Sol",
-      reasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
-      defaultReasoningEffort: "medium",
+      reasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      defaultReasoningEffort: "low",
+      serviceTiers: [{ id: "priority", name: "Fast", description: "1.5x speed, more usage" }],
     },
     {
       id: "gpt-5.6-terra",
       label: "GPT-5.6 Terra",
-      reasoningEfforts: ["low", "medium", "high"],
+      reasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
       defaultReasoningEffort: "medium",
+      serviceTiers: [{ id: "priority", name: "Fast", description: "1.5x speed, more usage" }],
     },
     {
       id: "gpt-5.6-luna",
       label: "GPT-5.6 Luna",
-      reasoningEfforts: ["none", "low", "medium"],
-      defaultReasoningEffort: "low",
+      reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
+      defaultReasoningEffort: "medium",
+      serviceTiers: [{ id: "priority", name: "Fast", description: "1.5x speed, more usage" }],
     },
   ];
 
@@ -988,101 +1000,95 @@ const mock = (() => {
   const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const resolvers = new Map<string, (d: "allow" | "deny") => void>();
 
+  const connectCodexAccount = (
+    accountLabel: string,
+    tier: string,
+    expiresAt: number | null,
+  ): OpenAIAccountSummary => {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const account: OpenAIAccountSummary = {
+      id: PRIMARY_CODEX_ACCOUNT_ID,
+      accountLabel,
+      tier,
+      expiresAt,
+      state: "connected",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastUsedAt: timestamp,
+    };
+    openaiAccounts = [account];
+    openaiOauth = {
+      signedIn: true,
+      expiresAt,
+      account: accountLabel,
+      tier,
+      available: true,
+      unavailableReason: null,
+    };
+    return account;
+  };
+
   return {
     async getSettings() {
       return { ...settings };
     },
     async saveSettings(s: Partial<Settings>) {
-      settings = { ...settings, ...s };
+      const candidate = { ...settings, ...s };
+      settings =
+        candidate.provider === "openai" && providerForModel(candidate.model) === "openai"
+          ? candidate
+          : { ...candidate, provider: "openai", model: DEFAULT_SETTINGS.model };
       return { ...settings };
     },
-    async setApiKey(_key: string) {
-      settings.apiKeySet = true;
-    },
-    async startOauthLogin() {
-      // Simulate a completed sign-in: subscription valid for ~8h.
-      oauth = {
-        signedIn: true,
-        expiresAt: Math.floor(Date.now() / 1000) + 8 * 60 * 60,
-        account: "preview@claude.local",
-        tier: "Claude Max",
-      };
-      return { ...oauth };
-    },
-    async oauthStatus() {
-      return { ...oauth };
-    },
-    async oauthLogout() {
-      oauth = { signedIn: false, expiresAt: null, account: null, tier: null };
-    },
     async openaiOauthStatus() {
+      return { ...openaiOauth };
+    },
+    async loginCodexApiKey(_apiKey: string) {
+      connectCodexAccount("OpenAI Platform API key", "OpenAI Platform", null);
       return { ...openaiOauth };
     },
     async listOpenAIAccounts() {
       return openaiAccounts.map((account) => ({ ...account }));
     },
     async startOpenAIAccountLogin() {
-      openaiAccountSequence += 1;
       const timestamp = Math.floor(Date.now() / 1000);
-      const suffix = openaiAccountSequence === 1 ? "" : `+${openaiAccountSequence}`;
-      const account: OpenAIAccountSummary = {
-        id: `00000000-0000-4000-8000-${String(openaiAccountSequence).padStart(12, "0")}`,
-        accountLabel: `preview${suffix}@chatgpt.local`,
-        tier: "ChatGPT Plus",
-        expiresAt: timestamp + 8 * 60 * 60,
-        state: "connected",
-        createdAt: timestamp,
-        updatedAt: timestamp,
-        lastUsedAt: null,
-      };
-      openaiAccounts = [...openaiAccounts, account];
-      openaiOauth = {
-        signedIn: true,
-        expiresAt: account.expiresAt,
-        account: account.accountLabel,
-        tier: account.tier,
-        available: true,
-        unavailableReason: null,
-      };
+      const account = connectCodexAccount(
+        "preview@chatgpt.local",
+        "ChatGPT Plus",
+        timestamp + 8 * 60 * 60,
+      );
       return { ...account };
     },
     async reconnectOpenAIAccount(accountProfileId: string) {
-      const index = openaiAccounts.findIndex((account) => account.id === accountProfileId);
-      if (index < 0) throw new Error("ChatGPT account profile was not found.");
+      if (accountProfileId !== PRIMARY_CODEX_ACCOUNT_ID) {
+        throw new Error("Codex account profile was not found.");
+      }
       const timestamp = Math.floor(Date.now() / 1000);
-      const account: OpenAIAccountSummary = {
-        ...openaiAccounts[index],
-        expiresAt: timestamp + 8 * 60 * 60,
-        state: "connected",
-        updatedAt: timestamp,
-      };
-      openaiAccounts = openaiAccounts.map((item, itemIndex) =>
-        itemIndex === index ? account : item,
+      const account = connectCodexAccount(
+        "preview@chatgpt.local",
+        "ChatGPT Plus",
+        timestamp + 8 * 60 * 60,
       );
       return { status: "reconnected" as const, account: { ...account } };
     },
     async removeOpenAIAccount(accountProfileId: string) {
-      const timestamp = Math.floor(Date.now() / 1000);
-      openaiAccounts = openaiAccounts.map((account) =>
-        account.id === accountProfileId
-          ? { ...account, state: "removed" as const, expiresAt: null, updatedAt: timestamp }
-          : account,
-      );
-      if (!openaiAccounts.some((account) => account.state === "connected")) {
-        openaiOauth = {
-          signedIn: false,
-          expiresAt: null,
-          account: null,
-          tier: null,
-          available: true,
-          unavailableReason: null,
-        };
+      if (accountProfileId !== PRIMARY_CODEX_ACCOUNT_ID) {
+        throw new Error("Codex account profile was not found.");
       }
+      openaiAccounts = [];
+      openaiOauth = {
+        signedIn: false,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: true,
+        unavailableReason: null,
+      };
     },
     async openaiModels(accountProfileId: string) {
       const account = openaiAccounts.find((item) => item.id === accountProfileId);
       if (!account || account.state !== "connected") {
-        throw new Error("Reconnect this ChatGPT account before loading models.");
+        throw new Error("Connect ChatGPT or an OpenAI Platform API key before loading models.");
       }
       return openaiCatalogue.map((model) => ({
         ...model,
@@ -1090,36 +1096,35 @@ const mock = (() => {
       }));
     },
     async getPlanUsage(
-      provider: ProviderId,
+      provider: "openai",
       accountProfileId?: string | null,
     ): Promise<PlanUsageSnapshot> {
+      if ((provider as string) !== "openai") {
+        throw new Error("Codex usage is available for OpenAI authentication only.");
+      }
       const now = Math.floor(Date.now() / 1000);
-      const openAIAccount = accountProfileId
-        ? openaiAccounts.find((account) => account.id === accountProfileId)
-        : undefined;
-      const signedIn =
-        provider === "anthropic" ? oauth.signedIn : openAIAccount?.state === "connected";
-      if (!signedIn)
-        throw new Error(`Sign in with ${provider === "anthropic" ? "Claude" : "ChatGPT"} first.`);
+      const openAIAccount = openaiAccounts.find(
+        (account) => account.id === accountProfileId && account.state === "connected",
+      );
+      if (!openAIAccount) {
+        throw new Error("Choose the connected Codex account before loading usage.");
+      }
       return {
-        provider,
-        plan:
-          provider === "anthropic"
-            ? (oauth.tier?.replace(/^Claude\s+/i, "") ?? null)
-            : (openAIAccount?.tier?.replace(/^ChatGPT\s+/i, "") ?? null),
+        provider: "openai",
+        plan: openAIAccount.tier?.replace(/^(?:ChatGPT|OpenAI)\s+/i, "") ?? null,
         updatedAt: now,
         windows: [
           {
             id: "primary",
             label: "Current session",
-            usedPercent: provider === "anthropic" ? 28 : 18,
+            usedPercent: 18,
             resetsAt: String(now + 3 * 60 * 60),
             windowMinutes: 300,
           },
           {
             id: "secondary",
             label: "Weekly limit",
-            usedPercent: provider === "anthropic" ? 57 : 34,
+            usedPercent: 34,
             resetsAt: String(now + 4 * 24 * 60 * 60),
             windowMinutes: 10_080,
           },
@@ -1133,21 +1138,24 @@ const mock = (() => {
       id: string,
       title = "New chat",
       workspace: string | null = null,
-      model = "claude-opus-4-8",
+      model = DEFAULT_SETTINGS.model,
       accountProfileId?: string | null,
     ): Promise<Session> {
       const timestamp = Date.now();
-      if (providerForModel(model) === "openai" && !accountProfileId) {
-        throw new Error("Choose a default ChatGPT account before creating a GPT chat.");
+      if (providerForModel(model) !== "openai") {
+        throw new Error("Portcode conversations now run through the Codex engine.");
       }
-      if (accountProfileId) {
-        const account = openaiAccounts.find((candidate) => candidate.id === accountProfileId);
-        if (!account || account.state !== "connected") {
-          throw new Error("Choose a connected ChatGPT account.");
-        }
+      const codexAccountProfileId = accountProfileId ?? PRIMARY_CODEX_ACCOUNT_ID;
+      if (codexAccountProfileId !== PRIMARY_CODEX_ACCOUNT_ID) {
+        throw new Error("The selected Codex account is no longer available.");
+      }
+      const account = openaiAccounts.find(
+        (candidate) => candidate.id === codexAccountProfileId && candidate.state === "connected",
+      );
+      if (account) {
         const usedAt = Math.floor(timestamp / 1000);
         openaiAccounts = openaiAccounts.map((candidate) =>
-          candidate.id === accountProfileId
+          candidate.id === codexAccountProfileId
             ? { ...candidate, lastUsedAt: usedAt, updatedAt: usedAt }
             : candidate,
         );
@@ -1158,7 +1166,7 @@ const mock = (() => {
         workspace,
         branch: null,
         model,
-        accountProfileId: accountProfileId ?? null,
+        accountProfileId: codexAccountProfileId,
         createdAt: timestamp,
         updatedAt: timestamp,
       };
@@ -1172,17 +1180,14 @@ const mock = (() => {
     ): Promise<Session> {
       const session = mockSessions.get(sessionId);
       if (!session) throw new Error("Session was not found.");
-      const account = openaiAccounts.find((candidate) => candidate.id === accountProfileId);
-      if (!account || account.state !== "connected") {
-        throw new Error("Choose a connected ChatGPT account.");
+      if (accountProfileId !== PRIMARY_CODEX_ACCOUNT_ID) {
+        throw new Error("The selected Codex account is no longer available.");
       }
-      const started = mockStartedSessions.has(sessionId);
-      if (session.accountProfileId && session.accountProfileId !== accountProfileId && started) {
-        throw new Error(
-          "This conversation has already started. Continue with another ChatGPT account in a new chat.",
-        );
+      const nextModel = model ?? session.model;
+      if (providerForModel(nextModel) !== "openai") {
+        throw new Error("Portcode conversations now run through the Codex engine.");
       }
-      const pinned = { ...session, accountProfileId, model: model ?? session.model };
+      const pinned = { ...session, accountProfileId, model: nextModel };
       mockSessions.set(sessionId, pinned);
       return { ...pinned };
     },
@@ -1259,9 +1264,12 @@ const mock = (() => {
     async subscribeSessionEvents(): Promise<Unlisten> {
       return () => {}; // inert: the preview launches no real background tasks.
     },
-    async resolvePermission(id: string, decision: "allow" | "deny") {
+    async resolvePermission(id: string, decision: "allow" | "deny", _forSession = false) {
       resolvers.get(id)?.(decision);
       resolvers.delete(id);
+    },
+    async resolveCodexRequest(_id: string, _response: CodexRequestResponse) {
+      // Browser preview has no app-server request waiting on the other side.
     },
     async listDir(sub?: string) {
       const tree: Record<string, { name: string; path: string; isDir: boolean }[]> = {
@@ -1402,9 +1410,8 @@ const mock = (() => {
       }
       throw new Error("Historical turn patches are unavailable in preview mode.");
     },
-    async runAgent(sessionId: string, text: string, onEvent: (e: StreamEvent) => void) {
+    async runAgent(_sessionId: string, text: string, onEvent: (e: StreamEvent) => void) {
       let cancelled = false;
-      mockStartedSessions.add(sessionId);
       (async () => {
         await delay(120);
         if (cancelled) return;
@@ -1414,7 +1421,7 @@ const mock = (() => {
 
         const reply =
           "Running in **preview mode** (browser, no Rust core yet).\n\n" +
-          "Once the Tauri core is running, this turn streams from Claude and " +
+          "Once the Tauri core is running, this turn streams from the bundled Codex engine and " +
           "runs tools. You said:\n\n> " +
           text +
           "\n\nLet me read a file and then write one:";

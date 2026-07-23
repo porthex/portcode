@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 
-import { toolLabel } from "../lib/toolNames";
+import { isCommandToolName, toolLabel } from "../lib/toolNames";
 import { useStore } from "../store/store";
 
 export function PermissionPrompt() {
@@ -49,14 +49,19 @@ export function PermissionPrompt() {
 
   if (!pending) return null;
 
-  const answer = (decision: "allow" | "deny", always?: boolean): void => {
-    if (activeId && pendingBelongsToRun) void resolve(activeId, pending.id, decision, always);
-    else void resolve(decision, always);
+  const answer = (decision: "allow" | "deny", forSession?: boolean): void => {
+    if (activeId && pendingBelongsToRun) void resolve(activeId, pending.id, decision, forSession);
+    else void resolve(decision, forSession);
   };
 
   const label = toolLabel(pending.tool);
   const remoteApproval = remoteMode || remoteConnected;
-  const rememberable = !remoteApproval;
+  const offeredDecisions = (pending.input as { availableDecisions?: unknown } | null)
+    ?.availableDecisions;
+  const sessionDecisionOffered =
+    !isCommandToolName(pending.tool) ||
+    (Array.isArray(offeredDecisions) && offeredDecisions.includes("acceptForSession"));
+  const canApproveForSession = !remoteApproval && sessionDecisionOffered;
 
   return (
     <div role="alert" className="pc-gate px-6 py-3.5">
@@ -80,7 +85,7 @@ export function PermissionPrompt() {
         {pending.diff && pending.diff.trim() && <DiffView diff={pending.diff} />}
         {remoteApproval && (
           <p className="text-[11.5px] leading-relaxed text-muted">
-            Remote approvals apply once. Change persistent permission rules on the desktop.
+            Remote approvals apply once. Session-scoped Codex approvals are desktop-only.
           </p>
         )}
         <div className="flex flex-wrap gap-[9px]">
@@ -88,14 +93,14 @@ export function PermissionPrompt() {
             onClick={() => answer("allow")}
             className="pc-btn-allow px-3.5 py-1.5 text-[12.5px]"
           >
-            Allow
+            Allow once
           </button>
-          {rememberable && (
+          {canApproveForSession && (
             <button
               onClick={() => answer("allow", true)}
               className="pc-btn-deny pc-btn-confirm px-3.5 py-1.5 text-[12.5px]"
             >
-              Always allow
+              Allow for session
             </button>
           )}
           <button

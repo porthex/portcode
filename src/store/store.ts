@@ -5,6 +5,8 @@ import type {
   ArchiveSessionResult,
   BackgroundTaskInfo,
   BackgroundTaskStatus,
+  CodexActivityEvent,
+  CodexRequestResponse,
   ComposerPhase,
   ContentBlock,
   DraftEntry,
@@ -12,19 +14,19 @@ import type {
   MessageLoadState,
   MessageRow,
   ModelInfo,
-  OAuthStatus,
   OpenAIAccountSummary,
   OpenAIAuthStatus,
   OpenAIModelCatalogState,
   OpenAIReconnectMismatch,
   PairingPayload,
   PairingRequest,
+  PendingCodexRequest,
   PendingPermission,
   PermissionMode,
   PhoneSyncStatus,
+  ReasoningEffort,
   ReviewTarget,
   RemoteCommand,
-  Rule,
   SearchHit,
   Session,
   SessionFolder,
@@ -45,16 +47,15 @@ import {
   CYCLE_MODES,
   DEFAULT_SETTINGS,
   OPENAI_FALLBACK_MODELS,
+  modelSupportsFast,
   normalizeOpenAIModels,
   openAIAccountLabel,
-  providerForModel,
   reasoningEffortForModel,
 } from "../types";
 import * as ipc from "../lib/ipc";
 import { isMobilePlatform } from "../lib/platform";
 import { markdownLiteralText, remoteAccountLabel } from "../lib/sessionFormat";
 import { classifySettingsSaveFailure } from "../lib/settingsPersistence";
-import { canonicalToolName, isCommandToolName, toolNamesEquivalent } from "../lib/toolNames";
 
 // ── Per-run state ─────────────────────────────────────────────────────────────
 // The streaming/cancel/pendingPermission of a single agent run. Today there is at
@@ -71,6 +72,7 @@ interface RunState {
   // belongs to the desktop-local agent run; the phone stops via a remote command).
   cancel: (() => Promise<void>) | null;
   pendingPermission: PendingPermission | null;
+  pendingCodexRequest?: PendingCodexRequest | null;
   /** Provisional until turn_start reconciles it to the native identity. */
   turnId: string | null;
   /** Native start time when known; optimistic/client-observed before turn_start. */
@@ -96,6 +98,7 @@ const EMPTY_RUN: RunState = {
   streaming: false,
   cancel: null,
   pendingPermission: null,
+  pendingCodexRequest: null,
   turnId: null,
   startedAt: null,
   finalizing: false,
@@ -113,35 +116,6 @@ const EMPTY_RUN: RunState = {
 // `${sessionId}:${agentId}`) — without touching the StreamEvent wire shape, which
 // already carries the session id every write site keys off.
 const runKey = (sessionId: string): string => sessionId;
-
-// Build the scoped allow-RULE that "Always allow" adds, instead of flipping the
-// global policy to allow-everything. A legacy peer without risk can still scope a
-// command to that exact text. Other tools are scoped by tool. Historical names
-// are normalized before persistence so new settings never extend the legacy
-// vocabulary. The native gate treats this explicit user choice differently from
-// an implicit Auto/default allow, so remembered protected approvals are effective.
-const scopedAllowRule = (p: PendingPermission): Rule => {
-  const tool = canonicalToolName(p.tool);
-  if (isCommandToolName(p.tool)) {
-    const command = (p.input as { command?: unknown } | null)?.command;
-    if (typeof command === "string" && command.length > 0) {
-      return { tool, command, decision: "allow" };
-    }
-  }
-  return { tool, decision: "allow" };
-};
-
-const sameRuleScope = (left: Rule, right: Rule): boolean =>
-  toolNamesEquivalent(left.tool, right.tool) && left.command === right.command;
-
-// Rules are first-match. Put an explicit "Always allow" scope first so an older
-// broad ask/deny rule cannot silently shadow the choice the user just made, and
-// discard any equivalent legacy/canonical scope instead of leaving dead entries.
-const rulesWithEffectiveAllow = (rules: Rule[], allow: Rule): Rule[] => {
-  const first = rules[0];
-  if (first && sameRuleScope(first, allow) && first.decision === "allow") return rules;
-  return [allow, ...rules.filter((rule) => !sameRuleScope(rule, allow))];
-};
 
 /**
  * In-app auto-update state, driving the {@link UpdateBanner}.
@@ -188,9 +162,10 @@ interface AppState {
   usage: Record<string, Usage>; // sessionId -> cumulative token usage
   agents: Record<string, AgentInfo[]>; // sessionId -> live subagents (the agents panel)
   backgroundTasks: Record<string, BackgroundTaskInfo[]>; // sessionId -> background command tasks
+  /** Durable + live lossless app-server activity, kept separate from the compact
+   * normalized transcript blocks so unknown Codex features remain inspectable. */
+  codexActivity: Record<string, CodexActivityEvent[]>;
   settings: Settings;
-  oauthStatus: OAuthStatus | null; // Claude subscription sign-in state
-  oauthError: string | null; // last sign-in/out failure, surfaced in Settings
   openAIAuthStatus: OpenAIAuthStatus | null; // ChatGPT subscription sign-in state
   openAIAuthError: string | null; // OpenAI sign-in/out/catalog failure
   openAIReconnectMismatch: OpenAIReconnectMismatch | null;
@@ -261,6 +236,7 @@ interface AppState {
   crashReporting: boolean | null; // opt-in crash/error reporting; null = not yet asked (show first-run prompt)
   cancel: (() => Promise<void>) | null;
   pendingPermission: PendingPermission | null;
+  pendingCodexRequest: PendingCodexRequest | null;
 
   // ── Error surfacing ─────────────────────────────────────────────────────────
   initError: string | null; // startup (init) failure — Chat shows an error/retry panel
@@ -293,6 +269,7 @@ interface AppState {
   retryInit: () => Promise<void>;
   retryLoad: (id: string) => Promise<void>;
   hydrateMessages: (id: string, options?: { force?: boolean; prefetch?: boolean }) => Promise<void>;
+  loadCodexActivity: (id: string) => Promise<void>;
   prefetchSession: (id: string) => Promise<void>;
   toggleFiles: () => void;
   toggleSidebar: () => void;
@@ -336,10 +313,10 @@ interface AppState {
   setUiScale: (n: number) => void;
   setCrashReporting: (v: boolean) => void;
   updateSettings: (s: Partial<Settings>) => Promise<void>;
+  updateDefaultOpenAISettings: (
+    s: Pick<Partial<Settings>, "model" | "reasoningEffort">,
+  ) => Promise<void>;
   cyclePermissionMode: () => Promise<void>;
-  refreshOAuthStatus: () => Promise<void>;
-  loginWithClaude: () => Promise<void>;
-  logoutClaude: () => Promise<void>;
   refreshOpenAIStatus: () => Promise<void>;
   loginWithOpenAI: () => Promise<void>;
   reconnectOpenAIAccount: (accountProfileId: string) => Promise<void>;
@@ -362,10 +339,15 @@ interface AppState {
       sessionId: string,
       permissionId: string,
       decision: "allow" | "deny",
-      always?: boolean,
+      forSession?: boolean,
     ): Promise<void>;
-    (decision: "allow" | "deny", always?: boolean): Promise<void>;
+    (decision: "allow" | "deny", forSession?: boolean): Promise<void>;
   };
+  resolveCodexRequest: (
+    sessionId: string,
+    requestId: string,
+    response: CodexRequestResponse,
+  ) => Promise<void>;
   setRemoteMode: (v: boolean) => void;
   clearRemoteError: () => void;
   confirmRemoteSas: () => void;
@@ -396,19 +378,25 @@ interface AppState {
 
 // Project the active session's run onto the three mirror fields. Called in every
 // set() that changes `runs` or `activeId`, so `streaming`/`cancel`/
-// `pendingPermission` always reflect the run on screen. A session with no run (or
-// no active session) reads as the empty run, i.e. idle.
+// `pendingPermission`/`pendingCodexRequest` always reflect the run on screen. A
+// session with no run (or no active session) reads as the empty run, i.e. idle.
 const projectActiveRun = (
   st: Pick<AppState, "activeId" | "runs">,
 ): Pick<
   AppState,
-  "streaming" | "cancel" | "pendingPermission" | "composerPhase" | "activeTool"
+  | "streaming"
+  | "cancel"
+  | "pendingPermission"
+  | "pendingCodexRequest"
+  | "composerPhase"
+  | "activeTool"
 > => {
   const r = (st.activeId ? st.runs[runKey(st.activeId)] : undefined) ?? EMPTY_RUN;
   return {
     streaming: r.streaming,
     cancel: r.cancel,
     pendingPermission: r.pendingPermission,
+    pendingCodexRequest: r.pendingCodexRequest ?? null,
     composerPhase: r.composerPhase ?? "idle",
     activeTool: r.activeTool ?? null,
   };
@@ -424,7 +412,13 @@ const runPatch = (
   patch: Partial<RunState>,
 ): Pick<
   AppState,
-  "runs" | "streaming" | "cancel" | "pendingPermission" | "composerPhase" | "activeTool"
+  | "runs"
+  | "streaming"
+  | "cancel"
+  | "pendingPermission"
+  | "pendingCodexRequest"
+  | "composerPhase"
+  | "activeTool"
 > => {
   const key = runKey(sessionId);
   const runs = { ...st.runs, [key]: { ...(st.runs[key] ?? EMPTY_RUN), ...patch } };
@@ -747,6 +741,7 @@ const terminalizeTurnState = (
   | "streaming"
   | "cancel"
   | "pendingPermission"
+  | "pendingCodexRequest"
   | "composerPhase"
   | "activeTool"
 > => {
@@ -782,6 +777,7 @@ const terminalizeTurnState = (
       streaming: false,
       cancel: null,
       pendingPermission: null,
+      pendingCodexRequest: null,
       turnId,
       startedAt: receipt?.startedAt ?? currentRun.startedAt,
       finalizing: false,
@@ -804,7 +800,13 @@ const terminalizeAllRunningTurns = (
   status: TurnStatus,
 ): Pick<
   AppState,
-  "messages" | "agents" | "runs" | "streaming" | "cancel" | "pendingPermission"
+  | "messages"
+  | "agents"
+  | "runs"
+  | "streaming"
+  | "cancel"
+  | "pendingPermission"
+  | "pendingCodexRequest"
 > => {
   const sessionIds = new Set(
     Object.entries(st.runs)
@@ -881,7 +883,55 @@ const applyBackgroundEvent = (
   }
 };
 
-// Desktop persistent background-task listeners, keyed by session id. Module-scoped
+const applyCodexActivityEvent = (
+  activity: Record<string, CodexActivityEvent[]>,
+  sessionId: string,
+  event: StreamEvent,
+): Record<string, CodexActivityEvent[]> => {
+  if (event.type !== "codex_event") return activity;
+  const current = activity[sessionId] ?? [];
+  if (current.some((candidate) => candidate.sequence === event.sequence)) return activity;
+  const next: CodexActivityEvent = {
+    sequence: event.sequence,
+    sessionId,
+    threadId: event.threadId ?? "",
+    turnId: event.turnId,
+    itemId: event.itemId,
+    method: event.method,
+    params: event.params,
+    requestId: event.requestId,
+    emittedAtMs: event.emittedAtMs,
+  };
+  // Keep the live React state bounded; SQLite retains the complete activity log.
+  const rows = [...current, next]
+    .sort((left, right) => left.sequence - right.sequence)
+    .slice(-2_000);
+  return { ...activity, [sessionId]: rows };
+};
+
+const applyCodexRequestEvent = (
+  state: AppState,
+  sessionId: string,
+  event: StreamEvent,
+): Partial<AppState> => {
+  if (event.type !== "codex_request") return {};
+  const current =
+    state.runs[runKey(sessionId)]?.pendingCodexRequest ??
+    (state.activeId === sessionId ? state.pendingCodexRequest : null);
+  if (event.method === "serverRequest/resolved") {
+    // An app-server timeout, cancellation, or other client may resolve a request
+    // without this prompt sending the response. Only clear the matching identity;
+    // a late resolution must never dismiss a newer prompt.
+    return current?.id === event.id
+      ? runPatch(state, sessionId, { pendingCodexRequest: null })
+      : {};
+  }
+  return runPatch(state, sessionId, {
+    pendingCodexRequest: { id: event.id, method: event.method, params: event.params },
+  });
+};
+
+// Desktop persistent session listeners, keyed by session id. Module-scoped
 // (like `remoteWatchdog`) because they outlive any single action and must survive
 // across turns: a `background_task_finished` can land long after the launching
 // turn's per-turn listener was disposed. Each subscription folds ONLY background
@@ -914,6 +964,8 @@ const ensureBackgroundListener = async (sessionId: string): Promise<void> => {
     unlisten = await ipc.subscribeSessionEvents(sessionId, (e) =>
       useStore.setState((st) => ({
         backgroundTasks: applyBackgroundEvent(st.backgroundTasks, sessionId, e),
+        codexActivity: applyCodexActivityEvent(st.codexActivity, sessionId, e),
+        ...applyCodexRequestEvent(st, sessionId, e),
       })),
     );
   } catch {
@@ -1434,6 +1486,15 @@ export const preferredOpenAIAccount = (
   )[0];
 };
 
+/** Codex persists one device-local OpenAI authentication slot. Prefer its
+ * canonical id while retaining a first-connected fallback for migrated data. */
+const codexOpenAIAccount = (
+  accounts: OpenAIAccountSummary[],
+  preferredId: string | null,
+): OpenAIAccountSummary | undefined =>
+  connectedOpenAIAccounts(accounts).find((account) => account.id === "codex-primary") ??
+  preferredOpenAIAccount(accounts, preferredId);
+
 /** Resolve a catalogue without ever borrowing another account's successful data. */
 const EMPTY_OPENAI_MODELS: ModelInfo[] = [];
 
@@ -1445,6 +1506,51 @@ export function modelsForOpenAIProfile(
   if (!accountProfileId) return unpinnedFallback ?? EMPTY_OPENAI_MODELS;
   const catalog = catalogs[accountProfileId];
   return catalog?.status === "ready" ? catalog.models : EMPTY_OPENAI_MODELS;
+}
+
+interface SessionReasoningResolution {
+  effort: ReasoningEffort;
+  error: string | null;
+}
+
+/** Resolve one conversation against its owning account's exact live catalogue.
+ * A different account's successful catalogue must never authorize a model or
+ * reasoning level for this session. */
+function reasoningForSession(
+  session: Session,
+  current: ReasoningEffort,
+  catalogs: Record<string, OpenAIModelCatalogState>,
+): SessionReasoningResolution {
+  if (!session.accountProfileId) {
+    return {
+      effort: current,
+      error: "Connect ChatGPT or an OpenAI Platform API key in Settings before sending.",
+    };
+  }
+  const catalog = catalogs[session.accountProfileId];
+  if (catalog?.status !== "ready") {
+    return {
+      effort: current,
+      error: catalog?.error ?? "Load this conversation's ChatGPT model catalogue before sending.",
+    };
+  }
+  const model = catalog.models.find((candidate) => candidate.id === session.model);
+  if (!model) {
+    return {
+      effort: current,
+      error: "This model is no longer available to the conversation's Codex authentication.",
+    };
+  }
+  if ((model.reasoningEfforts ?? []).length === 0) {
+    return {
+      effort: current,
+      error: "This model did not advertise any supported reasoning levels.",
+    };
+  }
+  return {
+    effort: reasoningEffortForModel(session.model, current, catalog.models),
+    error: null,
+  };
 }
 
 function makeSession(model: string, accountProfileId: string | null = null): Session {
@@ -1473,9 +1579,8 @@ export const useStore = create<AppState>((set, get) => ({
   usage: {},
   agents: {},
   backgroundTasks: {},
+  codexActivity: {},
   settings: DEFAULT_SETTINGS,
-  oauthStatus: null,
-  oauthError: null,
   openAIAuthStatus: null,
   openAIAuthError: null,
   openAIReconnectMismatch: null,
@@ -1519,6 +1624,7 @@ export const useStore = create<AppState>((set, get) => ({
   crashReporting: readTriPref("pc.crashReporting"),
   cancel: null,
   pendingPermission: null,
+  pendingCodexRequest: null,
   initError: null,
   loadErrors: {},
   settingsError: null,
@@ -1567,8 +1673,8 @@ export const useStore = create<AppState>((set, get) => ({
     // listener install is resilient and the mock is inert), kept off the load-
     // bearing startup path below.
     void get().listenForPairingRequests();
-    // Fetch settings, subscription status, and phone sync status together.
-    // The oauth and phoneSync calls are kept resilient so an unwired/older
+    // Fetch settings, Codex authentication, and phone sync status together.
+    // The authentication and phoneSync calls are kept resilient so an unwired/older
     // core can't block startup. The load-bearing calls (getSettings/listSessions/
     // createSession/getMessages) are guarded so a failed startup surfaces an
     // error+retry panel instead of a permanently blank welcome shell.
@@ -1589,7 +1695,6 @@ export const useStore = create<AppState>((set, get) => ({
           : Promise.resolve({ accounts: [], error: null });
       const [
         rawSettings,
-        oauthStatus,
         openAIAuthStatus,
         openAIAccountDiscovery,
         phoneSync,
@@ -1597,7 +1702,6 @@ export const useStore = create<AppState>((set, get) => ({
         allUsage,
       ] = await Promise.all([
         ipc.getSettings(),
-        ipc.oauthStatus().catch(() => null),
         openAIStatusPromise,
         openAIAccountsPromise,
         ipc.phoneSyncStatus().catch(() => null),
@@ -1608,10 +1712,7 @@ export const useStore = create<AppState>((set, get) => ({
       ]);
       const openAIAccounts = openAIAccountDiscovery.accounts;
       const openAIAvailable = openAIAuthStatus?.available !== false;
-      const preferredAccount = preferredOpenAIAccount(
-        openAIAccounts,
-        get().lastOpenAIAccountProfileId,
-      );
+      const preferredAccount = codexOpenAIAccount(openAIAccounts, get().lastOpenAIAccountProfileId);
       // A transient registry read failure is not evidence that the user's chosen
       // default disappeared. Retain it so a later successful refresh can reconcile
       // against the authoritative connected profiles without silently switching MRU.
@@ -1653,41 +1754,126 @@ export const useStore = create<AppState>((set, get) => ({
           };
         }
       }
-      const requestedModel = rawSettings.model ?? DEFAULT_SETTINGS.model;
-      const requestedProvider =
-        rawSettings.provider === "openai"
-          ? "openai"
-          : providerForModel(requestedModel, openAIModels);
+      const loadSessionProfileCatalog = async (session: Session) => {
+        const accountProfileId = session.accountProfileId;
+        if (
+          !openAIAvailable ||
+          !accountProfileId ||
+          openAIModelCatalogs[accountProfileId] ||
+          typeof ipc.openaiModels !== "function"
+        ) {
+          return;
+        }
+        const account = openAIAccounts.find(
+          (candidate) => candidate.id === accountProfileId && candidate.state === "connected",
+        );
+        if (!account) return;
+        try {
+          const models = normalizeOpenAIModels(await ipc.openaiModels(accountProfileId));
+          openAIModelCatalogs = {
+            ...openAIModelCatalogs,
+            [accountProfileId]:
+              models.length > 0
+                ? { status: "ready", models, error: null }
+                : {
+                    status: "error",
+                    models: [],
+                    error: "This account returned no compatible OpenAI models.",
+                  },
+          };
+        } catch (error) {
+          openAIModelCatalogs = {
+            ...openAIModelCatalogs,
+            [accountProfileId]: { status: "error", models: [], error: errMessage(error) },
+          };
+        }
+      };
       const preferredCatalog = preferredAccount
         ? openAIModelCatalogs[preferredAccount.id]
         : undefined;
-      const startupOpenAIBlockReason =
-        requestedProvider !== "openai"
-          ? null
-          : !openAIAvailable
-            ? (openAIAuthStatus?.unavailableReason ??
-              "ChatGPT subscription access is unavailable in this build.")
-            : openAIAccountDiscovery.error
-              ? "Couldn't load ChatGPT accounts: " + openAIAccountDiscovery.error
-              : !preferredAccount
-                ? "Choose a default ChatGPT account in Settings before creating a GPT chat."
-                : preferredCatalog?.status !== "ready"
-                  ? (preferredCatalog?.error ??
-                    "Load the default ChatGPT account's models before creating a GPT chat.")
-                  : !preferredCatalog.models.some((candidate) => candidate.id === requestedModel)
-                    ? "Choose a model available to the default ChatGPT account before creating a GPT chat."
-                    : null;
-      const model = requestedModel;
-      const settings: Settings = {
+      const requestedModel = rawSettings.model ?? DEFAULT_SETTINGS.model;
+      const startupModels =
+        preferredCatalog?.status === "ready" ? preferredCatalog.models : openAIModels;
+      const model =
+        startupModels.length === 0 ||
+        startupModels.some((candidate) => candidate.id === requestedModel)
+          ? requestedModel
+          : (startupModels.find((candidate) => candidate.id === DEFAULT_SETTINGS.model)?.id ??
+            startupModels[0]?.id ??
+            DEFAULT_SETTINGS.model);
+      const startupIdentityNeedsRepair =
+        rawSettings.provider !== "openai" || requestedModel !== model;
+      const startupOpenAIBlockReason = !openAIAvailable
+        ? (openAIAuthStatus?.unavailableReason ??
+          "ChatGPT subscription access is unavailable in this build.")
+        : openAIAccountDiscovery.error
+          ? "Couldn't load Codex authentication: " + openAIAccountDiscovery.error
+          : !preferredAccount
+            ? "Connect ChatGPT or an OpenAI Platform API key in Settings before creating a Codex chat."
+            : preferredCatalog?.status !== "ready"
+              ? (preferredCatalog?.error ??
+                "Load the current Codex authentication's models before creating a chat.")
+              : null;
+      let settings: Settings = {
         ...DEFAULT_SETTINGS,
         ...rawSettings,
         model,
-        provider: requestedProvider,
-        reasoningEffort: reasoningEffortForModel(
-          model,
-          rawSettings.reasoningEffort ?? DEFAULT_SETTINGS.reasoningEffort,
-          openAIModels,
-        ),
+        provider: "openai",
+        reasoningEffort: rawSettings.reasoningEffort ?? DEFAULT_SETTINGS.reasoningEffort,
+      };
+      let effortRepairError: string | null = null;
+      const persistSessionEffort = async (session: Session) => {
+        if (get().remoteMode || get().remoteConnected) return;
+        let resolution = reasoningForSession(
+          session,
+          settings.reasoningEffort,
+          openAIModelCatalogs,
+        );
+        // Historical sessions can carry a retired model or no Codex profile. They
+        // stay readable, while the shared default is repaired against the active
+        // Codex slot so the next runnable conversation is always OpenAI-backed.
+        if (
+          resolution.error &&
+          (!session.accountProfileId ||
+            !openAIModelCatalogs[session.accountProfileId]?.models.some(
+              (candidate) => candidate.id === session.model,
+            ))
+        ) {
+          resolution = reasoningForSession(
+            { ...session, model: settings.model, accountProfileId: defaultOpenAIAccountProfileId },
+            settings.reasoningEffort,
+            openAIModelCatalogs,
+          );
+        }
+        if (
+          resolution.error ||
+          (!startupIdentityNeedsRepair && resolution.effort === settings.reasoningEffort)
+        ) {
+          return;
+        }
+        try {
+          const repair: Partial<Settings> = startupIdentityNeedsRepair
+            ? { model: settings.model, provider: "openai", reasoningEffort: resolution.effort }
+            : { reasoningEffort: resolution.effort };
+          const saved = await ipc.saveSettings(repair);
+          if (
+            saved.reasoningEffort !== resolution.effort ||
+            (startupIdentityNeedsRepair &&
+              (saved.model !== settings.model || saved.provider !== "openai"))
+          ) {
+            effortRepairError = "The native core did not confirm the compatible Codex defaults.";
+            return;
+          }
+          settings = { ...settings, ...saved, model: settings.model, provider: "openai" };
+        } catch (error) {
+          // Keep startup usable. send() sees the still-stale effort, retries this
+          // repair, and refuses to run until native confirms the compatible value.
+          const failure = await reconcileSettingsSaveFailure(error);
+          effortRepairError = failure.message;
+          if (failure.authoritative) {
+            settings = { ...settings, ...failure.authoritative, model, provider: "openai" };
+          }
+        }
       };
       // Authoritative durable drafts merged under the already-hydrated optimistic
       // mirror; usage restored so per-session meters + workspace spend survive restart.
@@ -1697,7 +1883,6 @@ export const useStore = create<AppState>((set, get) => ({
       if (loaded.length === 0 && startupOpenAIBlockReason) {
         set((st) => ({
           settings,
-          oauthStatus,
           openAIAuthStatus,
           openAIAuthError: startupOpenAIBlockReason,
           openAIAccounts,
@@ -1715,19 +1900,18 @@ export const useStore = create<AppState>((set, get) => ({
           messages: {},
           showSettings: true,
           initError: null,
+          settingsError: effortRepairError,
           ...projectActiveRun({ activeId: null, runs: st.runs }),
         }));
         return;
       }
       if (loaded.length === 0) {
-        const accountProfileId =
-          providerForModel(settings.model, openAIModels) === "openai"
-            ? defaultOpenAIAccountProfileId
-            : null;
+        const accountProfileId = defaultOpenAIAccountProfileId;
         const pendingSession = makeSession(settings.model, accountProfileId);
+        await loadSessionProfileCatalog(pendingSession);
+        await persistSessionEffort(pendingSession);
         set((st) => ({
           settings,
-          oauthStatus,
           openAIAuthStatus,
           openAIAuthError: null,
           openAIAccounts,
@@ -1748,6 +1932,7 @@ export const useStore = create<AppState>((set, get) => ({
             [pendingSession.id]: { ...idleMessageLoad(), phase: "ready", loadedAt: now() },
           },
           initError: null,
+          settingsError: effortRepairError,
           // Keep the active-run mirror consistent with the newly active session
           // (idle here — a fresh session has no run).
           ...projectActiveRun({ activeId: pendingSession.id, runs: st.runs }),
@@ -1760,9 +1945,10 @@ export const useStore = create<AppState>((set, get) => ({
       // last-used default so Session.model stays a non-null string.
       const sessions = loaded.map((row) => ({ ...row, model: row.model ?? settings.model }));
       const activeId = sessions[0].id;
+      await loadSessionProfileCatalog(sessions[0]);
+      await persistSessionEffort(sessions[0]);
       set((st) => ({
         settings,
-        oauthStatus,
         openAIAuthStatus,
         openAIAuthError: null,
         openAIAccounts,
@@ -1778,10 +1964,12 @@ export const useStore = create<AppState>((set, get) => ({
         activeId,
         pendingSession: null,
         initError: null,
+        settingsError: effortRepairError,
         // Keep the active-run mirror consistent with the activated session.
         ...projectActiveRun({ activeId, runs: st.runs }),
       }));
       await get().hydrateMessages(activeId);
+      await get().loadCodexActivity(activeId);
       // One persistent background-task listener per known session (idempotent), so
       // a finish that lands while a different session is on screen is still tracked.
       sessions.forEach((s) => void ensureBackgroundListener(s.id));
@@ -1921,6 +2109,19 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  async loadCodexActivity(id) {
+    if (get().remoteMode || get().remoteConnected) return;
+    try {
+      const events = await ipc.getCodexActivity(id);
+      set((st) => ({
+        codexActivity: { ...st.codexActivity, [id]: events },
+      }));
+    } catch {
+      // The normalized transcript remains fully usable if an older core has no
+      // raw activity table. A later live codex_event still creates the timeline.
+    }
+  },
+
   async prefetchSession(id) {
     if (id === get().activeId || get().remoteMode || get().remoteConnected) return;
     await get().hydrateMessages(id);
@@ -1957,55 +2158,52 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       const model = modelId ?? get().settings.model;
       let profileId: string | null = null;
-      const provider = accountProfileId ? "openai" : providerForModel(model, get().openAIModels);
-      if (provider === "openai") {
-        const state = get();
-        if (!accountProfileId && state.openAIAccountsError) {
-          set({
-            showSettings: true,
-            openAIAuthError: `ChatGPT account registry is unavailable: ${state.openAIAccountsError}. Retry account discovery before creating a session.`,
-          });
-          return;
-        }
-        if (state.openAIAuthStatus?.available === false) {
-          set({
-            showSettings: true,
-            openAIAuthError:
-              state.openAIAuthStatus.unavailableReason ??
-              "ChatGPT subscription access is unavailable in this build.",
-          });
-          return;
-        }
-        const selected = accountProfileId
-          ? connectedOpenAIAccounts(state.openAIAccounts).find(
-              (account) => account.id === accountProfileId,
-            )
-          : preferredOpenAIAccount(state.openAIAccounts, state.lastOpenAIAccountProfileId);
-        if (!selected) {
-          set({
-            showSettings: true,
-            openAIAuthError: "Choose a default ChatGPT account in Settings first.",
-          });
-          return;
-        }
-        profileId = selected.id;
-        const models = await get().loadOpenAIAccountModels(profileId);
-        if (models.length === 0) {
-          throw new Error(
-            get().openAIModelCatalogs[profileId]?.error ??
-              "No compatible OpenAI models are available for this ChatGPT account.",
-          );
-        }
-        if (!models.some((candidate) => candidate.id === model)) {
-          set({
-            ...(modelId ? {} : { showSettings: true }),
-            openAIAuthError:
-              "Choose a model available to " +
-              openAIAccountLabel(selected, state.openAIAccounts) +
-              " before creating this session.",
-          });
-          return;
-        }
+      const state = get();
+      if (!accountProfileId && state.openAIAccountsError) {
+        set({
+          showSettings: true,
+          openAIAuthError: `Codex authentication is unavailable: ${state.openAIAccountsError}. Retry authentication discovery before creating a session.`,
+        });
+        return;
+      }
+      if (state.openAIAuthStatus?.available === false) {
+        set({
+          showSettings: true,
+          openAIAuthError:
+            state.openAIAuthStatus.unavailableReason ??
+            "ChatGPT subscription access is unavailable in this build.",
+        });
+        return;
+      }
+      const selected = accountProfileId
+        ? connectedOpenAIAccounts(state.openAIAccounts).find(
+            (account) => account.id === accountProfileId,
+          )
+        : codexOpenAIAccount(state.openAIAccounts, state.lastOpenAIAccountProfileId);
+      if (!selected) {
+        set({
+          showSettings: true,
+          openAIAuthError: "Connect ChatGPT or an OpenAI Platform API key in Settings first.",
+        });
+        return;
+      }
+      profileId = selected.id;
+      const models = await get().loadOpenAIAccountModels(profileId);
+      if (models.length === 0) {
+        throw new Error(
+          get().openAIModelCatalogs[profileId]?.error ??
+            "No compatible OpenAI models are available for the current Codex authentication.",
+        );
+      }
+      if (!models.some((candidate) => candidate.id === model)) {
+        set({
+          ...(modelId ? {} : { showSettings: true }),
+          openAIAuthError:
+            "Choose a model available to " +
+            openAIAccountLabel(selected, state.openAIAccounts) +
+            " before creating this session.",
+        });
+        return;
       }
 
       const s = makeSession(model, profileId);
@@ -2065,10 +2263,37 @@ export const useStore = create<AppState>((set, get) => ({
         ...projectActiveRun({ activeId: id, runs }),
       };
     });
+    if (!get().remoteMode && !get().remoteConnected) {
+      let selected = get().sessions.find((session) => session.id === id);
+      if (
+        selected?.accountProfileId &&
+        get().openAIModelCatalogs[selected.accountProfileId]?.status !== "ready"
+      ) {
+        try {
+          await get().loadOpenAIAccountModels(selected.accountProfileId);
+        } catch (error) {
+          set({ openAIAuthError: errMessage(error) });
+        }
+        selected = get().sessions.find((session) => session.id === id);
+      }
+      // A slower catalogue request for an earlier click must not overwrite the
+      // effort belonging to the session the user has since selected.
+      if (selected && get().activeId === id) {
+        const resolution = reasoningForSession(
+          selected,
+          get().settings.reasoningEffort,
+          get().openAIModelCatalogs,
+        );
+        if (!resolution.error && resolution.effort !== get().settings.reasoningEffort) {
+          await get().updateSettings({ reasoningEffort: resolution.effort });
+        }
+      }
+    }
     // Belt-and-suspenders: ensure the session being viewed has a background-task
     // listener (idempotent — a no-op if init/newSession already subscribed it).
     void ensureBackgroundListener(id);
     await get().hydrateMessages(id);
+    await get().loadCodexActivity(id);
   },
 
   // ── message search (⌘K jump to a past turn) ──────────────────────────────────
@@ -2161,6 +2386,8 @@ export const useStore = create<AppState>((set, get) => ({
       delete messageLoads[id];
       const backgroundTasks = { ...st.backgroundTasks };
       delete backgroundTasks[id]; // drop its background tasks
+      const codexActivity = { ...st.codexActivity };
+      delete codexActivity[id];
       const activeId = st.activeId === id ? (sessions[0]?.id ?? null) : st.activeId;
       // Prune the gone session's usage + draft to stay in lockstep with the backend
       // (db.rs deletes both rows on delete_session). Otherwise the deleted session's
@@ -2203,6 +2430,7 @@ export const useStore = create<AppState>((set, get) => ({
         messageLoads,
         runs,
         backgroundTasks,
+        codexActivity,
         activeId,
         usage,
         drafts,
@@ -2217,7 +2445,10 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
     const aid = get().activeId;
-    if (aid) await get().hydrateMessages(aid);
+    if (aid) {
+      await get().hydrateMessages(aid);
+      await get().loadCodexActivity(aid);
+    }
   },
 
   async renameSession(id, title) {
@@ -2276,42 +2507,35 @@ export const useStore = create<AppState>((set, get) => ({
       activeId && get().pendingSession?.id === activeId ? get().pendingSession : null;
     let activeSession =
       pendingSession ?? (activeId ? get().sessions.find((s) => s.id === activeId) : undefined);
-    if (
-      pendingSession &&
-      !pendingSession.accountProfileId &&
-      providerForModel(model, get().openAIModels) === "openai"
-    ) {
-      const account = preferredOpenAIAccount(
-        get().openAIAccounts,
-        get().lastOpenAIAccountProfileId,
-      );
+    if (pendingSession && !pendingSession.accountProfileId) {
+      const account = codexOpenAIAccount(get().openAIAccounts, get().lastOpenAIAccountProfileId);
       if (!account) {
-        set({ settingsError: "Choose a default ChatGPT account in Settings first." });
+        set({
+          settingsError: "Connect ChatGPT or an OpenAI Platform API key in Settings first.",
+        });
         return;
       }
       activeSession = { ...pendingSession, accountProfileId: account.id };
-    } else if (pendingSession && providerForModel(model, get().openAIModels) !== "openai") {
-      activeSession = { ...pendingSession, accountProfileId: null };
+    } else if (activeSession && !activeSession.accountProfileId) {
+      set({
+        settingsError: "Connect this historical conversation to Codex before selecting a model.",
+      });
+      return;
     }
     const activeOpenAIModels = modelsForOpenAIProfile(
       activeSession?.accountProfileId,
       get().openAIModelCatalogs,
       get().openAIModels,
     );
-    if (activeSession?.accountProfileId) {
-      if (!activeOpenAIModels.some((candidate) => candidate.id === model)) {
-        set({
-          settingsError: "That model is not available to this conversation's ChatGPT account.",
-        });
-        return;
-      }
-    } else if (!pendingSession && providerForModel(model, activeOpenAIModels) === "openai") {
+    const selectedModel = activeOpenAIModels.find((candidate) => candidate.id === model);
+    if (!selectedModel) {
       set({
-        settingsError:
-          "Choose an account for this legacy conversation before selecting an OpenAI model.",
+        settingsError: "That model is not available to this conversation's Codex authentication.",
       });
       return;
     }
+    const resetUnsupportedFast =
+      get().settings.responseSpeed === "fast" && !modelSupportsFast(selectedModel);
     if (pendingSession && activeId && activeSession) {
       set({ pendingSession: { ...activeSession, model }, settingsError: null });
       await get().updateSettings({
@@ -2321,6 +2545,7 @@ export const useStore = create<AppState>((set, get) => ({
           get().settings.reasoningEffort,
           activeOpenAIModels,
         ),
+        ...(resetUnsupportedFast ? { responseSpeed: "standard" as const } : {}),
       });
       return;
     }
@@ -2373,6 +2598,7 @@ export const useStore = create<AppState>((set, get) => ({
         get().settings.reasoningEffort,
         activeOpenAIModels,
       ),
+      ...(resetUnsupportedFast ? { responseSpeed: "standard" as const } : {}),
     });
   },
 
@@ -2383,6 +2609,24 @@ export const useStore = create<AppState>((set, get) => ({
     const messageLoad = get().messageLoads[activeId];
     if (messageLoad && messageLoad.phase !== "ready" && messageLoad.phase !== "refreshing") return;
 
+    // A model click updates the UI optimistically while its SQLite write is queued.
+    // Never let Send overtake that write: native admission reads the persisted row,
+    // so racing it could run the previous model with the new model's effort.
+    if (!get().remoteMode && !get().remoteConnected) {
+      const pendingModelWrite = sessionModelWriteQueues.get(activeId);
+      if (pendingModelWrite) {
+        try {
+          await pendingModelWrite;
+        } catch (error) {
+          set({ settingsError: errMessage(error) });
+          return;
+        }
+        if (get().activeId !== activeId) return;
+        const latestRun = get().runs[runKey(activeId)];
+        if (latestRun?.streaming || latestRun?.finalizing) return;
+      }
+    }
+
     // Native admission resolves the credential from the persisted session row,
     // but keep the client honest too: never clear a draft or append an optimistic
     // message for an unpinned/removed/reconnect-required OpenAI profile. Remote
@@ -2390,31 +2634,41 @@ export const useStore = create<AppState>((set, get) => ({
     const pendingSession = get().pendingSession?.id === activeId ? get().pendingSession : null;
     const activeSession =
       pendingSession ?? get().sessions.find((session) => session.id === activeId);
-    if (!get().remoteConnected && activeSession) {
-      const sessionModels = modelsForOpenAIProfile(
-        activeSession.accountProfileId,
+    if (!get().remoteMode && !get().remoteConnected && activeSession) {
+      const account = activeSession.accountProfileId
+        ? get().openAIAccounts.find((candidate) => candidate.id === activeSession.accountProfileId)
+        : undefined;
+      if (!activeSession.accountProfileId) {
+        set({
+          openAIAuthError:
+            "Connect ChatGPT or an OpenAI Platform API key in Settings before sending.",
+        });
+        return;
+      }
+      if (!account || account.state !== "connected") {
+        set({
+          openAIAuthError:
+            account?.state === "reconnect_required"
+              ? "Reconnect Codex authentication before sending."
+              : "This session's Codex authentication is unavailable.",
+        });
+        return;
+      }
+      const resolution = reasoningForSession(
+        activeSession,
+        get().settings.reasoningEffort,
         get().openAIModelCatalogs,
-        get().openAIModels,
       );
-      if (providerForModel(activeSession.model, sessionModels) === "openai") {
-        const account = activeSession.accountProfileId
-          ? get().openAIAccounts.find(
-              (candidate) => candidate.id === activeSession.accountProfileId,
-            )
-          : undefined;
-        if (!activeSession.accountProfileId) {
-          set({ openAIAuthError: "Choose a default ChatGPT account in Settings before sending." });
-          return;
-        }
-        if (!account || account.state !== "connected") {
-          set({
-            openAIAuthError:
-              account?.state === "reconnect_required"
-                ? "Reconnect this session's ChatGPT account before sending."
-                : "This session's ChatGPT account is unavailable.",
-          });
-          return;
-        }
+      if (resolution.error) {
+        set({ openAIAuthError: resolution.error });
+        return;
+      }
+      if (resolution.effort !== get().settings.reasoningEffort) {
+        await get().updateSettings({ reasoningEffort: resolution.effort });
+        // updateSettings surfaces persistence failures instead of throwing. Confirm
+        // the echoed native value before accepting the turn, otherwise the UI can
+        // look repaired while Rust still sends the stale unsupported effort.
+        if (get().settings.reasoningEffort !== resolution.effort) return;
       }
     }
 
@@ -2481,16 +2735,6 @@ export const useStore = create<AppState>((set, get) => ({
           pendingSession: null,
           creatingSession: false,
         }));
-        if (session.accountProfileId) {
-          writeStr("pc.lastOpenAIAccountProfileId", session.accountProfileId);
-          set({
-            lastOpenAIAccountProfileId: session.accountProfileId,
-            openAIModels: modelsForOpenAIProfile(
-              session.accountProfileId,
-              get().openAIModelCatalogs,
-            ),
-          });
-        }
         void ensureBackgroundListener(session.id);
       } catch (err) {
         set((st) => ({
@@ -2525,6 +2769,7 @@ export const useStore = create<AppState>((set, get) => ({
     setRun(set, activeId, {
       composerPhase: "received",
       activeTool: null,
+      pendingCodexRequest: null,
       turnId: provisionalTurnId,
       startedAt: optimisticStartedAt,
       unseenOutcome: null,
@@ -2888,6 +3133,7 @@ export const useStore = create<AppState>((set, get) => ({
                 streaming: false,
                 cancel: null,
                 pendingPermission: null,
+                pendingCodexRequest: null,
                 finalizing: e.receiptExpected !== false || status === "error",
                 agentDurationMs: receipt.agentDurationMs ?? receipt.durationMs ?? null,
                 phaseRevision,
@@ -2966,6 +3212,9 @@ export const useStore = create<AppState>((set, get) => ({
             },
           });
           break;
+        case "codex_request":
+          set((state) => applyCodexRequestEvent(state, activeId, e));
+          break;
         case "usage":
           set((st) => {
             const cur = st.usage[activeId] ?? { input: 0, output: 0 };
@@ -3004,6 +3253,11 @@ export const useStore = create<AppState>((set, get) => ({
         case "agent_progress":
         case "agent_finished":
           set((st) => ({ agents: applyAgentEvent(st.agents, activeId, e) }));
+          break;
+        case "codex_event":
+          set((st) => ({
+            codexActivity: applyCodexActivityEvent(st.codexActivity, activeId, e),
+          }));
           break;
       }
     };
@@ -3237,11 +3491,11 @@ export const useStore = create<AppState>((set, get) => ({
 
   async resolvePermission(
     sessionOrDecision: string,
-    permissionOrAlways?: string | boolean,
+    permissionOrForSession?: string | boolean,
     decisionArg?: "allow" | "deny",
-    alwaysArg?: boolean,
+    forSessionArg?: boolean,
   ) {
-    // Keep the historical `(decision, always?)` form while exposing the identity-
+    // Keep the historical `(decision, forSession?)` form while exposing the identity-
     // bearing form used by prompts that can remain pending in background sessions.
     const legacy = sessionOrDecision === "allow" || sessionOrDecision === "deny";
     const sessionId = legacy ? (get().activeId ?? "__legacy-active__") : sessionOrDecision;
@@ -3249,16 +3503,16 @@ export const useStore = create<AppState>((set, get) => ({
       ? (get().runs[runKey(sessionId)]?.pendingPermission ?? get().pendingPermission)
       : get().runs[runKey(sessionId)]?.pendingPermission;
     if (!p) return;
-    const permissionId = legacy ? p.id : String(permissionOrAlways ?? "");
+    const permissionId = legacy ? p.id : String(permissionOrForSession ?? "");
     const decision = legacy ? sessionOrDecision : decisionArg;
-    const always = legacy ? Boolean(permissionOrAlways) : alwaysArg;
+    const forSession = legacy ? Boolean(permissionOrForSession) : Boolean(forSessionArg);
     if ((decision !== "allow" && decision !== "deny") || permissionId !== p.id) return;
 
     // Remote mode: the permission gate belongs to the desktop's agent run, so
     // answer it as a Permission command over the link — the local
     // `resolve_permission` is desktop-only and not registered on the phone. The
-    // "always" policy is a desktop-side setting the phone can't change through
-    // this command, so it's ignored on the remote path. The same stale-click
+    // session-scoped approval is a desktop-side Codex capability the phone cannot
+    // use through this command, so it is ignored remotely. The same stale-click
     // guard applies (don't answer a request a newer one superseded).
     // A disconnected phone shell must fail closed here. It must never fall
     // through to the desktop-only IPC path (or persist a local allow rule) just
@@ -3275,37 +3529,48 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
 
-    // A superseding request may have replaced the prompt while we awaited
-    // (or between render and click); only resolve the request we captured so a
-    // stale click can't clear/answer a newer one.
+    // Only resolve the request captured by this click. A superseding request may
+    // have replaced the prompt between render and dispatch.
     const current = legacy
       ? (get().runs[runKey(sessionId)]?.pendingPermission ?? get().pendingPermission)
       : get().runs[runKey(sessionId)]?.pendingPermission;
     if (current && current.id !== permissionId) return;
-    // Persist an "Always allow" scope before releasing the backend gate. Native
-    // reads permission policy live between serialized prompts, so queued calls in
-    // this same task immediately observe the new rule instead of prompting again.
-    // updateSettings handles failures internally and always settles, after which
-    // this request is still resolved as a one-shot Allow.
-    if (always && decision === "allow") {
-      // "Always allow" adds a scoped rule instead of flipping the global policy.
-      // Commands retain their command scope; other prompts retain their tool scope.
-      const rule = scopedAllowRule(p);
-      const rules = get().settings.rules;
-      const nextRules = rulesWithEffectiveAllow(rules, rule);
-      if (nextRules !== rules) {
-        await get().updateSettings({ rules: nextRules });
-      }
-    }
-    // The settings save above crossed an async boundary. Re-check identity before
-    // clearing or answering so an impossible-but-defensive superseding request is
-    // never resolved by a stale click.
-    const latest = legacy
+    // Keep the prompt visible while native delivery is in flight. The Codex
+    // app-server owns its session approval cache; Portcode must not persist an
+    // obsolete parallel rules engine or claim broader scope than Codex granted.
+    await ipc.resolvePermission(permissionId, decision, forSession && decision === "allow");
+
+    const delivered = legacy
       ? (get().runs[runKey(sessionId)]?.pendingPermission ?? get().pendingPermission)
       : get().runs[runKey(sessionId)]?.pendingPermission;
-    if (latest && latest.id !== permissionId) return;
-    setRun(set, sessionId, { pendingPermission: null });
-    await ipc.resolvePermission(permissionId, decision);
+    if (delivered?.id === permissionId) {
+      setRun(set, sessionId, { pendingPermission: null });
+    }
+  },
+
+  async resolveCodexRequest(sessionId, requestId, response) {
+    // These lossless app-server requests are deliberately desktop-local; Phone
+    // Sync never receives their potentially sensitive form contents.
+    if (get().remoteMode) {
+      throw new Error("Structured Codex requests can only be answered on the desktop.");
+    }
+    const current =
+      get().runs[runKey(sessionId)]?.pendingCodexRequest ??
+      (get().activeId === sessionId ? get().pendingCodexRequest : null);
+    if (!current || current.id !== requestId) return;
+
+    // Keep the prompt visible while native delivery is in flight. On failure the
+    // user can retry or choose the safe cancel/decline action without losing it.
+    await ipc.resolveCodexRequest(requestId, response);
+
+    // A newer request may have arrived while the IPC call was pending. Never let
+    // the older response clear that newer prompt.
+    const latest =
+      get().runs[runKey(sessionId)]?.pendingCodexRequest ??
+      (get().activeId === sessionId ? get().pendingCodexRequest : null);
+    if (latest?.id === requestId) {
+      setRun(set, sessionId, { pendingCodexRequest: null });
+    }
   },
 
   setShowSettings(v) {
@@ -3537,20 +3802,85 @@ export const useStore = create<AppState>((set, get) => ({
     set({ settingsError: null });
     try {
       const patch: Partial<Settings> = { ...s };
-      if (s.model) {
-        const provider = providerForModel(s.model, get().openAIModels);
-        const reasoningEffort = reasoningEffortForModel(
-          s.model,
-          s.reasoningEffort ?? get().settings.reasoningEffort,
-          get().openAIModels,
-        );
-        if (provider !== get().settings.provider) patch.provider = provider;
-        if (reasoningEffort !== get().settings.reasoningEffort) {
-          patch.reasoningEffort = reasoningEffort;
+      if (s.model || s.provider) patch.provider = "openai";
+      const state = get();
+      const activeSession = state.activeId
+        ? (state.sessions.find((session) => session.id === state.activeId) ??
+          (state.pendingSession?.id === state.activeId ? state.pendingSession : undefined))
+        : undefined;
+      const targetModel = s.model ?? activeSession?.model ?? state.settings.model;
+      const preferred = preferredOpenAIAccount(
+        state.openAIAccounts,
+        state.lastOpenAIAccountProfileId,
+      );
+      const targetModels =
+        activeSession?.model === targetModel
+          ? modelsForOpenAIProfile(
+              activeSession.accountProfileId,
+              state.openAIModelCatalogs,
+              state.openAIModels,
+            )
+          : modelsForOpenAIProfile(preferred?.id, state.openAIModelCatalogs, state.openAIModels);
+      if (s.responseSpeed === "fast") {
+        const target = targetModels.find((model) => model.id === targetModel);
+        if (!modelSupportsFast(target)) {
+          throw new Error("Fast mode is not available for the selected model.");
         }
       }
+      if (s.model || "reasoningEffort" in s) {
+        const target = targetModels.find((model) => model.id === targetModel);
+        if (!target || (target.reasoningEfforts ?? []).length === 0) {
+          throw new Error("Load this model's supported reasoning levels before changing it.");
+        }
+        // Persist model + compatible effort in one native transaction. This keeps
+        // the Rust settings snapshot aligned with the controlled picker even when
+        // the previous model used Ultra and the next model does not.
+        patch.reasoningEffort = reasoningEffortForModel(
+          targetModel,
+          s.reasoningEffort ?? state.settings.reasoningEffort,
+          targetModels,
+        );
+      }
       const next = await ipc.saveSettings(patch);
-      set({ settings: next });
+      set({ settings: { ...next, provider: "openai" } });
+    } catch (err) {
+      const failure = await reconcileSettingsSaveFailure(err);
+      set({
+        settingsError: failure.message,
+        ...(failure.authoritative ? { settings: failure.authoritative } : {}),
+      });
+    }
+  },
+
+  async updateDefaultOpenAISettings(s) {
+    set({ settingsError: null });
+    try {
+      const state = get();
+      const preferred = preferredOpenAIAccount(
+        state.openAIAccounts,
+        state.lastOpenAIAccountProfileId,
+      );
+      const models = modelsForOpenAIProfile(
+        preferred?.id,
+        state.openAIModelCatalogs,
+        state.openAIModels,
+      );
+      const model = s.model ?? state.settings.model;
+      const target = models.find((candidate) => candidate.id === model);
+      if (!target || (target.reasoningEfforts ?? []).length === 0) {
+        throw new Error("Load the default ChatGPT account's supported reasoning levels first.");
+      }
+      const patch: Partial<Settings> = {
+        ...s,
+        reasoningEffort: reasoningEffortForModel(
+          model,
+          s.reasoningEffort ?? state.settings.reasoningEffort,
+          models,
+        ),
+      };
+      if (s.model || state.settings.provider !== "openai") patch.provider = "openai";
+      const next = await ipc.saveSettings(patch);
+      set({ settings: { ...next, provider: "openai" } });
     } catch (err) {
       const failure = await reconcileSettingsSaveFailure(err);
       set({
@@ -3569,35 +3899,6 @@ export const useStore = create<AppState>((set, get) => ({
     const i = CYCLE_MODES.indexOf(cur);
     const next: PermissionMode = CYCLE_MODES[(i + 1) % CYCLE_MODES.length] ?? "default";
     await get().updateSettings({ permissionMode: next });
-  },
-
-  async refreshOAuthStatus() {
-    try {
-      const oauthStatus = await ipc.oauthStatus();
-      set({ oauthStatus });
-    } catch {
-      // Transient / core not ready — keep whatever we last knew.
-    }
-  },
-
-  async loginWithClaude() {
-    set({ oauthError: null });
-    try {
-      const oauthStatus = await ipc.startOauthLogin();
-      set({ oauthStatus });
-    } catch (err) {
-      set({ oauthError: errMessage(err) });
-    }
-  },
-
-  async logoutClaude() {
-    set({ oauthError: null });
-    try {
-      await ipc.oauthLogout();
-      set({ oauthStatus: { signedIn: false, expiresAt: null, account: null, tier: null } });
-    } catch (err) {
-      set({ oauthError: errMessage(err) });
-    }
   },
 
   async refreshOpenAIStatus() {
@@ -3716,14 +4017,20 @@ export const useStore = create<AppState>((set, get) => ({
     set({ lastOpenAIAccountProfileId: accountProfileId });
     try {
       const models = await get().loadOpenAIAccountModels(accountProfileId);
+      if (get().lastOpenAIAccountProfileId !== accountProfileId) return;
       set({ openAIModels: models });
       const current = get().settings;
-      if (current.provider === "openai" && !models.some((model) => model.id === current.model)) {
-        const fallback = models[0];
-        if (fallback) {
-          await get().updateSettings({
-            model: fallback.id,
-            reasoningEffort: fallback.defaultReasoningEffort,
+      const selected = models.find((model) => model.id === current.model) ?? models[0];
+      if (selected && (selected.reasoningEfforts ?? []).length > 0) {
+        const effort = reasoningEffortForModel(selected.id, current.reasoningEffort, models);
+        if (
+          current.provider !== "openai" ||
+          selected.id !== current.model ||
+          effort !== current.reasoningEffort
+        ) {
+          await get().updateDefaultOpenAISettings({
+            model: selected.id,
+            reasoningEffort: effort,
           });
         }
       }
@@ -3856,6 +4163,32 @@ export const useStore = create<AppState>((set, get) => ({
           ...(preferred?.id === accountProfileId ? { openAIModels: models } : {}),
         };
       });
+      if (!get().remoteMode && !get().remoteConnected) {
+        const state = get();
+        const activeSession = state.activeId
+          ? (state.sessions.find((session) => session.id === state.activeId) ??
+            (state.pendingSession?.id === state.activeId ? state.pendingSession : undefined))
+          : undefined;
+        const preferred = preferredOpenAIAccount(
+          state.openAIAccounts,
+          state.lastOpenAIAccountProfileId,
+        );
+        const targetModel =
+          activeSession?.accountProfileId === accountProfileId
+            ? activeSession.model
+            : preferred?.id === accountProfileId
+              ? state.settings.model
+              : null;
+        const target = targetModel
+          ? models.find((candidate) => candidate.id === targetModel)
+          : undefined;
+        if (target && (target.reasoningEfforts ?? []).length > 0) {
+          const effort = reasoningEffortForModel(target.id, state.settings.reasoningEffort, models);
+          if (effort !== state.settings.reasoningEffort) {
+            await get().updateSettings({ reasoningEffort: effort });
+          }
+        }
+      }
       return models;
     } catch (error) {
       if (openAIModelRequestVersions.get(accountProfileId) === requestVersion) {
@@ -3880,12 +4213,23 @@ export const useStore = create<AppState>((set, get) => ({
 
   async pinSessionOpenAIAccount(sessionId, accountProfileId) {
     set({ openAIAuthError: null });
-    const session = get().sessions.find((candidate) => candidate.id === sessionId);
-    const account = get().openAIAccounts.find((candidate) => candidate.id === accountProfileId);
-    const run = get().runs[runKey(sessionId)];
-    if (!session) return "error";
+    const state = get();
+    const persistedSession = state.sessions.find((candidate) => candidate.id === sessionId);
+    const pendingSession =
+      state.pendingSession?.id === sessionId ? state.pendingSession : undefined;
+    const session = persistedSession ?? pendingSession;
+    const account = state.openAIAccounts.find((candidate) => candidate.id === accountProfileId);
+    const run = state.runs[runKey(sessionId)];
+    if (!session) {
+      set({ openAIAuthError: "This conversation is no longer available." });
+      return "error";
+    }
     if (session.accountProfileId === accountProfileId && account?.state === "connected") {
       return "selected";
+    }
+    if (pendingSession && state.creatingSession) {
+      set({ openAIAuthError: "Wait for this conversation to finish starting." });
+      return "error";
     }
     if (run?.streaming || run?.finalizing || run?.pendingPermission) {
       set({ openAIAuthError: "Wait for this conversation's active turn to finish." });
@@ -3897,25 +4241,92 @@ export const useStore = create<AppState>((set, get) => ({
     }
     try {
       const models = await get().loadOpenAIAccountModels(accountProfileId);
-      const selectedModel = models.find((model) => model.id === session.model) ?? models[0];
+      const latestState = get();
+      const latestPendingSession =
+        latestState.pendingSession?.id === sessionId ? latestState.pendingSession : undefined;
+      const latestPersistedSession = latestState.sessions.find(
+        (candidate) => candidate.id === sessionId,
+      );
+      const latestSession = latestPersistedSession ?? latestPendingSession;
+      if (!latestSession) throw new Error("This conversation is no longer available.");
+      if (
+        !latestState.openAIAccounts.some(
+          (candidate) => candidate.id === accountProfileId && candidate.state === "connected",
+        )
+      ) {
+        throw new Error("Choose a connected ChatGPT account.");
+      }
+      if (latestPendingSession && latestState.creatingSession) {
+        throw new Error("Wait for this conversation to finish starting.");
+      }
+      const selectedModel = models.find((model) => model.id === latestSession.model) ?? models[0];
       if (!selectedModel) throw new Error("This ChatGPT account has no compatible model.");
-      let pinned = await ipc.pinSessionOpenAIAccount(sessionId, accountProfileId, selectedModel.id);
-      // Compatibility with a transitional native command that performed the CAS
-      // but returned unit: reload and require authoritative confirmation.
-      if (!pinned) {
-        pinned = (await ipc.listSessions()).find((candidate) => candidate.id === sessionId)!;
+      if (latestPendingSession) {
+        const selectedPendingSession = {
+          ...latestPendingSession,
+          accountProfileId,
+          model: selectedModel.id,
+        };
+        set((current) =>
+          current.pendingSession?.id === sessionId
+            ? {
+                pendingSession: selectedPendingSession,
+                ...(current.lastOpenAIAccountProfileId === accountProfileId
+                  ? {
+                      openAIModels: modelsForOpenAIProfile(
+                        accountProfileId,
+                        current.openAIModelCatalogs,
+                      ),
+                    }
+                  : {}),
+              }
+            : {},
+        );
+        if (get().pendingSession?.accountProfileId !== accountProfileId) {
+          throw new Error(
+            "This conversation changed while its ChatGPT account was being selected.",
+          );
+        }
+      } else {
+        let pinned = await ipc.pinSessionOpenAIAccount(
+          sessionId,
+          accountProfileId,
+          selectedModel.id,
+        );
+        // Compatibility with a transitional native command that performed the CAS
+        // but returned unit: reload and require authoritative confirmation.
+        if (!pinned) {
+          pinned = (await ipc.listSessions()).find((candidate) => candidate.id === sessionId)!;
+        }
+        if (!pinned || pinned.accountProfileId !== accountProfileId) {
+          throw new Error("The native core did not confirm the selected ChatGPT account.");
+        }
+        set((current) => ({
+          sessions: current.sessions.map((candidate) =>
+            candidate.id === sessionId ? { ...candidate, ...pinned } : candidate,
+          ),
+          ...(current.lastOpenAIAccountProfileId === accountProfileId
+            ? {
+                openAIModels: modelsForOpenAIProfile(accountProfileId, current.openAIModelCatalogs),
+              }
+            : {}),
+        }));
       }
-      if (!pinned || pinned.accountProfileId !== accountProfileId) {
-        throw new Error("The native core did not confirm the selected ChatGPT account.");
+      if (!get().remoteMode && !get().remoteConnected && get().activeId === sessionId) {
+        const selected =
+          get().sessions.find((candidate) => candidate.id === sessionId) ??
+          (get().pendingSession?.id === sessionId ? get().pendingSession : undefined);
+        if (selected) {
+          const resolution = reasoningForSession(
+            selected,
+            get().settings.reasoningEffort,
+            get().openAIModelCatalogs,
+          );
+          if (!resolution.error && resolution.effort !== get().settings.reasoningEffort) {
+            await get().updateSettings({ reasoningEffort: resolution.effort });
+          }
+        }
       }
-      set((state) => ({
-        sessions: state.sessions.map((candidate) =>
-          candidate.id === sessionId ? { ...candidate, ...pinned } : candidate,
-        ),
-        ...(state.lastOpenAIAccountProfileId === accountProfileId
-          ? { openAIModels: modelsForOpenAIProfile(accountProfileId, state.openAIModelCatalogs) }
-          : {}),
-      }));
       return "selected";
     } catch (error) {
       const message = errMessage(error);

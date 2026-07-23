@@ -8,20 +8,13 @@
 //! is not unit-tested; it is exercised end-to-end by the iroh integration test
 //! (via a recording handler) and compiled + clippy-checked here.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tauri::{AppHandle, Manager};
 
-use crate::agent;
-use crate::agents;
-use crate::background;
+use crate::codex_engine::{CodexEngine, PRIMARY_CODEX_ACCOUNT_ID};
 use crate::db::{self, Db};
-use crate::events::{AppEventSink, EventSink};
-use crate::openai_accounts::OpenAiAccountRegistry;
-use crate::permissions::{self, Decision, Pending};
 use crate::settings::Settings;
 use crate::sync::protocol::{CommandRejectionCode, RemoteCommand, SyncFrame};
 use crate::sync::public;
@@ -35,16 +28,9 @@ use crate::sync::SyncHub;
 #[derive(Clone)]
 pub struct DesktopCommandHandler {
     pub app: AppHandle,
-    pub http: reqwest::Client,
     pub settings: Arc<Mutex<Settings>>,
     pub db: Arc<Db>,
-    pub cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
-    pub pending: Pending,
-    pub agents: agents::Agents,
-    pub background: background::Background,
-    pub oauth_refresh: Arc<tokio::sync::Mutex<()>>,
-    pub openai_accounts: Arc<OpenAiAccountRegistry>,
-    pub openai_accounts_startup_error: Arc<Mutex<Option<String>>>,
+    pub codex: Arc<CodexEngine>,
 }
 
 /// Upper bound on how many rows a single `FetchMessages` page may request. Clamps
@@ -79,15 +65,15 @@ static REMOTE_CREATE_LOCK: Mutex<()> = Mutex::new(());
 /// against an explicit allowlist. Only "allow"/"deny" are meaningful; ANY other
 /// value (typo, future variant, hostile input from a confirmed-but-misbehaving
 /// device) is treated as Deny (fail-closed) and logged — never coerced into Allow.
-fn parse_decision(decision: &str) -> Decision {
+fn parse_decision(decision: &str) -> bool {
     match decision {
-        "allow" => Decision::Allow,
-        "deny" => Decision::Deny,
+        "allow" => true,
+        "deny" => false,
         _ => {
             // This value is supplied by a paired peer. Keep the audit signal,
             // but never reflect arbitrary command content into local logs.
             eprintln!("phone-sync: unknown permission decision — denying");
-            Decision::Deny
+            false
         }
     }
 }
@@ -107,8 +93,8 @@ fn remote_create_model(settings: &Settings) -> Result<String, CommandRejectionCo
     if settings.provider != provider {
         return Err(CommandRejectionCode::InvalidDesktopConfiguration);
     }
-    if provider == "openai" {
-        return Err(CommandRejectionCode::OpenAiAccountSelectionRequired);
+    if provider != "openai" {
+        return Err(CommandRejectionCode::InvalidDesktopConfiguration);
     }
     Ok(model)
 }
@@ -229,7 +215,7 @@ fn create_remote_session(
         branch: None,
         workspace: None,
         model: Some(model.clone()),
-        account_profile_id: None,
+        account_profile_id: Some(PRIMARY_CODEX_ACCOUNT_ID.to_string()),
         created_at,
         updated_at: created_at,
     };
@@ -241,7 +227,7 @@ fn create_remote_session(
         &title,
         None, // workspace
         Some(&model),
-        None, // account profile: unsupported by this protocol version
+        Some(PRIMARY_CODEX_ACCOUNT_ID),
         created_at,
     )
     .map_err(|_| CommandRejectionCode::DesktopUnavailable)?;
@@ -263,77 +249,13 @@ impl CommandHandler for DesktopCommandHandler {
                 if text.is_empty() || text.len() > public::MAX_REMOTE_RUN_TEXT_BYTES {
                     return Ok(());
                 }
-                // Wrap the AppHandle in the concrete EventSink so the agent core sees
-                // only the trait (its sole Tauri coupling now lives behind it). Same
-                // sink the desktop `run_agent` command builds, so a phone-driven turn
-                // mirrors identically.
-                let sink: Arc<dyn EventSink> = Arc::new(AppEventSink(self.app.clone()));
-                let channel = format!("agent://{session_id}");
-                let admission: Result<agent::RunAdmission, String> = (|| {
-                    let settings = settings_snapshot(&self.settings)?;
-                    let run_config = self
-                        .db
-                        .session_run_config(&session_id)
-                        .map_err(|_| "Session is unavailable.".to_string())?;
-                    let model =
-                        crate::effective_session_model(&settings, run_config.model.as_deref())?;
-                    if crate::llm::provider_name_for_model(&model)? == "openai" {
-                        crate::ensure_openai_accounts_ready(
-                            &self.openai_accounts,
-                            &self.openai_accounts_startup_error,
-                        )?;
-                    }
-                    let admission = agent::admit_run(
-                        self.cancels.clone(),
-                        &self.db,
-                        &settings,
-                        self.openai_accounts.clone(),
-                        &session_id,
-                    )?;
-                    if admission.is_openai() {
-                        crate::ensure_openai_accounts_ready(
-                            &self.openai_accounts,
-                            &self.openai_accounts_startup_error,
-                        )?;
-                    }
-                    Ok(admission)
-                })();
-                let admission = match admission {
-                    Ok(admission) => admission,
-                    Err(message) => {
-                        let message = bounded_public_message(&message);
-                        sink.emit(
-                            &channel,
-                            crate::llm::StreamEvent::Error {
-                                message,
-                                receipt: None,
-                            },
-                        );
-                        return Ok(());
-                    }
+                let settings = match settings_snapshot(&self.settings) {
+                    Ok(settings) => settings,
+                    Err(_) => return Ok(()),
                 };
-                let http = self.http.clone();
-                let settings = self.settings.clone();
-                let db = self.db.clone();
-                let pending = self.pending.clone();
-                let agents = self.agents.clone();
-                let background = self.background.clone();
-                let oauth_refresh = self.oauth_refresh.clone();
+                let codex = self.codex.clone();
                 tauri::async_runtime::spawn(async move {
-                    agent::run(
-                        sink,
-                        http,
-                        settings,
-                        db,
-                        admission,
-                        pending,
-                        agents,
-                        background,
-                        oauth_refresh,
-                        session_id,
-                        text,
-                    )
-                    .await;
+                    codex.run_turn(session_id, text, settings).await;
                 });
                 Ok(())
             }
@@ -345,12 +267,7 @@ impl CommandHandler for DesktopCommandHandler {
                 else {
                     return Ok(());
                 };
-                if let Some(flag) = self.cancels.lock().unwrap().get(&session_id) {
-                    flag.store(true, Ordering::Relaxed);
-                }
-                agents::cancel_session(&self.agents, &session_id);
-                background::cancel_session(&self.background, &session_id);
-                permissions::deny_all(&self.pending, &session_id);
+                let _ = self.codex.interrupt_session(&session_id).await;
                 Ok(())
             }
             // Mirror `cancel_agent_by_id`: stop ONE subagent (and its descendants),
@@ -359,7 +276,7 @@ impl CommandHandler for DesktopCommandHandler {
                 if !public::valid_remote_identifier(&agent_id) {
                     return Ok(());
                 }
-                agents::cancel_one(&self.agents, &agent_id);
+                let _ = self.codex.interrupt_agent(&agent_id).await;
                 Ok(())
             }
             // Mirror `resolve_permission`, but validate the decision string against
@@ -373,7 +290,10 @@ impl CommandHandler for DesktopCommandHandler {
                 if !public::valid_remote_identifier(&id) {
                     return Ok(());
                 }
-                permissions::resolve(&self.pending, &id, parse_decision(&decision));
+                let _ = self
+                    .codex
+                    .resolve_approval(&id, parse_decision(&decision), false)
+                    .await;
                 Ok(())
             }
             // Mirror `create_session`. The phone supplies only a title; the desktop
@@ -458,40 +378,26 @@ mod tests {
 
     #[test]
     fn parse_decision_only_allows_the_literal_allow() {
-        assert_eq!(parse_decision("allow"), Decision::Allow);
-        assert_eq!(parse_decision("deny"), Decision::Deny);
+        assert!(parse_decision("allow"));
+        assert!(!parse_decision("deny"));
         // Everything else is fail-closed to Deny — never coerced into Allow.
         for bad in [
             "", "ALLOW", "Allow", "yes", "true", "1", "allow ", " allow", "grant",
         ] {
-            assert_eq!(
-                parse_decision(bad),
-                Decision::Deny,
-                "unknown decision {bad:?} must map to Deny"
-            );
+            assert!(!parse_decision(bad), "unknown decision {bad:?} must deny");
         }
     }
 
     #[test]
-    fn remote_create_freezes_anthropic_default_and_rejects_openai() {
-        let anthropic = Settings::default();
-        assert_eq!(remote_create_model(&anthropic).unwrap(), "claude-opus-4-8");
-
-        let openai = Settings {
-            provider: "openai".into(),
-            model: "gpt-5.6-sol".into(),
-            ..Settings::default()
-        };
-        assert_eq!(
-            remote_create_model(&openai).expect_err("profile negotiation is absent"),
-            CommandRejectionCode::OpenAiAccountSelectionRequired
-        );
+    fn remote_create_freezes_the_codex_default() {
+        let settings = Settings::default();
+        assert_eq!(remote_create_model(&settings).unwrap(), "gpt-5.6-terra");
     }
 
     #[test]
     fn remote_create_rejects_provider_model_mismatch() {
         let settings = Settings {
-            model: "gpt-5.6-sol".into(),
+            provider: "anthropic".into(),
             ..Settings::default()
         };
         assert_eq!(
@@ -501,30 +407,21 @@ mod tests {
     }
 
     #[test]
-    fn stale_openai_rejection_does_not_poison_the_next_remote_create() {
+    fn remote_create_pins_the_single_codex_account() {
         let db = Db::open(Path::new(":memory:")).unwrap();
-        let stale_phone_request = "create-stale";
-        let openai = Settings {
-            provider: "openai".into(),
-            model: "gpt-5.6-sol".into(),
-            ..Settings::default()
-        };
-
-        assert_eq!(
-            create_remote_session(&db, &openai, stale_phone_request, None).unwrap_err(),
-            CommandRejectionCode::OpenAiAccountSelectionRequired
-        );
-        assert!(db.list_sessions().unwrap().is_empty());
-
         let created = create_remote_session(
             &db,
             &Settings::default(),
-            "create-after-rejection",
+            "create-codex",
             Some("Still connected"),
         )
-        .expect("subsequent command must still work");
+        .expect("Codex session creation must work over Phone Sync");
         assert_eq!(created.title, "Still connected");
-        assert_eq!(created.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(created.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(
+            created.account_profile_id.as_deref(),
+            Some(PRIMARY_CODEX_ACCOUNT_ID)
+        );
         assert_eq!(db.list_sessions().unwrap().len(), 1);
     }
 

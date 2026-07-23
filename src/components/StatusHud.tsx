@@ -4,21 +4,18 @@ import * as ipc from "../lib/ipc";
 import { modelsForOpenAIProfile, useStore } from "../store/store";
 import {
   DANGER_MODES,
-  estimateCost,
   modelInfo,
   openAIAccountLabel,
-  providerForModel,
   type Message,
   type ModelInfo,
-  type ProviderId,
 } from "../types";
 import { PlanUsagePopover } from "./PlanUsagePopover";
 import { lowestPlanRemaining } from "./PlanUsagePanel";
 
-/** "claude-opus-4-8" -> "OPUS 4.8" */
+/** "gpt-5.6-sol" -> the concise live catalogue label shown in the HUD. */
 function modelLabel(id: string, openAIModels: ModelInfo[]): string {
   const m = modelInfo(id, openAIModels);
-  return (m?.label ?? id).replace(/^Claude\s+/, "").toUpperCase();
+  return (m?.label ?? id).toUpperCase();
 }
 
 /** Last path segment of a workspace dir, or "local". */
@@ -58,7 +55,6 @@ function countToolUses(messages: Message[] | undefined): number {
  * counts every live run, including runs in background sessions.
  */
 export function StatusHud() {
-  const sessions = useStore((s) => s.sessions);
   const session = useStore((s) => s.sessions.find((x) => x.id === s.activeId));
   const model = useStore((s) => {
     const sess = s.sessions.find((x) => x.id === s.activeId);
@@ -69,14 +65,12 @@ export function StatusHud() {
   const streaming = useStore((s) => s.streaming);
   const runs = useStore((s) => s.runs);
   const usage = useStore((s) => (s.activeId ? s.usage[s.activeId] : undefined));
-  const usageMap = useStore((s) => s.usage);
   const messages = useStore((s) => (s.activeId ? s.messages[s.activeId] : undefined));
   const remoteMode = useStore((s) => s.remoteMode);
   const openAIModels = useStore((s) => s.openAIModels);
   const openAIAccounts = useStore((s) => s.openAIAccounts);
   const openAIAccountsError = useStore((s) => s.openAIAccountsError);
   const openAIModelCatalogs = useStore((s) => s.openAIModelCatalogs);
-  const claudeAuth = useStore((s) => s.oauthStatus);
   const openAIAuth = useStore((s) => s.openAIAuthStatus);
   const showSettings = useStore((s) => s.showSettings);
   const showPalette = useStore((s) => s.showPalette);
@@ -98,26 +92,18 @@ export function StatusHud() {
     openAIModelCatalogs,
     openAIModels,
   );
-  const activeProvider = providerForModel(model, activeOpenAIModels);
   const activeOpenAIAccount = session?.accountProfileId
     ? openAIAccounts.find((account) => account.id === session.accountProfileId)
     : undefined;
   const providerConnected =
-    activeProvider === "openai"
-      ? openAIAuth?.available !== false && activeOpenAIAccount?.state === "connected"
-      : Boolean(claudeAuth?.signedIn);
+    openAIAuth?.available !== false && activeOpenAIAccount?.state === "connected";
 
   const closePlanUsage = useCallback(() => setShowPlanUsage(false), []);
   const openPlanSettings = useCallback(
-    (provider?: ProviderId) => {
+    (section?: "account") => {
       setShowPlanUsage(false);
       setShowSettings(true);
-      const target =
-        provider === "anthropic"
-          ? "pc-setting-claude"
-          : provider === "openai"
-            ? "pc-setting-openai"
-            : "pc-setting-usage";
+      const target = section === "account" ? "pc-setting-openai" : "pc-setting-usage";
       window.setTimeout(() => {
         document.getElementById(target)?.scrollIntoView?.({ behavior: "smooth", block: "center" });
       }, 0);
@@ -135,10 +121,7 @@ export function StatusHud() {
 
     let cancelled = false;
     void ipc
-      .getPlanUsage(
-        activeProvider,
-        activeProvider === "openai" ? (session?.accountProfileId ?? null) : null,
-      )
+      .getPlanUsage("openai", session?.accountProfileId ?? null)
       .then((snapshot) => {
         if (!cancelled) setPlanRemaining(lowestPlanRemaining([snapshot]));
       })
@@ -148,31 +131,13 @@ export function StatusHud() {
     return () => {
       cancelled = true;
     };
-  }, [activeProvider, providerConnected, remoteMode, session?.accountProfileId]);
+  }, [providerConnected, remoteMode, session?.accountProfileId]);
 
   const workspaceConnected = Boolean(session?.workspace);
   // Memoized so a token/usage-only re-render (messages array reference stable)
   // doesn't re-scan the transcript. A real message change — including each
   // streaming text delta, since patchLast rebuilds the array — still recomputes.
   const toolUses = useMemo(() => countToolUses(messages), [messages]);
-
-  // Cumulative Anthropic API spend across every session, persisted in SQLite and
-  // rehydrated on startup. Each usage row is priced with its owning session's model;
-  // OpenAI subscription usage has no API-price equivalent and is intentionally skipped.
-  const totalCost = useMemo(() => {
-    let total = 0;
-    for (const item of sessions) {
-      const itemUsage = usageMap[item.id];
-      const itemModels = modelsForOpenAIProfile(
-        item.accountProfileId,
-        openAIModelCatalogs,
-        openAIModels,
-      );
-      if (!itemUsage || providerForModel(item.model, itemModels) === "openai") continue;
-      total += estimateCost(item.model, itemUsage);
-    }
-    return total;
-  }, [openAIModelCatalogs, openAIModels, sessions, usageMap]);
 
   return (
     <>
@@ -185,30 +150,28 @@ export function StatusHud() {
         <div className="pc-hud-seg pc-hud-seg--left text-accent-2">
           <span className="pc-hud-trunc">{modelLabel(model, activeOpenAIModels)}</span>
         </div>
-        {activeProvider === "openai" && (
-          <div
-            className={`pc-hud-seg pc-hud-seg--left ${activeOpenAIAccount?.state === "connected" ? "text-success" : "text-warn"}`}
-            title={
-              activeOpenAIAccount
-                ? `ChatGPT account: ${openAIAccountLabel(activeOpenAIAccount, openAIAccounts)}`
-                : session?.accountProfileId
-                  ? openAIAccountsError
-                    ? "ChatGPT account registry is unavailable"
-                    : "This session's ChatGPT account was removed"
-                  : "This legacy session needs a ChatGPT account"
-            }
-          >
-            <span className="pc-hud-trunc">
-              {activeOpenAIAccount
-                ? openAIAccountLabel(activeOpenAIAccount, openAIAccounts)
-                : session?.accountProfileId
-                  ? openAIAccountsError
-                    ? "ACCOUNT UNAVAILABLE"
-                    : "ACCOUNT REMOVED"
-                  : "ACCOUNT NEEDED"}
-            </span>
-          </div>
-        )}
+        <div
+          className={`pc-hud-seg pc-hud-seg--left ${activeOpenAIAccount?.state === "connected" ? "text-success" : "text-warn"}`}
+          title={
+            activeOpenAIAccount
+              ? `Codex authentication: ${openAIAccountLabel(activeOpenAIAccount, openAIAccounts)}`
+              : session?.accountProfileId
+                ? openAIAccountsError
+                  ? "Codex authentication registry is unavailable"
+                  : "This session's Codex authentication was removed"
+                : "This session needs Codex authentication"
+          }
+        >
+          <span className="pc-hud-trunc">
+            {activeOpenAIAccount
+              ? openAIAccountLabel(activeOpenAIAccount, openAIAccounts)
+              : session?.accountProfileId
+                ? openAIAccountsError
+                  ? "ACCOUNT UNAVAILABLE"
+                  : "ACCOUNT REMOVED"
+                : "ACCOUNT NEEDED"}
+          </span>
+        </div>
         {/* The phone trims the HUD to essentials so the 7 desktop segments don't
           overflow a narrow screen — policy and the redundant workspace segment
           (the ⎇ branch above already names the workspace) are desktop-only. */}
@@ -259,11 +222,11 @@ export function StatusHud() {
             ref={planTriggerRef}
             type="button"
             className={`pc-hud-seg pc-hud-seg--right pc-hud-plan-trigger${showPlanUsage ? " pc-hud-plan-trigger--active" : ""}`}
-            aria-label={`Plan usage, ${planRemaining === null ? "percentage unavailable" : `${planRemaining}% remaining`}, ${providerConnected ? "connected" : "not connected"} for this ${activeProvider === "openai" ? "GPT" : "Claude"} chat`}
+            aria-label={`Plan usage, ${planRemaining === null ? "percentage unavailable" : `${planRemaining}% remaining`}, ${providerConnected ? "connected" : "not connected"} for this GPT chat`}
             aria-haspopup="dialog"
             aria-expanded={showPlanUsage}
             aria-controls="pc-plan-usage-popover"
-            title={`Lowest remaining percentage for this ${activeProvider === "openai" ? "GPT" : "Claude"} chat`}
+            title="Lowest remaining percentage for this GPT chat"
             onClick={() => setShowPlanUsage((open) => !open)}
           >
             <span
@@ -285,16 +248,6 @@ export function StatusHud() {
           </button>
         )}
         <div className="pc-hud-seg pc-hud-seg--right text-faint">{tokens.toLocaleString()} tok</div>
-        {/* Cumulative spend (all sessions), survives restarts. Phone trims the HUD to
-          essentials, so this desktop-only segment doesn't crowd a narrow screen. */}
-        {!remoteMode && totalCost > 0 && (
-          <div
-            className="pc-hud-seg pc-hud-seg--right tabular-nums text-success"
-            title="Total estimated Anthropic API spend across all sessions"
-          >
-            Σ ${totalCost.toFixed(totalCost < 0.01 ? 4 : 2)}
-          </div>
-        )}
         <div className="pc-hud-seg pc-hud-seg--right text-success">
           <span
             className={`pc-dot ${liveRunCount > 0 ? "pc-dot--ring" : "pc-dot--success"}`}
@@ -306,7 +259,6 @@ export function StatusHud() {
       {!remoteMode && (
         <PlanUsagePopover
           open={showPlanUsage}
-          provider={activeProvider}
           openAIAccountProfileId={session?.accountProfileId ?? null}
           triggerRef={planTriggerRef}
           onClose={closePlanUsage}

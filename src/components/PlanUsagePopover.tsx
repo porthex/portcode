@@ -1,23 +1,20 @@
 import { useCallback, useEffect, useRef, type RefObject } from "react";
 import { createPortal } from "react-dom";
 
-import type { ProviderId } from "../types";
 import { PlanUsagePanel } from "./PlanUsagePanel";
 
 interface PlanUsagePopoverProps {
   open: boolean;
-  provider: ProviderId;
   openAIAccountProfileId?: string | null;
   triggerRef: RefObject<HTMLButtonElement | null>;
   onClose: () => void;
-  onOpenSettings: (provider?: ProviderId) => void;
+  onOpenSettings: (section?: "account") => void;
   onRemainingChange: (remaining: number | null) => void;
 }
 
 /** Fast, non-modal plan check anchored above the persistent status HUD. */
 export function PlanUsagePopover({
   open,
-  provider,
   openAIAccountProfileId,
   triggerRef,
   onClose,
@@ -67,7 +64,7 @@ export function PlanUsagePopover({
     >
       <header className="pc-plan-quick__header">
         <div>
-          <span>{provider === "openai" ? "OPENAI · GPT" : "ANTHROPIC · CLAUDE"}</span>
+          <span>OPENAI · GPT</span>
           <strong>Plan usage</strong>
         </div>
         <button
@@ -81,7 +78,6 @@ export function PlanUsagePopover({
       </header>
       <PlanUsagePanel
         compact
-        onlyProvider={provider}
         openAIAccountProfileId={openAIAccountProfileId}
         onOpenSettings={onOpenSettings}
         onRemainingChange={onRemainingChange}

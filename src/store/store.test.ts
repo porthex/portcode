@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   DEFAULT_SETTINGS,
+  OPENAI_FALLBACK_MODELS,
   type Message,
   type MessageRow,
   type ModelInfo,
@@ -51,9 +52,6 @@ vi.mock("../lib/ipc", () => ({
   runAgent: vi.fn(),
   subscribeSessionEvents: vi.fn(),
   cancelAgentById: vi.fn(),
-  oauthStatus: vi.fn(),
-  startOauthLogin: vi.fn(),
-  oauthLogout: vi.fn(),
   openaiOauthStatus: vi.fn(),
   listOpenAIAccounts: vi.fn(),
   startOpenAIAccountLogin: vi.fn(),
@@ -93,7 +91,8 @@ const session = (over: Partial<Session> = {}): Session => ({
   id: "s1",
   title: "Chat",
   workspace: null,
-  model: "claude-opus-4-8",
+  model: "gpt-5.6-terra",
+  accountProfileId: "codex-primary",
   createdAt: 1,
   updatedAt: 1,
   ...over,
@@ -110,6 +109,70 @@ const openAIAccount = (over: Partial<OpenAIAccountSummary> = {}): OpenAIAccountS
   lastUsedAt: null,
   ...over,
 });
+
+const readyOpenAIState = (
+  account: OpenAIAccountSummary,
+  models: ModelInfo[] = [
+    {
+      id: "gpt-live",
+      label: "GPT Live",
+      provider: "openai",
+      reasoningEfforts: ["low", "medium", "high", "xhigh"],
+      defaultReasoningEffort: "medium",
+    },
+  ],
+) => ({
+  openAIModels: models,
+  openAIModelCatalogs: {
+    [account.id]: { status: "ready" as const, models, error: null },
+  },
+});
+
+const codexAccount = () =>
+  openAIAccount({
+    id: "codex-primary",
+    accountLabel: "OpenAI Platform API key",
+    tier: null,
+  });
+
+const codexCatalogRows: OpenAIModelCatalogRow[] = OPENAI_FALLBACK_MODELS.map((model) => ({
+  id: model.id,
+  label: model.label,
+  reasoningEfforts: model.reasoningEfforts ?? [],
+  defaultReasoningEffort: model.defaultReasoningEffort ?? "medium",
+  serviceTiers: model.serviceTiers ?? [],
+}));
+
+const arrangeConnectedCodex = () => {
+  const account = codexAccount();
+  useStore.setState({
+    openAIAuthStatus: {
+      signedIn: true,
+      expiresAt: null,
+      account: account.accountLabel,
+      tier: null,
+      available: true,
+    },
+    openAIAccounts: [account],
+    lastOpenAIAccountProfileId: account.id,
+    ...readyOpenAIState(account, OPENAI_FALLBACK_MODELS),
+  });
+  return account;
+};
+
+const mockConnectedCodexInit = () => {
+  const account = codexAccount();
+  m.openaiOauthStatus.mockResolvedValue({
+    signedIn: true,
+    expiresAt: null,
+    account: account.accountLabel,
+    tier: null,
+    available: true,
+  });
+  m.listOpenAIAccounts.mockResolvedValue([account]);
+  m.openaiModels.mockResolvedValue(codexCatalogRows);
+  return account;
+};
 
 const runState = (
   over: Partial<{
@@ -165,6 +228,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   // Restore a pristine store between tests (zustand has no built-in reset).
   useStore.setState(initialState, true);
+  arrangeConnectedCodex();
 
   m.getSettings.mockResolvedValue(DEFAULT_SETTINGS);
   m.listSessions.mockResolvedValue([]);
@@ -194,9 +258,6 @@ beforeEach(() => {
   m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}), dispose: vi.fn() });
   m.subscribeSessionEvents.mockResolvedValue(() => {});
   m.cancelAgentById.mockResolvedValue(undefined);
-  m.oauthStatus.mockResolvedValue(signedOut);
-  m.startOauthLogin.mockResolvedValue(signedOut);
-  m.oauthLogout.mockResolvedValue(undefined);
   m.openaiOauthStatus.mockResolvedValue(signedOut);
   m.listOpenAIAccounts.mockResolvedValue([]);
   m.startOpenAIAccountLogin.mockResolvedValue(openAIAccount());
@@ -233,13 +294,29 @@ beforeEach(() => {
 });
 
 describe("init", () => {
-  it("opens an unpersisted new-chat shell when the backend has no sessions", async () => {
+  it("opens the single Codex authentication settings when signed out", async () => {
     await useStore.getState().init();
 
     const st = useStore.getState();
     expect(m.createSession).not.toHaveBeenCalled();
     expect(st.sessions).toEqual([]);
-    expect(st.pendingSession?.id).toBe(st.activeId);
+    expect(st.pendingSession).toBeNull();
+    expect(st.activeId).toBeNull();
+    expect(st.showSettings).toBe(true);
+    expect(st.openAIAuthError).toContain("Connect ChatGPT or an OpenAI Platform API key");
+  });
+
+  it("opens a codex-primary new-chat shell when Codex is connected", async () => {
+    mockConnectedCodexInit();
+
+    await useStore.getState().init();
+
+    const st = useStore.getState();
+    expect(st.pendingSession).toMatchObject({
+      id: st.activeId,
+      model: DEFAULT_SETTINGS.model,
+      accountProfileId: "codex-primary",
+    });
     expect(st.messages[st.activeId!]).toEqual([]);
   });
 
@@ -286,13 +363,13 @@ describe("init", () => {
     // Old DB rows predate per-session model: listSessions yields a session whose
     // model is absent. The store must coalesce it to settings.model so
     // Session.model stays a non-null string.
-    m.getSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, model: "claude-sonnet-4-6" });
+    m.getSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, model: "gpt-5.6-sol" });
     const legacy = { ...session({ id: "a" }), model: undefined } as unknown as Session;
     m.listSessions.mockResolvedValue([legacy]);
 
     await useStore.getState().init();
 
-    expect(useStore.getState().sessions[0].model).toBe("claude-sonnet-4-6");
+    expect(useStore.getState().sessions[0].model).toBe("gpt-5.6-sol");
   });
 
   it("records initError when a load-bearing startup call rejects", async () => {
@@ -314,12 +391,14 @@ describe("init", () => {
     expect(useStore.getState().initError).toBe("core not ready");
 
     // The core recovers; the retry succeeds and clears the error.
+    mockConnectedCodexInit();
     await useStore.getState().retryInit();
 
     const st = useStore.getState();
     expect(st.initError).toBeNull();
     expect(st.sessions).toEqual([]);
     expect(st.pendingSession?.id).toBe(st.activeId);
+    expect(st.pendingSession?.accountProfileId).toBe("codex-primary");
     expect(m.createSession).not.toHaveBeenCalled();
   });
 
@@ -374,7 +453,280 @@ describe("init", () => {
     expect(m.saveSettings).not.toHaveBeenCalled();
   });
 
-  it("opens Settings instead of creating when the persisted model is disjoint from the default account", async () => {
+  it("persists a compatible effort for the initially active session before it can run", async () => {
+    const account = openAIAccount();
+    m.getSettings.mockResolvedValue({
+      ...DEFAULT_SETTINGS,
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "ultra",
+    });
+    m.openaiOauthStatus.mockResolvedValue({
+      signedIn: true,
+      expiresAt: null,
+      account: null,
+      tier: null,
+      available: true,
+    });
+    m.listOpenAIAccounts.mockResolvedValue([account]);
+    m.openaiModels.mockResolvedValue([
+      {
+        id: "gpt-5.6-sol",
+        label: "GPT-5.6 Sol",
+        reasoningEfforts: ["low", "high", "max", "ultra"],
+        defaultReasoningEffort: "low",
+      },
+      {
+        id: "gpt-5.3-codex-spark",
+        label: "GPT-5.3 Codex Spark",
+        reasoningEfforts: ["low", "medium", "high", "xhigh"],
+        defaultReasoningEffort: "high",
+      },
+    ]);
+    m.listSessions.mockResolvedValue([
+      session({
+        id: "spark-session",
+        model: "gpt-5.3-codex-spark",
+        accountProfileId: account.id,
+      }),
+    ]);
+
+    await useStore.getState().init();
+
+    expect(m.saveSettings).toHaveBeenCalledWith({ reasoningEffort: "high" });
+    expect(useStore.getState().settings.reasoningEffort).toBe("high");
+    expect(m.getMessages).toHaveBeenCalledWith("spark-session");
+  });
+
+  it("keeps startup usable when the effort repair cannot be persisted", async () => {
+    const account = openAIAccount();
+    m.getSettings.mockResolvedValue({
+      ...DEFAULT_SETTINGS,
+      provider: "openai",
+      model: "gpt-5.3-codex-spark",
+      reasoningEffort: "ultra",
+    });
+    m.openaiOauthStatus.mockResolvedValue({
+      signedIn: true,
+      expiresAt: null,
+      account: null,
+      tier: null,
+      available: true,
+    });
+    m.listOpenAIAccounts.mockResolvedValue([account]);
+    m.openaiModels.mockResolvedValue([
+      {
+        id: "gpt-5.3-codex-spark",
+        label: "GPT-5.3 Codex Spark",
+        reasoningEfforts: ["low", "medium", "high", "xhigh"],
+        defaultReasoningEffort: "high",
+      },
+    ]);
+    m.saveSettings.mockRejectedValueOnce(new Error("settings disk is locked"));
+
+    await useStore.getState().init();
+
+    expect(useStore.getState()).toMatchObject({
+      initError: null,
+      settingsError: "settings disk is locked",
+      settings: { reasoningEffort: "ultra" },
+    });
+    expect(useStore.getState().pendingSession?.id).toBe(useStore.getState().activeId);
+  });
+
+  it("keeps startup usable when native does not echo the repaired effort", async () => {
+    const account = openAIAccount();
+    m.getSettings.mockResolvedValue({
+      ...DEFAULT_SETTINGS,
+      provider: "openai",
+      model: "gpt-5.3-codex-spark",
+      reasoningEffort: "ultra",
+    });
+    m.openaiOauthStatus.mockResolvedValue({ ...signedOut, available: true });
+    m.listOpenAIAccounts.mockResolvedValue([account]);
+    m.openaiModels.mockResolvedValue([
+      {
+        id: "gpt-5.3-codex-spark",
+        label: "GPT-5.3 Codex Spark",
+        reasoningEfforts: ["low", "medium", "high", "xhigh"],
+        defaultReasoningEffort: "high",
+      },
+    ]);
+    m.saveSettings.mockResolvedValueOnce({
+      ...DEFAULT_SETTINGS,
+      provider: "openai",
+      model: "gpt-5.3-codex-spark",
+      reasoningEffort: "ultra",
+    });
+
+    await useStore.getState().init();
+
+    expect(useStore.getState()).toMatchObject({
+      initError: null,
+      settingsError: "The native core did not confirm the compatible Codex defaults.",
+      settings: { reasoningEffort: "ultra" },
+    });
+  });
+
+  it("uses authoritative settings after an unconfirmed committed startup repair", async () => {
+    const account = openAIAccount();
+    const authoritative = {
+      ...DEFAULT_SETTINGS,
+      provider: "openai" as const,
+      model: "gpt-5.3-codex-spark",
+      reasoningEffort: "high" as const,
+    };
+    m.getSettings.mockResolvedValueOnce({ ...authoritative, reasoningEffort: "ultra" });
+    m.openaiOauthStatus.mockResolvedValue({ ...signedOut, available: true });
+    m.listOpenAIAccounts.mockResolvedValue([account]);
+    m.openaiModels.mockResolvedValue([
+      {
+        id: authoritative.model,
+        label: "GPT-5.3 Codex Spark",
+        reasoningEfforts: ["low", "medium", "high", "xhigh"],
+        defaultReasoningEffort: "high",
+      },
+    ]);
+    m.saveSettings.mockRejectedValueOnce(
+      new Error(`${SETTINGS_COMMITTED_DURABILITY_UNCONFIRMED_PREFIX} Directory sync failed.`),
+    );
+    m.getSettings.mockResolvedValueOnce(authoritative);
+
+    await useStore.getState().init();
+
+    expect(useStore.getState()).toMatchObject({
+      initError: null,
+      settingsError: "Directory sync failed.",
+      settings: { reasoningEffort: "high" },
+    });
+  });
+
+  it("repairs the OpenAI default effort while restoring an active Claude session", async () => {
+    const account = openAIAccount();
+    m.getSettings.mockResolvedValue({
+      ...DEFAULT_SETTINGS,
+      provider: "openai",
+      model: "gpt-5.3-codex-spark",
+      reasoningEffort: "ultra",
+    });
+    m.openaiOauthStatus.mockResolvedValue({ ...signedOut, available: true });
+    m.listOpenAIAccounts.mockResolvedValue([account]);
+    m.openaiModels.mockResolvedValue([
+      {
+        id: "gpt-5.3-codex-spark",
+        label: "GPT-5.3 Codex Spark",
+        reasoningEfforts: ["low", "medium", "high", "xhigh"],
+        defaultReasoningEffort: "high",
+      },
+    ]);
+    m.listSessions.mockResolvedValue([session({ id: "claude", model: "claude-opus-4-8" })]);
+
+    await useStore.getState().init();
+
+    expect(m.saveSettings).toHaveBeenCalledWith({ reasoningEffort: "high" });
+    expect(useStore.getState()).toMatchObject({
+      activeId: "claude",
+      settings: { reasoningEffort: "high" },
+    });
+  });
+
+  it("records a non-default active account catalogue failure without failing startup", async () => {
+    const preferred = openAIAccount();
+    const pinned = openAIAccount({ id: "00000000-0000-4000-8000-000000000002" });
+    useStore.setState({ lastOpenAIAccountProfileId: preferred.id });
+    m.getSettings.mockResolvedValue({
+      ...DEFAULT_SETTINGS,
+      provider: "openai",
+      model: "gpt-preferred",
+      reasoningEffort: "high",
+    });
+    m.openaiOauthStatus.mockResolvedValue({ ...signedOut, available: true });
+    m.listOpenAIAccounts.mockResolvedValue([preferred, pinned]);
+    m.openaiModels.mockImplementation((accountProfileId) =>
+      accountProfileId === preferred.id
+        ? Promise.resolve([
+            {
+              id: "gpt-preferred",
+              label: "GPT Preferred",
+              reasoningEfforts: ["high"],
+              defaultReasoningEffort: "high",
+            },
+          ])
+        : Promise.reject(new Error("pinned catalogue unavailable")),
+    );
+    m.listSessions.mockResolvedValue([
+      session({ id: "pinned", model: "gpt-pinned", accountProfileId: pinned.id }),
+    ]);
+
+    await useStore.getState().init();
+
+    expect(useStore.getState()).toMatchObject({
+      initError: null,
+      activeId: "pinned",
+      openAIModelCatalogs: {
+        [pinned.id]: { status: "error", models: [], error: "pinned catalogue unavailable" },
+      },
+    });
+  });
+
+  it("loads a non-default active session's exact account catalogue before repairing effort", async () => {
+    const preferred = openAIAccount({ accountLabel: "preferred@chatgpt.test" });
+    const pinned = openAIAccount({
+      id: "00000000-0000-4000-8000-000000000002",
+      accountLabel: "pinned@chatgpt.test",
+    });
+    useStore.setState({ lastOpenAIAccountProfileId: preferred.id });
+    m.getSettings.mockResolvedValue({
+      ...DEFAULT_SETTINGS,
+      provider: "openai",
+      model: "gpt-shared",
+      reasoningEffort: "ultra",
+    });
+    m.openaiOauthStatus.mockResolvedValue({
+      signedIn: true,
+      expiresAt: null,
+      account: null,
+      tier: null,
+      available: true,
+    });
+    m.listOpenAIAccounts.mockResolvedValue([preferred, pinned]);
+    m.openaiModels.mockImplementation(async (accountProfileId) =>
+      accountProfileId === preferred.id
+        ? [
+            {
+              id: "gpt-shared",
+              label: "GPT Shared",
+              reasoningEfforts: ["high", "ultra"],
+              defaultReasoningEffort: "high",
+            },
+          ]
+        : [
+            {
+              id: "gpt-shared",
+              label: "GPT Shared",
+              reasoningEfforts: ["low", "medium", "high", "xhigh"],
+              defaultReasoningEffort: "high",
+            },
+          ],
+    );
+    m.listSessions.mockResolvedValue([
+      session({
+        id: "pinned-session",
+        model: "gpt-shared",
+        accountProfileId: pinned.id,
+      }),
+    ]);
+
+    await useStore.getState().init();
+
+    expect(m.openaiModels.mock.calls.map(([id]) => id)).toEqual([preferred.id, pinned.id]);
+    expect(m.saveSettings).toHaveBeenCalledWith({ reasoningEffort: "high" });
+    expect(useStore.getState().openAIModelCatalogs[pinned.id]).toMatchObject({
+      status: "ready",
+    });
+  });
+
+  it("repairs a persisted model that is disjoint from the current Codex catalogue", async () => {
     const account = openAIAccount();
     m.getSettings.mockResolvedValue({
       ...DEFAULT_SETTINGS,
@@ -404,17 +756,23 @@ describe("init", () => {
     expect(m.createSession).not.toHaveBeenCalled();
     expect(useStore.getState()).toMatchObject({
       settings: {
-        model: "gpt-persisted",
+        model: "gpt-account-default",
         provider: "openai",
-        reasoningEffort: "ultra",
+        reasoningEffort: "high",
       },
       sessions: [],
-      activeId: null,
-      showSettings: true,
-      openAIAuthError:
-        "Choose a model available to the default ChatGPT account before creating a GPT chat.",
+      showSettings: false,
+      openAIAuthError: null,
     });
-    expect(m.saveSettings).not.toHaveBeenCalled();
+    expect(useStore.getState().pendingSession).toMatchObject({
+      model: "gpt-account-default",
+      accountProfileId: account.id,
+    });
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      model: "gpt-account-default",
+      provider: "openai",
+      reasoningEffort: "high",
+    });
   });
 
   it.each([
@@ -476,6 +834,7 @@ describe("init", () => {
 
 describe("newSession", () => {
   it("opens a fresh unpersisted chat and makes it active", async () => {
+    arrangeConnectedCodex();
     useStore.setState({ sessions: [session({ id: "old" })] });
 
     await useStore.getState().newSession();
@@ -484,10 +843,12 @@ describe("newSession", () => {
     expect(m.createSession).not.toHaveBeenCalled();
     expect(st.sessions).toHaveLength(1);
     expect(st.pendingSession?.id).toBe(st.activeId);
+    expect(st.pendingSession?.accountProfileId).toBe("codex-primary");
     expect(st.messages[st.activeId!]).toEqual([]);
   });
 
   it("persists the pending chat immediately before its first turn", async () => {
+    arrangeConnectedCodex();
     useStore.setState({ sessions: [session({ id: "old" })], activeId: "old" });
 
     await useStore.getState().newSession();
@@ -501,7 +862,7 @@ describe("newSession", () => {
       "New chat",
       null,
       DEFAULT_SETTINGS.model,
-      null,
+      "codex-primary",
     );
     expect(useStore.getState().pendingSession).toBeNull();
     expect(useStore.getState().sessions[0].id).toBe(pendingId);
@@ -510,23 +871,25 @@ describe("newSession", () => {
   it("initializes the new session's model from the last-used settings.model", async () => {
     useStore.setState({
       sessions: [session({ id: "old" })],
-      settings: { ...DEFAULT_SETTINGS, model: "claude-haiku-4-5-20251001" },
+      settings: { ...DEFAULT_SETTINGS, model: "gpt-5.6-luna" },
     });
 
     await useStore.getState().newSession();
 
     const st = useStore.getState();
-    expect(st.pendingSession?.model).toBe("claude-haiku-4-5-20251001");
+    expect(st.pendingSession?.model).toBe("gpt-5.6-luna");
     expect(m.createSession).not.toHaveBeenCalled();
   });
 
   it("closes the mobile session drawer", async () => {
+    arrangeConnectedCodex();
     useStore.setState({ showSidebar: true });
     await useStore.getState().newSession();
     expect(useStore.getState().showSidebar).toBe(false);
   });
 
   it("opens a pending chat while another session keeps running", async () => {
+    arrangeConnectedCodex();
     useStore.setState({
       streaming: true,
       sessions: [session({ id: "a" })],
@@ -544,6 +907,7 @@ describe("newSession", () => {
   });
 
   it("a rapid double-call still leaves only one pending chat", async () => {
+    arrangeConnectedCodex();
     useStore.setState({ sessions: [session({ id: "old" })] });
 
     const first = useStore.getState().newSession();
@@ -758,7 +1122,7 @@ describe("newSession", () => {
     await useStore.getState().newSession(account.id);
     expect(useStore.getState()).toMatchObject({
       showSettings: true,
-      openAIAuthError: "Choose a default ChatGPT account in Settings first.",
+      openAIAuthError: "Connect ChatGPT or an OpenAI Platform API key in Settings first.",
       creatingSession: false,
     });
     expect(m.createSession).not.toHaveBeenCalled();
@@ -779,7 +1143,7 @@ describe("newSession", () => {
       sessions: [],
       showSettings: true,
       openAIAuthError:
-        "ChatGPT account registry is unavailable: credential registry is locked. Retry account discovery before creating a session.",
+        "Codex authentication is unavailable: credential registry is locked. Retry authentication discovery before creating a session.",
       creatingSession: false,
     });
   });
@@ -981,6 +1345,7 @@ describe("newSession", () => {
     // core not ready) lands in the visible error surface rather than escaping as an
     // unhandled promise rejection (callers use bare onClick / void).
     m.createSession.mockRejectedValueOnce(new Error("db locked"));
+    arrangeConnectedCodex();
     useStore.setState({ sessions: [session({ id: "old" })] });
 
     await useStore.getState().newSession();
@@ -995,47 +1360,159 @@ describe("newSession", () => {
 });
 
 describe("setSessionModel", () => {
-  it("updates a pending chat in memory and persists its chosen account only on first send", async () => {
-    await useStore.getState().newSession();
-    const pendingId = useStore.getState().activeId!;
-
-    await useStore.getState().setSessionModel("gpt-live");
-    expect(useStore.getState().settingsError).toBe(
-      "Choose a default ChatGPT account in Settings first.",
-    );
-
+  it("persists the target model with its compatible effort in one settings patch", async () => {
     const account = openAIAccount();
+    const sol: ModelInfo = {
+      id: "gpt-5.6-sol",
+      label: "GPT-5.6 Sol",
+      provider: "openai",
+      reasoningEfforts: ["low", "high", "max", "ultra"],
+      defaultReasoningEffort: "low",
+    };
+    const spark: ModelInfo = {
+      id: "gpt-5.3-codex-spark",
+      label: "GPT-5.3 Codex Spark",
+      provider: "openai",
+      reasoningEfforts: ["low", "medium", "high", "xhigh"],
+      defaultReasoningEffort: "high",
+    };
+    useStore.setState({
+      sessions: [session({ id: "a", model: sol.id, accountProfileId: account.id })],
+      activeId: "a",
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: sol.id,
+        reasoningEffort: "ultra",
+      },
+      openAIAccounts: [account],
+      openAIModels: [sol, spark],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: [sol, spark], error: null },
+      },
+      lastOpenAIAccountProfileId: account.id,
+    });
+
+    await useStore.getState().setSessionModel(spark.id);
+
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      model: spark.id,
+      provider: "openai",
+      reasoningEffort: "high",
+    });
+    expect(useStore.getState().settings).toMatchObject({
+      model: spark.id,
+      reasoningEffort: "high",
+    });
+  });
+
+  it("resets Fast to Standard when switching to a model without a Fast service tier", async () => {
+    const account = openAIAccount();
+    const fastModel: ModelInfo = {
+      id: "gpt-fast",
+      label: "GPT Fast",
+      provider: "openai",
+      reasoningEfforts: ["medium"],
+      defaultReasoningEffort: "medium",
+      serviceTiers: [{ id: "priority", name: "Fast", description: "1.5x speed" }],
+    };
+    const standardOnlyModel: ModelInfo = {
+      id: "gpt-standard-only",
+      label: "GPT Standard Only",
+      provider: "openai",
+      reasoningEfforts: ["medium"],
+      defaultReasoningEffort: "medium",
+      serviceTiers: [],
+    };
+    useStore.setState({
+      sessions: [session({ id: "a", model: fastModel.id, accountProfileId: account.id })],
+      activeId: "a",
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: fastModel.id,
+        reasoningEffort: "medium",
+        responseSpeed: "fast",
+      },
+      openAIAccounts: [account],
+      openAIModels: [fastModel, standardOnlyModel],
+      openAIModelCatalogs: {
+        [account.id]: {
+          status: "ready",
+          models: [fastModel, standardOnlyModel],
+          error: null,
+        },
+      },
+      lastOpenAIAccountProfileId: account.id,
+    });
+
+    await useStore.getState().setSessionModel(standardOnlyModel.id);
+
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      model: standardOnlyModel.id,
+      provider: "openai",
+      reasoningEffort: "medium",
+      responseSpeed: "standard",
+    });
+    expect(useStore.getState().settings).toMatchObject({
+      model: standardOnlyModel.id,
+      responseSpeed: "standard",
+    });
+  });
+
+  it("updates a pending chat in memory and persists its chosen account only on first send", async () => {
+    useStore.setState({
+      openAIAuthStatus: null,
+      openAIAccounts: [],
+      openAIModelCatalogs: {},
+      lastOpenAIAccountProfileId: null,
+    });
+    await useStore.getState().newSession();
+    expect(useStore.getState().pendingSession).toBeNull();
+    expect(useStore.getState().showSettings).toBe(true);
+
+    const account = codexAccount();
     const accountModel = {
       id: "gpt-live",
       label: "GPT Live",
       provider: "openai" as const,
       reasoningEfforts: ["high" as const],
       defaultReasoningEffort: "high" as const,
+      serviceTiers: [{ id: "priority", name: "Fast", description: "1.5x speed" }],
     };
+    const nextModel = {
+      ...accountModel,
+      id: "gpt-next",
+      label: "GPT Next",
+      serviceTiers: [],
+    };
+    localStorage.setItem("pc.lastOpenAIAccountProfileId", account.id);
     useStore.setState({
       openAIAccounts: [account],
-      openAIModels: [accountModel],
+      openAIModels: [accountModel, nextModel],
       openAIModelCatalogs: {
-        [account.id]: { status: "ready", models: [accountModel], error: null },
+        [account.id]: { status: "ready", models: [accountModel, nextModel], error: null },
       },
       lastOpenAIAccountProfileId: account.id,
+      settings: {
+        ...DEFAULT_SETTINGS,
+        model: accountModel.id,
+        reasoningEffort: "high",
+        responseSpeed: "fast",
+      },
       settingsError: null,
     });
 
-    await useStore.getState().setSessionModel(accountModel.id);
+    await useStore.getState().newSession(account.id, accountModel.id);
+    const pendingId = useStore.getState().activeId!;
+    await useStore.getState().setSessionModel(nextModel.id);
     expect(useStore.getState().pendingSession).toMatchObject({
       id: pendingId,
-      model: accountModel.id,
+      model: nextModel.id,
       accountProfileId: account.id,
     });
+    expect(useStore.getState().settings.responseSpeed).toBe("standard");
     expect(m.updateSessionModel).not.toHaveBeenCalled();
-
-    await useStore.getState().setSessionModel("claude-sonnet-4-6");
-    expect(useStore.getState().pendingSession).toMatchObject({
-      id: pendingId,
-      model: "claude-sonnet-4-6",
-      accountProfileId: null,
-    });
 
     await useStore.getState().setSessionModel(accountModel.id);
     await useStore.getState().send("create this chat");
@@ -1051,35 +1528,36 @@ describe("setSessionModel", () => {
     ["a connected remote chat", { remoteConnected: true }],
   ])("ignores palette model changes during %s", async (_label, guardedState) => {
     useStore.setState({
-      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      sessions: [session({ id: "a", model: "gpt-5.6-terra" })],
       activeId: "a",
       ...guardedState,
     });
 
     await useStore.getState().setSessionModel("gpt-5.6-sol");
 
-    expect(useStore.getState().sessions[0].model).toBe("claude-opus-4-8");
+    expect(useStore.getState().sessions[0].model).toBe("gpt-5.6-terra");
     expect(m.updateSessionModel).not.toHaveBeenCalled();
     expect(m.saveSettings).not.toHaveBeenCalled();
   });
 
   it("updates the active session's model and tracks it as the last-used default", async () => {
     useStore.setState({
-      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      sessions: [session({ id: "a", model: "gpt-5.6-terra" })],
       activeId: "a",
     });
 
-    await useStore.getState().setSessionModel("claude-sonnet-4-6");
+    await useStore.getState().setSessionModel("gpt-5.6-sol");
 
     const st = useStore.getState();
-    expect(st.sessions[0].model).toBe("claude-sonnet-4-6");
-    expect(m.updateSessionModel).toHaveBeenCalledWith("a", "claude-sonnet-4-6");
+    expect(st.sessions[0].model).toBe("gpt-5.6-sol");
+    expect(m.updateSessionModel).toHaveBeenCalledWith("a", "gpt-5.6-sol");
     // Last-used sync: settings.model is updated through ipc.saveSettings.
     expect(m.saveSettings).toHaveBeenCalledWith({
-      model: "claude-sonnet-4-6",
+      model: "gpt-5.6-sol",
+      provider: "openai",
       reasoningEffort: "medium",
     });
-    expect(st.settings.model).toBe("claude-sonnet-4-6");
+    expect(st.settings.model).toBe("gpt-5.6-sol");
   });
 
   it("rejects every model outside a pinned account's ready catalogue before native write", async () => {
@@ -1105,7 +1583,7 @@ describe("setSessionModel", () => {
 
     expect(useStore.getState().sessions[0].model).toBe(accountModel.id);
     expect(useStore.getState().settingsError).toBe(
-      "That model is not available to this conversation's ChatGPT account.",
+      "That model is not available to this conversation's Codex authentication.",
     );
     expect(m.updateSessionModel).not.toHaveBeenCalled();
     expect(m.saveSettings).not.toHaveBeenCalled();
@@ -1114,14 +1592,14 @@ describe("setSessionModel", () => {
   it("reverts the optimistic session model when durable persistence fails", async () => {
     m.updateSessionModel.mockRejectedValueOnce(new Error("database is locked"));
     useStore.setState({
-      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      sessions: [session({ id: "a", model: "gpt-5.6-terra" })],
       activeId: "a",
     });
 
-    await expect(useStore.getState().setSessionModel("claude-sonnet-4-6")).resolves.toBeUndefined();
+    await expect(useStore.getState().setSessionModel("gpt-5.6-sol")).resolves.toBeUndefined();
 
     const st = useStore.getState();
-    expect(st.sessions[0].model).toBe("claude-opus-4-8");
+    expect(st.sessions[0].model).toBe("gpt-5.6-terra");
     expect(st.settingsError).toBe("database is locked");
     // The global default must not claim a selection that the active chat rejected.
     expect(m.saveSettings).not.toHaveBeenCalled();
@@ -1138,27 +1616,25 @@ describe("setSessionModel", () => {
       )
       .mockResolvedValueOnce(undefined);
     useStore.setState({
-      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      sessions: [session({ id: "a", model: "gpt-5.6-terra" })],
       activeId: "a",
     });
 
-    const first = useStore.getState().setSessionModel("claude-sonnet-4-6");
-    const second = useStore.getState().setSessionModel("claude-haiku-4-5-20251001");
+    const first = useStore.getState().setSessionModel("gpt-5.6-sol");
+    const second = useStore.getState().setSessionModel("gpt-5.6-luna");
     // Per-session writes are serialized: the second invoke cannot overtake the
     // unresolved first and become vulnerable to the old value finishing last.
     expect(m.updateSessionModel).toHaveBeenCalledTimes(1);
     resolveFirst();
     await Promise.all([first, second]);
 
-    expect(useStore.getState().sessions[0].model).toBe("claude-haiku-4-5-20251001");
-    expect(useStore.getState().settings.model).toBe("claude-haiku-4-5-20251001");
+    expect(useStore.getState().sessions[0].model).toBe("gpt-5.6-luna");
+    expect(useStore.getState().settings.model).toBe("gpt-5.6-luna");
     expect(m.saveSettings).toHaveBeenCalledTimes(1);
-    expect(m.saveSettings).toHaveBeenCalledWith(
-      expect.objectContaining({ model: "claude-haiku-4-5-20251001" }),
-    );
+    expect(m.saveSettings).toHaveBeenCalledWith(expect.objectContaining({ model: "gpt-5.6-luna" }));
     expect(m.updateSessionModel.mock.calls).toEqual([
-      ["a", "claude-sonnet-4-6"],
-      ["a", "claude-haiku-4-5-20251001"],
+      ["a", "gpt-5.6-sol"],
+      ["a", "gpt-5.6-luna"],
     ]);
   });
 
@@ -1167,16 +1643,16 @@ describe("setSessionModel", () => {
       .mockRejectedValueOnce(new Error("old write failed"))
       .mockResolvedValueOnce(undefined);
     useStore.setState({
-      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      sessions: [session({ id: "a", model: "gpt-5.6-terra" })],
       activeId: "a",
     });
 
-    const first = useStore.getState().setSessionModel("claude-sonnet-4-6");
-    const second = useStore.getState().setSessionModel("claude-haiku-4-5-20251001");
+    const first = useStore.getState().setSessionModel("gpt-5.6-sol");
+    const second = useStore.getState().setSessionModel("gpt-5.6-luna");
     await Promise.all([first, second]);
 
-    expect(useStore.getState().sessions[0].model).toBe("claude-haiku-4-5-20251001");
-    expect(useStore.getState().settings.model).toBe("claude-haiku-4-5-20251001");
+    expect(useStore.getState().sessions[0].model).toBe("gpt-5.6-luna");
+    expect(useStore.getState().settings.model).toBe("gpt-5.6-luna");
     expect(useStore.getState().settingsError).toBeNull();
   });
 
@@ -1185,15 +1661,15 @@ describe("setSessionModel", () => {
       .mockRejectedValueOnce(new Error("first write failed"))
       .mockRejectedValueOnce(new Error("latest write failed"));
     useStore.setState({
-      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      sessions: [session({ id: "a", model: "gpt-5.6-terra" })],
       activeId: "a",
     });
 
-    const first = useStore.getState().setSessionModel("claude-sonnet-4-6");
-    const second = useStore.getState().setSessionModel("claude-haiku-4-5-20251001");
+    const first = useStore.getState().setSessionModel("gpt-5.6-sol");
+    const second = useStore.getState().setSessionModel("gpt-5.6-luna");
     await Promise.all([first, second]);
 
-    expect(useStore.getState().sessions[0].model).toBe("claude-opus-4-8");
+    expect(useStore.getState().sessions[0].model).toBe("gpt-5.6-terra");
     expect(useStore.getState().settingsError).toBe("latest write failed");
     expect(m.saveSettings).not.toHaveBeenCalled();
   });
@@ -1201,18 +1677,193 @@ describe("setSessionModel", () => {
   it("still updates the last-used default when no session is active (palette safety)", async () => {
     useStore.setState({ sessions: [], activeId: null });
 
-    await useStore.getState().setSessionModel("claude-haiku-4-5-20251001");
+    await useStore.getState().setSessionModel("gpt-5.6-luna");
 
     expect(m.saveSettings).toHaveBeenCalledWith({
-      model: "claude-haiku-4-5-20251001",
+      model: "gpt-5.6-luna",
+      provider: "openai",
       reasoningEffort: "medium",
     });
     expect(m.updateSessionModel).not.toHaveBeenCalled();
-    expect(useStore.getState().settings.model).toBe("claude-haiku-4-5-20251001");
+    expect(useStore.getState().settings.model).toBe("gpt-5.6-luna");
   });
 });
 
 describe("selectSession", () => {
+  it("repairs Ultra when selecting a session whose model does not support it", async () => {
+    const account = openAIAccount();
+    const sol: ModelInfo = {
+      id: "gpt-5.6-sol",
+      label: "GPT-5.6 Sol",
+      provider: "openai",
+      reasoningEfforts: ["high", "ultra"],
+      defaultReasoningEffort: "high",
+    };
+    const spark: ModelInfo = {
+      id: "gpt-5.3-codex-spark",
+      label: "GPT-5.3 Codex Spark",
+      provider: "openai",
+      reasoningEfforts: ["low", "medium", "high", "xhigh"],
+      defaultReasoningEffort: "high",
+    };
+    useStore.setState({
+      sessions: [
+        session({ id: "spark", model: spark.id, accountProfileId: account.id }),
+        session({ id: "sol", model: sol.id, accountProfileId: account.id }),
+      ],
+      activeId: "sol",
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: sol.id,
+        reasoningEffort: "ultra",
+      },
+      openAIAccounts: [account],
+      openAIModels: [sol, spark],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: [sol, spark], error: null },
+      },
+      lastOpenAIAccountProfileId: account.id,
+    });
+
+    await useStore.getState().selectSession("spark");
+
+    expect(m.saveSettings).toHaveBeenCalledWith({ reasoningEffort: "high" });
+    expect(useStore.getState().settings.reasoningEffort).toBe("high");
+  });
+
+  it("loads the selected non-default account catalogue before reconciling effort", async () => {
+    const preferred = openAIAccount();
+    const pinned = openAIAccount({ id: "00000000-0000-4000-8000-000000000002" });
+    const sol: ModelInfo = {
+      id: "gpt-shared",
+      label: "GPT Shared",
+      provider: "openai",
+      reasoningEfforts: ["high", "ultra"],
+      defaultReasoningEffort: "high",
+    };
+    useStore.setState({
+      sessions: [
+        session({ id: "spark", model: sol.id, accountProfileId: pinned.id }),
+        session({ id: "sol", model: sol.id, accountProfileId: preferred.id }),
+      ],
+      activeId: "sol",
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: sol.id,
+        reasoningEffort: "ultra",
+      },
+      openAIAuthStatus: {
+        signedIn: true,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: true,
+      },
+      openAIAccounts: [preferred, pinned],
+      openAIModels: [sol],
+      openAIModelCatalogs: {
+        [preferred.id]: { status: "ready", models: [sol], error: null },
+      },
+      lastOpenAIAccountProfileId: preferred.id,
+    });
+    m.openaiModels.mockResolvedValueOnce([
+      {
+        id: sol.id,
+        label: sol.label,
+        reasoningEfforts: ["low", "medium", "high", "xhigh"],
+        defaultReasoningEffort: "high",
+      },
+    ]);
+
+    await useStore.getState().selectSession("spark");
+
+    expect(m.openaiModels).toHaveBeenCalledWith(pinned.id);
+    expect(m.saveSettings).toHaveBeenCalledWith({ reasoningEffort: "high" });
+    expect(useStore.getState().settings.reasoningEffort).toBe("high");
+  });
+
+  it("surfaces a selected session's catalogue load failure", async () => {
+    const account = openAIAccount();
+    useStore.setState({
+      sessions: [session({ id: "target", model: "gpt-live", accountProfileId: account.id })],
+      activeId: "other",
+      openAIAuthStatus: { ...signedOut, available: true },
+      openAIAccounts: [account],
+      openAIModelCatalogs: {},
+    });
+    m.openaiModels.mockRejectedValueOnce(new Error("catalogue offline"));
+
+    await useStore.getState().selectSession("target");
+
+    expect(useStore.getState()).toMatchObject({
+      activeId: "target",
+      openAIAuthError: "catalogue offline",
+      openAIModelCatalogs: {
+        [account.id]: { status: "error", models: [], error: "catalogue offline" },
+      },
+    });
+  });
+
+  it("does not apply a slow earlier session's effort after a newer selection", async () => {
+    const first = openAIAccount();
+    const second = openAIAccount({ id: "00000000-0000-4000-8000-000000000002" });
+    const ultraModel: ModelInfo = {
+      id: "gpt-shared",
+      label: "GPT Shared",
+      provider: "openai",
+      reasoningEfforts: ["high", "ultra"],
+      defaultReasoningEffort: "high",
+    };
+    let finishLoad!: (rows: OpenAIModelCatalogRow[]) => void;
+    m.openaiModels.mockImplementationOnce(
+      () => new Promise<OpenAIModelCatalogRow[]>((resolve) => (finishLoad = resolve)),
+    );
+    useStore.setState({
+      sessions: [
+        session({ id: "slow", model: ultraModel.id, accountProfileId: first.id }),
+        session({ id: "latest", model: ultraModel.id, accountProfileId: second.id }),
+      ],
+      activeId: "latest",
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: ultraModel.id,
+        reasoningEffort: "ultra",
+      },
+      openAIAuthStatus: {
+        signedIn: true,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: true,
+      },
+      openAIAccounts: [first, second],
+      openAIModels: [ultraModel],
+      openAIModelCatalogs: {
+        [second.id]: { status: "ready", models: [ultraModel], error: null },
+      },
+      lastOpenAIAccountProfileId: second.id,
+    });
+
+    const slowSelection = useStore.getState().selectSession("slow");
+    await useStore.getState().selectSession("latest");
+    finishLoad([
+      {
+        id: ultraModel.id,
+        label: ultraModel.label,
+        reasoningEfforts: ["low", "medium", "high", "xhigh"],
+        defaultReasoningEffort: "high",
+      },
+    ]);
+    await slowSelection;
+
+    expect(useStore.getState().activeId).toBe("latest");
+    expect(useStore.getState().settings.reasoningEffort).toBe("ultra");
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
   it("switches instantly while another session continues streaming", async () => {
     useStore.setState({
       streaming: true,
@@ -1629,6 +2280,7 @@ describe("deleteSession", () => {
   });
 
   it("opens a pending new chat when the last session is deleted", async () => {
+    arrangeConnectedCodex();
     useStore.setState({
       sessions: [session({ id: "a" })],
       activeId: "a",
@@ -1831,6 +2483,120 @@ describe("send", () => {
     await useStore.getState().send("   ");
 
     expect(m.runAgent).not.toHaveBeenCalled();
+  });
+
+  it("waits for a model write and repairs Ultra before sending to Spark", async () => {
+    const account = openAIAccount();
+    const sol: ModelInfo = {
+      id: "gpt-5.6-sol",
+      label: "GPT-5.6 Sol",
+      provider: "openai",
+      reasoningEfforts: ["high", "ultra"],
+      defaultReasoningEffort: "high",
+    };
+    const spark: ModelInfo = {
+      id: "gpt-5.3-codex-spark",
+      label: "GPT-5.3 Codex Spark",
+      provider: "openai",
+      reasoningEfforts: ["low", "medium", "high", "xhigh"],
+      defaultReasoningEffort: "high",
+    };
+    let finishModelWrite!: () => void;
+    m.updateSessionModel.mockImplementationOnce(
+      () => new Promise<void>((resolve) => (finishModelWrite = resolve)),
+    );
+    useStore.setState({
+      sessions: [session({ id: "a", model: sol.id, accountProfileId: account.id })],
+      activeId: "a",
+      messages: { a: [] },
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: sol.id,
+        reasoningEffort: "ultra",
+      },
+      openAIAuthStatus: {
+        signedIn: true,
+        expiresAt: null,
+        account: null,
+        tier: null,
+        available: true,
+      },
+      openAIAccounts: [account],
+      openAIModels: [sol, spark],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: [sol, spark], error: null },
+      },
+      lastOpenAIAccountProfileId: account.id,
+    });
+
+    const changing = useStore.getState().setSessionModel(spark.id);
+    const sending = useStore.getState().send("use spark");
+    await Promise.resolve();
+    expect(m.runAgent).not.toHaveBeenCalled();
+
+    finishModelWrite();
+    await Promise.all([changing, sending]);
+
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      model: spark.id,
+      provider: "openai",
+      reasoningEffort: "high",
+    });
+    expect(useStore.getState().settings.reasoningEffort).toBe("high");
+    expect(m.runAgent).toHaveBeenCalledWith("a", "use spark", expect.any(Function));
+    expect(m.saveSettings.mock.invocationCallOrder[0]).toBeLessThan(
+      m.runAgent.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("blocks a local OpenAI send when the profile catalogue no longer contains its model", async () => {
+    const account = openAIAccount();
+    useStore.setState({
+      sessions: [session({ id: "a", model: "gpt-removed", accountProfileId: account.id })],
+      activeId: "a",
+      messages: { a: [] },
+      openAIAccounts: [account],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: [], error: null },
+      },
+    });
+
+    await useStore.getState().send("do not send");
+
+    expect(m.runAgent).not.toHaveBeenCalled();
+    expect(useStore.getState().openAIAuthError).toMatch(/no longer available/i);
+  });
+
+  it("does not send when persisting a compatible effort fails", async () => {
+    const account = openAIAccount();
+    const spark: ModelInfo = {
+      id: "gpt-5.3-codex-spark",
+      label: "GPT-5.3 Codex Spark",
+      provider: "openai",
+      reasoningEfforts: ["low", "medium", "high", "xhigh"],
+      defaultReasoningEffort: "high",
+    };
+    m.saveSettings.mockRejectedValueOnce(new Error("settings disk is locked"));
+    useStore.setState({
+      sessions: [session({ id: "a", model: spark.id, accountProfileId: account.id })],
+      activeId: "a",
+      messages: { a: [] },
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: spark.id,
+        reasoningEffort: "ultra",
+      },
+      openAIAccounts: [account],
+      ...readyOpenAIState(account, [spark]),
+    });
+
+    await useStore.getState().send("stay local");
+
+    expect(m.runAgent).not.toHaveBeenCalled();
+    expect(useStore.getState().settingsError).toBe("settings disk is locked");
+    expect(useStore.getState().settings.reasoningEffort).toBe("ultra");
   });
 
   it("appends user+assistant turns, titles the first turn, and folds streamed events", async () => {
@@ -2601,7 +3367,7 @@ describe("send", () => {
     expect(useStore.getState().messages.a[1].blocks).toEqual([
       {
         kind: "text",
-        text: "\n\n**Error:** OpenAI response was rejected (HTTP 400). Please retry.",
+        text: "\n\n**Error:** ` OpenAI Platform API key `: ChatGPT provider request failed.",
       },
     ]);
   });
@@ -2628,6 +3394,7 @@ describe("send", () => {
         activeId: "a",
         messages: { a: [] },
         openAIAccounts: [account],
+        ...readyOpenAIState(account),
       });
 
       await useStore.getState().send("go");
@@ -2659,6 +3426,7 @@ describe("send", () => {
       activeId: "a",
       messages: { a: [] },
       openAIAccounts: [account],
+      ...readyOpenAIState(account),
     });
 
     await useStore.getState().send("go");
@@ -2690,6 +3458,7 @@ describe("send", () => {
       activeId: "a",
       messages: { a: [] },
       openAIAccounts: [account],
+      ...readyOpenAIState(account),
     });
 
     await useStore.getState().send("go");
@@ -2719,6 +3488,7 @@ describe("send", () => {
       activeId: "a",
       messages: { a: [] },
       openAIAccounts: [account],
+      ...readyOpenAIState(account),
     });
 
     await useStore.getState().send("go");
@@ -3184,178 +3954,54 @@ describe("resolvePermission", () => {
 
     await useStore.getState().resolvePermission("deny");
 
-    expect(m.resolvePermission).toHaveBeenCalledWith("p1", "deny");
+    expect(m.resolvePermission).toHaveBeenCalledWith("p1", "deny", false);
     expect(useStore.getState().pendingPermission).toBeNull();
   });
 
-  it("allow-always canonicalizes a legacy file-tool rule", async () => {
+  it("forwards a one-shot allow without claiming session scope", async () => {
     useStore.setState({
       pendingPermission: { id: "p1", tool: "fs_edit", summary: "x", input: {} },
     });
 
-    await useStore.getState().resolvePermission("allow", true);
+    await useStore.getState().resolvePermission("allow");
 
-    // A file tool scopes to its canonical ID, not allow-everything.
-    expect(m.saveSettings).toHaveBeenCalledWith({
-      rules: [{ tool: "edit_file", decision: "allow" }],
-    });
-    expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
+    expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow", false);
+    expect(m.saveSettings).not.toHaveBeenCalled();
   });
 
-  it("allow-always canonicalizes a legacy command tool and scopes it to that command", async () => {
+  it("forwards Allow for session to Codex without persisting a parallel Portcode rule", async () => {
     useStore.setState({
       pendingPermission: {
         id: "p2",
-        tool: "shell",
+        tool: "run_command",
         summary: "git status",
-        input: { command: "git status" },
-      },
-    });
-
-    await useStore.getState().resolvePermission("allow", true);
-
-    expect(m.saveSettings).toHaveBeenCalledWith({
-      rules: [{ tool: "run_command", command: "git status", decision: "allow" }],
-    });
-  });
-
-  it.each(["shell", "dependencyInstall", "highRiskGit", "unknown", "futureRisk"] as const)(
-    "remembers a scoped %s approval after resolving the current gate",
-    async (risk) => {
-      useStore.setState({
-        pendingPermission: {
-          id: `protected-${risk}`,
-          tool: "run_command",
-          risk,
-          summary: "protected action",
-          input: { command: "echo safe" },
+        input: {
+          command: "git status",
+          availableDecisions: ["accept", "acceptForSession", "decline"],
         },
-      });
-
-      await useStore.getState().resolvePermission("allow", true);
-
-      expect(m.resolvePermission).toHaveBeenCalledWith(`protected-${risk}`, "allow");
-      expect(m.saveSettings).toHaveBeenCalledWith({
-        rules: [{ tool: "run_command", command: "echo safe", decision: "allow" }],
-      });
-      expect(useStore.getState().pendingPermission).toBeNull();
-    },
-  );
-
-  it("allow-always does not add a duplicate rule if an equivalent one exists", async () => {
-    useStore.setState({
-      settings: { ...DEFAULT_SETTINGS, rules: [{ tool: "fs_edit", decision: "allow" }] },
-      pendingPermission: { id: "p3", tool: "edit_file", summary: "x", input: {} },
+      },
     });
 
     await useStore.getState().resolvePermission("allow", true);
 
-    // The gate is still answered, but no redundant settings save is made.
-    expect(m.resolvePermission).toHaveBeenCalledWith("p3", "allow");
+    expect(m.resolvePermission).toHaveBeenCalledWith("p2", "allow", true);
     expect(m.saveSettings).not.toHaveBeenCalled();
+    expect(useStore.getState().pendingPermission).toBeNull();
   });
 
-  it("allow-always replaces a conflicting rule for the same scope", async () => {
-    useStore.setState({
-      settings: { ...DEFAULT_SETTINGS, rules: [{ tool: "fs_edit", decision: "ask" }] },
-      pendingPermission: { id: "p-conflict", tool: "edit_file", summary: "x", input: {} },
-    });
+  it("retains the prompt when native delivery fails so the user can retry", async () => {
+    const current = { id: "p1", tool: "fs_edit", summary: "retry", input: {} } as const;
+    m.resolvePermission.mockRejectedValueOnce(new Error("app-server unavailable"));
+    useStore.setState({ pendingPermission: current });
 
-    await useStore.getState().resolvePermission("allow", true);
+    await expect(useStore.getState().resolvePermission("allow")).rejects.toThrow(
+      "app-server unavailable",
+    );
 
-    expect(m.saveSettings).toHaveBeenCalledWith({
-      rules: [{ tool: "edit_file", decision: "allow" }],
-    });
+    expect(useStore.getState().pendingPermission).toEqual(current);
   });
 
-  it("allow-always moves a scoped command allow ahead of a broader shadowing rule", async () => {
-    useStore.setState({
-      settings: {
-        ...DEFAULT_SETTINGS,
-        rules: [
-          { tool: "run_command", decision: "ask" },
-          { tool: "shell", command: "git status", decision: "allow" },
-        ],
-      },
-      pendingPermission: {
-        id: "p-shadowed",
-        tool: "run_command",
-        summary: "git status",
-        input: { command: "git status" },
-      },
-    });
-
-    await useStore.getState().resolvePermission("allow", true);
-
-    expect(m.saveSettings).toHaveBeenCalledWith({
-      rules: [
-        { tool: "run_command", command: "git status", decision: "allow" },
-        { tool: "run_command", decision: "ask" },
-      ],
-    });
-  });
-
-  it("treats a saved legacy command rule as equivalent to a canonical request", async () => {
-    useStore.setState({
-      settings: {
-        ...DEFAULT_SETTINGS,
-        rules: [{ tool: "shell", command: "git status", decision: "allow" }],
-      },
-      pendingPermission: {
-        id: "p4",
-        tool: "run_command",
-        summary: "git status",
-        input: { command: "git status" },
-      },
-    });
-
-    await useStore.getState().resolvePermission("allow", true);
-
-    expect(m.resolvePermission).toHaveBeenCalledWith("p4", "allow");
-    expect(m.saveSettings).not.toHaveBeenCalled();
-  });
-
-  it("persists allow-always before releasing the gate so this task sees it (ordered)", async () => {
-    // Queued native prompts read live rules as soon as this gate is released, so
-    // the scoped save must complete first. updateSettings absorbs a save failure,
-    // ensuring the one-shot gate is still answered in that case.
-    const calls: string[] = [];
-    m.resolvePermission.mockImplementationOnce(async () => {
-      calls.push("resolve");
-    });
-    m.saveSettings.mockImplementationOnce(async (s) => {
-      calls.push("save");
-      return { ...DEFAULT_SETTINGS, ...s };
-    });
-    useStore.setState({
-      pendingPermission: { id: "p1", tool: "fs_edit", summary: "x", input: {} },
-    });
-
-    await useStore.getState().resolvePermission("allow", true);
-
-    expect(calls).toEqual(["save", "resolve"]);
-  });
-
-  it("still answers the gate and clears the prompt when the policy save rejects", async () => {
-    // updateSettings converts the rejection into settingsError and settles, then
-    // resolvePermission still releases the current request as a one-shot Allow.
-    m.saveSettings.mockRejectedValueOnce(new Error("disk full"));
-    useStore.setState({
-      pendingPermission: { id: "p1", tool: "fs_edit", summary: "x", input: {} },
-    });
-
-    await useStore.getState().resolvePermission("allow", true);
-
-    expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
-    const st = useStore.getState();
-    expect(st.pendingPermission).toBeNull();
-    // The failed best-effort policy save surfaces via settingsError (updateSettings).
-    expect(st.settingsError).toBe("disk full");
-  });
-
-  it("does not resolve a superseding request when a stale click lands mid-await", async () => {
-    // A newer permission request can arrive while we await the backend resolve.
-    // A stale click must not then clear or answer the new prompt.
+  it("does not clear a superseding request when delivery settles", async () => {
     const newer = { id: "p2", tool: "fs_edit", summary: "newer", input: {} };
     m.resolvePermission.mockImplementationOnce(async () => {
       useStore.setState({ pendingPermission: newer });
@@ -3364,14 +4010,9 @@ describe("resolvePermission", () => {
       pendingPermission: { id: "p1", tool: "fs_edit", summary: "stale", input: {} },
     });
 
-    // The captured request (p1) is answered and the allow-always policy save still
-    // runs; it just never touches pendingPermission, so the newer prompt that
-    // arrived mid-await stays pending (the pre-await guard only blocks answering a
-    // request whose id changed before the await began).
     await useStore.getState().resolvePermission("allow", true);
 
-    // p1 was answered, but the newer prompt that arrived mid-await stays pending.
-    expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
+    expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow", true);
     expect(useStore.getState().pendingPermission).toEqual(newer);
   });
 
@@ -4005,76 +4646,6 @@ describe("crashReporting (telemetry consent)", () => {
   });
 });
 
-describe("oauth (Claude subscription sign-in)", () => {
-  const signedIn = { signedIn: true, expiresAt: 9999, account: "me@x", tier: "Claude Max" };
-
-  it("init keeps oauthStatus null when the oauth bridge rejects", async () => {
-    m.oauthStatus.mockRejectedValue(new Error("core not ready"));
-    await useStore.getState().init();
-    expect(useStore.getState().oauthStatus).toBeNull();
-  });
-
-  it("init stores the signed-in subscription status", async () => {
-    m.oauthStatus.mockResolvedValue(signedIn);
-    await useStore.getState().init();
-    expect(useStore.getState().oauthStatus).toEqual(signedIn);
-  });
-
-  it("refreshOAuthStatus updates state and swallows a transient failure", async () => {
-    m.oauthStatus.mockResolvedValue(signedIn);
-    await useStore.getState().refreshOAuthStatus();
-    expect(useStore.getState().oauthStatus).toEqual(signedIn);
-
-    // A later failure must not clobber the last-known status.
-    m.oauthStatus.mockRejectedValue(new Error("blip"));
-    await useStore.getState().refreshOAuthStatus();
-    expect(useStore.getState().oauthStatus).toEqual(signedIn);
-  });
-
-  it("loginWithClaude stores the status and clears any prior error", async () => {
-    m.startOauthLogin.mockResolvedValue(signedIn);
-    useStore.setState({ oauthError: "old failure" });
-
-    await useStore.getState().loginWithClaude();
-
-    expect(m.startOauthLogin).toHaveBeenCalledTimes(1);
-    expect(useStore.getState().oauthStatus).toEqual(signedIn);
-    expect(useStore.getState().oauthError).toBeNull();
-  });
-
-  it("loginWithClaude records an Error's message on failure", async () => {
-    m.startOauthLogin.mockRejectedValue(new Error("oauth denied"));
-    await useStore.getState().loginWithClaude();
-    expect(useStore.getState().oauthError).toBe("oauth denied");
-  });
-
-  it("loginWithClaude stringifies a non-Error rejection", async () => {
-    m.startOauthLogin.mockRejectedValue("plain failure");
-    await useStore.getState().loginWithClaude();
-    expect(useStore.getState().oauthError).toBe("plain failure");
-  });
-
-  it("logoutClaude clears the subscription on success", async () => {
-    useStore.setState({ oauthStatus: signedIn });
-
-    await useStore.getState().logoutClaude();
-
-    expect(m.oauthLogout).toHaveBeenCalledTimes(1);
-    expect(useStore.getState().oauthStatus).toEqual({
-      signedIn: false,
-      expiresAt: null,
-      account: null,
-      tier: null,
-    });
-  });
-
-  it("logoutClaude records a failure message", async () => {
-    m.oauthLogout.mockRejectedValue(new Error("logout failed"));
-    await useStore.getState().logoutClaude();
-    expect(useStore.getState().oauthError).toBe("logout failed");
-  });
-});
-
 describe("OpenAI account registry and scoped catalogues", () => {
   const signedIn = {
     signedIn: true,
@@ -4176,7 +4747,10 @@ describe("OpenAI account registry and scoped catalogues", () => {
     const state = useStore.getState();
     expect(state.initError).toBeNull();
     expect(state.sessions).toEqual([]);
-    expect(state.pendingSession?.id).toBe(state.activeId);
+    expect(state.pendingSession).toBeNull();
+    expect(state.activeId).toBeNull();
+    expect(state.showSettings).toBe(true);
+    expect(state.openAIAuthError).toContain("Couldn't load Codex authentication");
     expect(state.openAIAccounts).toEqual([]);
     expect(state.openAIAccountsError).toBe("credential registry is locked");
   });
@@ -4538,6 +5112,7 @@ describe("OpenAI account registry and scoped catalogues", () => {
     });
     expect(m.saveSettings).toHaveBeenCalledWith({
       model: "gpt-second",
+      provider: "openai",
       reasoningEffort: "high",
     });
 
@@ -4546,6 +5121,158 @@ describe("OpenAI account registry and scoped catalogues", () => {
     expect(useStore.getState().openAIAuthError).toBe(
       "Choose a connected ChatGPT account as the default.",
     );
+  });
+
+  it("repairs effort when the new default account has the same model but no Ultra", async () => {
+    const first = openAIAccount();
+    const second = openAIAccount({ id: "00000000-0000-4000-8000-000000000002" });
+    const withUltra: ModelInfo = {
+      id: "gpt-shared",
+      label: "GPT Shared",
+      provider: "openai",
+      reasoningEfforts: ["high", "ultra"],
+      defaultReasoningEffort: "high",
+    };
+    const withoutUltra: ModelInfo = {
+      ...withUltra,
+      reasoningEfforts: ["low", "medium", "high", "xhigh"],
+    };
+    useStore.setState({
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: withUltra.id,
+        reasoningEffort: "ultra",
+      },
+      openAIAuthStatus: signedIn,
+      openAIAccounts: [first, second],
+      openAIModels: [withUltra],
+      openAIModelCatalogs: {
+        [first.id]: { status: "ready", models: [withUltra], error: null },
+        [second.id]: { status: "ready", models: [withoutUltra], error: null },
+      },
+      lastOpenAIAccountProfileId: first.id,
+    });
+
+    await useStore.getState().setDefaultOpenAIAccount(second.id);
+
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      model: withoutUltra.id,
+      provider: "openai",
+      reasoningEffort: "high",
+    });
+    expect(useStore.getState().settings.reasoningEffort).toBe("high");
+  });
+
+  it("does not let a slower earlier default-account load replace the latest account", async () => {
+    const first = openAIAccount();
+    const second = openAIAccount({ id: "00000000-0000-4000-8000-000000000002" });
+    const firstRows: OpenAIModelCatalogRow[] = [
+      {
+        id: "gpt-shared",
+        label: "GPT Shared",
+        reasoningEfforts: ["high", "ultra"],
+        defaultReasoningEffort: "high",
+      },
+    ];
+    const secondRows: OpenAIModelCatalogRow[] = [
+      {
+        id: "gpt-shared",
+        label: "GPT Shared",
+        reasoningEfforts: ["low", "medium", "high", "xhigh"],
+        defaultReasoningEffort: "high",
+      },
+    ];
+    let finishFirst!: (rows: OpenAIModelCatalogRow[]) => void;
+    m.openaiModels.mockImplementation((accountProfileId) =>
+      accountProfileId === first.id
+        ? new Promise<OpenAIModelCatalogRow[]>((resolve) => (finishFirst = resolve))
+        : Promise.resolve(secondRows),
+    );
+    useStore.setState({
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: "gpt-shared",
+        reasoningEffort: "ultra",
+      },
+      openAIAuthStatus: signedIn,
+      openAIAccounts: [first, second],
+      openAIModels: [],
+      openAIModelCatalogs: {},
+      lastOpenAIAccountProfileId: first.id,
+    });
+
+    const earlier = useStore.getState().setDefaultOpenAIAccount(first.id);
+    const latest = useStore.getState().setDefaultOpenAIAccount(second.id);
+    await latest;
+    finishFirst(firstRows);
+    await earlier;
+
+    expect(useStore.getState().lastOpenAIAccountProfileId).toBe(second.id);
+    expect(useStore.getState().openAIModels).toMatchObject([
+      { id: "gpt-shared", reasoningEfforts: ["low", "medium", "high", "xhigh"] },
+    ]);
+    expect(useStore.getState().settings.reasoningEffort).toBe("high");
+  });
+
+  it("surfaces a default account catalogue load failure", async () => {
+    const account = openAIAccount();
+    useStore.setState({
+      openAIAuthStatus: signedIn,
+      openAIAccounts: [account],
+      openAIModelCatalogs: {},
+      lastOpenAIAccountProfileId: null,
+    });
+    m.openaiModels.mockRejectedValueOnce(new Error("default catalogue offline"));
+
+    await useStore.getState().setDefaultOpenAIAccount(account.id);
+
+    expect(useStore.getState()).toMatchObject({
+      lastOpenAIAccountProfileId: account.id,
+      openAIAuthError: "default catalogue offline",
+    });
+  });
+
+  it("repairs the active effort when a refreshed catalogue removes Ultra", async () => {
+    const account = openAIAccount();
+    const previous: ModelInfo = {
+      id: "gpt-live",
+      label: "GPT Live",
+      provider: "openai",
+      reasoningEfforts: ["high", "ultra"],
+      defaultReasoningEffort: "high",
+    };
+    useStore.setState({
+      sessions: [session({ id: "a", model: previous.id, accountProfileId: account.id })],
+      activeId: "a",
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: previous.id,
+        reasoningEffort: "ultra",
+      },
+      openAIAuthStatus: signedIn,
+      openAIAccounts: [account],
+      openAIModels: [previous],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: [previous], error: null },
+      },
+      lastOpenAIAccountProfileId: account.id,
+    });
+    m.openaiModels.mockResolvedValueOnce([
+      {
+        id: previous.id,
+        label: previous.label,
+        reasoningEfforts: ["low", "medium", "high", "xhigh"],
+        defaultReasoningEffort: "high",
+      },
+    ]);
+
+    await useStore.getState().loadOpenAIAccountModels(account.id, true);
+
+    expect(m.saveSettings).toHaveBeenCalledWith({ reasoningEffort: "high" });
+    expect(useStore.getState().settings.reasoningEffort).toBe("high");
   });
 
   it("fails profile catalogue loads closed and reuses a confirmed cache", async () => {
@@ -4636,6 +5363,102 @@ describe("OpenAI account registry and scoped catalogues", () => {
     await useStore.getState().newSession(account.id);
     await useStore.getState().send("hello");
     expect(useStore.getState().lastOpenAIAccountProfileId).toBe(previous.id);
+  });
+
+  it("switches a pending chat locally and preserves the default when first sent", async () => {
+    const first = openAIAccount();
+    const second = openAIAccount({
+      id: "00000000-0000-4000-8000-000000000002",
+      accountLabel: "two@chatgpt.test",
+      tier: "ChatGPT Team",
+    });
+    const firstModel = {
+      ...liveRows[0],
+      reasoningEfforts: [...liveRows[0].reasoningEfforts],
+      provider: "openai" as const,
+    };
+    const secondModel = {
+      id: "gpt-second",
+      label: "GPT Second",
+      provider: "openai" as const,
+      reasoningEfforts: ["high" as const],
+      defaultReasoningEffort: "high" as const,
+    };
+    localStorage.setItem("pc.lastOpenAIAccountProfileId", first.id);
+    useStore.setState({
+      settings: {
+        ...DEFAULT_SETTINGS,
+        model: firstModel.id,
+        provider: "openai",
+        reasoningEffort: "high",
+      },
+      openAIAuthStatus: signedIn,
+      openAIAccounts: [first, second],
+      openAIModelCatalogs: {
+        [first.id]: { status: "ready", models: [firstModel], error: null },
+        [second.id]: { status: "ready", models: [secondModel], error: null },
+      },
+      openAIModels: [firstModel],
+      lastOpenAIAccountProfileId: first.id,
+    });
+
+    await useStore.getState().newSession();
+    const pendingId = useStore.getState().pendingSession?.id;
+    expect(pendingId).toBeTruthy();
+
+    await expect(useStore.getState().pinSessionOpenAIAccount(pendingId!, second.id)).resolves.toBe(
+      "selected",
+    );
+    expect(useStore.getState().pendingSession).toMatchObject({
+      id: pendingId,
+      accountProfileId: second.id,
+      model: secondModel.id,
+    });
+    expect(useStore.getState().sessions).toEqual([]);
+    expect(m.pinSessionOpenAIAccount).not.toHaveBeenCalled();
+    expect(useStore.getState().lastOpenAIAccountProfileId).toBe(first.id);
+
+    await useStore.getState().send("Use the second account");
+
+    expect(m.createSession).toHaveBeenCalledWith(
+      pendingId,
+      "New chat",
+      null,
+      secondModel.id,
+      second.id,
+    );
+    expect(useStore.getState().pendingSession).toBeNull();
+    expect(useStore.getState().sessions[0]).toMatchObject({
+      id: pendingId,
+      accountProfileId: second.id,
+      model: secondModel.id,
+    });
+    expect(useStore.getState().lastOpenAIAccountProfileId).toBe(first.id);
+    expect(localStorage.getItem("pc.lastOpenAIAccountProfileId")).toBe(first.id);
+  });
+
+  it("rejects account selection for a missing or currently starting pending chat", async () => {
+    const account = openAIAccount();
+    useStore.setState({
+      openAIAuthStatus: signedIn,
+      openAIAccounts: [account],
+    });
+
+    await expect(
+      useStore.getState().pinSessionOpenAIAccount("missing-session", account.id),
+    ).resolves.toBe("error");
+    expect(useStore.getState().openAIAuthError).toBe("This conversation is no longer available.");
+
+    const pending = session({ id: "pending-session", accountProfileId: null });
+    useStore.setState({ pendingSession: pending, creatingSession: true });
+
+    await expect(useStore.getState().pinSessionOpenAIAccount(pending.id, account.id)).resolves.toBe(
+      "error",
+    );
+    expect(useStore.getState().openAIAuthError).toBe(
+      "Wait for this conversation to finish starting.",
+    );
+    expect(m.pinSessionOpenAIAccount).not.toHaveBeenCalled();
   });
 
   it("pins a legacy session using the authoritative result and supports a void compatibility response", async () => {
@@ -4787,13 +5610,124 @@ describe("OpenAI account registry and scoped catalogues", () => {
 });
 
 describe("settings + workspace", () => {
+  it("validates Settings reasoning against the default account, not the active chat", async () => {
+    const activeAccount = openAIAccount();
+    const defaultAccount = openAIAccount({
+      id: "00000000-0000-4000-8000-000000000002",
+    });
+    const activeModel: ModelInfo = {
+      id: "gpt-shared",
+      label: "GPT Shared",
+      provider: "openai",
+      reasoningEfforts: ["low", "medium", "high", "xhigh"],
+      defaultReasoningEffort: "high",
+    };
+    const defaultModel: ModelInfo = {
+      ...activeModel,
+      reasoningEfforts: ["high", "ultra"],
+    };
+    useStore.setState({
+      sessions: [session({ id: "a", model: activeModel.id, accountProfileId: activeAccount.id })],
+      activeId: "a",
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: defaultModel.id,
+        reasoningEffort: "high",
+      },
+      openAIAccounts: [activeAccount, defaultAccount],
+      openAIModels: [defaultModel],
+      openAIModelCatalogs: {
+        [activeAccount.id]: { status: "ready", models: [activeModel], error: null },
+        [defaultAccount.id]: { status: "ready", models: [defaultModel], error: null },
+      },
+      lastOpenAIAccountProfileId: defaultAccount.id,
+    });
+
+    await useStore.getState().updateDefaultOpenAISettings({ reasoningEffort: "ultra" });
+
+    expect(m.saveSettings).toHaveBeenCalledWith({ reasoningEffort: "ultra" });
+    expect(useStore.getState().settings.reasoningEffort).toBe("ultra");
+  });
+
+  it("fails closed when active or default OpenAI effort metadata is unavailable", async () => {
+    const account = openAIAccount();
+    useStore.setState({
+      sessions: [session({ id: "a", model: "gpt-missing", accountProfileId: account.id })],
+      activeId: "a",
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: "gpt-missing",
+        reasoningEffort: "high",
+      },
+      openAIAccounts: [account],
+      openAIModels: [],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: [], error: null },
+      },
+      lastOpenAIAccountProfileId: account.id,
+    });
+
+    await useStore.getState().updateSettings({ reasoningEffort: "ultra" });
+    expect(useStore.getState().settingsError).toBe(
+      "Load this model's supported reasoning levels before changing it.",
+    );
+
+    await useStore.getState().updateDefaultOpenAISettings({ reasoningEffort: "ultra" });
+    expect(useStore.getState().settingsError).toBe(
+      "Load the default ChatGPT account's supported reasoning levels first.",
+    );
+    expect(m.saveSettings).not.toHaveBeenCalled();
+  });
+
   it("updateSettings persists through ipc and stores the echoed result", async () => {
-    m.saveSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, model: "claude-haiku-4-5-20251001" });
+    m.saveSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, model: "gpt-5.6-sol" });
 
-    await useStore.getState().updateSettings({ model: "claude-haiku-4-5-20251001" });
+    await useStore.getState().updateSettings({ model: "gpt-5.6-sol" });
 
-    expect(m.saveSettings).toHaveBeenCalledWith({ model: "claude-haiku-4-5-20251001" });
-    expect(useStore.getState().settings.model).toBe("claude-haiku-4-5-20251001");
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      model: "gpt-5.6-sol",
+      provider: "openai",
+      reasoningEffort: "medium",
+    });
+    expect(useStore.getState().settings.model).toBe("gpt-5.6-sol");
+  });
+
+  it("rejects Fast when the selected model does not advertise a Fast service tier", async () => {
+    const account = openAIAccount();
+    const standardOnlyModel: ModelInfo = {
+      id: "gpt-standard-only",
+      label: "GPT Standard Only",
+      provider: "openai",
+      reasoningEfforts: ["medium"],
+      defaultReasoningEffort: "medium",
+      serviceTiers: [],
+    };
+    useStore.setState({
+      sessions: [session({ id: "a", model: standardOnlyModel.id, accountProfileId: account.id })],
+      activeId: "a",
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: standardOnlyModel.id,
+        responseSpeed: "standard",
+      },
+      openAIAccounts: [account],
+      openAIModels: [standardOnlyModel],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: [standardOnlyModel], error: null },
+      },
+      lastOpenAIAccountProfileId: account.id,
+    });
+
+    await useStore.getState().updateSettings({ responseSpeed: "fast" });
+
+    expect(m.saveSettings).not.toHaveBeenCalled();
+    expect(useStore.getState().settings.responseSpeed).toBe("standard");
+    expect(useStore.getState().settingsError).toBe(
+      "Fast mode is not available for the selected model.",
+    );
   });
 
   it("openWorkspace stores a picked folder and ignores a cancelled picker", async () => {
@@ -4811,7 +5745,7 @@ describe("settings + workspace", () => {
     const prior = useStore.getState().settings;
     m.saveSettings.mockRejectedValueOnce(new Error("keyring locked"));
 
-    await useStore.getState().updateSettings({ model: "claude-sonnet-4-6" });
+    await useStore.getState().updateSettings({ model: "gpt-5.6-sol" });
 
     const st = useStore.getState();
     expect(st.settingsError).toBe("keyring locked");
@@ -4819,7 +5753,7 @@ describe("settings + workspace", () => {
   });
 
   it("updateSettings reconciles a committed value when durability is unconfirmed", async () => {
-    const committed = { ...DEFAULT_SETTINGS, model: "claude-sonnet-4-6" };
+    const committed = { ...DEFAULT_SETTINGS, model: "gpt-5.6-sol" };
     m.saveSettings.mockRejectedValueOnce(
       new Error(`${SETTINGS_COMMITTED_DURABILITY_UNCONFIRMED_PREFIX} Directory sync failed.`),
     );
@@ -4836,7 +5770,7 @@ describe("settings + workspace", () => {
   it("updateSettings clears a prior settingsError on a successful save", async () => {
     useStore.setState({ settingsError: "old failure" });
 
-    await useStore.getState().updateSettings({ model: "claude-sonnet-4-6" });
+    await useStore.getState().updateSettings({ model: "gpt-5.6-sol" });
 
     expect(useStore.getState().settingsError).toBeNull();
   });
@@ -7032,6 +7966,7 @@ describe("background shell tasks (background-tasks panel)", () => {
   });
 
   it("subscribes a background listener after a pending session is first sent", async () => {
+    arrangeConnectedCodex();
     useStore.setState({ sessions: [], activeId: null, messages: {} });
     await useStore.getState().newSession();
     const newId = useStore.getState().activeId;

@@ -1,14 +1,11 @@
-// DESKTOP-ONLY executable-capability cluster — excluded from the mobile (phone =
-// pure remote CLIENT) binary so no agent loop / shell+fs tools / OAuth loopback
-// code ships on the phone. `llm` stays SHARED: db/permissions/sync(protocol,mod)
+// DESKTOP-ONLY Codex host — excluded from the mobile (phone = pure remote
+// CLIENT) binary. `llm` stays SHARED: db/permissions/sync(protocol,mod)
 // `use crate::llm::{Block, ChatMessage, StreamEvent}` in production code — those
 // are the wire types the phone must decode — so gating `llm` would break mobile.
 #[cfg(desktop)]
-mod agent;
+mod codex_app_server;
 #[cfg(desktop)]
-mod agents;
-#[cfg(desktop)]
-mod background;
+mod codex_engine;
 // Cross-target crash-reporting consent flag (the on-disk opt-in). NOT cfg-gated: the
 // desktop `telemetry` module re-uses it AND the mobile `telemetry_set_consent`
 // command writes it (the Android `PortcodeApplication` reads the same flag before it
@@ -16,21 +13,13 @@ mod background;
 mod consent;
 mod db;
 // The event-emission seam ([`EventSink`] + the production [`AppEventSink`]). The
-// trait is SHARED because `llm::LlmProvider` (shared) takes `&dyn EventSink`; the
 // concrete `AppEventSink` is desktop-only (gated inside `events`).
 mod events;
 #[cfg(desktop)]
 mod git;
 #[cfg(desktop)]
 mod git_review;
-mod http_client;
 mod llm;
-#[cfg(desktop)]
-mod oauth;
-#[cfg(desktop)]
-mod openai_accounts;
-#[cfg(desktop)]
-mod openai_oauth;
 mod permissions;
 #[cfg(desktop)]
 mod plan_usage;
@@ -43,10 +32,6 @@ mod sync;
 #[cfg(desktop)]
 mod telemetry;
 mod tool_names;
-#[cfg(desktop)]
-mod tools;
-#[cfg(desktop)]
-mod turn_receipt;
 // Auto-updater command surface (desktop only — the phone is a remote client and
 // never self-updates). The whole module is `#![cfg(desktop)]` internally too.
 #[cfg(desktop)]
@@ -54,15 +39,7 @@ mod update;
 #[cfg(desktop)]
 mod workspace;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
-// `Ordering` is referenced ONLY by `cancel_agent` (desktop-gated); `AtomicBool`
-// stays shared as the `AppState.cancels` value type. Split so mobile has no unused
-// import. Inert on desktop (both names stay used). NB: list_dir uses the unrelated
-// `std::cmp::Ordering` fully-qualified, so it does not keep this import alive.
-#[cfg(desktop)]
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -72,36 +49,13 @@ use crate::db::{Db, DraftRow, SearchHit, SessionRow, UiMessage, UiMessagePage, U
 use crate::settings::Settings;
 
 pub struct AppState {
-    pub http: reqwest::Client,
     pub config_dir: PathBuf,
     pub settings: Arc<Mutex<Settings>>,
     pub db: Arc<Db>,
-    pub cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
-    pub pending: permissions::Pending,
-    /// Live subagents (`delegate_task`), keyed by agent id, so the agents panel can
-    /// Stop one without the rest. DESKTOP-ONLY — only the desktop runs the agent
-    /// loop that spawns subagents; the phone is a pure remote client.
+    /// The real Codex app-server owns every GPT agent turn. Portcode retains
+    /// only the session mapping, event projection, and product UI around it.
     #[cfg(desktop)]
-    pub agents: agents::Agents,
-    /// Live background `run_command` tasks, keyed by task id, so a session Stop can kill
-    /// the ones it launched. DESKTOP-ONLY — only the desktop runs the agent loop.
-    #[cfg(desktop)]
-    pub background: background::Background,
-    /// Serializes every OAuth credential mutation across refresh, interactive
-    /// login persistence, and logout. Refreshes stay single-flight, and a queued
-    /// refresh can never recreate a credential that logout cleared.
-    pub oauth_refresh: Arc<tokio::sync::Mutex<()>>,
-    /// Native, profile-scoped ChatGPT credential registry. The registry owns its
-    /// own short commit lock, per-profile refresh locks, browser-login gate, and
-    /// lifecycle leases; it is intentionally independent from Anthropic OAuth.
-    #[cfg(desktop)]
-    pub openai_accounts: Arc<openai_accounts::OpenAiAccountRegistry>,
-    /// A failed singleton-to-registry migration must never be rendered as
-    /// "signed out". Commands retry the migration and clear this slot on success;
-    /// until then OpenAI admission fails visibly while exact profile removal stays
-    /// available as a recovery action.
-    #[cfg(desktop)]
-    pub openai_accounts_startup_error: Arc<Mutex<Option<String>>>,
+    pub codex: Arc<codex_engine::CodexEngine>,
     /// The phone's live remote-control session, when connected. Holds the
     /// command-injection sender + the session task handle; `None` when not
     /// connected. The `std::sync::Mutex` guard is only ever held across cheap
@@ -129,9 +83,7 @@ pub struct AppState {
 
 #[tauri::command]
 fn get_settings(state: State<AppState>) -> Settings {
-    let mut s = state.settings.lock().unwrap().clone();
-    s.api_key_set = secrets::has_api_key();
-    s
+    state.settings.lock().unwrap().clone()
 }
 
 #[tauri::command]
@@ -188,9 +140,6 @@ fn save_settings(state: State<AppState>, settings: Value) -> Result<Settings, St
     persist_settings_candidate(&mut current, candidate.clone(), &state.config_dir)?;
     drop(current);
 
-    // Credential presence is derived from the OS store. It is never accepted
-    // from the patch or persisted as the source of truth.
-    candidate.api_key_set = secrets::has_api_key();
     Ok(candidate)
 }
 
@@ -320,17 +269,10 @@ mod settings_command_transaction_tests {
     }
 }
 
-#[tauri::command]
-fn set_api_key(key: String) -> Result<(), String> {
-    secrets::set_api_key(&key)
-}
+// ── Codex authentication ─────────────────────────────────────────────────────
 
-// ── subscription OAuth ───────────────────────────────────────────────────────
-
-/// Sign-in state for the frontend. `expires_at` is unix seconds; `account` is the
-/// signed-in email and `tier` a display label ("Claude Max" / "Claude Pro") —
-/// both best-effort from the OAuth profile, so either may be `None`.
-// DESKTOP-ONLY: the subscription-OAuth surface (`oauth.rs` is mobile-excluded).
+/// Display-safe authentication state for the frontend. Codex owns the actual
+/// ChatGPT or API-key credential; Portcode receives only account metadata.
 #[cfg(desktop)]
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -346,68 +288,6 @@ struct OAuthStatus {
     tier: Option<String>,
 }
 
-/// Map a stored plan code (`"max"` / `"pro"`) to a user-facing tier label.
-#[cfg(desktop)]
-fn tier_label(plan: Option<&str>) -> Option<String> {
-    match plan {
-        Some("max") => Some("Claude Max".to_string()),
-        Some("pro") => Some("Claude Pro".to_string()),
-        _ => None,
-    }
-}
-
-#[cfg(desktop)]
-fn current_oauth_status() -> OAuthStatus {
-    match secrets::get_oauth() {
-        Some(t) => OAuthStatus {
-            available: true,
-            unavailable_reason: None,
-            signed_in: true,
-            expires_at: Some(t.expires_at),
-            account: t.email,
-            tier: tier_label(t.plan.as_deref()),
-        },
-        None => OAuthStatus {
-            available: true,
-            unavailable_reason: None,
-            signed_in: false,
-            expires_at: None,
-            account: None,
-            tier: None,
-        },
-    }
-}
-
-/// Run the interactive subscription sign-in (loopback OAuth + PKCE), store the
-/// resulting tokens, and return the new status.
-#[cfg(desktop)]
-#[tauri::command]
-async fn start_oauth_login(state: State<'_, AppState>) -> Result<OAuthStatus, String> {
-    // Hold the same mutation lock used by refresh for the entire interactive
-    // flow. If logout is requested while the browser is open it waits and then
-    // clears the newly persisted credential, rather than being resurrected.
-    let _guard = state.oauth_refresh.lock().await;
-    let http = state.http.clone();
-    let tokens = oauth::run_loopback_login(&http).await?;
-    secrets::set_oauth(&tokens)?;
-    Ok(current_oauth_status())
-}
-
-/// Report whether a subscription sign-in is currently stored.
-#[cfg(desktop)]
-#[tauri::command]
-fn oauth_status() -> Result<OAuthStatus, String> {
-    Ok(current_oauth_status())
-}
-
-/// Forget the stored subscription tokens (sign out). Idempotent.
-#[cfg(desktop)]
-#[tauri::command]
-async fn oauth_logout(state: State<'_, AppState>) -> Result<(), String> {
-    let _guard = state.oauth_refresh.lock().await;
-    secrets::clear_oauth()
-}
-
 #[cfg(desktop)]
 fn openai_tier_label(plan: Option<&str>) -> Option<String> {
     plan.map(|plan| {
@@ -421,287 +301,80 @@ fn openai_tier_label(plan: Option<&str>) -> Option<String> {
 }
 
 #[cfg(desktop)]
-fn account_error_message(error: &openai_accounts::OpenAiAccountError) -> String {
-    error.user_message().to_string()
-}
-
-/// Retry a failed legacy migration before any operation that could otherwise
-/// mistake an unavailable singleton credential for an empty account registry.
-/// The health slot serializes retries and is cleared only after a complete,
-/// journaled migration succeeds.
-#[cfg(desktop)]
-pub(crate) fn ensure_openai_accounts_ready(
-    registry: &openai_accounts::OpenAiAccountRegistry,
-    startup_error: &Mutex<Option<String>>,
-) -> Result<(), String> {
-    let mut health = startup_error
-        .lock()
-        .map_err(|_| "ChatGPT account health check is unavailable.".to_string())?;
-    if health.is_none() {
-        return Ok(());
-    }
-    match registry.migrate_legacy(oauth::now_secs()) {
-        Ok(_) => {
-            *health = None;
-            Ok(())
-        }
-        Err(error) => {
-            let message = account_error_message(&error);
-            *health = Some(message.clone());
-            Err(message)
-        }
-    }
-}
-
-#[cfg(desktop)]
-fn unavailable_openai_status(reason: String) -> OAuthStatus {
-    OAuthStatus {
-        available: false,
-        unavailable_reason: Some(reason),
-        signed_in: false,
-        expires_at: None,
-        account: None,
-        tier: None,
-    }
-}
-
-#[cfg(desktop)]
-fn current_openai_oauth_status(state: &AppState) -> OAuthStatus {
-    if let Err(reason) = openai_oauth::ensure_direct_subscription_enabled() {
-        return unavailable_openai_status(reason);
-    }
-    if let Err(reason) =
-        ensure_openai_accounts_ready(&state.openai_accounts, &state.openai_accounts_startup_error)
-    {
-        return unavailable_openai_status(reason);
-    }
-    match state.openai_accounts.list_accounts() {
-        Ok(accounts) => {
-            let connected = accounts
-                .into_iter()
-                .find(|account| account.state == openai_accounts::OpenAiAccountState::Connected);
-            OAuthStatus {
-                available: true,
-                unavailable_reason: None,
-                signed_in: connected.is_some(),
-                expires_at: connected.as_ref().and_then(|account| account.expires_at),
-                account: connected
-                    .as_ref()
-                    .and_then(|account| account.account_label.clone()),
-                tier: connected
-                    .as_ref()
-                    .and_then(|account| openai_tier_label(account.tier.as_deref())),
-            }
-        }
-        Err(error) => unavailable_openai_status(account_error_message(&error)),
-    }
-}
-
-#[cfg(desktop)]
-fn load_connected_openai_profile(
-    registry: &openai_accounts::OpenAiAccountRegistry,
-    id: &openai_accounts::AccountProfileId,
-) -> Result<openai_accounts::OpenAiAccountProfile, String> {
-    let summary = registry
-        .list_accounts()
-        .map_err(|error| account_error_message(&error))?
-        .into_iter()
-        .find(|account| account.id == *id)
-        .ok_or_else(|| "ChatGPT account profile was not found.".to_string())?;
-    if summary.state != openai_accounts::OpenAiAccountState::Connected {
-        return Err(match summary.state {
-            openai_accounts::OpenAiAccountState::Removed => {
-                "This ChatGPT account was removed. Reconnect it before use.".into()
-            }
-            openai_accounts::OpenAiAccountState::ReconnectRequired
-            | openai_accounts::OpenAiAccountState::Unavailable => {
-                "This ChatGPT account must be reconnected before use.".into()
-            }
-            openai_accounts::OpenAiAccountState::Connected => unreachable!(),
-        });
-    }
-    registry
-        .load_profile(id)
-        .map_err(|error| account_error_message(&error))
-}
-
-#[cfg(desktop)]
-fn openai_profile_is_fresh(profile: &openai_accounts::OpenAiAccountProfile) -> bool {
-    const REFRESH_SKEW_SECS: i64 = 300;
-    profile.tokens.expires_at - oauth::now_secs() > REFRESH_SKEW_SECS
-}
-
-#[cfg(desktop)]
-async fn fresh_openai_profile(
-    http: &reqwest::Client,
-    registry: &openai_accounts::OpenAiAccountRegistry,
-    id: &openai_accounts::AccountProfileId,
-) -> Result<openai_accounts::OpenAiAccountProfile, String> {
-    openai_oauth::ensure_direct_subscription_enabled()?;
-    let profile = load_connected_openai_profile(registry, id)?;
-    if openai_profile_is_fresh(&profile) {
-        return Ok(profile);
-    }
-
-    let _refresh = registry
-        .lock_refresh(id)
-        .await
-        .map_err(|error| account_error_message(&error))?;
-    let current = load_connected_openai_profile(registry, id)?;
-    if openai_profile_is_fresh(&current) {
-        return Ok(current);
-    }
-
-    match openai_oauth::refresh(http, &current.tokens).await {
-        Ok(tokens) => match registry.store_refreshed_profile(
-            id,
-            current.credential_generation,
-            tokens,
-            oauth::now_secs(),
-        ) {
-            Ok(profile) => Ok(profile),
-            Err(openai_accounts::OpenAiAccountError::CredentialConflict) => {
-                let latest = load_connected_openai_profile(registry, id)?;
-                if openai_profile_is_fresh(&latest) {
-                    Ok(latest)
-                } else {
-                    Err("The ChatGPT credential changed during refresh. Please retry.".into())
-                }
-            }
-            Err(error) => Err(account_error_message(&error)),
-        },
-        Err(error) if openai_oauth::refresh_failure_requires_reconnect(&error) => {
-            match registry.mark_reconnect_required(
-                id,
-                current.credential_generation,
-                oauth::now_secs(),
-            ) {
-                Ok(()) => Err(
-                    "Your ChatGPT subscription session expired. Reconnect this account in Settings."
-                        .into(),
-                ),
-                Err(openai_accounts::OpenAiAccountError::CredentialConflict) => {
-                    let latest = load_connected_openai_profile(registry, id)?;
-                    if openai_profile_is_fresh(&latest) {
-                        Ok(latest)
-                    } else {
-                        Err("The ChatGPT credential changed during refresh. Please retry.".into())
-                    }
-                }
-                Err(mark_error) => Err(account_error_message(&mark_error)),
-            }
-        }
-        Err(error) => Err(error),
-    }
-}
-
-/// Recover one account-scoped 401 without changing profile identity. A newer
-/// access token committed while the failed request was in flight is reused;
-/// otherwise this performs one generation-checked refresh. The caller retries
-/// the failed request exactly once with the returned profile.
-#[cfg(desktop)]
-async fn recover_openai_authentication(
-    http: &reqwest::Client,
-    registry: &openai_accounts::OpenAiAccountRegistry,
-    id: &openai_accounts::AccountProfileId,
-    attempted: &openai_accounts::OpenAiAccountProfile,
-) -> Result<openai_accounts::OpenAiAccountProfile, String> {
-    let _refresh = registry
-        .lock_refresh(id)
-        .await
-        .map_err(|error| account_error_message(&error))?;
-    let current = load_connected_openai_profile(registry, id)?;
-    if current.tokens.access_token != attempted.tokens.access_token {
-        return Ok(current);
-    }
-
-    match openai_oauth::refresh(http, &current.tokens).await {
-        Ok(tokens) => match registry.store_refreshed_profile(
-            id,
-            current.credential_generation,
-            tokens,
-            oauth::now_secs(),
-        ) {
-            Ok(profile) => Ok(profile),
-            Err(openai_accounts::OpenAiAccountError::CredentialConflict) => {
-                let latest = load_connected_openai_profile(registry, id)?;
-                if latest.tokens.access_token != attempted.tokens.access_token {
-                    Ok(latest)
-                } else {
-                    Err(account_error_message(
-                        &openai_accounts::OpenAiAccountError::CredentialConflict,
-                    ))
-                }
-            }
-            Err(error) => Err(account_error_message(&error)),
-        },
-        Err(error) if openai_oauth::refresh_failure_requires_reconnect(&error) => {
-            match registry.mark_reconnect_required(
-                id,
-                current.credential_generation,
-                oauth::now_secs(),
-            ) {
-                Ok(()) => Err(
-                    "Your ChatGPT subscription session expired. Reconnect this account in Settings."
-                        .into(),
-                ),
-                Err(openai_accounts::OpenAiAccountError::CredentialConflict) => {
-                    let latest = load_connected_openai_profile(registry, id)?;
-                    if latest.tokens.access_token != attempted.tokens.access_token {
-                        Ok(latest)
-                    } else {
-                        Err(account_error_message(
-                            &openai_accounts::OpenAiAccountError::CredentialConflict,
-                        ))
-                    }
-                }
-                Err(mark_error) => Err(account_error_message(&mark_error)),
-            }
-        }
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(desktop)]
 #[tauri::command]
-fn list_openai_accounts(
+async fn list_openai_accounts(
     state: State<'_, AppState>,
-) -> Result<Vec<openai_accounts::OpenAiAccountSummary>, String> {
-    ensure_openai_accounts_ready(&state.openai_accounts, &state.openai_accounts_startup_error)?;
-    state
-        .openai_accounts
-        .list_accounts()
-        .map_err(|error| account_error_message(&error))
+) -> Result<Vec<CodexAccountSummary>, String> {
+    let account = state.codex.account(false).await?;
+    Ok(codex_account_summary(&account).into_iter().collect())
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAccountSummary {
+    id: String,
+    account_label: Option<String>,
+    tier: Option<String>,
+    expires_at: Option<i64>,
+    state: &'static str,
+    created_at: i64,
+    updated_at: i64,
+    last_used_at: Option<i64>,
+}
+
+#[cfg(desktop)]
+fn codex_account_summary(account: &codex_engine::CodexAccountView) -> Option<CodexAccountSummary> {
+    if !account.signed_in {
+        return None;
+    }
+    let now = db::now_ms() / 1000;
+    let api_key = account.auth_mode.as_deref() == Some("apiKey");
+    Some(CodexAccountSummary {
+        id: codex_engine::PRIMARY_CODEX_ACCOUNT_ID.to_string(),
+        account_label: account.account.clone().or_else(|| {
+            Some(if api_key {
+                "OpenAI Platform API key".to_string()
+            } else {
+                "ChatGPT account".to_string()
+            })
+        }),
+        tier: if api_key {
+            Some("OpenAI Platform".to_string())
+        } else {
+            account
+                .tier
+                .clone()
+                .map(|tier| openai_tier_label(Some(&tier)).unwrap_or(tier))
+        },
+        expires_at: None,
+        state: "connected",
+        created_at: now,
+        updated_at: now,
+        last_used_at: Some(now),
+    })
 }
 
 #[cfg(desktop)]
 #[tauri::command]
 async fn start_openai_account_login(
     state: State<'_, AppState>,
-) -> Result<openai_accounts::OpenAiAccountSummary, String> {
-    openai_oauth::ensure_direct_subscription_enabled()?;
-    ensure_openai_accounts_ready(&state.openai_accounts, &state.openai_accounts_startup_error)?;
-    let _browser_login = state
-        .openai_accounts
-        .try_lock_browser_login()
-        .map_err(|error| account_error_message(&error))?;
-    let tokens = openai_oauth::run_loopback_login(&state.http).await?;
-    state
-        .openai_accounts
-        .register_account(tokens, oauth::now_secs())
-        .map_err(|error| account_error_message(&error))
+) -> Result<CodexAccountSummary, String> {
+    let login = state.codex.start_chatgpt_login().await?;
+    tauri_plugin_opener::open_url(&login.auth_url, None::<&str>)
+        .map_err(|error| format!("Could not open ChatGPT sign-in: {error}"))?;
+    let account = state.codex.wait_for_login(&login.login_id).await?;
+    codex_account_summary(&account)
+        .ok_or_else(|| "Codex did not finish signing in to ChatGPT.".to_string())
 }
 
 #[cfg(desktop)]
 #[derive(serde::Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[allow(dead_code)]
 enum OpenAiReconnectOutcome {
-    Reconnected {
-        account: openai_accounts::OpenAiAccountSummary,
-    },
-    IdentityMismatch {
-        message: String,
-    },
+    Reconnected { account: CodexAccountSummary },
+    IdentityMismatch { message: String },
 }
 
 #[cfg(desktop)]
@@ -710,45 +383,11 @@ async fn reconnect_openai_account(
     state: State<'_, AppState>,
     account_profile_id: String,
 ) -> Result<OpenAiReconnectOutcome, String> {
-    openai_oauth::ensure_direct_subscription_enabled()?;
-    ensure_openai_accounts_ready(&state.openai_accounts, &state.openai_accounts_startup_error)?;
-    let id = openai_accounts::AccountProfileId::parse(&account_profile_id)
-        .map_err(|error| account_error_message(&error))?;
-    if !state
-        .openai_accounts
-        .list_accounts()
-        .map_err(|error| account_error_message(&error))?
-        .iter()
-        .any(|account| account.id == id)
-    {
+    if account_profile_id != codex_engine::PRIMARY_CODEX_ACCOUNT_ID {
         return Err("ChatGPT account profile was not found.".into());
     }
-    // Hold the lifecycle lease before opening the browser and through the
-    // credential commit. A concurrent removal therefore cannot tombstone this
-    // profile and then be silently undone by the in-flight reconnect.
-    let _profile = state
-        .openai_accounts
-        .acquire_run_lease(&id)
-        .map_err(|error| account_error_message(&error))?;
-    let _browser_login = state
-        .openai_accounts
-        .try_lock_browser_login()
-        .map_err(|error| account_error_message(&error))?;
-    let tokens = openai_oauth::run_loopback_login(&state.http).await?;
-    match state
-        .openai_accounts
-        .reconnect_account(&id, tokens, oauth::now_secs())
-    {
-        Ok(account) => Ok(OpenAiReconnectOutcome::Reconnected { account }),
-        Err(openai_accounts::OpenAiAccountError::IdentityMismatch) => {
-            Ok(OpenAiReconnectOutcome::IdentityMismatch {
-                message: openai_accounts::OpenAiAccountError::IdentityMismatch
-                    .user_message()
-                    .to_string(),
-            })
-        }
-        Err(error) => Err(account_error_message(&error)),
-    }
+    let account = start_openai_account_login(state).await?;
+    Ok(OpenAiReconnectOutcome::Reconnected { account })
 }
 
 #[cfg(desktop)]
@@ -757,26 +396,88 @@ async fn remove_openai_account(
     state: State<'_, AppState>,
     account_profile_id: String,
 ) -> Result<(), String> {
-    // Removal deliberately bypasses the capability and migration-health gates:
-    // users must be able to delete an exact local profile while network access is
-    // disabled or another registry entry is damaged.
-    let id = openai_accounts::AccountProfileId::parse(&account_profile_id)
-        .map_err(|error| account_error_message(&error))?;
-    // Removal participates in the global browser-flow ordering without checking
-    // the network capability gate. If a login is already open, the queued remove
-    // commits afterward and wins; if removal owns the lock first, a new login
-    // fails fast rather than resurrecting the profile after its tombstone.
-    let _browser_login = state.openai_accounts.lock_browser_login().await;
-    state
-        .openai_accounts
-        .remove_account(&id, oauth::now_secs())
-        .map_err(|error| account_error_message(&error))
+    if account_profile_id != codex_engine::PRIMARY_CODEX_ACCOUNT_ID {
+        return Err("ChatGPT account profile was not found.".into());
+    }
+    state.codex.logout().await
 }
 
 #[cfg(desktop)]
 #[tauri::command]
-fn openai_oauth_status(state: State<'_, AppState>) -> Result<OAuthStatus, String> {
-    Ok(current_openai_oauth_status(&state))
+async fn openai_oauth_status(state: State<'_, AppState>) -> Result<OAuthStatus, String> {
+    let account = state.codex.account(false).await?;
+    Ok(oauth_status_from_codex_account(account))
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn codex_login_api_key(
+    state: State<'_, AppState>,
+    api_key: String,
+) -> Result<OAuthStatus, String> {
+    let account = state.codex.login_api_key(api_key).await?;
+    Ok(oauth_status_from_codex_account(account))
+}
+
+#[cfg(desktop)]
+fn oauth_status_from_codex_account(account: codex_engine::CodexAccountView) -> OAuthStatus {
+    let api_key = account.auth_mode.as_deref() == Some("apiKey");
+    OAuthStatus {
+        available: true,
+        unavailable_reason: None,
+        signed_in: account.signed_in,
+        expires_at: None,
+        account: account
+            .account
+            .or_else(|| api_key.then(|| "OpenAI Platform API key".to_string())),
+        tier: if api_key {
+            Some("OpenAI Platform".to_string())
+        } else {
+            account
+                .tier
+                .map(|tier| openai_tier_label(Some(&tier)).unwrap_or(tier))
+        },
+    }
+}
+
+#[cfg(all(test, desktop))]
+mod codex_account_projection_tests {
+    use super::*;
+
+    #[test]
+    fn api_key_auth_remains_identifiable_after_status_refresh() {
+        let account = codex_engine::CodexAccountView {
+            signed_in: true,
+            auth_mode: Some("apiKey".into()),
+            account: None,
+            tier: None,
+        };
+
+        let status = oauth_status_from_codex_account(account.clone());
+        assert!(status.signed_in);
+        assert_eq!(status.account.as_deref(), Some("OpenAI Platform API key"));
+        assert_eq!(status.tier.as_deref(), Some("OpenAI Platform"));
+
+        let summary = codex_account_summary(&account).expect("signed-in API key slot");
+        assert_eq!(
+            summary.account_label.as_deref(),
+            Some("OpenAI Platform API key")
+        );
+        assert_eq!(summary.tier.as_deref(), Some("OpenAI Platform"));
+    }
+
+    #[test]
+    fn chatgpt_auth_keeps_account_and_plan_labels() {
+        let status = oauth_status_from_codex_account(codex_engine::CodexAccountView {
+            signed_in: true,
+            auth_mode: Some("chatgpt".into()),
+            account: Some("person@example.test".into()),
+            tier: Some("plus".into()),
+        });
+
+        assert_eq!(status.account.as_deref(), Some("person@example.test"));
+        assert_eq!(status.tier.as_deref(), Some("ChatGPT Plus"));
+    }
 }
 
 #[cfg(desktop)]
@@ -784,28 +485,11 @@ fn openai_oauth_status(state: State<'_, AppState>) -> Result<OAuthStatus, String
 async fn openai_models(
     state: State<'_, AppState>,
     account_profile_id: String,
-) -> Result<Vec<openai_oauth::OpenAiModel>, String> {
-    ensure_openai_accounts_ready(&state.openai_accounts, &state.openai_accounts_startup_error)?;
-    let id = openai_accounts::AccountProfileId::parse(&account_profile_id)
-        .map_err(|error| account_error_message(&error))?;
-    let _profile = state
-        .openai_accounts
-        .acquire_run_lease(&id)
-        .map_err(|error| account_error_message(&error))?;
-    let profile = fresh_openai_profile(&state.http, &state.openai_accounts, &id).await?;
-    // Re-check the runtime kill switch immediately before the network request.
-    openai_oauth::ensure_direct_subscription_enabled()?;
-    match openai_oauth::models(&state.http, &profile.tokens).await {
-        Ok(models) => Ok(models),
-        Err(error) if openai_oauth::is_model_authentication_error(&error) => {
-            let recovered =
-                recover_openai_authentication(&state.http, &state.openai_accounts, &id, &profile)
-                    .await?;
-            openai_oauth::ensure_direct_subscription_enabled()?;
-            openai_oauth::models(&state.http, &recovered.tokens).await
-        }
-        Err(error) => Err(error),
+) -> Result<Vec<codex_engine::CodexModelView>, String> {
+    if account_profile_id != codex_engine::PRIMARY_CODEX_ACCOUNT_ID {
+        return Err("ChatGPT account profile was not found.".into());
     }
+    state.codex.models().await
 }
 
 /// Fetch a display-safe subscription quota snapshot for one signed-in provider.
@@ -818,65 +502,21 @@ async fn get_plan_usage(
     provider: String,
     account_profile_id: Option<String>,
 ) -> Result<plan_usage::PlanUsageSnapshot, String> {
-    match provider.as_str() {
-        "anthropic" => {
-            if account_profile_id.is_some() {
-                return Err("Claude usage does not accept a ChatGPT account profile.".into());
-            }
-            let tokens = secrets::get_oauth()
-                .ok_or("Sign in with your Claude subscription in Settings first.")?;
-            let credential = agent::ensure_fresh(
-                &state.http,
-                secrets::Credential::OAuth(tokens),
-                &state.oauth_refresh,
-            )
-            .await?;
-            let secrets::Credential::OAuth(tokens) = credential else {
-                return Err("Claude usage received the wrong credential type.".into());
-            };
-            plan_usage::anthropic(&state.http, &tokens).await
-        }
-        "openai" => {
-            ensure_openai_accounts_ready(
-                &state.openai_accounts,
-                &state.openai_accounts_startup_error,
-            )?;
-            let account_profile_id =
-                account_profile_id.ok_or("Choose a ChatGPT account before loading plan usage.")?;
-            let id = openai_accounts::AccountProfileId::parse(&account_profile_id)
-                .map_err(|error| account_error_message(&error))?;
-            let _profile = state
-                .openai_accounts
-                .acquire_run_lease(&id)
-                .map_err(|error| account_error_message(&error))?;
-            let profile = fresh_openai_profile(&state.http, &state.openai_accounts, &id).await?;
-            openai_oauth::ensure_direct_subscription_enabled()?;
-            match plan_usage::openai(&state.http, &profile.tokens).await {
-                Ok(snapshot) => Ok(snapshot),
-                Err(error) if plan_usage::is_openai_authentication_error(&error) => {
-                    let recovered = recover_openai_authentication(
-                        &state.http,
-                        &state.openai_accounts,
-                        &id,
-                        &profile,
-                    )
-                    .await?;
-                    openai_oauth::ensure_direct_subscription_enabled()?;
-                    // Exactly one retry; another 401 is returned without a loop.
-                    plan_usage::openai(&state.http, &recovered.tokens).await
-                }
-                Err(error) => Err(error),
-            }
-        }
-        _ => Err("Unknown plan-usage provider.".into()),
+    if provider != "openai" {
+        return Err("Codex usage is available for OpenAI authentication only.".into());
     }
+    if account_profile_id.as_deref() != Some(codex_engine::PRIMARY_CODEX_ACCOUNT_ID) {
+        return Err("Choose the connected Codex account before loading usage.".into());
+    }
+    let value = state.codex.rate_limits().await?;
+    Ok(plan_usage::from_codex_app_server(
+        &value,
+        db::now_ms() / 1000,
+    ))
 }
 
-/*
- * The singleton OpenAI credential commands intentionally end here. Profiles are
- * always addressed by canonical local UUID; no command reads or rewrites a
- * process-global OpenAI credential slot.
- */
+// The single Codex authentication slot intentionally ends here. ChatGPT login
+// and API-key login are two auth modes for the same app-server process.
 
 // ── sessions ─────────────────────────────────────────────────────────────────
 
@@ -945,44 +585,20 @@ fn require_session_row(db: &Db, id: &str) -> Result<SessionRow, String> {
 }
 
 #[cfg(desktop)]
-struct ValidatedOpenAiAccount {
-    id: openai_accounts::AccountProfileId,
-    _lease: openai_accounts::ProfileRunLease,
-}
-
-#[cfg(desktop)]
 fn validate_model_account(
-    state: &AppState,
+    _state: &AppState,
     model: &str,
     account_profile_id: Option<&str>,
-) -> Result<Option<ValidatedOpenAiAccount>, String> {
-    match llm::provider_name_for_model(model)? {
-        "anthropic" => {
-            if account_profile_id.is_some() {
-                Err("A Claude conversation cannot be assigned a ChatGPT account.".into())
-            } else {
-                Ok(None)
-            }
-        }
-        "openai" => {
-            openai_oauth::ensure_direct_subscription_enabled()?;
-            ensure_openai_accounts_ready(
-                &state.openai_accounts,
-                &state.openai_accounts_startup_error,
-            )?;
-            let raw_id = account_profile_id
-                .ok_or("Choose a connected ChatGPT account for this conversation.")?;
-            let id = openai_accounts::AccountProfileId::parse(raw_id)
-                .map_err(|error| account_error_message(&error))?;
-            let lease = state
-                .openai_accounts
-                .acquire_run_lease(&id)
-                .map_err(|error| account_error_message(&error))?;
-            load_connected_openai_profile(&state.openai_accounts, &id)?;
-            Ok(Some(ValidatedOpenAiAccount { id, _lease: lease }))
-        }
-        _ => unreachable!("provider_name_for_model returns only supported providers"),
+) -> Result<Option<String>, String> {
+    if llm::provider_name_for_model(model)? != "openai" {
+        return Err("Portcode conversations now run through the Codex engine.".into());
     }
+    if let Some(id) = account_profile_id {
+        if id != codex_engine::PRIMARY_CODEX_ACCOUNT_ID {
+            return Err("The selected Codex account is no longer available.".into());
+        }
+    }
+    Ok(Some(codex_engine::PRIMARY_CODEX_ACCOUNT_ID.to_string()))
 }
 
 #[cfg(mobile)]
@@ -991,14 +607,13 @@ fn validate_model_account(
     model: &str,
     account_profile_id: Option<&str>,
 ) -> Result<(), String> {
-    match llm::provider_name_for_model(model)? {
-        "anthropic" if account_profile_id.is_none() => Ok(()),
-        "anthropic" => Err("A Claude conversation cannot be assigned a ChatGPT account.".into()),
-        "openai" => {
-            Err("ChatGPT account selection is available on the paired desktop only.".into())
-        }
-        _ => unreachable!("provider_name_for_model returns only supported providers"),
+    if llm::provider_name_for_model(model)? != "openai" {
+        return Err("Portcode conversations now run through the Codex engine.".into());
     }
+    if account_profile_id.is_some_and(|id| id != codex_engine::PRIMARY_CODEX_ACCOUNT_ID) {
+        return Err("The selected Codex account is no longer available.".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1010,7 +625,7 @@ mod session_command_contract_tests {
         let settings = Settings::default();
         assert_eq!(
             effective_session_model(&settings, None).unwrap(),
-            "claude-opus-4-8"
+            "gpt-5.6-terra"
         );
         assert_eq!(
             effective_session_model(&settings, Some("gpt-5.6-sol")).unwrap(),
@@ -1022,23 +637,9 @@ mod session_command_contract_tests {
 
     #[cfg(desktop)]
     #[test]
-    fn account_storage_errors_do_not_cross_ipc_with_backend_details() {
-        let error = openai_accounts::OpenAiAccountError::Storage(
-            secrets::SecretStoreError::Backend("access-token-at-C:/private/path".into()),
-        );
-        let display = account_error_message(&error);
-        assert!(display.contains("unavailable or corrupt"));
-        assert!(!display.contains("access-token"));
-        assert!(!display.contains("private/path"));
-    }
-
-    #[cfg(desktop)]
-    #[test]
     fn reconnect_identity_mismatch_is_a_typed_display_safe_outcome() {
         let value = serde_json::to_value(OpenAiReconnectOutcome::IdentityMismatch {
-            message: openai_accounts::OpenAiAccountError::IdentityMismatch
-                .user_message()
-                .to_string(),
+            message: "The signed-in ChatGPT account does not match this profile.".to_string(),
         })
         .unwrap();
         assert_eq!(value["status"], "identity_mismatch");
@@ -1067,7 +668,7 @@ fn create_session(
     #[cfg(mobile)]
     validate_model_account(&state, &model, account_profile_id.as_deref())?;
     #[cfg(desktop)]
-    let persisted_account_profile_id = account.as_ref().map(|account| account.id.as_str());
+    let persisted_account_profile_id = account.as_deref();
     #[cfg(mobile)]
     let persisted_account_profile_id: Option<&str> = None;
 
@@ -1082,19 +683,6 @@ fn create_session(
             db::now_ms(),
         )
         .map_err(|e| e.to_string())?;
-
-    #[cfg(desktop)]
-    if let Some(account) = &account {
-        // Metadata follows the committed session write. Its best-effort failure
-        // must not turn a successful create into a false client-visible failure.
-        if state
-            .openai_accounts
-            .record_last_used(&account.id, oauth::now_secs())
-            .is_err()
-        {
-            eprintln!("openai-accounts: failed to update last-used metadata after session create");
-        }
-    }
 
     let saved = require_session_row(&state.db, &id)?;
     // Notify any connected sync client of the new session (best-effort).
@@ -1122,22 +710,12 @@ fn pin_session_openai_account(
         return Err("Only an OpenAI conversation can be pinned to a ChatGPT account.".into());
     }
     let account = validate_model_account(&state, &effective_model, Some(&account_profile_id))?
-        .expect("OpenAI validation always returns a profile lease");
-
-    // Share the admission mutex while committing the account/model pair. A run
-    // either reserves first (and selection is rejected) or reads the fully
-    // committed selection after this guard is released.
-    let run_guard = state.cancels.lock().unwrap();
-    if run_guard.contains_key(&session_id)
-        || background::has_session(&state.background, &session_id)
-    {
-        return Err("Wait for this conversation's active work to finish.".into());
-    }
+        .expect("Codex validation always returns the primary account id");
     match state
         .db
         .select_session_openai_account_if_config(
             &session_id,
-            account.id.as_str(),
+            &account,
             &effective_model,
             &run_config,
         )
@@ -1154,23 +732,15 @@ fn pin_session_openai_account(
             );
         }
     }
-    drop(run_guard);
     let persisted = state
         .db
         .session_run_config(&session_id)
         .map_err(|error| format!("Session is unavailable after pinning: {error}"))?;
     let persisted_model = effective_session_model(&settings, persisted.model.as_deref())?;
     if llm::provider_name_for_model(&persisted_model)? != "openai"
-        || persisted.account_profile_id.as_deref() != Some(account.id.as_str())
+        || persisted.account_profile_id.as_deref() != Some(account.as_str())
     {
         return Err("The conversation changed while its ChatGPT account was being saved. Review it before sending.".into());
-    }
-    if state
-        .openai_accounts
-        .record_last_used(&account.id, oauth::now_secs())
-        .is_err()
-    {
-        eprintln!("openai-accounts: failed to update last-used metadata after session pin");
     }
     let saved = require_session_row(&state.db, &session_id)?;
     push_session_list(&app, &state.db);
@@ -1225,11 +795,13 @@ fn update_session_model(
 }
 
 #[tauri::command]
-fn delete_session(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
+async fn delete_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
     #[cfg(desktop)]
-    if state.cancels.lock().unwrap().contains_key(&id)
-        || background::has_session(&state.background, &id)
-    {
+    if state.codex.is_session_active(&id).await {
         return Err("Cannot delete a session while it is running or has background work.".into());
     }
     state.db.delete_session(&id).map_err(|e| e.to_string())?;
@@ -1260,6 +832,23 @@ async fn get_message_page(
     tokio::task::spawn_blocking(move || db.try_ui_message_page(&session_id, cursor.as_deref()))
         .await
         .map_err(|error| format!("history worker failed: {error}"))?
+        .map_err(|error| error.to_string())
+}
+
+/// Newest durable raw Codex activity for the desktop inspector. This command is
+/// deliberately absent on mobile: raw app-server payloads are not part of the
+/// sanitized Phone Sync contract.
+#[cfg(desktop)]
+#[tauri::command]
+async fn get_codex_activity(
+    state: State<'_, AppState>,
+    session_id: String,
+    limit: Option<u32>,
+) -> Result<Vec<db::CodexActivityRow>, String> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.codex_activity(&session_id, limit.unwrap_or(500)))
+        .await
+        .map_err(|error| format!("Codex activity worker failed: {error}"))?
         .map_err(|error| error.to_string())
 }
 
@@ -1388,104 +977,98 @@ fn list_dir(state: State<AppState>, sub: Option<String>) -> Result<Vec<DirEntry>
 
 // ── agent ────────────────────────────────────────────────────────────────────
 
-// DESKTOP-ONLY: drives `agent::run` (the agent loop + shell/fs tools), which is
-// mobile-excluded. The phone issues turns via `phone_sync_send_command` over the
-// encrypted channel to a paired desktop; it never runs the agent locally.
+// DESKTOP-ONLY: drives the supervised Codex app-server process, which is
+// mobile-excluded. The phone issues turns over the encrypted sync channel to a
+// paired desktop; it never launches Codex locally.
 #[cfg(desktop)]
 #[tauri::command]
 async fn run_agent(
-    app: AppHandle,
     state: State<'_, AppState>,
     session_id: String,
     text: String,
 ) -> Result<(), String> {
-    let settings_for_admission = settings_snapshot(&state)?;
-    let run_config = state
+    state
         .db
-        .session_run_config(&session_id)
-        .map_err(|error| format!("Session is unavailable: {error}"))?;
-    let effective_model =
-        effective_session_model(&settings_for_admission, run_config.model.as_deref())?;
-    if llm::provider_name_for_model(&effective_model)? == "openai" {
-        ensure_openai_accounts_ready(&state.openai_accounts, &state.openai_accounts_startup_error)?;
+        .require_session(&session_id)
+        .map_err(|error| error.to_string())?;
+    if text.trim().is_empty() {
+        return Err("Enter a message before sending.".to_string());
     }
-    let admission = agent::admit_run(
-        state.cancels.clone(),
-        &state.db,
-        &settings_for_admission,
-        state.openai_accounts.clone(),
-        &session_id,
-    )?;
-    // Re-check against the immutable admission to close a provider/model race
-    // between the preliminary health lookup and the authoritative DB snapshot.
-    if admission.is_openai() {
-        ensure_openai_accounts_ready(&state.openai_accounts, &state.openai_accounts_startup_error)?;
-    }
+    let settings = settings_snapshot(&state)?;
+    let codex = state.codex.clone();
 
-    let http = state.http.clone();
-    let settings = state.settings.clone();
-    let db = state.db.clone();
-    let pending = state.pending.clone();
-    let agents = state.agents.clone();
-    let background = state.background.clone();
-    let oauth_refresh = state.oauth_refresh.clone();
-
-    // Wrap the AppHandle in the concrete EventSink at the command boundary, so the
-    // agent core receives only the trait — its sole Tauri coupling (event emission)
-    // now lives behind `events::EventSink`.
-    let sink: Arc<dyn events::EventSink> = Arc::new(events::AppEventSink(app));
-
-    // Run in the background so the command returns immediately and the frontend
-    // can register its cancel handle before the run finishes.
+    // The shared engine owns app-server supervision and event projection. Keep
+    // this command non-blocking while the turn streams through its EventSink.
     tauri::async_runtime::spawn(async move {
-        agent::run(
-            sink,
-            http,
-            settings,
-            db,
-            admission,
-            pending,
-            agents,
-            background,
-            oauth_refresh,
-            session_id,
-            text,
-        )
-        .await;
+        codex.run_turn(session_id, text, settings).await;
     });
     Ok(())
 }
 
 #[cfg(desktop)]
 #[tauri::command]
-fn cancel_agent(state: State<AppState>, session_id: String) {
-    if let Some(flag) = state.cancels.lock().unwrap().get(&session_id) {
-        flag.store(true, Ordering::Relaxed);
-    }
-    // A session-wide Stop also cancels every subagent the run launched...
-    agents::cancel_session(&state.agents, &session_id);
-    // ...and kills its background tasks.
-    background::cancel_session(&state.background, &session_id);
-    permissions::deny_all(&state.pending, &session_id);
+async fn cancel_agent(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    state.codex.interrupt_session(&session_id).await
 }
 
 /// Stop ONE subagent (and its descendants) from the agents panel, leaving the rest
 /// of the session — including the top-level turn — running.
 #[cfg(desktop)]
 #[tauri::command]
-fn cancel_agent_by_id(state: State<AppState>, agent_id: String) {
-    agents::cancel_one(&state.agents, &agent_id);
+async fn cancel_agent_by_id(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
+    state.codex.interrupt_agent(&agent_id).await
+}
+
+#[cfg(desktop)]
+fn parse_approval_decision(
+    decision: &str,
+    for_session: Option<bool>,
+) -> Result<(bool, bool), String> {
+    match decision {
+        "allow" => Ok((true, for_session.unwrap_or(false))),
+        "deny" => Ok((false, false)),
+        _ => Err("Approval decision must be either allow or deny.".to_string()),
+    }
 }
 
 #[cfg(desktop)]
 #[tauri::command]
-fn resolve_permission(state: State<AppState>, id: String, decision: String) {
-    let d = if decision == "allow" {
-        permissions::Decision::Allow
-    } else {
-        permissions::Decision::Deny
-    };
-    permissions::resolve(&state.pending, &id, d);
+async fn resolve_permission(
+    state: State<'_, AppState>,
+    id: String,
+    decision: String,
+    for_session: Option<bool>,
+) -> Result<(), String> {
+    let (allow, for_session) = parse_approval_decision(&decision, for_session)?;
+    state.codex.resolve_approval(&id, allow, for_session).await
+}
+
+#[cfg(all(test, desktop))]
+mod approval_command_contract_tests {
+    use super::parse_approval_decision;
+
+    #[test]
+    fn approval_decisions_are_exact_and_session_scope_is_allow_only() {
+        assert_eq!(
+            parse_approval_decision("allow", Some(true)).unwrap(),
+            (true, true)
+        );
+        assert_eq!(
+            parse_approval_decision("deny", Some(true)).unwrap(),
+            (false, false)
+        );
+        assert!(parse_approval_decision("unexpected", None).is_err());
+    }
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn resolve_codex_request(
+    state: State<'_, AppState>,
+    id: String,
+    response: Value,
+) -> Result<(), String> {
+    state.codex.resolve_codex_request(&id, response).await
 }
 
 // ── Opt-in crash reporting (Phase 1b desktop / Phase 3 Android) ──────────────
@@ -1712,16 +1295,9 @@ fn phone_sync_listen(app: AppHandle, state: State<AppState>) -> Result<(), Strin
     }
     start_listener(
         app.clone(),
-        state.http.clone(),
         state.settings.clone(),
         state.db.clone(),
-        state.cancels.clone(),
-        state.pending.clone(),
-        state.agents.clone(),
-        state.background.clone(),
-        state.oauth_refresh.clone(),
-        state.openai_accounts.clone(),
-        state.openai_accounts_startup_error.clone(),
+        state.codex.clone(),
         state.listen_endpoint.clone(),
         state.pairing_gate.clone(),
     )
@@ -1954,22 +1530,13 @@ async fn serve_connection(
 // `phone_sync_listen` backstop.
 #[cfg(desktop)]
 // The AppState pieces the accept loop needs as owned clones, plus the
-// shared `listen_endpoint` and `pairing_gate`) > clippy's 7-arg threshold; same
-// pattern + allow as `agent::run`. Bundling them into a struct buys nothing here —
-// they are already the `AppState` fields, threaded through once.
-#[allow(clippy::too_many_arguments)]
+// shared `listen_endpoint` and `pairing_gate`) are already the `AppState` fields,
+// threaded through once; bundling them again would not simplify ownership here.
 fn start_listener(
     app: AppHandle,
-    http: reqwest::Client,
     settings: Arc<Mutex<Settings>>,
     db: Arc<Db>,
-    cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
-    pending: permissions::Pending,
-    agents: agents::Agents,
-    background: background::Background,
-    oauth_refresh: Arc<tokio::sync::Mutex<()>>,
-    openai_accounts: Arc<openai_accounts::OpenAiAccountRegistry>,
-    openai_accounts_startup_error: Arc<Mutex<Option<String>>>,
+    codex: Arc<codex_engine::CodexEngine>,
     listen_endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
     pairing_gate: Arc<sync::pairing_gate::PairingGate>,
 ) -> Result<(), String> {
@@ -1980,16 +1547,9 @@ fn start_listener(
 
     let handler = sync::server::DesktopCommandHandler {
         app: app.clone(),
-        http,
         settings,
         db: db.clone(),
-        cancels,
-        pending,
-        agents,
-        background,
-        oauth_refresh,
-        openai_accounts,
-        openai_accounts_startup_error,
+        codex,
     };
     let app_for_loop = app.clone();
 
@@ -2232,6 +1792,20 @@ fn phone_sync_disconnect(state: State<AppState>) -> Result<(), String> {
     Ok(()) // no-op when nothing was connected
 }
 
+#[cfg(desktop)]
+fn shutdown_codex_on_app_exit(app: &AppHandle) {
+    let Some(codex) = app.try_state::<AppState>().map(|state| state.codex.clone()) else {
+        return;
+    };
+
+    // `RunEvent::Exit` is the last reliable lifecycle hook before Tauri cleans up
+    // or restarts the process. Block that hook only for a short outer bound; the
+    // transport also has its own child-reap timeout, so exit cannot hang forever.
+    tauri::async_runtime::block_on(async move {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), codex.shutdown()).await;
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Phase 2 — arm desktop crash reporting FIRST: the out-of-process minidump monitor
@@ -2264,42 +1838,27 @@ pub fn run() {
             secrets::init_dir(dir.clone());
 
             let settings = Settings::load(&dir);
-            // Bound connection establishment (DNS + TCP + TLS) so a turn or a token
-            // refresh can't hang indefinitely before any byte arrives. We deliberately
-            // do NOT set a blanket request `.timeout()` — that would kill long but
-            // healthy streaming turns; the per-read idle timeout in `llm::stream_turn`
-            // handles a stream that connects and then stalls.
-            let http = http_client::credentialed_client_builder()
-                .connect_timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("failed to build HTTP client");
-            let db = Db::open(&dir.join("portcode.db")).expect("failed to open database");
+            let db = Arc::new(Db::open(&dir.join("portcode.db")).expect("failed to open database"));
             #[cfg(desktop)]
-            let openai_accounts = Arc::new(openai_accounts::OpenAiAccountRegistry::system());
-            #[cfg(desktop)]
-            let openai_accounts_startup_error = Arc::new(Mutex::new(
-                openai_accounts
-                    .migrate_legacy(oauth::now_secs())
-                    .err()
-                    .map(|error| account_error_message(&error)),
-            ));
-
+            let codex = {
+                let options = codex_app_server::CodexAppServerOptions {
+                    resource_dir: app.path().resource_dir().ok(),
+                    broadcast_capacity: 8_192,
+                    ..Default::default()
+                };
+                let server = codex_app_server::CodexAppServer::new(options);
+                let sink: Arc<dyn events::EventSink> =
+                    Arc::new(events::AppEventSink(app.handle().clone()));
+                let engine = codex_engine::CodexEngine::new(server, db.clone(), sink);
+                engine.start_event_pump();
+                engine
+            };
             app.manage(AppState {
-                http,
                 config_dir: dir,
                 settings: Arc::new(Mutex::new(settings)),
-                db: Arc::new(db),
-                cancels: Arc::new(Mutex::new(HashMap::new())),
-                pending: Arc::new(Mutex::new(HashMap::new())),
+                db,
                 #[cfg(desktop)]
-                agents: agents::new(),
-                #[cfg(desktop)]
-                background: background::new(),
-                oauth_refresh: Arc::new(tokio::sync::Mutex::new(())),
-                #[cfg(desktop)]
-                openai_accounts,
-                #[cfg(desktop)]
-                openai_accounts_startup_error,
+                codex,
                 phone_client: Arc::new(Mutex::new(None)),
                 listen_endpoint: Arc::new(Mutex::new(None)),
                 #[cfg(desktop)]
@@ -2320,16 +1879,9 @@ pub fn run() {
                 let state = app.state::<AppState>();
                 if let Err(e) = start_listener(
                     app.handle().clone(),
-                    state.http.clone(),
                     state.settings.clone(),
                     state.db.clone(),
-                    state.cancels.clone(),
-                    state.pending.clone(),
-                    state.agents.clone(),
-                    state.background.clone(),
-                    state.oauth_refresh.clone(),
-                    state.openai_accounts.clone(),
-                    state.openai_accounts_startup_error.clone(),
+                    state.codex.clone(),
                     state.listen_endpoint.clone(),
                     state.pairing_gate.clone(),
                 ) {
@@ -2349,17 +1901,14 @@ pub fn run() {
     // per-item `cfg`, so shadow-rebind `builder` per target: EXACTLY ONE arm
     // compiles (tauri-build sets exactly one of `cfg(desktop)`/`cfg(mobile)`).
     //
-    // DESKTOP — the full surface (byte-identical to the pre-split list): all
-    // settings/sessions + OAuth + workspace file-tree + agent + the sync SERVER.
+    // DESKTOP — settings/sessions + Codex authentication and execution +
+    // workspace file-tree + the sync server.
     #[cfg(desktop)]
     let builder = builder.invoke_handler(tauri::generate_handler![
         get_settings,
         save_settings,
-        set_api_key,
-        start_oauth_login,
-        oauth_status,
-        oauth_logout,
         openai_oauth_status,
+        codex_login_api_key,
         list_openai_accounts,
         start_openai_account_login,
         reconnect_openai_account,
@@ -2374,6 +1923,7 @@ pub fn run() {
         delete_session,
         get_messages,
         get_message_page,
+        get_codex_activity,
         save_draft,
         get_draft,
         get_drafts,
@@ -2392,6 +1942,7 @@ pub fn run() {
         cancel_agent,
         cancel_agent_by_id,
         resolve_permission,
+        resolve_codex_request,
         telemetry_set_consent,
         phone_sync_status,
         phone_sync_begin_pairing,
@@ -2409,7 +1960,7 @@ pub fn run() {
         update::update_channel
     ]);
 
-    // MOBILE — the remote-CLIENT subset. Shared settings/secrets/sessions +
+    // MOBILE — the remote-client subset. Shared settings/sessions +
     // pairing-status/unpair + the phone CLIENT trio. OMITS the desktop-only
     // commands (the OAuth trio, list_dir, run_agent, cancel_agent,
     // resolve_permission, phone_sync_listen, phone_sync_begin_pairing) — none are
@@ -2420,7 +1971,6 @@ pub fn run() {
     let builder = builder.invoke_handler(tauri::generate_handler![
         get_settings,
         save_settings,
-        set_api_key,
         list_sessions,
         create_session,
         rename_session,
@@ -2442,6 +1992,19 @@ pub fn run() {
         phone_sync_disconnect
     ]);
 
+    #[cfg(desktop)]
+    {
+        let app = builder
+            .build(tauri::generate_context!())
+            .expect("error while building Portcode");
+        app.run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                shutdown_codex_on_app_exit(app);
+            }
+        });
+    }
+
+    #[cfg(mobile)]
     builder
         .run(tauri::generate_context!())
         .expect("error while running Portcode");

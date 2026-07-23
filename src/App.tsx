@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { modelsForOpenAIProfile, useStore } from "./store/store";
+import { useStore } from "./store/store";
 import { Sidebar } from "./components/Sidebar";
 import { Chat } from "./components/Chat";
 import { FileExplorer } from "./components/FileExplorer";
@@ -27,7 +27,7 @@ import { isTauri, isWebClientMode, onUpdaterEvent } from "./lib/ipc";
 import { isSelfDev } from "./lib/channel";
 import { getInstallState } from "./lib/installGate";
 import { initTelemetry, shutdownTelemetry, telemetryConfigured } from "./lib/telemetry";
-import { openAIAccountLabel, providerForModel } from "./types";
+import { openAIAccountLabel } from "./types";
 
 export default function App() {
   const init = useStore((s) => s.init);
@@ -386,8 +386,6 @@ function TitleBar({
   );
   const openAIAccounts = useStore((s) => s.openAIAccounts);
   const openAIAccountsError = useStore((s) => s.openAIAccountsError);
-  const openAIModelCatalogs = useStore((s) => s.openAIModelCatalogs);
-  const openAIModels = useStore((s) => s.openAIModels);
   const openAIAccount = useStore((s) =>
     session?.accountProfileId
       ? s.openAIAccounts.find((account) => account.id === session.accountProfileId)
@@ -398,15 +396,7 @@ function TitleBar({
   const workspaceSurface = useStore((s) => s.workspaceSurface);
   const setWorkspaceSurface = useStore((s) => s.setWorkspaceSurface);
   const openWorkspaceReview = useStore((s) => s.openWorkspaceReview);
-  const sessionOpenAIModels = modelsForOpenAIProfile(
-    session?.accountProfileId,
-    openAIModelCatalogs,
-    openAIModels,
-  );
-  const sessionUsesOpenAI =
-    !!session &&
-    (session.accountProfileId != null ||
-      providerForModel(session.model, sessionOpenAIModels) === "openai");
+  const sessionUsesCodex = !!session;
   return (
     <header
       data-tauri-drag-region={isTauri() ? "deep" : undefined}
@@ -442,17 +432,17 @@ function TitleBar({
             {workspaceSurface === "review" ? "Review changes" : (session?.title ?? "New chat")}
           </span>
         </span>
-        {sessionUsesOpenAI && (
+        {sessionUsesCodex && (
           <span
             className={`pc-titlebar__account-pill pc-pill ${openAIAccount?.state === "connected" ? "pc-pill--success" : "pc-pill--warn"}`}
             title={
               openAIAccount
-                ? `ChatGPT account: ${openAIAccountLabel(openAIAccount, openAIAccounts)}`
+                ? `Codex authentication: ${openAIAccountLabel(openAIAccount, openAIAccounts)}`
                 : session.accountProfileId
                   ? openAIAccountsError
-                    ? "ChatGPT account registry is unavailable"
-                    : "This session's ChatGPT account was removed"
-                  : "Choose a ChatGPT account before continuing this legacy session"
+                    ? "Codex authentication registry is unavailable"
+                    : "This session's Codex authentication was removed"
+                  : "Connect Codex authentication before continuing this legacy session"
             }
           >
             <span

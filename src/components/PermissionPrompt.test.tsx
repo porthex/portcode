@@ -20,8 +20,8 @@ const m = vi.mocked(ipc);
 const initialState = useStore.getState();
 
 // The buttons fire-and-forget the async action (`void resolve(...)`). The
-// allow-always resolves the gate and then awaits the optional settings save, so
-// drain the whole microtask queue (one Promise.resolve only clears one await).
+// Approval resolution crosses the mocked IPC boundary, so drain the microtask
+// queue before asserting the store state.
 const flush = () => new Promise<void>((r) => setTimeout(r, 0));
 
 const pending = (over: Partial<PendingPermission> = {}): PendingPermission => ({
@@ -78,25 +78,44 @@ describe("PermissionPrompt", () => {
     expect(screen.getByText("README.md")).toBeInTheDocument();
     // All three actions are offered. The ⏎ hint lives on Deny (the focused,
     // safe default) so the affordance matches what Enter actually does.
-    expect(screen.getByRole("button", { name: "Allow" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Always allow" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Allow once" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Allow for session" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "⏎ Deny" })).toBeInTheDocument();
   });
 
   it.each(["shell", "dependencyInstall", "highRiskGit", "unknown", "futureRisk"] as const)(
-    "offers Always allow for a local %s approval",
+    "offers session scope for a local %s command only when Codex offers it",
     (risk) => {
       useStore.setState({
-        pendingPermission: pending({ tool: "run_command", risk, summary: "echo safe" }),
+        pendingPermission: pending({
+          tool: "run_command",
+          risk,
+          summary: "echo safe",
+          input: { availableDecisions: ["accept", "acceptForSession", "decline"] },
+        }),
       });
 
       render(<PermissionPrompt />);
 
-      expect(screen.getByRole("button", { name: "Allow" })).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "Always allow" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Allow once" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Allow for session" })).toBeInTheDocument();
       expect(screen.queryByText(/requires one-time approval/i)).not.toBeInTheDocument();
     },
   );
+
+  it("hides session scope when a command approval does not offer acceptForSession", () => {
+    useStore.setState({
+      pendingPermission: pending({
+        tool: "run_command",
+        input: { availableDecisions: ["accept", "decline"] },
+      }),
+    });
+
+    render(<PermissionPrompt />);
+
+    expect(screen.getByRole("button", { name: "Allow once" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Allow for session" })).not.toBeInTheDocument();
+  });
 
   it.each([
     ["remote shell", { remoteMode: true }],
@@ -111,9 +130,11 @@ describe("PermissionPrompt", () => {
 
       render(<PermissionPrompt />);
 
-      expect(screen.queryByRole("button", { name: "Always allow" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Allow for session" })).not.toBeInTheDocument();
       expect(screen.getByText(/Remote approvals apply once/i)).toBeInTheDocument();
-      expect(screen.getByText(/persistent permission rules on the desktop/i)).toBeInTheDocument();
+      expect(
+        screen.getByText(/Session-scoped Codex approvals are desktop-only/i),
+      ).toBeInTheDocument();
     },
   );
 
@@ -139,7 +160,7 @@ describe("PermissionPrompt", () => {
     expect(deny).toHaveFocus();
     // The Allow label must not claim the Enter affordance, and Deny advertises
     // it only via the ⏎ label — native focused-button Enter needs no ARIA.
-    expect(screen.getByRole("button", { name: "Allow" })).not.toHaveFocus();
+    expect(screen.getByRole("button", { name: "Allow once" })).not.toHaveFocus();
   });
 
   it("preserves the full path in a title attribute and keeps all three actions in order", () => {
@@ -159,7 +180,11 @@ describe("PermissionPrompt", () => {
 
     // All three actions still render, in DOM order, anchored below the summary.
     const buttons = screen.getAllByRole("button");
-    expect(buttons.map((b) => b.textContent)).toEqual(["Allow", "Always allow", "⏎ Deny"]);
+    expect(buttons.map((b) => b.textContent)).toEqual([
+      "Allow once",
+      "Allow for session",
+      "⏎ Deny",
+    ]);
   });
 
   it("auto-focuses the safe Deny action so a reflexive Enter denies", () => {
@@ -170,31 +195,29 @@ describe("PermissionPrompt", () => {
     expect(screen.getByRole("button", { name: "⏎ Deny" })).toHaveFocus();
   });
 
-  it("Allow forwards an allow decision to the IPC layer and clears the prompt", async () => {
+  it("Allow once forwards a one-shot decision and clears the prompt", async () => {
     useStore.setState({ pendingPermission: pending() });
 
     render(<PermissionPrompt />);
-    fireEvent.click(screen.getByRole("button", { name: "Allow" }));
+    fireEvent.click(screen.getByRole("button", { name: "Allow once" }));
 
     await flush();
 
-    expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
+    expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow", false);
     expect(m.saveSettings).not.toHaveBeenCalled();
     expect(useStore.getState().pendingPermission).toBeNull();
   });
 
-  it("Always allow adds a scoped allow-rule for the tool (not a global policy flip)", async () => {
+  it("Allow for session delegates scope to Codex without saving Portcode rules", async () => {
     useStore.setState({ pendingPermission: pending() });
 
     render(<PermissionPrompt />);
-    fireEvent.click(screen.getByRole("button", { name: "Always allow" }));
+    fireEvent.click(screen.getByRole("button", { name: "Allow for session" }));
 
     await flush();
 
-    expect(m.saveSettings).toHaveBeenCalledWith({
-      rules: [{ tool: "edit_file", decision: "allow" }],
-    });
-    expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow");
+    expect(m.saveSettings).not.toHaveBeenCalled();
+    expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow", true);
     expect(useStore.getState().pendingPermission).toBeNull();
   });
 
@@ -206,7 +229,7 @@ describe("PermissionPrompt", () => {
 
     await flush();
 
-    expect(m.resolvePermission).toHaveBeenCalledWith("p9", "deny");
+    expect(m.resolvePermission).toHaveBeenCalledWith("p9", "deny", false);
     expect(m.saveSettings).not.toHaveBeenCalled();
     expect(useStore.getState().pendingPermission).toBeNull();
   });
@@ -300,7 +323,7 @@ describe("PermissionPrompt", () => {
 
     // The three actions share a flex row; flex-wrap is the only fallback that
     // keeps "Deny" reachable below ~320px (the panel is overflow-hidden).
-    const row = screen.getByRole("button", { name: "Allow" }).parentElement;
+    const row = screen.getByRole("button", { name: "Allow once" }).parentElement;
     expect(row).toHaveClass("flex", "flex-wrap");
   });
 });

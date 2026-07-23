@@ -20,7 +20,6 @@ function PopoverHost({ onOpenSettings = () => {} }: { onOpenSettings?: () => voi
       <button type="button">Outside control</button>
       <PlanUsagePopover
         open={open}
-        provider="openai"
         triggerRef={triggerRef}
         onClose={() => setOpen(false)}
         onOpenSettings={() => {
@@ -66,6 +65,18 @@ describe("PlanUsagePopover", () => {
     fireEvent.mouseDown(screen.getByRole("button", { name: "Outside control" }));
 
     expect(screen.queryByRole("dialog", { name: "Plan usage quick view" })).toBeNull();
+  });
+
+  it("ignores pointer and non-Escape keyboard events inside the popover", () => {
+    render(<PopoverHost />);
+    const trigger = screen.getByRole("button", { name: "Plan limits" });
+    fireEvent.click(trigger);
+
+    fireEvent.mouseDown(screen.getByRole("button", { name: "Close plan usage" }));
+    fireEvent.mouseDown(trigger);
+    fireEvent.keyDown(window, { key: "Enter" });
+
+    expect(screen.getByRole("dialog", { name: "Plan usage quick view" })).toBeInTheDocument();
   });
 
   it("routes the detailed-usage action to Settings", () => {

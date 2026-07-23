@@ -5,19 +5,17 @@ import { SettingsPanel } from "./Settings";
 import { useStore } from "../store/store";
 import * as ipc from "../lib/ipc";
 import {
-  ANTHROPIC_MODELS,
   DEFAULT_SETTINGS,
   MODELS,
   type OpenAIAccountSummary,
   type PairedDevice,
   type PhoneSyncStatus,
   type Settings,
-  type ToolPolicy,
 } from "../types";
 
 // SettingsPanel is the settings modal. It reads `settings` from the real store
 // and mutates it through the store's `updateSettings` action (which lands on
-// ipc.saveSettings) plus a direct ipc.setApiKey for the credential. We mock the
+// ipc.saveSettings) plus direct Codex authentication IPC. We mock the
 // IPC layer (TDD London style) and drive the real store so the assertions check
 // genuine wiring: which ipc calls fire and how store state changes.
 vi.mock("../lib/ipc", () => ({
@@ -27,16 +25,12 @@ vi.mock("../lib/ipc", () => ({
   // Reached by the store's checkForUpdate (manual "Check now" button); no update.
   checkForUpdate: vi.fn(async () => null),
   setTelemetryConsent: vi.fn(async (_enabled: boolean) => {}),
-  // Called directly by the component when saving the API key.
-  setApiKey: vi.fn(async (_key: string) => {}),
+  // Called directly by the component for API-key authentication. Portcode never stores the key.
+  loginCodexApiKey: vi.fn(),
   // Resolves a folder path; present for completeness of the store's surface.
   openFolder: vi.fn(async () => "C:/work/repo" as string | null),
   // Footer reads this to label native vs. preview.
   isTauri: vi.fn(() => false),
-  // Subscription sign-in: reached via the store's loginWithClaude/logoutClaude.
-  startOauthLogin: vi.fn(),
-  oauthLogout: vi.fn(),
-  oauthStatus: vi.fn(),
   openaiOauthStatus: vi.fn(),
   listOpenAIAccounts: vi.fn(),
   startOpenAIAccountLogin: vi.fn(),
@@ -85,17 +79,15 @@ beforeEach(() => {
     ...s,
   }));
   m.getSettings.mockResolvedValue(DEFAULT_SETTINGS);
-  m.setApiKey.mockResolvedValue(undefined);
+  m.loginCodexApiKey.mockResolvedValue({
+    signedIn: true,
+    expiresAt: null,
+    account: "OpenAI Platform API key",
+    tier: null,
+    available: true,
+  });
   m.openFolder.mockResolvedValue("C:/work/repo");
   m.isTauri.mockReturnValue(false);
-  m.startOauthLogin.mockResolvedValue({
-    signedIn: true,
-    expiresAt: 4102444800, // 2100-01-01 — stable, so the formatted expiry never flakes
-    account: "you@claude.ai",
-    tier: "Claude Max",
-  });
-  m.oauthLogout.mockResolvedValue(undefined);
-  m.oauthStatus.mockResolvedValue({ signedIn: false, expiresAt: null, account: null, tier: null });
   m.openaiOauthStatus.mockResolvedValue({
     signedIn: false,
     expiresAt: null,
@@ -142,48 +134,45 @@ describe("SettingsPanel — structure", () => {
   it("renders the modal chrome, provider, model select and footer", () => {
     renderPanel();
 
-    // The panel is an accessible modal: role="dialog"/aria-modal labelled by the
-    // SETTINGS title span (id="pc-settings-title").
     expect(screen.getByRole("dialog", { name: /settings/i })).toBeInTheDocument();
-
-    // The Neon-Noir header renders the title as a styled (font-display) span,
-    // not a semantic heading; assert on its literal uppercase text instead.
     expect(screen.getByText("SETTINGS")).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Claude" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "GPT / Codex" })).toBeInTheDocument();
-
-    // The themed model picker reflects the store's current model. Query by its
-    // accessible name to lock in the visible label/combobox wiring.
-    const select = screen.getByLabelText("Claude model for new sessions");
-    expect(select).toHaveValue(DEFAULT_SETTINGS.model);
-    fireEvent.click(select);
-    // Claude's picker stays provider-scoped; GPT models live in their own section.
-    for (const model of ANTHROPIC_MODELS) {
-      expect(screen.getByRole("option", { name: model.label })).toBeInTheDocument();
-    }
-    expect(screen.queryByRole("option", { name: "GPT-5.6 Sol" })).not.toBeInTheDocument();
-
-    // The API-key field names its owner instead of presenting a generic credential.
-    expect(screen.getByLabelText("Anthropic API key")).toBeInTheDocument();
+    expect(screen.getByLabelText("OpenAI model for new sessions")).toHaveValue(
+      DEFAULT_SETTINGS.model,
+    );
+    expect(screen.getByLabelText("OpenAI Platform API key")).toHaveAttribute("type", "password");
+    expect(screen.queryByRole("heading", { name: "Claude" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Anthropic API key")).not.toBeInTheDocument();
   });
 
-  it("keeps each provider's models and authentication inside its own section", () => {
+  it("keeps both Codex authentication modes inside the OpenAI section", () => {
     renderPanel();
-    const claude = document.getElementById("pc-settings-claude")!;
     const openai = document.getElementById("pc-settings-openai")!;
 
-    expect(within(claude).getByLabelText("Claude model for new sessions")).toBeInTheDocument();
-    expect(within(claude).getByRole("button", { name: "Sign in with Claude" })).toBeInTheDocument();
-    expect(within(claude).getByLabelText("Anthropic API key")).toBeInTheDocument();
-    expect(within(claude).queryByRole("button", { name: "+ Add account" })).toBeNull();
-
     expect(within(openai).getByLabelText("OpenAI model for new sessions")).toBeInTheDocument();
-    expect(within(openai).getByRole("button", { name: "+ Add account" })).toBeInTheDocument();
-    expect(within(openai).getByText(/OpenAI API keys are not used/i)).toBeInTheDocument();
+    expect(
+      within(openai).getByRole("button", { name: "Sign in with ChatGPT" }),
+    ).toBeInTheDocument();
+    expect(within(openai).getByLabelText("OpenAI Platform API key")).toBeInTheDocument();
+    expect(within(openai).getByText(/same bundled Codex engine/i)).toBeInTheDocument();
+    expect(within(openai).getByText(/never stored by Portcode/i)).toBeInTheDocument();
     expect(within(openai).queryByLabelText("Anthropic API key")).toBeNull();
+    expect(document.getElementById("pc-settings-claude")).toBeNull();
   });
 
-  it("removes unavailable OpenAI controls from the settings map and usage surface", () => {
+  it("tracks the usage section when focus enters it", () => {
+    renderPanel();
+    const usageSection = document.getElementById("pc-settings-usage")!;
+
+    fireEvent.focus(usageSection);
+
+    expect(screen.getByRole("button", { name: "Plan usage" })).toHaveAttribute(
+      "aria-current",
+      "location",
+    );
+  });
+
+  it("keeps API-key mode available when new ChatGPT connections are disabled", () => {
     useStore.setState({
       openAIAuthStatus: {
         signedIn: false,
@@ -198,10 +187,13 @@ describe("SettingsPanel — structure", () => {
     renderPanel();
 
     const map = screen.getByRole("navigation", { name: "Settings map" });
-    expect(within(map).queryByRole("button", { name: "OpenAI / GPT" })).not.toBeInTheDocument();
-    expect(document.getElementById("pc-settings-openai")).toHaveClass("hidden");
-    expect(within(map).getByText("0 connected accounts")).toBeInTheDocument();
-    expect(screen.queryByRole("article", { name: "GPT plan usage" })).not.toBeInTheDocument();
+    expect(within(map).getByRole("button", { name: "OpenAI / GPT" })).toBeInTheDocument();
+    expect(document.getElementById("pc-settings-openai")).not.toHaveClass("hidden");
+    expect(screen.getByText("New ChatGPT connections are disabled")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Sign in with ChatGPT" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("OpenAI Platform API key")).toBeInTheDocument();
+    expect(within(map).getAllByText(/Codex not connected/).length).toBeGreaterThan(0);
+    expect(document.getElementById("pc-setting-plan-usage")).toBeInTheDocument();
   });
 
   it("presents a categorized settings map with live configuration summaries", () => {
@@ -210,7 +202,6 @@ describe("SettingsPanel — structure", () => {
 
     const map = screen.getByRole("navigation", { name: "Settings map" });
     for (const name of [
-      "Claude",
       "OpenAI / GPT",
       "Plan usage",
       "Permissions",
@@ -220,7 +211,7 @@ describe("SettingsPanel — structure", () => {
     ]) {
       expect(within(map).getByRole("button", { name })).toBeInTheDocument();
     }
-    expect(within(map).getByText(/plan · 1 rule/i)).toBeInTheDocument();
+    expect(within(map).getByText("plan")).toBeInTheDocument();
     expect(within(map).getByText(/110% · effects on/i)).toBeInTheDocument();
   });
 
@@ -243,13 +234,11 @@ describe("SettingsPanel — structure", () => {
 
     expect(screen.getByText("1 category found")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Interface" })).not.toHaveAttribute("data-filtered");
-    expect(screen.getByRole("button", { name: "Claude" })).toHaveAttribute("data-filtered", "true");
     expect(screen.getByRole("button", { name: "OpenAI / GPT" })).toHaveAttribute(
       "data-filtered",
       "true",
     );
     expect(document.getElementById("pc-settings-interface")).not.toHaveClass("hidden");
-    expect(document.getElementById("pc-settings-claude")).toHaveClass("hidden");
     expect(document.getElementById("pc-settings-openai")).toHaveClass("hidden");
     expect(document.getElementById("pc-setting-scanlines")).toHaveClass("pc-settings-target");
 
@@ -274,16 +263,16 @@ describe("SettingsPanel — structure", () => {
     expect(document.getElementById("pc-setting-plan-usage")).toHaveClass("pc-settings-target");
   });
 
-  it("routes command-prefix searches to the tool-rule editor", () => {
+  it("routes permission-mode searches to the Codex policy selector", () => {
     renderPanel();
 
     fireEvent.change(screen.getByRole("searchbox", { name: "Find a setting" }), {
-      target: { value: "command prefix" },
+      target: { value: "permission mode" },
     });
 
     expect(screen.getByText("1 category found")).toBeInTheDocument();
     expect(document.getElementById("pc-settings-permissions")).not.toHaveClass("hidden");
-    expect(document.getElementById("pc-setting-tool-rules")).toHaveClass("pc-settings-target");
+    expect(document.getElementById("pc-setting-permission-mode")).toHaveClass("pc-settings-target");
   });
 
   it("surfaces a useful empty state and clears an unsuccessful search", () => {
@@ -305,7 +294,7 @@ describe("SettingsPanel — structure", () => {
     const search = screen.getByRole("searchbox", { name: "Find a setting" });
 
     fireEvent.change(search, { target: { value: "reasoning level" } });
-    expect(screen.getByText("No setting found")).toBeInTheDocument();
+    expect(screen.getByText("1 category found")).toBeInTheDocument();
 
     unmount();
     useStore.setState({ remoteMode: true });
@@ -319,15 +308,15 @@ describe("SettingsPanel — structure", () => {
   it("changes the active route from the category rail", () => {
     renderPanel();
 
-    const claude = screen.getByRole("button", { name: "Claude" });
+    const openai = screen.getByRole("button", { name: "OpenAI / GPT" });
     const permissions = screen.getByRole("button", { name: "Permissions" });
-    expect(claude).toHaveAttribute("aria-current", "location");
+    expect(openai).toHaveAttribute("aria-current", "location");
 
     fireEvent.click(permissions);
     expect(permissions).toHaveAttribute("aria-current", "location");
-    expect(claude).not.toHaveAttribute("aria-current");
+    expect(openai).not.toHaveAttribute("aria-current");
 
-    fireEvent.focus(screen.getByRole("button", { name: "ask" }));
+    fireEvent.focus(screen.getByRole("button", { name: "Plan" }));
     expect(permissions).toHaveAttribute("aria-current", "location");
 
     const interfaceRoute = screen.getByRole("button", { name: "Interface" });
@@ -410,6 +399,28 @@ describe("SettingsPanel — structure", () => {
 });
 
 describe("SettingsPanel — OpenAI subscription", () => {
+  it("retries slot discovery and cancels a sign-out confirmation", () => {
+    const refresh = vi.fn(async () => {});
+    useStore.setState({
+      openAIAccounts: [openAIAccount()],
+      openAIAccountsError: "registry offline",
+      refreshOpenAIStatus: refresh,
+    });
+    renderPanel();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(refresh).toHaveBeenCalledOnce();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign out you@openai.com" }));
+    expect(
+      screen.getByRole("button", { name: "Confirm sign out you@openai.com" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(
+      screen.queryByRole("button", { name: "Confirm sign out you@openai.com" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("distinguishes loading, discovery error, true zero, and reconnect-only registries", () => {
     const refresh = vi.fn(async () => {});
     useStore.setState({
@@ -420,11 +431,11 @@ describe("SettingsPanel — OpenAI subscription", () => {
     });
     const view = renderPanel();
 
-    expect(screen.getByText(/Loading ChatGPT accounts/)).toHaveAttribute("role", "status");
+    expect(screen.getByText(/Loading Codex authentication/)).toHaveAttribute("role", "status");
 
     useStore.setState({ openAIAccountsLoading: false, openAIAccountsError: "registry locked" });
     view.rerender(<SettingsPanel />);
-    expect(screen.getByText(/load ChatGPT accounts/).closest("[role=alert]")).toHaveTextContent(
+    expect(screen.getByText(/load Codex authentication/).closest("[role=alert]")).toHaveTextContent(
       "registry locked",
     );
     fireEvent.click(screen.getByRole("button", { name: "Retry account discovery" }));
@@ -432,13 +443,13 @@ describe("SettingsPanel — OpenAI subscription", () => {
 
     useStore.setState({ openAIAccountsError: null });
     view.rerender(<SettingsPanel />);
-    expect(screen.getByText("No ChatGPT accounts connected")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "+ Add account" })).toBeEnabled();
+    expect(screen.getByText("Codex is not connected")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sign in with ChatGPT" })).toBeEnabled();
 
     const saved = openAIAccount({ state: "reconnect_required", expiresAt: null });
     useStore.setState({ openAIAccounts: [saved] });
     view.rerender(<SettingsPanel />);
-    expect(screen.getByText("No connected ChatGPT account")).toBeInTheDocument();
+    expect(screen.getByText("Codex needs authentication")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Reconnect you@openai.com" })).toBeEnabled();
   });
 
@@ -452,7 +463,7 @@ describe("SettingsPanel — OpenAI subscription", () => {
         [account.id]: { status: "ready", models: [gptModel], error: null },
       },
     });
-    renderPanel({ provider: "anthropic", model: ANTHROPIC_MODELS[0].id });
+    renderPanel({ provider: "anthropic", model: "claude-opus-4-8" });
 
     const picker = screen.getByLabelText("OpenAI model for new sessions");
     expect(picker).toHaveValue("choose-openai");
@@ -460,7 +471,11 @@ describe("SettingsPanel — OpenAI subscription", () => {
     expect(screen.queryByRole("option", { name: "Claude Opus 4.8" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("option", { name: gptModel.label }));
 
-    expect(m.saveSettings).toHaveBeenCalledWith({ model: gptModel.id, provider: "openai" });
+    expect(m.saveSettings).toHaveBeenCalledWith({
+      model: gptModel.id,
+      provider: "openai",
+      reasoningEffort: "medium",
+    });
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
@@ -471,77 +486,54 @@ describe("SettingsPanel — OpenAI subscription", () => {
     });
   });
 
-  it("scopes the default picker to backend MRU when no local account preference exists", () => {
+  it("renders only the backend's codex-primary authentication slot", () => {
     const model = MODELS.find((candidate) => candidate.provider === "openai")!;
-    const older = openAIAccount({ lastUsedAt: 100 });
-    const newer = openAIAccount({
+    const primary = openAIAccount({ id: "codex-primary", accountLabel: "primary@chatgpt.test" });
+    const stale = openAIAccount({
       id: "00000000-0000-4000-8000-000000000002",
-      accountLabel: "recent@chatgpt.test",
-      lastUsedAt: 200,
+      accountLabel: "stale@chatgpt.test",
     });
     useStore.setState({
-      openAIAccounts: [older, newer],
-      lastOpenAIAccountProfileId: null,
+      openAIAccounts: [stale, primary],
       openAIModels: [model],
       openAIModelCatalogs: {
-        [older.id]: { status: "ready", models: [model], error: null },
-        [newer.id]: { status: "ready", models: [model], error: null },
+        [primary.id]: { status: "ready", models: [model], error: null },
+        [stale.id]: { status: "ready", models: [model], error: null },
       },
     });
     renderPanel({ provider: "openai", model: model.id });
 
-    expect(screen.getByText(/Models for recent@chatgpt\.test/)).toBeInTheDocument();
+    expect(screen.getByText(/Models for primary@chatgpt\.test/)).toBeInTheDocument();
+    expect(screen.getAllByText("primary@chatgpt.test").length).toBeGreaterThan(0);
+    expect(screen.queryByText("stale@chatgpt.test")).toBeNull();
   });
 
-  it("changes the default ChatGPT account in Settings without changing existing chats", async () => {
+  it("does not offer profiles and explains that authentication modes replace the slot", () => {
     const model = MODELS.find((candidate) => candidate.provider === "openai")!;
-    const first = openAIAccount({ accountLabel: "first@chatgpt.test" });
-    const second = openAIAccount({
-      id: "00000000-0000-4000-8000-000000000002",
-      accountLabel: "second@chatgpt.test",
-      tier: "ChatGPT Team",
-    });
-    const existingSession = {
-      id: "existing",
-      title: "Existing chat",
-      workspace: null,
-      model: model.id,
-      accountProfileId: first.id,
-      createdAt: 1,
-      updatedAt: 1,
-    };
+    const primary = openAIAccount({ id: "codex-primary" });
     useStore.setState({
-      sessions: [existingSession],
-      openAIAccounts: [first, second],
-      lastOpenAIAccountProfileId: first.id,
+      openAIAccounts: [primary],
       openAIModels: [model],
       openAIModelCatalogs: {
-        [first.id]: { status: "ready", models: [model], error: null },
-        [second.id]: { status: "ready", models: [model], error: null },
+        [primary.id]: { status: "ready", models: [model], error: null },
       },
     });
     renderPanel({ provider: "openai", model: model.id });
 
-    const picker = screen.getByLabelText("Default ChatGPT account");
-    expect(picker).toHaveValue(first.id);
+    expect(screen.queryByLabelText("Default ChatGPT account")).toBeNull();
+    expect(screen.getByRole("button", { name: "Switch to ChatGPT" })).toBeEnabled();
     expect(
-      screen.getByText(/New GPT chats use this account\. Existing chats keep the account/),
+      screen.getByText(/Switching modes replaces the current Codex authentication/),
     ).toBeInTheDocument();
-
-    fireEvent.click(picker);
-    await act(async () => {
-      fireEvent.click(screen.getByRole("option", { name: /second@chatgpt\.test/i }));
-      await Promise.resolve();
-    });
-
-    expect(useStore.getState().lastOpenAIAccountProfileId).toBe(second.id);
-    expect(useStore.getState().sessions[0].accountProfileId).toBe(first.id);
+    expect(
+      screen.getByText(/Using it replaces the current ChatGPT authentication/),
+    ).toBeInTheDocument();
   });
 
-  it("adds a ChatGPT profile and refreshes only its live model catalogue", async () => {
+  it("signs in to the Codex slot and refreshes its live model catalogue", async () => {
     renderPanel();
 
-    fireEvent.click(screen.getByRole("button", { name: "+ Add account" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with ChatGPT" }));
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
@@ -592,15 +584,11 @@ describe("SettingsPanel — OpenAI subscription", () => {
     expect(useStore.getState().openAIAccounts).toEqual([connected]);
   });
 
-  it("offers a mismatched reconnect as a separate account without changing the original", async () => {
+  it("does not advertise a second profile after a mismatched reconnect", async () => {
     const original = openAIAccount({
       accountLabel: "original@chatgpt.test",
       state: "reconnect_required",
       expiresAt: null,
-    });
-    const separate = openAIAccount({
-      id: "00000000-0000-4000-8000-000000000002",
-      accountLabel: "different@chatgpt.test",
     });
     useStore.setState({
       openAIAuthStatus: {
@@ -616,7 +604,6 @@ describe("SettingsPanel — OpenAI subscription", () => {
       status: "identity_mismatch",
       message: "That sign-in belongs to a different ChatGPT account.",
     });
-    m.startOpenAIAccountLogin.mockResolvedValue(separate);
     renderPanel();
 
     fireEvent.click(screen.getByRole("button", { name: "Reconnect original@chatgpt.test" }));
@@ -625,36 +612,24 @@ describe("SettingsPanel — OpenAI subscription", () => {
       await Promise.resolve();
     });
 
-    const notice = screen.getByRole("alert");
-    expect(notice).toHaveTextContent("Different ChatGPT account detected");
-    expect(notice).toHaveTextContent("The original profile (original@chatgpt.test) was unchanged.");
     expect(useStore.getState().openAIAccounts).toEqual([original]);
-
-    fireEvent.click(screen.getByRole("button", { name: "Add as separate account" }));
-    await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(m.startOpenAIAccountLogin).toHaveBeenCalledTimes(1);
-    expect(useStore.getState().openAIAccounts).toEqual([separate, original]);
-    expect(useStore.getState().openAIReconnectMismatch).toBeNull();
+    expect(screen.queryByText("Different ChatGPT account detected")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Add as separate account" })).toBeNull();
   });
 
-  it("disambiguates missing labels with stable ordinals and never renders profile ids", () => {
-    const first = openAIAccount({ accountLabel: null, createdAt: 10 });
-    const second = openAIAccount({
+  it("renders one unlabeled Codex slot and never exposes profile ids", () => {
+    const primary = openAIAccount({ id: "codex-primary", accountLabel: null, createdAt: 10 });
+    const stale = openAIAccount({
       id: "00000000-0000-4000-8000-000000000002",
       accountLabel: null,
       createdAt: 20,
     });
-    useStore.setState({ openAIAccounts: [second, first] });
+    useStore.setState({ openAIAccounts: [stale, primary] });
     const { container } = renderPanel();
 
-    expect(screen.getAllByText("ChatGPT account 1").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("ChatGPT account 2").length).toBeGreaterThan(0);
-    expect(container).not.toHaveTextContent(first.id);
-    expect(container).not.toHaveTextContent(second.id);
+    expect(container.querySelectorAll(".pc-openai-account-row")).toHaveLength(1);
+    expect(container).not.toHaveTextContent(primary.id);
+    expect(container).not.toHaveTextContent(stale.id);
   });
 
   it("does not offer stale model rows when a profile catalogue is in error", () => {
@@ -700,9 +675,9 @@ describe("SettingsPanel — OpenAI subscription", () => {
     renderPanel();
 
     expect(screen.getByText("New ChatGPT connections are disabled")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "+ Add account" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Remove you@openai.com" }));
-    fireEvent.click(screen.getByRole("button", { name: "Confirm remove you@openai.com" }));
+    expect(screen.queryByRole("button", { name: "Sign in with ChatGPT" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Sign out you@openai.com" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm sign out you@openai.com" }));
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
@@ -711,7 +686,9 @@ describe("SettingsPanel — OpenAI subscription", () => {
     expect(m.removeOpenAIAccount).toHaveBeenCalledWith(connected.id);
     expect(useStore.getState().openAIAccounts).toEqual([removed]);
     expect(screen.getByText(/Removed .* history retained/)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Remove you@openai.com" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Sign out you@openai.com" }),
+    ).not.toBeInTheDocument();
   });
 
   it("shows and persists only supported reasoning levels for the selected OpenAI model", async () => {
@@ -745,63 +722,30 @@ describe("SettingsPanel — OpenAI subscription", () => {
     });
     expect(m.saveSettings).toHaveBeenCalledWith({ reasoningEffort: "minimal" });
   });
-});
 
-describe("SettingsPanel — Claude subscription sign-in", () => {
-  const signedInStatus = (over: Record<string, unknown> = {}) => ({
-    signedIn: true,
-    expiresAt: 4102444800, // 2100-01-01 — stable so the formatted expiry never flakes
-    account: "you@claude.ai",
-    tier: "Claude Max",
-    ...over,
-  });
-
-  it("shows the sign-in button when signed out and logs in via the store on click", async () => {
-    renderPanel(); // oauthStatus null -> signed out
-    const btn = screen.getByRole("button", { name: "Sign in with Claude" });
-
-    await act(async () => {
-      fireEvent.click(btn);
-      await Promise.resolve();
-      await Promise.resolve();
+  it("shows Spark's advertised default instead of a stale Ultra setting", () => {
+    useStore.setState({
+      openAIModels: [
+        {
+          id: "gpt-5.3-codex-spark",
+          label: "GPT-5.3 Codex Spark",
+          provider: "openai",
+          reasoningEfforts: ["low", "medium", "high", "xhigh"],
+          defaultReasoningEffort: "high",
+        },
+      ],
+    });
+    renderPanel({
+      provider: "openai",
+      model: "gpt-5.3-codex-spark",
+      reasoningEffort: "ultra",
     });
 
-    expect(m.startOauthLogin).toHaveBeenCalledTimes(1);
-    expect(useStore.getState().oauthStatus?.signedIn).toBe(true);
-  });
-
-  it("renders the signed-in account, a Max tier badge and expiry, and logs out on click", async () => {
-    useStore.setState({ oauthStatus: signedInStatus() });
-    renderPanel();
-
-    expect(screen.getByText(/Signed in as you@claude\.ai/)).toBeInTheDocument();
-    expect(screen.getByTitle("Claude Max").className).toContain("amber"); // "Claude " stripped; Max gradient
-    expect(screen.getByText(/Access expires/)).toBeInTheDocument();
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Log out of Claude" }));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(m.oauthLogout).toHaveBeenCalledTimes(1);
-    expect(useStore.getState().oauthStatus?.signedIn).toBe(false);
-  });
-
-  it("uses the non-Max badge styling for a Pro tier", () => {
-    useStore.setState({ oauthStatus: signedInStatus({ tier: "Claude Pro" }) });
-    renderPanel();
-    expect(screen.getByTitle("Claude Pro").className).toContain("violet");
-  });
-
-  it("surfaces a sign-in error from the store as an assertive live region", () => {
-    useStore.setState({ oauthError: "oauth denied" });
-    renderPanel();
-    const alert = screen.getByText(/Sign-in failed: oauth denied/);
-    expect(alert).toBeInTheDocument();
-    // The error appears asynchronously after the sign-in click while focus stays
-    // on the trigger, so it must be announced (role="alert") like pairingError.
-    expect(alert).toHaveAttribute("role", "alert");
+    const reasoning = screen.getByLabelText("Reasoning level");
+    expect(reasoning).toHaveValue("high");
+    fireEvent.click(reasoning);
+    expect(screen.queryByRole("option", { name: "Ultra" })).toBeNull();
+    expect(screen.getByRole("option", { name: "High" })).toHaveAttribute("aria-selected", "true");
   });
 });
 
@@ -829,18 +773,27 @@ describe("SettingsPanel — close affordances", () => {
   });
 
   it("lets an open settings picker consume Escape before the modal", () => {
-    renderPanel();
+    const account = openAIAccount();
+    const gptModel = MODELS.find((model) => model.provider === "openai")!;
+    useStore.setState({
+      openAIAccounts: [account],
+      openAIModels: [gptModel],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: [gptModel], error: null },
+      },
+    });
+    renderPanel({ provider: "openai", model: gptModel.id });
     useStore.setState({ showSettings: true });
-    const model = screen.getByRole("combobox", { name: "Claude model for new sessions" });
+    const model = screen.getByRole("combobox", { name: "OpenAI model for new sessions" });
 
     fireEvent.click(model);
     expect(
-      screen.getByRole("listbox", { name: "Claude model for new sessions" }),
+      screen.getByRole("listbox", { name: "OpenAI model for new sessions" }),
     ).toBeInTheDocument();
     fireEvent.keyDown(model, { key: "Escape" });
 
     expect(
-      screen.queryByRole("listbox", { name: "Claude model for new sessions" }),
+      screen.queryByRole("listbox", { name: "OpenAI model for new sessions" }),
     ).not.toBeInTheDocument();
     expect(useStore.getState().showSettings).toBe(true);
   });
@@ -963,367 +916,86 @@ describe("SettingsPanel — focus management", () => {
   });
 });
 
-describe("SettingsPanel — model picker", () => {
-  it("persists a model change through ipc.saveSettings and updates the store", async () => {
+describe("SettingsPanel — Codex API-key authentication", () => {
+  it("explains key handling and keeps submission disabled until a non-empty key is entered", () => {
     renderPanel();
 
-    const select = screen.getByLabelText("Claude model for new sessions");
-    fireEvent.click(select);
-    fireEvent.click(screen.getByRole("option", { name: "Claude Haiku 4.5" }));
-
-    // updateSettings -> ipc.saveSettings; flush the microtask the action awaits.
-    expect(m.saveSettings).toHaveBeenCalledWith({ model: "claude-haiku-4-5-20251001" });
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(useStore.getState().settings.model).toBe("claude-haiku-4-5-20251001");
-  });
-
-  it("surfaces store.settingsError when a model save fails and preserves the prior value", async () => {
-    m.saveSettings.mockRejectedValueOnce(new Error("disk full"));
-    renderPanel({ model: MODELS[0].id });
-
-    const select = screen.getByLabelText("Claude model for new sessions");
-    fireEvent.click(select);
-    await act(async () => {
-      fireEvent.click(screen.getByRole("option", { name: "Claude Haiku 4.5" }));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    // The store's updateSettings catches the reject into settingsError; the panel
-    // keeps a global sticky alert visible even when the failing category is filtered.
-    const settingsAlert = screen.getByRole("alert");
-    expect(settingsAlert).toBeInTheDocument();
-    expect(within(settingsAlert).getByText("Couldn't save settings")).toBeInTheDocument();
-    expect(within(settingsAlert).getByText("disk full")).toBeInTheDocument();
-
-    fireEvent.change(screen.getByRole("searchbox", { name: "Find a setting" }), {
-      target: { value: "scanlines" },
-    });
-    expect(screen.getByRole("alert")).toBeInTheDocument();
-    expect(useStore.getState().settings.model).toBe(MODELS[0].id);
-    expect(useStore.getState().settingsError).toBe("disk full");
-  });
-});
-
-describe("SettingsPanel — API key", () => {
-  beforeEach(() => {
-    // A successful credential write makes get_settings derive apiKeySet=true
-    // from the native credential store.
-    m.getSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, apiKeySet: true });
-  });
-
-  it("shows the input placeholder and unsaved hint when no key is stored", () => {
-    renderPanel({ apiKeySet: false });
-
-    expect(screen.getByText(/used only for Claude requests/i)).toBeInTheDocument();
-    const input = screen.getByPlaceholderText("sk-ant-…");
-    expect(input).toBeInTheDocument();
-  });
-
-  it("gives the API-key input a keyboard-focus border affordance that survives the global box-shadow reset", () => {
-    renderPanel({ apiKeySet: false });
-
-    // The dialog is a focus trap whose only Tab-reachable text control is this
-    // input; the global `input:focus { box-shadow: none }` rule zeroes any ring,
-    // so the focus indicator must be a border change (focus:border-accent/50),
-    // mirroring the RemotePairing textarea. WCAG 2.4.7 (Focus Visible).
-    const input = screen.getByLabelText("Anthropic API key");
+    const input = screen.getByLabelText("OpenAI Platform API key");
+    const submit = screen.getByRole("button", { name: "Use API key" });
+    expect(input).toHaveAttribute("type", "password");
+    expect(input).toHaveAttribute("placeholder", "sk-…");
     expect(input.className).toContain("focus:border-accent/50");
-  });
+    expect(screen.getByText(/never stored by Portcode/i)).toBeInTheDocument();
+    expect(submit).toBeDisabled();
 
-  it("shows the 'key stored' hint and replace placeholder when a key exists", () => {
-    renderPanel({ apiKeySet: true });
-
-    expect(
-      screen.getByText("An Anthropic key is stored in Windows Credential Manager."),
-    ).toBeInTheDocument();
-    // Source placeholder has two spaces before "(replace)"; getByPlaceholderText
-    // normalizes whitespace, so match loosely on the distinctive bullet+label.
-    expect(screen.getByPlaceholderText(/\(replace\)/)).toBeInTheDocument();
-  });
-
-  it("disables Save for empty/whitespace input and ignores a whitespace submit", async () => {
-    renderPanel();
-
-    const save = screen.getByRole("button", { name: "Save" });
-    expect(save).toBeDisabled();
-
-    // Whitespace keeps it disabled and the guard short-circuits saveKey.
-    const input = screen.getByPlaceholderText("sk-ant-…");
     fireEvent.change(input, { target: { value: "   " } });
-    expect(save).toBeDisabled();
-    fireEvent.click(save);
-    await Promise.resolve();
-    expect(m.setApiKey).not.toHaveBeenCalled();
+    expect(submit).toBeDisabled();
+    fireEvent.click(submit);
+    expect(m.loginCodexApiKey).not.toHaveBeenCalled();
   });
 
-  it("saves a trimmed key, flips apiKeySet, clears the field and flashes Saved", async () => {
-    vi.useFakeTimers();
-    renderPanel({ apiKeySet: false });
-
-    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "  sk-ant-secret  " } });
-
-    const save = screen.getByRole("button", { name: "Save" });
-    expect(save).not.toBeDisabled();
-    fireEvent.click(save);
-
-    // The credential is sent trimmed.
-    expect(m.setApiKey).toHaveBeenCalledWith("sk-ant-secret");
-
-    // saveKey awaits setApiKey then refreshes authoritative settings. Flush
-    // several turns inside act so React commits the resulting state. Avoid
-    // vi.waitFor here — it polls on real time and would hang under fake timers.
-    await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
+  it("hands a trimmed key to Codex, clears the raw value, refreshes auth, and announces success", async () => {
+    m.openaiOauthStatus.mockResolvedValue({
+      signedIn: true,
+      expiresAt: null,
+      account: "OpenAI Platform API key",
+      tier: null,
+      available: true,
     });
-    expect(m.getSettings).toHaveBeenCalledTimes(1);
-    expect(m.saveSettings).not.toHaveBeenCalled();
-
-    // Store now reflects a stored key; the input is cleared; button reads "Saved".
-    expect(useStore.getState().settings.apiKeySet).toBe(true);
-    expect(input.value).toBe("");
-    expect(screen.getByRole("button", { name: "Saved" })).toBeInTheDocument();
-
-    // The 1800ms timer clears the flash; advancing the fake timer fires
-    // setSavedKey(false), wrapped in act so React re-renders. With a key now
-    // stored, the button settles on its resting "Replace" label (not "Save").
-    act(() => {
-      vi.advanceTimersByTime(1800);
-    });
-    expect(screen.getByRole("button", { name: "Replace" })).toBeInTheDocument();
-  });
-
-  it("clears the raw key before the authoritative settings refresh completes", async () => {
-    let resolveSettings!: (settings: Settings) => void;
-    m.getSettings.mockReturnValueOnce(
-      new Promise<Settings>((resolve) => {
-        resolveSettings = resolve;
-      }),
-    );
-    renderPanel({ apiKeySet: false });
-
-    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-
-    await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(m.setApiKey).toHaveBeenCalledWith("sk-ant-secret");
-    expect(m.getSettings).toHaveBeenCalledTimes(1);
-    expect(input.value).toBe("");
-    expect(m.saveSettings).not.toHaveBeenCalled();
-
-    await act(async () => {
-      resolveSettings({ ...DEFAULT_SETTINGS, apiKeySet: true });
-      await Promise.resolve();
-    });
-    expect(screen.getByRole("button", { name: "Saved" })).toBeInTheDocument();
-  });
-
-  it("keeps focus inside the dialog after a successful save (no flash remount)", async () => {
-    renderPanel({ apiKeySet: false });
-
-    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
-
-    // A keyboard user activates Save from the button itself; capture the node so we
-    // can prove the flash replay reuses it rather than remounting via a React key
-    // (which would drop focus to <body>, outside the focus trap).
-    const save = screen.getByRole("button", { name: "Save" }) as HTMLButtonElement;
-    save.focus();
-    expect(document.activeElement).toBe(save);
-
-    await act(async () => {
-      fireEvent.click(save);
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    // Same DOM node survived the save (re-querying by its new "Saved" label returns
-    // the very element we held), so focus never left the focus-trapped dialog.
-    expect(screen.getByRole("button", { name: "Saved" })).toBe(save);
-    const dialog = screen.getByRole("dialog", { name: /settings/i });
-    expect(document.activeElement).not.toBe(document.body);
-    expect(dialog.contains(document.activeElement)).toBe(true);
-  });
-
-  it("clears a stale 'Couldn't save key' error as the user edits the field", async () => {
-    m.setApiKey.mockRejectedValueOnce(new Error("keyring locked"));
-    renderPanel({ apiKeySet: false });
-
-    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Save" }));
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(screen.getByText(/Couldn't save key: keyring locked/)).toBeInTheDocument();
-
-    // Editing the key toward a correction clears the stale error immediately,
-    // rather than lingering until the next Save click.
-    fireEvent.change(input, { target: { value: "sk-ant-secret2" } });
-    expect(screen.queryByText(/Couldn't save key/)).not.toBeInTheDocument();
-  });
-
-  it("surfaces a setApiKey failure and retains the typed value", async () => {
-    m.setApiKey.mockRejectedValueOnce(new Error("keyring locked"));
-    renderPanel({ apiKeySet: false });
-
-    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Save" }));
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    // The error is shown and the typed value is kept so the user can retry.
-    const keyAlert = screen.getByText(/Couldn't save key: keyring locked/);
-    expect(keyAlert).toBeInTheDocument();
-    // Announced like its success counterpart (the role="status" save message).
-    expect(keyAlert).toHaveAttribute("role", "alert");
-    expect(input.value).toBe("sk-ant-secret");
-    // apiKeySet was never flipped, so the resting label is still "Save".
-    expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
-    expect(useStore.getState().settings.apiKeySet).toBe(false);
-  });
-
-  it("does not write settings and keeps the committed key visible if its refresh fails", async () => {
-    m.getSettings.mockRejectedValueOnce(new Error("settings read unavailable"));
-    renderPanel({ apiKeySet: false });
-
-    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Save" }));
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    // set_api_key already committed the credential. A failed follow-up read is
-    // therefore not a failed save: discard the secret, mark key presence locally,
-    // and avoid the unrelated settings write path entirely.
-    expect(m.getSettings).toHaveBeenCalledTimes(1);
-    expect(m.saveSettings).not.toHaveBeenCalled();
-    expect(input.value).toBe("");
-    expect(useStore.getState().settings.apiKeySet).toBe(true);
-    expect(screen.getByRole("button", { name: "Saved" })).toBeInTheDocument();
-    expect(screen.queryByText(/Couldn't save key/)).not.toBeInTheDocument();
-    expect(screen.queryByText(/Couldn't save settings/)).not.toBeInTheDocument();
-    expect(useStore.getState().settingsError).toBeNull();
-  });
-
-  it("announces the saved key via a polite live region after a successful save", async () => {
-    vi.useFakeTimers();
-    renderPanel({ apiKeySet: false });
-
-    // Before saving, the status region is empty (rendered unconditionally).
-    const region = screen.getByRole("status");
-    expect(region).toHaveTextContent("");
-
-    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(screen.getByRole("status")).toHaveTextContent("Anthropic API key saved");
-  });
-
-  it("clears the Saved-flash timer on unmount so it can't update state after close", async () => {
-    vi.useFakeTimers();
-    renderPanel({ apiKeySet: false });
-
-    const input = screen.getByPlaceholderText("sk-ant-…") as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "sk-ant-secret" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-
-    // Flush saveKey's microtasks so the 1800ms flash timer is armed.
-    await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(screen.getByRole("button", { name: "Saved" })).toBeInTheDocument();
-
-    // React warns on console.error if a state update lands after unmount. Watch
-    // for it: unmount the modal (as closing it would), then run the timer past
-    // 1800ms. The unmount-effect must have cleared the timer, so setSavedKey
-    // never fires and no warning is emitted.
-    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    cleanup(); // unmounts the panel before the 1800ms flash elapses
-    act(() => {
-      vi.advanceTimersByTime(1800);
-    });
-
-    expect(errSpy).not.toHaveBeenCalled();
-    errSpy.mockRestore();
-  });
-});
-
-describe("SettingsPanel — default tool permission", () => {
-  it("highlights the active policy and switches policy through ipc.saveSettings", async () => {
-    renderPanel({ defaultPolicy: "ask" });
-
-    // The active policy is styled cyan: it carries a filled accent background
-    // (bg-accent-2/10) + accent text. Inactive buttons use bg-panel-2 and only
-    // an accent *hover* border, so discriminate on the active background token
-    // rather than "border-accent" (which the inactive hover class also matches).
-    const ask = screen.getByRole("button", { name: "ask" });
-    expect(ask.className).toContain("bg-accent-2/10");
-    expect(ask.className).toContain("text-accent-2");
-    const allow = screen.getByRole("button", { name: "allow" });
-    expect(allow.className).not.toContain("bg-accent-2/10");
-
-    fireEvent.click(allow);
-    expect(m.saveSettings).not.toHaveBeenCalled();
-    expect(
-      screen.getByText(/every unmatched configurable action.*without asking/i),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(/Protected actions still ask unless an explicit Allow rule matches/i),
-    ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Enable default Allow" }));
-    expect(m.saveSettings).toHaveBeenCalledWith({ defaultPolicy: "allow" });
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(useStore.getState().settings.defaultPolicy).toBe("allow");
-  });
-
-  it("cancels the default Allow confirmation without saving", () => {
-    renderPanel({ defaultPolicy: "ask" });
-
-    fireEvent.click(screen.getByRole("button", { name: "allow" }));
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-
-    expect(m.saveSettings).not.toHaveBeenCalled();
-    expect(useStore.getState().settings.defaultPolicy).toBe("ask");
-  });
-
-  it("offers every policy button", () => {
+    m.listOpenAIAccounts.mockResolvedValue([
+      openAIAccount({ id: "codex-primary", accountLabel: "OpenAI Platform API key" }),
+    ]);
     renderPanel();
-    const policies: ToolPolicy[] = ["allow", "ask", "deny"];
-    for (const p of policies) {
-      expect(screen.getByRole("button", { name: p })).toBeInTheDocument();
-    }
+
+    const input = screen.getByLabelText("OpenAI Platform API key") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "  sk-proj-secret  " } });
+    fireEvent.click(screen.getByRole("button", { name: "Use API key" }));
+
+    await act(async () => {});
+    expect(m.loginCodexApiKey).toHaveBeenCalledTimes(1);
+    expect(m.loginCodexApiKey).toHaveBeenCalledWith("sk-proj-secret");
+    expect(input.value).toBe("");
+    expect(m.openaiOauthStatus).toHaveBeenCalled();
+    expect(m.listOpenAIAccounts).toHaveBeenCalled();
+    expect(screen.getByRole("status")).toHaveTextContent("OpenAI API key connected");
+    expect(screen.getByRole("button", { name: "Connected" })).toBeInTheDocument();
+  });
+
+  it("retains a rejected key for correction and clears the stale error while editing", async () => {
+    m.loginCodexApiKey.mockRejectedValueOnce(new Error("Codex rejected the key"));
+    renderPanel();
+
+    const input = screen.getByLabelText("OpenAI Platform API key") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "sk-proj-retry" } });
+    fireEvent.click(screen.getByRole("button", { name: "Use API key" }));
+
+    await act(async () => {});
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "API-key sign-in failed: Codex rejected the key",
+    );
+    expect(input.value).toBe("sk-proj-retry");
+
+    fireEvent.change(input, { target: { value: "sk-proj-corrected" } });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("clears the connected-state timer on unmount", async () => {
+    vi.useFakeTimers();
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout");
+    const { unmount } = renderPanel();
+
+    fireEvent.change(screen.getByLabelText("OpenAI Platform API key"), {
+      target: { value: "sk-proj-secret" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Use API key" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    unmount();
+    expect(clearSpy).toHaveBeenCalled();
+    clearSpy.mockRestore();
   });
 });
 
@@ -1377,7 +1049,7 @@ describe("SettingsPanel — permission modes & rules", () => {
     expect(m.saveSettings).not.toHaveBeenCalled();
     const confirm = screen.getByRole("button", { name: /Enable Auto/i });
     expect(screen.getByRole("alert")).toHaveTextContent(
-      /protected actions still ask unless an Allow rule matches/i,
+      /workspace-write sandbox with on-request approvals and automatic review/i,
     );
 
     // Confirming engages the mode.
@@ -1400,171 +1072,55 @@ describe("SettingsPanel — permission modes & rules", () => {
     expect(m.saveSettings).not.toHaveBeenCalled();
   });
 
-  it("warns that Bypass skips every prompt and ignores permission rules", async () => {
+  it("warns that Bypass grants danger-full-access without approval prompts", async () => {
     renderPanel({ permissionMode: "default" });
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /Bypass/i }));
     });
 
-    expect(screen.getByRole("alert")).toHaveTextContent(/every mutation without prompts/i);
-    expect(screen.getByRole("alert")).toHaveTextContent(/ignores permission rules/i);
+    expect(screen.getByRole("alert")).toHaveTextContent(/danger-full-access/i);
+    expect(screen.getByRole("alert")).toHaveTextContent(/without approval prompts/i);
   });
 
-  it("adds a per-tool rule through ipc.saveSettings", async () => {
-    renderPanel(); // form defaults: Run command + ask
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
-    });
-
-    expect(m.saveSettings).toHaveBeenCalledWith({
-      rules: [{ tool: "run_command", decision: "ask" }],
-    });
-  });
-
-  it("does not offer Allow when creating a Run command rule", () => {
-    renderPanel(); // tool=Run command
-    fireEvent.click(screen.getByLabelText("Rule decision"));
-
-    expect(screen.queryByRole("option", { name: "allow" })).not.toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "ask" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "deny" })).toBeInTheDocument();
-  });
-
-  it("warns when a wildcard Allow would match every gated tool", () => {
-    renderPanel();
-    fireEvent.click(screen.getByLabelText("Rule tool"));
-    fireEvent.click(screen.getByRole("option", { name: "Any tool" }));
-    fireEvent.click(screen.getByLabelText("Rule decision"));
-    fireEvent.click(screen.getByRole("option", { name: "allow" }));
-
-    expect(screen.getByRole("alert")).toHaveTextContent(/every gated tool/i);
-    expect(screen.getByRole("alert")).toHaveTextContent(/including protected actions/i);
-  });
-
-  it("renders a historical rule with a friendly label and removes it", async () => {
-    renderPanel({ rules: [{ tool: "fs_edit", decision: "allow" }] });
-
-    expect(screen.getByText("Edit file")).toBeInTheDocument();
-    expect(screen.queryByText("fs_edit")).not.toBeInTheDocument();
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Remove rule 1" }));
-    });
-
-    expect(m.saveSettings).toHaveBeenCalledWith({ rules: [] });
-  });
-
-  it("shows an effective historical shell Allow and lets the user remove it", async () => {
-    renderPanel({ rules: [{ tool: "shell", command: "git ", decision: "allow" }] });
-
-    expect(screen.getAllByText("Run command").length).toBeGreaterThan(0);
-    expect(screen.queryByText(/overridden: asks every time/i)).not.toBeInTheDocument();
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Remove rule 1" }));
-    });
-
-    expect(m.saveSettings).toHaveBeenCalledWith({ rules: [] });
-  });
-
-  it("does not add a duplicate rule", async () => {
-    // The canonical default matches this historical alias, so adding is a no-op.
-    renderPanel({ rules: [{ tool: "shell", decision: "ask" }] });
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
-    });
-
-    expect(m.saveSettings).not.toHaveBeenCalled();
-  });
-
-  it("replaces a conflicting legacy rule instead of appending an inert duplicate", async () => {
-    // The form defaults to Run command + ask; the stored equivalent says allow.
-    renderPanel({ rules: [{ tool: "shell", decision: "allow" }] });
-
-    expect(screen.queryByText(/overridden: asks every time/i)).not.toBeInTheDocument();
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
-    });
-
-    expect(m.saveSettings).toHaveBeenCalledWith({
-      rules: [{ tool: "run_command", decision: "ask" }],
-    });
-  });
-
-  it("puts a newly added rule before a broader rule so first-match evaluation honors it", async () => {
-    renderPanel({ rules: [{ tool: "*", decision: "deny" }] });
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
-    });
-
-    expect(m.saveSettings).toHaveBeenCalledWith({
-      rules: [
-        { tool: "run_command", decision: "ask" },
-        { tool: "*", decision: "deny" },
-      ],
-    });
-  });
-
-  it("keeps an existing command exception before a newly added tool-wide rule", async () => {
+  it("does not render obsolete local policy or rule controls", () => {
     renderPanel({
-      rules: [{ tool: "run_command", command: "git push", decision: "deny" }],
+      defaultPolicy: "allow",
+      rules: [{ tool: "run_command", command: "git ", decision: "allow" }],
     });
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
-    });
-
-    expect(m.saveSettings).toHaveBeenCalledWith({
-      rules: [
-        { tool: "run_command", command: "git push", decision: "deny" },
-        { tool: "run_command", decision: "ask" },
-      ],
-    });
+    expect(document.getElementById("pc-setting-default-policy")).toBeNull();
+    expect(document.getElementById("pc-setting-tool-rules")).toBeNull();
+    expect(screen.queryByLabelText("Rule tool")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Rule decision")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Command prefix")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add rule" })).not.toBeInTheDocument();
   });
 
-  it("inserts a command exception before an existing tool-wide rule", async () => {
-    renderPanel({ rules: [{ tool: "shell", decision: "deny" }] });
-    fireEvent.change(screen.getByLabelText("Command prefix"), {
-      target: { value: "git push" },
-    });
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
-    });
-
-    expect(m.saveSettings).toHaveBeenCalledWith({
-      rules: [
-        { tool: "run_command", command: "git push", decision: "ask" },
-        { tool: "shell", decision: "deny" },
-      ],
-    });
-  });
-
-  it("offers friendly names only for tools that can reach the permission gate", () => {
+  it("describes the native Codex approval and sandbox mappings", () => {
     renderPanel();
+    const spectrum = within(document.getElementById("pc-setting-permission-mode")!);
 
-    fireEvent.click(screen.getByLabelText("Rule tool"));
-
-    for (const name of ["Write file", "Edit file", "Run command", "Any tool"]) {
-      expect(screen.getByRole("option", { name })).toBeInTheDocument();
-    }
-    for (const name of [
-      "Read file",
-      "Browse folder",
-      "Find files",
-      "Search project",
-      "Delegate task",
-    ]) {
-      expect(screen.queryByRole("option", { name })).not.toBeInTheDocument();
-    }
-    expect(
-      screen.getByText(/read-only browsing and delegated tasks never require permission rules/i),
-    ).toBeInTheDocument();
+    expect(spectrum.getByRole("button", { name: "Default" })).toHaveAttribute(
+      "title",
+      "Codex policy: untrusted approvals · workspace-write sandbox.",
+    );
+    expect(spectrum.getByRole("button", { name: "Accept edits" })).toHaveAttribute(
+      "title",
+      "Codex policy: on-request approvals · workspace-write sandbox.",
+    );
+    expect(spectrum.getByRole("button", { name: "Plan" })).toHaveAttribute(
+      "title",
+      "Codex policy: never ask · read-only sandbox.",
+    );
+    expect(spectrum.getByRole("button", { name: /Auto/i })).toHaveAttribute(
+      "title",
+      "Codex policy: auto-review · on-request approvals · workspace-write sandbox.",
+    );
+    expect(spectrum.getByRole("button", { name: /Bypass/i })).toHaveAttribute(
+      "title",
+      "Codex policy: never ask · danger-full-access sandbox.",
+    );
   });
 });
 
@@ -1999,7 +1555,7 @@ describe("SettingsPanel — Phone Sync section", () => {
     useStore.setState({ remoteMode: true });
     renderPanel();
 
-    expect(document.getElementById("pc-settings-claude")).toHaveClass("hidden");
+    expect(document.getElementById("pc-settings-claude")).toBeNull();
     expect(document.getElementById("pc-settings-openai")).toHaveClass("hidden");
     expect(document.getElementById("pc-settings-usage")).toHaveClass("hidden");
     expect(screen.getByText("PERMISSIONS").closest("section")).toHaveClass("hidden");

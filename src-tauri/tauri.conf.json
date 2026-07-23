@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "pnpm dev",
-    "beforeBuildCommand": "pnpm build"
+    "beforeDevCommand": "pnpm codex:runtime && pnpm dev",
+    "beforeBuildCommand": "pnpm codex:runtime && pnpm build"
   },
   "app": {
     "withGlobalTauri": false,
@@ -32,6 +32,9 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "resources": {
+      "generated/codex-runtime/": "codex-runtime/"
+    },
     "publisher": "Porthex",
     "copyright": "© 2026 Porthex",
     "windows": {

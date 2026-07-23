@@ -4,8 +4,8 @@
   "mainBinaryName": "portcode-beta",
   "identifier": "dev.porthex.portcode.beta",
   "build": {
-    "beforeDevCommand": "pnpm dev:beta",
-    "beforeBuildCommand": "pnpm build:beta"
+    "beforeDevCommand": "pnpm codex:runtime && pnpm dev:beta",
+    "beforeBuildCommand": "pnpm codex:runtime && pnpm build:beta"
   },
   "app": {
     "windows": [

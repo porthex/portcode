@@ -232,6 +232,36 @@ pub struct SessionRunConfig {
     pub account_profile_id: Option<String>,
 }
 
+/// Execution identity owned by the real Codex app-server. Portcode's SQLite
+/// session remains the UI/search/Phone-Sync read model; `codex_thread_id` is the
+/// durable bridge back to Codex's authoritative conversation history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexSessionConfig {
+    pub workspace: Option<String>,
+    pub model: Option<String>,
+    pub codex_thread_id: Option<String>,
+}
+
+/// One lossless app-server notification/request captured for the activity
+/// timeline. Payloads intentionally remain JSON so a newer Codex can add fields
+/// or methods without Portcode silently discarding them.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexActivityRow {
+    pub sequence: i64,
+    pub session_id: String,
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    pub method: String,
+    pub params: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<Value>,
+    pub emitted_at_ms: i64,
+}
+
 /// Result of the compare-and-set used to attribute an unpinned legacy session.
 /// Once a non-NULL profile is present this API never rewrites it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -439,6 +469,7 @@ impl Db {
                 workspace TEXT,
                 model TEXT,
                 account_profile_id TEXT,
+                codex_thread_id TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -478,6 +509,17 @@ impl Db {
                 output INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS codex_events (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                turn_id TEXT,
+                item_id TEXT,
+                method TEXT NOT NULL,
+                params_json TEXT NOT NULL,
+                request_id_json TEXT,
+                emitted_at_ms INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS turn_receipts (
                 turn_id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -499,7 +541,9 @@ impl Db {
         // until the next reload.
         Self::migrate_add_model(&conn)?;
         Self::migrate_add_session_account_profile_id(&conn)?;
+        Self::migrate_add_codex_thread_id(&conn)?;
         Self::migrate_add_receipt_account_profile_id(&conn)?;
+        Self::migrate_sessions_to_codex(&conn)?;
         // ADDITIVE migration: a `paired_devices` table created before the
         // device-trust gate landed has no `confirmed` column. Add it without
         // dropping the table, defaulting every pre-existing row to 0 (untrusted).
@@ -522,6 +566,11 @@ impl Db {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_turn_receipts_timeline
              ON turn_receipts(session_id, terminal, anchor_seq)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_codex_events_session
+             ON codex_events(session_id, sequence)",
             [],
         )?;
         Ok(Self {
@@ -560,6 +609,42 @@ impl Db {
                 [],
             )?;
         }
+        Ok(())
+    }
+
+    /// Add the nullable Codex conversation identity without fabricating a thread
+    /// for legacy sessions. Their first post-migration turn starts a real thread;
+    /// subsequent turns resume it through this column.
+    fn migrate_add_codex_thread_id(conn: &Connection) -> rusqlite::Result<()> {
+        let mut sessions = conn.prepare("PRAGMA table_info(sessions)")?;
+        let has_codex_thread = sessions
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .any(|name| name == "codex_thread_id");
+        drop(sessions);
+        if !has_codex_thread {
+            conn.execute("ALTER TABLE sessions ADD COLUMN codex_thread_id TEXT", [])?;
+        }
+        Ok(())
+    }
+
+    fn migrate_sessions_to_codex(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute(
+            "UPDATE sessions
+             SET model = 'gpt-5.6-terra', account_profile_id = 'codex-primary'
+             WHERE model IS NULL OR model = '' OR model LIKE 'claude-%'",
+            [],
+        )?;
+        // Older GPT sessions were pinned to Portcode's retired local OAuth
+        // profile UUIDs. Codex owns one active authentication slot, so preserve
+        // the selected GPT model while normalizing that obsolete identity.
+        conn.execute(
+            "UPDATE sessions
+             SET account_profile_id = 'codex-primary'
+             WHERE model LIKE 'gpt-%' OR model LIKE 'codex-%'
+                OR model LIKE 'openai-%' OR model GLOB 'o[0-9]*'",
+            [],
+        )?;
         Ok(())
     }
 
@@ -876,6 +961,169 @@ impl Db {
         )
     }
 
+    /// Load the values needed to start or resume a Codex thread in one database
+    /// read. The workspace and model are Portcode choices; conversation context
+    /// itself belongs to the returned app-server thread id.
+    pub fn codex_session_config(&self, id: &str) -> rusqlite::Result<CodexSessionConfig> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT workspace, model, codex_thread_id FROM sessions WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(CodexSessionConfig {
+                    workspace: row.get(0)?,
+                    model: row.get(1)?,
+                    codex_thread_id: row.get(2)?,
+                })
+            },
+        )
+    }
+
+    /// Restore every durable root-thread route when the app-server bridge starts.
+    /// Subagent thread routes are ephemeral and are rediscovered from collaboration
+    /// items; root conversations survive Portcode/app-server restarts.
+    pub fn codex_thread_routes(&self) -> rusqlite::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT codex_thread_id, id FROM sessions
+             WHERE codex_thread_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Bind a Portcode session to its authoritative Codex thread exactly once.
+    /// Returning the persisted value closes the race between two starts without
+    /// ever replacing an established conversation identity.
+    pub fn bind_codex_thread(&self, id: &str, thread_id: &str) -> rusqlite::Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE sessions SET codex_thread_id = ?2
+             WHERE id = ?1 AND codex_thread_id IS NULL",
+            params![id, thread_id],
+        )?;
+        if updated == 1 {
+            return Ok(thread_id.to_string());
+        }
+        conn.query_row(
+            "SELECT codex_thread_id FROM sessions WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, Option<String>>(0),
+        )?
+        .ok_or(rusqlite::Error::QueryReturnedNoRows)
+    }
+
+    pub fn turn_has_messages(&self, session_id: &str, turn_id: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM messages WHERE session_id = ?1 AND turn_id = ?2
+             )",
+            params![session_id, turn_id],
+            |row| row.get(0),
+        )
+    }
+
+    /// Append one raw Codex activity event and return its local monotonic
+    /// sequence. The caller supplies extracted identities for efficient routing,
+    /// while `params` remains complete and forward-compatible.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_codex_activity(
+        &self,
+        session_id: &str,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        item_id: Option<&str>,
+        method: &str,
+        params_value: &Value,
+        request_id: Option<&Value>,
+        emitted_at_ms: i64,
+    ) -> rusqlite::Result<i64> {
+        let params_json = serde_json::to_string(params_value)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let request_id_json = request_id
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO codex_events (
+                 session_id, thread_id, turn_id, item_id, method,
+                 params_json, request_id_json, emitted_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                session_id,
+                thread_id,
+                turn_id,
+                item_id,
+                method,
+                params_json,
+                request_id_json,
+                emitted_at_ms,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Read the newest bounded activity window in chronological order. The
+    /// bounded IPC surface keeps a long-running Codex thread from producing an
+    /// unbounded startup payload; older rows remain durable in SQLite.
+    pub fn codex_activity(
+        &self,
+        session_id: &str,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<CodexActivityRow>> {
+        let limit = i64::from(limit.clamp(1, 2_000));
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT sequence, session_id, thread_id, turn_id, item_id, method,
+                    params_json, request_id_json, emitted_at_ms
+             FROM (
+                 SELECT sequence, session_id, thread_id, turn_id, item_id, method,
+                        params_json, request_id_json, emitted_at_ms
+                 FROM codex_events
+                 WHERE session_id = ?1
+                 ORDER BY sequence DESC
+                 LIMIT ?2
+             )
+             ORDER BY sequence ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit], |row| {
+            let params_json: String = row.get(6)?;
+            let request_id_json: Option<String> = row.get(7)?;
+            let params_value = serde_json::from_str(&params_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            let request_id = request_id_json
+                .map(|value| {
+                    serde_json::from_str(&value).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            7,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })
+                .transpose()?;
+            Ok(CodexActivityRow {
+                sequence: row.get(0)?,
+                session_id: row.get(1)?,
+                thread_id: row.get(2)?,
+                turn_id: row.get(3)?,
+                item_id: row.get(4)?,
+                method: row.get(5)?,
+                params: params_value,
+                request_id,
+                emitted_at_ms: row.get(8)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// Pin an un-attributed legacy session exactly once. A competing choice can
     /// never overwrite the winner; callers receive the persisted profile in the
     /// conflict result and can ask the user to reopen the now-pinned session.
@@ -1082,6 +1330,10 @@ impl Db {
         // leaves no orphaned rows that would skew the workspace-total spend.
         conn.execute("DELETE FROM drafts WHERE session_id = ?1", params![id])?;
         conn.execute("DELETE FROM usage WHERE session_id = ?1", params![id])?;
+        conn.execute(
+            "DELETE FROM codex_events WHERE session_id = ?1",
+            params![id],
+        )?;
         conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -2304,6 +2556,159 @@ mod tests {
         assert_eq!(rows[1].workspace, None);
         // A non-existent workspace path resolves to no branch (not an error).
         assert_eq!(rows[0].branch, None);
+    }
+
+    #[test]
+    fn codex_thread_binding_is_durable_and_never_reassigned() {
+        let db = mem_db();
+        db.create_session(
+            "codex-chat",
+            "Codex chat",
+            Some("C:/work"),
+            Some("gpt-5.6-sol"),
+            100,
+        )
+        .unwrap();
+
+        let before = db.codex_session_config("codex-chat").unwrap();
+        assert_eq!(before.codex_thread_id, None);
+        assert_eq!(before.workspace.as_deref(), Some("C:/work"));
+
+        assert_eq!(
+            db.bind_codex_thread("codex-chat", "thread-a").unwrap(),
+            "thread-a"
+        );
+        assert_eq!(
+            db.bind_codex_thread("codex-chat", "thread-b").unwrap(),
+            "thread-a",
+            "a later start must not replace the authoritative conversation"
+        );
+        assert_eq!(
+            db.codex_session_config("codex-chat")
+                .unwrap()
+                .codex_thread_id
+                .as_deref(),
+            Some("thread-a")
+        );
+    }
+
+    #[test]
+    fn codex_activity_round_trips_future_payloads_and_is_deleted_with_session() {
+        let db = mem_db();
+        db.create_session("codex-chat", "Codex chat", None, None, 100)
+            .unwrap();
+        let request_id = json!(42);
+        let first = db
+            .append_codex_activity(
+                "codex-chat",
+                "thread-a",
+                Some("turn-a"),
+                Some("item-a"),
+                "item/futureThing/delta",
+                &json!({ "nested": { "unknown": true }, "delta": "hello" }),
+                Some(&request_id),
+                1234,
+            )
+            .unwrap();
+        let second = db
+            .append_codex_activity(
+                "codex-chat",
+                "thread-a",
+                Some("turn-a"),
+                None,
+                "turn/completed",
+                &json!({ "turn": { "id": "turn-a", "status": "completed" } }),
+                None,
+                1235,
+            )
+            .unwrap();
+        assert!(second > first);
+
+        let rows = db.codex_activity("codex-chat", 100).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].method, "item/futureThing/delta");
+        assert_eq!(rows[0].request_id, Some(json!(42)));
+        assert_eq!(rows[0].params["nested"]["unknown"], true);
+        assert_eq!(rows[1].method, "turn/completed");
+
+        db.delete_session("codex-chat").unwrap();
+        assert!(db.codex_activity("codex-chat", 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_sessions_gain_a_nullable_codex_thread_column_idempotently() {
+        let conn = Connection::open(Path::new(":memory:")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace TEXT,
+                model TEXT,
+                account_profile_id TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO sessions (
+                id, title, workspace, model, account_profile_id, created_at, updated_at
+            ) VALUES ('legacy', 'Kept chat', NULL, 'gpt-5.6-sol', NULL, 10, 20);",
+        )
+        .unwrap();
+        Db::migrate_add_codex_thread_id(&conn).unwrap();
+        Db::migrate_add_codex_thread_id(&conn).unwrap();
+        let db = Db {
+            conn: Mutex::new(conn),
+        };
+        assert_eq!(
+            db.codex_session_config("legacy").unwrap().codex_thread_id,
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_claude_sessions_migrate_to_the_single_codex_engine() {
+        let conn = Connection::open(Path::new(":memory:")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace TEXT,
+                model TEXT,
+                account_profile_id TEXT,
+                codex_thread_id TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO sessions VALUES (
+                'legacy', 'Claude chat', NULL, 'claude-opus-4-8', NULL, NULL, 10, 20
+            );
+            INSERT INTO sessions VALUES (
+                'gpt-legacy', 'GPT chat', NULL, 'gpt-5.6-sol', 'old-profile-uuid', NULL, 10, 20
+            );",
+        )
+        .unwrap();
+
+        Db::migrate_sessions_to_codex(&conn).unwrap();
+        Db::migrate_sessions_to_codex(&conn).unwrap();
+
+        let (model, account): (String, String) = conn
+            .query_row(
+                "SELECT model, account_profile_id FROM sessions WHERE id = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(model, "gpt-5.6-terra");
+        assert_eq!(account, "codex-primary");
+
+        let (model, account): (String, String) = conn
+            .query_row(
+                "SELECT model, account_profile_id FROM sessions WHERE id = 'gpt-legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(model, "gpt-5.6-sol");
+        assert_eq!(account, "codex-primary");
     }
 
     #[test]

@@ -5,7 +5,6 @@ import {
   DEFAULT_SETTINGS,
   type Message,
   type PlanUsageSnapshot,
-  type ProviderId,
   type Session,
   type Settings,
   type Usage,
@@ -40,7 +39,7 @@ const session = (over: Partial<Session> = {}): Session => ({
   id: "s1",
   title: "Chat",
   workspace: null,
-  model: "claude-opus-4-8",
+  model: "gpt-5.6-terra",
   createdAt: 1,
   updatedAt: 1,
   ...over,
@@ -236,7 +235,7 @@ describe("StatusHud", () => {
 
   it("renders the active session's model and the policy from settings", () => {
     useStore.setState({
-      sessions: [session({ model: "claude-sonnet-4-6" })],
+      sessions: [session({ model: "gpt-5.6-luna" })],
       activeId: "s1",
       settings: settings({ defaultPolicy: "deny" }),
     });
@@ -244,7 +243,7 @@ describe("StatusHud", () => {
     render(<StatusHud />);
 
     // The model segment now reads the ACTIVE SESSION's model, not settings.model.
-    expect(screen.getByText("SONNET 4.6")).toBeInTheDocument();
+    expect(screen.getByText("GPT-5.6 LUNA")).toBeInTheDocument();
     expect(screen.getByText("POLICY: DENY")).toBeInTheDocument();
   });
 
@@ -310,12 +309,6 @@ describe("StatusHud", () => {
     useStore.setState({
       sessions: [session({ model: "gpt-5.6-sol", accountProfileId })],
       activeId: "s1",
-      oauthStatus: {
-        signedIn: true,
-        expiresAt: null,
-        account: "claude@example.com",
-        tier: "Claude Max",
-      },
       openAIAuthStatus: {
         signedIn: true,
         expiresAt: null,
@@ -335,15 +328,15 @@ describe("StatusHud", () => {
         },
       ],
     });
-    getPlanUsage.mockImplementation(async (provider: ProviderId): Promise<PlanUsageSnapshot> => ({
-      provider,
-      plan: provider === "openai" ? "Plus" : "Max",
+    getPlanUsage.mockImplementation(async (): Promise<PlanUsageSnapshot> => ({
+      provider: "openai",
+      plan: "Plus",
       updatedAt: Math.floor(Date.now() / 1000),
       windows: [
         {
           id: "session",
           label: "Current session",
-          usedPercent: provider === "openai" ? 20 : 35,
+          usedPercent: 20,
           resetsAt: String(Math.floor(Date.now() / 1000) + 60 * 60),
           windowMinutes: 300,
         },
@@ -372,6 +365,41 @@ describe("StatusHud", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "Plan usage quick view" })).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
+  });
+
+  it("keeps plan usage unavailable when the Codex usage request fails", async () => {
+    const connected = {
+      id: "codex-primary",
+      accountLabel: "OpenAI Platform API key",
+      tier: null,
+      expiresAt: null,
+      state: "connected" as const,
+      createdAt: 1,
+      updatedAt: 1,
+      lastUsedAt: null,
+    };
+    useStore.setState({
+      sessions: [session({ accountProfileId: connected.id })],
+      activeId: "s1",
+      openAIAuthStatus: {
+        signedIn: true,
+        expiresAt: null,
+        account: connected.accountLabel,
+        tier: null,
+        available: true,
+      },
+      openAIAccounts: [connected],
+    });
+    getPlanUsage.mockRejectedValueOnce(new Error("usage offline"));
+
+    render(<StatusHud />);
+
+    await vi.waitFor(() => expect(getPlanUsage).toHaveBeenCalledWith("openai", connected.id));
+    expect(
+      screen.getByRole("button", {
+        name: "Plan usage, percentage unavailable, connected for this GPT chat",
+      }),
+    ).toHaveTextContent(/USAGE\s*--%/);
   });
 
   it("opens the detailed Settings usage section from the quick view", () => {
@@ -440,7 +468,7 @@ describe("StatusHud", () => {
     expect(screen.queryByText(/BG TASK/)).not.toBeInTheDocument();
   });
 
-  it("prices each Anthropic session with its own model and excludes GPT usage", () => {
+  it("does not expose legacy provider price estimates from historical sessions", () => {
     useStore.setState({
       sessions: [
         session({ id: "s1", model: "gpt-5.6-sol" }),
@@ -457,8 +485,8 @@ describe("StatusHud", () => {
 
     render(<StatusHud />);
 
-    // GPT subscription usage is excluded; Opus input is $5/M and Sonnet is $3/M.
-    expect(screen.getByText("Σ $8.00")).toBeInTheDocument();
+    expect(screen.queryByText(/^Σ /)).toBeNull();
+    expect(document.body.textContent).not.toContain("Anthropic API spend");
   });
 
   it("omits the spend segment when nothing has been spent", () => {
@@ -502,7 +530,7 @@ describe("StatusHud", () => {
 
     expect(screen.getByText("ACCOUNT UNAVAILABLE").closest(".pc-hud-seg")).toHaveAttribute(
       "title",
-      "ChatGPT account registry is unavailable",
+      "Codex authentication registry is unavailable",
     );
     expect(screen.queryByText("ACCOUNT REMOVED")).not.toBeInTheDocument();
     expect(container).not.toHaveTextContent(accountProfileId);

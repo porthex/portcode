@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { modelsForOpenAIProfile, useStore } from "../store/store";
+import { useStore } from "../store/store";
 import { MessageView } from "./Message";
 import { Composer } from "./Composer";
 import { PermissionPrompt } from "./PermissionPrompt";
 import { BackgroundTasksPanel } from "./BackgroundTasksPanel";
-import { providerForModel, type Message } from "../types";
+import { CodexRequestPrompt } from "./CodexRequestPrompt";
+import { type Message } from "../types";
 
 // Stable reference so the selector never returns a fresh array (which would
 // trip useSyncExternalStore's infinite-loop guard).
@@ -404,6 +405,7 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
       </div>
       <BackgroundTasksPanel />
       <PermissionPrompt />
+      <CodexRequestPrompt />
       <div data-testid="chat-composer-area" className="w-full shrink-0">
         <Composer />
       </div>
@@ -498,7 +500,6 @@ function EmptyState() {
   // Keyboard shortcuts are meaningless on the phone (no Ctrl key, and the file
   // explorer is desktop-only), so the hint row is desktop-only.
   const remoteMode = useStore((s) => s.remoteMode);
-  const oauthStatus = useStore((s) => s.oauthStatus);
   const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
   const openAIAccountsError = useStore((s) => s.openAIAccountsError);
   const activeSession = useStore((s) =>
@@ -506,9 +507,6 @@ function EmptyState() {
       ? (s.sessions.find((session) => session.id === s.activeId) ??
         (s.pendingSession?.id === s.activeId ? s.pendingSession : undefined))
       : undefined,
-  );
-  const openAIModels = useStore((s) =>
-    modelsForOpenAIProfile(activeSession?.accountProfileId, s.openAIModelCatalogs, s.openAIModels),
   );
   const activeOpenAIAccount = useStore((s) =>
     activeSession?.accountProfileId
@@ -518,43 +516,24 @@ function EmptyState() {
   const connectedOpenAIAccountCount = useStore(
     (s) => s.openAIAccounts.filter((account) => account.state === "connected").length,
   );
-  const settings = useStore((s) => s.settings);
-  const activeModel = useStore((s) => {
-    const session = s.activeId
-      ? (s.sessions.find((item) => item.id === s.activeId) ??
-        (s.pendingSession?.id === s.activeId ? s.pendingSession : undefined))
-      : undefined;
-    return session?.model ?? s.settings.model;
-  });
   const setShowSettings = useStore((s) => s.setShowSettings);
   const refreshOpenAIStatus = useStore((s) => s.refreshOpenAIStatus);
-  // oauthStatus is null until the first refresh resolves; treat unknown as not
-  // signed in, so the sign-in nudge shows until auth is confirmed.
-  const provider = providerForModel(activeModel, openAIModels);
-  const openAIUnavailable = provider === "openai" && openAIAuthStatus?.available === false;
+  const openAIUnavailable = openAIAuthStatus?.available === false;
   const openAIRegistryUnavailable = Boolean(
-    provider === "openai" &&
-    activeSession?.accountProfileId &&
-    !activeOpenAIAccount &&
-    openAIAccountsError,
+    activeSession?.accountProfileId && !activeOpenAIAccount && openAIAccountsError,
   );
   const authed =
-    provider === "openai"
-      ? !openAIUnavailable && activeOpenAIAccount?.state === "connected"
-      : !!oauthStatus?.signedIn || settings.apiKeySet;
+    !openAIUnavailable &&
+    (activeSession ? activeOpenAIAccount?.state === "connected" : connectedOpenAIAccountCount > 0);
   const authNudge = openAIRegistryUnavailable
     ? "This chat's ChatGPT account is unavailable because account discovery failed"
     : openAIUnavailable
-      ? `${openAIAuthStatus?.unavailableReason ?? "ChatGPT subscription access is unavailable in this build"}. Choose Claude in Settings to start`
-      : provider === "openai"
-        ? activeSession?.accountProfileId
-          ? "Reconnect this chat's ChatGPT account to start"
-          : activeSession
-            ? "Choose a default ChatGPT account in Settings to start"
-            : connectedOpenAIAccountCount > 0
-              ? "New GPT chats use your default ChatGPT account"
-              : "Add a ChatGPT account to start"
-        : "Sign in with Claude or add an API key to start";
+      ? `${openAIAuthStatus?.unavailableReason ?? "Codex authentication is unavailable in this build"}. Connect ChatGPT or an OpenAI Platform API key in Settings to start`
+      : activeSession?.accountProfileId
+        ? "Reconnect this chat's ChatGPT account to start"
+        : activeSession
+          ? "Connect ChatGPT or an OpenAI Platform API key in Settings to start"
+          : "Connect ChatGPT or an OpenAI Platform API key to start";
   return (
     <div className="flex min-h-[60vh] flex-col items-center justify-center text-center">
       <div className="mb-4 rounded-2xl border border-border bg-panel p-4">
@@ -599,7 +578,7 @@ function EmptyState() {
               onClick={() => setShowSettings(true)}
               className="rounded border border-border bg-panel px-2 py-0.5 text-fg hover:border-accent"
             >
-              {openAIUnavailable ? "Choose Claude" : "Open settings"}
+              Open settings
             </button>
           )}
         </div>

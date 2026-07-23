@@ -18,19 +18,22 @@ third-party open-source software. Each such component remains under its own
 license. The authoritative, complete list of dependencies and their versions is
 recorded in the project's manifests and lockfiles:
 
-  - Rust crates:  src-tauri/Cargo.toml  and  src-tauri/Cargo.lock
+  - Rust crates:  Cargo.toml, src-tauri/Cargo.toml, and Cargo.lock
   - JavaScript:   package.json          and  pnpm-lock.yaml
 
 Notable bundled or linked components include (non-exhaustive):
 
   - Tauri and the Tauri plugins (Apache-2.0 OR MIT)
-  - Tokio, reqwest, serde, anyhow, thiserror, uuid (Apache-2.0 OR MIT)
+  - Tokio, reqwest, serde, thiserror, uuid (Apache-2.0 OR MIT)
   - rusqlite / SQLite (SQLite is in the public domain; rusqlite is MIT)
   - keyring (Apache-2.0 OR MIT)
-  - regex, globset, ignore, similar (Apache-2.0 OR MIT)
+  - regex and similar (Apache-2.0 OR MIT)
   - React and React DOM (MIT)
   - react-markdown, remark-gfm, rehype-highlight (MIT)
   - Vite, TypeScript, Tailwind CSS (MIT)
+  - OpenAI Codex app-server and its canonical runtime package (Apache-2.0),
+    Copyright OpenAI. The exact redistributed release assets and SHA-256
+    digests are recorded in codex-runtime.lock.json.
 
 A machine-readable Software Bill of Materials (CycloneDX) is generated and
 published alongside each release. See docs/RELEASE.md for the release process.
