@@ -992,6 +992,38 @@ describe("newSession", () => {
     expect(st.creatingSession).toBe(false); // lock released
     expect(st.drafts[st.activeId!]).toBe("keep this draft");
   });
+
+  it("does not re-enter local first-send creation while the first create is pending", async () => {
+    let finishCreate!: (created: Session) => void;
+    let emit!: (event: StreamEvent) => void;
+    m.createSession.mockImplementationOnce(
+      () =>
+        new Promise<Session>((resolve) => {
+          finishCreate = resolve;
+        }),
+    );
+    m.runAgent.mockImplementationOnce(async (_id, _text, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
+    useStore.setState({ sessions: [session({ id: "old" })] });
+
+    await useStore.getState().newSession();
+    const pending = useStore.getState().pendingSession!;
+    const first = useStore.getState().send("first message");
+    const second = useStore.getState().send("duplicate message");
+
+    expect(m.createSession).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().creatingSession).toBe(true);
+
+    finishCreate(session({ ...pending }));
+    await Promise.all([first, second]);
+
+    expect(m.createSession).toHaveBeenCalledTimes(1);
+    expect(m.runAgent).toHaveBeenCalledTimes(1);
+    expect(m.runAgent).toHaveBeenCalledWith(pending.id, "first message", expect.any(Function));
+    emit({ type: "turn_end", stopReason: "end_turn" });
+  });
 });
 
 describe("setSessionModel", () => {
@@ -3047,6 +3079,80 @@ describe("stop", () => {
     );
   });
 
+  it.each(["terminalized", "successor"] as const)(
+    "ignores a stale cancel rejection after the stopped turn is %s",
+    async (after) => {
+      const emits: Array<(event: StreamEvent) => void> = [];
+      let rejectCancel!: (reason: Error) => void;
+      const firstCancel = vi.fn(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            rejectCancel = reject;
+          }),
+      );
+      const secondCancel = vi.fn(async () => {});
+      m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+        emits.push(onEvent);
+        return {
+          cancel: emits.length === 1 ? firstCancel : secondCancel,
+          dispose: vi.fn(),
+        };
+      });
+      useStore.setState({
+        sessions: [session({ id: "a" })],
+        activeId: "a",
+        messages: { a: [] },
+      });
+
+      await useStore.getState().send("first turn");
+      const stoppedTurnId = useStore.getState().runs.a.turnId!;
+      const stopping = useStore.getState().stop();
+      expect(firstCancel).toHaveBeenCalledOnce();
+
+      emits[0]({
+        type: "turn_end",
+        stopReason: "cancelled",
+        receipt: turnReceipt({
+          turnId: stoppedTurnId,
+          status: "cancelled",
+          stopReason: "cancelled",
+        }),
+      });
+
+      let successorTurnId: string | null = null;
+      let successorCancel: (() => Promise<void>) | null = null;
+      if (after === "successor") {
+        await useStore.getState().send("second turn");
+        successorTurnId = useStore.getState().runs.a.turnId;
+        successorCancel = useStore.getState().runs.a.cancel;
+        expect(useStore.getState().composerPhase).toBe("received");
+      }
+
+      rejectCancel(new Error("late cancel rejection"));
+      await expect(stopping).resolves.toBeUndefined();
+
+      const st = useStore.getState();
+      const transcript = st.messages.a
+        .flatMap((message) => message.blocks)
+        .map((block) => (block.kind === "text" ? block.text : ""))
+        .join("");
+      expect(transcript).not.toContain("Stop could not be confirmed");
+      if (after === "terminalized") {
+        expect(st.runs.a.streaming).toBe(false);
+        expect(st.composerPhase).toBe("idle");
+        expect(st.cancel).toBeNull();
+      } else {
+        expect(st.runs.a).toMatchObject({
+          streaming: true,
+          turnId: successorTurnId,
+          cancel: successorCancel,
+          composerPhase: "received",
+        });
+        emits[1]({ type: "turn_end", stopReason: "end_turn" });
+      }
+    },
+  );
+
   it("stops a remote turn with a Cancel command, not the (absent) local cancel", async () => {
     const cancel = vi.fn(async () => {});
     useStore.setState({
@@ -3185,6 +3291,111 @@ describe("resolvePermission", () => {
     await useStore.getState().resolvePermission("deny");
 
     expect(m.resolvePermission).toHaveBeenCalledWith("p1", "deny");
+    expect(useStore.getState().pendingPermission).toBeNull();
+  });
+
+  it("restores the owned prompt and settles when local permission IPC rejects", async () => {
+    const pending = { id: "p-retry", tool: "fs_edit", summary: "retry me", input: {} };
+    m.resolvePermission.mockRejectedValueOnce(new Error("permission bridge down"));
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      runs: {
+        a: runState({
+          streaming: true,
+          turnId: "turn-a",
+          startedAt: 10,
+          pendingPermission: pending,
+        }),
+      },
+      streaming: true,
+      pendingPermission: pending,
+    });
+
+    await expect(
+      useStore.getState().resolvePermission("a", pending.id, "allow"),
+    ).resolves.toBeUndefined();
+
+    expect(m.resolvePermission).toHaveBeenCalledWith(pending.id, "allow");
+    expect(useStore.getState().runs.a.pendingPermission).toEqual(pending);
+    expect(useStore.getState().pendingPermission).toEqual(pending);
+  });
+
+  it("does not overwrite a newer prompt when local permission IPC rejects late", async () => {
+    const pending = { id: "p-old", tool: "fs_edit", summary: "old", input: {} };
+    const newer = { id: "p-new", tool: "run_command", summary: "new", input: {} };
+    let rejectResolve!: (reason: Error) => void;
+    m.resolvePermission.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectResolve = reject;
+        }),
+    );
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      runs: {
+        a: runState({
+          streaming: true,
+          turnId: "turn-a",
+          startedAt: 10,
+          pendingPermission: pending,
+        }),
+      },
+      streaming: true,
+      pendingPermission: pending,
+    });
+
+    const resolving = useStore.getState().resolvePermission("a", pending.id, "deny");
+    expect(useStore.getState().pendingPermission).toBeNull();
+    useStore.setState((st) => ({
+      runs: { ...st.runs, a: { ...st.runs.a, pendingPermission: newer } },
+      pendingPermission: newer,
+    }));
+    rejectResolve(new Error("late rejection"));
+    await expect(resolving).resolves.toBeUndefined();
+
+    expect(useStore.getState().runs.a.pendingPermission).toEqual(newer);
+    expect(useStore.getState().pendingPermission).toEqual(newer);
+  });
+
+  it("does not resurrect a prompt after its owning turn terminalizes", async () => {
+    const pending = { id: "p-old", tool: "fs_edit", summary: "old", input: {} };
+    let rejectResolve!: (reason: Error) => void;
+    m.resolvePermission.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectResolve = reject;
+        }),
+    );
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      runs: {
+        a: runState({
+          streaming: true,
+          turnId: "turn-a",
+          startedAt: 10,
+          pendingPermission: pending,
+        }),
+      },
+      streaming: true,
+      pendingPermission: pending,
+    });
+
+    const resolving = useStore.getState().resolvePermission("a", pending.id, "allow");
+    useStore.setState((st) => ({
+      runs: {
+        ...st.runs,
+        a: { ...st.runs.a, streaming: false, pendingPermission: null, outcome: "completed" },
+      },
+      streaming: false,
+      pendingPermission: null,
+    }));
+    rejectResolve(new Error("late rejection"));
+    await expect(resolving).resolves.toBeUndefined();
+
+    expect(useStore.getState().runs.a.pendingPermission).toBeNull();
     expect(useStore.getState().pendingPermission).toBeNull();
   });
 
@@ -3546,6 +3757,20 @@ describe("cyclePermissionMode", () => {
 
 describe("draft + UI setters", () => {
   const draftOf = (id: string) => useStore.getState().drafts[id];
+
+  it("keeps a pending chat draft in memory until the chat is persisted", () => {
+    const pending = session({ id: "pending-chat" });
+    useStore.setState({ activeId: pending.id, pendingSession: pending, drafts: {} });
+    const mirroredDrafts = localStorage.getItem("pc.drafts");
+
+    useStore.getState().setDraft("not persisted yet");
+    expect(useStore.getState().drafts).toEqual({ [pending.id]: "not persisted yet" });
+    expect(localStorage.getItem("pc.drafts")).toBe(mirroredDrafts);
+    expect(m.saveDraft).not.toHaveBeenCalled();
+
+    useStore.getState().setDraft("");
+    expect(useStore.getState().drafts).toEqual({});
+  });
 
   // setDraft schedules a ~400ms debounced backend write; fake timers keep that
   // pending timer from firing into a later test's saveDraft assertions.
@@ -6029,6 +6254,7 @@ describe("remote client", () => {
       // guard makes it a no-op.
       const second = useStore.getState().connectRemote("QR-B");
 
+      await vi.waitFor(() => expect(m.phoneSyncConnect).toHaveBeenCalledTimes(1));
       release();
       await Promise.all([first, second]);
 
@@ -6055,6 +6281,31 @@ describe("remote client", () => {
       expect(useStore.getState().remoteConnecting).toBe(false);
     });
 
+    it("marks a stale live connection unroutable while its resume redial is pending", async () => {
+      let release!: () => void;
+      m.phoneSyncConnect.mockReturnValueOnce(
+        new Promise((resolve) => {
+          release = () => resolve({ sas: "SAS-NEW", peerPublicKey: "PEER-NEW==" });
+        }),
+      );
+      useStore.setState({ remoteConnected: true, remoteVerified: true });
+
+      const connecting = useStore.getState().connectRemote("QR", true);
+
+      expect(useStore.getState()).toMatchObject({
+        remoteConnected: false,
+        remoteVerified: false,
+        remoteConnecting: true,
+      });
+      release();
+      await connecting;
+      expect(useStore.getState()).toMatchObject({
+        remoteConnected: true,
+        remoteVerified: true,
+        remoteConnecting: false,
+      });
+    });
+
     it("honors a disconnect that lands mid-dial: stays disconnected, leaks no listener", async () => {
       // disconnectRemote during an in-flight dial clears remoteConnecting as an abort
       // sentinel. When the (slow) dial finally resolves, connectRemote must bail
@@ -6070,6 +6321,7 @@ describe("remote client", () => {
       m.onPhoneSyncFrame.mockResolvedValue(unlistenFrame);
 
       const connecting = useStore.getState().connectRemote("QR");
+      await vi.waitFor(() => expect(m.phoneSyncConnect).toHaveBeenCalledTimes(1));
       // The user disconnects while the dial is still pending.
       await useStore.getState().disconnectRemote();
       expect(useStore.getState().remoteConnecting).toBe(false); // abort sentinel set
@@ -6089,6 +6341,209 @@ describe("remote client", () => {
       // phoneSyncDisconnect ran once for the user's disconnect and once for the
       // abort-path teardown of the just-opened native session.
       expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(2);
+    });
+
+    it("cleans an abandoned native dial before starting its queued replacement", async () => {
+      let resolveDialA!: () => void;
+      let resolveDialB!: () => void;
+      m.phoneSyncConnect
+        .mockReturnValueOnce(
+          new Promise((resolve) => {
+            resolveDialA = () => resolve({ sas: "SAS-A", peerPublicKey: "PEER-A==" });
+          }),
+        )
+        .mockReturnValueOnce(
+          new Promise((resolve) => {
+            resolveDialB = () => resolve({ sas: "SAS-B", peerPublicKey: "PEER-B==" });
+          }),
+        );
+
+      const connectingA = useStore.getState().connectRemote("QR-A");
+      await vi.waitFor(() => expect(m.phoneSyncConnect).toHaveBeenCalledTimes(1));
+      await useStore.getState().disconnectRemote();
+
+      const connectingB = useStore.getState().connectRemote("QR-B");
+      await Promise.resolve();
+      expect(m.phoneSyncConnect).toHaveBeenCalledTimes(1);
+
+      resolveDialA();
+      await vi.waitFor(() => expect(m.phoneSyncConnect).toHaveBeenCalledTimes(2));
+      // One close is the explicit disconnect; the second closes A's late-installed
+      // native slot before B is allowed to dial into that singleton.
+      expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(2);
+
+      resolveDialB();
+      await Promise.all([connectingA, connectingB]);
+      expect(useStore.getState()).toMatchObject({
+        remoteConnected: true,
+        remoteSas: "SAS-B",
+        remotePeerKey: "PEER-B==",
+        remoteConnecting: false,
+      });
+    });
+
+    it("cleans a stale rejected dial before its queued replacement enters native", async () => {
+      let rejectDialA!: () => void;
+      let resolveDialB!: () => void;
+      m.phoneSyncConnect
+        .mockReturnValueOnce(
+          new Promise((_resolve, reject) => {
+            rejectDialA = () => reject(new Error("A failed after partial install"));
+          }),
+        )
+        .mockReturnValueOnce(
+          new Promise((resolve) => {
+            resolveDialB = () => resolve({ sas: "SAS-B", peerPublicKey: "PEER-B==" });
+          }),
+        );
+
+      const connectingA = useStore.getState().connectRemote("QR-A");
+      await vi.waitFor(() => expect(m.phoneSyncConnect).toHaveBeenCalledTimes(1));
+      await useStore.getState().disconnectRemote();
+      const connectingB = useStore.getState().connectRemote("QR-B");
+
+      rejectDialA();
+      await vi.waitFor(() => expect(m.phoneSyncConnect).toHaveBeenCalledTimes(2));
+      expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(2);
+
+      resolveDialB();
+      await Promise.all([connectingA, connectingB]);
+      expect(useStore.getState()).toMatchObject({
+        remoteConnected: true,
+        remoteSas: "SAS-B",
+        remotePeerKey: "PEER-B==",
+        remoteError: null,
+      });
+    });
+
+    it("cleans a frame listener that finishes registering after disconnect", async () => {
+      const unlistenFrame = vi.fn();
+      let resolveFrame!: (unlisten: () => void) => void;
+      m.onPhoneSyncFrame.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFrame = resolve;
+          }),
+      );
+
+      const connecting = useStore.getState().connectRemote("QR");
+      await vi.waitFor(() => expect(m.onPhoneSyncFrame).toHaveBeenCalledOnce());
+
+      await useStore.getState().disconnectRemote();
+      resolveFrame(unlistenFrame);
+      await connecting;
+
+      expect(unlistenFrame).toHaveBeenCalledOnce();
+      expect(m.onPhoneSyncDisconnected).not.toHaveBeenCalled();
+      expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(2);
+      expect(useStore.getState()).toMatchObject({
+        remoteConnected: false,
+        remoteConnecting: false,
+        remoteUnlisten: null,
+      });
+    });
+
+    it("cleans both listeners when disconnect lands during drop-listener registration", async () => {
+      const unlistenFrame = vi.fn();
+      const unlistenDrop = vi.fn();
+      let staleFrame!: (frame: SyncFrame) => void;
+      let resolveDrop!: (unlisten: () => void) => void;
+      m.onPhoneSyncFrame.mockImplementationOnce(async (callback) => {
+        staleFrame = callback;
+        return unlistenFrame;
+      });
+      m.onPhoneSyncDisconnected.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveDrop = resolve;
+          }),
+      );
+
+      const connecting = useStore.getState().connectRemote("QR");
+      await vi.waitFor(() => expect(m.onPhoneSyncDisconnected).toHaveBeenCalledOnce());
+
+      await useStore.getState().disconnectRemote();
+      staleFrame({ t: "session_list", sessions: [session({ id: "stale" })] });
+      resolveDrop(unlistenDrop);
+      await connecting;
+
+      expect(unlistenFrame).toHaveBeenCalledOnce();
+      expect(unlistenDrop).toHaveBeenCalledOnce();
+      expect(useStore.getState().sessions).toEqual([]);
+      expect(useStore.getState()).toMatchObject({
+        remoteConnected: false,
+        remoteConnecting: false,
+        remoteUnlisten: null,
+      });
+    });
+
+    it("keeps B authoritative when A resolves after A → disconnect → B", async () => {
+      const unlistenFrameA = vi.fn();
+      const unlistenDropA = vi.fn();
+      const unlistenB = vi.fn();
+      const unlistenDropB = vi.fn();
+      let staleFrameA!: (frame: SyncFrame) => void;
+      let staleDropA!: () => void;
+      let resolveDropA!: (unlisten: () => void) => void;
+      let resolveDialB!: (info: {
+        sas: string;
+        peerPublicKey: string;
+        vapidPublicKey?: string;
+      }) => void;
+      m.phoneSyncConnect
+        .mockResolvedValueOnce({ sas: "SAS-A", peerPublicKey: "PEER-A==" })
+        .mockReturnValueOnce(
+          new Promise((resolve) => {
+            resolveDialB = resolve;
+          }),
+        );
+      m.onPhoneSyncFrame
+        .mockImplementationOnce(async (callback) => {
+          staleFrameA = callback;
+          return unlistenFrameA;
+        })
+        .mockResolvedValueOnce(unlistenB);
+      m.onPhoneSyncDisconnected
+        .mockImplementationOnce((callback) => {
+          staleDropA = callback;
+          return new Promise((resolve) => {
+            resolveDropA = resolve;
+          });
+        })
+        .mockResolvedValueOnce(unlistenDropB);
+
+      const connectingA = useStore.getState().connectRemote("QR-A");
+      await vi.waitFor(() => expect(m.onPhoneSyncDisconnected).toHaveBeenCalledOnce());
+      await useStore.getState().disconnectRemote();
+
+      const connectingB = useStore.getState().connectRemote("QR-B");
+      expect(useStore.getState().remoteConnecting).toBe(true);
+
+      resolveDropA(unlistenDropA);
+      await connectingA;
+
+      expect(unlistenFrameA).toHaveBeenCalledOnce();
+      expect(unlistenDropA).toHaveBeenCalledOnce();
+      expect(useStore.getState().remoteConnecting).toBe(true);
+      expect(m.phoneSyncDisconnect).toHaveBeenCalledTimes(1);
+
+      resolveDialB({ sas: "SAS-B", peerPublicKey: "PEER-B==" });
+      await connectingB;
+
+      staleFrameA({ t: "session_list", sessions: [session({ id: "stale-a" })] });
+      staleDropA();
+      expect(useStore.getState()).toMatchObject({
+        remoteConnected: true,
+        remoteConnecting: false,
+        remoteSas: "SAS-B",
+        remotePeerKey: "PEER-B==",
+        remoteDropped: false,
+        lastPairingQr: "QR-B",
+        sessions: [],
+      });
+      expect(m.onPhoneSyncDisconnected).toHaveBeenCalledTimes(2);
+      expect(unlistenB).not.toHaveBeenCalled();
+      expect(unlistenDropB).not.toHaveBeenCalled();
     });
   });
 

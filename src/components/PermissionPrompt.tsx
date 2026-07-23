@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { toolLabel } from "../lib/toolNames";
 import { useStore } from "../store/store";
@@ -15,6 +15,8 @@ export function PermissionPrompt() {
   const denyRef = useRef<HTMLButtonElement>(null);
   const pendingSession = useRef<string | null>(null);
   const wasPending = useRef(false);
+  const answeringId = useRef<string | null>(null);
+  const [answering, setAnswering] = useState(false);
 
   // Focus the safe "Deny" action whenever a new request appears, so a reflexive
   // Enter denies rather than allows. Keyed on the request id so re-renders that
@@ -22,6 +24,14 @@ export function PermissionPrompt() {
   const pendingId = pending?.id;
   useEffect(() => {
     if (pendingId) denyRef.current?.focus();
+  }, [pendingId]);
+
+  // Keep one physical gate answer single-shot even when persisting an
+  // "Always allow" rule takes long enough for a second click or Enter press.
+  // A successor request gets a fresh lock keyed by its own permission id.
+  useEffect(() => {
+    answeringId.current = null;
+    setAnswering(false);
   }, [pendingId]);
 
   // When the prompt clears, the focused Deny button unmounts and focus falls to
@@ -49,9 +59,22 @@ export function PermissionPrompt() {
 
   if (!pending) return null;
 
-  const answer = (decision: "allow" | "deny", always?: boolean): void => {
-    if (activeId && pendingBelongsToRun) void resolve(activeId, pending.id, decision, always);
-    else void resolve(decision, always);
+  const answer = async (decision: "allow" | "deny", always?: boolean): Promise<void> => {
+    if (answeringId.current === pending.id) return;
+    answeringId.current = pending.id;
+    setAnswering(true);
+    try {
+      if (activeId && pendingBelongsToRun) {
+        await resolve(activeId, pending.id, decision, always);
+      } else {
+        await resolve(decision, always);
+      }
+    } finally {
+      if (answeringId.current === pending.id) {
+        answeringId.current = null;
+        setAnswering(false);
+      }
+    }
   };
 
   const label = toolLabel(pending.tool);
@@ -83,25 +106,28 @@ export function PermissionPrompt() {
             Remote approvals apply once. Change persistent permission rules on the desktop.
           </p>
         )}
-        <div className="flex flex-wrap gap-[9px]">
+        <div className="flex flex-wrap gap-[9px]" aria-busy={answering}>
           <button
-            onClick={() => answer("allow")}
-            className="pc-btn-allow px-3.5 py-1.5 text-[12.5px]"
+            onClick={() => void answer("allow")}
+            disabled={answering}
+            className="pc-btn-allow px-3.5 py-1.5 text-[12.5px] disabled:cursor-wait disabled:opacity-60"
           >
             Allow
           </button>
           {rememberable && (
             <button
-              onClick={() => answer("allow", true)}
-              className="pc-btn-deny pc-btn-confirm px-3.5 py-1.5 text-[12.5px]"
+              onClick={() => void answer("allow", true)}
+              disabled={answering}
+              className="pc-btn-deny pc-btn-confirm px-3.5 py-1.5 text-[12.5px] disabled:cursor-wait disabled:opacity-60"
             >
               Always allow
             </button>
           )}
           <button
             ref={denyRef}
-            onClick={() => answer("deny")}
-            className="pc-btn-deny px-3.5 py-1.5 text-[12.5px]"
+            onClick={() => void answer("deny")}
+            disabled={answering}
+            className="pc-btn-deny px-3.5 py-1.5 text-[12.5px] disabled:cursor-wait disabled:opacity-60"
           >
             ⏎ Deny
           </button>
