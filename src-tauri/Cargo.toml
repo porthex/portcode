@@ -51,7 +51,6 @@ futures-util = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["form", "json", "stream", "rustls"] }
 
 async-trait = "0.1"
-anyhow = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 # Cross-platform crash-durable settings replacement: the crate fsyncs the parent
@@ -59,10 +58,9 @@ uuid = { version = "1", features = ["v4"] }
 atomicwrites = "0.4.4"
 rusqlite = { version = "0.40", features = ["bundled"] }
 
-# Subscription OAuth (PKCE S256). All safe Rust. The OAuth constants and flow in
-# `src/oauth.rs` are credited to opencode (MIT) and the official Claude Code CLI.
+# Hashing and encoding used by the durable conversation store, Git review, and
+# end-to-end encrypted Phone Sync protocol.
 sha2 = "0.10"
-hmac = "0.12"
 base64 = "0.22"
 rand = "0.10"
 
@@ -83,8 +81,6 @@ iroh = "1"
 
 # search / matching for tools
 regex = "1"
-globset = "0.4"
-ignore = "0.4"
 similar = "3"
 
 # `keyring` (Windows Credential Manager) only has a working backend on Windows.

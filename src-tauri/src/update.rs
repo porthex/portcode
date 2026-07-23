@@ -18,7 +18,9 @@
 
 #![cfg(desktop)]
 
-use tauri::Emitter;
+use std::future::Future;
+
+use tauri::{Emitter, State};
 use tauri_plugin_updater::UpdaterExt;
 
 /// The release channel selected at compile time. Stable is the safe default;
@@ -125,12 +127,25 @@ pub async fn update_download_and_install(app: tauri::AppHandle) -> Result<bool, 
     Ok(true)
 }
 
-/// Relaunch the app to apply a staged update. `AppHandle::restart` returns `!`,
-/// so this command can never return — no `Result` needed. Used by the UI after
-/// `update_download_and_install` succeeds and the user accepts the restart prompt.
+/// Run a final action only after the supplied shutdown future settles. Keeping
+/// the ordering here makes the updater lifecycle deterministic to unit test.
+async fn after_shutdown<F>(shutdown: F, action: impl FnOnce())
+where
+    F: Future<Output = ()>,
+{
+    shutdown.await;
+    action();
+}
+
 #[tauri::command]
-pub fn update_relaunch(app: tauri::AppHandle) {
-    app.restart();
+pub async fn update_relaunch(
+    app: tauri::AppHandle,
+    state: State<'_, crate::AppState>,
+) -> Result<(), String> {
+    // The supervisor's own shutdown wait is bounded, so a stuck Codex child can
+    // delay but never indefinitely block applying a staged Portcode update.
+    after_shutdown(state.codex.shutdown(), || app.request_restart()).await;
+    Ok(())
 }
 
 /// Report the release channel so the UI can adjust copy.
@@ -141,7 +156,7 @@ pub fn update_channel() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::channel;
+    use super::{after_shutdown, channel};
 
     #[test]
     fn reports_the_compiled_release_channel() {
@@ -149,5 +164,22 @@ mod tests {
         assert_eq!(channel(), "beta");
         #[cfg(not(feature = "beta-channel"))]
         assert_eq!(channel(), "stable");
+    }
+
+    #[tokio::test]
+    async fn relaunch_action_runs_only_after_shutdown_finishes() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let shutdown_events = events.clone();
+        let relaunch_events = events.clone();
+
+        after_shutdown(
+            async move {
+                shutdown_events.lock().unwrap().push("shutdown");
+            },
+            move || relaunch_events.lock().unwrap().push("relaunch"),
+        )
+        .await;
+
+        assert_eq!(*events.lock().unwrap(), ["shutdown", "relaunch"]);
     }
 }

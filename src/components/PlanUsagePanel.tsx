@@ -2,12 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import * as ipc from "../lib/ipc";
 import { useStore } from "../store/store";
-import {
-  openAIAccountLabel,
-  type PlanUsageSnapshot,
-  type PlanUsageWindow,
-  type ProviderId,
-} from "../types";
+import { openAIAccountLabel, type PlanUsageSnapshot, type PlanUsageWindow } from "../types";
 
 interface UsageState {
   snapshot: PlanUsageSnapshot | null;
@@ -121,19 +116,17 @@ function UsageWindowRow({ window }: { window: PlanUsageWindow }) {
   );
 }
 
-interface ProviderUsageCardProps {
-  provider: ProviderId;
+interface PlanUsageCardProps {
   account: string | null;
   tier: string | null;
   signedIn: boolean;
   state: UsageState;
   onRefresh: () => void;
-  onOpenSettings?: (provider: ProviderId) => void;
+  onOpenSettings?: (section: "account") => void;
   ariaLabel?: string;
 }
 
-function ProviderUsageCard({
-  provider,
+function PlanUsageCard({
   account,
   tier,
   signedIn,
@@ -141,32 +134,30 @@ function ProviderUsageCard({
   onRefresh,
   onOpenSettings,
   ariaLabel,
-}: ProviderUsageCardProps) {
-  const isClaude = provider === "anthropic";
-  const name = isClaude ? "Claude" : "GPT";
-  const vendor = isClaude ? "Anthropic" : "OpenAI · Codex";
-  const target = isClaude ? "pc-setting-claude" : "pc-setting-openai";
-  const plan = state.snapshot?.plan ?? tier?.replace(/^(Claude|ChatGPT)\s+/i, "") ?? null;
+}: PlanUsageCardProps) {
+  const plan = state.snapshot?.plan ?? tier?.replace(/^ChatGPT\s+/i, "") ?? null;
   const openAccount = () => {
     if (onOpenSettings) {
-      onOpenSettings(provider);
+      onOpenSettings("account");
       return;
     }
-    document.getElementById(target)?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+    document
+      .getElementById("pc-setting-openai")
+      ?.scrollIntoView?.({ behavior: "smooth", block: "center" });
   };
 
   return (
     <article
-      className={`pc-plan-card pc-plan-card--${isClaude ? "claude" : "openai"}`}
-      aria-label={ariaLabel ?? `${name} plan usage`}
+      className="pc-plan-card pc-plan-card--openai"
+      aria-label={ariaLabel ?? "GPT plan usage"}
     >
       <header className="pc-plan-card__header">
         <span className="pc-plan-card__mark" aria-hidden="true">
-          {isClaude ? "C" : "G"}
+          G
         </span>
         <div className="pc-plan-card__identity">
-          <span>{vendor}</span>
-          <strong>{name}</strong>
+          <span>OpenAI · Codex</span>
+          <strong>GPT</strong>
           {account && <small title={account}>{account}</small>}
         </div>
         {plan && <span className="pc-plan-card__tier">{plan}</span>}
@@ -178,11 +169,11 @@ function ProviderUsageCard({
           <strong>Not connected</strong>
           <p>Sign in to see included-plan limits and reset times.</p>
           <button type="button" onClick={openAccount}>
-            Open {name} account settings
+            Open GPT account settings
           </button>
         </div>
       ) : state.loading && !state.snapshot ? (
-        <div className="pc-plan-card__loading" role="status" aria-label={`Loading ${name} usage`}>
+        <div className="pc-plan-card__loading" role="status" aria-label="Loading GPT usage">
           <span />
           <span />
           <span />
@@ -204,7 +195,7 @@ function ProviderUsageCard({
               type="button"
               onClick={onRefresh}
               disabled={state.loading}
-              aria-label={`Refresh ${name} usage`}
+              aria-label="Refresh GPT usage"
             >
               <span aria-hidden="true">↻</span> {state.loading ? "Refreshing" : "Refresh"}
             </button>
@@ -231,56 +222,42 @@ function ProviderUsageCard({
 
 interface UsageTarget {
   key: string;
-  provider: ProviderId;
   accountProfileId: string | null;
   account: string | null;
   tier: string | null;
   signedIn: boolean;
 }
 
-/** Combined plan allowance view. Every ChatGPT card has its own request key and
- * profile id, so a slow/error response for Account A cannot replace Account B. */
+/** Codex plan allowance view. Codex owns one OpenAI authentication slot;
+ * an explicit historical profile id is still supported for readable old chats. */
 export function PlanUsagePanel({
   compact = false,
-  onlyProvider,
   openAIAccountProfileId,
   onOpenSettings,
   onRemainingChange,
 }: {
   compact?: boolean;
-  onlyProvider?: ProviderId;
   openAIAccountProfileId?: string | null;
-  onOpenSettings?: (provider: ProviderId) => void;
+  onOpenSettings?: (section: "account") => void;
   onRemainingChange?: (remaining: number | null) => void;
 } = {}) {
-  const claude = useStore((state) => state.oauthStatus);
   const openAIStatus = useStore((state) => state.openAIAuthStatus);
   const openAIAccounts = useStore((state) => state.openAIAccounts);
-  const showClaude = onlyProvider !== "openai";
   const openAIAvailable = openAIStatus?.available !== false;
 
   const targets = useMemo<UsageTarget[]>(() => {
     const next: UsageTarget[] = [];
-    if (showClaude) {
-      next.push({
-        key: "anthropic",
-        provider: "anthropic",
-        accountProfileId: null,
-        account: claude?.account ?? null,
-        tier: claude?.tier ?? null,
-        signedIn: Boolean(claude?.signedIn),
-      });
-    }
-    if (onlyProvider === "anthropic") return next;
-
+    const codexAccount =
+      openAIAccounts.find((account) => account.id === "codex-primary") ?? openAIAccounts[0];
     const scopedAccounts = openAIAccountProfileId
       ? openAIAccounts.filter((account) => account.id === openAIAccountProfileId)
-      : openAIAccounts;
+      : codexAccount
+        ? [codexAccount]
+        : [];
     if (scopedAccounts.length > 0) {
       for (const account of scopedAccounts) {
         next.push({
           key: `openai:${account.id}`,
-          provider: "openai",
           accountProfileId: account.id,
           account: openAIAccountLabel(account, openAIAccounts),
           tier: account.tier,
@@ -292,7 +269,6 @@ export function PlanUsagePanel({
       // is intentionally not rendered. The card routes users to account Settings.
       next.push({
         key: `openai:${openAIAccountProfileId}`,
-        provider: "openai",
         accountProfileId: openAIAccountProfileId,
         account: "Removed ChatGPT account",
         tier: null,
@@ -301,7 +277,6 @@ export function PlanUsagePanel({
     } else if (openAIAvailable) {
       next.push({
         key: "openai:none",
-        provider: "openai",
         accountProfileId: null,
         account: null,
         tier: null,
@@ -309,16 +284,7 @@ export function PlanUsagePanel({
       });
     }
     return next;
-  }, [
-    claude?.account,
-    claude?.signedIn,
-    claude?.tier,
-    onlyProvider,
-    openAIAccountProfileId,
-    openAIAccounts,
-    openAIAvailable,
-    showClaude,
-  ]);
+  }, [openAIAccountProfileId, openAIAccounts, openAIAvailable]);
 
   const [states, setStates] = useState<Record<string, UsageState>>({});
   const mounted = useRef(true);
@@ -347,7 +313,7 @@ export function PlanUsagePanel({
       },
     }));
     try {
-      const snapshot = await ipc.getPlanUsage(target.provider, target.accountProfileId);
+      const snapshot = await ipc.getPlanUsage("openai", target.accountProfileId);
       if (!mounted.current || requestIds.current[target.key] !== requestId) return;
       setStates((current) => ({
         ...current,
@@ -389,7 +355,6 @@ export function PlanUsagePanel({
     onRemainingChange(snapshots.length > 0 ? lowestPlanRemaining(snapshots) : null);
   }, [onRemainingChange, snapshots]);
 
-  const openAITargetCount = targets.filter((target) => target.provider === "openai").length;
   return (
     <div className={`pc-plan-usage${compact ? " pc-plan-usage--compact" : ""}`}>
       <div className="pc-plan-usage__toolbar">
@@ -411,22 +376,16 @@ export function PlanUsagePanel({
       </div>
       <div className="pc-plan-usage__grid">
         {targets.map((target) => {
-          const name = target.provider === "openai" ? "GPT" : "Claude";
-          const ariaLabel =
-            target.provider === "openai" && openAITargetCount > 1 && target.account
-              ? `GPT plan usage for ${target.account}`
-              : `${name} plan usage`;
           return (
-            <ProviderUsageCard
+            <PlanUsageCard
               key={target.key}
-              provider={target.provider}
               account={target.account}
               tier={target.tier}
               signedIn={target.signedIn}
               state={states[target.key] ?? EMPTY}
               onRefresh={() => void refresh(target)}
               onOpenSettings={onOpenSettings}
-              ariaLabel={ariaLabel}
+              ariaLabel="GPT plan usage"
             />
           );
         })}

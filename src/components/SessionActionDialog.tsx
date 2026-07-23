@@ -157,8 +157,8 @@ export function SessionActionDialog({
             >
               <p>
                 <strong className="text-fg">{state.session.title}</strong> already started with{" "}
-                <strong className="text-fg">{state.currentAccountLabel}</strong>. Its ChatGPT
-                account cannot change after the first message.
+                <strong className="text-fg">{state.currentAccountLabel}</strong>. Its Codex
+                authentication cannot change after the first message.
               </p>
               <p>
                 Continue with <strong className="text-fg">{state.nextAccountLabel}</strong> in a new

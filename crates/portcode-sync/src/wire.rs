@@ -376,6 +376,33 @@ pub enum StreamEvent {
         exit_code: i32,
         output: String,
     },
+    /// Lossless desktop-local Codex app-server activity. Existing normalized
+    /// variants above keep the chat UX and Phone Sync compatible; this envelope
+    /// preserves every current and future notification/request for the full
+    /// activity inspector without pretending an unknown method is a known tool.
+    CodexEvent {
+        sequence: i64,
+        method: String,
+        params: Value,
+        #[serde(rename = "requestId", default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<Value>,
+        #[serde(rename = "threadId", default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+        #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        #[serde(rename = "itemId", default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        #[serde(rename = "emittedAtMs")]
+        emitted_at_ms: i64,
+    },
+    /// A structured app-server request that requires richer user input than the
+    /// legacy allow/deny permission gate (for example request_user_input or an
+    /// MCP elicitation form). `params` remains lossless and method-specific.
+    CodexRequest {
+        id: String,
+        method: String,
+        params: Value,
+    },
 }
 
 /// A session header row. (Was `crate::db::SessionRow`.)
@@ -770,6 +797,28 @@ mod tests {
                 "turnId": "turn-1",
                 "startedAt": 42
             })
+        );
+    }
+
+    #[test]
+    fn codex_event_preserves_unknown_payloads_and_server_request_identity() {
+        let event = StreamEvent::CodexEvent {
+            sequence: 7,
+            method: "item/futureThing/delta".into(),
+            params: json!({ "future": { "nested": true } }),
+            request_id: Some(json!(99)),
+            thread_id: Some("thread-1".into()),
+            turn_id: Some("turn-1".into()),
+            item_id: Some("item-1".into()),
+            emitted_at_ms: 42,
+        };
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["type"], "codex_event");
+        assert_eq!(encoded["requestId"], 99);
+        assert_eq!(encoded["params"]["future"]["nested"], true);
+        assert_eq!(
+            serde_json::from_value::<StreamEvent>(encoded).unwrap(),
+            event
         );
     }
 

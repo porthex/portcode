@@ -65,7 +65,7 @@ describe("Chat empty state", () => {
       activeId: null,
       messages: {},
       streaming: false,
-      settings: { ...initial.settings, apiKeySet: true },
+      settings: { ...initial.settings },
     });
 
     render(<Chat />);
@@ -112,6 +112,63 @@ describe("Chat empty state", () => {
 });
 
 describe("Chat transcript", () => {
+  it("keeps raw Codex activity out of the chat layout", () => {
+    useStore.setState({
+      activeId: "s1",
+      messages: { s1: [] },
+      streaming: true,
+      codexActivity: {
+        s1: [
+          {
+            sequence: 1,
+            sessionId: "s1",
+            threadId: "thread-1",
+            turnId: "turn-1",
+            itemId: "item-1",
+            method: "item/started",
+            params: { item: { type: "collabAgentToolCall", tool: "spawnAgent" } },
+            emittedAtMs: 10,
+          },
+        ],
+      },
+    });
+
+    render(<Chat />);
+
+    expect(screen.queryByRole("region", { name: "Codex activity" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Agent collaboration started/i)).not.toBeInTheDocument();
+  });
+
+  it("mounts a structured Codex request above the composer", () => {
+    useStore.setState({
+      activeId: "s1",
+      messages: { s1: [] },
+      streaming: true,
+      pendingCodexRequest: {
+        id: "request-1",
+        method: "item/tool/requestUserInput",
+        params: {
+          questions: [
+            {
+              id: "scope",
+              header: "Scope",
+              question: "Which package should Codex change?",
+            },
+          ],
+        },
+      },
+    });
+
+    render(<Chat />);
+
+    const prompt = screen.getByRole("dialog", { name: "Codex needs your input" });
+    const composer = screen.getByTestId("chat-composer-area");
+    expect(prompt).toBeInTheDocument();
+    expect(
+      prompt.compareDocumentPosition(composer) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
   it("renders one MessageView per message, in order, and hides the empty state", () => {
     const messages: Message[] = [
       userMessage("m1", "first question"),
@@ -834,7 +891,7 @@ describe("Chat load-error retry block", () => {
       messages: { s1: [] },
       loadErrors: {},
       streaming: false,
-      settings: { ...initial.settings, apiKeySet: true },
+      settings: { ...initial.settings },
     });
 
     render(<Chat />);
@@ -920,7 +977,7 @@ describe("Chat scroll-to-latest affordance", () => {
       sessions: [session()],
       messages: { s1: [] },
       streaming: false,
-      settings: { ...initial.settings, apiKeySet: true },
+      settings: { ...initial.settings },
     });
 
     const { container } = render(<Chat />);
@@ -1021,12 +1078,13 @@ describe("Chat EmptyState auth affordance", () => {
       messages: {},
       streaming: false,
       remoteMode: false,
-      oauthStatus: null,
-      settings: { ...initial.settings, apiKeySet: false },
+      settings: { ...initial.settings },
     });
 
     render(<Chat />);
-    expect(screen.getByText("Sign in with Claude or add an API key to start")).toBeInTheDocument();
+    expect(
+      screen.getByText("Connect ChatGPT or an OpenAI Platform API key to start"),
+    ).toBeInTheDocument();
   });
 
   it("opens settings when the sign-in nudge button is clicked", () => {
@@ -1036,8 +1094,7 @@ describe("Chat EmptyState auth affordance", () => {
       messages: {},
       streaming: false,
       remoteMode: false,
-      oauthStatus: null,
-      settings: { ...initial.settings, apiKeySet: false },
+      settings: { ...initial.settings },
       setShowSettings,
     });
 
@@ -1046,35 +1103,36 @@ describe("Chat EmptyState auth affordance", () => {
     expect(setShowSettings).toHaveBeenCalledWith(true);
   });
 
-  it("hides the nudge when signed in via OAuth", () => {
+  it("hides the nudge when Codex reports an API-key account", () => {
     useStore.setState({
       activeId: null,
       messages: {},
       streaming: false,
       remoteMode: false,
-      oauthStatus: { signedIn: true, expiresAt: null, account: null, tier: null },
-      settings: { ...initial.settings, apiKeySet: false },
+      openAIAuthStatus: {
+        signedIn: true,
+        expiresAt: null,
+        account: "OpenAI Platform API key",
+        tier: null,
+        available: true,
+      },
+      openAIAccounts: [
+        {
+          id: "codex-primary",
+          accountLabel: "OpenAI Platform API key",
+          tier: null,
+          expiresAt: null,
+          state: "connected",
+          createdAt: 1,
+          updatedAt: 1,
+          lastUsedAt: null,
+        },
+      ],
     });
 
     render(<Chat />);
     expect(
-      screen.queryByText("Sign in with Claude or add an API key to start"),
-    ).not.toBeInTheDocument();
-  });
-
-  it("hides the nudge when an API key is set", () => {
-    useStore.setState({
-      activeId: null,
-      messages: {},
-      streaming: false,
-      remoteMode: false,
-      oauthStatus: null,
-      settings: { ...initial.settings, apiKeySet: true },
-    });
-
-    render(<Chat />);
-    expect(
-      screen.queryByText("Sign in with Claude or add an API key to start"),
+      screen.queryByText("Connect ChatGPT or an OpenAI Platform API key to start"),
     ).not.toBeInTheDocument();
   });
 
@@ -1089,12 +1147,13 @@ describe("Chat EmptyState auth affordance", () => {
         ...initial.settings,
         provider: "openai",
         model: "gpt-5.6-sol",
-        apiKeySet: true,
       },
     });
 
     const { rerender } = render(<Chat />);
-    expect(screen.getByText("Add a ChatGPT account to start")).toBeInTheDocument();
+    expect(
+      screen.getByText("Connect ChatGPT or an OpenAI Platform API key to start"),
+    ).toBeInTheDocument();
 
     const accountProfileId = "00000000-0000-4000-8000-000000000001";
     act(() =>
@@ -1117,10 +1176,10 @@ describe("Chat EmptyState auth affordance", () => {
       }),
     );
     rerender(<Chat />);
-    expect(screen.queryByText("Add a ChatGPT account to start")).toBeNull();
+    expect(screen.queryByText(/Connect ChatGPT or an OpenAI Platform API key/)).toBeNull();
   });
 
-  it("distinguishes default, legacy-unassigned, and removed-account OpenAI empty states", () => {
+  it("hides default-account info while preserving legacy and removed-account recovery", () => {
     const accountProfileId = "00000000-0000-4000-8000-000000000001";
     const account = {
       id: accountProfileId,
@@ -1149,7 +1208,7 @@ describe("Chat EmptyState auth affordance", () => {
       settings: { ...initial.settings, provider: "openai", model: "gpt-5.6-sol" },
     });
     const view = render(<Chat />);
-    expect(screen.getByText("New GPT chats use your default ChatGPT account")).toBeInTheDocument();
+    expect(screen.queryByText(/default ChatGPT account/)).not.toBeInTheDocument();
 
     act(() =>
       useStore.setState({
@@ -1160,7 +1219,7 @@ describe("Chat EmptyState auth affordance", () => {
     );
     view.rerender(<Chat />);
     expect(
-      screen.getByText("Choose a default ChatGPT account in Settings to start"),
+      screen.getByText("Connect ChatGPT or an OpenAI Platform API key in Settings to start"),
     ).toBeInTheDocument();
 
     act(() =>
@@ -1219,7 +1278,7 @@ describe("Chat EmptyState auth affordance", () => {
     expect(useStore.getState().showSettings).toBe(true);
   });
 
-  it("directs unavailable OpenAI builds to Claude instead of asking for ChatGPT sign-in", () => {
+  it("directs unavailable Codex auth to Settings without offering Claude", () => {
     const setShowSettings = vi.fn();
     useStore.setState({
       activeId: null,
@@ -1245,10 +1304,12 @@ describe("Chat EmptyState auth affordance", () => {
     render(<Chat />);
 
     expect(
-      screen.getByText("Disabled in this build. Choose Claude in Settings to start"),
+      screen.getByText(
+        "Disabled in this build. Connect ChatGPT or an OpenAI Platform API key in Settings to start",
+      ),
     ).toBeInTheDocument();
-    expect(screen.queryByText("Sign in with ChatGPT to start")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Choose Claude" }));
+    expect(screen.queryByText(/Choose Claude/i)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Open settings" }));
     expect(setShowSettings).toHaveBeenCalledWith(true);
   });
 
@@ -1258,13 +1319,12 @@ describe("Chat EmptyState auth affordance", () => {
       messages: {},
       streaming: false,
       remoteMode: true,
-      oauthStatus: null,
-      settings: { ...initial.settings, apiKeySet: false },
+      settings: { ...initial.settings },
     });
 
     render(<Chat />);
     expect(
-      screen.queryByText("Sign in with Claude or add an API key to start"),
+      screen.queryByText("Connect ChatGPT or an OpenAI Platform API key to start"),
     ).not.toBeInTheDocument();
   });
 });

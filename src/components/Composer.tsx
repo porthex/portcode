@@ -3,19 +3,17 @@ import { toolPresence } from "../lib/toolNames";
 import { modelsForOpenAIProfile, preferredOpenAIAccount, useStore } from "../store/store";
 import {
   DANGER_MODES,
-  MODEL_PRICING,
-  estimateCost,
+  fastServiceTierForModel,
   modelInfo,
   openAIAccountLabel,
-  providerForModel,
   providerGroups,
+  reasoningEffortForModel,
   reasoningEffortLabel,
   type PermissionMode,
   type ResponseSpeed,
 } from "../types";
 import { SelectMenu } from "./SelectMenu";
 import { ComposerEditor } from "./ComposerEditor";
-import { SessionAccountSwitcher } from "./SessionAccountSwitcher";
 
 /** Read the active session's model, falling back to the global default. */
 function useActiveModel(): string {
@@ -71,21 +69,16 @@ export function Composer() {
   const setShowSettings = useStore((s) => s.setShowSettings);
   const remoteMode = useStore((s) => s.remoteMode);
   const remoteConnected = useStore((s) => s.remoteConnected);
-  const activeModel = useActiveModel();
   const activeSession = useStore((s) =>
     s.activeId
       ? (s.sessions.find((session) => session.id === s.activeId) ??
         (s.pendingSession?.id === s.activeId ? s.pendingSession : undefined))
       : undefined,
   );
-  const openAIModels = useStore((s) =>
-    modelsForOpenAIProfile(activeSession?.accountProfileId, s.openAIModelCatalogs, s.openAIModels),
-  );
   const openAIAccounts = useStore((s) => s.openAIAccounts);
   const defaultOpenAIAccountProfileId = useStore((s) => s.lastOpenAIAccountProfileId);
   const pinSessionOpenAIAccount = useStore((s) => s.pinSessionOpenAIAccount);
   const settings = useStore((s) => s.settings);
-  const oauthStatus = useStore((s) => s.oauthStatus);
   const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
   const settingsError = useStore((s) => s.settingsError);
   const ref = useRef<HTMLDivElement>(null);
@@ -96,23 +89,13 @@ export function Composer() {
   const rowHeightRef = useRef<number | null>(null);
 
   // Send is fireable only with non-whitespace content and no turn in flight.
-  const activeProvider = providerForModel(activeModel, openAIModels);
-  const sessionUsesOpenAI = Boolean(
-    activeSession && (activeSession.accountProfileId != null || activeProvider === "openai"),
-  );
-  const openAIUnavailable = activeProvider === "openai" && openAIAuthStatus?.available === false;
+  const openAIUnavailable = openAIAuthStatus?.available === false;
   const activeOpenAIAccount = activeSession?.accountProfileId
     ? openAIAccounts.find((account) => account.id === activeSession.accountProfileId)
     : undefined;
-  const unassignedOpenAISession = activeProvider === "openai" && !activeSession?.accountProfileId;
+  const unassignedOpenAISession = !activeSession?.accountProfileId;
   useEffect(() => {
-    if (
-      remoteMode ||
-      streaming ||
-      activeProvider !== "openai" ||
-      !activeSession ||
-      activeSession.accountProfileId
-    ) {
+    if (remoteMode || streaming || !activeSession || activeSession.accountProfileId) {
       return;
     }
     const defaultAccount = preferredOpenAIAccount(openAIAccounts, defaultOpenAIAccountProfileId);
@@ -120,7 +103,6 @@ export function Composer() {
       void pinSessionOpenAIAccount(activeSession.id, defaultAccount.id);
     }
   }, [
-    activeProvider,
     activeSession,
     defaultOpenAIAccountProfileId,
     openAIAccounts,
@@ -130,27 +112,18 @@ export function Composer() {
   ]);
   const authenticated =
     (remoteMode && remoteConnected) ||
-    (activeProvider === "openai"
-      ? !openAIUnavailable && activeOpenAIAccount?.state === "connected"
-      : !!oauthStatus?.signedIn || settings.apiKeySet);
-  const authHint =
-    activeProvider === "openai"
-      ? openAIUnavailable
-        ? (openAIAuthStatus?.unavailableReason ??
-          "ChatGPT subscription access is unavailable in this build")
-        : unassignedOpenAISession
-          ? "Choose a default ChatGPT account in Settings to send"
-          : activeOpenAIAccount?.state === "reconnect_required"
-            ? `Reconnect ${openAIAccountLabel(activeOpenAIAccount, openAIAccounts)} in Settings to send`
-            : activeSession?.accountProfileId
-              ? "This session's ChatGPT account is unavailable"
-              : "Add a ChatGPT account in Settings to send"
-      : "Sign in with Claude or add an API key in Settings to send";
-  const authAction = openAIUnavailable
-    ? "Open settings"
-    : activeProvider === "openai"
-      ? "Manage ChatGPT"
-      : "Connect Claude";
+    (!openAIUnavailable && activeOpenAIAccount?.state === "connected");
+  const authHint = openAIUnavailable
+    ? (openAIAuthStatus?.unavailableReason ??
+      "ChatGPT subscription access is unavailable in this build")
+    : unassignedOpenAISession
+      ? "Connect ChatGPT or an OpenAI Platform API key in Settings to send"
+      : activeOpenAIAccount?.state === "reconnect_required"
+        ? `Reconnect ${openAIAccountLabel(activeOpenAIAccount, openAIAccounts)} in Settings to send`
+        : activeSession?.accountProfileId
+          ? "This session's Codex authentication is unavailable"
+          : "Connect ChatGPT or an OpenAI Platform API key in Settings to send";
+  const authAction = "Open settings";
   const historyReady = Boolean(
     activeId &&
     (messageLoad === undefined ||
@@ -220,7 +193,7 @@ export function Composer() {
     el.style.height = "auto";
     const next = Math.min(el.scrollHeight, MAX_TEXTAREA_H);
     // Memoize the single-row height the first time we see a collapsed editor,
-    // so submit() can animate down to a px value instead of snapping via "auto".
+    // so an accepted send can animate down to a px value instead of snapping via "auto".
     if (rowHeightRef.current == null && !text) rowHeightRef.current = el.scrollHeight;
     el.style.height = next + "px";
   }, [text]);
@@ -237,14 +210,17 @@ export function Composer() {
   const submit = async () => {
     const t = text;
     if (!t.trim() || streaming || finalizing || !authenticated || !historyReady) return;
-    setText("");
-    // Collapse to the measured single-row height (a px target) so the declared
-    // transition-[height] can ease the shrink; fall back to "auto" only if we
-    // never captured a row height (e.g. submit before the first layout pass).
-    if (ref.current)
+    const submittedSessionId = activeId;
+    await send(t);
+    // send() owns the acceptance boundary and clears the session draft only after
+    // every model/catalog/settings preflight succeeds. Preserve both the editor
+    // text and its height when a compatibility repair fails, or when the user has
+    // already started typing a follow-up while the command handle was resolving.
+    if (!submittedSessionId || submittedSessionId in useStore.getState().drafts) return;
+    if (ref.current) {
       ref.current.style.height =
         rowHeightRef.current != null ? rowHeightRef.current + "px" : "auto";
-    await send(t);
+    }
   };
 
   return (
@@ -276,9 +252,6 @@ export function Composer() {
             <div className="pc-composer-controls" role="group" aria-label="Turn controls">
               <PermissionPicker />
               <ModelSetupPicker />
-              {!remoteMode && activeSession && sessionUsesOpenAI && (
-                <SessionAccountSwitcher session={activeSession} />
-              )}
             </div>
 
             <div className="pc-composer-state">
@@ -476,14 +449,6 @@ function ModelSetupPicker() {
   const model = useActiveModel();
   const setSessionModel = useStore((s) => s.setSessionModel);
   const activeId = useStore((s) => s.activeId);
-  const activeAccountProfileId = useStore((s) =>
-    s.activeId
-      ? ((
-          s.sessions.find((candidate) => candidate.id === s.activeId) ??
-          (s.pendingSession?.id === s.activeId ? s.pendingSession : undefined)
-        )?.accountProfileId ?? null)
-      : null,
-  );
   const streaming = useStore((s) => s.streaming);
   const remoteMode = useStore((s) => s.remoteMode);
   const openAIModels = useStore((s) => {
@@ -500,13 +465,18 @@ function ModelSetupPicker() {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(false);
   const [panel, setPanel] = useState<SetupPanel>("main");
+  // Portcode now runs every turn through the bundled Codex engine. Keep legacy
+  // model labels readable in history, but never offer Claude as a runnable
+  // choice in the active composer.
   const groups = providerGroups(openAIModels).filter(
-    (provider) =>
-      provider.models.length > 0 && (!activeAccountProfileId || provider.id === "openai"),
+    (provider) => provider.id === "openai" && provider.models.length > 0,
   );
   const current = modelInfo(model, openAIModels);
-  const openAI = providerForModel(model, openAIModels) === "openai";
   const supported = current?.reasoningEfforts ?? [];
+  const fastTier = fastServiceTierForModel(current);
+  const supportsFast = fastTier !== undefined;
+  const effectiveSpeed: ResponseSpeed = supportsFast ? speed : "standard";
+  const effectiveEffort = reasoningEffortForModel(model, effort, openAIModels);
 
   useEffect(() => {
     if (!open) return;
@@ -536,6 +506,16 @@ function ModelSetupPicker() {
     if (streaming) setOpen(false);
   }, [streaming]);
 
+  useEffect(() => {
+    if (supportsFast || panel !== "speed") return;
+    setPanel("main");
+  }, [panel, supportsFast]);
+
+  useEffect(() => {
+    if (!current || supportsFast || speed !== "fast") return;
+    void updateSettings({ responseSpeed: "standard" });
+  }, [current, speed, supportsFast, updateSettings]);
+
   // The desktop owns session models and provider credentials. Until the remote
   // protocol has an authoritative set-model command, showing a phone-side picker
   // would promise a change that the next desktop session snapshot simply reverts.
@@ -550,12 +530,14 @@ function ModelSetupPicker() {
     setPanel("main");
   };
   const commitSpeed = (next: ResponseSpeed) => {
+    if (next === "fast" && !supportsFast) return;
     void updateSettings({ responseSpeed: next });
     setPanel("main");
   };
   const compactModelLabel = (current?.label ?? model)
     .replace(/^GPT[-\s]*/i, "")
     .replace(/^Claude\s+/i, "");
+  const setupControlLabel = supportsFast ? "Model, effort, and speed" : "Model and effort";
 
   return (
     <div ref={rootRef} className="pc-run-setup">
@@ -563,21 +545,21 @@ function ModelSetupPicker() {
         ref={triggerRef}
         type="button"
         className="pc-run-setup__trigger"
-        aria-label="Model, effort, and speed"
+        aria-label={setupControlLabel}
         aria-haspopup="dialog"
         aria-expanded={open}
         disabled={streaming || !activeId}
-        title="Configure model, effort, and speed"
+        title={`Configure ${setupControlLabel.toLowerCase()}`}
         onClick={() => {
           setPanel("main");
           setOpen((currentOpen) => !currentOpen);
         }}
       >
         <span className="pc-run-setup__model">{compactModelLabel}</span>
-        {openAI && supported.length > 0 && (
-          <span className="pc-run-setup__effort">{reasoningEffortLabel(effort)}</span>
+        {supported.length > 0 && (
+          <span className="pc-run-setup__effort">{reasoningEffortLabel(effectiveEffort)}</span>
         )}
-        {openAI && speed === "fast" && (
+        {effectiveSpeed === "fast" && (
           <svg className="pc-run-setup__bolt" viewBox="0 0 12 14" aria-hidden="true">
             <path d="M7.3.8 1.7 8h3.5l-.6 5.2L10.3 6H6.8z" fill="currentColor" />
           </svg>
@@ -600,25 +582,25 @@ function ModelSetupPicker() {
                 value={compactModelLabel}
                 onClick={() => setPanel(panel === "model" ? "main" : "model")}
               />
-              {openAI && supported.length > 0 && (
+              {supported.length > 0 && (
                 <SetupRow
                   label="Effort"
-                  value={reasoningEffortLabel(effort)}
+                  value={reasoningEffortLabel(effectiveEffort)}
                   onClick={() => setPanel(panel === "effort" ? "main" : "effort")}
                 />
               )}
-              {openAI && (
+              {supportsFast && (
                 <SetupRow
                   label="Speed"
-                  value={SPEED_PRESENTATION[speed].label}
+                  value={SPEED_PRESENTATION[effectiveSpeed].label}
                   onClick={() => setPanel(panel === "speed" ? "main" : "speed")}
-                  accent={speed === "fast"}
+                  accent={effectiveSpeed === "fast"}
                 />
               )}
             </div>
           </div>
 
-          {panel !== "main" && (
+          {panel !== "main" && (panel !== "speed" || supportsFast) && (
             <div className={`pc-run-setup__sidecar pc-run-setup__sidecar--${panel}`}>
               <div className="pc-run-setup__sidecar-label">
                 {panel === "model" ? "Model" : panel === "effort" ? "Effort" : "Speed"}
@@ -646,20 +628,24 @@ function ModelSetupPicker() {
                     <SetupOption
                       key={level}
                       label={reasoningEffortLabel(level)}
-                      selected={level === effort}
+                      selected={level === effectiveEffort}
                       onClick={() => commitEffort(level)}
                     />
                   ))}
                 </div>
               )}
-              {panel === "speed" && (
+              {panel === "speed" && supportsFast && (
                 <div role="listbox" aria-label="Response speed" className="pc-run-setup__options">
                   {(Object.keys(SPEED_PRESENTATION) as ResponseSpeed[]).map((value) => (
                     <SetupOption
                       key={value}
                       label={SPEED_PRESENTATION[value].label}
-                      detail={SPEED_PRESENTATION[value].detail}
-                      selected={value === speed}
+                      detail={
+                        value === "fast"
+                          ? fastTier?.description || SPEED_PRESENTATION.fast.detail
+                          : SPEED_PRESENTATION.standard.detail
+                      }
+                      selected={value === effectiveSpeed}
                       icon={value === "fast" ? "bolt" : undefined}
                       onClick={() => commitSpeed(value)}
                     />
@@ -823,16 +809,9 @@ function UsageMeter() {
   });
   const usage = useStore((s) => (s.activeId ? s.usage[s.activeId] : undefined));
   const total = usage ? usage.input + usage.output : 0;
-  const cost = usage ? estimateCost(model, usage) : 0;
-  const openAI = providerForModel(model, openAIModels) === "openai";
   const label = modelInfo(model, openAIModels)?.label ?? model;
   if (total === 0) return null;
-  const costKnown = openAI || Object.prototype.hasOwnProperty.call(MODEL_PRICING, model);
-  const costLabel = openAI
-    ? "ChatGPT plan"
-    : costKnown
-      ? `$${cost.toFixed(cost < 0.01 ? 4 : 2)} estimated`
-      : "Cost unavailable";
+  const costLabel = "Codex plan or API billing";
   return (
     <span
       role="group"

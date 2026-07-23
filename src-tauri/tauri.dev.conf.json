@@ -3,8 +3,8 @@
   "productName": "Portcode Dev",
   "identifier": "dev.porthex.portcode.dev",
   "build": {
-    "beforeDevCommand": "pnpm dev:self",
-    "beforeBuildCommand": "pnpm build:self"
+    "beforeDevCommand": "pnpm codex:runtime && pnpm dev:self",
+    "beforeBuildCommand": "pnpm codex:runtime && pnpm build:self"
   },
   "app": {
     "windows": [

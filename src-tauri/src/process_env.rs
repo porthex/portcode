@@ -71,6 +71,7 @@ const ABSOLUTE_TOOLCHAIN_ROOTS: &[&str] = &[
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ChildKind {
+    #[allow(dead_code)]
     AgentShell,
     ReadOnlyGit,
 }

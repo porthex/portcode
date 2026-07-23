@@ -19,6 +19,10 @@ dist-ssr
 web-dist
 # rust
 src-tauri/target
+# Verified Codex app-server packages are generated from codex-runtime.lock.json.
+# They are intentionally absent from Git and staged atomically before bundling.
+src-tauri/generated/codex-runtime/
+src-tauri/generated/codex-runtime-cache/
 # Workspace build output. Phase 1 of docs/IOS_WEB_CLIENT_PLAN.md turned the repo
 # into a Cargo workspace, so cargo now writes a shared `target/` at the repo root
 # (the per-crate `src-tauri/target` above is kept for any legacy/standalone build).

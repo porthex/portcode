@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 
-import { DEFAULT_SETTINGS, type OpenAIAccountSummary, type Session, type Settings } from "../types";
+import {
+  DEFAULT_SETTINGS,
+  OPENAI_FALLBACK_MODELS,
+  type OpenAIAccountSummary,
+  type Session,
+  type Settings,
+} from "../types";
 import { useStore } from "../store/store";
 import { NewSessionControl, Sidebar } from "./Sidebar";
 
@@ -28,10 +34,6 @@ vi.mock("../lib/ipc", () => ({
   resolvePermission: vi.fn(),
   openFolder: vi.fn(),
   runAgent: vi.fn(),
-  // Subscription sign-in surface, reached transitively via the store.
-  startOauthLogin: vi.fn(),
-  oauthLogout: vi.fn(),
-  oauthStatus: vi.fn(),
 }));
 
 import * as ipc from "../lib/ipc";
@@ -43,7 +45,8 @@ const session = (over: Partial<Session> = {}): Session => ({
   id: "s1",
   title: "Chat",
   workspace: null,
-  model: "claude-opus-4-8",
+  model: "gpt-5.6-terra",
+  accountProfileId: "codex-primary",
   createdAt: 1,
   updatedAt: 1,
   ...over,
@@ -95,6 +98,28 @@ beforeEach(() => {
   localStorage.removeItem("pc.sessionsPanelWidth");
   // zustand has no built-in reset; restore the pristine snapshot each test.
   useStore.setState(initialState, true);
+  useStore.setState({
+    settings: DEFAULT_SETTINGS,
+    openAIAuthStatus: {
+      signedIn: true,
+      expiresAt: null,
+      account: "OpenAI Platform API key",
+      tier: null,
+      available: true,
+    },
+    openAIAccounts: [
+      openAIAccount({
+        id: "codex-primary",
+        accountLabel: "OpenAI Platform API key",
+        tier: null,
+      }),
+    ],
+    openAIModels: OPENAI_FALLBACK_MODELS,
+    openAIModelCatalogs: {
+      "codex-primary": { status: "ready", models: OPENAI_FALLBACK_MODELS, error: null },
+    },
+    lastOpenAIAccountProfileId: "codex-primary",
+  });
 
   m.getMessages.mockResolvedValue([]);
   m.getMessagePage.mockResolvedValue({ messages: [], nextCursor: null });
@@ -154,7 +179,7 @@ describe("Sidebar", () => {
     expect(screen.queryByRole("button", { name: /^Delete session:/ })).not.toBeInTheDocument();
   });
 
-  it("shows a safe ChatGPT account label in OpenAI session metadata", () => {
+  it("shows a safe Codex authentication label in session metadata", () => {
     const account = openAIAccount();
     useStore.setState({
       sessions: [session({ model: "gpt-5.6-sol", accountProfileId: account.id })],
@@ -164,7 +189,7 @@ describe("Sidebar", () => {
 
     const { container } = render(<Sidebar />);
 
-    expect(screen.getByTitle("ChatGPT account: one@chatgpt.test")).toBeInTheDocument();
+    expect(screen.getByTitle("Codex authentication: one@chatgpt.test")).toBeInTheDocument();
     expect(container).toHaveTextContent("one@chatgpt.test");
     expect(container).not.toHaveTextContent(account.id);
   });
@@ -179,8 +204,8 @@ describe("Sidebar", () => {
 
     const { container } = render(<Sidebar />);
 
-    expect(screen.getByTitle("ChatGPT account: removed account")).toBeInTheDocument();
-    expect(container).toHaveTextContent("removed account");
+    expect(screen.getByTitle("Codex authentication: authentication removed")).toBeInTheDocument();
+    expect(container).toHaveTextContent("authentication removed");
     expect(container).not.toHaveTextContent(accountProfileId);
   });
 
@@ -195,9 +220,11 @@ describe("Sidebar", () => {
 
     const { container } = render(<Sidebar />);
 
-    expect(screen.getByTitle("ChatGPT account: account unavailable")).toBeInTheDocument();
-    expect(container).toHaveTextContent("account unavailable");
-    expect(container).not.toHaveTextContent("removed account");
+    expect(
+      screen.getByTitle("Codex authentication: authentication unavailable"),
+    ).toBeInTheDocument();
+    expect(container).toHaveTextContent("authentication unavailable");
+    expect(container).not.toHaveTextContent("authentication removed");
     expect(container).not.toHaveTextContent(accountProfileId);
   });
 
@@ -463,57 +490,36 @@ describe("Sidebar", () => {
     expect(useStore.getState().showSettings).toBe(true);
   });
 
-  it("shows the KEY SET indicator when a key is configured", () => {
-    useStore.setState({ settings: settings({ apiKeySet: true }) });
-
+  it("uses one Codex indicator for the connected authentication slot", () => {
     const { container } = render(<Sidebar />);
 
-    // The redesign surfaces a configured key as a "KEY SET" label plus a
-    // pulsing ring dot (.pc-dot--ring), both gated on settings.apiKeySet.
-    expect(screen.getByText("KEY SET")).toBeInTheDocument();
+    expect(screen.getByText("CODEX")).toBeInTheDocument();
+    expect(screen.queryByText("KEY SET")).toBeNull();
     expect(container.querySelector(".pc-dot--ring")).not.toBeNull();
   });
 
-  it("hides the KEY SET indicator when no key is configured", () => {
-    useStore.setState({ settings: settings({ apiKeySet: false }) });
-
-    const { container } = render(<Sidebar />);
-
-    // With no key, neither the label nor the ring dot render.
-    expect(screen.queryByText("KEY SET")).not.toBeInTheDocument();
-    expect(container.querySelector(".pc-dot--ring")).toBeNull();
-  });
-
-  it("shows the CLAUDE indicator when signed in via subscription (no API key)", () => {
+  it("hides the Codex indicator when its authentication slot is disconnected", () => {
     useStore.setState({
-      settings: settings({ apiKeySet: false }),
-      oauthStatus: {
-        signedIn: true,
-        expiresAt: null,
-        account: "you@claude.ai",
-        tier: "Claude Max",
-      },
+      openAIAuthStatus: null,
+      openAIAccounts: [],
     });
 
     const { container } = render(<Sidebar />);
 
-    // Signed in with Claude still surfaces the auth indicator, labelled CLAUDE
-    // (subscription) rather than KEY SET, with the same pulsing ring dot.
-    expect(screen.getByText("CLAUDE")).toBeInTheDocument();
-    expect(screen.queryByText("KEY SET")).not.toBeInTheDocument();
-    expect(container.querySelector(".pc-dot--ring")).not.toBeNull();
+    expect(screen.queryByText("CODEX")).not.toBeInTheDocument();
+    expect(container.querySelector(".pc-dot--ring")).toBeNull();
   });
 
   // The footer used to render hardcoded fake telemetry ("◴ 32 MB RAM", "◉ 6 MB")
   // that masqueraded as live system stats. Those numbers were static placeholders
   // and there is no backend command to source them. The chrome now shows only
   // honest, real-state labels — mirroring the StatusHud honesty fix.
-  it("uses the active OpenAI model's ChatGPT auth indicator", () => {
+  it("uses the active Codex account's unified auth indicator", () => {
     const account = openAIAccount();
     useStore.setState({
       sessions: [session({ model: "gpt-5.6-sol", accountProfileId: account.id })],
       activeId: "s1",
-      settings: settings({ provider: "openai", model: "gpt-5.6-sol", apiKeySet: true }),
+      settings: settings({ provider: "openai", model: "gpt-5.6-sol" }),
       openAIAuthStatus: {
         signedIn: true,
         expiresAt: null,
@@ -525,7 +531,7 @@ describe("Sidebar", () => {
 
     render(<Sidebar />);
 
-    expect(screen.getByText("OPENAI")).toBeInTheDocument();
+    expect(screen.getByText("CODEX")).toBeInTheDocument();
     expect(screen.queryByText("KEY SET")).toBeNull();
   });
 

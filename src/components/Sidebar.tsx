@@ -13,10 +13,9 @@ import {
   type SidebarRow,
   type SessionActivityStatus,
 } from "../lib/sessionView";
-import { modelsForOpenAIProfile, useStore } from "../store/store";
+import { useStore } from "../store/store";
 import {
   openAIAccountLabel,
-  providerForModel,
   type Session,
   type SessionFolder,
   type SessionGroup,
@@ -140,13 +139,9 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   const deleteSession = useStore((s) => s.deleteSession);
   const renameSession = useStore((s) => s.renameSession);
   const setShowSettings = useStore((s) => s.setShowSettings);
-  const settings = useStore((s) => s.settings);
-  const oauthStatus = useStore((s) => s.oauthStatus);
   const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
-  const openAIModels = useStore((s) => s.openAIModels);
   const openAIAccounts = useStore((s) => s.openAIAccounts);
   const openAIAccountsError = useStore((s) => s.openAIAccountsError);
-  const openAIModelCatalogs = useStore((s) => s.openAIModelCatalogs);
 
   const sortBy = useStore((s) => s.sortBy);
   const groupBy = useStore((s) => s.groupBy);
@@ -165,38 +160,23 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   const toggleArchived = useStore((s) => s.toggleArchived);
   const setSidebarCollapsed = useStore((s) => s.setSidebarCollapsed);
 
-  const signedInClaude = !!oauthStatus?.signedIn;
   const pendingSession = useStore((s) => s.pendingSession);
   const activeSession =
     sessions.find((session) => session.id === activeId) ??
     (pendingSession?.id === activeId ? pendingSession : undefined);
-  const activeModel = activeSession?.model ?? settings.model;
-  const activeModels = modelsForOpenAIProfile(
-    activeSession?.accountProfileId,
-    openAIModelCatalogs,
-    openAIModels,
-  );
-  const activeProvider = providerForModel(activeModel, activeModels);
   const activeAccount = activeSession?.accountProfileId
     ? openAIAccounts.find((account) => account.id === activeSession.accountProfileId)
-    : undefined;
+    : openAIAccounts.find((account) => account.state === "connected");
   const signedInOpenAI =
     openAIAuthStatus?.available !== false && activeAccount?.state === "connected";
-  const authed =
-    activeProvider === "openai" ? signedInOpenAI : signedInClaude || settings.apiKeySet;
+  const authed = signedInOpenAI;
   const authTitle =
-    activeProvider === "openai"
-      ? signedInOpenAI
-        ? `Using ${openAIAccountLabel(activeAccount, openAIAccounts)}`
-        : activeSession?.accountProfileId
-          ? "This ChatGPT account needs attention"
-          : "Choose a default ChatGPT account in Settings"
-      : signedInClaude
-        ? "Signed in with Claude"
-        : settings.apiKeySet
-          ? "API key set"
-          : "Not authenticated";
-  const authLabel = activeProvider === "openai" ? "OPENAI" : signedInClaude ? "CLAUDE" : "KEY SET";
+    signedInOpenAI && activeAccount
+      ? `Using ${openAIAccountLabel(activeAccount, openAIAccounts)}`
+      : activeSession?.accountProfileId
+        ? "This Codex account needs attention"
+        : "Connect ChatGPT or an OpenAI Platform API key in Settings";
+  const authLabel = "CODEX";
 
   // Which sort/group popover is open (transient, instance-local). Only one at a time.
   const [menu, setMenu] = useState<"sort" | "group" | null>(null);
@@ -732,25 +712,16 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
     const meta = s.branch
       ? `${s.branch} · ${workspaceLabel(s.workspace)}`
       : workspaceLabel(s.workspace);
-    const sessionModels = modelsForOpenAIProfile(
-      s.accountProfileId,
-      openAIModelCatalogs,
-      openAIModels,
-    );
-    const sessionProvider = providerForModel(s.model, sessionModels);
     const sessionAccount = s.accountProfileId
       ? openAIAccounts.find((account) => account.id === s.accountProfileId)
       : undefined;
-    const accountMeta =
-      sessionProvider === "openai"
-        ? sessionAccount
-          ? openAIAccountLabel(sessionAccount, openAIAccounts)
-          : s.accountProfileId
-            ? openAIAccountsError
-              ? "account unavailable"
-              : "removed account"
-            : "default account pending"
-        : null;
+    const accountMeta = sessionAccount
+      ? openAIAccountLabel(sessionAccount, openAIAccounts)
+      : s.accountProfileId
+        ? openAIAccountsError
+          ? "authentication unavailable"
+          : "authentication removed"
+        : "default authentication pending";
     const rowEl = (
       <div
         key={s.id}
@@ -886,7 +857,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
                     className={
                       sessionAccount?.state === "connected" ? "text-accent-2" : "text-warn"
                     }
-                    title={`ChatGPT account: ${accountMeta}`}
+                    title={`Codex authentication: ${accountMeta}`}
                   >
                     {" "}
                     · {accountMeta}
@@ -1244,12 +1215,8 @@ function SessionRail() {
   const archivedIds = useStore((s) => s.archivedIds);
   const setShowSettings = useStore((s) => s.setShowSettings);
   const setSidebarCollapsed = useStore((s) => s.setSidebarCollapsed);
-  const settings = useStore((s) => s.settings);
-  const oauthStatus = useStore((s) => s.oauthStatus);
   const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
-  const openAIModels = useStore((s) => s.openAIModels);
   const openAIAccounts = useStore((s) => s.openAIAccounts);
-  const openAIModelCatalogs = useStore((s) => s.openAIModelCatalogs);
   const activeId = useStore((s) => s.activeId);
   const activeSessionCount = useMemo(() => {
     const archived = new Set(archivedIds);
@@ -1260,30 +1227,16 @@ function SessionRail() {
   const activeSession =
     sessions.find((session) => session.id === activeId) ??
     (pendingSession?.id === activeId ? pendingSession : undefined);
-  const activeModel = activeSession?.model ?? settings.model;
-  const activeProvider = providerForModel(
-    activeModel,
-    modelsForOpenAIProfile(activeSession?.accountProfileId, openAIModelCatalogs, openAIModels),
-  );
   const activeAccount = activeSession?.accountProfileId
     ? openAIAccounts.find((account) => account.id === activeSession.accountProfileId)
-    : undefined;
-  const authed =
-    activeProvider === "openai"
-      ? openAIAuthStatus?.available !== false && activeAccount?.state === "connected"
-      : !!oauthStatus?.signedIn || settings.apiKeySet;
+    : openAIAccounts.find((account) => account.state === "connected");
+  const authed = openAIAuthStatus?.available !== false && activeAccount?.state === "connected";
   const authTitle =
-    activeProvider === "openai"
-      ? activeAccount?.state === "connected"
-        ? `Using ${openAIAccountLabel(activeAccount, openAIAccounts)}`
-        : activeSession?.accountProfileId
-          ? "This ChatGPT account needs attention"
-          : "Choose a default ChatGPT account in Settings"
-      : oauthStatus?.signedIn
-        ? "Signed in with Claude"
-        : settings.apiKeySet
-          ? "API key set"
-          : "Not authenticated";
+    activeAccount?.state === "connected"
+      ? `Using ${openAIAccountLabel(activeAccount, openAIAccounts)}`
+      : activeSession?.accountProfileId
+        ? "This Codex account needs attention"
+        : "Connect ChatGPT or an OpenAI Platform API key in Settings";
 
   return (
     <aside

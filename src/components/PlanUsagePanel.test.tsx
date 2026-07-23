@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as ipc from "../lib/ipc";
 import { useStore } from "../store/store";
-import type { OpenAIAccountSummary, PlanUsageSnapshot, ProviderId } from "../types";
+import type { OpenAIAccountSummary, PlanUsageSnapshot } from "../types";
 import { PlanUsagePanel } from "./PlanUsagePanel";
 
 vi.mock("../lib/ipc", () => ({
@@ -25,19 +25,16 @@ const account = (over: Partial<OpenAIAccountSummary> = {}): OpenAIAccountSummary
   ...over,
 });
 
-function usage(
-  provider: ProviderId,
-  overrides: Partial<PlanUsageSnapshot> = {},
-): PlanUsageSnapshot {
+function usage(overrides: Partial<PlanUsageSnapshot> = {}): PlanUsageSnapshot {
   return {
-    provider,
-    plan: provider === "openai" ? "Plus" : "Max",
+    provider: "openai",
+    plan: "Plus",
     updatedAt: Math.floor(Date.now() / 1000),
     windows: [
       {
         id: "session",
         label: "Current session",
-        usedPercent: provider === "openai" ? 20 : 78,
+        usedPercent: 20,
         resetsAt: String(Math.floor(Date.now() / 1000) + 30 * 60),
         windowMinutes: 300,
       },
@@ -52,20 +49,41 @@ beforeEach(() => {
 });
 
 describe("PlanUsagePanel", () => {
-  it("keeps both providers disconnected and disables refresh while signed out", () => {
-    render(<PlanUsagePanel />);
+  it("routes the disconnected card to the Codex account section", () => {
+    const onOpenSettings = vi.fn();
+    render(<PlanUsagePanel onOpenSettings={onOpenSettings} />);
 
-    expect(screen.getAllByText("Not connected")).toHaveLength(2);
-    expect(screen.getByRole("button", { name: "Refresh all plan usage" })).toBeDisabled();
-    expect(m.getPlanUsage).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Open GPT account settings" }));
+
+    expect(onOpenSettings).toHaveBeenCalledWith("account");
   });
 
-  it("can scope the quick view to only the active chat provider", () => {
-    render(<PlanUsagePanel onlyProvider="openai" />);
+  it("falls back to scrolling the Codex account control into view", () => {
+    const scrollIntoView = vi.fn();
+    render(
+      <>
+        <div
+          id="pc-setting-openai"
+          ref={(node) => {
+            if (node) node.scrollIntoView = scrollIntoView;
+          }}
+        />
+        <PlanUsagePanel />
+      </>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Open GPT account settings" }));
+
+    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "center" });
+  });
+
+  it("keeps the Codex account disconnected and disables refresh while signed out", () => {
+    render(<PlanUsagePanel />);
 
     expect(screen.getByRole("article", { name: "GPT plan usage" })).toBeInTheDocument();
     expect(screen.queryByRole("article", { name: "Claude plan usage" })).not.toBeInTheDocument();
-    expect(screen.getAllByText("Not connected")).toHaveLength(1);
+    expect(screen.getByText("Not connected")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh all plan usage" })).toBeDisabled();
     expect(m.getPlanUsage).not.toHaveBeenCalled();
   });
 
@@ -84,19 +102,12 @@ describe("PlanUsagePanel", () => {
     render(<PlanUsagePanel />);
 
     expect(screen.queryByRole("article", { name: "GPT plan usage" })).not.toBeInTheDocument();
-    expect(screen.getByRole("article", { name: "Claude plan usage" })).toBeInTheDocument();
-    expect(screen.getAllByText("Not connected")).toHaveLength(1);
+    expect(screen.queryByRole("article", { name: "Claude plan usage" })).not.toBeInTheDocument();
     expect(m.getPlanUsage).not.toHaveBeenCalled();
   });
 
-  it("loads both providers independently and refreshes one account", async () => {
+  it("loads and refreshes only the Codex account", async () => {
     useStore.setState({
-      oauthStatus: {
-        signedIn: true,
-        expiresAt: null,
-        account: "claude@example.com",
-        tier: "Claude Max",
-      },
       openAIAuthStatus: {
         signedIn: true,
         expiresAt: null,
@@ -105,20 +116,16 @@ describe("PlanUsagePanel", () => {
       },
       openAIAccounts: [account()],
     });
-    m.getPlanUsage.mockImplementation(async (provider) => usage(provider));
+    m.getPlanUsage.mockResolvedValue(usage());
 
     render(<PlanUsagePanel />);
 
     const gptCard = screen.getByRole("article", { name: "GPT plan usage" });
-    const claudeCard = screen.getByRole("article", { name: "Claude plan usage" });
     expect(
       await within(gptCard).findByRole("progressbar", { name: "Current session remaining" }),
     ).toHaveAttribute("aria-valuenow", "80");
-    expect(
-      await within(claudeCard).findByRole("progressbar", { name: "Current session remaining" }),
-    ).toHaveAttribute("aria-valuenow", "22");
     expect(within(gptCard).getByText("gpt@example.com")).toBeInTheDocument();
-    expect(within(claudeCard).getByText("claude@example.com")).toBeInTheDocument();
+    expect(screen.queryByRole("article", { name: "Claude plan usage" })).not.toBeInTheDocument();
     expect(within(gptCard).getByText(/Resets in/)).toBeInTheDocument();
 
     fireEvent.click(within(gptCard).getByRole("button", { name: "Refresh GPT usage" }));
@@ -128,14 +135,14 @@ describe("PlanUsagePanel", () => {
       ),
     );
     expect(m.getPlanUsage).toHaveBeenCalledWith("openai", "00000000-0000-4000-8000-000000000001");
-    expect(m.getPlanUsage).toHaveBeenCalledWith("anthropic", null);
+    expect(m.getPlanUsage.mock.calls.every(([provider]) => provider === "openai")).toBe(true);
   });
 
-  it("renders and requests each ChatGPT profile independently", async () => {
-    const first = account();
-    const second = account({
+  it("renders and requests only the codex-primary authentication slot", async () => {
+    const primary = account({ id: "codex-primary" });
+    const stale = account({
       id: "00000000-0000-4000-8000-000000000002",
-      accountLabel: "second@chatgpt.test",
+      accountLabel: "stale@chatgpt.test",
     });
     useStore.setState({
       openAIAuthStatus: {
@@ -145,15 +152,15 @@ describe("PlanUsagePanel", () => {
         tier: null,
         available: true,
       },
-      openAIAccounts: [first, second],
+      openAIAccounts: [stale, primary],
     });
-    m.getPlanUsage.mockImplementation(async (provider, accountProfileId) =>
-      usage(provider, {
+    m.getPlanUsage.mockImplementation(async (_provider, accountProfileId) =>
+      usage({
         windows: [
           {
             id: "session",
             label: "Current session",
-            usedPercent: accountProfileId === second.id ? 60 : 20,
+            usedPercent: accountProfileId === primary.id ? 20 : 60,
             resetsAt: null,
             windowMinutes: 300,
           },
@@ -161,31 +168,22 @@ describe("PlanUsagePanel", () => {
       }),
     );
 
-    render(<PlanUsagePanel onlyProvider="openai" />);
+    render(<PlanUsagePanel />);
 
-    const firstCard = screen.getByRole("article", {
-      name: "GPT plan usage for gpt@example.com",
-    });
-    const secondCard = screen.getByRole("article", {
-      name: "GPT plan usage for second@chatgpt.test",
-    });
+    const card = screen.getByRole("article", { name: "GPT plan usage" });
     expect(
-      await within(firstCard).findByRole("progressbar", {
+      await within(card).findByRole("progressbar", {
         name: "Current session remaining",
       }),
     ).toHaveAttribute("aria-valuenow", "80");
-    expect(
-      await within(secondCard).findByRole("progressbar", {
-        name: "Current session remaining",
-      }),
-    ).toHaveAttribute("aria-valuenow", "40");
-    expect(m.getPlanUsage).toHaveBeenCalledWith("openai", first.id);
-    expect(m.getPlanUsage).toHaveBeenCalledWith("openai", second.id);
+    expect(screen.queryByText("stale@chatgpt.test")).toBeNull();
+    expect(m.getPlanUsage).toHaveBeenCalledWith("openai", primary.id);
+    expect(m.getPlanUsage).not.toHaveBeenCalledWith("openai", stale.id);
   });
 
   it("never exposes a missing profile UUID in the scoped removed-account card", () => {
     const missing = "00000000-0000-4000-8000-000000000009";
-    render(<PlanUsagePanel onlyProvider="openai" openAIAccountProfileId={missing} />);
+    render(<PlanUsagePanel openAIAccountProfileId={missing} />);
 
     expect(screen.getByText("Removed ChatGPT account")).toBeInTheDocument();
     expect(screen.queryByText(missing)).not.toBeInTheDocument();
@@ -203,7 +201,7 @@ describe("PlanUsagePanel", () => {
       openAIAccounts: [account()],
     });
     m.getPlanUsage.mockResolvedValueOnce(
-      usage("openai", {
+      usage({
         updatedAt: Math.floor(Date.now() / 1000) - 2 * 60 * 60,
         windows: [
           {
@@ -234,19 +232,21 @@ describe("PlanUsagePanel", () => {
     ).toHaveAttribute("aria-valuenow", "5");
   });
 
-  it("shows an initial provider error and recovers through Refresh all", async () => {
+  it("shows an initial Codex usage error and recovers through Refresh all", async () => {
     useStore.setState({
-      oauthStatus: {
+      openAIAuthStatus: {
         signedIn: true,
         expiresAt: null,
         account: null,
-        tier: "Claude Pro",
+        tier: "ChatGPT Pro",
+        available: true,
       },
+      openAIAccounts: [account({ tier: "ChatGPT Pro" })],
     });
     m.getPlanUsage
-      .mockRejectedValueOnce(new Error("Claude usage unavailable"))
+      .mockRejectedValueOnce(new Error("Codex usage unavailable"))
       .mockResolvedValueOnce(
-        usage("anthropic", {
+        usage({
           plan: null,
           windows: [
             {
@@ -261,9 +261,9 @@ describe("PlanUsagePanel", () => {
       );
 
     render(<PlanUsagePanel />);
-    const card = screen.getByRole("article", { name: "Claude plan usage" });
+    const card = screen.getByRole("article", { name: "GPT plan usage" });
     expect(await within(card).findByText("Usage unavailable")).toBeInTheDocument();
-    expect(within(card).getByRole("alert")).toHaveTextContent("Claude usage unavailable");
+    expect(within(card).getByRole("alert")).toHaveTextContent("Codex usage unavailable");
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh all plan usage" }));
 

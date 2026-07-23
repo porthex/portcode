@@ -20,9 +20,6 @@ pub struct Settings {
     /// settings files while the UI currently exposes standard and fast.
     #[serde(default = "default_response_speed")]
     pub response_speed: String,
-    /// Derived from the OS credential store at read time; never the source of truth.
-    #[serde(default)]
-    pub api_key_set: bool,
     /// Legacy global policy (allow/ask/deny). Retained for back-compat: it is the
     /// `Default` permission mode's fallthrough, so a settings file written before
     /// modes existed behaves identically. New, finer control lives in
@@ -133,11 +130,10 @@ fn confirm_parent_durability(_directory: &Path) -> std::io::Result<()> {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            provider: "anthropic".into(),
-            model: "claude-opus-4-8".into(),
+            provider: "openai".into(),
+            model: "gpt-5.6-terra".into(),
             reasoning_effort: default_reasoning_effort(),
             response_speed: default_response_speed(),
-            api_key_set: false,
             default_policy: "ask".into(),
             workspace: None,
             typing_animation: default_typing_animation(),
@@ -156,10 +152,18 @@ impl Settings {
     }
 
     pub fn load(dir: &Path) -> Self {
-        match std::fs::read_to_string(Self::path(dir)) {
+        let mut settings = match std::fs::read_to_string(Self::path(dir)) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
             Err(_) => Self::default(),
+        };
+        if settings.provider != "openai"
+            || settings.model.trim().is_empty()
+            || settings.model.starts_with("claude-")
+        {
+            settings.provider = "openai".to_string();
+            settings.model = "gpt-5.6-terra".to_string();
         }
+        settings
     }
 
     /// Persist settings without exposing a partially-written `settings.json`.
@@ -445,6 +449,11 @@ mod tests {
         // unchanged — no silent safety downgrade or settings wipe.
         assert_eq!(s.permission_mode, PermissionMode::Default);
         assert!(s.rules.is_empty());
+        let serialized = serde_json::to_string(&s).unwrap();
+        assert!(
+            !serialized.contains("\"apiKeySet\""),
+            "the retired credential flag must not be written back"
+        );
     }
 
     #[test]

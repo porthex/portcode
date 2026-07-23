@@ -69,39 +69,30 @@ describe("Tauri command serialization", () => {
 
   it("get_settings is invoked with no arguments", async () => {
     const { ipc, invoke } = await load();
-    const settings = { provider: "anthropic" };
+    const settings = { provider: "openai" };
     invoke.mockResolvedValue(settings);
     await expect(ipc.getSettings()).resolves.toBe(settings);
     expect(invoke).toHaveBeenCalledWith("get_settings");
   });
 
-  it("save_settings wraps the patch under a `settings` key", async () => {
+  it("save_settings wraps Codex patches and normalizes retired provider values", async () => {
     const { ipc, invoke } = await load();
-    const patch = { model: "claude-sonnet-4-6" };
+    const patch = { model: "gpt-5.6-sol" };
     invoke.mockResolvedValue({ ...patch });
     await ipc.saveSettings(patch);
     expect(invoke).toHaveBeenCalledWith("save_settings", { settings: patch });
+
+    await ipc.saveSettings({ provider: "anthropic", model: "claude-sonnet-4-6" });
+    expect(invoke).toHaveBeenLastCalledWith("save_settings", {
+      settings: { provider: "openai", model: "gpt-5.6-terra" },
+    });
   });
 
-  it("set_api_key forwards the raw key", async () => {
+  it("the legacy setApiKey alias authenticates through the Codex engine", async () => {
     const { ipc, invoke } = await load();
     invoke.mockResolvedValue(undefined);
     await ipc.setApiKey("sk-123");
-    expect(invoke).toHaveBeenCalledWith("set_api_key", { key: "sk-123" });
-  });
-
-  it("oauth commands invoke their core counterparts with no arguments", async () => {
-    const { ipc, invoke } = await load();
-    const status = { signedIn: true, expiresAt: 123, account: "a@b.co", tier: "Claude Max" };
-    invoke.mockResolvedValue(status);
-    await expect(ipc.startOauthLogin()).resolves.toBe(status);
-    expect(invoke).toHaveBeenCalledWith("start_oauth_login");
-    await expect(ipc.oauthStatus()).resolves.toBe(status);
-    expect(invoke).toHaveBeenCalledWith("oauth_status");
-
-    invoke.mockResolvedValue(undefined);
-    await expect(ipc.oauthLogout()).resolves.toBeUndefined();
-    expect(invoke).toHaveBeenCalledWith("oauth_logout");
+    expect(invoke).toHaveBeenCalledWith("codex_login_api_key", { apiKey: "sk-123" });
   });
 
   it("OpenAI capability status and model catalogue invoke their scoped counterparts", async () => {
@@ -120,15 +111,15 @@ describe("Tauri command serialization", () => {
       },
     ];
     invoke.mockResolvedValue(models);
-    await expect(ipc.openaiModels("00000000-0000-4000-8000-000000000001")).resolves.toBe(models);
+    await expect(ipc.openaiModels("codex-primary")).resolves.toBe(models);
     expect(invoke).toHaveBeenCalledWith("openai_models", {
-      accountProfileId: "00000000-0000-4000-8000-000000000001",
+      accountProfileId: "codex-primary",
     });
   });
 
-  it("serializes multi-account registry commands with opaque profile ids", async () => {
+  it("serializes Codex-slot commands with the canonical local profile id", async () => {
     const { ipc, invoke } = await load();
-    const accountProfileId = "00000000-0000-4000-8000-000000000001";
+    const accountProfileId = "codex-primary";
     const summary = {
       id: accountProfileId,
       accountLabel: "one@chatgpt.test",
@@ -163,7 +154,7 @@ describe("Tauri command serialization", () => {
     const idToken = "oauth-id-secret";
     const rawRemoteAccountId = "acct_remote_secret";
     const leakedNativeAccount = {
-      id: "00000000-0000-4000-8000-000000000001",
+      id: "codex-primary",
       accountLabel: "one@chatgpt.test",
       tier: "Plus",
       expiresAt: 123,
@@ -241,26 +232,28 @@ describe("Tauri command serialization", () => {
     };
     invoke.mockResolvedValue(snapshot);
 
-    const accountProfileId = "00000000-0000-4000-8000-000000000001";
+    const accountProfileId = "codex-primary";
     await expect(ipc.getPlanUsage("openai", accountProfileId)).resolves.toBe(snapshot);
     expect(invoke).toHaveBeenCalledWith("get_plan_usage", {
       provider: "openai",
       accountProfileId,
     });
-    await ipc.getPlanUsage("anthropic");
-    expect(invoke).toHaveBeenLastCalledWith("get_plan_usage", {
-      provider: "anthropic",
-      accountProfileId: null,
-    });
   });
 
-  it("resolve_permission forwards id + decision", async () => {
+  it("resolve_permission forwards one-shot and session-scoped decisions", async () => {
     const { ipc, invoke } = await load();
     invoke.mockResolvedValue(undefined);
     await ipc.resolvePermission("perm-1", "deny");
     expect(invoke).toHaveBeenCalledWith("resolve_permission", {
       id: "perm-1",
       decision: "deny",
+      forSession: false,
+    });
+    await ipc.resolvePermission("perm-2", "allow", true);
+    expect(invoke).toHaveBeenCalledWith("resolve_permission", {
+      id: "perm-2",
+      decision: "allow",
+      forSession: true,
     });
   });
 
@@ -277,14 +270,8 @@ describe("Tauri command serialization", () => {
     const { ipc, invoke } = await load();
     invoke.mockResolvedValue(undefined);
     await ipc.createSession("s1", "Title", "C:/ws");
-    await ipc.createSession(
-      "s2",
-      "OpenAI",
-      null,
-      "gpt-5.6-sol",
-      "00000000-0000-4000-8000-000000000001",
-    );
-    await ipc.pinSessionOpenAIAccount("legacy", "00000000-0000-4000-8000-000000000001");
+    await ipc.createSession("s2", "OpenAI", null, "gpt-5.6-sol", "codex-primary");
+    await ipc.pinSessionOpenAIAccount("legacy", "codex-primary");
     await ipc.renameSession("s1", "Renamed");
     await ipc.updateSessionModel("s1", "gpt-5.6-sol");
     await ipc.deleteSession("s1");
@@ -302,11 +289,11 @@ describe("Tauri command serialization", () => {
       title: "OpenAI",
       workspace: null,
       model: "gpt-5.6-sol",
-      accountProfileId: "00000000-0000-4000-8000-000000000001",
+      accountProfileId: "codex-primary",
     });
     expect(invoke).toHaveBeenCalledWith("pin_session_openai_account", {
       sessionId: "legacy",
-      accountProfileId: "00000000-0000-4000-8000-000000000001",
+      accountProfileId: "codex-primary",
       model: null,
     });
     expect(invoke).toHaveBeenCalledWith("rename_session", { id: "s1", title: "Renamed" });
@@ -703,14 +690,13 @@ describe("browser fallback (no Tauri core)", () => {
   it("getSettings returns the mock defaults without touching invoke", async () => {
     const { ipc, invoke } = await load();
     await expect(ipc.getSettings()).resolves.toEqual({
-      provider: "anthropic",
-      model: "claude-opus-4-8",
+      provider: "openai",
+      model: "gpt-5.6-terra",
       reasoningEffort: "medium",
       responseSpeed: "standard",
-      apiKeySet: false,
       defaultPolicy: "ask",
       workspace: null,
-      typingAnimation: true,
+      typingAnimation: false,
       permissionMode: "default",
       rules: [],
       autoUpdate: true,
@@ -736,18 +722,33 @@ describe("browser fallback (no Tauri core)", () => {
     expect(listen).not.toHaveBeenCalled();
   });
 
-  it("saveSettings merges a partial patch and echoes the merged result", async () => {
+  it("saveSettings keeps partial Codex patches and normalizes retired providers", async () => {
     const { ipc } = await load();
-    const next = await ipc.saveSettings({ model: "claude-sonnet-4-6" });
-    expect(next.model).toBe("claude-sonnet-4-6");
-    expect(next.provider).toBe("anthropic"); // untouched fields survive
+    const next = await ipc.saveSettings({ model: "gpt-5.6-sol" });
+    expect(next.model).toBe("gpt-5.6-sol");
+    expect(next.provider).toBe("openai");
+
+    const normalizedProvider = await ipc.saveSettings({ provider: "anthropic" });
+    expect(normalizedProvider).toMatchObject({ provider: "openai", model: "gpt-5.6-sol" });
+    const normalizedModel = await ipc.saveSettings({ model: "claude-sonnet-4-6" });
+    expect(normalizedModel).toMatchObject({ provider: "openai", model: "gpt-5.6-terra" });
   });
 
-  it("setApiKey flips apiKeySet on the persisted settings", async () => {
+  it("setApiKey is a compatibility alias for the single Codex API-key slot", async () => {
     const { ipc } = await load();
-    expect((await ipc.getSettings()).apiKeySet).toBe(false);
     await ipc.setApiKey("sk-test");
-    expect((await ipc.getSettings()).apiKeySet).toBe(true);
+    expect(await ipc.openaiOauthStatus()).toMatchObject({
+      signedIn: true,
+      account: "OpenAI Platform API key",
+      tier: "OpenAI Platform",
+    });
+    expect(await ipc.listOpenAIAccounts()).toEqual([
+      expect.objectContaining({
+        id: "codex-primary",
+        accountLabel: "OpenAI Platform API key",
+        state: "connected",
+      }),
+    ]);
   });
 
   it("listSessions and getMessages are empty without a core", async () => {
@@ -763,7 +764,8 @@ describe("browser fallback (no Tauri core)", () => {
     expect(created).toMatchObject({
       id: "id",
       title: "title",
-      accountProfileId: null,
+      model: "gpt-5.6-terra",
+      accountProfileId: "codex-primary",
     });
     await expect(ipc.listSessions()).resolves.toEqual([created]);
     await expect(ipc.renameSession("id", "new")).resolves.toBeUndefined();
@@ -993,40 +995,28 @@ describe("browser fallback (no Tauri core)", () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
-  it("oauth mock signs into a Claude Max subscription and logout clears it", async () => {
-    const { ipc } = await load();
-    expect((await ipc.oauthStatus()).signedIn).toBe(false);
-
-    const signedIn = await ipc.startOauthLogin();
-    expect(signedIn.signedIn).toBe(true);
-    expect(signedIn.tier).toBe("Claude Max");
-    expect(signedIn.account).toBe("preview@claude.local");
-    expect(typeof signedIn.expiresAt).toBe("number");
-    // The mock persists the state on its singleton until logout.
-    expect((await ipc.oauthStatus()).signedIn).toBe(true);
-
-    await ipc.oauthLogout();
-    expect(await ipc.oauthStatus()).toEqual({
-      signedIn: false,
-      expiresAt: null,
-      account: null,
-      tier: null,
-    });
-  });
-
-  it("OpenAI mock retains canonical account tombstones and reconnects exact identities", async () => {
+  it("OpenAI mock uses one canonical slot and replaces its authentication mode", async () => {
     const { ipc } = await load();
     expect((await ipc.openaiOauthStatus()).signedIn).toBe(false);
     expect(await ipc.listOpenAIAccounts()).toEqual([]);
 
+    await ipc.loginCodexApiKey("sk-test");
+    expect(await ipc.listOpenAIAccounts()).toEqual([
+      expect.objectContaining({
+        id: "codex-primary",
+        accountLabel: "OpenAI Platform API key",
+      }),
+    ]);
+
     const account = await ipc.startOpenAIAccountLogin();
     expect(account).toMatchObject({
-      id: "00000000-0000-4000-8000-000000000001",
+      id: "codex-primary",
       accountLabel: "preview@chatgpt.local",
       tier: "ChatGPT Plus",
       state: "connected",
-      lastUsedAt: null,
+      lastUsedAt: expect.any(Number),
     });
+    expect(await ipc.listOpenAIAccounts()).toHaveLength(1);
     expect(Object.keys(account)).toEqual([
       "id",
       "accountLabel",
@@ -1037,21 +1027,19 @@ describe("browser fallback (no Tauri core)", () => {
       "updatedAt",
       "lastUsedAt",
     ]);
-    expect(account.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/);
     await expect(ipc.openaiModels(account.id)).resolves.toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           id: "gpt-5.6-sol",
-          reasoningEfforts: expect.arrayContaining(["none", "max"]),
+          defaultReasoningEffort: "low",
+          reasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
         }),
       ]),
     );
 
     await ipc.removeOpenAIAccount(account.id);
-    expect(await ipc.listOpenAIAccounts()).toEqual([
-      expect.objectContaining({ id: account.id, state: "removed", expiresAt: null }),
-    ]);
-    await expect(ipc.openaiModels(account.id)).rejects.toThrow(/Reconnect/i);
+    expect(await ipc.listOpenAIAccounts()).toEqual([]);
+    await expect(ipc.openaiModels(account.id)).rejects.toThrow(/Connect ChatGPT/i);
 
     const reconnected = await ipc.reconnectOpenAIAccount(account.id);
     expect(reconnected).toMatchObject({
@@ -1059,15 +1047,19 @@ describe("browser fallback (no Tauri core)", () => {
       account: { id: account.id, state: "connected" },
     });
     await expect(ipc.openaiModels(account.id)).resolves.toHaveLength(3);
+    await expect(ipc.removeOpenAIAccount("retired-profile-id")).rejects.toThrow(/not found/i);
   });
 
-  it("browser sessions allow account selection until a conversation starts", async () => {
+  it("browser sessions always pin the bundled engine's primary Codex slot", async () => {
     const { ipc } = await load();
-    const unknownProfileId = "00000000-0000-4000-8000-000000000099";
+    const unknownProfileId = "retired-profile-id";
 
     await expect(
       ipc.createSession("unknown", "Unknown", null, "gpt-5.6-sol", unknownProfileId),
-    ).rejects.toThrow(/connected ChatGPT account/i);
+    ).rejects.toThrow(/no longer available/i);
+    await expect(ipc.createSession("legacy", "Legacy", null, "claude-opus-4-8")).rejects.toThrow(
+      /Codex engine/i,
+    );
 
     const account = await ipc.startOpenAIAccountLogin();
     const created = await ipc.createSession(
@@ -1087,55 +1079,45 @@ describe("browser fallback (no Tauri core)", () => {
 
     await expect(
       ipc.createSession("missing-default", "Missing default", null, "gpt-5.6-sol", null),
-    ).rejects.toThrow(/default ChatGPT account/i);
+    ).resolves.toMatchObject({ accountProfileId: "codex-primary" });
     await expect(ipc.pinSessionOpenAIAccount(created.id, account.id)).resolves.toMatchObject({
       accountProfileId: account.id,
     });
-    const secondAccount = await ipc.startOpenAIAccountLogin();
+    const replacement = await ipc.startOpenAIAccountLogin();
+    expect(replacement.id).toBe(account.id);
     await expect(
-      ipc.pinSessionOpenAIAccount(created.id, secondAccount.id, "gpt-5.6-terra"),
+      ipc.pinSessionOpenAIAccount(created.id, replacement.id, "gpt-5.6-terra"),
     ).resolves.toMatchObject({
-      accountProfileId: secondAccount.id,
+      accountProfileId: "codex-primary",
       model: "gpt-5.6-terra",
     });
     await ipc.runAgent(created.id, "start the chat", () => undefined);
-    await expect(ipc.pinSessionOpenAIAccount(created.id, account.id)).rejects.toThrow(
-      /already started.*new chat/i,
-    );
+    await expect(ipc.pinSessionOpenAIAccount(created.id, account.id)).resolves.toMatchObject({
+      accountProfileId: "codex-primary",
+    });
     await expect(ipc.pinSessionOpenAIAccount("missing", account.id)).rejects.toThrow(/not found/i);
-
-    const removedAccountSession = await ipc.createSession(
-      "removed-account",
-      "Removed account",
-      null,
-      "gpt-5.6-sol",
-      account.id,
-    );
-    await ipc.removeOpenAIAccount(account.id);
-    await expect(
-      ipc.createSession("removed", "Removed", null, "gpt-5.6-sol", account.id),
-    ).rejects.toThrow(/connected ChatGPT account/i);
-    await expect(ipc.pinSessionOpenAIAccount(removedAccountSession.id, account.id)).rejects.toThrow(
-      /connected ChatGPT account/i,
+    await expect(ipc.pinSessionOpenAIAccount(created.id, unknownProfileId)).rejects.toThrow(
+      /no longer available/i,
     );
     await expect(ipc.reconnectOpenAIAccount(unknownProfileId)).rejects.toThrow(/not found/i);
   });
 
-  it("browser plan-usage mocks require sign-in and expose both reset windows", async () => {
+  it("browser plan usage is available only for the connected Codex slot", async () => {
     const { ipc, invoke } = await load();
-    await expect(ipc.getPlanUsage("anthropic")).rejects.toThrow(/Sign in with Claude/i);
-    await ipc.startOauthLogin();
-    const claude = await ipc.getPlanUsage("anthropic");
-    expect(claude).toMatchObject({ provider: "anthropic", plan: "Max" });
-    expect(claude.windows.map((window) => window.label)).toEqual([
-      "Current session",
-      "Weekly limit",
-    ]);
+    await expect(ipc.getPlanUsage("openai", "codex-primary")).rejects.toThrow(
+      /connected Codex account/i,
+    );
+    await expect(ipc.getPlanUsage("anthropic" as never, "codex-primary")).rejects.toThrow(
+      /OpenAI authentication only/i,
+    );
 
     const account = await ipc.startOpenAIAccountLogin();
     const openai = await ipc.getPlanUsage("openai", account.id);
     expect(openai).toMatchObject({ provider: "openai", plan: "Plus" });
-    expect(openai.windows).toHaveLength(2);
+    expect(openai.windows.map((window) => window.label)).toEqual([
+      "Current session",
+      "Weekly limit",
+    ]);
     expect(invoke).not.toHaveBeenCalled();
   });
 });

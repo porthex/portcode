@@ -5,6 +5,7 @@ import { Composer } from "./Composer";
 import { useStore } from "../store/store";
 import {
   DEFAULT_SETTINGS,
+  OPENAI_FALLBACK_MODELS,
   type ComposerPhase,
   type OpenAIAccountSummary,
   type Session,
@@ -36,7 +37,9 @@ const m = vi.mocked(ipc);
 
 // Snapshot a pristine store once, restore it (zustand has no built-in reset)
 // before every test so cross-test state never leaks.
-const initial = useStore.getState();
+// Keep a detached top-level snapshot. Re-installing the store's live object and
+// then rendering a component lets later state writes leak into the baseline.
+const initial = { ...useStore.getState() };
 
 const run = (over: Partial<(typeof initial.runs)[string]> = {}): (typeof initial.runs)[string] => ({
   streaming: false,
@@ -85,9 +88,32 @@ const seedDraft = (text: string, id = "a") =>
 beforeEach(() => {
   vi.clearAllMocks();
   useStore.setState(initial, true);
-  // Most composer tests exercise drafting/streaming, not auth. Seed the legacy
-  // Claude API-key path so Send stays available; auth-specific cases override it.
-  useStore.setState({ settings: { ...DEFAULT_SETTINGS, apiKeySet: true } });
+  // Most composer tests exercise drafting/streaming, not auth. Seed the single
+  // Codex account slot; auth-specific cases override it.
+  useStore.setState({
+    settings: DEFAULT_SETTINGS,
+    sessions: [session()],
+    activeId: "a",
+    openAIAuthStatus: {
+      signedIn: true,
+      expiresAt: null,
+      account: "OpenAI Platform API key",
+      tier: null,
+      available: true,
+    },
+    openAIAccounts: [
+      openAIAccount({
+        id: "codex-primary",
+        accountLabel: "OpenAI Platform API key",
+        tier: null,
+      }),
+    ],
+    openAIModels: OPENAI_FALLBACK_MODELS,
+    openAIModelCatalogs: {
+      "codex-primary": { status: "ready", models: OPENAI_FALLBACK_MODELS, error: null },
+    },
+    lastOpenAIAccountProfileId: "codex-primary",
+  });
   // Default: runAgent resolves to a cancellable handle so `send` starts a turn
   // without ever touching a real backend.
   m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}), dispose: vi.fn() });
@@ -106,7 +132,8 @@ const session = (over: Partial<Session> = {}): Session => ({
   id: "a",
   title: "New chat",
   workspace: null,
-  model: "claude-opus-4-8",
+  model: "gpt-5.6-terra",
+  accountProfileId: "codex-primary",
   createdAt: 1,
   updatedAt: 1,
   ...over,
@@ -241,6 +268,7 @@ describe("Composer rich editor", () => {
   it("disables the input when there is no active session to draft into", () => {
     // Without an activeId, setDraft has nowhere to key the draft, so an enabled
     // field would silently eat keystrokes — disable it instead (honest dead-end).
+    useStore.setState({ activeId: null });
     render(<Composer />);
     expect(textarea()).toHaveAttribute("contenteditable", "false");
     expect(textarea()).toHaveAttribute("aria-readonly", "true");
@@ -250,7 +278,7 @@ describe("Composer rich editor", () => {
 
   it("routes the no-session CTA through the shared default creation path", () => {
     const newSession = vi.fn(async () => {});
-    useStore.setState({ newSession });
+    useStore.setState({ activeId: null, newSession });
     render(<Composer />);
 
     fireEvent.click(screen.getByRole("button", { name: "New chat" }));
@@ -259,6 +287,7 @@ describe("Composer rich editor", () => {
   });
 
   it("uses a dedicated full-width writing surface with a compliant placeholder", () => {
+    useStore.setState({ activeId: null });
     render(<Composer />);
     const editor = textarea();
     expect(editor).toHaveAttribute("contenteditable", "false");
@@ -336,16 +365,7 @@ describe("Composer send button", () => {
 
   it("submits on click: clears the active draft and forwards the text to send", async () => {
     useStore.setState({
-      sessions: [
-        {
-          id: "a",
-          title: "New chat",
-          workspace: null,
-          model: "claude-opus-4-8",
-          createdAt: 1,
-          updatedAt: 1,
-        },
-      ],
+      sessions: [session()],
       activeId: "a",
       messages: { a: [] },
       drafts: { a: "Refactor the parser" },
@@ -354,7 +374,7 @@ describe("Composer send button", () => {
 
     fireEvent.click(sendButton());
 
-    // submit() clears the draft synchronously, then awaits send().
+    // The store accepts the turn and clears the draft before starting the agent.
     expect(useStore.getState().drafts.a).toBeUndefined();
     await Promise.resolve();
     await Promise.resolve();
@@ -363,16 +383,7 @@ describe("Composer send button", () => {
 
   it("collapses the textarea to an explicit px height on submit (not 'auto')", async () => {
     useStore.setState({
-      sessions: [
-        {
-          id: "a",
-          title: "New chat",
-          workspace: null,
-          model: "claude-opus-4-8",
-          createdAt: 1,
-          updatedAt: 1,
-        },
-      ],
+      sessions: [session()],
       activeId: "a",
       messages: { a: [] },
     });
@@ -403,16 +414,7 @@ describe("Composer send button", () => {
 describe("Composer key handling", () => {
   const seedSession = (draft: string) =>
     useStore.setState({
-      sessions: [
-        {
-          id: "a",
-          title: "New chat",
-          workspace: null,
-          model: "claude-opus-4-8",
-          createdAt: 1,
-          updatedAt: 1,
-        },
-      ],
+      sessions: [session()],
       activeId: "a",
       messages: { a: [] },
       drafts: { a: draft },
@@ -719,11 +721,11 @@ describe("Composer presence region", () => {
 
 describe("Composer UsageMeter", () => {
   it("shows the selected model once and omits usage when the session has none", () => {
-    useStore.setState({ activeId: "a" });
+    useStore.setState({ sessions: [session({ model: "gpt-5.6-terra" })], activeId: "a" });
     render(<Composer />);
     expect(screen.getByRole("status").textContent).toContain("ready when you are");
     // The model lives in its labeled picker and is no longer repeated in telemetry.
-    expect(screen.getAllByText("Opus 4.8")).toHaveLength(1);
+    expect(screen.getAllByText("5.6 Terra")).toHaveLength(1);
     expect(screen.queryByRole("group", { name: /Session usage/i })).toBeNull();
   });
 
@@ -733,14 +735,18 @@ describe("Composer UsageMeter", () => {
     expect(screen.queryByRole("group", { name: /Session usage/i })).toBeNull();
   });
 
-  it("labels cumulative session tokens and estimated Opus cost", () => {
+  it("labels cumulative session tokens and Codex billing", () => {
     const usage: Usage = { input: 1200, output: 300 };
-    useStore.setState({ activeId: "a", usage: { a: usage } });
+    useStore.setState({
+      sessions: [session({ model: "gpt-5.6-terra" })],
+      activeId: "a",
+      usage: { a: usage },
+    });
     render(<Composer />);
 
-    // fmtTokens(1500) -> "1.5k"; Opus cost = (1200*5 + 300*25)/1e6 = 0.0135 -> $0.01.
+    // fmtTokens(1500) -> "1.5k" while billing remains owned by Codex.
     expect(screen.getByText("1.5k tokens")).toBeInTheDocument();
-    expect(screen.getByText("$0.01 estimated")).toBeInTheDocument();
+    expect(screen.getByText("Codex plan or API billing")).toBeInTheDocument();
     expect(screen.getByText("Session")).toBeInTheDocument();
     expect(screen.getByTitle("1,200 in · 300 out")).toBeInTheDocument();
     expect(
@@ -750,7 +756,7 @@ describe("Composer UsageMeter", () => {
     ).toHaveClass("pc-composer-usage");
   });
 
-  it("formats million-scale usage cleanly and names the ChatGPT plan", () => {
+  it("formats million-scale usage cleanly and keeps billing mode neutral", () => {
     useStore.setState({
       sessions: [session({ model: "gpt-5.6-sol" })],
       activeId: "a",
@@ -760,34 +766,43 @@ describe("Composer UsageMeter", () => {
     render(<Composer />);
 
     expect(screen.getByText("2.2M tokens")).toBeInTheDocument();
-    expect(screen.getByText("ChatGPT plan")).toBeInTheDocument();
+    expect(screen.getByText("Codex plan or API billing")).toBeInTheDocument();
     expect(screen.queryByText("2199.7k tokens")).toBeNull();
   });
 
   it("keeps ticking visuals out of the live region but exposes a stable accessible summary", () => {
-    useStore.setState({ activeId: "a", usage: { a: { input: 1200, output: 300 } } });
+    useStore.setState({
+      sessions: [session({ model: "gpt-5.6-terra" })],
+      activeId: "a",
+      usage: { a: { input: 1200, output: 300 } },
+    });
     render(<Composer />);
 
     const usageGroup = screen.getByRole("group", { name: /Session usage: 1,500 tokens/i });
     expect(usageGroup.firstElementChild).toHaveAttribute("aria-hidden", "true");
     expect(screen.getByRole("status").textContent).not.toContain("tokens");
     expect(usageGroup).toHaveAccessibleName(
-      "Session usage: 1,500 tokens, 1,200 input and 300 output; $0.01 estimated; Claude Opus 4.8",
+      "Session usage: 1,500 tokens, 1,200 input and 300 output; Codex plan or API billing; GPT-5.6 Terra",
     );
   });
 
-  it("uses 4 decimals when the cost is below one cent", () => {
+  it("keeps exact low-volume input/output counts in the title", () => {
     const usage: Usage = { input: 100, output: 0 };
-    useStore.setState({ activeId: "a", usage: { a: usage } });
+    useStore.setState({
+      sessions: [session({ model: "gpt-5.6-terra" })],
+      activeId: "a",
+      usage: { a: usage },
+    });
     render(<Composer />);
 
     expect(screen.getByText("100 tokens")).toBeInTheDocument();
-    expect(screen.getByText("$0.0005 estimated")).toBeInTheDocument();
+    expect(screen.getByText("Codex plan or API billing")).toBeInTheDocument();
     expect(screen.getByTitle("100 in · 0 out")).toBeInTheDocument();
   });
 
-  it("reports unavailable pricing honestly instead of treating an unknown model as free", () => {
+  it("keeps historical unknown-model usage readable without inventing pricing", () => {
     useStore.setState({
+      sessions: [session({ model: "no-such-model" })],
       activeId: "a",
       usage: { a: { input: 5000, output: 0 } },
       settings: { ...initial.settings, model: "no-such-model" },
@@ -795,7 +810,7 @@ describe("Composer UsageMeter", () => {
     render(<Composer />);
 
     expect(screen.getByText("5.0k tokens")).toBeInTheDocument();
-    expect(screen.getByText("Cost unavailable")).toBeInTheDocument();
+    expect(screen.getByText("Codex plan or API billing")).toBeInTheDocument();
     expect(screen.queryByText("$0.0000")).toBeNull();
     expect(screen.getByRole("group", { name: /no-such-model/i })).toBeInTheDocument();
   });
@@ -867,7 +882,7 @@ describe("Composer permission dropdown", () => {
   it("removes the plan warning banner while keeping plan state clear in the composer", () => {
     useStore.setState({
       activeId: "a",
-      settings: { ...DEFAULT_SETTINGS, apiKeySet: true, permissionMode: "plan" },
+      settings: { ...DEFAULT_SETTINGS, permissionMode: "plan" },
     });
     render(<Composer />);
 
@@ -900,9 +915,18 @@ describe("Composer recovery", () => {
 });
 
 describe("Composer run setup", () => {
-  it("reflects the active session's model and groups options by provider", () => {
+  it("captures the rendered editor row height for a later animated collapse", () => {
+    const clientHeight = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(24);
+
+    render(<Composer />);
+
+    expect(textarea()).toHaveStyle({ height: "0px" });
+    clientHeight.mockRestore();
+  });
+
+  it("reflects the active Codex model and offers only OpenAI choices", () => {
     useStore.setState({
-      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      sessions: [session({ id: "a", model: "gpt-5.6-terra" })],
       activeId: "a",
       messages: { a: [] },
     });
@@ -910,24 +934,29 @@ describe("Composer run setup", () => {
 
     const picker = screen.getByRole("button", { name: "Model, effort, and speed" });
     expect(screen.queryByText("Chat model")).not.toBeInTheDocument();
-    expect(picker).toHaveTextContent("Opus 4.8");
+    expect(picker).toHaveTextContent("5.6 Terra");
     fireEvent.click(picker);
     fireEvent.click(screen.getByRole("button", { name: /^Model:/ }));
-    // Provider-grouped inside Portcode's themed listbox (not a native OS popup).
-    expect(screen.getByRole("group", { name: "Anthropic · Claude" })).toBeInTheDocument();
-    expect(
-      screen.getByRole("group", { name: "OpenAI · ChatGPT subscription" }),
-    ).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "Claude Sonnet 4.6" })).toBeInTheDocument();
+    // The bundled Codex engine exposes only its OpenAI catalogue here.
+    expect(screen.getByRole("group", { name: "OpenAI · Codex" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "GPT-5.6 Sol" })).toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: /Anthropic/ })).toBeNull();
+    expect(screen.queryByRole("option", { name: /Claude/ })).toBeNull();
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByRole("listbox", { name: "Model" })).toBeNull();
     fireEvent.keyDown(document, { key: "Escape" });
+    expect(picker).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(picker);
+    fireEvent.keyDown(document, { key: "Enter" });
+    expect(picker).toHaveAttribute("aria-expanded", "true");
+    fireEvent.pointerDown(document.body);
     expect(picker).toHaveAttribute("aria-expanded", "false");
   });
 
   it("changing the model updates the active session AND the last-used default", async () => {
     useStore.setState({
-      sessions: [session({ id: "a", model: "claude-opus-4-8" })],
+      sessions: [session({ id: "a", model: "gpt-5.6-terra" })],
       activeId: "a",
       messages: { a: [] },
     });
@@ -935,18 +964,19 @@ describe("Composer run setup", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Model, effort, and speed" }));
     fireEvent.click(screen.getByRole("button", { name: /^Model:/ }));
-    fireEvent.click(screen.getByRole("option", { name: "Claude Sonnet 4.6" }));
+    fireEvent.click(screen.getByRole("option", { name: "GPT-5.6 Sol" }));
 
     // setSessionModel updates the session synchronously, then awaits the
     // last-used sync into settings.model (updateSettings -> ipc.saveSettings).
-    expect(useStore.getState().sessions[0].model).toBe("claude-sonnet-4-6");
+    expect(useStore.getState().sessions[0].model).toBe("gpt-5.6-sol");
     await Promise.resolve();
     await Promise.resolve();
     expect(m.saveSettings).toHaveBeenCalledWith({
-      model: "claude-sonnet-4-6",
+      model: "gpt-5.6-sol",
+      provider: "openai",
       reasoningEffort: "medium",
     });
-    expect(useStore.getState().settings.model).toBe("claude-sonnet-4-6");
+    expect(useStore.getState().settings.model).toBe("gpt-5.6-sol");
   });
 
   it("is disabled while a turn is streaming", () => {
@@ -968,11 +998,12 @@ describe("Composer OpenAI auth and reasoning", () => {
     provider: "openai" as const,
     reasoningEfforts: ["minimal", "high", "ultra"],
     defaultReasoningEffort: "high",
+    serviceTiers: [{ id: "priority", name: "Fast", description: "1.5x speed, more usage" }],
   };
 
   it("routes an unassigned GPT session to Settings without an account prompt above the composer", () => {
     useStore.setState({
-      sessions: [session({ model: "gpt-live" })],
+      sessions: [session({ model: "gpt-live", accountProfileId: null })],
       activeId: "a",
       drafts: { a: "ship it" },
       openAIModels: [openAIModel],
@@ -983,19 +1014,19 @@ describe("Composer OpenAI auth and reasoning", () => {
 
     expect(
       screen.getByRole("button", {
-        name: "Choose a default ChatGPT account in Settings to send",
+        name: "Connect ChatGPT or an OpenAI Platform API key in Settings to send",
       }),
     ).toBeDisabled();
     expect(screen.queryByRole("group", { name: "Choose ChatGPT account" })).not.toBeInTheDocument();
     expect(
       screen.queryByRole("combobox", { name: "ChatGPT account for this conversation" }),
     ).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Manage ChatGPT" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open settings" }));
     expect(useStore.getState().showSettings).toBe(true);
   });
   it("fails closed and removes OpenAI choices when this build disables the capability", () => {
     useStore.setState({
-      sessions: [session({ model: "gpt-live" })],
+      sessions: [session({ model: "gpt-live", accountProfileId: null })],
       activeId: "a",
       drafts: { a: "ship it" },
       openAIModels: [],
@@ -1019,10 +1050,10 @@ describe("Composer OpenAI auth and reasoning", () => {
     ).toBe(true);
     expect(screen.getByRole("button", { name: "Open settings" })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Model, effort, and speed" }));
+    fireEvent.click(screen.getByRole("button", { name: "Model and effort" }));
     fireEvent.click(screen.getByRole("button", { name: /^Model:/ }));
     expect(screen.queryByRole("group", { name: /OpenAI/ })).not.toBeInTheDocument();
-    expect(screen.getByRole("group", { name: /Anthropic/ })).toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: /Anthropic/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("listbox", { name: "Reasoning level" })).not.toBeInTheDocument();
   });
 
@@ -1060,7 +1091,79 @@ describe("Composer OpenAI auth and reasoning", () => {
     expect(m.saveSettings).toHaveBeenCalledWith({ reasoningEffort: "minimal" });
   });
 
-  it("places the multi-account selector beside the model control", () => {
+  it("never renders a stale Ultra selection for Spark", () => {
+    const account = openAIAccount();
+    const sparkModel = {
+      id: "gpt-5.3-codex-spark",
+      label: "GPT-5.3 Codex Spark",
+      provider: "openai" as const,
+      reasoningEfforts: ["low" as const, "medium" as const, "high" as const, "xhigh" as const],
+      defaultReasoningEffort: "high" as const,
+    };
+    useStore.setState({
+      sessions: [session({ model: sparkModel.id, accountProfileId: account.id })],
+      activeId: "a",
+      openAIModels: [sparkModel],
+      openAIAccounts: [account],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: [sparkModel], error: null },
+      },
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: sparkModel.id,
+        reasoningEffort: "ultra",
+      },
+    });
+    render(<Composer />);
+
+    const picker = screen.getByRole("button", { name: "Model and effort" });
+    expect(picker).toHaveTextContent("High");
+    expect(picker).not.toHaveTextContent("Ultra");
+    fireEvent.click(picker);
+    fireEvent.click(screen.getByRole("button", { name: /^Effort:/ }));
+    expect(screen.queryByRole("option", { name: "Ultra" })).toBeNull();
+    expect(screen.getByRole("option", { name: "High" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("preserves the draft when a stale effort cannot be repaired before send", async () => {
+    const account = openAIAccount();
+    const sparkModel = {
+      id: "gpt-5.3-codex-spark",
+      label: "GPT-5.3 Codex Spark",
+      provider: "openai" as const,
+      reasoningEfforts: ["low" as const, "medium" as const, "high" as const, "xhigh" as const],
+      defaultReasoningEffort: "high" as const,
+    };
+    useStore.setState({
+      sessions: [session({ model: sparkModel.id, accountProfileId: account.id })],
+      activeId: "a",
+      drafts: { a: "keep this unsent task" },
+      openAIModels: [sparkModel],
+      openAIAccounts: [account],
+      openAIModelCatalogs: {
+        [account.id]: { status: "ready", models: [sparkModel], error: null },
+      },
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai",
+        model: sparkModel.id,
+        reasoningEffort: "ultra",
+      },
+      openAIAuthStatus: { signedIn: true, expiresAt: null, account: null, tier: null },
+    });
+    m.saveSettings.mockRejectedValueOnce(new Error("settings write failed"));
+    render(<Composer />);
+
+    fireEvent.click(sendButton());
+
+    await waitFor(() => expect(m.saveSettings).toHaveBeenCalledWith({ reasoningEffort: "high" }));
+    expect(m.runAgent).not.toHaveBeenCalled();
+    expect(useStore.getState().drafts.a).toBe("keep this unsent task");
+    expect(textarea()).toHaveTextContent("keep this unsent task");
+  });
+
+  it("keeps the single Codex authentication slot out of per-chat controls", () => {
     const first = openAIAccount();
     const second = openAIAccount({
       id: "00000000-0000-4000-8000-000000000002",
@@ -1082,15 +1185,11 @@ describe("Composer OpenAI auth and reasoning", () => {
 
     const controls = screen.getByRole("group", { name: "Turn controls" });
     const modelPicker = screen.getByRole("button", { name: "Model, effort, and speed" });
-    const accountPicker = screen.getByRole("combobox", {
-      name: "ChatGPT account for this chat",
-    });
     expect(controls).toContainElement(modelPicker);
-    expect(controls).toContainElement(accountPicker);
-    expect(modelPicker.compareDocumentPosition(accountPicker)).toBe(
-      Node.DOCUMENT_POSITION_FOLLOWING,
-    );
-    expect(accountPicker).toHaveTextContent("one@chatgpt.test");
+    expect(
+      screen.queryByRole("combobox", { name: "ChatGPT account for this chat" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("one@chatgpt.test")).not.toBeInTheDocument();
     expect(screen.queryByText("Which ChatGPT account owns this conversation?")).toBeNull();
   });
 
@@ -1122,6 +1221,9 @@ describe("Composer OpenAI auth and reasoning", () => {
       sessions: [session({ model: "gpt-live" })],
       activeId: "a",
       openAIModels: [openAIModel],
+      openAIModelCatalogs: {
+        "codex-primary": { status: "ready", models: [openAIModel], error: null },
+      },
       settings: {
         ...DEFAULT_SETTINGS,
         provider: "openai",
@@ -1144,6 +1246,70 @@ describe("Composer OpenAI auth and reasoning", () => {
     expect(screen.queryByText("Advanced")).not.toBeInTheDocument();
   });
 
+  it("returns to the main setup panel when refreshed metadata removes Fast", () => {
+    useStore.setState({
+      sessions: [session({ model: openAIModel.id })],
+      activeId: "a",
+      openAIModels: [openAIModel],
+      openAIModelCatalogs: {
+        "codex-primary": { status: "ready", models: [openAIModel], error: null },
+      },
+      settings: { ...DEFAULT_SETTINGS, model: openAIModel.id },
+    });
+    render(<Composer />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Model, effort, and speed" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Speed:/ }));
+    expect(screen.getByRole("listbox", { name: "Response speed" })).toBeInTheDocument();
+
+    const standardOnlyModel = { ...openAIModel, serviceTiers: [] };
+    act(() => {
+      useStore.setState({
+        openAIModels: [standardOnlyModel],
+        openAIModelCatalogs: {
+          "codex-primary": { status: "ready", models: [standardOnlyModel], error: null },
+        },
+      });
+    });
+
+    expect(screen.queryByRole("listbox", { name: "Response speed" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Model:/ })).toBeInTheDocument();
+  });
+
+  it("hides Fast and clears a stale Fast preference when Codex advertises Standard only", async () => {
+    const standardOnlyModel = {
+      ...openAIModel,
+      id: "gpt-standard-only",
+      label: "GPT Standard Only",
+      serviceTiers: [],
+    };
+    useStore.setState({
+      sessions: [session({ model: standardOnlyModel.id })],
+      activeId: "a",
+      openAIModels: [standardOnlyModel],
+      openAIModelCatalogs: {
+        "codex-primary": { status: "ready", models: [standardOnlyModel], error: null },
+      },
+      settings: {
+        ...DEFAULT_SETTINGS,
+        model: standardOnlyModel.id,
+        responseSpeed: "fast",
+      },
+    });
+
+    render(<Composer />);
+
+    const setup = screen.getByRole("button", { name: "Model and effort" });
+    expect(setup.querySelector(".pc-run-setup__bolt")).toBeNull();
+    fireEvent.click(setup);
+    expect(screen.queryByRole("button", { name: /^Speed:/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /Fast/ })).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(m.saveSettings).toHaveBeenCalledWith({ responseSpeed: "standard" });
+      expect(useStore.getState().settings.responseSpeed).toBe("standard");
+    });
+  });
+
   it("keeps remote sends available because subscription auth lives on the desktop", () => {
     useStore.setState({
       sessions: [session({ model: "gpt-live" })],
@@ -1164,7 +1330,7 @@ describe("Composer OpenAI auth and reasoning", () => {
 
   it("does not bypass authentication while remote mode is disconnected", () => {
     useStore.setState({
-      sessions: [session({ model: "gpt-live" })],
+      sessions: [session({ model: "gpt-live", accountProfileId: null })],
       activeId: "a",
       drafts: { a: "remote task" },
       openAIModels: [openAIModel],
@@ -1177,13 +1343,15 @@ describe("Composer OpenAI auth and reasoning", () => {
 
     expect(
       screen.getByRole("button", {
-        name: "Choose a default ChatGPT account in Settings to send",
+        name: "Connect ChatGPT or an OpenAI Platform API key in Settings to send",
       }),
     ).toBeDisabled();
     expect(
       screen
         .getAllByRole("status")
-        .some((status) => status.textContent?.includes("Choose a default ChatGPT account")),
+        .some((status) =>
+          status.textContent?.includes("Connect ChatGPT or an OpenAI Platform API key"),
+        ),
     ).toBe(true);
   });
 
@@ -1275,8 +1443,10 @@ describe("Composer OpenAI auth and reasoning", () => {
     });
     render(<Composer />);
 
-    expect(screen.getByText("This session's ChatGPT account is unavailable")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Manage ChatGPT" })).toBeInTheDocument();
+    expect(
+      screen.getByText("This session's Codex authentication is unavailable"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open settings" })).toBeInTheDocument();
     expect(screen.queryByText(removed.id)).not.toBeInTheDocument();
     expect(textarea()).toHaveTextContent("history remains");
   });

@@ -391,6 +391,8 @@ describe("startWebClientLifecycle — reconnect on resume", () => {
     expect(hydrateRememberedQr).toHaveBeenCalledWith("QR-FROM-IDB");
     expect(state.lastPairingQr).toBe("QR-FROM-IDB");
 
+    // If another state hydration briefly clears the store copy, connect restores
+    // it from the controller's remembered durable QR before dialing.
     state.lastPairingQr = null;
     hydrateRememberedQr.mockClear();
     w.resume();

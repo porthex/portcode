@@ -9,9 +9,10 @@ import { DEFAULT_SETTINGS, estimateCost, type Usage } from "../types";
 
 describe("shared types", () => {
   it("ship sensible default settings", () => {
-    expect(DEFAULT_SETTINGS.provider).toBe("anthropic");
+    expect(DEFAULT_SETTINGS.provider).toBe("openai");
+    expect(DEFAULT_SETTINGS.model).toBe("gpt-5.6-terra");
+    expect(DEFAULT_SETTINGS.reasoningEffort).toBe("medium");
     expect(DEFAULT_SETTINGS.defaultPolicy).toBe("ask");
-    expect(DEFAULT_SETTINGS.apiKeySet).toBe(false);
   });
 
   it("estimate cost from per-million-token pricing", () => {

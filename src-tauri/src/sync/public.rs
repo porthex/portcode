@@ -299,6 +299,12 @@ pub fn project_event(event: &StreamEvent) -> PhoneStreamEvent {
                 },
             }
         }
+        // A raw app-server payload can contain local paths, command arguments,
+        // MCP data, and future fields with no public privacy contract. Keep it
+        // desktop-only; the safe normalized events above remain the phone wire.
+        StreamEvent::CodexEvent { .. } | StreamEvent::CodexRequest { .. } => {
+            PhoneStreamEvent::Unknown
+        }
     }
 }
 

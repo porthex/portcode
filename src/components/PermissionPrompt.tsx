@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { toolLabel } from "../lib/toolNames";
+import { isCommandToolName, toolLabel } from "../lib/toolNames";
 import { useStore } from "../store/store";
 
 export function PermissionPrompt() {
@@ -59,15 +59,15 @@ export function PermissionPrompt() {
 
   if (!pending) return null;
 
-  const answer = async (decision: "allow" | "deny", always?: boolean): Promise<void> => {
+  const answer = async (decision: "allow" | "deny", forSession?: boolean): Promise<void> => {
     if (answeringId.current === pending.id) return;
     answeringId.current = pending.id;
     setAnswering(true);
     try {
       if (activeId && pendingBelongsToRun) {
-        await resolve(activeId, pending.id, decision, always);
+        await resolve(activeId, pending.id, decision, forSession);
       } else {
-        await resolve(decision, always);
+        await resolve(decision, forSession);
       }
     } finally {
       if (answeringId.current === pending.id) {
@@ -79,7 +79,12 @@ export function PermissionPrompt() {
 
   const label = toolLabel(pending.tool);
   const remoteApproval = remoteMode || remoteConnected;
-  const rememberable = !remoteApproval;
+  const offeredDecisions = (pending.input as { availableDecisions?: unknown } | null)
+    ?.availableDecisions;
+  const sessionDecisionOffered =
+    !isCommandToolName(pending.tool) ||
+    (Array.isArray(offeredDecisions) && offeredDecisions.includes("acceptForSession"));
+  const canApproveForSession = !remoteApproval && sessionDecisionOffered;
 
   return (
     <div role="alert" className="pc-gate px-6 py-3.5">
@@ -103,7 +108,7 @@ export function PermissionPrompt() {
         {pending.diff && pending.diff.trim() && <DiffView diff={pending.diff} />}
         {remoteApproval && (
           <p className="text-[11.5px] leading-relaxed text-muted">
-            Remote approvals apply once. Change persistent permission rules on the desktop.
+            Remote approvals apply once. Session-scoped Codex approvals are desktop-only.
           </p>
         )}
         <div className="flex flex-wrap gap-[9px]" aria-busy={answering}>
@@ -112,15 +117,15 @@ export function PermissionPrompt() {
             disabled={answering}
             className="pc-btn-allow px-3.5 py-1.5 text-[12.5px] disabled:cursor-wait disabled:opacity-60"
           >
-            Allow
+            Allow once
           </button>
-          {rememberable && (
+          {canApproveForSession && (
             <button
               onClick={() => void answer("allow", true)}
               disabled={answering}
               className="pc-btn-deny pc-btn-confirm px-3.5 py-1.5 text-[12.5px] disabled:cursor-wait disabled:opacity-60"
             >
-              Always allow
+              Allow for session
             </button>
           )}
           <button
