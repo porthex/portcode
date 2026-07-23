@@ -2227,6 +2227,7 @@ mod tests {
             turn_id: turn_id.into(),
             account_profile_id: None,
             status: TurnStatus::Completed,
+            failure: None,
             stop_reason: Some("end_turn".into()),
             started_at: 2,
             completed_at: 9,

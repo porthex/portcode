@@ -136,6 +136,15 @@ export function TurnReceipt({
         </div>
       )}
 
+      {receipt?.failure && (
+        <div className="pc-turn-receipt__failure" aria-label="Failure diagnostics">
+          <div className="pc-turn-receipt__failure-message">{receipt.failure.message}</div>
+          <div className="pc-turn-receipt__failure-meta">
+            {failureDiagnosticLabel(receipt.failure)}
+          </div>
+        </div>
+      )}
+
       {/* The visible timer is excluded from AT, so the transcript's parent live
           region cannot announce a new number every second. Mount this nested
           status while the lifecycle is live and for its same-mounted terminal
@@ -172,6 +181,26 @@ export function TurnReceipt({
       )}
     </div>
   );
+}
+
+function failureDiagnosticLabel(failure: NonNullable<TurnReceiptData["failure"]>): string {
+  const parts = [failure.code.replaceAll("_", " ")];
+  const providerModel = [failure.provider, failure.model].filter(Boolean).join(" / ");
+  if (providerModel) parts.push(providerModel);
+  if (failure.httpStatus !== undefined) parts.push(`HTTP ${failure.httpStatus}`);
+  if (failure.transcriptMessages !== undefined) {
+    parts.push(`${failure.transcriptMessages.toLocaleString()} transcript messages`);
+  }
+  if (failure.transcriptBytes !== undefined) {
+    parts.push(`${formatDiagnosticBytes(failure.transcriptBytes)} transcript`);
+  }
+  return `Diagnostic: ${parts.join(" · ")}`;
+}
+
+function formatDiagnosticBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
 }
 
 function ReceiptStripContent({

@@ -391,12 +391,30 @@ describe("startWebClientLifecycle — reconnect on resume", () => {
     expect(hydrateRememberedQr).toHaveBeenCalledWith("QR-FROM-IDB");
     expect(state.lastPairingQr).toBe("QR-FROM-IDB");
 
+    state.lastPairingQr = null;
+    hydrateRememberedQr.mockClear();
     w.resume();
     await flush();
     // The controller's connect() saw the QR and called reconnectRemote, which now
     // finds a non-null lastPairingQr (the hydrated one) to dial.
     expect(reconnectRemote).toHaveBeenCalledTimes(1);
+    expect(hydrateRememberedQr).toHaveBeenCalledWith("QR-FROM-IDB");
     set({}); // touch to ensure no crash on a no-op notify
+    stop();
+  });
+
+  it("does nothing on resume when no pairing QR exists", async () => {
+    const { store, reconnectRemote } = makeFakeStore({ lastPairingQr: null });
+    const storage = makeFakeStorage();
+    const w = makeWatchStub();
+    const stop = startWebClientLifecycle({ store, storage, watch: w.watch });
+    await flush();
+    await flush();
+
+    w.resume();
+    await flush();
+
+    expect(reconnectRemote).not.toHaveBeenCalled();
     stop();
   });
 

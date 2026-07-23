@@ -9,6 +9,7 @@ import { providerForModel, type Message } from "../types";
 // Stable reference so the selector never returns a fresh array (which would
 // trip useSyncExternalStore's infinite-loop guard).
 const EMPTY: Message[] = [];
+const TRANSCRIPT_VERTICAL_PADDING_PX = 48;
 
 type ChatProps = {
   transcriptAside?: ReactNode;
@@ -31,8 +32,12 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
   const retryLoad = useStore((s) => s.retryLoad);
   const scrollTargetId = useStore((s) => s.scrollTargetId);
   const clearScrollTarget = useStore((s) => s.clearScrollTarget);
+  const transcriptScrollRequest = useStore((s) => s.transcriptScrollRequest);
+  const clearTranscriptScrollRequest = useStore((s) => s.clearTranscriptScrollRequest);
+  const workspaceSurface = useStore((s) => s.workspaceSurface);
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  const currentTurnRef = useRef<HTMLDivElement>(null);
   // Whether the viewport is pinned to the bottom. We only auto-follow new content
   // while the user is already at the bottom — otherwise scrolling up to read history
   // (especially mid-stream, when the decode grows the transcript ~45x/sec) would
@@ -41,6 +46,37 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
   // Mirror of stuckToBottom in render state so the "scroll to latest" button can
   // appear/hide reactively (the ref alone wouldn't re-render).
   const [pinned, setPinned] = useState(true);
+  // After this client sends a turn, keep that turn at least one transcript viewport
+  // tall. Bottom-following then places the user bubble at the top while the answer
+  // grows into the space below (Claude/Codex-style), without exposing older turns.
+  // Keying by session prevents a switch from leaking the runway into another chat.
+  const [turnAnchorSessionId, setTurnAnchorSessionId] = useState<string | null>(null);
+  const requestedNewTurn = Boolean(
+    activeId &&
+    transcriptScrollRequest?.kind === "newTurn" &&
+    transcriptScrollRequest.sessionId === activeId,
+  );
+  const anchorCurrentTurn =
+    Boolean(activeId && turnAnchorSessionId === activeId) || requestedNewTurn;
+  let currentTurnStart = -1;
+  if (anchorCurrentTurn) {
+    const requestedMessageId = requestedNewTurn
+      ? transcriptScrollRequest?.targetMessageId
+      : undefined;
+    if (requestedMessageId) {
+      currentTurnStart = messages.findIndex((message) => message.id === requestedMessageId);
+    }
+    // Authoritative remote catch-up can replace an optimistic id. The newest user
+    // row is still the correct turn boundary, so use it as the durable fallback.
+    if (currentTurnStart < 0) {
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        if (messages[index].role === "user") {
+          currentTurnStart = index;
+          break;
+        }
+      }
+    }
+  }
   // Anchor for preserving scroll position across a PREPEND (scroll-up pagination):
   // the prior render's scrollHeight + the id of the prior first message. When older
   // rows land in front, the content above the viewport grows; restoring scrollTop by
@@ -51,6 +87,16 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
 
   // Distance from the top below which scrolling up triggers loading older history.
   const LOAD_OLDER_THRESHOLD_PX = 200;
+
+  const sizeCurrentTurn = useCallback(() => {
+    const scroller = scrollRef.current;
+    const turn = currentTurnRef.current;
+    if (!scroller || !turn) return;
+    turn.style.minHeight = `${Math.max(
+      0,
+      scroller.clientHeight - TRANSCRIPT_VERTICAL_PADDING_PX,
+    )}px`;
+  }, []);
 
   // Track whether the user is near the bottom; a programmatic scroll keeps it true.
   // Also drives scroll-up pagination: when the user nears the TOP in remote mode and
@@ -82,18 +128,70 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
     return () => el.removeEventListener("scroll", onScroll);
   }, []);
 
-  // A freshly-selected session starts pinned to its latest message.
-  useEffect(() => {
+  // Keep the current-turn runway matched to the real transcript viewport (the
+  // composer, permission banner, and background-task panel can all change it).
+  useLayoutEffect(() => {
+    if (!anchorCurrentTurn || currentTurnStart < 0) return;
+    sizeCurrentTurn();
+    const scroller = scrollRef.current;
+    if (!scroller || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(sizeCurrentTurn);
+    observer.observe(scroller);
+    return () => observer.disconnect();
+  }, [anchorCurrentTurn, currentTurnStart, sizeCurrentTurn]);
+
+  // A session identity change jumps before paint. Keeping the bottom pin enabled
+  // means a cold history load that lands a tick later also finishes at its latest
+  // row instead of leaving the viewport at the old session's scroll offset.
+  useLayoutEffect(() => {
+    setTurnAnchorSessionId(null);
     stuckToBottom.current = true;
     setPinned(true);
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [activeId]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = scrollRef.current;
     if (el && stuckToBottom.current) el.scrollTop = el.scrollHeight;
   }, [messages, streaming]);
+
+  // Explicit navigation requests also cover re-selecting the already-active chat,
+  // which an activeId-only effect cannot observe. A new turn keeps its viewport
+  // runway after the one-shot request is consumed; selecting Latest removes it.
+  useLayoutEffect(() => {
+    const request = transcriptScrollRequest;
+    if (!request || request.sessionId !== activeId || (!remoteMode && workspaceSurface !== "chat"))
+      return;
+    const el = scrollRef.current;
+    if (!el) return;
+
+    if (request.kind === "newTurn") {
+      const turn = currentTurnRef.current;
+      if (!turn || currentTurnStart < 0) return;
+      sizeCurrentTurn();
+      setTurnAnchorSessionId(activeId);
+    } else {
+      // The wrapper may still exist for an earlier anchored turn during this layout
+      // pass. Remove its runway before measuring the true transcript bottom.
+      if (currentTurnRef.current) currentTurnRef.current.style.minHeight = "";
+      setTurnAnchorSessionId(null);
+    }
+
+    stuckToBottom.current = true;
+    setPinned(true);
+    el.scrollTop = el.scrollHeight;
+    clearTranscriptScrollRequest(request.id);
+  }, [
+    activeId,
+    clearTranscriptScrollRequest,
+    currentTurnStart,
+    messages,
+    remoteMode,
+    sizeCurrentTurn,
+    transcriptScrollRequest,
+    workspaceSurface,
+  ]);
 
   // A ⌘K search result asked to reveal a specific past message: scroll it into view
   // once it's in the DOM (it can arrive a tick later when the session was just
@@ -171,6 +269,53 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
     setPinned(true);
   };
 
+  const renderMessage = (message: Message, index: number) => {
+    const isActiveAssistant = streaming && index === lastIndex && message.role === "assistant";
+    const isRunMessage =
+      message.role === "assistant" &&
+      Boolean(
+        activeRun?.turnId &&
+        (message.turnId === activeRun.turnId || message.id === activeRun.turnId),
+      );
+    const run = isRunMessage ? activeRun : undefined;
+    const turnPresentation =
+      run && (run.streaming || run.finalizing)
+        ? {
+            active: run.streaming,
+            startedAt: run.startedAt,
+            waiting: run.pendingPermission !== null,
+            // Stop acknowledgement also uses `finalizing`, but the response is
+            // complete only after streaming turns false.
+            finalizing: run.finalizing && !run.streaming,
+          }
+        : undefined;
+    return (
+      <MessageView
+        key={message.id}
+        message={message}
+        isActive={isActiveAssistant}
+        turnPresentation={turnPresentation}
+        agents={isRunMessage ? activeAgents : undefined}
+        onReviewChanges={reviewTurn}
+        reviewAvailable={!remoteMode}
+      />
+    );
+  };
+
+  const renderedMessages =
+    currentTurnStart >= 0 ? (
+      <>
+        {messages.slice(0, currentTurnStart).map((message, index) => renderMessage(message, index))}
+        <div ref={currentTurnRef} data-testid="chat-current-turn" className="min-w-0">
+          {messages
+            .slice(currentTurnStart)
+            .map((message, index) => renderMessage(message, currentTurnStart + index))}
+        </div>
+      </>
+    ) : (
+      messages.map(renderMessage)
+    );
+
   return (
     <div data-testid="chat-shell" className="flex min-h-0 min-w-0 flex-1 flex-col">
       {/* The scroller spans the transcript so its gutter stays at the far-right edge.
@@ -209,38 +354,7 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
               ) : messages.length === 0 ? (
                 <EmptyState />
               ) : (
-                messages.map((m, i) => {
-                  const isActiveAssistant = streaming && i === lastIndex && m.role === "assistant";
-                  const isRunMessage =
-                    m.role === "assistant" &&
-                    Boolean(
-                      activeRun?.turnId &&
-                      (m.turnId === activeRun.turnId || m.id === activeRun.turnId),
-                    );
-                  const run = isRunMessage ? activeRun : undefined;
-                  const turnPresentation =
-                    run && (run.streaming || run.finalizing)
-                      ? {
-                          active: run.streaming,
-                          startedAt: run.startedAt,
-                          waiting: run.pendingPermission !== null,
-                          // Stop acknowledgement also uses `finalizing`, but the
-                          // response is complete only after streaming turns false.
-                          finalizing: run.finalizing && !run.streaming,
-                        }
-                      : undefined;
-                  return (
-                    <MessageView
-                      key={m.id}
-                      message={m}
-                      isActive={isActiveAssistant}
-                      turnPresentation={turnPresentation}
-                      agents={isRunMessage ? activeAgents : undefined}
-                      onReviewChanges={reviewTurn}
-                      reviewAvailable={!remoteMode}
-                    />
-                  );
-                })
+                renderedMessages
               )}
               {refreshError && (
                 <RefreshErrorNotice onRetry={() => activeId && void retryLoad(activeId)} />

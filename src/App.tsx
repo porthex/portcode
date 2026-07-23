@@ -247,8 +247,8 @@ export default function App() {
             {/* The file rail stays mounted and animates its inline width (0fr<->1fr
                 grid accordion, the same pattern ToolCall uses on rows) so toggling
                 it slides instead of jumping the main column sideways. The inner
-                overflow-hidden clips the 236px-wide content to zero; reduced-motion
-                users get the instant swap they had before. Collapsed, the rail is
+                overflow-hidden clips the explorer's remembered width to zero;
+                reduced-motion users get the instant swap they had before. Collapsed, the rail is
                 inert + aria-hidden so its tree stays out of the tab order and AT. */}
             <div
               data-testid="file-rail"

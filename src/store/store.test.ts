@@ -1266,11 +1266,18 @@ describe("selectSession", () => {
     await useStore.getState().selectSession("b");
     expect(useStore.getState().activeId).toBe("b");
     expect(useStore.getState().messages["b"]).toEqual([msg]);
+    expect(useStore.getState().transcriptScrollRequest).toMatchObject({
+      sessionId: "b",
+      kind: "latest",
+    });
+    const firstRequestId = useStore.getState().transcriptScrollRequest?.id;
 
-    // Cached now — a re-select must not refetch.
+    // Cached now — a re-select must not refetch, but it must issue a fresh Latest
+    // request so clicking the active row still returns the viewport to the bottom.
     m.getMessages.mockClear();
     await useStore.getState().selectSession("b");
     expect(m.getMessages).not.toHaveBeenCalled();
+    expect(useStore.getState().transcriptScrollRequest?.id).not.toBe(firstRequestId);
   });
 
   it("commits selection + cold loading state before history resolves", async () => {
@@ -1333,6 +1340,130 @@ describe("selectSession", () => {
     release({ messages: [cached], nextCursor: null });
     await refreshing;
     expect(useStore.getState().messages.b.map((message) => message.id)).toEqual(["cached", "live"]);
+  });
+
+  it("keeps cached older turns before a refreshed newest-page tail", async () => {
+    const olderUser: Message = {
+      id: "older-user",
+      role: "user",
+      blocks: [],
+      createdAt: 1,
+      turnId: "older-turn",
+    };
+    const olderAssistant: Message = {
+      id: "older-assistant",
+      role: "assistant",
+      blocks: [],
+      createdAt: 2,
+      turnId: "older-turn",
+    };
+    const latestUser: Message = {
+      id: "latest-user",
+      role: "user",
+      blocks: [],
+      createdAt: 3,
+      turnId: "latest-turn",
+    };
+    const liveAssistant: Message = {
+      id: "latest-assistant",
+      role: "assistant",
+      blocks: [],
+      createdAt: 4,
+      turnId: "latest-turn",
+    };
+    useStore.setState({
+      sessions: [session({ id: "b" })],
+      messages: { b: [olderUser, olderAssistant, latestUser, liveAssistant] },
+      messageLoads: {
+        b: {
+          phase: "ready",
+          loadedAt: 0,
+          lastAccessedAt: 0,
+          requestId: 1,
+          error: null,
+          nextCursor: null,
+          loadingOlder: false,
+        },
+      },
+    });
+    // A long active turn can consume the entire bounded newest page. Its still-live
+    // assistant row exists only in memory while the cached completed turn is older
+    // than the page boundary.
+    m.getMessagePage.mockResolvedValueOnce({ messages: [latestUser], nextCursor: "older-page" });
+
+    await useStore.getState().hydrateMessages("b");
+
+    expect(useStore.getState().messages.b.map((message) => message.id)).toEqual([
+      "older-user",
+      "older-assistant",
+      "latest-user",
+      "latest-assistant",
+    ]);
+  });
+
+  it("keeps a disjoint refresh and its paging cursor atomic", async () => {
+    const held: Message = { id: "held", role: "user", blocks: [], createdAt: 1 };
+    const fetched: Message = { id: "fetched", role: "user", blocks: [], createdAt: 2 };
+    useStore.setState({
+      sessions: [session({ id: "b" })],
+      messages: { b: [held] },
+      messageLoads: {
+        b: {
+          phase: "ready",
+          loadedAt: 0,
+          lastAccessedAt: 0,
+          requestId: 1,
+          error: null,
+          nextCursor: "held-cursor",
+          loadingOlder: false,
+        },
+      },
+    });
+    m.getMessagePage.mockResolvedValueOnce({
+      messages: [fetched],
+      nextCursor: "fetched-cursor",
+    });
+
+    await useStore.getState().hydrateMessages("b", { force: true });
+
+    const state = useStore.getState();
+    expect(state.messages.b).toEqual([held]);
+    expect(state.messageLoads.b).toMatchObject({
+      phase: "ready",
+      loadedAt: 0,
+      nextCursor: "held-cursor",
+    });
+  });
+
+  it("keeps current-only rows between refresh anchors in place", async () => {
+    const first: Message = { id: "first", role: "user", blocks: [], createdAt: 1 };
+    const live: Message = { id: "live", role: "assistant", blocks: [], createdAt: 2 };
+    const last: Message = { id: "last", role: "user", blocks: [], createdAt: 3 };
+    useStore.setState({
+      sessions: [session({ id: "b" })],
+      messages: { b: [first, live, last] },
+      messageLoads: {
+        b: {
+          phase: "ready",
+          loadedAt: 0,
+          lastAccessedAt: 0,
+          requestId: 1,
+          error: null,
+          nextCursor: "held-cursor",
+          loadingOlder: false,
+        },
+      },
+    });
+    m.getMessagePage.mockResolvedValueOnce({
+      messages: [first, last],
+      nextCursor: "fetched-cursor",
+    });
+
+    await useStore.getState().hydrateMessages("b", { force: true });
+
+    const state = useStore.getState();
+    expect(state.messages.b).toEqual([first, live, last]);
+    expect(state.messageLoads.b.nextCursor).toBe("held-cursor");
   });
 
   it("prepends an older desktop page and advances its opaque cursor", async () => {
@@ -1752,6 +1883,11 @@ describe("send", () => {
     expect(st.streaming).toBe(true);
     expect(st.messages.a).toHaveLength(2);
     expect(st.messages.a[0].role).toBe("user");
+    expect(st.transcriptScrollRequest).toMatchObject({
+      sessionId: "a",
+      kind: "newTurn",
+      targetMessageId: st.messages.a[0].id,
+    });
     expect(st.sessions[0].title).toBe("Refactor the parser"); // derived from first message
     expect(m.runAgent).toHaveBeenCalledWith("a", "Refactor the parser", expect.any(Function));
 
@@ -1787,10 +1923,14 @@ describe("send", () => {
     expect(useStore.getState().pendingPermission?.diff).toBe("-a\n+b\n");
 
     // turn_end clears streaming + any pending prompt
+    useStore.setState({
+      backgroundTasks: { a: [{ id: "bg-1", command: "watch", status: "running" }] },
+    });
     emit({ type: "turn_end", stopReason: "end_turn" });
     st = useStore.getState();
     expect(st.streaming).toBe(false);
     expect(st.pendingPermission).toBeNull();
+    expect(st.messages.a[1].receipt?.backgroundTasksRunning).toBe(true);
   });
 
   it("reconciles both optimistic bubbles to native turn identity and attaches its receipt", async () => {
@@ -1919,6 +2059,7 @@ describe("send", () => {
       sessions: [session({ id: "a" })],
       activeId: "a",
       messages: { a: [] },
+      backgroundTasks: { a: [{ id: "bg-1", command: "watch", status: "running" }] },
     });
 
     await useStore.getState().send("change it");
@@ -1959,6 +2100,7 @@ describe("send", () => {
       changeState: "unknown",
       changeCertainty: "unavailable",
       changedFileCount: 0,
+      backgroundTasksRunning: true,
     });
     expect(dispose).not.toHaveBeenCalled();
 
@@ -2360,6 +2502,11 @@ describe("send", () => {
       turnId: expect.any(String),
       blocks: [],
     });
+    expect(st.transcriptScrollRequest).toMatchObject({
+      sessionId: "a",
+      kind: "newTurn",
+      targetMessageId: st.messages.a[0].id,
+    });
   });
 
   it("remote send flips streaming optimistically so a second send can't double-dispatch", async () => {
@@ -2433,6 +2580,62 @@ describe("send", () => {
 
     expect(dispose).toHaveBeenCalledTimes(1);
     expect(useStore.getState().streaming).toBe(false);
+  });
+
+  it("keeps a no-capture failed turn subscribed until the authoritative error arrives", async () => {
+    const dispose = vi.fn();
+    let emit!: (e: StreamEvent) => void;
+    m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose };
+    });
+    useStore.setState({ sessions: [session({ id: "a" })], activeId: "a", messages: { a: [] } });
+
+    await useStore.getState().send("start a swarm");
+    emit({ type: "turn_start", messageId: "native-turn", turnId: "native-turn", startedAt: 100 });
+    emit({
+      type: "turn_phase",
+      turnId: "native-turn",
+      phase: "agent_completed",
+      at: 350,
+      revision: 1,
+      status: "error",
+      agentDurationMs: 250,
+      receiptExpected: false,
+    });
+
+    expect(dispose).not.toHaveBeenCalled();
+    expect(useStore.getState().runs.a).toMatchObject({
+      streaming: false,
+      finalizing: true,
+      outcome: "error",
+    });
+
+    const receipt = turnReceipt({
+      turnId: "native-turn",
+      status: "error",
+      stopReason: undefined,
+      changeState: "not_applicable",
+    });
+    emit({
+      type: "error",
+      message: "OpenAI response was rejected (HTTP 400). Please retry.",
+      receipt,
+    });
+
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(useStore.getState().runs.a).toMatchObject({
+      streaming: false,
+      finalizing: false,
+      outcome: "error",
+      receipt,
+    });
+    expect(useStore.getState().messages.a[1].blocks).toEqual([
+      {
+        kind: "text",
+        text: "\n\n**Error:** OpenAI response was rejected (HTTP 400). Please retry.",
+      },
+    ]);
   });
 
   it.each([
@@ -3554,6 +3757,20 @@ describe("cyclePermissionMode", () => {
 
 describe("draft + UI setters", () => {
   const draftOf = (id: string) => useStore.getState().drafts[id];
+
+  it("keeps a pending chat draft in memory until the chat is persisted", () => {
+    const pending = session({ id: "pending-chat" });
+    useStore.setState({ activeId: pending.id, pendingSession: pending, drafts: {} });
+    const mirroredDrafts = localStorage.getItem("pc.drafts");
+
+    useStore.getState().setDraft("not persisted yet");
+    expect(useStore.getState().drafts).toEqual({ [pending.id]: "not persisted yet" });
+    expect(localStorage.getItem("pc.drafts")).toBe(mirroredDrafts);
+    expect(m.saveDraft).not.toHaveBeenCalled();
+
+    useStore.getState().setDraft("");
+    expect(useStore.getState().drafts).toEqual({});
+  });
 
   // setDraft schedules a ~400ms debounced backend write; fake timers keep that
   // pending timer from firing into a later test's saveDraft assertions.
@@ -5530,7 +5747,9 @@ describe("remote client", () => {
       live({ type: "text_delta", text: "Hello " });
       live({ type: "text_delta", text: "world" });
       live({ type: "tool_use", id: "t1", name: "fs_read", input: { path: "x" } });
+      expect(useStore.getState().activeTool).toBe("fs_read");
       live({ type: "tool_result", id: "t1", output: "ok", isError: false });
+      expect(useStore.getState().activeTool).toBeNull();
 
       const blocks = useStore.getState().messages.s1[0].blocks;
       expect(blocks).toEqual([
@@ -5548,6 +5767,27 @@ describe("remote client", () => {
       });
 
       expect(useStore.getState().messages.s1).toBeUndefined();
+    });
+
+    it("ignores a delta when the current turn's assistant row is missing", () => {
+      seedTurn("s1", "a1");
+      const userOnly = [
+        {
+          id: "u1",
+          role: "user" as const,
+          blocks: [{ kind: "text" as const, text: "hi" }],
+          createdAt: 1,
+        },
+      ];
+      useStore.setState({ messages: { s1: userOnly } });
+
+      useStore.getState().applyFrame({
+        t: "live",
+        session_id: "s1",
+        event: { type: "text_delta", text: "lost" },
+      });
+
+      expect(useStore.getState().messages.s1).toEqual(userOnly);
     });
 
     it("permission_request surfaces a pending prompt (with its diff) for the active session", () => {
@@ -6995,9 +7235,11 @@ describe("live subagents (agents panel)", () => {
 
     emit({ type: "agent_started", agentId: "g1", description: "first" });
     emit({ type: "agent_started", agentId: "g2", description: "second", parentId: "g1" });
+    emit({ type: "agent_started", agentId: "g1", description: "first-again" });
 
     const a = useStore.getState().agents.a;
     expect(a.map((x) => x.id)).toEqual(["g1", "g2"]);
+    expect(a[0].description).toBe("first-again");
     expect(a[1].parentId).toBe("g1");
   });
 
@@ -7141,7 +7383,7 @@ describe("background shell tasks (background-tasks panel)", () => {
     });
   });
 
-  it("keeps multiple tasks in launch order and replaces a duplicate start", () => {
+  it("keeps multiple tasks in launch order and replaces a duplicate running start", () => {
     useStore.setState({ activeId: "a", backgroundTasks: {} });
     const f = useStore.getState().applyFrame;
     f(bgFrame("a", { type: "background_task_started", id: "t1", command: "first" }));
@@ -7150,6 +7392,25 @@ describe("background shell tasks (background-tasks panel)", () => {
     const t = useStore.getState().backgroundTasks.a;
     expect(t.map((x) => x.id)).toEqual(["t1", "t2"]);
     expect(t[0].command).toBe("first-again");
+  });
+
+  it("does not regress a finished task when a delayed start is replayed", () => {
+    useStore.setState({ activeId: "a", backgroundTasks: {} });
+    const f = useStore.getState().applyFrame;
+    f(
+      bgFrame("a", {
+        type: "background_task_finished",
+        id: "t1",
+        command: "build",
+        exitCode: 2,
+        output: "boom",
+      }),
+    );
+    f(bgFrame("a", { type: "background_task_started", id: "t1", command: "build" }));
+
+    expect(useStore.getState().backgroundTasks.a).toEqual([
+      { id: "t1", command: "build", status: "error", exitCode: 2, output: "boom" },
+    ]);
   });
 
   it("upserts a finished event whose start it never saw", () => {

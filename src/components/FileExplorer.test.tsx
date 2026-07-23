@@ -38,6 +38,7 @@ beforeEach(() => {
   // leak is timing-dependent (whether every Once is consumed before a test ends),
   // so it surfaced as a flaky FileExplorer failure under CI load.
   vi.resetAllMocks();
+  localStorage.removeItem("pc.filesPanelWidth");
   // Restore a pristine store between tests (zustand has no built-in reset).
   useStore.setState(initialState, true);
 
@@ -51,6 +52,23 @@ beforeEach(() => {
 });
 
 describe("FileExplorer header", () => {
+  it("resizes horizontally within its persisted min/max range", async () => {
+    const { container } = render(<FileExplorer />);
+    const explorer = container.firstElementChild as HTMLElement;
+    const handle = screen.getByRole("separator", { name: "Resize file explorer" });
+
+    expect(explorer).toHaveStyle({ width: "236px" });
+    expect(handle).toHaveAttribute("aria-valuemin", "180");
+    expect(handle).toHaveAttribute("aria-valuemax", "420");
+
+    fireEvent.keyDown(handle, { key: "Home" });
+    expect(explorer).toHaveStyle({ width: "180px" });
+    fireEvent.keyDown(handle, { key: "End" });
+    expect(explorer).toHaveStyle({ width: "420px" });
+    expect(localStorage.getItem("pc.filesPanelWidth")).toBe("420");
+    await waitFor(() => expect(m.listDir).toHaveBeenCalledWith(undefined));
+  });
+
   it("shows the PORTCODE eyebrow regardless of workspace", async () => {
     render(<FileExplorer />);
     // Neon-Noir header: a fixed "◧ PORTCODE" eyebrow (no workspace basename).

@@ -59,6 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Beta upgrades now close and remove superseded executables immediately, migrate
+  owned desktop and Start Menu shortcuts even during GUI updates, and clean up
+  legacy beta binaries and shortcuts during uninstall.
 - Markdown now formats during streaming, active exploration uses present-tense
   wording, interrupted tools or agents no longer remain visibly running, and a
   stopped turn can no longer duplicate cached user messages during hydration.

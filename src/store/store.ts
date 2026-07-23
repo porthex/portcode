@@ -162,6 +162,13 @@ export interface UpdateState {
 
 const IDLE_UPDATE: UpdateState = { phase: "idle", info: null, progress: null, error: null };
 
+interface TranscriptScrollRequest {
+  id: string;
+  sessionId: string;
+  kind: "latest" | "newTurn";
+  targetMessageId?: string;
+}
+
 interface AppState {
   sessions: Session[];
   activeId: string | null;
@@ -247,6 +254,10 @@ interface AppState {
   // The message a ⌘K search result asked to reveal; the Chat transcript scrolls it
   // into view, then clears it (see jumpToMessage / clearScrollTarget). Null at rest.
   scrollTargetId: string | null;
+  // One-shot navigation intent for transcript positioning. Session selection asks
+  // for the latest message; an accepted send asks Chat to place that new user turn
+  // at the top with a response runway beneath it.
+  transcriptScrollRequest: TranscriptScrollRequest | null;
   crashReporting: boolean | null; // opt-in crash/error reporting; null = not yet asked (show first-run prompt)
   cancel: (() => Promise<void>) | null;
   pendingPermission: PendingPermission | null;
@@ -319,6 +330,7 @@ interface AppState {
   searchMessages: (query: string) => Promise<SearchHit[]>;
   jumpToMessage: (sessionId: string, messageId: string) => Promise<void>;
   clearScrollTarget: () => void;
+  clearTranscriptScrollRequest: (id: string) => void;
   setAmbientRain: (v: boolean) => void;
   setScanlines: (v: boolean) => void;
   setUiScale: (n: number) => void;
@@ -824,14 +836,15 @@ const patchBackgroundTasks = (
   [sessionId]: fn(tasks[sessionId] ?? []),
 });
 
-// Add a newly-started task, preserving launch order; replace on a duplicate id
-// (defensive against a re-delivered started event) rather than listing it twice.
+// Add a newly-started task, preserving launch order. A duplicate start may refresh
+// a still-running row, but it must never regress an already-terminal task back to
+// running when lifecycle events are replayed or delivered out of order.
 const startBackgroundTask = (
   list: BackgroundTaskInfo[],
   info: BackgroundTaskInfo,
 ): BackgroundTaskInfo[] =>
   list.some((t) => t.id === info.id)
-    ? list.map((t) => (t.id === info.id ? info : t))
+    ? list.map((t) => (t.id === info.id && t.status === "running" ? info : t))
     : [...list, info];
 
 // Fold one background-task StreamEvent into a session's task list. Shared by the
@@ -1191,9 +1204,57 @@ const idleMessageLoad = (at = now()): MessageLoadState => ({
 const messageIdentity = (message: Message): string =>
   message.turnId ? `${message.role}:turn:${message.turnId}` : `${message.role}:id:${message.id}`;
 
-/** Persisted rows lead, while messages created/streamed during the request are
- * retained and win on identity collisions. */
-const mergeHydratedMessages = (persisted: Message[], current: Message[]): Message[] => {
+/** Merge a refreshed newest-page tail into the held chronological transcript.
+ * Cached rows before the first shared message are older than the bounded page and
+ * must stay in front; rows after the final shared message may have arrived live
+ * while the request was in flight. Null means there is no safe identity anchor, so
+ * the caller must keep both the held transcript and its matching paging cursor. */
+const mergeNewestHydratedPage = (persisted: Message[], current: Message[]): Message[] | null => {
+  if (persisted.length === 0) return current.length === 0 ? [] : null;
+  if (current.length === 0) return persisted;
+
+  const currentByKey = new Map(current.map((message) => [messageIdentity(message), message]));
+  const currentIndexByKey = new Map(
+    current.map((message, index) => [messageIdentity(message), index]),
+  );
+  const persistedKeys = new Set(persisted.map(messageIdentity));
+  const overlapIndexes = persisted.flatMap((message) => {
+    const index = currentIndexByKey.get(messageIdentity(message));
+    return index === undefined ? [] : [index];
+  });
+  if (overlapIndexes.length === 0) return null;
+  for (let index = 1; index < overlapIndexes.length; index += 1) {
+    if (overlapIndexes[index] <= overlapIndexes[index - 1]) return null;
+  }
+
+  const firstOverlap = overlapIndexes[0];
+  const lastOverlap = overlapIndexes[overlapIndexes.length - 1];
+  if (
+    current
+      .slice(firstOverlap, lastOverlap + 1)
+      .some((message) => !persistedKeys.has(messageIdentity(message)))
+  ) {
+    return null;
+  }
+
+  const older = current.slice(0, firstOverlap);
+  const seen = new Set(older.map(messageIdentity));
+  const merged = [...older];
+  for (const message of persisted) {
+    const key = messageIdentity(message);
+    seen.add(key);
+    merged.push(currentByKey.get(key) ?? message);
+  }
+  for (const message of current.slice(lastOverlap + 1)) {
+    const key = messageIdentity(message);
+    if (!seen.has(key)) merged.push(message);
+  }
+  return merged;
+};
+
+/** Merge an authoritative chronological prefix (a full history or older page),
+ * retaining current/live versions on overlap and appending the held newer tail. */
+const mergePersistedPrefix = (persisted: Message[], current: Message[]): Message[] => {
   const currentByKey = new Map(current.map((message) => [messageIdentity(message), message]));
   const seen = new Set<string>();
   const merged = persisted.map((message) => {
@@ -1480,6 +1541,7 @@ export const useStore = create<AppState>((set, get) => ({
   composerPhase: "idle",
   activeTool: null,
   scrollTargetId: null,
+  transcriptScrollRequest: null,
   crashReporting: readTriPref("pc.crashReporting"),
   cancel: null,
   pendingPermission: null,
@@ -1835,19 +1897,18 @@ export const useStore = create<AppState>((set, get) => ({
           if (load?.requestId !== requestId) {
             return {};
           }
-          const messages = {
-            ...st.messages,
-            [id]: mergeHydratedMessages(page.messages, st.messages[id] ?? []),
-          };
+          const merged = mergeNewestHydratedPage(page.messages, st.messages[id] ?? []);
+          const accepted = merged !== null;
+          const messages = accepted ? { ...st.messages, [id]: merged } : st.messages;
           const messageLoads = {
             ...st.messageLoads,
             [id]: {
               ...load,
               phase: "ready" as const,
-              loadedAt: now(),
+              loadedAt: accepted ? now() : load.loadedAt,
               lastAccessedAt: now(),
               error: null,
-              nextCursor: page.nextCursor,
+              nextCursor: accepted ? page.nextCursor : load.nextCursor,
               loadingOlder: false,
             },
           };
@@ -2026,6 +2087,7 @@ export const useStore = create<AppState>((set, get) => ({
         drafts,
         showSidebar: false, // close the mobile drawer on navigation
         runs,
+        transcriptScrollRequest: { id: uid(), sessionId: id, kind: "latest" },
         ...projectActiveRun({ activeId: id, runs }),
       };
     });
@@ -2060,7 +2122,7 @@ export const useStore = create<AppState>((set, get) => ({
         set((st) => ({
           messages: {
             ...st.messages,
-            [sessionId]: mergeHydratedMessages(messages, st.messages[sessionId] ?? []),
+            [sessionId]: mergePersistedPrefix(messages, st.messages[sessionId] ?? []),
           },
           messageLoads: {
             ...st.messageLoads,
@@ -2087,6 +2149,10 @@ export const useStore = create<AppState>((set, get) => ({
 
   clearScrollTarget() {
     set({ scrollTargetId: null });
+  },
+
+  clearTranscriptScrollRequest(id) {
+    set((st) => (st.transcriptScrollRequest?.id === id ? { transcriptScrollRequest: null } : {}));
   },
 
   async deleteSession(id) {
@@ -2598,6 +2664,12 @@ export const useStore = create<AppState>((set, get) => ({
           ...st.messages,
           [activeId]: [...msgs, userMsg, assistant],
         },
+        transcriptScrollRequest: {
+          id: uid(),
+          sessionId: activeId,
+          kind: "newTurn",
+          targetMessageId: userMsg.id,
+        },
         // Each turn's agents panel starts empty; this turn's subagents repopulate it.
         agents: { ...st.agents, [activeId]: [] },
       };
@@ -2692,8 +2764,9 @@ export const useStore = create<AppState>((set, get) => ({
     ) => {
       const eventTurnId = receipt?.turnId ?? observedTurnId;
       const current = get().runs[myKey];
-      // `receiptExpected: false` unlocks immediately, so a quick follow-up can
-      // start before this listener receives its trailing authoritative terminal.
+      // A successful `receiptExpected: false` turn unlocks immediately, so a
+      // quick follow-up can start before this listener receives its trailing
+      // authoritative terminal. Failed turns now remain subscribed through Error.
       // Distinguish an authoritative replacement of this turn's provisional ID
       // from a genuinely newer run, and never let the stale listener end that run.
       const stillOwnsCurrentRun = nativeTurnIdKnown
@@ -2756,10 +2829,10 @@ export const useStore = create<AppState>((set, get) => ({
     };
 
     const onEvent = (e: StreamEvent) => {
-      // `receiptExpected: false` is terminal for this frontend listener. Native
-      // still persists/emits its authoritative TurnEnd, but the no-capture phase
-      // already carries every fact needed to unlock the UI. A hard callback guard
-      // protects tests and queued channel deliveries even before unlisten finishes.
+      // `receiptExpected: false` means no Git finalization is needed; it does NOT
+      // replace the authoritative TurnEnd/Error. Successful no-capture turns may
+      // unlock immediately, but failed turns must keep this listener until Error
+      // delivers the actionable provider/lifecycle message.
       if (settled) return;
       // Once cancellation is acknowledged, only this turn's terminal receipt is
       // relevant. Ignoring late deltas/turn_start also prevents this listener from
@@ -2843,7 +2916,7 @@ export const useStore = create<AppState>((set, get) => ({
                 streaming: false,
                 cancel: null,
                 pendingPermission: null,
-                finalizing: e.receiptExpected !== false,
+                finalizing: e.receiptExpected !== false || status === "error",
                 agentDurationMs: receipt.agentDurationMs ?? receipt.durationMs ?? null,
                 phaseRevision,
                 receipt,
@@ -2855,7 +2928,7 @@ export const useStore = create<AppState>((set, get) => ({
             };
           });
 
-          if (e.receiptExpected !== false) {
+          if (e.receiptExpected !== false || status === "error") {
             if (receiptTerminalTimer !== null) clearTimeout(receiptTerminalTimer);
             receiptTerminalTimer = setTimeout(() => {
               receiptTerminalTimer = null;
@@ -2943,7 +3016,7 @@ export const useStore = create<AppState>((set, get) => ({
               e.receipt?.status ?? "error",
               e.receipt?.stopReason,
               e.receipt,
-              `\n\n**Error:** ${errorMessage}`,
+              e.receipt?.failure ? undefined : `\n\n**Error:** ${errorMessage}`,
             );
           }
           break;
@@ -4508,6 +4581,12 @@ export const useStore = create<AppState>((set, get) => ({
               ...(assistant ? [assistant] : []),
             ],
           },
+          transcriptScrollRequest: {
+            id: uid(),
+            sessionId: session_id,
+            kind: "newTurn",
+            targetMessageId: userMsg.id,
+          },
         };
       });
     }
@@ -4574,7 +4653,7 @@ export const useStore = create<AppState>((set, get) => ({
           return {
             messages: {
               ...st.messages,
-              [sessionId]: mergeHydratedMessages(page.messages, st.messages[sessionId] ?? []),
+              [sessionId]: mergePersistedPrefix(page.messages, st.messages[sessionId] ?? []),
             },
             messageLoads: {
               ...st.messageLoads,

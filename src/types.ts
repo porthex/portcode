@@ -83,9 +83,24 @@ export interface TurnChangedFile {
 }
 
 /** Persisted, reload-safe completion metadata for an assistant turn. */
+export interface TurnFailure {
+  /** Stable local category; never derived from prompt or tool content. */
+  code: string;
+  /** Secret-scrubbed, bounded failure summary. */
+  message: string;
+  provider?: string;
+  model?: string;
+  httpStatus?: number;
+  /** Persisted transcript measurements supplied to the failed root run. */
+  transcriptMessages?: number;
+  transcriptBytes?: number;
+}
+
 export interface TurnReceipt {
   turnId: string;
   status: TurnStatus;
+  /** Durable diagnostics for a failed turn; absent on successful and legacy receipts. */
+  failure?: TurnFailure;
   /** Provider/native stop reason; omitted when the turn failed before one existed. */
   stopReason?: string;
   startedAt: number;

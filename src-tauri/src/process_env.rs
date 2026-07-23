@@ -352,6 +352,7 @@ mod tests {
             ("DYLD_INSERT_LIBRARIES", "/tmp/inject.dylib"),
             ("NODE_OPTIONS", "--require /tmp/inject.js"),
             ("NPM_CONFIG_TOKEN", "planted-secret"),
+            ("PSExecutionPolicyPreference", "Unrestricted"),
             ("GIT_CONFIG_COUNT", "1"),
             ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
         ];

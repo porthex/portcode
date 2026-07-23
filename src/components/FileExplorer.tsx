@@ -1,5 +1,6 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { useContextMenu, type ContextMenuItem } from "./ContextMenu";
+import { PanelResizeHandle, usePersistentPanelWidth } from "./PanelResizeHandle";
 import { useStore } from "../store/store";
 import * as ipc from "../lib/ipc";
 import type { DirEntry } from "../types";
@@ -33,11 +34,21 @@ function visibleEntries(entries: DirEntry[], showGenerated: boolean): DirEntry[]
   return showGenerated ? entries : entries.filter((entry) => !isGeneratedDirectory(entry));
 }
 
+const FILE_PANEL_DEFAULT_WIDTH = 236;
+const FILE_PANEL_MIN_WIDTH = 180;
+const FILE_PANEL_MAX_WIDTH = 420;
+
 export function FileExplorer() {
   const workspace = useStore((s) => s.settings.workspace);
   const openWorkspace = useStore((s) => s.openWorkspace);
   const workspaceError = useStore((s) => s.workspaceError);
   const toggleFiles = useStore((s) => s.toggleFiles);
+  const { width, setWidth } = usePersistentPanelWidth({
+    storageKey: "pc.filesPanelWidth",
+    defaultWidth: FILE_PANEL_DEFAULT_WIDTH,
+    minWidth: FILE_PANEL_MIN_WIDTH,
+    maxWidth: FILE_PANEL_MAX_WIDTH,
+  });
   const [roots, setRoots] = useState<DirEntry[]>([]);
   const [showGenerated, setShowGenerated] = useState(false);
   // Roving-tabindex active row: the path of the single treeitem that holds
@@ -137,7 +148,8 @@ export function FileExplorer() {
   return (
     <aside
       aria-label="File explorer"
-      className="flex h-full w-[236px] shrink-0 flex-col border-r border-border bg-panel/80"
+      className="relative flex h-full shrink-0 flex-col border-r border-border bg-panel/80"
+      style={{ width }}
     >
       <div className="flex items-center gap-2 border-b border-border px-3.5 py-[11px]">
         <span
@@ -248,6 +260,14 @@ export function FileExplorer() {
           </Fragment>
         )}
       </div>
+      <PanelResizeHandle
+        label="Resize file explorer"
+        width={width}
+        minWidth={FILE_PANEL_MIN_WIDTH}
+        maxWidth={FILE_PANEL_MAX_WIDTH}
+        defaultWidth={FILE_PANEL_DEFAULT_WIDTH}
+        onResize={setWidth}
+      />
     </aside>
   );
 }

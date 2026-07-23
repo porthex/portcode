@@ -49,6 +49,31 @@ export interface SessionRow {
 export type Block = { type: "text"; text: string } | { type: "tool_use"; id: string; name: string; input: Value } | { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean } | { type: "reasoning"; model?: string; id?: string; encrypted_content?: string; summary?: Value[] };
 
 /**
+ * Bounded, reload-safe diagnostics for a failed root turn. This deliberately
+ * contains only operational metadata: never prompts, tool inputs/results,
+ * credentials, provider response bodies, or absolute paths.
+ */
+export interface TurnFailure {
+    /**
+     * Stable local classification such as `provider_http` or `provider_timeout`.
+     */
+    code: string;
+    /**
+     * User-safe, secret-scrubbed summary, bounded by the desktop before storage.
+     */
+    message: string;
+    provider?: string;
+    model?: string;
+    httpStatus?: number;
+    /**
+     * Number and serialized byte size of persisted transcript messages supplied
+     * to the failing root run. These are diagnostics, not token estimates.
+     */
+    transcriptMessages?: number;
+    transcriptBytes?: number;
+}
+
+/**
  * Events streamed to the frontend. Tagged + camelCased to match `StreamEvent`
  * in `src/types.ts`. This is the rich internal desktop event; Phone Sync frames
  * embed the separate projected [`PhoneStreamEvent`] type below.
@@ -85,6 +110,11 @@ export interface TurnReceipt {
      */
     accountProfileId?: string;
     status: TurnStatus;
+    /**
+     * Present only for failed turns. Optional for additive compatibility with
+     * receipts written by older desktop and phone builds.
+     */
+    failure?: TurnFailure;
     stopReason?: string;
     startedAt: number;
     completedAt: number;

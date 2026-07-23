@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEven
 
 import { useContextMenu, type ContextMenuItem } from "./ContextMenu";
 import { SessionActionDialog, type SessionDialogState } from "./SessionActionDialog";
+import { PanelResizeHandle, usePersistentPanelWidth } from "./PanelResizeHandle";
 import { isTauri } from "../lib/ipc";
 import {
   buildSidebarRows,
@@ -81,18 +82,46 @@ export function NewSessionControl({ compact = false }: { compact?: boolean }) {
   );
 }
 
-/** The sessions sidebar. A width-animated shell morphs between the full 248px
- *  panel and the slim 52px rail (the swapped content cross-fades in); the mobile
- *  drawer passes `collapsible={false}` so it always shows the panel. */
+const SESSION_PANEL_DEFAULT_WIDTH = 248;
+const SESSION_PANEL_MIN_WIDTH = 200;
+const SESSION_PANEL_MAX_WIDTH = 420;
+
+/** The sessions sidebar. Its expanded width is draggable and persisted; collapsing
+ * keeps that width in reserve while the shell morphs to the slim 52px rail. The
+ * mobile drawer passes `collapsible={false}` and remains a fixed-width panel. */
 export function Sidebar({ collapsible = true }: { collapsible?: boolean }) {
   const sidebarCollapsed = useStore((s) => s.sidebarCollapsed);
   const isCollapsed = collapsible && sidebarCollapsed;
+  const [resizing, setResizing] = useState(false);
+  const { width, setWidth } = usePersistentPanelWidth({
+    storageKey: "pc.sessionsPanelWidth",
+    defaultWidth: SESSION_PANEL_DEFAULT_WIDTH,
+    minWidth: SESSION_PANEL_MIN_WIDTH,
+    maxWidth: SESSION_PANEL_MAX_WIDTH,
+  });
+  const expandedWidth = collapsible ? width : SESSION_PANEL_DEFAULT_WIDTH;
+
   return (
     <div
-      className="relative h-full shrink-0 overflow-hidden border-r border-border bg-panel transition-[width] duration-200 ease-out motion-reduce:transition-none"
-      style={{ width: isCollapsed ? 52 : 248 }}
+      data-testid="sessions-panel-shell"
+      className={`relative h-full shrink-0 overflow-hidden border-r border-border bg-panel motion-reduce:transition-none ${
+        resizing ? "" : "transition-[width] duration-200 ease-out"
+      }`}
+      style={{ width: isCollapsed ? 52 : expandedWidth }}
     >
       {isCollapsed ? <SessionRail /> : <SessionPanel collapsible={collapsible} />}
+      {collapsible && !isCollapsed && (
+        <PanelResizeHandle
+          label="Resize sessions explorer"
+          width={width}
+          minWidth={SESSION_PANEL_MIN_WIDTH}
+          maxWidth={SESSION_PANEL_MAX_WIDTH}
+          defaultWidth={SESSION_PANEL_DEFAULT_WIDTH}
+          onResize={setWidth}
+          onResizeStart={() => setResizing(true)}
+          onResizeEnd={() => setResizing(false)}
+        />
+      )}
     </div>
   );
 }
@@ -936,7 +965,7 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
   const groupLabel = GROUP_OPTIONS.find((o) => o.value === groupBy)?.label ?? "None";
 
   return (
-    <aside aria-label="Sessions" className="pc-fade-in flex h-full w-[248px] flex-col">
+    <aside aria-label="Sessions" className="pc-fade-in flex h-full w-full flex-col">
       {/* Header */}
       <div
         data-testid="sidebar-titlebar"

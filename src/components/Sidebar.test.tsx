@@ -92,6 +92,7 @@ const openArchive = (): void => {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  localStorage.removeItem("pc.sessionsPanelWidth");
   // zustand has no built-in reset; restore the pristine snapshot each test.
   useStore.setState(initialState, true);
 
@@ -1179,6 +1180,9 @@ describe("Sidebar", () => {
       // The drawer always shows the full panel — toolbar present, no collapse control.
       expect(screen.getByRole("button", { name: /Sort sessions/ })).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "Collapse sidebar" })).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("separator", { name: "Resize sessions explorer" }),
+      ).not.toBeInTheDocument();
     });
   });
 
@@ -1714,6 +1718,32 @@ describe("Sidebar", () => {
   });
 
   describe("open/close animation", () => {
+    it("resizes within bounds and preserves the expanded width across collapse", () => {
+      useStore.setState({
+        sessions: [session({ id: "a" })],
+        activeId: "a",
+        sidebarCollapsed: false,
+      });
+      const { container } = render(<Sidebar />);
+      const shell = container.firstElementChild as HTMLElement;
+      const handle = screen.getByRole("separator", { name: "Resize sessions explorer" });
+
+      expect(handle).toHaveAttribute("aria-valuemin", "200");
+      expect(handle).toHaveAttribute("aria-valuemax", "420");
+      fireEvent.keyDown(handle, { key: "End" });
+      expect(shell).toHaveStyle({ width: "420px" });
+      expect(localStorage.getItem("pc.sessionsPanelWidth")).toBe("420");
+
+      fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+      expect(shell).toHaveStyle({ width: "52px" });
+      expect(
+        screen.queryByRole("separator", { name: "Resize sessions explorer" }),
+      ).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
+      expect(shell).toHaveStyle({ width: "420px" });
+    });
+
     it("morphs the shell width between the panel (248) and rail (52)", () => {
       useStore.setState({
         sessions: [session({ id: "a" })],
