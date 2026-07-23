@@ -79,7 +79,7 @@ export interface TurnFailure {
  * embed the separate projected [`PhoneStreamEvent`] type below.
  * (Was `crate::llm::StreamEvent`.)
  */
-export type StreamEvent = { type: "turn_start"; messageId: string; turnId?: string; startedAt?: number } | { type: "turn_phase"; turnId: string; phase: TurnPhase; at: number; revision?: number; status?: TurnStatus; stopReason?: string; agentDurationMs?: number; receiptExpected?: boolean } | { type: "text_delta"; text: string } | { type: "tool_use"; id: string; name: string; input: Value } | { type: "tool_result"; id: string; output: string; isError: boolean } | { type: "permission_request"; id: string; tool: string; risk?: PermissionRisk; summary: string; input: Value; diff?: string } | { type: "usage"; inputTokens: number; outputTokens: number } | { type: "turn_end"; stopReason: string; receipt?: TurnReceipt } | { type: "error"; message: string; receipt?: TurnReceipt } | { type: "agent_started"; agentId: string; description: string; parentId?: string } | { type: "agent_progress"; agentId: string; step: number } | { type: "agent_finished"; agentId: string; status: string } | { type: "background_task_started"; id: string; command: string } | { type: "background_task_finished"; id: string; command: string; exitCode: number; output: string };
+export type StreamEvent = { type: "turn_start"; messageId: string; turnId?: string; startedAt?: number } | { type: "turn_phase"; turnId: string; phase: TurnPhase; at: number; revision?: number; status?: TurnStatus; stopReason?: string; agentDurationMs?: number; receiptExpected?: boolean } | { type: "text_delta"; text: string } | { type: "tool_use"; id: string; name: string; input: Value } | { type: "tool_result"; id: string; output: string; isError: boolean } | { type: "permission_request"; id: string; tool: string; risk?: PermissionRisk; summary: string; input: Value; diff?: string } | { type: "usage"; inputTokens: number; outputTokens: number } | { type: "turn_end"; stopReason: string; receipt?: TurnReceipt } | { type: "error"; message: string; receipt?: TurnReceipt } | { type: "agent_started"; agentId: string; description: string; parentId?: string } | { type: "agent_progress"; agentId: string; step: number } | { type: "agent_finished"; agentId: string; status: string } | { type: "background_task_started"; id: string; command: string } | { type: "background_task_finished"; id: string; command: string; exitCode: number; output: string } | { type: "codex_event"; sequence: number; method: string; params: Value; requestId?: Value; threadId?: string; turnId?: string; itemId?: string; emittedAtMs: number } | { type: "codex_request"; id: string; method: string; params: Value };
 
 /**
  * Everything that crosses the encrypted channel, in both directions.
@@ -456,15 +456,15 @@ export interface InitOutput {
     readonly intounderlyingsource_cancel: (a: number) => void;
     readonly intounderlyingsource_pull: (a: number, b: any) => any;
     readonly ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hfe1c0a6f1e8b05bc: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen__convert__closures_____invoke__h16b583695eaaa759: (a: number, b: number, c: any, d: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h09422128ca52abe5: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hdbc11045f7dc48e5: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h9768ca95ee41dd2d: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h1b7d021b1c5dfc2e: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h478ee851fa3c1656: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h080f7a4b92422f09: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h838e0803cc6d1745: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__haeef4d57e6a88c91: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen__convert__closures_____invoke__h29f3221e742a74f6: (a: number, b: number, c: any, d: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h68ec937c7cebd819: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h57b4aa5ba5f8eab8: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__hc6a33f57e9316770: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__hd51a085c8f3dffa7: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h732d2251e9086dd9: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h069bff72c256f5f0: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__hfe7f4cbcccf4f5d6: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;
