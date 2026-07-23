@@ -55,8 +55,9 @@ describe("BackgroundTasksPanel", () => {
 
     expect(screen.getByText("done")).toBeInTheDocument();
     expect(screen.getByText("exit 2")).toBeInTheDocument();
-    // Nothing running → the header falls back to a plain count.
-    expect(screen.getByText("2 background tasks")).toBeInTheDocument();
+    // Nothing running and one failure → the header must not imply success.
+    const header = screen.getByText("1 background task failed").closest("div");
+    expect(header?.querySelector(".pc-dot")).toHaveClass("bg-danger");
   });
 
   it("exposes the captured output via the row's title for hover inspection", () => {

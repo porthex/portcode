@@ -221,6 +221,63 @@ describe("PermissionPrompt", () => {
     expect(useStore.getState().pendingPermission).toBeNull();
   });
 
+  it("locks every action while an answer is being delivered so rapid clicks resolve once", async () => {
+    let finishResolve!: () => void;
+    m.resolvePermission.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishResolve = resolve;
+      }),
+    );
+    useStore.setState({ pendingPermission: pending() });
+
+    render(<PermissionPrompt />);
+    const forSession = screen.getByRole("button", { name: "Allow for session" });
+    fireEvent.click(forSession);
+
+    for (const action of screen.getAllByRole("button")) expect(action).toBeDisabled();
+    (forSession as HTMLButtonElement).disabled = false;
+    fireEvent.click(forSession);
+    expect(m.saveSettings).not.toHaveBeenCalled();
+    expect(m.resolvePermission).toHaveBeenCalledTimes(1);
+    expect(m.resolvePermission).toHaveBeenCalledWith("p1", "allow", true);
+
+    finishResolve();
+    await flush();
+
+    expect(m.resolvePermission).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().pendingPermission).toBeNull();
+  });
+
+  it("routes a run-owned prompt by identity and unlocks if the resolver leaves it pending", async () => {
+    let finishResolve!: () => void;
+    const resolvePermission = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishResolve = resolve;
+        }),
+    );
+    const request = pending({ id: "p-run" });
+    type StoreState = ReturnType<typeof useStore.getState>;
+    useStore.setState({
+      pendingPermission: request,
+      runs: {
+        s1: { pendingPermission: request } as StoreState["runs"][string],
+      },
+      resolvePermission: resolvePermission as StoreState["resolvePermission"],
+    });
+
+    render(<PermissionPrompt />);
+    fireEvent.click(screen.getByRole("button", { name: "Allow once" }));
+
+    expect(resolvePermission).toHaveBeenCalledWith("s1", "p-run", "allow", undefined);
+    for (const action of screen.getAllByRole("button")) expect(action).toBeDisabled();
+
+    finishResolve();
+    await flush();
+
+    for (const action of screen.getAllByRole("button")) expect(action).not.toBeDisabled();
+  });
+
   it("Deny forwards a deny decision and clears the prompt", async () => {
     useStore.setState({ pendingPermission: pending({ id: "p9" }) });
 
