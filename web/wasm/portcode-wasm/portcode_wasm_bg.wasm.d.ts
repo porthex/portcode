@@ -28,11 +28,12 @@ export const ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d
 export const wasm_bindgen__convert__closures_____invoke__haeef4d57e6a88c91: (a: number, b: number, c: any) => [number, number];
 export const wasm_bindgen__convert__closures_____invoke__h29f3221e742a74f6: (a: number, b: number, c: any, d: any) => void;
 export const wasm_bindgen__convert__closures_____invoke__h68ec937c7cebd819: (a: number, b: number, c: any) => void;
-export const wasm_bindgen__convert__closures_____invoke__h57b4aa5ba5f8eab8: (a: number, b: number, c: any) => void;
+export const wasm_bindgen__convert__closures_____invoke__ha78c0b5f48faa34b: (a: number, b: number, c: any) => void;
 export const wasm_bindgen__convert__closures_____invoke__hc6a33f57e9316770: (a: number, b: number, c: any) => void;
 export const wasm_bindgen__convert__closures_____invoke__hd51a085c8f3dffa7: (a: number, b: number) => void;
 export const wasm_bindgen__convert__closures_____invoke__h732d2251e9086dd9: (a: number, b: number) => void;
 export const wasm_bindgen__convert__closures_____invoke__h069bff72c256f5f0: (a: number, b: number) => void;
+export const wasm_bindgen__convert__closures_____invoke__h21f443bd54d6525d: (a: number, b: number) => void;
 export const wasm_bindgen__convert__closures_____invoke__hfe7f4cbcccf4f5d6: (a: number, b: number) => void;
 export const __wbindgen_malloc: (a: number, b: number) => number;
 export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
