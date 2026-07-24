@@ -42,7 +42,7 @@
     "@lexical/react": "^0.48.0",
     "@lexical/rich-text": "^0.48.0",
     "@lexical/utils": "^0.48.0",
-    "@sentry/react": "^10.65.0",
+    "@sentry/react": "^10.68.0",
     "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/plugin-barcode-scanner": "^2.4.5",
     "@tauri-apps/plugin-dialog": "^2.2.0",
