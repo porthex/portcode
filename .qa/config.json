@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "defaultProvider": "hermes",
+  "providers": {
+    "hermes": {
+      "command": "hermes",
+      "args": [
+        "chat",
+        "-Q",
+        "--source",
+        "portcode-qa-runner",
+        "-t",
+        "file,terminal,browser,vision",
+        "-q",
+        "{{prompt}}"
+      ],
+      "timeoutMs": 1800000
+    }
+  },
+  "application": {
+    "target": "Portcode web preview",
+    "appMode": "web-preview",
+    "command": "node",
+    "args": [
+      "node_modules/vite/bin/vite.js",
+      "--config",
+      "vite.web.config.ts",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "1420",
+      "--strictPort"
+    ],
+    "readinessUrl": "http://127.0.0.1:1420",
+    "startupTimeoutMs": 120000,
+    "resetProcedure": "Use a fresh browser context for each independent scenario. Clear localStorage, sessionStorage, IndexedDB, cookies, dialogs, pending requests, and timers before navigating back to the entry point.",
+    "limitations": [
+      "The web preview cannot prove native Tauri IPC or WebView2-only behavior.",
+      "Native-only candidates must be reported as blocked or inconclusive, never passed."
+    ]
+  },
+  "validation": {
+    "pythonCommand": "python"
+  },
+  "gate": {
+    "blockingSeverities": ["critical", "high"]
+  },
+  "artifacts": {
+    "root": ".qa/generated"
+  }
+}

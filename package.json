@@ -34,6 +34,9 @@
     "test:coverage": "vitest run --coverage",
     "test:e2e": "tsx e2e/smoke.mts",
     "test:e2e:typecheck": "tsc --noEmit -p e2e/tsconfig.json",
+    "qa:contracts": "node --test .qa/tests/*.test.mjs",
+    "qa:change": "node .qa/scripts/qa-runner.mjs --mode change",
+    "qa:full": "node .qa/scripts/qa-runner.mjs --mode full",
     "prepare": "husky"
   },
   "dependencies": {

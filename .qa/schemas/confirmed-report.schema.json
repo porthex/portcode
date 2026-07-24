@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qa://schemas/confirmed-report/0.1.0",
+  "title": "Independent QA Confirmation Report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "runId", "outcome", "featureModelId", "blockers"],
+  "properties": {
+    "schemaVersion": { "const": "0.1.0" },
+    "runId": { "type": "string", "minLength": 1 },
+    "outcome": { "enum": ["completed", "blocked"] },
+    "featureModelId": { "type": "string", "minLength": 1 },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "run": { "$ref": "#/$defs/run" },
+    "environment": { "$ref": "#/$defs/environment" },
+    "candidateManifest": { "type": "array", "items": { "$ref": "#/$defs/candidateManifestItem" } },
+    "verdicts": { "type": "array", "items": { "$ref": "#/$defs/verdict" } },
+    "summary": { "$ref": "#/$defs/summary" },
+    "blockers": { "type": "array", "items": { "$ref": "#/$defs/blocker" } }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "outcome": { "const": "completed" } } },
+      "then": {
+        "required": ["provenance", "run", "environment", "candidateManifest", "verdicts", "summary"]
+      }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "blocked" } } },
+      "then": { "properties": { "blockers": { "minItems": 1 } } }
+    }
+  ],
+  "$defs": {
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent", "agentVersion", "featureModelSha256", "explorationReportSha256", "designReportSha256", "gitBase", "gitHead", "artifactRoot", "dataProfile"],
+      "properties": {
+        "agent": { "const": "independent-reproducer" },
+        "agentVersion": { "const": "0.1.0" },
+        "featureModelSha256": { "$ref": "#/$defs/sha256" },
+        "explorationReportSha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "designReportSha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "gitBase": { "type": ["string", "null"] },
+        "gitHead": { "type": ["string", "null"] },
+        "artifactRoot": { "type": "string", "minLength": 1 },
+        "dataProfile": { "type": "string", "minLength": 1 }
+      }
+    },
+    "sha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "startedAt", "completedAt"],
+      "properties": {
+        "mode": { "enum": ["change", "full"] },
+        "startedAt": { "type": "string", "format": "date-time" },
+        "completedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "appMode", "platform", "browser", "viewportIds", "dataResetId"],
+      "properties": {
+        "target": { "type": "string", "minLength": 1 },
+        "appMode": { "type": "string", "minLength": 1 },
+        "platform": { "type": "string", "minLength": 1 },
+        "browser": { "type": ["string", "null"] },
+        "viewportIds": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "uniqueItems": true },
+        "dataResetId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "candidateManifestItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidateId", "source", "sourceReportSha256"],
+      "properties": {
+        "candidateId": { "type": "string", "pattern": "^(OBS|DES)-[0-9]{3}$" },
+        "source": { "enum": ["edge-case-explorer", "design-ux-auditor"] },
+        "sourceReportSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "verdict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidateId", "source", "disposition", "reasonCode", "rationale", "classification", "finalSeverity", "reach", "frequency", "preconditions", "steps", "expected", "actual", "reproduction", "oracleBasis", "evidence"],
+      "properties": {
+        "candidateId": { "type": "string", "pattern": "^(OBS|DES)-[0-9]{3}$" },
+        "source": { "enum": ["edge-case-explorer", "design-ux-auditor"] },
+        "disposition": { "enum": ["confirmed", "rejected", "inconclusive"] },
+        "reasonCode": { "enum": ["reproduced", "not-reproduced", "expected-behavior", "invalid-oracle", "duplicate", "insufficient-evidence", "environment-blocked", "intermittent", "unsafe-to-reproduce"] },
+        "rationale": { "type": "string", "minLength": 1 },
+        "classification": { "type": "string", "minLength": 1 },
+        "finalSeverity": { "type": ["string", "null"], "enum": ["critical", "high", "medium", "low", null] },
+        "reach": { "enum": ["common", "occasional", "rare", "unknown"] },
+        "frequency": { "enum": ["always", "frequent", "intermittent", "once", "not-observed"] },
+        "preconditions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "steps": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+        "expected": { "type": "string", "minLength": 1 },
+        "actual": { "type": "string", "minLength": 1 },
+        "reproduction": { "$ref": "#/$defs/reproduction" },
+        "oracleBasis": { "type": "array", "items": { "$ref": "#/$defs/oracleBasis" }, "minItems": 1 },
+        "evidence": { "$ref": "#/$defs/independentEvidence" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "disposition": { "const": "confirmed" } } },
+          "then": {
+            "properties": {
+              "reasonCode": { "const": "reproduced" },
+              "finalSeverity": { "enum": ["critical", "high", "medium", "low"] }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "disposition": { "enum": ["rejected", "inconclusive"] } } },
+          "then": { "properties": { "finalSeverity": { "type": "null" } } }
+        }
+      ]
+    },
+    "reproduction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempts", "observed", "resetBetweenAttempts", "resetExceptionRationale"],
+      "properties": {
+        "attempts": { "type": "integer", "minimum": 1 },
+        "observed": { "type": "integer", "minimum": 0 },
+        "resetBetweenAttempts": { "type": "boolean" },
+        "resetExceptionRationale": { "type": ["string", "null"] }
+      }
+    },
+    "oracleBasis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "locator", "expectation"],
+      "properties": {
+        "type": { "enum": ["explicit-requirement", "feature-state", "project-rule", "existing-pattern", "platform-convention", "accessibility-standard"] },
+        "locator": { "type": "string", "minLength": 1 },
+        "expectation": { "type": "string", "minLength": 1 }
+      }
+    },
+    "independentEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["screenshots", "trace", "console", "pageErrors", "network"],
+      "properties": {
+        "screenshots": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "trace": { "type": ["string", "null"] },
+        "console": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "pageErrors": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "network": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      },
+      "anyOf": [
+        { "properties": { "screenshots": { "minItems": 1 } } },
+        { "properties": { "trace": { "type": "string", "minLength": 1 } } },
+        { "properties": { "console": { "minItems": 1 } } },
+        { "properties": { "pageErrors": { "minItems": 1 } } },
+        { "properties": { "network": { "minItems": 1 } } }
+      ]
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["totalCandidates", "confirmed", "rejected", "inconclusive", "bySeverity", "blockingSeverities", "mergeGate", "gateReasons"],
+      "properties": {
+        "totalCandidates": { "type": "integer", "minimum": 0 },
+        "confirmed": { "type": "integer", "minimum": 0 },
+        "rejected": { "type": "integer", "minimum": 0 },
+        "inconclusive": { "type": "integer", "minimum": 0 },
+        "bySeverity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["critical", "high", "medium", "low"],
+          "properties": {
+            "critical": { "type": "integer", "minimum": 0 },
+            "high": { "type": "integer", "minimum": 0 },
+            "medium": { "type": "integer", "minimum": 0 },
+            "low": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "blockingSeverities": { "type": "array", "items": { "enum": ["critical", "high", "medium", "low"] }, "minItems": 1, "uniqueItems": true },
+        "mergeGate": { "enum": ["pass", "fail", "needs-review"] },
+        "gateReasons": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "blocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "area", "reason", "affectedCandidateIds"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^BLK-[0-9]{3}$" },
+        "area": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "affectedCandidateIds": { "type": "array", "items": { "type": "string", "pattern": "^(OBS|DES)-[0-9]{3}$" }, "uniqueItems": true }
+      }
+    }
+  }
+}

@@ -1,0 +1,276 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qa://schemas/feature-model/0.2.0",
+  "title": "Feature Completeness Model",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "modelId", "outcome", "blockers"],
+  "properties": {
+    "schemaVersion": { "const": "0.2.0" },
+    "modelId": { "type": "string", "minLength": 1 },
+    "outcome": { "enum": ["ready", "blocked"] },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "blockers": { "type": "array", "items": { "$ref": "#/$defs/blocker" } },
+    "feature": { "$ref": "#/$defs/feature" },
+    "sourceSummary": { "$ref": "#/$defs/sourceSummary" },
+    "stateModel": { "$ref": "#/$defs/stateModel" },
+    "missingBehaviors": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/behaviorOmission" }
+    },
+    "missingDesigns": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/designOmission" }
+    },
+    "edgeCaseCharter": { "$ref": "#/$defs/edgeCaseCharter" },
+    "coverageNotes": { "$ref": "#/$defs/coverageNotes" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "outcome": { "const": "ready" } } },
+      "then": {
+        "required": [
+          "provenance",
+          "feature",
+          "sourceSummary",
+          "stateModel",
+          "missingBehaviors",
+          "missingDesigns",
+          "edgeCaseCharter",
+          "coverageNotes"
+        ],
+        "properties": { "blockers": { "maxItems": 0 } }
+      }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "blocked" } } },
+      "then": { "properties": { "blockers": { "minItems": 1 } } }
+    }
+  ],
+  "$defs": {
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent", "agentVersion", "taskSha256", "gitBase", "gitHead"],
+      "properties": {
+        "agent": { "const": "feature-completeness" },
+        "agentVersion": { "const": "0.2.0" },
+        "taskSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "gitBase": { "type": ["string", "null"] },
+        "gitHead": { "type": ["string", "null"] }
+      }
+    },
+    "blocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "area", "reason"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^BLK-[0-9]{3}$" },
+        "area": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "feature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "goal", "entryPoints", "affectedAreas"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "goal": { "type": "string", "minLength": 1 },
+        "entryPoints": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "uniqueItems": true },
+        "affectedAreas": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "uniqueItems": true }
+      }
+    },
+    "sourceSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["explicitRequirements", "inferredConventions", "unknowns"],
+      "properties": {
+        "explicitRequirements": { "type": "array", "items": { "$ref": "#/$defs/requirement" }, "minItems": 1 },
+        "inferredConventions": { "type": "array", "items": { "$ref": "#/$defs/convention" } },
+        "unknowns": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "text", "source"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^REQ-[0-9]{3}$" },
+        "text": { "type": "string", "minLength": 1 },
+        "source": { "$ref": "#/$defs/sourceCitation" }
+      }
+    },
+    "sourceCitation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "locator"],
+      "properties": {
+        "type": { "enum": ["original-task", "acceptance-criteria", "project-rule", "existing-pattern", "platform-convention", "accessibility-standard"] },
+        "locator": { "type": "string", "minLength": 1 }
+      }
+    },
+    "convention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectation", "source"],
+      "properties": {
+        "expectation": { "type": "string", "minLength": 1 },
+        "source": { "$ref": "#/$defs/sourceCitation" }
+      }
+    },
+    "stateModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["states", "transitions", "invariants"],
+      "properties": {
+        "states": { "type": "array", "items": { "$ref": "#/$defs/state" }, "minItems": 1 },
+        "transitions": { "type": "array", "items": { "$ref": "#/$defs/transition" }, "minItems": 1 },
+        "invariants": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "risk", "entryCondition", "visibleDesign", "availableActions", "exitConditions"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^state-[a-z0-9-]+$" },
+        "name": { "type": "string", "minLength": 1 },
+        "risk": { "enum": ["critical", "high", "medium", "low"] },
+        "entryCondition": { "type": "string", "minLength": 1 },
+        "visibleDesign": { "type": "string", "minLength": 1 },
+        "availableActions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "exitConditions": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "from", "action", "to", "expectedFeedback", "failure"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^transition-[a-z0-9-]+$" },
+        "from": { "type": "string", "minLength": 1 },
+        "action": { "type": "string", "minLength": 1 },
+        "to": { "type": "string", "minLength": 1 },
+        "expectedFeedback": { "type": "string", "minLength": 1 },
+        "failure": { "$ref": "#/$defs/failurePath" }
+      }
+    },
+    "failurePath": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "stateId", "rationale"],
+      "properties": {
+        "kind": { "enum": ["modeled", "not-applicable"] },
+        "stateId": { "type": ["string", "null"] },
+        "rationale": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "modeled" } } },
+          "then": { "properties": { "stateId": { "type": "string", "minLength": 1 } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "not-applicable" } } },
+          "then": { "properties": { "stateId": { "type": "null" } } }
+        }
+      ]
+    },
+    "omissionBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "classification", "basis", "trigger", "expected", "risk", "confidence"],
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string", "minLength": 1 },
+        "classification": { "enum": ["explicit-requirement", "reachable-state", "project-consistency", "platform-convention", "accessibility"] },
+        "basis": { "type": "string", "minLength": 1 },
+        "trigger": { "type": "string", "minLength": 1 },
+        "expected": { "type": "string", "minLength": 1 },
+        "risk": { "enum": ["critical", "high", "medium", "low"] },
+        "confidence": { "enum": ["high", "medium", "low"] }
+      }
+    },
+    "behaviorOmission": {
+      "allOf": [
+        { "$ref": "#/$defs/omissionBase" },
+        { "properties": { "id": { "pattern": "^MB-[0-9]{3}$" } } }
+      ]
+    },
+    "designOmission": {
+      "allOf": [
+        { "$ref": "#/$defs/omissionBase" },
+        { "properties": { "id": { "pattern": "^MD-[0-9]{3}$" } } }
+      ]
+    },
+    "edgeCaseCharter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["categories", "highestRiskSequences"],
+      "properties": {
+        "categories": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["input", "timing", "lifecycle", "interaction", "persistence", "layout", "accessibility", "neighboringRegression"],
+          "properties": {
+            "input": { "$ref": "#/$defs/edgeCases" },
+            "timing": { "$ref": "#/$defs/edgeCases" },
+            "lifecycle": { "$ref": "#/$defs/edgeCases" },
+            "interaction": { "$ref": "#/$defs/edgeCases" },
+            "persistence": { "$ref": "#/$defs/edgeCases" },
+            "layout": { "$ref": "#/$defs/edgeCases" },
+            "accessibility": { "$ref": "#/$defs/edgeCases" },
+            "neighboringRegression": { "$ref": "#/$defs/edgeCases" }
+          }
+        },
+        "highestRiskSequences": { "type": "array", "items": { "$ref": "#/$defs/sequence" }, "minItems": 1 }
+      }
+    },
+    "edgeCases": { "type": "array", "items": { "$ref": "#/$defs/edgeCase" } },
+    "edgeCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "scenario", "why", "priority", "oracle", "coversRequirementIds", "coversStateIds", "coversTransitionIds"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^EC-[A-Z]+-[0-9]{3}$" },
+        "scenario": { "type": "string", "minLength": 1 },
+        "why": { "type": "string", "minLength": 1 },
+        "priority": { "enum": ["must", "should", "could"] },
+        "oracle": { "type": "string", "minLength": 1 },
+        "coversRequirementIds": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "coversStateIds": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "coversTransitionIds": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+      }
+    },
+    "sequence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "steps", "risk", "expected"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^SEQ-[0-9]{3}$" },
+        "name": { "type": "string", "minLength": 1 },
+        "steps": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 2 },
+        "risk": { "type": "string", "minLength": 1 },
+        "expected": { "type": "string", "minLength": 1 }
+      }
+    },
+    "coverageNotes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["notApplicable", "blocked"],
+      "properties": {
+        "notApplicable": { "type": "array", "items": { "$ref": "#/$defs/categoryNote" } },
+        "blocked": { "type": "array", "items": { "$ref": "#/$defs/categoryNote" } }
+      }
+    },
+    "categoryNote": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["category", "reason"],
+      "properties": {
+        "category": { "enum": ["input", "timing", "lifecycle", "interaction", "persistence", "layout", "accessibility", "neighboringRegression"] },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}
