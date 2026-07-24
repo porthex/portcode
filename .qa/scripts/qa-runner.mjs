@@ -41,7 +41,7 @@ export const STAGES = [
 const scriptPath = fileURLToPath(import.meta.url);
 const defaultProjectRoot = resolve(dirname(scriptPath), "../..");
 
-export function extractJsonObject(output) {
+function extractJsonObjects(output) {
   const candidates = [];
   for (let start = 0; start < output.length; start += 1) {
     if (output[start] !== "{") continue;
@@ -57,10 +57,31 @@ export function extractJsonObject(output) {
       // This brace belonged to non-JSON diagnostic output.
     }
   }
+  return candidates;
+}
+
+export function extractJsonObject(output) {
+  const candidates = extractJsonObjects(output);
   if (candidates.length !== 1) {
-    throw new Error(`Agent output must contain exactly one JSON object; found ${candidates.length}`);
+    throw new Error(
+      `Agent output must contain exactly one JSON object; found ${candidates.length}`,
+    );
   }
   return candidates[0];
+}
+
+export async function extractValidatedJsonObject(output, validate) {
+  const candidates = extractJsonObjects(output);
+  const valid = [];
+  for (const candidate of candidates) {
+    if (await validate(candidate)) valid.push(candidate);
+  }
+  if (valid.length !== 1) {
+    throw new Error(
+      `Agent output must contain exactly one schema-valid JSON report; found ${valid.length} of ${candidates.length} parseable objects`,
+    );
+  }
+  return valid[0];
 }
 
 function findObjectEnd(text, start) {
@@ -159,53 +180,98 @@ async function main() {
   const taskPath = resolve(projectRoot, requireOption(options.task, "--task is required"));
   const task = await readFile(taskPath, "utf8");
   if (!task.trim()) throw new Error("Task file is empty");
-  if (!new Set(["change", "full"]).has(options.mode)) throw new Error("--mode must be change or full");
+  if (!new Set(["change", "full"]).has(options.mode))
+    throw new Error("--mode must be change or full");
 
   if (options.dryRun) {
-    process.stdout.write(`${JSON.stringify({
-      mode: options.mode,
-      provider: providerName,
-      task: normalizePath(taskPath),
-      stages: STAGES.map(({ id }) => id),
-      app: { started: false, target: config.application.target },
-    }, null, 2)}\n`);
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          mode: options.mode,
+          provider: providerName,
+          task: normalizePath(taskPath),
+          stages: STAGES.map(({ id }) => id),
+          app: { started: false, target: config.application.target },
+        },
+        null,
+        2,
+      )}\n`,
+    );
     return 0;
   }
 
-  const runId = createRunId();
+  const runId = options.resumeRun ?? createRunId();
   const runRoot = resolve(projectRoot, config.artifacts.root, runId);
   const inputRoot = resolve(runRoot, "inputs");
   const reportRoot = resolve(runRoot, "reports");
   const rawRoot = resolve(runRoot, "raw");
   const promptRoot = resolve(runRoot, "prompts");
-  await Promise.all([inputRoot, reportRoot, rawRoot, promptRoot].map((path) => mkdir(path, { recursive: true })));
+  await Promise.all(
+    [inputRoot, reportRoot, rawRoot, promptRoot].map((path) => mkdir(path, { recursive: true })),
+  );
   const copiedTaskPath = resolve(inputRoot, "task.md");
-  await copyFile(taskPath, copiedTaskPath);
-
   const git = await captureGitContext(projectRoot);
-  await writeFile(resolve(inputRoot, "git-diff.patch"), git.diff, "utf8");
-  await writeFile(resolve(inputRoot, "git-status.txt"), git.status, "utf8");
   const sourceBaseline = await captureSourceSnapshot(projectRoot, config.artifacts.root);
-  const manifest = {
-    version: 1,
-    runId,
-    mode: options.mode,
-    provider: providerName,
-    startedAt: new Date().toISOString(),
-    taskSha256: sha256(task),
-    gitBase: git.base,
-    gitHead: git.head,
-    status: "running",
-    stages: [],
-  };
-  await writeJson(resolve(runRoot, "run-manifest.json"), manifest);
+  let manifest;
+  if (options.resumeRun) {
+    manifest = JSON.parse(await readFile(resolve(runRoot, "run-manifest.json"), "utf8"));
+    const mismatches = [
+      ["runId", manifest.runId, runId],
+      ["mode", manifest.mode, options.mode],
+      ["provider", manifest.provider, providerName],
+      ["taskSha256", manifest.taskSha256, sha256(task)],
+      ["gitBase", manifest.gitBase, git.base],
+      ["gitHead", manifest.gitHead, git.head],
+    ].filter(([, actual, expected]) => actual !== expected);
+    if (mismatches.length) {
+      throw new Error(
+        `Cannot resume run with changed provenance: ${mismatches.map(([key]) => key).join(", ")}`,
+      );
+    }
+    const copiedTask = await readFile(copiedTaskPath, "utf8");
+    if (sha256(copiedTask) !== manifest.taskSha256)
+      throw new Error("Cannot resume run: copied task provenance changed");
+    manifest.status = "running";
+    delete manifest.completedAt;
+    delete manifest.error;
+    delete manifest.mergeGate;
+    await writeJson(resolve(runRoot, "run-manifest.json"), manifest);
+  } else {
+    await copyFile(taskPath, copiedTaskPath);
+    await writeFile(resolve(inputRoot, "git-diff.patch"), git.diff, "utf8");
+    await writeFile(resolve(inputRoot, "git-status.txt"), git.status, "utf8");
+    manifest = {
+      version: 1,
+      runId,
+      mode: options.mode,
+      provider: providerName,
+      startedAt: new Date().toISOString(),
+      taskSha256: sha256(task),
+      gitBase: git.base,
+      gitHead: git.head,
+      status: "running",
+      stages: [],
+    };
+    await writeJson(resolve(runRoot, "run-manifest.json"), manifest);
+  }
 
   let appProcess = null;
   const reports = {};
   try {
-    reports.feature = await runStage({
-      stage: STAGES[0], config, configPath, copiedTaskPath, inputPaths: [], manifest,
-      projectRoot, providerName, promptRoot, rawRoot, reportRoot, runRoot, sourceBaseline,
+    reports.feature = await runOrLoadStage({
+      stage: STAGES[0],
+      config,
+      configPath,
+      copiedTaskPath,
+      inputPaths: [],
+      manifest,
+      projectRoot,
+      providerName,
+      promptRoot,
+      rawRoot,
+      reportRoot,
+      runRoot,
+      sourceBaseline,
     });
     validateSemantic("feature-completeness", reports);
     validateProvenanceOrThrow("feature-completeness", reports.feature, {
@@ -213,17 +279,28 @@ async function main() {
       gitBase: manifest.gitBase,
       gitHead: manifest.gitHead,
     });
-    if (reports.feature.outcome === "blocked") return await finishBlocked(manifest, runRoot, "Feature model blocked");
+    if (reports.feature.outcome === "blocked")
+      return await finishBlocked(manifest, runRoot, "Feature model blocked");
     reports.identities = {
       featureModelSha256: sha256(await readFile(resolve(reportRoot, STAGES[0].report))),
     };
 
     appProcess = await startApplication(config.application, projectRoot, runRoot);
 
-    reports.exploration = await runStage({
-      stage: STAGES[1], config, configPath, copiedTaskPath,
-      inputPaths: [resolve(reportRoot, STAGES[0].report)], manifest,
-      projectRoot, providerName, promptRoot, rawRoot, reportRoot, runRoot, sourceBaseline,
+    reports.exploration = await runOrLoadStage({
+      stage: STAGES[1],
+      config,
+      configPath,
+      copiedTaskPath,
+      inputPaths: [resolve(reportRoot, STAGES[0].report)],
+      manifest,
+      projectRoot,
+      providerName,
+      promptRoot,
+      rawRoot,
+      reportRoot,
+      runRoot,
+      sourceBaseline,
     });
     validateSemantic("edge-case-explorer", reports);
     validateProvenanceOrThrow("edge-case-explorer", reports.exploration, {
@@ -232,10 +309,20 @@ async function main() {
       gitHead: manifest.gitHead,
     });
 
-    reports.design = await runStage({
-      stage: STAGES[2], config, configPath, copiedTaskPath,
-      inputPaths: [resolve(reportRoot, STAGES[0].report)], manifest,
-      projectRoot, providerName, promptRoot, rawRoot, reportRoot, runRoot, sourceBaseline,
+    reports.design = await runOrLoadStage({
+      stage: STAGES[2],
+      config,
+      configPath,
+      copiedTaskPath,
+      inputPaths: [resolve(reportRoot, STAGES[0].report)],
+      manifest,
+      projectRoot,
+      providerName,
+      promptRoot,
+      rawRoot,
+      reportRoot,
+      runRoot,
+      sourceBaseline,
     });
     validateSemantic("design-ux-auditor", reports);
     validateProvenanceOrThrow("design-ux-auditor", reports.design, {
@@ -255,10 +342,20 @@ async function main() {
       explorationSha256: sha256(explorationBytes),
       designSha256: sha256(designBytes),
     };
-    reports.confirmed = await runStage({
-      stage: STAGES[3], config, configPath, copiedTaskPath,
-      inputPaths: STAGES.slice(0, 3).map(({ report }) => resolve(reportRoot, report)), manifest,
-      projectRoot, providerName, promptRoot, rawRoot, reportRoot, runRoot, sourceBaseline,
+    reports.confirmed = await runOrLoadStage({
+      stage: STAGES[3],
+      config,
+      configPath,
+      copiedTaskPath,
+      inputPaths: STAGES.slice(0, 3).map(({ report }) => resolve(reportRoot, report)),
+      manifest,
+      projectRoot,
+      providerName,
+      promptRoot,
+      rawRoot,
+      reportRoot,
+      runRoot,
+      sourceBaseline,
     });
     validateSemantic("independent-reproducer", reports);
     validateProvenanceOrThrow("independent-reproducer", reports.confirmed, {
@@ -271,7 +368,9 @@ async function main() {
     manifest.completedAt = new Date().toISOString();
     manifest.mergeGate = reports.confirmed.summary?.mergeGate ?? "needs-review";
     await writeJson(resolve(runRoot, "run-manifest.json"), manifest);
-    process.stdout.write(`${JSON.stringify({ runId, runRoot: normalizePath(runRoot), mergeGate: manifest.mergeGate }, null, 2)}\n`);
+    process.stdout.write(
+      `${JSON.stringify({ runId, runRoot: normalizePath(runRoot), mergeGate: manifest.mergeGate }, null, 2)}\n`,
+    );
     return manifest.mergeGate === "pass" ? 0 : manifest.mergeGate === "fail" ? 1 : 2;
   } catch (error) {
     manifest.status = "error";
@@ -284,10 +383,35 @@ async function main() {
   }
 }
 
+async function runOrLoadStage(context) {
+  const { stage, config, manifest, projectRoot, reportRoot } = context;
+  const completed = manifest.stages.find(({ id }) => id === stage.id);
+  if (!completed) return runStage(context);
+  const outputPath = resolve(reportRoot, stage.report);
+  const report = JSON.parse(await readFile(outputPath, "utf8"));
+  await validateJsonSchema(config, resolve(projectRoot, stage.schema), outputPath, projectRoot);
+  const reportHash = sha256(await readFile(outputPath));
+  if (completed.reportSha256 !== reportHash) {
+    throw new Error(`Cannot resume run: ${stage.id} report hash changed`);
+  }
+  return report;
+}
+
 async function runStage(context) {
   const {
-    stage, config, configPath, copiedTaskPath, inputPaths, manifest, projectRoot,
-    providerName, promptRoot, rawRoot, reportRoot, runRoot, sourceBaseline,
+    stage,
+    config,
+    configPath,
+    copiedTaskPath,
+    inputPaths,
+    manifest,
+    projectRoot,
+    providerName,
+    promptRoot,
+    rawRoot,
+    reportRoot,
+    runRoot,
+    sourceBaseline,
   } = context;
   const outputPath = resolve(reportRoot, stage.report);
   const prompt = buildStagePrompt({
@@ -305,7 +429,23 @@ async function runStage(context) {
   const raw = await invokeProvider(config.providers[providerName], prompt, projectRoot);
   await writeFile(resolve(rawRoot, `${stage.id}.stdout.txt`), raw.stdout, "utf8");
   await writeFile(resolve(rawRoot, `${stage.id}.stderr.txt`), raw.stderr, "utf8");
-  const report = extractJsonObject(raw.stdout);
+  let candidateIndex = 0;
+  const report = await extractValidatedJsonObject(raw.stdout, async (candidate) => {
+    candidateIndex += 1;
+    const candidatePath = resolve(rawRoot, `${stage.id}.candidate-${candidateIndex}.json`);
+    await writeJson(candidatePath, candidate);
+    try {
+      await validateJsonSchema(
+        config,
+        resolve(projectRoot, stage.schema),
+        candidatePath,
+        projectRoot,
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  });
   await writeJson(outputPath, report);
   await validateJsonSchema(config, resolve(projectRoot, stage.schema), outputPath, projectRoot);
 
@@ -329,42 +469,53 @@ async function runStage(context) {
 function validateSemantic(stageId, reports) {
   let errors;
   if (stageId === "feature-completeness") errors = validateFeatureModelSemantics(reports.feature);
-  else if (stageId === "edge-case-explorer") errors = validateExplorationReportSemantics(reports.exploration, reports.feature);
-  else if (stageId === "design-ux-auditor") errors = validateDesignAuditSemantics(reports.design, reports.feature);
-  else errors = validateConfirmedReportSemantics(
-    reports.confirmed,
-    reports.feature,
-    reports.exploration,
-    reports.design,
-    reports.identities,
-  );
-  if (errors.length) throw new Error(`${stageId} semantic validation failed:\n- ${errors.join("\n- ")}`);
+  else if (stageId === "edge-case-explorer")
+    errors = validateExplorationReportSemantics(reports.exploration, reports.feature);
+  else if (stageId === "design-ux-auditor")
+    errors = validateDesignAuditSemantics(reports.design, reports.feature);
+  else
+    errors = validateConfirmedReportSemantics(
+      reports.confirmed,
+      reports.feature,
+      reports.exploration,
+      reports.design,
+      reports.identities,
+    );
+  if (errors.length)
+    throw new Error(`${stageId} semantic validation failed:\n- ${errors.join("\n- ")}`);
 }
 
 function validateProvenanceOrThrow(stageId, report, expected) {
   const errors = validateStageProvenance(stageId, report, expected);
-  if (errors.length) throw new Error(`${stageId} provenance validation failed:\n- ${errors.join("\n- ")}`);
+  if (errors.length)
+    throw new Error(`${stageId} provenance validation failed:\n- ${errors.join("\n- ")}`);
 }
 
 async function invokeProvider(provider, prompt, projectRoot) {
-  const args = provider.args.map((value) => value === "{{prompt}}" ? prompt : value);
+  const args = provider.args.map((value) => (value === "{{prompt}}" ? prompt : value));
   const result = await runProcess(provider.command, args, {
     cwd: projectRoot,
     timeoutMs: provider.timeoutMs,
     shell: false,
   });
-  if (result.code !== 0) throw new Error(`Agent provider exited ${result.code}: ${result.stderr || result.stdout}`);
+  if (result.code !== 0)
+    throw new Error(`Agent provider exited ${result.code}: ${result.stderr || result.stdout}`);
   return result;
 }
 
 async function validateJsonSchema(config, schemaPath, documentPath, projectRoot) {
   const script = resolve(projectRoot, ".qa/scripts/validate-json-schema.py");
-  const result = await runProcess(config.validation.pythonCommand, [script, schemaPath, documentPath], {
-    cwd: projectRoot,
-    timeoutMs: 60_000,
-    shell: false,
-  });
-  if (result.code !== 0) throw new Error(`JSON Schema validation failed:\n${result.stderr || result.stdout}`);
+  const result = await runProcess(
+    config.validation.pythonCommand,
+    [script, schemaPath, documentPath],
+    {
+      cwd: projectRoot,
+      timeoutMs: 60_000,
+      shell: false,
+    },
+  );
+  if (result.code !== 0)
+    throw new Error(`JSON Schema validation failed:\n${result.stderr || result.stdout}`);
 }
 
 export function resolveApplicationCommand(command, projectRoot) {
@@ -401,7 +552,8 @@ async function startApplication(application, projectRoot, runRoot) {
 async function waitForReady(url, timeoutMs, processHandle) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (processHandle.exitCode !== null) throw new Error(`Application exited before readiness with code ${processHandle.exitCode}`);
+    if (processHandle.exitCode !== null)
+      throw new Error(`Application exited before readiness with code ${processHandle.exitCode}`);
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
       if (response.ok) return;
@@ -428,10 +580,15 @@ async function stopApplication(processHandle) {
 
 async function captureGitContext(projectRoot) {
   const [base, head, status, diff] = await Promise.all([
-    runGit(["merge-base", "HEAD", "main"], projectRoot).catch(() => runGit(["rev-parse", "HEAD"], projectRoot)),
+    runGit(["merge-base", "HEAD", "main"], projectRoot).catch(() =>
+      runGit(["rev-parse", "HEAD"], projectRoot),
+    ),
     runGit(["rev-parse", "HEAD"], projectRoot),
     runGit(["status", "--short", "--untracked-files=all"], projectRoot),
-    runGit(["diff", "--no-ext-diff", "--binary", "HEAD", "--", ".", ":(exclude).qa/generated/**"], projectRoot),
+    runGit(
+      ["diff", "--no-ext-diff", "--binary", "HEAD", "--", ".", ":(exclude).qa/generated/**"],
+      projectRoot,
+    ),
   ]);
   return { base: base.trim(), head: head.trim(), status, diff };
 }
@@ -444,15 +601,20 @@ async function captureSourceSnapshot(projectRoot, artifactRoot) {
   });
   if (result.code !== 0) throw new Error(`Unable to enumerate source files: ${result.stderr}`);
   const excluded = normalizePath(artifactRoot).replace(/\/$/, "") + "/";
-  const paths = result.stdout.split("\0").filter(Boolean).filter((path) => !normalizePath(path).startsWith(excluded));
+  const paths = result.stdout
+    .split("\0")
+    .filter(Boolean)
+    .filter((path) => !normalizePath(path).startsWith(excluded));
   const snapshot = new Map();
-  await Promise.all(paths.map(async (path) => {
-    try {
-      snapshot.set(normalizePath(path), sha256(await readFile(resolve(projectRoot, path))));
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-    }
-  }));
+  await Promise.all(
+    paths.map(async (path) => {
+      try {
+        snapshot.set(normalizePath(path), sha256(await readFile(resolve(projectRoot, path))));
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }),
+  );
   return snapshot;
 }
 
@@ -473,8 +635,12 @@ function runProcess(command, args, { cwd, timeoutMs, shell }) {
     });
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
     child.on("error", reject);
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
@@ -493,7 +659,9 @@ async function finishBlocked(manifest, runRoot, reason) {
   manifest.mergeGate = "needs-review";
   manifest.blockedReason = reason;
   await writeJson(resolve(runRoot, "run-manifest.json"), manifest);
-  process.stdout.write(`${JSON.stringify({ runId: manifest.runId, runRoot: normalizePath(runRoot), mergeGate: "needs-review", reason }, null, 2)}\n`);
+  process.stdout.write(
+    `${JSON.stringify({ runId: manifest.runId, runRoot: normalizePath(runRoot), mergeGate: "needs-review", reason }, null, 2)}\n`,
+  );
   return 2;
 }
 
@@ -537,9 +705,13 @@ async function writeJson(path, value) {
 const isMain = process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url;
 if (isMain) {
   main()
-    .then((code) => { process.exitCode = code; })
+    .then((code) => {
+      process.exitCode = code;
+    })
     .catch((error) => {
-      process.stderr.write(`QA runner error: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+      process.stderr.write(
+        `QA runner error: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
+      );
       process.exitCode = 2;
     });
 }
