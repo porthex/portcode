@@ -26,7 +26,7 @@ iroh = "1"
 # crate that does NOT build for wasm32). On native that's fine and matches the
 # desktop's existing build, so we keep snow's defaults here.
 snow = "0.10"
-rand = "0.8"
+rand = "0.10"
 
 # ── wasm32 (browser) only: channels-only tokio + relay-only iroh (§5.3) ──────
 # tokio carries ONLY `sync` (channels) + `macros` here — NO `time`/`net`/
@@ -55,7 +55,7 @@ web-sys = "0.3"
 # add `std`/`ring-accelerated`/`ring-resolver`: `ring` does not build for
 # wasm32-unknown-unknown (§4.3).
 snow = { version = "0.10", default-features = false, features = ["default-resolver", "default-resolver-crypto"] }
-rand = "0.8"
+rand = "0.10"
 # getrandom 0.3 is what snow's `use-getrandom` resolves to; the wasm_js feature +
 # the cfg flag in `.cargo/config.toml` select the JS-backed CSPRNG.
 getrandom = { version = "0.3", features = ["wasm_js"] }
