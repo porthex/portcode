@@ -29,7 +29,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # base64-encode the pinned peer key for JS to persist (same engine as the rest of
 # the workspace).
-base64 = "0.22"
+base64 = "0.23"
 # Single-threaded async mutex for the split channel halves the spawn_local loops
 # share — `futures-util`'s `Mutex` is `!Send`-friendly and exactly what the Phase 0
 # spike used for the same job.

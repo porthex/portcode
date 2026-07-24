@@ -61,7 +61,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # Hashing and encoding used by the durable conversation store, Git review, and
 # end-to-end encrypted Phone Sync protocol.
 sha2 = "0.10"
-base64 = "0.22"
+base64 = "0.23"
 rand = "0.10"
 
 # Phone Sync E2E crypto (Phase 1): application-layer Noise so the relay stays
