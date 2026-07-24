@@ -18,25 +18,19 @@
     }
   },
   "application": {
-    "target": "Portcode web preview",
-    "appMode": "web-preview",
-    "command": "node",
-    "args": [
-      "node_modules/vite/bin/vite.js",
-      "--config",
-      "vite.web.config.ts",
-      "--host",
-      "127.0.0.1",
-      "--port",
-      "1420",
-      "--strictPort"
-    ],
-    "readinessUrl": "http://127.0.0.1:1420",
+    "target": "Portcode QA Calibration native WebView2 app",
+    "appMode": "tauri-native-cdp",
+    "command": "src-tauri/target/e2e/debug/portcode.exe",
+    "args": [],
+    "readinessUrl": "http://127.0.0.1:9222/json/list",
     "startupTimeoutMs": 120000,
-    "resetProcedure": "Use a fresh browser context for each independent scenario. Clear localStorage, sessionStorage, IndexedDB, cookies, dialogs, pending requests, and timers before navigating back to the entry point.",
+    "profileIdentifier": "dev.porthex.portcode.qa-calibration",
+    "automationProcedure": "Drive the running native WebView2 through its loopback CDP endpoint, never through a separate web-preview browser. Use `node .qa/scripts/webview-cdp.mjs info`, `node .qa/scripts/webview-cdp.mjs eval --file <repository-relative-script.js>`, and `node .qa/scripts/webview-cdp.mjs screenshot --output <repository-relative-image.png>`. Put evaluation scripts and screenshots only beneath the current run artifact root. To exercise native validation without opening an uncontrolled OS dialog, create synthetic fixtures beneath the current run artifact root and dispatch a DOM drop using a File whose non-enumerable `path` property is the fixture's absolute path; the real UI then invokes the real Rust validate_attachments command. The native Tauri drag event bridge and picker invocation may additionally be inspected and covered by deterministic tests. Never click Send or invoke run_agent because that could contact a provider.",
+    "resetProcedure": "This binary uses the isolated dev.porthex.portcode.qa-calibration app config/database and qa-calibration WebView profile, never the user's normal Portcode profile. Before each independent scenario, remove any attachment chips, clear attachment errors, clear localStorage/sessionStorage/IndexedDB through CDP, reload the WebView, and wait for the composer to become ready. Use only synthetic fixtures beneath the run artifact root. Do not create provider-backed turns or alter accounts/settings.",
     "limitations": [
-      "The web preview cannot prove native Tauri IPC or WebView2-only behavior.",
-      "Native-only candidates must be reported as blocked or inconclusive, never passed."
+      "No live provider call is allowed, so provider-side interpretation is established from protocol fidelity and deterministic tests rather than a paid end-to-end turn.",
+      "CDP can exercise the native WebView, React UI, and Rust validation IPC, but it cannot safely automate the operating-system file-picker dialog; picker wiring must be inspected and tested without selecting personal files.",
+      "The QA binary must be prebuilt from .qa/tauri.qa.conf.json before invoking the runner."
     ]
   },
   "validation": {

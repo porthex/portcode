@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "dev.porthex.portcode.qa-calibration",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Portcode QA Calibration",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 500,
+        "resizable": true,
+        "fullscreen": false,
+        "theme": "Dark",
+        "dataDirectory": "qa-calibration",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port=9222"
+      }
+    ]
+  }
+}
