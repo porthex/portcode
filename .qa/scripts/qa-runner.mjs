@@ -367,12 +367,18 @@ async function validateJsonSchema(config, schemaPath, documentPath, projectRoot)
   if (result.code !== 0) throw new Error(`JSON Schema validation failed:\n${result.stderr || result.stdout}`);
 }
 
+export function resolveApplicationCommand(command, projectRoot) {
+  if (!command.includes("/") && !command.includes("\\")) return command;
+  return isAbsolute(command) ? command : resolve(projectRoot, command);
+}
+
 async function startApplication(application, projectRoot, runRoot) {
   const logPath = resolve(runRoot, "app.log");
-  const processHandle = spawn(application.command, application.args, {
+  const command = resolveApplicationCommand(application.command, projectRoot);
+  const processHandle = spawn(command, application.args, {
     cwd: projectRoot,
     env: { ...process.env, PORTCODE_QA_RUN: "1" },
-    shell: process.platform === "win32",
+    shell: false,
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });

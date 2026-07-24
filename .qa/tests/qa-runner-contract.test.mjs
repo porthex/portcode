@@ -10,6 +10,7 @@ import {
   buildStagePrompt,
   extractJsonObject,
   compareSourceSnapshots,
+  resolveApplicationCommand,
   validateStageProvenance,
 } from "../scripts/qa-runner.mjs";
 
@@ -93,6 +94,14 @@ test("package scripts expose contracts, change, and full workflows", async () =>
   assert.equal(packageJson.scripts["qa:contracts"], "node --test .qa/tests/*.test.mjs");
   assert.match(packageJson.scripts["qa:change"], /qa-runner\.mjs --mode change/);
   assert.match(packageJson.scripts["qa:full"], /qa-runner\.mjs --mode full/);
+});
+
+test("application command resolves repository-relative executable paths without a shell", () => {
+  const root = "D:/Projects/portcode";
+  const resolved = resolveApplicationCommand("src-tauri/target/e2e/debug/portcode.exe", root);
+  assert.ok(resolved.replaceAll("\\", "/").endsWith("/D:/Projects/portcode/src-tauri/target/e2e/debug/portcode.exe") ||
+    resolved.replaceAll("\\", "/") === "D:/Projects/portcode/src-tauri/target/e2e/debug/portcode.exe");
+  assert.equal(resolveApplicationCommand("node", root), "node");
 });
 
 test("dry-run CLI plans all stages without invoking an agent or starting the app", async () => {
