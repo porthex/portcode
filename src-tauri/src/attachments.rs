@@ -11,6 +11,7 @@ use std::io::{Cursor, Read};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub(crate) const MAX_ATTACHMENT_COUNT: usize = 10;
@@ -159,10 +160,23 @@ pub(crate) type AgentTextArg = BoundedString<MAX_AGENT_TEXT_BYTES>;
 
 static ATTACHMENT_VALIDATION_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(2)));
+const ATTACHMENT_VALIDATION_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) async fn acquire_attachment_validation_permit(
-) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
-    ATTACHMENT_VALIDATION_PERMITS.clone().acquire_owned().await
+) -> Result<OwnedSemaphorePermit, &'static str> {
+    acquire_attachment_validation_permit_with_timeout(ATTACHMENT_VALIDATION_QUEUE_TIMEOUT).await
+}
+
+async fn acquire_attachment_validation_permit_with_timeout(
+    timeout: Duration,
+) -> Result<OwnedSemaphorePermit, &'static str> {
+    tokio::time::timeout(
+        timeout,
+        ATTACHMENT_VALIDATION_PERMITS.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| "Attachment validation is busy. Try again.")?
+    .map_err(|_| "Attachment validation is unavailable.")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -274,16 +288,30 @@ pub(crate) fn prepare_attachment_paths(paths: &[PathBuf]) -> PreparedAttachmentS
         }
 
         let name = safe_file_name(&canonical);
+        let path_metadata = match fs::metadata(&canonical) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                prepared.issues.push(issue(
+                    name,
+                    "This file could not be read. Check its permissions and try again.",
+                ));
+                continue;
+            }
+        };
+        if !path_metadata.is_file() {
+            prepared.issues.push(issue(
+                name,
+                "Only regular files can be attached; folders and special files are not supported.",
+            ));
+            continue;
+        }
         let file = match File::open(&canonical) {
             Ok(file) => file,
             Err(_) => {
-                let message = match fs::metadata(&canonical) {
-                    Ok(metadata) if !metadata.is_file() => {
-                        "Only regular files can be attached; folders and special files are not supported."
-                    }
-                    _ => "This file could not be read. Check its permissions and try again.",
-                };
-                prepared.issues.push(issue(name, message));
+                prepared.issues.push(issue(
+                    name,
+                    "This file could not be read. Check its permissions and try again.",
+                ));
                 continue;
             }
         };
@@ -804,12 +832,11 @@ mod tests {
     async fn bounds_concurrent_attachment_validation_workers() {
         let first = acquire_attachment_validation_permit().await.unwrap();
         let second = acquire_attachment_validation_permit().await.unwrap();
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            acquire_attachment_validation_permit(),
-        )
-        .await
-        .is_err());
+        assert!(
+            acquire_attachment_validation_permit_with_timeout(Duration::from_millis(20))
+                .await
+                .is_err()
+        );
         drop(first);
         assert!(tokio::time::timeout(
             std::time::Duration::from_millis(100),
@@ -818,6 +845,39 @@ mod tests {
         .await
         .is_ok());
         drop(second);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejects_a_fifo_without_blocking_on_open() {
+        use std::ffi::CString;
+        use std::os::raw::c_char;
+        use std::sync::mpsc;
+
+        unsafe extern "C" {
+            #[link_name = "mkfifo"]
+            fn c_mkfifo(path: *const c_char, mode: u32) -> i32;
+        }
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("blocked.txt");
+        let native_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { c_mkfifo(native_path.as_ptr(), 0o600) }, 0);
+
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = prepare_attachment_paths(&[path]);
+            let _ = sender.send(result);
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_millis(500))
+            .expect("FIFO validation must reject before File::open can block");
+
+        assert!(result.attachments.is_empty());
+        assert!(result
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("regular files")));
     }
 
     #[test]
