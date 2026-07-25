@@ -272,8 +272,9 @@ describe("PermissionPrompt", () => {
     expect(resolvePermission).toHaveBeenCalledWith("s1", "p-run", "allow", undefined);
     for (const action of screen.getAllByRole("button")) expect(action).toBeDisabled();
 
-    finishResolve();
-    await flush();
+    await act(async () => {
+      finishResolve();
+    });
 
     for (const action of screen.getAllByRole("button")) expect(action).not.toBeDisabled();
   });
