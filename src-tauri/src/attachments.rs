@@ -850,19 +850,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn rejects_a_fifo_without_blocking_on_open() {
-        use std::ffi::CString;
-        use std::os::raw::c_char;
+        use std::process::Command;
         use std::sync::mpsc;
-
-        unsafe extern "C" {
-            #[link_name = "mkfifo"]
-            fn c_mkfifo(path: *const c_char, mode: u32) -> i32;
-        }
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("blocked.txt");
-        let native_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
-        assert_eq!(unsafe { c_mkfifo(native_path.as_ptr(), 0o600) }, 0);
+        let status = Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("Linux test environment must provide mkfifo");
+        assert!(status.success());
 
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
