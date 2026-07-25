@@ -82,6 +82,7 @@ struct ActiveSessionTurn {
     run_id: String,
     generation: Option<u64>,
     turn_id: Option<String>,
+    _attachment_snapshot: Option<Arc<tempfile::TempDir>>,
 }
 
 #[derive(Clone, Debug)]
@@ -176,6 +177,7 @@ pub struct CodexEngine {
     db: Arc<Db>,
     sink: Arc<dyn EventSink>,
     event_pump: StdMutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    shutdown_gate: RwLock<bool>,
     routes: RwLock<HashMap<String, ThreadRoute>>,
     resumed_generation: Mutex<HashMap<String, u64>>,
     pending_starts: Mutex<HashMap<String, PendingTurnStart>>,
@@ -210,6 +212,7 @@ impl CodexEngine {
             db,
             sink,
             event_pump: StdMutex::new(None),
+            shutdown_gate: RwLock::new(false),
             routes: RwLock::new(routes),
             resumed_generation: Mutex::new(HashMap::new()),
             pending_starts: Mutex::new(HashMap::new()),
@@ -358,6 +361,18 @@ impl CodexEngine {
         turn: PreparedTurn,
         settings: Settings,
     ) {
+        let shutdown_gate = self.shutdown_gate.read().await;
+        if *shutdown_gate {
+            self.sink.emit(
+                &session_channel(&session_id),
+                StreamEvent::Error {
+                    message: "The Codex engine is shutting down. Retry after Portcode restarts."
+                        .to_string(),
+                    receipt: None,
+                },
+            );
+            return;
+        }
         let run_id = uuid::Uuid::new_v4().to_string();
         if let Err(message) = self
             .run_turn_inner(&run_id, &session_id, &turn, &settings)
@@ -389,6 +404,8 @@ impl CodexEngine {
                 );
             }
         }
+        // Keep admission owned through every awaited dispatch/cleanup path.
+        drop(shutdown_gate);
     }
 
     async fn run_turn_inner(
@@ -409,6 +426,7 @@ impl CodexEngine {
                     run_id: run_id.to_string(),
                     generation: None,
                     turn_id: None,
+                    _attachment_snapshot: prepared_turn.attachment_snapshot(),
                 },
             );
         }
@@ -618,12 +636,26 @@ impl CodexEngine {
     /// Stop and reap the bundled Codex app-server. The transport applies its own
     /// short timeout so application exit and updater relaunch remain bounded.
     pub async fn shutdown(&self) {
+        // Close the transport centrally first: this rejects every request source and
+        // wakes any admitted run_turn blocked on a response. Then acquire exclusive
+        // turn admission so all PreparedTurn owners have drained before snapshots do.
+        self.server.shutdown().await;
+        let mut shutdown_gate = self.shutdown_gate.write().await;
+        *shutdown_gate = true;
         let event_pump = self.event_pump.lock().unwrap().take();
         if let Some(event_pump) = event_pump {
             event_pump.abort();
             let _ = event_pump.await;
         }
-        self.server.shutdown().await;
+        self.pending_starts.lock().await.clear();
+        self.active_by_thread.lock().await.clear();
+        self.turns.lock().await.clear();
+        self.usage_by_turn.lock().await.clear();
+        self.pending_requests.lock().await.clear();
+        self.deferred_by_thread.lock().await.clear();
+        // Clear this last: it owns native attachment snapshots, which must remain
+        // readable until active work has stopped but must not outlive shutdown.
+        self.active_by_session.lock().await.clear();
     }
 
     pub async fn interrupt_agent(&self, agent_thread_id: &str) -> Result<(), String> {
@@ -2341,7 +2373,7 @@ mod tests {
     }
 
     #[test]
-    fn event_pump_uses_tauri_runtime_outside_a_tokio_context() {
+    fn event_pump_shutdown_releases_active_attachment_snapshots() {
         assert!(tokio::runtime::Handle::try_current().is_err());
 
         let directory = tempfile::tempdir().unwrap();
@@ -2352,8 +2384,75 @@ mod tests {
         engine.start_event_pump();
         assert!(engine.event_pump.lock().unwrap().is_some());
 
-        tauri::async_runtime::block_on(engine.shutdown());
+        let snapshot = Arc::new(tempfile::tempdir().unwrap());
+        let snapshot_path = snapshot.path().join("image-0.png");
+        std::fs::write(&snapshot_path, b"snapshot").unwrap();
+        let weak_snapshot = Arc::downgrade(&snapshot);
+        tauri::async_runtime::block_on(async {
+            engine.active_by_session.lock().await.insert(
+                "active-session".to_string(),
+                ActiveSessionTurn {
+                    run_id: "active-run".to_string(),
+                    generation: Some(1),
+                    turn_id: Some("active-turn".to_string()),
+                    _attachment_snapshot: Some(snapshot),
+                },
+            );
+            engine.shutdown().await;
+        });
+
         assert!(engine.event_pump.lock().unwrap().is_none());
+        assert!(weak_snapshot.upgrade().is_none());
+        assert!(!snapshot_path.exists());
+        assert!(tauri::async_runtime::block_on(engine.active_by_session.lock()).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_waits_for_admitted_turns_before_releasing_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(&directory.path().join("portcode.db")).unwrap());
+        let sink = Arc::new(RecordingSink::default());
+        let engine = Arc::new(CodexEngine::new(
+            CodexAppServer::new(Default::default()),
+            db,
+            sink,
+        ));
+
+        let snapshot = Arc::new(tempfile::tempdir().unwrap());
+        let snapshot_path = snapshot.path().join("image-0.png");
+        std::fs::write(&snapshot_path, b"snapshot").unwrap();
+        let weak_snapshot = Arc::downgrade(&snapshot);
+        engine.active_by_session.lock().await.insert(
+            "active-session".to_string(),
+            ActiveSessionTurn {
+                run_id: "active-run".to_string(),
+                generation: Some(1),
+                turn_id: Some("active-turn".to_string()),
+                _attachment_snapshot: Some(snapshot),
+            },
+        );
+
+        // This shared guard represents a run_turn that passed admission but has not
+        // yet finished dispatching its PreparedTurn into active native state.
+        let admitted_turn = engine.shutdown_gate.read().await;
+        let shutdown_engine = engine.clone();
+        let shutdown = tokio::spawn(async move { shutdown_engine.shutdown().await });
+        tokio::task::yield_now().await;
+
+        assert!(!shutdown.is_finished());
+        assert!(snapshot_path.exists());
+        assert!(weak_snapshot.upgrade().is_some());
+
+        drop(admitted_turn);
+        tokio::time::timeout(Duration::from_secs(3), shutdown)
+            .await
+            .expect("shutdown should finish after admitted dispatches drain")
+            .unwrap();
+
+        assert!(*engine.shutdown_gate.read().await);
+        assert!(engine.active_by_session.lock().await.is_empty());
+        assert!(weak_snapshot.upgrade().is_none());
+        assert!(!snapshot_path.exists());
     }
 
     #[test]
@@ -2431,6 +2530,7 @@ mod tests {
                 run_id: "old-run".to_string(),
                 generation: Some(1),
                 turn_id: Some("old-turn".to_string()),
+                _attachment_snapshot: None,
             },
         );
         engine.active_by_session.lock().await.insert(
@@ -2439,6 +2539,7 @@ mod tests {
                 run_id: "replacement-run".to_string(),
                 generation: Some(2),
                 turn_id: Some("replacement-turn".to_string()),
+                _attachment_snapshot: None,
             },
         );
         engine.pending_starts.lock().await.insert(

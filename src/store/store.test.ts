@@ -1345,25 +1345,53 @@ describe("newSession", () => {
     }
   });
 
-  it("surfaces a first-send create rejection instead of an unhandled rejection", async () => {
-    // The local path now wraps createSession in try/catch so a reject (locked DB /
-    // core not ready) lands in the visible error surface rather than escaping as an
-    // unhandled promise rejection (callers use bare onClick / void).
+  it("rolls a first attachment send back when local session creation rejects", async () => {
     m.createSession.mockRejectedValueOnce(new Error("db locked"));
     arrangeConnectedCodex();
     useStore.setState({ sessions: [session({ id: "old" })] });
 
     await useStore.getState().newSession();
+    const pendingId = useStore.getState().activeId!;
+    const sent = attachment();
+    useStore.setState((state) => ({
+      attachments: { ...state.attachments, [pendingId]: [sent] },
+      drafts: { ...state.drafts, [pendingId]: "keep this draft" },
+    }));
+
     await expect(useStore.getState().send("keep this draft")).resolves.toBeUndefined();
 
     const st = useStore.getState();
     expect(st.initError).toBe("db locked");
     expect(st.sessions).toHaveLength(1); // no phantom session on failure
     expect(st.creatingSession).toBe(false); // lock released
-    expect(st.drafts[st.activeId!]).toBe("keep this draft");
+    expect(st.messages[pendingId]).toEqual([]);
+    expect(st.drafts[pendingId]).toBe("keep this draft");
+    expect(st.attachments[pendingId]).toEqual([sent]);
+    expect(st.streaming).toBe(false);
   });
 
-  it("does not re-enter local first-send creation while the first create is pending", async () => {
+  it("preserves newer typing when first-session creation rejects", async () => {
+    let rejectCreate!: (error: Error) => void;
+    m.createSession.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => (rejectCreate = reject)),
+    );
+    arrangeConnectedCodex();
+    useStore.setState({ sessions: [session({ id: "old" })] });
+
+    await useStore.getState().newSession();
+    const pendingId = useStore.getState().activeId!;
+    useStore.setState((state) => ({ drafts: { ...state.drafts, [pendingId]: "first turn" } }));
+
+    const sending = useStore.getState().send("first turn");
+    useStore.getState().setDraft("follow-up");
+    rejectCreate(new Error("db locked"));
+    await sending;
+
+    expect(useStore.getState().drafts[pendingId]).toBe("follow-up");
+    expect(useStore.getState().messages[pendingId]).toEqual([]);
+  });
+
+  it("shows a first attachment send before local session creation resolves and blocks duplicates", async () => {
     let finishCreate!: (created: Session) => void;
     let emit!: (event: StreamEvent) => void;
     m.createSession.mockImplementationOnce(
@@ -1380,9 +1408,21 @@ describe("newSession", () => {
 
     await useStore.getState().newSession();
     const pending = useStore.getState().pendingSession!;
-    const first = useStore.getState().send("first message");
-    const second = useStore.getState().send("duplicate message");
+    const sent = attachment();
+    useStore.setState((state) => ({
+      attachments: { ...state.attachments, [pending.id]: [sent] },
+      drafts: { ...state.drafts, [pending.id]: "first message" },
+    }));
 
+    const first = useStore.getState().send("first message");
+
+    expect(useStore.getState().messages[pending.id]?.[0]?.blocks).toEqual([
+      { kind: "text", text: "first message\n\nAttached: example.rs" },
+    ]);
+    expect(useStore.getState().attachments[pending.id]).toBeUndefined();
+    expect(useStore.getState().drafts[pending.id]).toBeUndefined();
+
+    const second = useStore.getState().send("duplicate message");
     expect(m.createSession).toHaveBeenCalledTimes(1);
     expect(useStore.getState().creatingSession).toBe(true);
 
@@ -1391,7 +1431,13 @@ describe("newSession", () => {
 
     expect(m.createSession).toHaveBeenCalledTimes(1);
     expect(m.runAgent).toHaveBeenCalledTimes(1);
-    expect(m.runAgent).toHaveBeenCalledWith(pending.id, "first message", expect.any(Function));
+    expect(m.runAgent).toHaveBeenCalledWith(
+      pending.id,
+      "first message",
+      expect.any(Function),
+      [sent.path],
+      [sent.displayName],
+    );
     emit({ type: "turn_end", stopReason: "end_turn" });
   });
 });
@@ -2316,6 +2362,72 @@ describe("deleteSession", () => {
       });
   });
 
+  it("drains draft persistence before deleting a session", async () => {
+    vi.useFakeTimers();
+    try {
+      let finishSave!: () => void;
+      m.saveDraft.mockImplementationOnce(
+        () => new Promise<void>((resolve) => (finishSave = resolve)),
+      );
+      useStore.setState({
+        sessions: [session({ id: "a" }), session({ id: "b" })],
+        activeId: "a",
+        messages: { a: [], b: [] },
+        archivedIds: ["a"],
+      });
+      useStore.getState().setDraft("in flight");
+      await vi.advanceTimersByTimeAsync(400);
+
+      const deleting = useStore.getState().deleteSession("a");
+      expect(m.deleteSession).not.toHaveBeenCalled();
+      useStore.getState().setDraft("must not recreate the deleted row");
+      await vi.advanceTimersByTimeAsync(400);
+      expect(m.saveDraft).toHaveBeenCalledTimes(1);
+
+      finishSave();
+      await deleting;
+
+      expect(m.deleteSession).toHaveBeenCalledWith("a");
+      expect(m.saveDraft).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("re-persists an empty draft when deletion fails after a clear", async () => {
+    vi.useFakeTimers();
+    try {
+      let finishSave!: () => void;
+      m.saveDraft.mockImplementationOnce(
+        () => new Promise<void>((resolve) => (finishSave = resolve)),
+      );
+      m.deleteSession.mockRejectedValue(new Error("locked"));
+      useStore.setState({
+        sessions: [session({ id: "a" }), session({ id: "b" })],
+        activeId: "a",
+        messages: { a: [], b: [] },
+        archivedIds: ["a"],
+      });
+      useStore.getState().setDraft("in flight");
+      await vi.advanceTimersByTimeAsync(400);
+
+      const deleting = useStore.getState().deleteSession("a");
+      useStore.getState().setDraft("");
+      await vi.advanceTimersByTimeAsync(400);
+      expect(m.saveDraft).toHaveBeenCalledTimes(1);
+
+      finishSave();
+      await deleting;
+      await vi.advanceTimersByTimeAsync(400);
+
+      expect(m.deleteSession).toHaveBeenCalledWith("a");
+      expect(m.saveDraft).toHaveBeenLastCalledWith("a", "");
+      expect(useStore.getState().sessions.map((row) => row.id)).toEqual(["a", "b"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("opens a pending new chat when the last session is deleted", async () => {
     arrangeConnectedCodex();
     useStore.setState({
@@ -2653,7 +2765,7 @@ describe("composer attachments", () => {
     expect(useStore.getState().attachments.a).toEqual([second]);
   });
 
-  it("keeps attachment input until turn_start accepts it, then clears only its session", async () => {
+  it("moves attachment input into chat immediately while preserving other sessions", async () => {
     const sent = attachment();
     const other = attachment({ path: "C:/fixtures/other.txt", name: "other.txt" });
     let emit!: (event: StreamEvent) => void;
@@ -2669,7 +2781,15 @@ describe("composer attachments", () => {
       attachments: { a: [sent], b: [other] },
     });
 
-    await useStore.getState().send("");
+    const sending = useStore.getState().send("");
+
+    expect(useStore.getState().attachments.a).toBeUndefined();
+    expect(useStore.getState().attachments.b).toEqual([other]);
+    expect(useStore.getState().messages.a[0].blocks).toEqual([
+      { kind: "text", text: "Attached: example.rs" },
+    ]);
+
+    await sending;
 
     expect(m.runAgent).toHaveBeenCalledWith(
       "a",
@@ -2678,11 +2798,8 @@ describe("composer attachments", () => {
       [sent.path],
       [sent.displayName],
     );
-    expect(useStore.getState().attachments.a).toEqual([sent]);
+    expect(useStore.getState().attachments.a).toBeUndefined();
     expect(useStore.getState().attachments.b).toEqual([other]);
-    expect(useStore.getState().messages.a[0].blocks).toEqual([
-      { kind: "text", text: "Attached: example.rs" },
-    ]);
 
     emit({ type: "turn_start", messageId: "native-message", turnId: "native-turn" });
 
@@ -2690,7 +2807,7 @@ describe("composer attachments", () => {
     expect(useStore.getState().attachments.b).toEqual([other]);
   });
 
-  it("keeps a text-only draft until turn_start accepts it", async () => {
+  it("moves a text-only draft into chat immediately", async () => {
     let emit!: (event: StreamEvent) => void;
     m.runAgent.mockImplementationOnce(async (_sessionId, _text, onEvent) => {
       emit = onEvent;
@@ -2704,8 +2821,13 @@ describe("composer attachments", () => {
       attachments: {},
     });
 
-    await useStore.getState().send("Inspect this");
-    expect(useStore.getState().drafts.a).toBe("Inspect this");
+    const sending = useStore.getState().send("Inspect this");
+    expect(useStore.getState().drafts.a).toBeUndefined();
+    expect(useStore.getState().messages.a[0].blocks).toEqual([
+      { kind: "text", text: "Inspect this" },
+    ]);
+
+    await sending;
 
     emit({ type: "turn_start", messageId: "native-message", turnId: "native-turn" });
     expect(useStore.getState().drafts.a).toBeUndefined();
@@ -2775,15 +2897,16 @@ describe("composer attachments", () => {
     );
   });
 
-  it("preserves attachments and the typed draft when native acceptance rejects", async () => {
+  it("restores the full composer and session projection when native acceptance rejects", async () => {
     const sent = attachment();
     useStore.setState({
-      sessions: [session({ id: "a" })],
+      sessions: [session({ id: "a", title: "New chat", updatedAt: 123 })],
       activeId: "a",
       messages: { a: [] },
       drafts: { a: "Inspect this" },
       attachments: { a: [sent] },
     });
+    const scrollRequestBefore = useStore.getState().transcriptScrollRequest;
     m.runAgent.mockRejectedValueOnce(new Error("example.rs: This file could not be read."));
 
     await useStore.getState().send("Inspect this");
@@ -2791,6 +2914,34 @@ describe("composer attachments", () => {
     expect(useStore.getState().attachments.a).toEqual([sent]);
     expect(useStore.getState().drafts.a).toBe("Inspect this");
     expect(useStore.getState().attachmentBusy.a).toBeUndefined();
+    expect(useStore.getState().messages.a).toEqual([]);
+    expect(useStore.getState().sessions[0]).toMatchObject({ title: "New chat", updatedAt: 123 });
+    expect(useStore.getState().transcriptScrollRequest).toBe(scrollRequestBefore);
+  });
+
+  it("does not overwrite a newer intentional draft clear when admission rejects", async () => {
+    const sent = attachment();
+    let rejectRun!: (error: Error) => void;
+    m.runAgent.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => (rejectRun = reject)),
+    );
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: { a: [] },
+      drafts: { a: "Inspect this" },
+      attachments: { a: [sent] },
+    });
+
+    const sending = useStore.getState().send("Inspect this");
+    await vi.waitFor(() => expect(m.runAgent).toHaveBeenCalled());
+    useStore.getState().setDraft("");
+    rejectRun(new Error("admission rejected"));
+    await sending;
+
+    expect(useStore.getState().drafts.a).toBeUndefined();
+    expect(useStore.getState().attachments.a).toEqual([sent]);
+    expect(useStore.getState().messages.a).toEqual([]);
   });
 
   it("restores an actionable retry snapshot when an error follows command return before turn_start", async () => {
@@ -2821,7 +2972,7 @@ describe("composer attachments", () => {
     expect(useStore.getState().messages.a).toEqual([]);
   });
 
-  it("locks submitted attachments while an earlier model write is still settling", async () => {
+  it("moves submitted attachments into chat while an earlier model write is still settling", async () => {
     const sent = attachment();
     let finishModelWrite!: () => void;
     m.updateSessionModel.mockImplementationOnce(
@@ -2840,8 +2991,10 @@ describe("composer attachments", () => {
     await Promise.resolve();
 
     expect(useStore.getState().attachmentBusy.a).toBe(true);
-    useStore.getState().removeAttachment(sent.path);
-    expect(useStore.getState().attachments.a).toEqual([sent]);
+    expect(useStore.getState().attachments.a).toBeUndefined();
+    expect(useStore.getState().messages.a[0]?.blocks).toEqual([
+      { kind: "text", text: "Inspect this\n\nAttached: example.rs" },
+    ]);
 
     finishModelWrite();
     await Promise.all([changingModel, sending]);
@@ -4925,6 +5078,60 @@ describe("composer drafts on send", () => {
       expect(useStore.getState().drafts.a).toBeUndefined();
       expect(JSON.parse(localStorage.getItem("pc.drafts")!)).toEqual({});
       expect(m.saveDraft).toHaveBeenLastCalledWith("a", "");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not cancel a newer follow-up draft save when turn_start accepts the prior send", async () => {
+    vi.useFakeTimers();
+    try {
+      let emit!: (event: StreamEvent) => void;
+      m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+        emit = onEvent;
+        return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+      });
+      useStore.getState().setDraft("first turn");
+
+      await useStore.getState().send("first turn");
+      useStore.getState().setDraft("follow-up");
+      emit({ type: "turn_start", messageId: "native-turn", turnId: "native-turn", startedAt: 100 });
+      vi.advanceTimersByTime(400);
+
+      expect(useStore.getState().drafts.a).toBe("follow-up");
+      expect(m.saveDraft).not.toHaveBeenCalledWith("a", "");
+      expect(m.saveDraft).toHaveBeenLastCalledWith("a", "follow-up");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("serializes an accepted clear behind an in-flight nonblank draft save", async () => {
+    vi.useFakeTimers();
+    try {
+      let emit!: (event: StreamEvent) => void;
+      let finishOldSave!: () => void;
+      let finishClear!: () => void;
+      m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+        emit = onEvent;
+        return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+      });
+      m.saveDraft
+        .mockImplementationOnce(() => new Promise<void>((resolve) => (finishOldSave = resolve)))
+        .mockImplementationOnce(() => new Promise<void>((resolve) => (finishClear = resolve)));
+
+      useStore.getState().setDraft("stale if it completes last");
+      await vi.advanceTimersByTimeAsync(400);
+      expect(m.saveDraft).toHaveBeenCalledTimes(1);
+
+      await useStore.getState().send("stale if it completes last");
+      emit({ type: "turn_start", messageId: "native-turn", turnId: "native-turn", startedAt: 100 });
+      expect(m.saveDraft).toHaveBeenCalledTimes(1);
+
+      finishOldSave();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(m.saveDraft).toHaveBeenNthCalledWith(2, "a", "");
+      finishClear();
     } finally {
       vi.useRealTimers();
     }

@@ -13,7 +13,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Weak,
     },
     time::Duration,
@@ -24,7 +24,7 @@ use serde_json::{json, Map, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::ChildStdin,
-    sync::{broadcast, oneshot, Mutex},
+    sync::{broadcast, oneshot, watch, Mutex},
 };
 
 use crate::process_env::hidden_command;
@@ -297,6 +297,8 @@ struct Inner {
     state: Mutex<RuntimeState>,
     pending: Mutex<HashMap<u64, PendingRequest>>,
     incoming: broadcast::Sender<Incoming>,
+    closed: AtomicBool,
+    shutdown_signal: watch::Sender<bool>,
     next_request_id: AtomicU64,
     next_generation: AtomicU64,
 }
@@ -327,12 +329,15 @@ impl CodexAppServer {
     pub fn new(options: CodexAppServerOptions) -> Self {
         let capacity = options.broadcast_capacity.max(1);
         let (incoming, _) = broadcast::channel(capacity);
+        let (shutdown_signal, _) = watch::channel(false);
         Self {
             inner: Arc::new(Inner {
                 options,
                 state: Mutex::new(RuntimeState::default()),
                 pending: Mutex::new(HashMap::new()),
                 incoming,
+                closed: AtomicBool::new(false),
+                shutdown_signal,
                 next_request_id: AtomicU64::new(1),
                 next_generation: AtomicU64::new(1),
             }),
@@ -474,9 +479,11 @@ impl CodexAppServer {
         self.request("model/list", Value::Object(params)).await
     }
 
-    /// Stop the current generation and reject its outstanding requests. A later
-    /// request starts a fresh process and performs a fresh handshake.
+    /// Permanently close this supervisor, stop the current generation, and reject
+    /// outstanding and future requests. A new engine must construct a new server.
     pub async fn shutdown(&self) {
+        self.inner.closed.store(true, Ordering::Release);
+        self.inner.shutdown_signal.send_replace(true);
         let running = self.inner.state.lock().await.running.take();
         if let Some(mut running) = running {
             self.inner
@@ -520,19 +527,31 @@ impl CodexAppServer {
     }
 
     async fn ensure_running(&self) -> Result<Connection> {
+        let mut shutdown_signal = self.inner.shutdown_signal.subscribe();
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(CodexAppServerError::Exited("client shutdown".to_owned()));
+        }
         // Holding this Tokio mutex across initialization serializes concurrent
         // first-use calls. Reader/waiter tasks use separate locks to resolve the
         // initialize response, so the handshake cannot deadlock.
         let mut state = self.inner.state.lock().await;
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(CodexAppServerError::Exited("client shutdown".to_owned()));
+        }
         if let Some(running) = state.running.as_ref() {
             return Ok(running.connection.clone());
         }
 
-        let executable = resolve_codex_executable(
-            self.inner.options.resource_dir.as_deref(),
-            self.inner.options.version_probe_timeout,
-        )
-        .await?;
+        let executable = tokio::select! {
+            changed = shutdown_signal.changed() => match changed {
+                Ok(()) => Err(CodexAppServerError::Exited("client shutdown".to_owned())),
+                Err(_) => Err(CodexAppServerError::Exited("shutdown signal closed".to_owned())),
+            },
+            resolved = resolve_codex_executable(
+                self.inner.options.resource_dir.as_deref(),
+                self.inner.options.version_probe_timeout,
+            ) => resolved,
+        }?;
         let generation = next_monotonic(&self.inner.next_generation)?;
         let spawned = spawn_app_server(executable, generation)?;
         let connection = spawned.connection.clone();
@@ -549,30 +568,39 @@ impl CodexAppServer {
             shutdown: Some(spawned.shutdown_tx),
         });
 
-        let initialize = tokio::time::timeout(
-            self.inner.options.startup_timeout,
-            self.inner.send_request_on(
-                &connection,
-                "initialize",
-                initialize_params(&self.inner.options),
-            ),
-        )
-        .await
-        .map_err(|_| CodexAppServerError::Timeout {
-            operation: "initialize",
-        })
-        .and_then(|result| result);
-
-        let startup = match initialize {
-            Ok(_) => tokio::time::timeout(
+        let initialize = tokio::select! {
+            changed = shutdown_signal.changed() => match changed {
+                Ok(()) => Err(CodexAppServerError::Exited("client shutdown".to_owned())),
+                Err(_) => Err(CodexAppServerError::Exited("shutdown signal closed".to_owned())),
+            },
+            result = tokio::time::timeout(
                 self.inner.options.startup_timeout,
-                write_json_line(&connection.stdin, &json!({ "method": "initialized" })),
-            )
-            .await
-            .map_err(|_| CodexAppServerError::Timeout {
-                operation: "initialized notification",
-            })
-            .and_then(|result| result),
+                self.inner.send_request_on(
+                    &connection,
+                    "initialize",
+                    initialize_params(&self.inner.options),
+                ),
+            ) => result
+                .map_err(|_| CodexAppServerError::Timeout { operation: "initialize" })
+                .and_then(|result| result),
+        };
+
+        let initialized_frame = json!({ "method": "initialized" });
+        let startup = match initialize {
+            Ok(_) => tokio::select! {
+                changed = shutdown_signal.changed() => match changed {
+                    Ok(()) => Err(CodexAppServerError::Exited("client shutdown".to_owned())),
+                    Err(_) => Err(CodexAppServerError::Exited("shutdown signal closed".to_owned())),
+                },
+                result = tokio::time::timeout(
+                    self.inner.options.startup_timeout,
+                    write_json_line(&connection.stdin, &initialized_frame),
+                ) => result
+                    .map_err(|_| CodexAppServerError::Timeout {
+                        operation: "initialized notification",
+                    })
+                    .and_then(|result| result),
+            },
             Err(error) => Err(error),
         };
 
@@ -583,7 +611,7 @@ impl CodexAppServer {
                 .fail_pending_generation(generation, error.clone())
                 .await;
             if let Some(shutdown) = running.as_mut().and_then(|running| running.shutdown.take()) {
-                let _ = shutdown.send(None);
+                let _ = request_child_shutdown(shutdown, self.inner.options.shutdown_timeout).await;
             }
             return Err(error);
         }
@@ -608,6 +636,14 @@ impl Inner {
                 responder,
             },
         );
+
+        // Close can race between ensure_running and pending insertion. Checking after
+        // insertion covers both orderings: shutdown either fails this pending entry,
+        // or this branch removes it before any transport write.
+        if self.closed.load(Ordering::Acquire) {
+            self.pending.lock().await.remove(&id);
+            return Err(CodexAppServerError::Exited("client shutdown".to_owned()));
+        }
 
         let frame = json!({ "method": method, "id": id, "params": params });
         if let Err(error) = write_json_line(&connection.stdin, &frame).await {
@@ -1673,6 +1709,22 @@ mod tests {
                 reason: "Codex app-server stopped: stdout closed".to_string(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_permanently_rejects_every_future_request_source() {
+        let server = CodexAppServer::new(Default::default());
+        server.shutdown().await;
+
+        assert!(matches!(
+            server.request("account/read", json!({})).await,
+            Err(CodexAppServerError::Exited(reason)) if reason == "client shutdown"
+        ));
+        assert!(matches!(
+            server.version().await,
+            Err(CodexAppServerError::Exited(reason)) if reason == "client shutdown"
+        ));
+        assert!(!server.status().await.running);
     }
 
     #[tokio::test]

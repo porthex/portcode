@@ -233,7 +233,13 @@ pub(crate) struct AttachmentValidationResult {
 pub(crate) struct PreparedTurn {
     pub display_text: String,
     pub input: Vec<Value>,
-    _attachment_snapshot: Option<tempfile::TempDir>,
+    attachment_snapshot: Option<Arc<tempfile::TempDir>>,
+}
+
+impl PreparedTurn {
+    pub(crate) fn attachment_snapshot(&self) -> Option<Arc<tempfile::TempDir>> {
+        self.attachment_snapshot.clone()
+    }
 }
 
 impl PreparedAttachmentSet {
@@ -630,7 +636,7 @@ pub(crate) fn prepare_turn_with_display_names(
             bytes.shrink_to_fit();
             image_index += 1;
         }
-        Some(snapshot)
+        Some(Arc::new(snapshot))
     } else {
         None
     };
@@ -652,7 +658,7 @@ pub(crate) fn prepare_turn_with_display_names(
     Ok(PreparedTurn {
         display_text,
         input,
-        _attachment_snapshot: attachment_snapshot,
+        attachment_snapshot,
     })
 }
 
@@ -979,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_turn_binds_images_to_owned_snapshots_until_the_turn_is_dropped() {
+    fn prepare_turn_snapshot_can_be_retained_by_the_active_turn_after_dispatch() {
         let dir = tempdir().unwrap();
         let original = dir.path().join("mutable.png");
         let png = base64::engine::general_purpose::STANDARD
@@ -994,7 +1000,11 @@ mod tests {
         fs::write(&original, b"different private bytes").unwrap();
         assert_eq!(fs::read(&snapshot).unwrap(), png);
 
+        let active_turn_snapshot = turn.attachment_snapshot();
         drop(turn);
+        assert_eq!(fs::read(&snapshot).unwrap(), png);
+
+        drop(active_turn_snapshot);
         assert!(!snapshot.exists());
     }
 

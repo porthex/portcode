@@ -843,7 +843,7 @@ describe("Composer send button", () => {
     }
   });
 
-  it("submits on click while preserving the draft until authoritative acceptance", async () => {
+  it("moves a clicked send into chat and clears the composer immediately", async () => {
     useStore.setState({
       sessions: [session()],
       activeId: "a",
@@ -854,10 +854,117 @@ describe("Composer send button", () => {
 
     fireEvent.click(sendButton());
 
-    expect(useStore.getState().drafts.a).toBe("Refactor the parser");
+    expect(useStore.getState().drafts.a).toBeUndefined();
+    expect(textarea().textContent).toBe("");
     await Promise.resolve();
     await Promise.resolve();
     expect(m.runAgent).toHaveBeenCalledWith("a", "Refactor the parser", expect.any(Function));
+  });
+
+  it("restores the editor when native admission fails before turn_start", async () => {
+    m.runAgent.mockRejectedValueOnce(new Error("Attachment changed before send"));
+    useStore.setState({
+      sessions: [session()],
+      activeId: "a",
+      messages: { a: [] },
+      drafts: { a: "Explain the screenshot" },
+    });
+    render(<Composer />);
+
+    fireEvent.click(sendButton());
+
+    expect(textarea().textContent).toBe("");
+    await waitFor(() => expect(textarea().textContent).toBe("Explain the screenshot"));
+    expect(useStore.getState().drafts.a).toBe("Explain the screenshot");
+    expect(screen.getByRole("alert")).toHaveTextContent("Attachment changed before send");
+  });
+
+  it("does not rewrite a follow-up draft when native handle admission succeeds", async () => {
+    let finishRun!: () => void;
+    m.runAgent.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishRun = () => resolve({ cancel: vi.fn(async () => {}), dispose: vi.fn() });
+        }),
+    );
+    useStore.setState({
+      sessions: [session()],
+      activeId: "a",
+      messages: { a: [] },
+      drafts: { a: "First turn" },
+    });
+    render(<Composer />);
+
+    fireEvent.click(sendButton());
+    await waitFor(() => expect(m.runAgent).toHaveBeenCalled());
+    act(() => seedDraft("Follow-up"));
+    await waitFor(() => expect(textarea().textContent).toBe("Follow-up"));
+
+    const mutations: MutationRecord[] = [];
+    const observer = new MutationObserver((records) => mutations.push(...records));
+    observer.observe(textarea(), { childList: true, characterData: true, subtree: true });
+    await act(async () => finishRun());
+    await Promise.resolve();
+    observer.disconnect();
+
+    expect(textarea().textContent).toBe("Follow-up");
+    expect(mutations).toEqual([]);
+  });
+
+  it("does not rewrite an IME follow-up draft when the prior send is rejected", async () => {
+    let rejectRun!: (error: Error) => void;
+    m.runAgent.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => (rejectRun = reject)),
+    );
+    useStore.setState({
+      sessions: [session()],
+      activeId: "a",
+      messages: { a: [] },
+      drafts: { a: "First turn" },
+    });
+    render(<Composer />);
+
+    fireEvent.click(sendButton());
+    await waitFor(() => expect(m.runAgent).toHaveBeenCalled());
+    act(() => useStore.getState().setDraft("入力中の follow-up"));
+    await waitFor(() => expect(textarea().textContent).toBe("入力中の follow-up"));
+    fireEvent.compositionStart(textarea());
+
+    const mutations: MutationRecord[] = [];
+    const observer = new MutationObserver((records) => mutations.push(...records));
+    observer.observe(textarea(), { childList: true, characterData: true, subtree: true });
+    await act(async () => rejectRun(new Error("Prior send rejected")));
+    await Promise.resolve();
+    observer.disconnect();
+
+    expect(textarea().textContent).toBe("入力中の follow-up");
+    expect(useStore.getState().drafts.a).toBe("入力中の follow-up");
+    expect(mutations).toEqual([]);
+  });
+
+  it("does not import a rejected send into another session's editor", async () => {
+    let rejectRun!: (error: Error) => void;
+    m.runAgent.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => (rejectRun = reject)),
+    );
+    useStore.setState({
+      sessions: [session(), session({ id: "b", title: "Other" })],
+      activeId: "a",
+      messages: { a: [], b: [] },
+      drafts: { a: "Send from A", b: "Keep B" },
+    });
+    render(<Composer />);
+
+    fireEvent.click(sendButton());
+    await waitFor(() => expect(m.runAgent).toHaveBeenCalled());
+    act(() => useStore.setState({ activeId: "b" }));
+    await waitFor(() => expect(textarea().textContent).toBe("Keep B"));
+
+    await act(async () => rejectRun(new Error("A was rejected")));
+
+    expect(textarea().textContent).toBe("Keep B");
+    expect(useStore.getState().drafts.b).toBe("Keep B");
+    expect(useStore.getState().drafts.a).toBe("Send from A");
   });
 
   it("collapses the textarea to an explicit px height on submit (not 'auto')", async () => {
@@ -904,7 +1011,8 @@ describe("Composer key handling", () => {
     render(<Composer />);
     fireEvent.keyDown(textarea(), { key: "Enter" });
 
-    expect(useStore.getState().drafts.a).toBe("ship it");
+    expect(useStore.getState().drafts.a).toBeUndefined();
+    expect(textarea().textContent).toBe("");
     await Promise.resolve();
     await Promise.resolve();
     expect(m.runAgent).toHaveBeenCalledWith("a", "ship it", expect.any(Function));
