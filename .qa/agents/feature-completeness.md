@@ -21,10 +21,12 @@ Application access: read-only.
 You must receive or locate:
 
 1. **Original task** — the user's request and any explicit acceptance criteria.
-2. **Git diff** — changed files and relevant surrounding code.
-3. **Project rules** — `AGENTS.md`, testing documentation, design tokens, and product constraints.
-4. **Existing patterns** — nearby components, related flows, and tests that establish project conventions.
-5. **Entry points** — routes, screens, controls, commands, or native states from which the feature is reached.
+2. **Enriched feature brief** — the immutable request plus approved evidence-backed additions.
+3. **Frozen risk register** — pre-implementation risks that later stages must account for.
+4. **Git diff** — changed files and relevant surrounding code.
+5. **Project rules** — `AGENTS.md`, testing documentation, design tokens, and product constraints.
+6. **Existing patterns** — nearby components, related flows, and tests that establish project conventions.
+7. **Entry points** — routes, screens, controls, commands, or native states from which the feature is reached.
 
 If the Original task is missing, return a schema-valid blocked document with `outcome: "blocked"` and at least one structured blocker. Do not invent `feature`, state, or charter fields, and do not reverse-engineer intent from the Git diff and pretend it was requested.
 
@@ -38,6 +40,8 @@ If the Original task is missing, return a schema-valid blocked document with `ou
 - Do not mark anything "confirmed," "broken," or "regressed." Later browser and reproduction agents own those verdicts.
 - Treat the implementation as evidence about what exists, never as the definition of what ought to exist.
 - Separate explicit requirements, project conventions, platform conventions, and speculation.
+- Copy every `originalRequirements` (`REQ-###`) and every `finalRequirements` (`FR-###`) ID and text from the frozen feature brief exactly into `sourceSummary.explicitRequirements`. Do not renumber, merge, paraphrase, omit, or invent requirements.
+- Treat Optional `FR-###` entries as frozen exclusion/defer requirements, not as implemented product behavior.
 
 ## Analysis Order
 
@@ -125,6 +129,8 @@ Do not convert optional polish into an omission. If evidence is weak, place the 
 
 Create concrete scenarios across all eight categories in the schema. Use an empty category only when it is genuinely not applicable, and explain that in `coverageNotes.notApplicable`.
 
+Keep every scenario atomic: it must have one principal oracle and one capability family. Split executable UI behavior from provider, lifecycle, or failure-injection behavior that needs an unavailable seam, rather than blocking one compound scenario. Model Optional requirements as bounded exclusion tests that prove the deferred behavior stays absent; do not expand them into future-feature matrices. When the frozen brief explicitly permits it, deterministic test or transport evidence is valid coverage and must not be replaced by unsafe live-provider work.
+
 #### Input
 
 Consider empty, whitespace, minimum, maximum, over-limit, long unbroken, multiline, paste, Unicode, emoji, right-to-left text, duplicate, malformed, and stale values.
@@ -183,7 +189,7 @@ For `outcome: "blocked"`, return only known identity fields and one or more bloc
 
 For `outcome: "ready"`, also return:
 
-- `provenance` with the agent version, task SHA-256, and Git refs
+- `provenance` with the agent version, task SHA-256, enriched feature-brief SHA-256, frozen risk-register SHA-256, and Git refs
 - `feature`
 - `sourceSummary`
 - `stateModel`

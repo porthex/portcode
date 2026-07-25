@@ -49,6 +49,19 @@ test("confirmation rejects missing candidates, false confirmation, reused paths,
   assert.ok(errors.some((error) => error.includes("mergeGate must be fail")));
 });
 
+test("confirmation cannot weaken the runner-owned blocking policy", () => {
+  const report = validReport();
+  report.summary.blockingSeverities = ["low"];
+  report.summary.mergeGate = "pass";
+  report.summary.gateReasons = [];
+  const errors = validateConfirmedReportSemantics(report, model, exploration, design, {
+    ...identities,
+    blockingSeverities: ["critical", "high"],
+  });
+  assert.ok(errors.some((error) => /runner-owned gate policy/i.test(error)));
+  assert.ok(errors.some((error) => /mergeGate must be fail/i.test(error)));
+});
+
 function validReport() {
   return {
     schemaVersion: "0.1.0",

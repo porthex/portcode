@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qa://schemas/risk-register/0.1.0",
+  "title": "Frozen pre-implementation risk register",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "registerId", "outcome", "blockers"],
+  "properties": {
+    "schemaVersion": { "const": "0.1.0" },
+    "registerId": { "type": "string", "minLength": 1 },
+    "outcome": { "enum": ["ready", "blocked"] },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "blockers": { "type": "array", "items": { "$ref": "#/$defs/blocker" } },
+    "architectureSummary": { "type": "string", "minLength": 1 },
+    "risks": { "type": "array", "items": { "$ref": "#/$defs/risk" } }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "outcome": { "const": "ready" } } },
+      "then": {
+        "required": ["provenance", "architectureSummary", "risks"],
+        "properties": { "blockers": { "maxItems": 0 } }
+      }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "blocked" } } },
+      "then": { "properties": { "blockers": { "minItems": 1 } } }
+    }
+  ],
+  "$defs": {
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent",
+        "agentVersion",
+        "taskSha256",
+        "useCaseScoutSha256",
+        "gitBase",
+        "gitHead",
+        "workingTreeSha256"
+      ],
+      "properties": {
+        "agent": { "const": "pre-implementation-risk-architect" },
+        "agentVersion": { "const": "0.1.0" },
+        "taskSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "useCaseScoutSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "gitBase": { "type": ["string", "null"] },
+        "gitHead": { "type": ["string", "null"] },
+        "workingTreeSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" }
+      }
+    },
+    "blocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "reason"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^BLK-[0-9]{3}$" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["methods", "requiredCapabilities", "oracle", "fixturePlan"],
+      "properties": {
+        "methods": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "source-review",
+              "unit-test",
+              "integration-test",
+              "runtime",
+              "native-runtime",
+              "browser-runtime",
+              "transport-capture",
+              "controlled-race"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "requiredCapabilities": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "oracle": { "type": "string", "minLength": 1 },
+        "fixturePlan": { "type": "string", "minLength": 1 }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "category",
+        "severity",
+        "trigger",
+        "failureMode",
+        "userImpact",
+        "expectedControl",
+        "relatedRequirementIds",
+        "relatedProposalIds",
+        "verification"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^RISK-[0-9]{3}$" },
+        "title": { "type": "string", "minLength": 1 },
+        "category": {
+          "enum": [
+            "trust-boundary",
+            "race-condition",
+            "async-acceptance",
+            "state-ownership",
+            "persistence",
+            "rollback",
+            "security-integrity",
+            "resource-bound",
+            "mode-transition",
+            "error-propagation",
+            "neighboring-regression"
+          ]
+        },
+        "severity": { "enum": ["critical", "high", "medium", "low"] },
+        "trigger": { "type": "string", "minLength": 1 },
+        "failureMode": { "type": "string", "minLength": 1 },
+        "userImpact": { "type": "string", "minLength": 1 },
+        "expectedControl": { "type": "string", "minLength": 1 },
+        "relatedRequirementIds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^REQ-[0-9]{3}$" },
+          "uniqueItems": true
+        },
+        "relatedProposalIds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^UC-[0-9]{3}$" },
+          "uniqueItems": true
+        },
+        "verification": { "$ref": "#/$defs/verification" }
+      }
+    }
+  }
+}

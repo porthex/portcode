@@ -20,6 +20,9 @@ test("independent reproducer resets and verifies every candidate without trustin
     "inconclusive",
     "Do not edit application code",
     "Do not invent findings",
+    "Do not author custom CDP or input-automation scripts",
+    "approved built-in interaction tools",
+    "mark the candidate inconclusive",
     "confirmed-report.schema.json",
   ]) {
     assert.match(prompt, new RegExp(escapeRegExp(requiredText), "i"), `missing: ${requiredText}`);

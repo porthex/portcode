@@ -24,7 +24,16 @@
     {
       "if": { "properties": { "outcome": { "const": "completed" } } },
       "then": {
-        "required": ["provenance", "run", "environment", "instrumentation", "scenarioPlan", "executedScenarios", "observations", "coverage" ]
+        "required": [
+          "provenance",
+          "run",
+          "environment",
+          "instrumentation",
+          "scenarioPlan",
+          "executedScenarios",
+          "observations",
+          "coverage"
+        ]
       }
     },
     {
@@ -36,13 +45,27 @@
     "provenance": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["agent", "agentVersion", "featureModelSha256", "gitBase", "gitHead", "artifactRoot", "dataProfile"],
+      "required": [
+        "agent",
+        "agentVersion",
+        "featureModelSha256",
+        "featureBriefSha256",
+        "riskRegisterSha256",
+        "gitBase",
+        "gitHead",
+        "workingTreeSha256",
+        "artifactRoot",
+        "dataProfile"
+      ],
       "properties": {
         "agent": { "const": "edge-case-explorer" },
         "agentVersion": { "const": "0.2.0" },
         "featureModelSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "featureBriefSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "riskRegisterSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
         "gitBase": { "type": ["string", "null"] },
         "gitHead": { "type": ["string", "null"] },
+        "workingTreeSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
         "artifactRoot": { "type": "string", "minLength": 1 },
         "dataProfile": { "type": "string", "minLength": 1 }
       }
@@ -116,9 +139,21 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "caseId", "source", "category", "status", "risk", "oracle", "steps",
-        "expected", "actual", "startedAt", "completedAt", "observationIds",
-        "blockerId", "dispositionReason", "evidenceRefs"
+        "caseId",
+        "source",
+        "category",
+        "status",
+        "risk",
+        "oracle",
+        "steps",
+        "expected",
+        "actual",
+        "startedAt",
+        "completedAt",
+        "observationIds",
+        "blockerId",
+        "dispositionReason",
+        "evidenceRefs"
       ],
       "properties": {
         "caseId": { "type": "string", "minLength": 1 },
@@ -132,7 +167,11 @@
         "actual": { "type": "string", "minLength": 1 },
         "startedAt": { "type": "string", "format": "date-time" },
         "completedAt": { "type": "string", "format": "date-time" },
-        "observationIds": { "type": "array", "items": { "type": "string", "pattern": "^OBS-[0-9]{3}$" }, "uniqueItems": true },
+        "observationIds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^OBS-[0-9]{3}$" },
+          "uniqueItems": true
+        },
         "blockerId": { "type": ["string", "null"] },
         "dispositionReason": { "type": ["string", "null"] },
         "evidenceRefs": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
@@ -142,24 +181,52 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "id", "title", "classification", "provisionalImpact", "confidence",
-        "charterCaseIds", "preconditions", "steps", "expected", "actual",
-        "reproduction", "evidence", "status"
+        "id",
+        "title",
+        "classification",
+        "provisionalImpact",
+        "confidence",
+        "charterCaseIds",
+        "preconditions",
+        "steps",
+        "expected",
+        "actual",
+        "reproduction",
+        "evidence",
+        "status"
       ],
       "properties": {
         "id": { "type": "string", "pattern": "^OBS-[0-9]{3}$" },
         "title": { "type": "string", "minLength": 1 },
         "classification": {
           "enum": [
-            "functional-defect-candidate", "behavior-omission-candidate",
-            "state-desync-candidate", "crash-or-freeze-candidate",
-            "console-error-candidate", "network-error-candidate",
-            "accessibility-candidate", "design-gap-candidate"
+            "functional-defect-candidate",
+            "behavior-omission-candidate",
+            "state-desync-candidate",
+            "crash-or-freeze-candidate",
+            "console-error-candidate",
+            "network-error-candidate",
+            "accessibility-candidate",
+            "design-gap-candidate"
           ]
         },
-        "provisionalImpact": { "enum": ["unsafe-or-security", "data-loss", "primary-flow-blocked", "recovery-required", "misleading-state", "limited-impact"] },
+        "provisionalImpact": {
+          "enum": [
+            "unsafe-or-security",
+            "data-loss",
+            "primary-flow-blocked",
+            "recovery-required",
+            "misleading-state",
+            "limited-impact"
+          ]
+        },
         "confidence": { "enum": ["high", "medium", "low"] },
-        "charterCaseIds": { "type": "array", "items": { "type": "string" }, "minItems": 1, "uniqueItems": true },
+        "charterCaseIds": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "uniqueItems": true
+        },
         "preconditions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "steps": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
         "expected": { "type": "string", "minLength": 1 },
@@ -227,7 +294,17 @@
     "coverage": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["planned", "selected", "executed", "passed", "observationsRecorded", "blocked", "notApplicable", "byCategory", "untestedRisks"],
+      "required": [
+        "planned",
+        "selected",
+        "executed",
+        "passed",
+        "observationsRecorded",
+        "blocked",
+        "notApplicable",
+        "byCategory",
+        "untestedRisks"
+      ],
       "properties": {
         "planned": { "type": "integer", "minimum": 0 },
         "selected": { "type": "integer", "minimum": 0 },
@@ -239,7 +316,16 @@
         "byCategory": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["input", "timing", "lifecycle", "interaction", "persistence", "layout", "accessibility", "neighboringRegression"],
+          "required": [
+            "input",
+            "timing",
+            "lifecycle",
+            "interaction",
+            "persistence",
+            "layout",
+            "accessibility",
+            "neighboringRegression"
+          ],
           "properties": {
             "input": { "$ref": "#/$defs/categoryCoverage" },
             "timing": { "$ref": "#/$defs/categoryCoverage" },
@@ -257,7 +343,15 @@
     "categoryCoverage": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["planned", "selected", "executed", "passed", "observationsRecorded", "blocked", "notApplicable"],
+      "required": [
+        "planned",
+        "selected",
+        "executed",
+        "passed",
+        "observationsRecorded",
+        "blocked",
+        "notApplicable"
+      ],
       "properties": {
         "planned": { "type": "integer", "minimum": 0 },
         "selected": { "type": "integer", "minimum": 0 },
@@ -279,6 +373,17 @@
         "affectedCaseIds": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
       }
     },
-    "category": { "enum": ["input", "timing", "lifecycle", "interaction", "persistence", "layout", "accessibility", "neighboringRegression"] }
+    "category": {
+      "enum": [
+        "input",
+        "timing",
+        "lifecycle",
+        "interaction",
+        "persistence",
+        "layout",
+        "accessibility",
+        "neighboringRegression"
+      ]
+    }
   }
 }

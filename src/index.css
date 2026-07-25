@@ -4267,7 +4267,10 @@ button.pc-turn-receipt__strip:focus-visible {
    ========================================================================= */
 .pc-composer-dock {
   position: relative;
-  flex-shrink: 0;
+  display: flex;
+  min-height: 0;
+  flex: 0 1 auto;
+  flex-direction: column;
   border-top: 1px solid rgba(35, 42, 61, 0.78);
   padding: 10px clamp(12px, 1.6vw, 20px) 7px;
   background: linear-gradient(180deg, rgba(10, 12, 19, 0.88), rgba(7, 9, 14, 0.98));
@@ -4292,6 +4295,9 @@ button.pc-turn-receipt__strip:focus-visible {
    deliberately neutral; focus, ready-to-send, and running states earn the color. */
 .pc-neon-frame {
   position: relative;
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
   isolation: isolate;
   border-radius: 17px;
   padding: 1px;
@@ -4359,13 +4365,204 @@ button.pc-turn-receipt__strip:focus-visible {
 }
 
 .pc-composer-surface {
+  position: relative;
+  display: flex;
+  min-height: 0;
   min-width: 0;
+  flex-direction: column;
   border-radius: 16px;
   background: linear-gradient(180deg, rgba(12, 15, 24, 0.99), rgba(8, 10, 16, 0.99));
+}
+.pc-composer-surface[data-drag-active="true"]::after {
+  content: "Drop files to attach";
+  position: absolute;
+  inset: 4px;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  border: 1px dashed rgba(33, 230, 255, 0.72);
+  border-radius: 13px;
+  background: rgba(7, 13, 21, 0.9);
+  color: var(--color-accent-2);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  pointer-events: none;
 }
 .pc-composer-input-zone {
   position: relative;
   padding: 11px 14px 9px;
+}
+.pc-attachment-tray {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  gap: 7px;
+  padding: 0 10px 8px;
+}
+.pc-attachment-list {
+  display: flex;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  gap: 7px;
+  overflow-x: auto;
+  list-style: none;
+  scrollbar-width: thin;
+}
+.pc-attachment-chip {
+  display: grid;
+  grid-template-columns: 30px minmax(72px, 1fr) 24px;
+  align-items: center;
+  flex: 0 1 210px;
+  min-width: 126px;
+  max-width: 230px;
+  min-height: 43px;
+  gap: 7px;
+  border: 1px solid rgba(48, 57, 79, 0.82);
+  border-radius: 10px;
+  padding: 5px 5px 5px 6px;
+  background: rgba(15, 18, 28, 0.82);
+}
+.pc-attachment-chip__preview,
+.pc-attachment-chip__icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+}
+.pc-attachment-chip__preview {
+  display: block;
+  object-fit: cover;
+  background: rgba(5, 7, 12, 0.82);
+}
+.pc-attachment-chip__icon {
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(33, 230, 255, 0.2);
+  background: rgba(33, 230, 255, 0.06);
+  color: var(--color-accent-2);
+  font-family: var(--font-mono);
+  font-size: 16px;
+}
+.pc-attachment-chip__copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+.pc-attachment-chip__name {
+  min-width: 0;
+  overflow: hidden;
+  color: #dce2ed;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pc-attachment-chip__meta {
+  color: var(--color-faint);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.pc-attachment-chip__remove {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-muted);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+}
+.pc-attachment-chip__remove:hover:not(:disabled) {
+  background: rgba(255, 77, 87, 0.1);
+  color: #ff7b84;
+}
+.pc-attachment-chip__remove:disabled,
+.pc-attach-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.46;
+}
+.pc-attachment-chip__remove:focus-visible,
+.pc-attach-button:focus-visible,
+.pc-attachment-error button:focus-visible {
+  outline: 2px solid var(--color-accent-2);
+  outline-offset: 2px;
+}
+.pc-attachment-status {
+  color: var(--color-muted);
+  font-size: 10px;
+}
+.pc-attachment-error {
+  display: flex;
+  min-height: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid rgba(255, 77, 87, 0.28);
+  border-radius: 8px;
+  padding: 7px 9px;
+  background: rgba(255, 77, 87, 0.07);
+  color: #ff9da4;
+  font-size: 10px;
+  line-height: 1.4;
+}
+.pc-attachment-error > ul {
+  min-height: 0;
+  min-width: 0;
+  max-height: min(9rem, 24dvh);
+  flex: 1 1 auto;
+  margin: 0;
+  overflow-y: auto;
+  padding-left: 1.25rem;
+  overflow-wrap: anywhere;
+}
+.pc-attachment-error > ul > li + li {
+  margin-top: 3px;
+}
+.pc-attachment-error > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.pc-attachment-error button {
+  flex: none;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #ffc1c5;
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.pc-attach-button {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid rgba(35, 42, 61, 0.88);
+  border-radius: 8px;
+  padding: 4px 8px;
+  background: rgba(15, 18, 28, 0.72);
+  color: #c4cad6;
+  font-family: var(--font-display);
+  font-size: 11px;
+  cursor: pointer;
+}
+.pc-attach-button:hover:not(:disabled) {
+  border-color: rgba(33, 230, 255, 0.42);
+  background: rgba(20, 24, 36, 0.92);
+  color: var(--color-accent-2);
+}
+.pc-attach-button:active:not(:disabled) {
+  transform: translateY(1px);
+  background: rgba(10, 13, 22, 0.96);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.55);
 }
 .pc-composer-editor-shell {
   position: relative;
@@ -4663,6 +4860,7 @@ button.pc-turn-receipt__strip:focus-visible {
   display: flex;
   width: 100%;
   min-width: 0;
+  overflow: hidden;
   min-height: 30px;
   align-items: center;
   gap: 5px;
@@ -5123,6 +5321,33 @@ button.pc-turn-receipt__strip:focus-visible {
   opacity: 0.55;
   filter: saturate(0.7);
   cursor: default;
+}
+
+/* The viewport can remain wide while browser zoom or an inline sidebar leaves
+   the actual drafting pane narrow. Reflow from the measured main pane, not only
+   from the outer WebView width. */
+@container desktop-main (max-width: 760px) {
+  .pc-composer-toolbar {
+    grid-template-columns: minmax(0, 1fr) 38px;
+  }
+  .pc-composer-controls {
+    flex-wrap: wrap;
+  }
+  .pc-composer-state {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    justify-content: flex-start;
+    min-height: 30px;
+    border-top: 1px solid rgba(35, 42, 61, 0.5);
+    padding-top: 8px;
+  }
+  .pc-composer-presence {
+    justify-content: flex-start;
+  }
+  .pc-composer-action-slot {
+    grid-column: 2;
+    grid-row: 1;
+  }
 }
 
 @media (max-width: 760px) {

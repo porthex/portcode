@@ -1,6 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "identifier": "dev.porthex.portcode.qa-calibration",
+  "build": {
+    "beforeBuildCommand": "npm run build:qa"
+  },
   "app": {
     "windows": [
       {

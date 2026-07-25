@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, act, waitFor, within } from "@testing-library/react";
 
 import { Composer } from "./Composer";
 import { useStore } from "../store/store";
 import {
+  type Attachment,
   DEFAULT_SETTINGS,
   OPENAI_FALLBACK_MODELS,
   type ComposerPhase,
@@ -21,6 +22,9 @@ import {
 vi.mock("../lib/ipc", () => ({
   runAgent: vi.fn(),
   openFolder: vi.fn(),
+  pickAttachmentPaths: vi.fn(),
+  validateAttachments: vi.fn(),
+  onNativeFileDrop: vi.fn(async () => () => {}),
   // setSessionModel persists the active chat, then updateSettings mirrors it as
   // the default for future chats.
   updateSessionModel: vi.fn(),
@@ -118,6 +122,8 @@ beforeEach(() => {
   // without ever touching a real backend.
   m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}), dispose: vi.fn() });
   m.openFolder.mockResolvedValue(null);
+  m.pickAttachmentPaths.mockResolvedValue([]);
+  m.validateAttachments.mockResolvedValue({ attachments: [], errors: [] });
   m.updateSessionModel.mockResolvedValue(undefined);
   m.saveSettings.mockImplementation(async (s) => ({ ...DEFAULT_SETTINGS, ...s }));
   m.saveDraft.mockResolvedValue(undefined);
@@ -149,6 +155,480 @@ const openAIAccount = (over: Partial<OpenAIAccountSummary> = {}): OpenAIAccountS
   updatedAt: 1,
   lastUsedAt: null,
   ...over,
+});
+
+const attachment = (over: Partial<Attachment> = {}): Attachment => {
+  const name = over.name ?? "example.rs";
+  return {
+    path: "C:/fixtures/example.rs",
+    name,
+    displayName: over.displayName ?? name,
+    kind: "text",
+    mediaType: "text/x-rust",
+    size: 1536,
+    thumbnailUrl: null,
+    ...over,
+  };
+};
+
+describe("Composer attachments", () => {
+  it("picks multiple files and renders accessible metadata and removal", async () => {
+    const code = attachment();
+    const image = attachment({
+      path: "C:/fixtures/pixel.png",
+      name: "pixel.png",
+      kind: "image",
+      mediaType: "image/png",
+      size: 68,
+      thumbnailUrl: "data:image/png;base64,synthetic",
+    });
+    const extensionless = attachment({
+      path: "C:/fixtures/README",
+      name: "README",
+      size: 2 * 1024 * 1024,
+    });
+    m.pickAttachmentPaths.mockResolvedValue([code.path, image.path, extensionless.path]);
+    m.validateAttachments.mockResolvedValue({
+      attachments: [code, image, extensionless],
+      errors: [],
+    });
+    render(<Composer />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Attach files" }));
+
+    expect(await screen.findByText("example.rs")).toBeInTheDocument();
+    expect(screen.getByText("RS · 1.5 KiB")).toBeInTheDocument();
+    expect(screen.getByText("PNG · 68 B")).toBeInTheDocument();
+    expect(screen.getByText("TEXT · 2.0 MiB")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Preview pixel.png" })).toHaveAttribute(
+      "src",
+      image.thumbnailUrl,
+    );
+    const remove = screen.getByRole("button", { name: "Remove example.rs" });
+    fireEvent.click(remove);
+    expect(screen.queryByText("example.rs")).not.toBeInTheDocument();
+    expect(screen.getByText("pixel.png")).toBeInTheDocument();
+  });
+
+  it("moves focus to a logical composer control after Remove and Dismiss unmount", async () => {
+    const first = attachment({ path: "C:/first.txt", name: "first.txt" });
+    const second = attachment({ path: "C:/second.txt", name: "second.txt" });
+    const third = attachment({ path: "C:/third.txt", name: "third.txt" });
+    useStore.setState({
+      attachments: { a: [first, second, third] },
+      attachmentErrors: { a: "archive.zip: unsupported" },
+    });
+    render(<Composer />);
+
+    const firstRemove = screen.getByRole("button", { name: "Remove first.txt" });
+    firstRemove.focus();
+    fireEvent.click(firstRemove);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Remove second.txt" })).toHaveFocus(),
+    );
+
+    const dismiss = screen.getByRole("button", { name: "Dismiss attachment error" });
+    dismiss.focus();
+    fireEvent.click(dismiss);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Attach files" })).toHaveFocus());
+  });
+
+  it("keeps duplicate review identities collision-free and stable as the tray changes", () => {
+    const first = attachment({
+      path: "C:/fixtures/alpha/index.ts",
+      name: "index.ts",
+      displayName: undefined,
+    });
+    const second = attachment({
+      path: "C:/fixtures/beta/index.ts",
+      name: "index.ts",
+      displayName: undefined,
+      kind: "image",
+      mediaType: "image/png",
+      thumbnailUrl: "data:image/png;base64,synthetic",
+    });
+    const reservedCollision = attachment({
+      path: "C:/fixtures/gamma/index-qualified.ts",
+      name: "index.ts <attachment 1>",
+      displayName: undefined,
+    });
+    useStore.setState({ attachments: { a: [first, second, reservedCollision] } });
+
+    render(<Composer />);
+
+    expect(screen.getByText("index.ts <attachment 1>")).toBeInTheDocument();
+    expect(screen.getByText("index.ts <attachment 2>")).toBeInTheDocument();
+    expect(screen.getByText("index.ts <attachment 3>")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Preview index.ts <attachment 3>" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Remove index.ts <attachment 2>" })).toHaveAttribute(
+      "title",
+      "Remove index.ts <attachment 2>",
+    );
+    expect(screen.getByRole("button", { name: "Remove index.ts <attachment 3>" })).toHaveAttribute(
+      "title",
+      "Remove index.ts <attachment 3>",
+    );
+
+    act(() => useStore.setState({ streaming: true }));
+    expect(screen.getByRole("button", { name: "Remove index.ts <attachment 3>" })).toHaveAttribute(
+      "title",
+      "Remove index.ts <attachment 3> — attachments are locked during a turn",
+    );
+    act(() => useStore.setState({ streaming: false }));
+
+    act(() => useStore.setState({ attachments: { a: [reservedCollision, second, first] } }));
+    expect(screen.getByText("index.ts <attachment 2>")).toBeInTheDocument();
+    expect(screen.getByText("index.ts <attachment 3>")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove index.ts <attachment 3>" }));
+    expect(screen.getByText("index.ts <attachment 2>")).toBeInTheDocument();
+    expect(screen.queryByText("index.ts <attachment 3>")).not.toBeInTheDocument();
+    expect(document.body.innerHTML).not.toMatch(/fixtures|alpha|beta|gamma/i);
+  });
+
+  it("renders the immutable admitted display identity after a duplicate peer is gone", () => {
+    const survivor = attachment({
+      path: "C:/fixtures/beta/index.ts",
+      name: "index.ts",
+      displayName: "index.ts <attachment 2>",
+    });
+    useStore.setState({ attachments: { a: [survivor] } });
+
+    render(<Composer />);
+
+    expect(screen.getByText("index.ts <attachment 2>")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove index.ts <attachment 2>" })).toBeVisible();
+    expect(document.body.innerHTML).not.toContain("fixtures/beta");
+  });
+
+  it("isolates duplicate review identities between sessions", () => {
+    const shared = attachment({
+      path: "C:/shared/index.ts",
+      name: "index.ts",
+      displayName: undefined,
+    });
+    const firstPeer = attachment({
+      path: "C:/first/index.ts",
+      name: "index.ts",
+      displayName: undefined,
+    });
+    const collision = attachment({
+      path: "C:/second/reserved.ts",
+      name: "index.ts <attachment 1>",
+      displayName: undefined,
+    });
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      attachments: { a: [shared, firstPeer], b: [shared, collision] },
+    });
+
+    render(<Composer />);
+    expect(screen.getByText("index.ts <attachment 1>")).toBeInTheDocument();
+    expect(screen.getByText("index.ts <attachment 2>")).toBeInTheDocument();
+
+    act(() => useStore.setState({ activeId: "b" }));
+    expect(screen.getByText("index.ts")).toBeInTheDocument();
+    expect(screen.getByText("index.ts <attachment 1>")).toBeInTheDocument();
+
+    act(() => useStore.setState({ activeId: "a" }));
+    expect(screen.getByText("index.ts <attachment 1>")).toBeInTheDocument();
+    expect(screen.getByText("index.ts <attachment 2>")).toBeInTheDocument();
+  });
+
+  it("keeps visible attachments scoped to the active session", () => {
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      attachments: {
+        a: [attachment({ name: "a.txt", path: "C:/a.txt" })],
+        b: [attachment({ name: "b.txt", path: "C:/b.txt" })],
+      },
+    });
+    render(<Composer />);
+    expect(screen.getByText("a.txt")).toBeInTheDocument();
+    expect(screen.queryByText("b.txt")).not.toBeInTheDocument();
+
+    act(() => useStore.setState({ activeId: "b" }));
+    expect(screen.getByText("b.txt")).toBeInTheDocument();
+    expect(screen.queryByText("a.txt")).not.toBeInTheDocument();
+  });
+
+  it("renders multiple validation issues as a readable list", async () => {
+    const valid = attachment();
+    m.pickAttachmentPaths.mockResolvedValue([valid.path, "C:/bad-a.zip", "C:/bad-b.exe"]);
+    m.validateAttachments.mockResolvedValue({
+      attachments: [valid],
+      errors: [
+        { name: "bad-a.zip", message: "Unsupported archive." },
+        { name: "bad-b.exe", message: "Unsupported executable." },
+      ],
+    });
+    render(<Composer />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Attach files" }));
+
+    const alert = await screen.findByRole("alert");
+    const issueList = within(alert).getByRole("list", { name: "Attachment validation issues" });
+    expect(issueList).toHaveAttribute("tabindex", "0");
+    const issues = within(issueList).getAllByRole("listitem");
+    expect(issues).toHaveLength(2);
+    expect(issues[0]).toHaveTextContent("bad-a.zip: Unsupported archive.");
+    expect(issues[1]).toHaveTextContent("bad-b.exe: Unsupported executable.");
+  });
+
+  it("shows picker failures and lets the user retry opening the picker", async () => {
+    const valid = attachment();
+    m.pickAttachmentPaths
+      .mockRejectedValueOnce(new Error("File picker unavailable"))
+      .mockResolvedValueOnce([valid.path]);
+    m.validateAttachments.mockResolvedValue({ attachments: [valid], errors: [] });
+    render(<Composer />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Attach files" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("File picker unavailable");
+    fireEvent.click(screen.getByRole("button", { name: "Retry attachment picker" }));
+
+    await waitFor(() => expect(m.pickAttachmentPaths).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("example.rs")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("labels attachment send preacceptance without calling it validation or active reading", () => {
+    useStore.setState({
+      attachments: { a: [attachment()] },
+      attachmentBusy: { a: true },
+      streaming: true,
+      composerPhase: "received",
+    });
+
+    render(<Composer />);
+
+    expect(screen.getByText("awaiting acceptance…")).toBeInTheDocument();
+    expect(screen.queryByText("Checking files…")).not.toBeInTheDocument();
+    expect(screen.queryByText("got it — reading…")).not.toBeInTheDocument();
+  });
+
+  it("presents a preacceptance send failure as an alert with explicit Retry Send", () => {
+    const retrySend = vi.fn(async () => {});
+    useStore.setState({
+      attachments: { a: [attachment()] },
+      attachmentErrors: { a: "Your message and files were not sent. Retry safely." },
+      attachmentSendErrors: { a: true },
+      drafts: { a: "Inspect this" },
+      send: retrySend,
+    });
+
+    render(<Composer />);
+
+    const alert = screen.getByRole("alert");
+    const retry = within(alert).getByRole("button", { name: "Retry Send" });
+    fireEvent.click(retry);
+    expect(retrySend).toHaveBeenCalledWith("Inspect this");
+  });
+
+  it("retries a failed validation transport with the preserved request", async () => {
+    const valid = attachment();
+    m.pickAttachmentPaths.mockResolvedValue([valid.path]);
+    m.validateAttachments
+      .mockRejectedValueOnce(new Error("native transport unavailable"))
+      .mockResolvedValueOnce({ attachments: [valid], errors: [] });
+    render(<Composer />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Attach files" }));
+    expect(await screen.findByText("native transport unavailable")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry attachment validation" }));
+
+    await waitFor(() => expect(m.validateAttachments).toHaveBeenCalledTimes(2));
+    expect(m.validateAttachments).toHaveBeenNthCalledWith(2, [valid.path]);
+    expect(await screen.findByText("example.rs")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Attach files" })).toHaveFocus();
+  });
+
+  it("does not steal focus when a retry completes after switching sessions", async () => {
+    let finish!: (value: { attachments: Attachment[]; errors: [] }) => void;
+    m.validateAttachments.mockImplementationOnce(
+      () => new Promise((resolve) => (finish = resolve)),
+    );
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      attachmentErrors: { a: "native transport unavailable" },
+      attachmentRetryPaths: { a: ["C:/fixtures/example.rs"] },
+    });
+    render(<Composer />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry attachment validation" }));
+    act(() => useStore.setState({ activeId: "b" }));
+    const formattingHelp = screen.getByRole("button", { name: "Formatting help" });
+    formattingHelp.focus();
+    finish({ attachments: [attachment()], errors: [] });
+    await waitFor(() => expect(useStore.getState().attachmentBusy.a).toBe(false));
+
+    expect(formattingHelp).toHaveFocus();
+  });
+
+  it("enables attachment-only send and displays validation errors without losing valid files", async () => {
+    const valid = attachment();
+    useStore.setState({
+      attachments: { a: [valid] },
+      attachmentErrors: { a: "archive.zip: This file type is not supported." },
+    });
+    render(<Composer />);
+
+    expect(screen.getByRole("alert")).toHaveTextContent("archive.zip");
+    expect(screen.getByText("example.rs")).toBeInTheDocument();
+    expect(sendButton()).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss attachment error" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    fireEvent.click(sendButton());
+    await waitFor(() =>
+      expect(m.runAgent).toHaveBeenCalledWith(
+        "a",
+        "",
+        expect.any(Function),
+        [valid.path],
+        [valid.displayName],
+      ),
+    );
+  });
+
+  it("attaches dropped and pasted files when the host exposes local paths", async () => {
+    const dropped = attachment({ path: "C:/fixtures/drop.txt", name: "drop.txt" });
+    const pasted = attachment({ path: "C:/fixtures/paste.txt", name: "paste.txt" });
+    m.validateAttachments
+      .mockResolvedValueOnce({ attachments: [dropped], errors: [] })
+      .mockResolvedValueOnce({ attachments: [dropped, pasted], errors: [] });
+    render(<Composer />);
+    const target = screen.getByTestId("composer-drop-zone");
+    const dropFile = new File(["drop"], "drop.txt", { type: "text/plain" });
+    Object.defineProperty(dropFile, "path", { value: dropped.path });
+    const dragData = { files: [dropFile], dropEffect: "none" };
+    fireEvent.dragEnter(target, { dataTransfer: dragData });
+    expect(target).toHaveAttribute("data-drag-active", "true");
+    fireEvent.dragOver(target, { dataTransfer: dragData });
+    expect(dragData.dropEffect).toBe("copy");
+    fireEvent.dragLeave(target, { dataTransfer: dragData, relatedTarget: document.body });
+    expect(target).not.toHaveAttribute("data-drag-active");
+    fireEvent.dragEnter(target, { dataTransfer: dragData });
+    fireEvent.drop(target, { dataTransfer: { files: [dropFile] } });
+    expect(await screen.findByText("drop.txt")).toBeInTheDocument();
+
+    const pasteFile = new File(["paste"], "paste.txt", { type: "text/plain" });
+    Object.defineProperty(pasteFile, "path", { value: pasted.path });
+    fireEvent.paste(target, { clipboardData: { files: [pasteFile] } });
+    expect(await screen.findByText("paste.txt")).toBeInTheDocument();
+
+    const pathless = new File(["browser-only"], "browser-only.txt", { type: "text/plain" });
+    const validations = m.validateAttachments.mock.calls.length;
+    fireEvent.paste(target, { clipboardData: { files: [pathless] } });
+    expect(m.validateAttachments).toHaveBeenCalledTimes(validations);
+  });
+
+  it("accepts native desktop drops only when their logical position is over the composer", async () => {
+    const native = attachment({ path: "C:/fixtures/native.rs", name: "native.rs" });
+    m.validateAttachments.mockResolvedValue({ attachments: [native], errors: [] });
+    const unlisten = vi.fn();
+    let nativeHandler!: Parameters<typeof ipc.onNativeFileDrop>[0];
+    m.onNativeFileDrop.mockImplementation(async (handler) => {
+      nativeHandler = handler;
+      return unlisten;
+    });
+    const { unmount } = render(<Composer />);
+    const target = screen.getByTestId("composer-drop-zone");
+    vi.spyOn(target, "getBoundingClientRect").mockReturnValue({
+      x: 10,
+      y: 20,
+      left: 10,
+      top: 20,
+      right: 410,
+      bottom: 220,
+      width: 400,
+      height: 200,
+      toJSON: () => ({}),
+    });
+    await waitFor(() => expect(m.onNativeFileDrop).toHaveBeenCalledOnce());
+
+    act(() => nativeHandler({ type: "enter", paths: [native.path], x: 500, y: 500 }));
+    expect(target).not.toHaveAttribute("data-drag-active");
+    act(() => nativeHandler({ type: "over", x: 30, y: 40 }));
+    expect(target).toHaveAttribute("data-drag-active", "true");
+    act(() => nativeHandler({ type: "leave" }));
+    expect(target).not.toHaveAttribute("data-drag-active");
+    act(() => nativeHandler({ type: "enter", paths: [native.path], x: 30, y: 40 }));
+    expect(target).toHaveAttribute("data-drag-active", "true");
+    act(() => nativeHandler({ type: "drop", paths: [native.path], x: 30, y: 40 }));
+    expect(await screen.findByText("native.rs")).toBeInTheDocument();
+    expect(target).not.toHaveAttribute("data-drag-active");
+
+    unmount();
+    expect(unlisten).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed when native drop registration is unavailable", async () => {
+    m.onNativeFileDrop.mockRejectedValueOnce(new Error("webview listener unavailable"));
+    render(<Composer />);
+    const target = screen.getByTestId("composer-drop-zone");
+
+    await waitFor(() => expect(m.onNativeFileDrop).toHaveBeenCalledOnce());
+    expect(target).not.toHaveAttribute("data-drag-active");
+  });
+
+  it("disposes a native drop listener that resolves after unmount", async () => {
+    const unlisten = vi.fn();
+    let finish!: (unlisten: () => void) => void;
+    m.onNativeFileDrop.mockImplementationOnce(() => new Promise((resolve) => (finish = resolve)));
+    const { unmount } = render(<Composer />);
+    await waitFor(() => expect(m.onNativeFileDrop).toHaveBeenCalledOnce());
+
+    unmount();
+    finish(unlisten);
+    await waitFor(() => expect(unlisten).toHaveBeenCalledOnce());
+  });
+
+  it("ignores empty browser gestures and drops while remote", async () => {
+    render(<Composer />);
+    const target = screen.getByTestId("composer-drop-zone");
+    fireEvent.click(screen.getByRole("button", { name: "Attach files" }));
+    await waitFor(() => expect(m.pickAttachmentPaths).toHaveBeenCalledOnce());
+    fireEvent.dragEnter(target, { dataTransfer: { files: [] } });
+    fireEvent.dragOver(target, { dataTransfer: { files: [], dropEffect: "none" } });
+    fireEvent.dragLeave(target, { relatedTarget: target.firstElementChild });
+    fireEvent.drop(target, { dataTransfer: { files: [] } });
+    fireEvent.paste(target, { clipboardData: { files: [] } });
+
+    const remoteFile = new File(["remote"], "remote.txt", { type: "text/plain" });
+    Object.defineProperty(remoteFile, "path", { value: "C:/fixtures/remote.txt" });
+    act(() => useStore.setState({ remoteMode: true }));
+    fireEvent.drop(target, { dataTransfer: { files: [remoteFile] } });
+
+    expect(m.validateAttachments).not.toHaveBeenCalled();
+    expect(target).not.toHaveAttribute("data-drag-active");
+  });
+
+  it("hides local attachment affordances remotely and freezes them during a turn", () => {
+    const file = attachment();
+    useStore.setState({ attachments: { a: [file] } });
+    const { rerender } = render(<Composer />);
+    expect(screen.getByRole("button", { name: "Attach files" })).toBeEnabled();
+
+    act(() =>
+      useStore.setState({
+        runs: { a: run({ streaming: true }) },
+        streaming: true,
+      }),
+    );
+    expect(screen.getByRole("button", { name: "Attach files" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Remove example.rs" })).toBeDisabled();
+
+    act(() => useStore.setState({ remoteMode: true, streaming: false, runs: {} }));
+    rerender(<Composer />);
+    expect(screen.queryByRole("button", { name: "Attach files" })).not.toBeInTheDocument();
+    expect(screen.queryByText("example.rs")).not.toBeInTheDocument();
+  });
 });
 
 describe("Composer rich editor", () => {
@@ -363,7 +843,7 @@ describe("Composer send button", () => {
     }
   });
 
-  it("submits on click: clears the active draft and forwards the text to send", async () => {
+  it("submits on click while preserving the draft until authoritative acceptance", async () => {
     useStore.setState({
       sessions: [session()],
       activeId: "a",
@@ -374,8 +854,7 @@ describe("Composer send button", () => {
 
     fireEvent.click(sendButton());
 
-    // The store accepts the turn and clears the draft before starting the agent.
-    expect(useStore.getState().drafts.a).toBeUndefined();
+    expect(useStore.getState().drafts.a).toBe("Refactor the parser");
     await Promise.resolve();
     await Promise.resolve();
     expect(m.runAgent).toHaveBeenCalledWith("a", "Refactor the parser", expect.any(Function));
@@ -425,7 +904,7 @@ describe("Composer key handling", () => {
     render(<Composer />);
     fireEvent.keyDown(textarea(), { key: "Enter" });
 
-    expect(useStore.getState().drafts.a).toBeUndefined();
+    expect(useStore.getState().drafts.a).toBe("ship it");
     await Promise.resolve();
     await Promise.resolve();
     expect(m.runAgent).toHaveBeenCalledWith("a", "ship it", expect.any(Function));

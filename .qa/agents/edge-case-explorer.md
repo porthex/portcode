@@ -200,9 +200,19 @@ Use mock/self-dev modes unless the orchestrator explicitly approves a provider-b
 
 ## Output
 
-Return exactly one JSON object conforming to `.qa/schemas/exploration-report.schema.json`. Do not use Markdown fences or add prose before or after it.
+Return exactly one JSON object conforming to `.qa/schemas/exploration-report.schema.json`. Do not use Markdown fences or add prose before or after it. Provenance must include the exact feature-model, enriched feature-brief, and frozen risk-register SHA-256 values supplied by the runner.
 
-Coverage totals must be derived from `scenarioPlan`, `executedScenarios`, and `observations`, not estimated. Every `observation-recorded` scenario references observation IDs; every blocked scenario references a blocker; every not-applicable scenario includes a disposition reason. Use portable artifact paths relative to the declared artifact root.
+Coverage totals must be derived from `scenarioPlan`, `executedScenarios`, and `observations`, not estimated. Use these exact runner-owned equations globally and apply the same equations independently within every category:
+
+- `planned = number of feature-model charter cases`.
+- `selected = number of scenarioPlan items where selected is true`.
+- `executed = passed + observation-recorded`.
+- `passed = number of executedScenarios with status passed`.
+- `observationsRecorded = observations.length` globally; within a category, count the observation IDs referenced by that category's scenarios.
+- `blocked = number of executedScenarios with status blocked`; blocked scenarios are not included in executed.
+- `notApplicable = number of executedScenarios with status not-applicable`; not-applicable scenarios are not included in executed.
+
+Every `observation-recorded` scenario references observation IDs; every blocked scenario references a blocker; every not-applicable scenario includes a disposition reason. Use portable artifact paths relative to the declared artifact root.
 
 After schema validation, the orchestrator must run `.qa/scripts/validate-contracts.mjs` against this report and its exact feature model. Schema validity alone does not prove references, totals, evidence, or lifecycle consistency.
 

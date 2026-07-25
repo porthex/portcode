@@ -51,13 +51,25 @@
     "provenance": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["agent", "agentVersion", "taskSha256", "gitBase", "gitHead"],
+      "required": [
+        "agent",
+        "agentVersion",
+        "taskSha256",
+        "featureBriefSha256",
+        "riskRegisterSha256",
+        "gitBase",
+        "gitHead",
+        "workingTreeSha256"
+      ],
       "properties": {
         "agent": { "const": "feature-completeness" },
         "agentVersion": { "const": "0.2.0" },
         "taskSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "featureBriefSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "riskRegisterSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
         "gitBase": { "type": ["string", "null"] },
-        "gitHead": { "type": ["string", "null"] }
+        "gitHead": { "type": ["string", "null"] },
+        "workingTreeSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" }
       }
     },
     "blocker": {
@@ -77,8 +89,18 @@
       "properties": {
         "name": { "type": "string", "minLength": 1 },
         "goal": { "type": "string", "minLength": 1 },
-        "entryPoints": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "uniqueItems": true },
-        "affectedAreas": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "uniqueItems": true }
+        "entryPoints": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "affectedAreas": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true
+        }
       }
     },
     "sourceSummary": {
@@ -86,7 +108,11 @@
       "additionalProperties": false,
       "required": ["explicitRequirements", "inferredConventions", "unknowns"],
       "properties": {
-        "explicitRequirements": { "type": "array", "items": { "$ref": "#/$defs/requirement" }, "minItems": 1 },
+        "explicitRequirements": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/requirement" },
+          "minItems": 1
+        },
         "inferredConventions": { "type": "array", "items": { "$ref": "#/$defs/convention" } },
         "unknowns": { "type": "array", "items": { "type": "string", "minLength": 1 } }
       }
@@ -96,7 +122,7 @@
       "additionalProperties": false,
       "required": ["id", "text", "source"],
       "properties": {
-        "id": { "type": "string", "pattern": "^REQ-[0-9]{3}$" },
+        "id": { "type": "string", "pattern": "^(REQ|FR)-[0-9]{3}$" },
         "text": { "type": "string", "minLength": 1 },
         "source": { "$ref": "#/$defs/sourceCitation" }
       }
@@ -106,7 +132,16 @@
       "additionalProperties": false,
       "required": ["type", "locator"],
       "properties": {
-        "type": { "enum": ["original-task", "acceptance-criteria", "project-rule", "existing-pattern", "platform-convention", "accessibility-standard"] },
+        "type": {
+          "enum": [
+            "original-task",
+            "acceptance-criteria",
+            "project-rule",
+            "existing-pattern",
+            "platform-convention",
+            "accessibility-standard"
+          ]
+        },
         "locator": { "type": "string", "minLength": 1 }
       }
     },
@@ -125,14 +160,26 @@
       "required": ["states", "transitions", "invariants"],
       "properties": {
         "states": { "type": "array", "items": { "$ref": "#/$defs/state" }, "minItems": 1 },
-        "transitions": { "type": "array", "items": { "$ref": "#/$defs/transition" }, "minItems": 1 },
+        "transitions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/transition" },
+          "minItems": 1
+        },
         "invariants": { "type": "array", "items": { "type": "string", "minLength": 1 } }
       }
     },
     "state": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "name", "risk", "entryCondition", "visibleDesign", "availableActions", "exitConditions"],
+      "required": [
+        "id",
+        "name",
+        "risk",
+        "entryCondition",
+        "visibleDesign",
+        "availableActions",
+        "exitConditions"
+      ],
       "properties": {
         "id": { "type": "string", "pattern": "^state-[a-z0-9-]+$" },
         "name": { "type": "string", "minLength": 1 },
@@ -179,11 +226,28 @@
     "omissionBase": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "title", "classification", "basis", "trigger", "expected", "risk", "confidence"],
+      "required": [
+        "id",
+        "title",
+        "classification",
+        "basis",
+        "trigger",
+        "expected",
+        "risk",
+        "confidence"
+      ],
       "properties": {
         "id": { "type": "string" },
         "title": { "type": "string", "minLength": 1 },
-        "classification": { "enum": ["explicit-requirement", "reachable-state", "project-consistency", "platform-convention", "accessibility"] },
+        "classification": {
+          "enum": [
+            "explicit-requirement",
+            "reachable-state",
+            "project-consistency",
+            "platform-convention",
+            "accessibility"
+          ]
+        },
         "basis": { "type": "string", "minLength": 1 },
         "trigger": { "type": "string", "minLength": 1 },
         "expected": { "type": "string", "minLength": 1 },
@@ -211,7 +275,16 @@
         "categories": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["input", "timing", "lifecycle", "interaction", "persistence", "layout", "accessibility", "neighboringRegression"],
+          "required": [
+            "input",
+            "timing",
+            "lifecycle",
+            "interaction",
+            "persistence",
+            "layout",
+            "accessibility",
+            "neighboringRegression"
+          ],
           "properties": {
             "input": { "$ref": "#/$defs/edgeCases" },
             "timing": { "$ref": "#/$defs/edgeCases" },
@@ -223,23 +296,44 @@
             "neighboringRegression": { "$ref": "#/$defs/edgeCases" }
           }
         },
-        "highestRiskSequences": { "type": "array", "items": { "$ref": "#/$defs/sequence" }, "minItems": 1 }
+        "highestRiskSequences": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sequence" },
+          "minItems": 1
+        }
       }
     },
     "edgeCases": { "type": "array", "items": { "$ref": "#/$defs/edgeCase" } },
     "edgeCase": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "scenario", "why", "priority", "oracle", "coversRequirementIds", "coversStateIds", "coversTransitionIds"],
+      "required": [
+        "id",
+        "scenario",
+        "why",
+        "priority",
+        "oracle",
+        "coversRequirementIds",
+        "coversStateIds",
+        "coversTransitionIds"
+      ],
       "properties": {
-        "id": { "type": "string", "pattern": "^EC-[A-Z]+-[0-9]{3}$" },
+        "id": { "type": "string", "pattern": "^EC-[A-Z0-9]+-[0-9]{3}$" },
         "scenario": { "type": "string", "minLength": 1 },
         "why": { "type": "string", "minLength": 1 },
         "priority": { "enum": ["must", "should", "could"] },
         "oracle": { "type": "string", "minLength": 1 },
-        "coversRequirementIds": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "coversRequirementIds": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
         "coversStateIds": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
-        "coversTransitionIds": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+        "coversTransitionIds": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
       }
     },
     "sequence": {
@@ -268,7 +362,18 @@
       "additionalProperties": false,
       "required": ["category", "reason"],
       "properties": {
-        "category": { "enum": ["input", "timing", "lifecycle", "interaction", "persistence", "layout", "accessibility", "neighboringRegression"] },
+        "category": {
+          "enum": [
+            "input",
+            "timing",
+            "lifecycle",
+            "interaction",
+            "persistence",
+            "layout",
+            "accessibility",
+            "neighboringRegression"
+          ]
+        },
         "reason": { "type": "string", "minLength": 1 }
       }
     }

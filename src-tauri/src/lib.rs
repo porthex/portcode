@@ -3,6 +3,8 @@
 // `use crate::llm::{Block, ChatMessage, StreamEvent}` in production code — those
 // are the wire types the phone must decode — so gating `llm` would break mobile.
 #[cfg(desktop)]
+mod attachments;
+#[cfg(desktop)]
 mod codex_app_server;
 #[cfg(desktop)]
 mod codex_engine;
@@ -977,6 +979,27 @@ fn list_dir(state: State<AppState>, sub: Option<String>) -> Result<Vec<DirEntry>
 
 // ── agent ────────────────────────────────────────────────────────────────────
 
+#[cfg(desktop)]
+#[tauri::command]
+async fn validate_attachments(
+    paths: attachments::AttachmentPathArgs,
+) -> Result<attachments::AttachmentValidationResult, String> {
+    let permit = attachments::acquire_attachment_validation_permit()
+        .await
+        .map_err(|_| "Attachment validation is unavailable.".to_owned())?;
+    let paths = paths
+        .into_inner()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        attachments::prepare_attachment_paths(&paths).validation_result()
+    })
+    .await
+    .map_err(|error| format!("Attachment validation worker failed: {error}"))
+}
+
 // DESKTOP-ONLY: drives the supervised Codex app-server process, which is
 // mobile-excluded. The phone issues turns over the encrypted sync channel to a
 // paired desktop; it never launches Codex locally.
@@ -985,22 +1008,37 @@ fn list_dir(state: State<AppState>, sub: Option<String>) -> Result<Vec<DirEntry>
 async fn run_agent(
     state: State<'_, AppState>,
     session_id: String,
-    text: String,
+    text: attachments::AgentTextArg,
+    attachment_paths: attachments::AttachmentPathArgs,
+    attachment_display_names: attachments::AttachmentDisplayNameArgs,
 ) -> Result<(), String> {
     state
         .db
         .require_session(&session_id)
         .map_err(|error| error.to_string())?;
-    if text.trim().is_empty() {
-        return Err("Enter a message before sending.".to_string());
-    }
+    let text = text.into_inner();
+    let paths = attachment_paths
+        .into_inner()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let attachment_display_names = attachment_display_names.into_inner();
+    let permit = attachments::acquire_attachment_validation_permit()
+        .await
+        .map_err(|_| "Attachment validation is unavailable.".to_owned())?;
+    let prepared_turn = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        attachments::prepare_turn_with_display_names(&text, &paths, &attachment_display_names)
+    })
+    .await
+    .map_err(|error| format!("Attachment validation worker failed: {error}"))??;
     let settings = settings_snapshot(&state)?;
     let codex = state.codex.clone();
 
     // The shared engine owns app-server supervision and event projection. Keep
     // this command non-blocking while the turn streams through its EventSink.
     tauri::async_runtime::spawn(async move {
-        codex.run_turn(session_id, text, settings).await;
+        codex.run_turn(session_id, prepared_turn, settings).await;
     });
     Ok(())
 }
@@ -1938,6 +1976,7 @@ pub fn run() {
         git_review::get_turn_review_manifest,
         git_review::get_turn_review_file,
         list_dir,
+        validate_attachments,
         run_agent,
         cancel_agent,
         cancel_agent_by_id,

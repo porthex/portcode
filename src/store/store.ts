@@ -3,6 +3,7 @@ import type {
   AgentInfo,
   AgentStatus,
   ArchiveSessionResult,
+  Attachment,
   BackgroundTaskInfo,
   BackgroundTaskStatus,
   CodexActivityEvent,
@@ -117,6 +118,63 @@ const EMPTY_RUN: RunState = {
 // already carries the session id every write site keys off.
 const runKey = (sessionId: string): string => sessionId;
 
+/** Privacy-safe labels for transcript/title summaries. */
+const attachmentSummaryLabels = (attachments: Attachment[]): string[] => {
+  if (attachments.every((attachment) => attachment.displayName)) {
+    return attachments.map((attachment) => attachment.displayName!);
+  }
+  const counts = new Map<string, number>();
+  const reserved = new Set(attachments.map((attachment) => attachment.name));
+  const generated = new Set<string>();
+  let nextId = 1;
+  for (const attachment of attachments) {
+    counts.set(attachment.name, (counts.get(attachment.name) ?? 0) + 1);
+  }
+  return attachments.map((attachment) => {
+    if ((counts.get(attachment.name) ?? 0) < 2) return attachment.name;
+    let label: string;
+    do {
+      label = `${attachment.name} <attachment ${nextId}>`;
+      nextId += 1;
+    } while (reserved.has(label) || generated.has(label));
+    generated.add(label);
+    return label;
+  });
+};
+
+/** Preserve admitted identities by canonical path while avoiding literal-name collisions. */
+const admitAttachmentDisplayNames = (previous: Attachment[], next: Attachment[]): Attachment[] => {
+  const priorByPath = new Map(
+    previous.map((attachment) => [attachment.path, attachment.displayName]),
+  );
+  const counts = new Map<string, number>();
+  const reserved = new Set(next.map((attachment) => attachment.name));
+  for (const attachment of next) {
+    counts.set(attachment.name, (counts.get(attachment.name) ?? 0) + 1);
+  }
+  const assigned = new Set<string>();
+  let nextId = 1;
+  return next.map((attachment) => {
+    const prior = priorByPath.get(attachment.path);
+    const qualified =
+      (counts.get(attachment.name) ?? 0) > 1 || Boolean(prior && prior !== attachment.name);
+    if (!qualified) {
+      assigned.add(attachment.name);
+      return { ...attachment, displayName: attachment.name };
+    }
+    if (prior && prior !== attachment.name && !reserved.has(prior) && !assigned.has(prior)) {
+      assigned.add(prior);
+      return { ...attachment, displayName: prior };
+    }
+    while (true) {
+      const candidate = `${attachment.name} <attachment ${nextId++}>`;
+      if (reserved.has(candidate) || assigned.has(candidate)) continue;
+      assigned.add(candidate);
+      return { ...attachment, displayName: candidate };
+    }
+  });
+};
+
 /**
  * In-app auto-update state, driving the {@link UpdateBanner}.
  * - `idle`       — no update offered (or the banner was dismissed); `error` may
@@ -218,6 +276,13 @@ interface AppState {
   // so a half-written message can't bleed across sessions; persisted via the
   // backend (durable) with an optimistic localStorage mirror for instant restore.
   drafts: Record<string, string>;
+  /** Native-validated local files belonging to each session's unsent draft. */
+  attachments: Record<string, Attachment[]>;
+  attachmentErrors: Record<string, string>;
+  /** A send failed before authoritative turn_start; the preserved snapshot can retry. */
+  attachmentSendErrors: Record<string, boolean>;
+  attachmentRetryPaths: Record<string, string[]>;
+  attachmentBusy: Record<string, boolean>;
   // The composer's live presence phase, driven by REAL turn/stream events (never
   // padded). Surfaced in the role="status" region beside the composer.
   composerPhase: ComposerPhase;
@@ -288,6 +353,10 @@ interface AppState {
   toggleArchived: (sessionId: string, force?: boolean) => Promise<ArchiveSessionResult>;
   setDraft: (v: string) => void;
   appendDraft: (v: string) => void;
+  addAttachments: (paths: string[]) => Promise<void>;
+  retryAttachmentValidation: () => Promise<void>;
+  removeAttachment: (path: string) => void;
+  clearAttachmentError: () => void;
   openWorkspace: () => Promise<void>;
   newSession: (accountProfileId?: string, modelId?: string) => Promise<void>;
   selectSession: (id: string) => Promise<void>;
@@ -1643,6 +1712,11 @@ export const useStore = create<AppState>((set, get) => ({
   // Hydrate the optimistic mirror synchronously so a reload restores drafts BEFORE
   // the backend round-trip; init() then merges the authoritative backend drafts.
   drafts: readJSON<Record<string, string>>("pc.drafts", {}),
+  attachments: {},
+  attachmentErrors: {},
+  attachmentSendErrors: {},
+  attachmentRetryPaths: {},
+  attachmentBusy: {},
   composerPhase: "idle",
   activeTool: null,
   scrollTargetId: null,
@@ -2432,6 +2506,16 @@ export const useStore = create<AppState>((set, get) => ({
         writeJSON("pc.drafts", drafts);
       }
       flushPendingDraftSave(id); // cancel any in-flight debounced save for the gone session
+      const attachments = { ...st.attachments };
+      const attachmentErrors = { ...st.attachmentErrors };
+      const attachmentSendErrors = { ...st.attachmentSendErrors };
+      const attachmentRetryPaths = { ...st.attachmentRetryPaths };
+      const attachmentBusy = { ...st.attachmentBusy };
+      delete attachments[id];
+      delete attachmentErrors[id];
+      delete attachmentSendErrors[id];
+      delete attachmentRetryPaths[id];
+      delete attachmentBusy[id];
       // Drop the gone session's sidebar-org entries so stale folder membership /
       // archived state can't accumulate in localStorage across deletions.
       let folderOf = st.folderOf;
@@ -2460,6 +2544,11 @@ export const useStore = create<AppState>((set, get) => ({
         activeId,
         usage,
         drafts,
+        attachments,
+        attachmentErrors,
+        attachmentSendErrors,
+        attachmentRetryPaths,
+        attachmentBusy,
         folderOf,
         archivedIds,
         manualOrder,
@@ -2631,271 +2720,220 @@ export const useStore = create<AppState>((set, get) => ({
   async send(text) {
     const { activeId, streaming } = get();
     const activeRun = activeId ? get().runs[runKey(activeId)] : undefined;
-    if (!activeId || streaming || activeRun?.finalizing || !text.trim()) return;
+    const submittedAttachments = activeId ? (get().attachments[activeId] ?? []) : [];
+    const hasAttachments = submittedAttachments.length > 0;
+    if (
+      !activeId ||
+      streaming ||
+      activeRun?.finalizing ||
+      get().attachmentBusy[activeId] ||
+      (!text.trim() && !hasAttachments)
+    )
+      return;
+    if ((get().remoteMode || get().remoteConnected) && hasAttachments) {
+      set((st) => ({
+        attachmentErrors: {
+          ...st.attachmentErrors,
+          [activeId]: "File attachments are available only in a local desktop chat.",
+        },
+      }));
+      return;
+    }
+    const submittedDraft = get().drafts[activeId];
     const messageLoad = get().messageLoads[activeId];
     if (messageLoad && messageLoad.phase !== "ready" && messageLoad.phase !== "refreshing") return;
+    if (hasAttachments) {
+      set((st) => {
+        const attachmentSendErrors = { ...st.attachmentSendErrors };
+        delete attachmentSendErrors[activeId];
+        return {
+          attachmentBusy: { ...st.attachmentBusy, [activeId]: true },
+          attachmentSendErrors,
+        };
+      });
+    }
+    let attachmentAccepted = false;
+    let commandReturned = false;
+    try {
+      // A model click updates the UI optimistically while its SQLite write is queued.
+      // Never let Send overtake that write: native admission reads the persisted row,
+      // so racing it could run the previous model with the new model's effort.
+      if (!get().remoteMode && !get().remoteConnected) {
+        const pendingModelWrite = sessionModelWriteQueues.get(activeId);
+        if (pendingModelWrite) {
+          try {
+            await pendingModelWrite;
+          } catch (error) {
+            set({ settingsError: errMessage(error) });
+            return;
+          }
+          if (get().activeId !== activeId) return;
+          const latestRun = get().runs[runKey(activeId)];
+          if (latestRun?.streaming || latestRun?.finalizing) return;
+        }
+      }
 
-    // A model click updates the UI optimistically while its SQLite write is queued.
-    // Never let Send overtake that write: native admission reads the persisted row,
-    // so racing it could run the previous model with the new model's effort.
-    if (!get().remoteMode && !get().remoteConnected) {
-      const pendingModelWrite = sessionModelWriteQueues.get(activeId);
-      if (pendingModelWrite) {
-        try {
-          await pendingModelWrite;
-        } catch (error) {
-          set({ settingsError: errMessage(error) });
+      // Native admission resolves the credential from the persisted session row,
+      // but keep the client honest too: never clear a draft or append an optimistic
+      // message for an unpinned/removed/reconnect-required OpenAI profile. Remote
+      // mode delegates this check to the credential-owning desktop.
+      const pendingSession = get().pendingSession?.id === activeId ? get().pendingSession : null;
+      // The first send persists a pending local chat before starting its turn. Keep
+      // a second Enter inside that await window from issuing another create/run.
+      if (pendingSession && get().creatingSession) return;
+      const activeSession =
+        pendingSession ?? get().sessions.find((session) => session.id === activeId);
+      if (!get().remoteMode && !get().remoteConnected && activeSession) {
+        const account = activeSession.accountProfileId
+          ? get().openAIAccounts.find(
+              (candidate) => candidate.id === activeSession.accountProfileId,
+            )
+          : undefined;
+        if (!activeSession.accountProfileId) {
+          set({
+            openAIAuthError:
+              "Connect ChatGPT or an OpenAI Platform API key in Settings before sending.",
+          });
           return;
         }
-        if (get().activeId !== activeId) return;
-        const latestRun = get().runs[runKey(activeId)];
-        if (latestRun?.streaming || latestRun?.finalizing) return;
-      }
-    }
-
-    // Native admission resolves the credential from the persisted session row,
-    // but keep the client honest too: never clear a draft or append an optimistic
-    // message for an unpinned/removed/reconnect-required OpenAI profile. Remote
-    // mode delegates this check to the credential-owning desktop.
-    const pendingSession = get().pendingSession?.id === activeId ? get().pendingSession : null;
-    // The first send persists a pending local chat before starting its turn. Keep
-    // a second Enter inside that await window from issuing another create/run.
-    if (pendingSession && get().creatingSession) return;
-    const activeSession =
-      pendingSession ?? get().sessions.find((session) => session.id === activeId);
-    if (!get().remoteMode && !get().remoteConnected && activeSession) {
-      const account = activeSession.accountProfileId
-        ? get().openAIAccounts.find((candidate) => candidate.id === activeSession.accountProfileId)
-        : undefined;
-      if (!activeSession.accountProfileId) {
-        set({
-          openAIAuthError:
-            "Connect ChatGPT or an OpenAI Platform API key in Settings before sending.",
-        });
-        return;
-      }
-      if (!account || account.state !== "connected") {
-        set({
-          openAIAuthError:
-            account?.state === "reconnect_required"
-              ? "Reconnect Codex authentication before sending."
-              : "This session's Codex authentication is unavailable.",
-        });
-        return;
-      }
-      const resolution = reasoningForSession(
-        activeSession,
-        get().settings.reasoningEffort,
-        get().openAIModelCatalogs,
-      );
-      if (resolution.error) {
-        set({ openAIAuthError: resolution.error });
-        return;
-      }
-      if (resolution.effort !== get().settings.reasoningEffort) {
-        await get().updateSettings({ reasoningEffort: resolution.effort });
-        // updateSettings surfaces persistence failures instead of throwing. Confirm
-        // the echoed native value before accepting the turn, otherwise the UI can
-        // look repaired while Rust still sends the stale unsupported effort.
-        if (get().settings.reasoningEffort !== resolution.effort) return;
-      }
-    }
-
-    // Trim once so the stored user bubble and the forwarded command match the
-    // derived (trimmed) title — a padded draft otherwise renders odd blank lines.
-    const body = text.trim();
-
-    // A blank New chat is only local navigation state. Persist it immediately
-    // before the first turn, keeping empty sessions out of history and SQLite.
-    if (pendingSession && get().remoteConnected) {
-      const requestId = uid();
-      set({ creatingSession: true });
-      pendingRemoteCreateRequestId = requestId;
-      pendingRemoteFirstMessage = { draftId: pendingSession.id, body };
-      if (pendingRemoteCreateTimer !== null) clearTimeout(pendingRemoteCreateTimer);
-      pendingRemoteCreateTimer = setTimeout(() => {
-        if (pendingRemoteCreateRequestId !== requestId) return;
-        const queued = pendingRemoteFirstMessage;
-        clearPendingRemoteCreate();
-        useStore.setState((st) => ({
-          creatingSession: false,
-          remoteError: "Creating the conversation timed out. Please try again.",
-          drafts: queued ? { ...st.drafts, [queued.draftId]: queued.body } : st.drafts,
-        }));
-      }, 15_000);
-      await get().sendRemoteCommand({ cmd: "create_session", request_id: requestId });
-      if (get().remoteDropped && pendingRemoteCreateRequestId === requestId) {
-        const queued = pendingRemoteFirstMessage;
-        clearPendingRemoteCreate();
-        set((st) => ({
-          creatingSession: false,
-          drafts: queued ? { ...st.drafts, [queued.draftId]: queued.body } : st.drafts,
-        }));
-      }
-      return;
-    }
-    if (pendingSession && !get().remoteConnected) {
-      set({ creatingSession: true });
-      try {
-        const created = await ipc.createSession(
-          pendingSession.id,
-          pendingSession.title,
-          pendingSession.workspace,
-          pendingSession.model,
-          pendingSession.accountProfileId,
+        if (!account || account.state !== "connected") {
+          set({
+            openAIAuthError:
+              account?.state === "reconnect_required"
+                ? "Reconnect Codex authentication before sending."
+                : "This session's Codex authentication is unavailable.",
+          });
+          return;
+        }
+        const resolution = reasoningForSession(
+          activeSession,
+          get().settings.reasoningEffort,
+          get().openAIModelCatalogs,
         );
-        if (!created || created.id !== pendingSession.id) {
-          throw new Error("The native core did not confirm the new session.");
+        if (resolution.error) {
+          set({ openAIAuthError: resolution.error });
+          return;
         }
-        if (
-          pendingSession.accountProfileId &&
-          created.accountProfileId !== pendingSession.accountProfileId
-        ) {
-          throw new Error("The native core did not preserve the selected ChatGPT account.");
+        if (resolution.effort !== get().settings.reasoningEffort) {
+          await get().updateSettings({ reasoningEffort: resolution.effort });
+          // updateSettings surfaces persistence failures instead of throwing. Confirm
+          // the echoed native value before accepting the turn, otherwise the UI can
+          // look repaired while Rust still sends the stale unsupported effort.
+          if (get().settings.reasoningEffort !== resolution.effort) return;
         }
-        const session: Session = {
-          ...created,
-          model: created.model ?? pendingSession.model,
-          accountProfileId: created.accountProfileId ?? pendingSession.accountProfileId,
-        };
-        set((st) => ({
-          sessions: [session, ...st.sessions.filter((item) => item.id !== session.id)],
-          pendingSession: null,
-          creatingSession: false,
-        }));
-        void ensureBackgroundListener(session.id);
-      } catch (err) {
-        set((st) => ({
-          creatingSession: false,
-          initError: errMessage(err),
-          drafts: { ...st.drafts, [activeId]: body },
-        }));
+      }
+
+      // Trim once so the stored user bubble and the forwarded command match the
+      // derived (trimmed) title — a padded draft otherwise renders odd blank lines.
+      const body = text.trim();
+      const attachmentNames = attachmentSummaryLabels(submittedAttachments).join(", ");
+      const displayBody = body
+        ? hasAttachments
+          ? body + "\n\nAttached: " + attachmentNames
+          : body
+        : "Attached: " + attachmentNames;
+      // A blank New chat is only local navigation state. Persist it immediately
+      // before the first turn, keeping empty sessions out of history and SQLite.
+      if (pendingSession && get().remoteConnected) {
+        const requestId = uid();
+        set({ creatingSession: true });
+        pendingRemoteCreateRequestId = requestId;
+        pendingRemoteFirstMessage = { draftId: pendingSession.id, body };
+        if (pendingRemoteCreateTimer !== null) clearTimeout(pendingRemoteCreateTimer);
+        pendingRemoteCreateTimer = setTimeout(() => {
+          if (pendingRemoteCreateRequestId !== requestId) return;
+          const queued = pendingRemoteFirstMessage;
+          clearPendingRemoteCreate();
+          useStore.setState((st) => ({
+            creatingSession: false,
+            remoteError: "Creating the conversation timed out. Please try again.",
+            drafts: queued ? { ...st.drafts, [queued.draftId]: queued.body } : st.drafts,
+          }));
+        }, 15_000);
+        await get().sendRemoteCommand({ cmd: "create_session", request_id: requestId });
+        if (get().remoteDropped && pendingRemoteCreateRequestId === requestId) {
+          const queued = pendingRemoteFirstMessage;
+          clearPendingRemoteCreate();
+          set((st) => ({
+            creatingSession: false,
+            drafts: queued ? { ...st.drafts, [queued.draftId]: queued.body } : st.drafts,
+          }));
+        }
         return;
       }
-    }
+      if (pendingSession && !get().remoteConnected) {
+        set({ creatingSession: true });
+        try {
+          const created = await ipc.createSession(
+            pendingSession.id,
+            pendingSession.title,
+            pendingSession.workspace,
+            pendingSession.model,
+            pendingSession.accountProfileId,
+          );
+          if (!created || created.id !== pendingSession.id) {
+            throw new Error("The native core did not confirm the new session.");
+          }
+          if (
+            pendingSession.accountProfileId &&
+            created.accountProfileId !== pendingSession.accountProfileId
+          ) {
+            throw new Error("The native core did not preserve the selected ChatGPT account.");
+          }
+          const session: Session = {
+            ...created,
+            model: created.model ?? pendingSession.model,
+            accountProfileId: created.accountProfileId ?? pendingSession.accountProfileId,
+          };
+          set((st) => ({
+            sessions: [session, ...st.sessions.filter((item) => item.id !== session.id)],
+            pendingSession: null,
+            creatingSession: false,
+          }));
+          void ensureBackgroundListener(session.id);
+        } catch (err) {
+          set((st) => ({
+            creatingSession: false,
+            initError: errMessage(err),
+            drafts: { ...st.drafts, [activeId]: body },
+            attachmentBusy: hasAttachments
+              ? { ...st.attachmentBusy, [activeId]: false }
+              : st.attachmentBusy,
+          }));
+          return;
+        }
+      }
 
-    // Close the open loop: the message is on its way, so clear this session's draft
-    // everywhere — the in-memory map, the optimistic mirror, and (immediately,
-    // cancelling any pending debounce) the durable backend — so a fast restart can't
-    // restore a just-sent draft.
-    set((st) => {
-      if (!(activeId in st.drafts)) return {};
-      const drafts = { ...st.drafts };
-      delete drafts[activeId];
-      writeJSON("pc.drafts", drafts);
-      return { drafts };
-    });
-    persistDraft(activeId, "", true);
-
-    // Turn-taking receipt (Doherty <400ms): acknowledge the send instantly ("got it
-    // — reading…"); the first REAL stream event settles it to "thinking…", with a
-    // 900ms fallback for a slow first byte. Honest — never padded latency.
-    // Reset the tool label up front so a new turn never briefly shows the previous
-    // turn's last tool before its first real event arrives.
-    const provisionalTurnId = uid();
-    const optimisticStartedAt = now();
-    setRun(set, activeId, {
-      composerPhase: "received",
-      activeTool: null,
-      pendingCodexRequest: null,
-      turnId: provisionalTurnId,
-      startedAt: optimisticStartedAt,
-      unseenOutcome: null,
-    });
-    armSettleTimer(activeId, provisionalTurnId);
-
-    // Remote mode: this device is the phone driving a paired desktop. Forward the
-    // turn as a `run` command instead of running the local agent — the desktop is
-    // authoritative and its reply streams back as live frames. sendRemoteCommand
-    // appends both the optimistic user row and a provisional assistant turn, so a
-    // terminal timeout/error has an exact target even before turn_start arrives.
-    // We DO flip `streaming` optimistically
-    // (rather than waiting for the desktop's turn_start frame) to close the
-    // double-submit window: the round-trip can be slow or dropped, and an enabled
-    // composer would let a second Enter fire a duplicate `run`. Every terminal/drop
-    // path (turn_end/error, the drop listener, the send catch, disconnectRemote)
-    // already clears streaming:false, so the composer can't get stranded.
-    if (get().remoteConnected) {
+      // Turn-taking receipt (Doherty <400ms): acknowledge the send instantly ("got it
+      // — reading…"); the first REAL stream event settles it to "thinking…", with a
+      // 900ms fallback for a slow first byte. Honest — never padded latency.
+      // Reset the tool label up front so a new turn never briefly shows the previous
+      // turn's last tool before its first real event arrives.
+      const provisionalTurnId = uid();
+      const optimisticStartedAt = now();
       setRun(set, activeId, {
-        streaming: true,
+        composerPhase: "received",
+        activeTool: null,
+        pendingCodexRequest: null,
         turnId: provisionalTurnId,
         startedAt: optimisticStartedAt,
-        finalizing: false,
-        agentDurationMs: null,
-        phaseRevision: 0,
-        receipt: null,
-        outcome: null,
+        unseenOutcome: null,
       });
-      // Remote idle watchdog (symmetric with the local one below). The desktop is
-      // authoritative, but if its agent dies/hangs without ever emitting
-      // turn_end/error AND the channel stays up (no drop fires), nothing would clear
-      // `streaming` and the composer would be stranded. Arm a timer that force-ends a
-      // silent remote turn; every live frame for the active session resets it (see
-      // applyFrame), and every terminal/teardown path clears it (turn_end/error in
-      // applyRemoteEvent, the drop listener, the send-command catch, stop(),
-      // disconnectRemote).
-      clearRemoteWatchdog(activeId);
-      remoteLastActivity.set(activeId, now());
-      const watchdog = setInterval(() => {
-        // The turn already ended or was stopped elsewhere — just clean up. The
-        // remote turn runs on the active session, so the active-run mirror is the
-        // right "still streaming?" signal here.
-        const current = get().runs[runKey(activeId)];
-        if (!current?.streaming || remoteWatchdogs.get(activeId) !== watchdog) {
-          clearRemoteWatchdog(activeId);
-          return;
-        }
-        if (now() - (remoteLastActivity.get(activeId) ?? 0) < TURN_IDLE_TIMEOUT_MS) return;
-        // No live frame for the whole idle window → treat the desktop as hung and
-        // recover, so the composer can't stay disabled forever.
-        clearRemoteWatchdog(activeId);
-        clearSettleTimer(activeId);
-        set((st) => ({
-          ...terminalizeTurnState(
-            st,
-            activeId,
-            TOOL_INTERRUPTED_ERROR,
-            "interrupted",
-            undefined,
-            undefined,
-            "\n\n**The desktop stopped responding (timed out).**",
-          ),
-        }));
-      }, 1000);
-      remoteWatchdogs.set(activeId, watchdog);
-      await get().sendRemoteCommand({ cmd: "run", session_id: activeId, text: body });
-      return;
-    }
+      armSettleTimer(activeId, provisionalTurnId);
 
-    const userMsg: Message = {
-      id: uid(),
-      role: "user",
-      blocks: [{ kind: "text", text: body }],
-      createdAt: now(),
-      turnId: provisionalTurnId,
-    };
-    const assistant: Message = {
-      id: provisionalTurnId,
-      role: "assistant",
-      blocks: [],
-      createdAt: optimisticStartedAt,
-      turnId: provisionalTurnId,
-    };
-
-    set((st) => {
-      const msgs = st.messages[activeId] ?? [];
-      const sessions = st.sessions.map((s) =>
-        s.id === activeId
-          ? {
-              ...s,
-              updatedAt: now(),
-              title: msgs.length === 0 ? deriveTitle(body) : s.title,
-            }
-          : s,
-      );
-      return {
-        sessions,
-        ...runPatch(st, activeId, {
+      // Remote mode: this device is the phone driving a paired desktop. Forward the
+      // turn as a `run` command instead of running the local agent — the desktop is
+      // authoritative and its reply streams back as live frames. sendRemoteCommand
+      // appends both the optimistic user row and a provisional assistant turn, so a
+      // terminal timeout/error has an exact target even before turn_start arrives.
+      // We DO flip `streaming` optimistically
+      // (rather than waiting for the desktop's turn_start frame) to close the
+      // double-submit window: the round-trip can be slow or dropped, and an enabled
+      // composer would let a second Enter fire a duplicate `run`. Every terminal/drop
+      // path (turn_end/error, the drop listener, the send catch, disconnectRemote)
+      // already clears streaming:false, so the composer can't get stranded.
+      if (get().remoteConnected) {
+        setRun(set, activeId, {
           streaming: true,
           turnId: provisionalTurnId,
           startedAt: optimisticStartedAt,
@@ -2904,491 +2942,660 @@ export const useStore = create<AppState>((set, get) => ({
           phaseRevision: 0,
           receipt: null,
           outcome: null,
-        }),
-        messages: {
-          ...st.messages,
-          [activeId]: [...msgs, userMsg, assistant],
-        },
-        transcriptScrollRequest: {
-          id: uid(),
-          sessionId: activeId,
-          kind: "newTurn",
-          targetMessageId: userMsg.id,
-        },
-        // Each turn's agents panel starts empty; this turn's subagents repopulate it.
-        agents: { ...st.agents, [activeId]: [] },
+        });
+        // Remote idle watchdog (symmetric with the local one below). The desktop is
+        // authoritative, but if its agent dies/hangs without ever emitting
+        // turn_end/error AND the channel stays up (no drop fires), nothing would clear
+        // `streaming` and the composer would be stranded. Arm a timer that force-ends a
+        // silent remote turn; every live frame for the active session resets it (see
+        // applyFrame), and every terminal/teardown path clears it (turn_end/error in
+        // applyRemoteEvent, the drop listener, the send-command catch, stop(),
+        // disconnectRemote).
+        clearRemoteWatchdog(activeId);
+        remoteLastActivity.set(activeId, now());
+        const watchdog = setInterval(() => {
+          // The turn already ended or was stopped elsewhere — just clean up. The
+          // remote turn runs on the active session, so the active-run mirror is the
+          // right "still streaming?" signal here.
+          const current = get().runs[runKey(activeId)];
+          if (!current?.streaming || remoteWatchdogs.get(activeId) !== watchdog) {
+            clearRemoteWatchdog(activeId);
+            return;
+          }
+          if (now() - (remoteLastActivity.get(activeId) ?? 0) < TURN_IDLE_TIMEOUT_MS) return;
+          // No live frame for the whole idle window → treat the desktop as hung and
+          // recover, so the composer can't stay disabled forever.
+          clearRemoteWatchdog(activeId);
+          clearSettleTimer(activeId);
+          set((st) => ({
+            ...terminalizeTurnState(
+              st,
+              activeId,
+              TOOL_INTERRUPTED_ERROR,
+              "interrupted",
+              undefined,
+              undefined,
+              "\n\n**The desktop stopped responding (timed out).**",
+            ),
+          }));
+        }, 1000);
+        remoteWatchdogs.set(activeId, watchdog);
+        await get().sendRemoteCommand({ cmd: "run", session_id: activeId, text: body });
+        return;
+      }
+
+      const userMsg: Message = {
+        id: uid(),
+        role: "user",
+        blocks: [{ kind: "text", text: displayBody }],
+        createdAt: now(),
+        turnId: provisionalTurnId,
       };
-    });
+      const assistant: Message = {
+        id: provisionalTurnId,
+        role: "assistant",
+        blocks: [],
+        createdAt: optimisticStartedAt,
+        turnId: provisionalTurnId,
+      };
 
-    const apply = (fn: (blocks: ContentBlock[]) => ContentBlock[]) =>
-      set((st) => ({
-        messages: patchTurnMessage(
-          st.messages,
-          activeId,
-          st.runs[runKey(activeId)]?.turnId ?? provisionalTurnId,
-          (message) => ({ ...message, blocks: fn(message.blocks) }),
-        ),
-      }));
+      set((st) => {
+        const msgs = st.messages[activeId] ?? [];
+        const sessions = st.sessions.map((s) =>
+          s.id === activeId
+            ? {
+                ...s,
+                updatedAt: now(),
+                title: msgs.length === 0 ? deriveTitle(displayBody) : s.title,
+              }
+            : s,
+        );
+        return {
+          sessions,
+          ...runPatch(st, activeId, {
+            streaming: true,
+            turnId: provisionalTurnId,
+            startedAt: optimisticStartedAt,
+            finalizing: false,
+            agentDurationMs: null,
+            phaseRevision: 0,
+            receipt: null,
+            outcome: null,
+          }),
+          messages: {
+            ...st.messages,
+            [activeId]: [...msgs, userMsg, assistant],
+          },
+          transcriptScrollRequest: {
+            id: uid(),
+            sessionId: activeId,
+            kind: "newTurn",
+            targetMessageId: userMsg.id,
+          },
+          // Each turn's agents panel starts empty; this turn's subagents repopulate it.
+          agents: { ...st.agents, [activeId]: [] },
+        };
+      });
 
-    // A turn must ALWAYS reach a terminal state. The Rust core emits turn_end/error,
-    // but if it ever hangs or dies silently nothing would clear `streaming` — and
-    // since send() no-ops while streaming, that would brick every future message.
-    // So we (a) tear the per-turn event listener down the instant a turn ends — a
-    // leaked listener folds the NEXT turn's deltas into this message — and (b) run a
-    // client-side watchdog that force-ends a silent turn so the app always recovers.
-    // The run-map key for this turn's session, captured up front so the watchdog
-    // and the post-await Stop check read THIS run's streaming flag (the
-    // authoritative source) rather than the active-session mirror — correct even
-    // if the active session were to change out from under a long-running turn.
-    const myKey = runKey(activeId);
-    let run: Awaited<ReturnType<typeof ipc.runAgent>> | null = null;
-    let settled = false;
-    let lastActivity = now();
-    let watchdog: ReturnType<typeof setInterval> | null = null;
-    let cancelTerminalTimer: ReturnType<typeof setTimeout> | null = null;
-    let receiptTerminalTimer: ReturnType<typeof setTimeout> | null = null;
-    let watchdogCancelInFlight = false;
-    let awaitingCancelTerminal = false;
-    let observedTurnId = provisionalTurnId;
-    let nativeTurnIdKnown = false;
-    // More than one tool_use can arrive in a single model turn. Track all live ids
-    // so one fast result does not clear the presence label while a sibling tool is
-    // still outstanding; the most recently announced pending tool wins the label.
-    const pendingTools = new Map<string, string>();
-
-    const markSettled = (): boolean => {
-      if (settled) return false;
-      settled = true;
-      if (watchdog !== null) {
-        clearInterval(watchdog);
-        watchdog = null;
-      }
-      if (cancelTerminalTimer !== null) {
-        clearTimeout(cancelTerminalTimer);
-        cancelTerminalTimer = null;
-      }
-      if (receiptTerminalTimer !== null) {
-        clearTimeout(receiptTerminalTimer);
-        receiptTerminalTimer = null;
-      }
-      awaitingCancelTerminal = false;
-      return true;
-    };
-
-    // Stop the watchdog + the per-turn listener exactly once after a terminal event.
-    const settle = () => {
-      if (!markSettled()) return;
-      run?.dispose();
-    };
-
-    // cancel_agent returning means the abort was accepted, not that native has
-    // finished its Git snapshot and emitted TurnEnd/Error. Stop the idle watchdog
-    // while retaining the event listener for that authoritative receipt. Legacy
-    // cores and simple test mocks may emit nothing, so dispose after a bounded wait.
-    const awaitCancelledTerminal = (onGraceExpired: () => void) => {
-      if (settled) return;
-      awaitingCancelTerminal = true;
-      if (watchdog !== null) {
-        clearInterval(watchdog);
-        watchdog = null;
-      }
-      if (cancelTerminalTimer !== null) clearTimeout(cancelTerminalTimer);
-      cancelTerminalTimer = setTimeout(() => {
-        cancelTerminalTimer = null;
-        onGraceExpired();
-        settle();
-      }, CANCEL_TERMINAL_GRACE_MS);
-    };
-
-    const applyTerminalEvent = (
-      toolOutput: string,
-      status: TurnStatus,
-      stopReason: string | undefined,
-      receipt: TurnReceipt | undefined,
-      terminalText?: string,
-    ) => {
-      const eventTurnId = receipt?.turnId ?? observedTurnId;
-      const current = get().runs[myKey];
-      // A successful `receiptExpected: false` turn unlocks immediately, so a
-      // quick follow-up can start before this listener receives its trailing
-      // authoritative terminal. Failed turns now remain subscribed through Error.
-      // Distinguish an authoritative replacement of this turn's provisional ID
-      // from a genuinely newer run, and never let the stale listener end that run.
-      const stillOwnsCurrentRun = nativeTurnIdKnown
-        ? current?.turnId === observedTurnId || current?.turnId === eventTurnId
-        : current?.turnId === provisionalTurnId || current?.turnId === eventTurnId;
-      const supersededByNewTurn = current?.turnId != null && !stillOwnsCurrentRun;
-      stopRequestedSessions.delete(activeId);
-      pendingTools.clear();
-      settle();
-      if (supersededByNewTurn) {
-        // A quick follow-up turn started during the receipt grace window. Attach
-        // this terminal receipt to the cancelled turn only; never stop or relabel
-        // the newer run that now owns the session-level UI mirror.
+      const apply = (fn: (blocks: ContentBlock[]) => ContentBlock[]) =>
         set((st) => ({
-          messages: patchTerminalTurnMessage(
+          messages: patchTurnMessage(
             st.messages,
             activeId,
-            observedTurnId,
+            st.runs[runKey(activeId)]?.turnId ?? provisionalTurnId,
+            (message) => ({ ...message, blocks: fn(message.blocks) }),
+          ),
+        }));
+
+      // A turn must ALWAYS reach a terminal state. The Rust core emits turn_end/error,
+      // but if it ever hangs or dies silently nothing would clear `streaming` — and
+      // since send() no-ops while streaming, that would brick every future message.
+      // So we (a) tear the per-turn event listener down the instant a turn ends — a
+      // leaked listener folds the NEXT turn's deltas into this message — and (b) run a
+      // client-side watchdog that force-ends a silent turn so the app always recovers.
+      // The run-map key for this turn's session, captured up front so the watchdog
+      // and the post-await Stop check read THIS run's streaming flag (the
+      // authoritative source) rather than the active-session mirror — correct even
+      // if the active session were to change out from under a long-running turn.
+      const myKey = runKey(activeId);
+      let run: Awaited<ReturnType<typeof ipc.runAgent>> | null = null;
+      let settled = false;
+      let lastActivity = now();
+      let watchdog: ReturnType<typeof setInterval> | null = null;
+      let cancelTerminalTimer: ReturnType<typeof setTimeout> | null = null;
+      let receiptTerminalTimer: ReturnType<typeof setTimeout> | null = null;
+      let watchdogCancelInFlight = false;
+      let awaitingCancelTerminal = false;
+      let observedTurnId = provisionalTurnId;
+      let nativeTurnIdKnown = false;
+      const acceptSubmittedAttachments = () => {
+        if (attachmentAccepted) return;
+        attachmentAccepted = true;
+        let clearedDraft = false;
+        set((st) => {
+          const attachments = { ...st.attachments };
+          const attachmentErrors = { ...st.attachmentErrors };
+          const attachmentSendErrors = { ...st.attachmentSendErrors };
+          const attachmentRetryPaths = { ...st.attachmentRetryPaths };
+          const attachmentBusy = { ...st.attachmentBusy };
+          delete attachments[activeId];
+          delete attachmentErrors[activeId];
+          delete attachmentSendErrors[activeId];
+          delete attachmentRetryPaths[activeId];
+          delete attachmentBusy[activeId];
+          let drafts = st.drafts;
+          if (submittedDraft !== undefined && st.drafts[activeId] === submittedDraft) {
+            drafts = { ...st.drafts };
+            delete drafts[activeId];
+            writeJSON("pc.drafts", drafts);
+            clearedDraft = true;
+          }
+          return {
+            attachments,
+            attachmentErrors,
+            attachmentSendErrors,
+            attachmentRetryPaths,
+            attachmentBusy,
+            drafts,
+          };
+        });
+        if (clearedDraft) persistDraft(activeId, "", true);
+      };
+      // More than one tool_use can arrive in a single model turn. Track all live ids
+      // so one fast result does not clear the presence label while a sibling tool is
+      // still outstanding; the most recently announced pending tool wins the label.
+      const pendingTools = new Map<string, string>();
+
+      const markSettled = (): boolean => {
+        if (settled) return false;
+        settled = true;
+        if (watchdog !== null) {
+          clearInterval(watchdog);
+          watchdog = null;
+        }
+        if (cancelTerminalTimer !== null) {
+          clearTimeout(cancelTerminalTimer);
+          cancelTerminalTimer = null;
+        }
+        if (receiptTerminalTimer !== null) {
+          clearTimeout(receiptTerminalTimer);
+          receiptTerminalTimer = null;
+        }
+        awaitingCancelTerminal = false;
+        return true;
+      };
+
+      // Stop the watchdog + the per-turn listener exactly once after a terminal event.
+      const settle = () => {
+        if (!markSettled()) return;
+        run?.dispose();
+      };
+
+      // cancel_agent returning means the abort was accepted, not that native has
+      // finished its Git snapshot and emitted TurnEnd/Error. Stop the idle watchdog
+      // while retaining the event listener for that authoritative receipt. Legacy
+      // cores and simple test mocks may emit nothing, so dispose after a bounded wait.
+      const awaitCancelledTerminal = (onGraceExpired: () => void) => {
+        if (settled) return;
+        awaitingCancelTerminal = true;
+        if (watchdog !== null) {
+          clearInterval(watchdog);
+          watchdog = null;
+        }
+        if (cancelTerminalTimer !== null) clearTimeout(cancelTerminalTimer);
+        cancelTerminalTimer = setTimeout(() => {
+          cancelTerminalTimer = null;
+          onGraceExpired();
+          settle();
+        }, CANCEL_TERMINAL_GRACE_MS);
+      };
+
+      const applyTerminalEvent = (
+        toolOutput: string,
+        status: TurnStatus,
+        stopReason: string | undefined,
+        receipt: TurnReceipt | undefined,
+        terminalText?: string,
+      ) => {
+        const eventTurnId = receipt?.turnId ?? observedTurnId;
+        const current = get().runs[myKey];
+        // A successful `receiptExpected: false` turn unlocks immediately, so a
+        // quick follow-up can start before this listener receives its trailing
+        // authoritative terminal. Failed turns now remain subscribed through Error.
+        // Distinguish an authoritative replacement of this turn's provisional ID
+        // from a genuinely newer run, and never let the stale listener end that run.
+        const stillOwnsCurrentRun = nativeTurnIdKnown
+          ? current?.turnId === observedTurnId || current?.turnId === eventTurnId
+          : current?.turnId === provisionalTurnId || current?.turnId === eventTurnId;
+        const supersededByNewTurn = current?.turnId != null && !stillOwnsCurrentRun;
+        stopRequestedSessions.delete(activeId);
+        pendingTools.clear();
+        settle();
+        if (supersededByNewTurn) {
+          // A quick follow-up turn started during the receipt grace window. Attach
+          // this terminal receipt to the cancelled turn only; never stop or relabel
+          // the newer run that now owns the session-level UI mirror.
+          set((st) => ({
+            messages: patchTerminalTurnMessage(
+              st.messages,
+              activeId,
+              observedTurnId,
+              toolOutput,
+              receipt,
+              terminalText,
+            ),
+          }));
+          return;
+        }
+        clearSettleTimer(activeId);
+        set((st) => ({
+          ...terminalizeTurnState(
+            st,
+            activeId,
             toolOutput,
+            status,
+            stopReason,
             receipt,
             terminalText,
           ),
         }));
-        return;
-      }
-      clearSettleTimer(activeId);
-      set((st) => ({
-        ...terminalizeTurnState(
-          st,
-          activeId,
-          toolOutput,
-          status,
-          stopReason,
-          receipt,
-          terminalText,
-        ),
-      }));
-    };
+      };
 
-    const applyCancelGraceFallback = (
-      toolOutput: string,
-      status: "cancelled" | "interrupted",
-      stopReason?: string,
-      terminalText?: string,
-    ) => {
-      pendingTools.clear();
-      stopRequestedSessions.delete(activeId);
-      clearSettleTimer(activeId);
-      set((st) => ({
-        ...terminalizeTurnState(
-          st,
-          activeId,
-          toolOutput,
-          status,
-          stopReason,
-          undefined,
-          terminalText,
-        ),
-      }));
-    };
+      const applyCancelGraceFallback = (
+        toolOutput: string,
+        status: "cancelled" | "interrupted",
+        stopReason?: string,
+        terminalText?: string,
+      ) => {
+        pendingTools.clear();
+        stopRequestedSessions.delete(activeId);
+        clearSettleTimer(activeId);
+        set((st) => ({
+          ...terminalizeTurnState(
+            st,
+            activeId,
+            toolOutput,
+            status,
+            stopReason,
+            undefined,
+            terminalText,
+          ),
+        }));
+      };
 
-    const onEvent = (e: StreamEvent) => {
-      // `receiptExpected: false` means no Git finalization is needed; it does NOT
-      // replace the authoritative TurnEnd/Error. Successful no-capture turns may
-      // unlock immediately, but failed turns must keep this listener until Error
-      // delivers the actionable provider/lifecycle message.
-      if (settled) return;
-      // Once cancellation is acknowledged, only this turn's terminal receipt is
-      // relevant. Ignoring late deltas/turn_start also prevents this listener from
-      // touching a fast follow-up turn during the bounded receipt grace window.
-      if (awaitingCancelTerminal) {
-        const acknowledgedOutcome = e.type === "turn_phase" && e.phase === "agent_completed";
-        if (e.type !== "turn_end" && e.type !== "error" && !acknowledgedOutcome) return;
-        if (acknowledgedOutcome && e.turnId !== observedTurnId) return;
-        if (
-          nativeTurnIdKnown &&
-          (e.type === "turn_end" || e.type === "error") &&
-          e.receipt &&
-          e.receipt.turnId !== observedTurnId
-        )
-          return;
-      }
-      lastActivity = now();
-      switch (e.type) {
-        case "turn_start": {
-          const currentRun = get().runs[runKey(activeId)] ?? EMPTY_RUN;
-          const turnId = e.turnId ?? e.messageId;
-          observedTurnId = turnId;
-          nativeTurnIdKnown = true;
-          const startedAt = e.startedAt ?? currentRun.startedAt ?? optimisticStartedAt;
-          set((st) => ({
-            ...runPatch(st, activeId, {
-              turnId,
-              startedAt,
-              finalizing: false,
-              agentDurationMs: null,
-              phaseRevision: 0,
-              receipt: null,
-              outcome: null,
-            }),
-            messages: reconcileTurnMessage(
-              st.messages,
-              activeId,
-              currentRun.turnId ?? provisionalTurnId,
-              turnId,
-              e.messageId,
-              startedAt,
-            ),
-          }));
-          break;
+      const onEvent = (e: StreamEvent) => {
+        // `receiptExpected: false` means no Git finalization is needed; it does NOT
+        // replace the authoritative TurnEnd/Error. Successful no-capture turns may
+        // unlock immediately, but failed turns must keep this listener until Error
+        // delivers the actionable provider/lifecycle message.
+        if (settled) return;
+        // Once cancellation is acknowledged, only this turn's terminal receipt is
+        // relevant. Ignoring late deltas/turn_start also prevents this listener from
+        // touching a fast follow-up turn during the bounded receipt grace window.
+        if (awaitingCancelTerminal) {
+          const acknowledgedOutcome = e.type === "turn_phase" && e.phase === "agent_completed";
+          if (e.type !== "turn_end" && e.type !== "error" && !acknowledgedOutcome) return;
+          if (acknowledgedOutcome && e.turnId !== observedTurnId) return;
+          if (
+            nativeTurnIdKnown &&
+            (e.type === "turn_end" || e.type === "error") &&
+            e.receipt &&
+            e.receipt.turnId !== observedTurnId
+          )
+            return;
         }
-        case "turn_phase": {
-          const currentRun = get().runs[myKey];
-          if (!currentRun || currentRun.turnId !== e.turnId) break;
-          const previousRevision = currentRun.phaseRevision ?? 0;
-          if (e.revision !== undefined && e.revision <= previousRevision) break;
-          const phaseRevision = e.revision ?? previousRevision + 1;
-          if (e.phase === "provider_started") {
-            if (!currentRun.streaming || currentRun.composerPhase === "stopping") break;
-            clearSettleTimer(activeId);
-            setRun(set, activeId, { composerPhase: "thinking", phaseRevision });
-            break;
-          }
-
-          clearSettleTimer(activeId);
-          pendingTools.clear();
-          const status = e.status ?? "completed";
-          const toolOutput =
-            status === "cancelled" ? TOOL_INTERRUPTED_CANCELLED : TOOL_INTERRUPTED_ERROR;
-          set((st) => {
-            const run = st.runs[myKey];
-            if (!run || run.turnId !== e.turnId) return {};
-            const receipt = receiptFromAgentCompletion(st, activeId, e);
-            if (!receipt) return {};
-            const agentStatus: TerminalAgentStatus =
-              status === "completed" ? "ok" : status === "cancelled" ? "cancelled" : "error";
-            return {
-              messages: patchTerminalTurnMessage(
+        lastActivity = now();
+        switch (e.type) {
+          case "turn_start": {
+            acceptSubmittedAttachments();
+            const currentRun = get().runs[runKey(activeId)] ?? EMPTY_RUN;
+            const turnId = e.turnId ?? e.messageId;
+            observedTurnId = turnId;
+            nativeTurnIdKnown = true;
+            const startedAt = e.startedAt ?? currentRun.startedAt ?? optimisticStartedAt;
+            set((st) => ({
+              ...runPatch(st, activeId, {
+                turnId,
+                startedAt,
+                finalizing: false,
+                agentDurationMs: null,
+                phaseRevision: 0,
+                receipt: null,
+                outcome: null,
+              }),
+              messages: reconcileTurnMessage(
                 st.messages,
                 activeId,
-                e.turnId,
-                toolOutput,
-                receipt,
+                currentRun.turnId ?? provisionalTurnId,
+                turnId,
+                e.messageId,
+                startedAt,
               ),
-              agents: terminalizeRunningAgents(st.agents, activeId, agentStatus),
-              ...runPatch(st, activeId, {
-                streaming: false,
-                cancel: null,
-                pendingPermission: null,
-                pendingCodexRequest: null,
-                finalizing: e.receiptExpected !== false || status === "error",
-                agentDurationMs: receipt.agentDurationMs ?? receipt.durationMs ?? null,
-                phaseRevision,
-                receipt,
-                outcome: status,
-                composerPhase: "idle",
-                activeTool: null,
-                unseenOutcome: st.activeId !== activeId && status !== "completed" ? status : null,
-              }),
-            };
-          });
+            }));
+            break;
+          }
+          case "turn_phase": {
+            const currentRun = get().runs[myKey];
+            if (!currentRun || currentRun.turnId !== e.turnId) break;
+            const previousRevision = currentRun.phaseRevision ?? 0;
+            if (e.revision !== undefined && e.revision <= previousRevision) break;
+            const phaseRevision = e.revision ?? previousRevision + 1;
+            if (e.phase === "provider_started") {
+              if (!currentRun.streaming || currentRun.composerPhase === "stopping") break;
+              clearSettleTimer(activeId);
+              setRun(set, activeId, { composerPhase: "thinking", phaseRevision });
+              break;
+            }
 
-          if (e.receiptExpected !== false || status === "error") {
-            if (receiptTerminalTimer !== null) clearTimeout(receiptTerminalTimer);
-            receiptTerminalTimer = setTimeout(() => {
-              receiptTerminalTimer = null;
-              const run = get().runs[myKey];
-              if (!run?.finalizing || run.streaming || run.turnId !== e.turnId) return;
-              applyTerminalEvent(toolOutput, status, e.stopReason, run.receipt ?? undefined);
-            }, RECEIPT_TERMINAL_GRACE_MS);
-          } else {
-            // No Git boundary remains, so there is nothing for this per-run
-            // listener to finalize. Tear it down before Send can start a follow-up
-            // on the same session channel; the persisted TurnEnd is recovered on
-            // reload and the provisional receipt is already complete for this UI.
-            settle();
-          }
-          break;
-        }
-        case "text_delta":
-          // First real byte settles the receipt into "thinking with you…" (and
-          // cancels the fallback timer). Only advance from "received" so a Stop
-          // in flight ("stopping…") isn't overwritten by a late delta.
-          if (get().runs[myKey]?.composerPhase === "received") {
             clearSettleTimer(activeId);
-            setRun(set, activeId, { composerPhase: "thinking" });
+            pendingTools.clear();
+            const status = e.status ?? "completed";
+            const toolOutput =
+              status === "cancelled" ? TOOL_INTERRUPTED_CANCELLED : TOOL_INTERRUPTED_ERROR;
+            set((st) => {
+              const run = st.runs[myKey];
+              if (!run || run.turnId !== e.turnId) return {};
+              const receipt = receiptFromAgentCompletion(st, activeId, e);
+              if (!receipt) return {};
+              const agentStatus: TerminalAgentStatus =
+                status === "completed" ? "ok" : status === "cancelled" ? "cancelled" : "error";
+              return {
+                messages: patchTerminalTurnMessage(
+                  st.messages,
+                  activeId,
+                  e.turnId,
+                  toolOutput,
+                  receipt,
+                ),
+                agents: terminalizeRunningAgents(st.agents, activeId, agentStatus),
+                ...runPatch(st, activeId, {
+                  streaming: false,
+                  cancel: null,
+                  pendingPermission: null,
+                  pendingCodexRequest: null,
+                  finalizing: e.receiptExpected !== false || status === "error",
+                  agentDurationMs: receipt.agentDurationMs ?? receipt.durationMs ?? null,
+                  phaseRevision,
+                  receipt,
+                  outcome: status,
+                  composerPhase: "idle",
+                  activeTool: null,
+                  unseenOutcome: st.activeId !== activeId && status !== "completed" ? status : null,
+                }),
+              };
+            });
+
+            if (e.receiptExpected !== false || status === "error") {
+              if (receiptTerminalTimer !== null) clearTimeout(receiptTerminalTimer);
+              receiptTerminalTimer = setTimeout(() => {
+                receiptTerminalTimer = null;
+                const run = get().runs[myKey];
+                if (!run?.finalizing || run.streaming || run.turnId !== e.turnId) return;
+                applyTerminalEvent(toolOutput, status, e.stopReason, run.receipt ?? undefined);
+              }, RECEIPT_TERMINAL_GRACE_MS);
+            } else {
+              // No Git boundary remains, so there is nothing for this per-run
+              // listener to finalize. Tear it down before Send can start a follow-up
+              // on the same session channel; the persisted TurnEnd is recovered on
+              // reload and the provisional receipt is already complete for this UI.
+              settle();
+            }
+            break;
           }
-          apply((blocks) => appendText(blocks, e.text));
-          break;
-        case "tool_use":
-          if (get().runs[myKey]?.composerPhase === "received") {
-            clearSettleTimer(activeId);
-            setRun(set, activeId, { composerPhase: "thinking" });
-          }
-          // Surface the running tool in the presence line ("running <tool>…").
-          pendingTools.set(e.id, e.name);
-          setRun(set, activeId, { activeTool: e.name });
-          apply((blocks) => [
-            ...blocks,
-            { kind: "tool_use", id: e.id, name: e.name, input: e.input },
-          ]);
-          break;
-        case "tool_result":
-          // The tool finished — fall back to the generic "thinking with you…".
-          pendingTools.delete(e.id);
-          setRun(set, activeId, { activeTool: Array.from(pendingTools.values()).pop() ?? null });
-          apply((blocks) => [
-            ...blocks,
-            {
-              kind: "tool_result",
-              toolUseId: e.id,
-              output: e.output,
-              isError: e.isError,
-            },
-          ]);
-          break;
-        case "permission_request":
-          setRun(set, activeId, {
-            pendingPermission: {
-              id: e.id,
-              tool: e.tool,
-              risk: e.risk,
-              summary: e.summary,
-              input: e.input,
-              diff: e.diff,
-            },
-          });
-          break;
-        case "codex_request":
-          set((state) => applyCodexRequestEvent(state, activeId, e));
-          break;
-        case "usage":
-          set((st) => {
-            const cur = st.usage[activeId] ?? { input: 0, output: 0 };
-            return {
-              usage: {
-                ...st.usage,
-                [activeId]: {
-                  input: cur.input + e.inputTokens,
-                  output: cur.output + e.outputTokens,
-                },
+          case "text_delta":
+            // First real byte settles the receipt into "thinking with you…" (and
+            // cancels the fallback timer). Only advance from "received" so a Stop
+            // in flight ("stopping…") isn't overwritten by a late delta.
+            if (get().runs[myKey]?.composerPhase === "received") {
+              clearSettleTimer(activeId);
+              setRun(set, activeId, { composerPhase: "thinking" });
+            }
+            apply((blocks) => appendText(blocks, e.text));
+            break;
+          case "tool_use":
+            if (get().runs[myKey]?.composerPhase === "received") {
+              clearSettleTimer(activeId);
+              setRun(set, activeId, { composerPhase: "thinking" });
+            }
+            // Surface the running tool in the presence line ("running <tool>…").
+            pendingTools.set(e.id, e.name);
+            setRun(set, activeId, { activeTool: e.name });
+            apply((blocks) => [
+              ...blocks,
+              { kind: "tool_use", id: e.id, name: e.name, input: e.input },
+            ]);
+            break;
+          case "tool_result":
+            // The tool finished — fall back to the generic "thinking with you…".
+            pendingTools.delete(e.id);
+            setRun(set, activeId, { activeTool: Array.from(pendingTools.values()).pop() ?? null });
+            apply((blocks) => [
+              ...blocks,
+              {
+                kind: "tool_result",
+                toolUseId: e.id,
+                output: e.output,
+                isError: e.isError,
               },
-            };
-          });
-          break;
-        case "error":
-          {
-            const errorMessage = sessionScopedStreamError(get(), activeId, e.message);
+            ]);
+            break;
+          case "permission_request":
+            setRun(set, activeId, {
+              pendingPermission: {
+                id: e.id,
+                tool: e.tool,
+                risk: e.risk,
+                summary: e.summary,
+                input: e.input,
+                diff: e.diff,
+              },
+            });
+            break;
+          case "codex_request":
+            set((state) => applyCodexRequestEvent(state, activeId, e));
+            break;
+          case "usage":
+            set((st) => {
+              const cur = st.usage[activeId] ?? { input: 0, output: 0 };
+              return {
+                usage: {
+                  ...st.usage,
+                  [activeId]: {
+                    input: cur.input + e.inputTokens,
+                    output: cur.output + e.outputTokens,
+                  },
+                },
+              };
+            });
+            break;
+          case "error":
+            {
+              const errorMessage = sessionScopedStreamError(get(), activeId, e.message);
+              const displayError = errorMessage.replace(/^(?:Error:\s*)+/i, "").trim();
+              if (!nativeTurnIdKnown) {
+                set((st) => {
+                  const sessionStillExists =
+                    st.sessions.some((session) => session.id === activeId) ||
+                    st.pendingSession?.id === activeId;
+                  const attachmentBusy = { ...st.attachmentBusy };
+                  delete attachmentBusy[activeId];
+                  if (!sessionStillExists) return { attachmentBusy };
+                  return {
+                    attachmentBusy,
+                    messages: {
+                      ...st.messages,
+                      [activeId]: (st.messages[activeId] ?? []).filter(
+                        (message) => message.turnId !== provisionalTurnId,
+                      ),
+                    },
+                    attachmentErrors: {
+                      ...st.attachmentErrors,
+                      [activeId]: hasAttachments
+                        ? `Your message and files were not sent. ${displayError} Review them and retry Send.`
+                        : `Your message was not sent. ${displayError} Review it and retry Send.`,
+                    },
+                    attachmentSendErrors: { ...st.attachmentSendErrors, [activeId]: true },
+                    ...runPatch(st, activeId, {
+                      streaming: false,
+                      finalizing: false,
+                      cancel: null,
+                      pendingPermission: null,
+                      pendingCodexRequest: null,
+                      composerPhase: "idle",
+                      activeTool: null,
+                      receipt: null,
+                      outcome: null,
+                    }),
+                  };
+                });
+                clearSettleTimer(activeId);
+                settle();
+                break;
+              }
+              applyTerminalEvent(
+                TOOL_INTERRUPTED_ERROR,
+                e.receipt?.status ?? "error",
+                e.receipt?.stopReason,
+                e.receipt,
+                e.receipt?.failure ? undefined : `\n\n**Error:** ${displayError}`,
+              );
+            }
+            break;
+          case "turn_end":
             applyTerminalEvent(
-              TOOL_INTERRUPTED_ERROR,
-              e.receipt?.status ?? "error",
-              e.receipt?.stopReason,
+              e.stopReason === "cancelled" ? TOOL_INTERRUPTED_CANCELLED : TOOL_INTERRUPTED_ERROR,
+              e.receipt?.status ?? (e.stopReason === "cancelled" ? "cancelled" : "completed"),
+              e.stopReason,
               e.receipt,
-              e.receipt?.failure ? undefined : `\n\n**Error:** ${errorMessage}`,
             );
-          }
-          break;
-        case "turn_end":
-          applyTerminalEvent(
-            e.stopReason === "cancelled" ? TOOL_INTERRUPTED_CANCELLED : TOOL_INTERRUPTED_ERROR,
-            e.receipt?.status ?? (e.stopReason === "cancelled" ? "cancelled" : "completed"),
-            e.stopReason,
-            e.receipt,
-          );
-          break;
-        case "agent_started":
-        case "agent_progress":
-        case "agent_finished":
-          set((st) => ({ agents: applyAgentEvent(st.agents, activeId, e) }));
-          break;
-        case "codex_event":
-          set((st) => ({
-            codexActivity: applyCodexActivityEvent(st.codexActivity, activeId, e),
-          }));
-          break;
-      }
-    };
-
-    watchdog = setInterval(() => {
-      // The turn already ended or was stopped elsewhere (e.g. Stop) — just clean up.
-      const currentRun = get().runs[myKey];
-      if (settled || (!currentRun?.streaming && !currentRun?.finalizing)) {
-        settle();
-        return;
-      }
-      // Provider/tool work is over. Receipt delivery has its own much shorter cap;
-      // never run the agent idle-cancel path against Git finalization.
-      if (currentRun.finalizing && !currentRun.streaming) return;
-      // No event for the whole idle window → treat the turn as hung and recover, so
-      // the composer can't stay disabled forever.
-      if (now() - lastActivity < TURN_IDLE_TIMEOUT_MS) return;
-      if (watchdogCancelInFlight) return;
-      // Cancellation must be acknowledged before we hide the listener or claim the
-      // timed-out run stopped. A rejected invoke keeps streaming locked and visible.
-      if (run === null) {
-        stopRequestedSessions.add(activeId);
-        setRun(set, activeId, { finalizing: true });
-        setRun(set, activeId, { composerPhase: "stopping" });
-        return;
-      }
-      watchdogCancelInFlight = true;
-      setRun(set, activeId, { finalizing: true });
-      void run
-        .cancel()
-        .then(() => {
-          awaitCancelledTerminal(() =>
-            applyCancelGraceFallback(
-              TOOL_INTERRUPTED_ERROR,
-              "interrupted",
-              undefined,
-              "\n\n**Error:** The agent stopped responding (timed out). Please try again.",
-            ),
-          );
-        })
-        .catch((err) => {
-          watchdogCancelInFlight = false;
-          lastActivity = now();
-          setRun(set, activeId, { finalizing: false });
-          apply((blocks) =>
-            appendText(
-              blocks,
-              `\n\n**The agent timed out, but cancellation could not be confirmed:** ${errMessage(err)}. It may still be running.`,
-            ),
-          );
-          setRun(set, activeId, { composerPhase: "thinking" });
-        });
-    }, 1000);
-
-    try {
-      // Per-session model (PR #30): fall back to the global default for older rows.
-      const handle = await ipc.runAgent(activeId, body, onEvent);
-      run = handle;
-      const cancelRun = async () => {
-        await handle.cancel();
-        awaitCancelledTerminal(() =>
-          applyCancelGraceFallback(TOOL_INTERRUPTED_CANCELLED, "cancelled", "cancelled"),
-        );
+            break;
+          case "agent_started":
+          case "agent_progress":
+          case "agent_finished":
+            set((st) => ({ agents: applyAgentEvent(st.agents, activeId, e) }));
+            break;
+          case "codex_event":
+            set((st) => ({
+              codexActivity: applyCodexActivityEvent(st.codexActivity, activeId, e),
+            }));
+            break;
+        }
       };
-      receiptAwareCancels.add(cancelRun);
-      if (settled) {
-        // A terminal event (or the watchdog) settled the turn before the handle
-        // resolved. settle() already ran with run===null (a no-op), so the now-resolved
-        // handle still needs its listener torn down. The terminal event already issued
-        // any backend cancel it needed, so just dispose — no spurious cancel_agent.
-        handle.dispose();
-      } else if (stopRequestedSessions.has(activeId)) {
-        // The user pressed Stop while runAgent was still awaiting its handle, so
-        // stop() could mark finalization but could not yet reach the backend. Send
-        // the deferred cancel now and keep the listener until the terminal receipt.
-        try {
-          await cancelRun();
-        } catch (err) {
-          stopRequestedSessions.delete(activeId);
-          lastActivity = now();
-          // Cancellation was not acknowledged. Keep streaming + listener + watchdog
-          // live, arm Stop for a retry, and state the uncertainty in the transcript.
-          setRun(set, activeId, { cancel: cancelRun, finalizing: false });
-          apply((blocks) =>
-            appendText(
-              blocks,
-              `\n\n**Stop could not be confirmed:** ${errMessage(err)}. The agent may still be running.`,
-            ),
-          );
-          setRun(set, activeId, { composerPhase: "thinking" });
+
+      watchdog = setInterval(() => {
+        // The turn already ended or was stopped elsewhere (e.g. Stop) — just clean up.
+        const currentRun = get().runs[myKey];
+        if (settled || (!currentRun?.streaming && !currentRun?.finalizing)) {
+          settle();
           return;
         }
-        // Cancellation is acknowledged, but native still has to capture and emit
-        // the durable terminal receipt. Keep streaming/finalizing locked until that
-        // event arrives or the bounded grace fallback above expires.
-      } else {
-        // Stop aborts the run AND clears this turn's watchdog (owned by this closure).
-        setRun(set, activeId, {
-          cancel: cancelRun,
+        // Provider/tool work is over. Receipt delivery has its own much shorter cap;
+        // never run the agent idle-cancel path against Git finalization.
+        if (currentRun.finalizing && !currentRun.streaming) return;
+        // No event for the whole idle window → treat the turn as hung and recover, so
+        // the composer can't stay disabled forever.
+        if (now() - lastActivity < TURN_IDLE_TIMEOUT_MS) return;
+        if (watchdogCancelInFlight) return;
+        // Cancellation must be acknowledged before we hide the listener or claim the
+        // timed-out run stopped. A rejected invoke keeps streaming locked and visible.
+        if (run === null) {
+          stopRequestedSessions.add(activeId);
+          setRun(set, activeId, { finalizing: true });
+          setRun(set, activeId, { composerPhase: "stopping" });
+          return;
+        }
+        watchdogCancelInFlight = true;
+        setRun(set, activeId, { finalizing: true });
+        void run
+          .cancel()
+          .then(() => {
+            awaitCancelledTerminal(() =>
+              applyCancelGraceFallback(
+                TOOL_INTERRUPTED_ERROR,
+                "interrupted",
+                undefined,
+                "\n\n**Error:** The agent stopped responding (timed out). Please try again.",
+              ),
+            );
+          })
+          .catch((err) => {
+            watchdogCancelInFlight = false;
+            lastActivity = now();
+            setRun(set, activeId, { finalizing: false });
+            apply((blocks) =>
+              appendText(
+                blocks,
+                `\n\n**The agent timed out, but cancellation could not be confirmed:** ${errMessage(err)}. It may still be running.`,
+              ),
+            );
+            setRun(set, activeId, { composerPhase: "thinking" });
+          });
+      }, 1000);
+
+      try {
+        // Per-session model (PR #30): fall back to the global default for older rows.
+        const submittedPaths = submittedAttachments.map((attachment) => attachment.path);
+        const submittedDisplayNames = attachmentSummaryLabels(submittedAttachments);
+        const handle =
+          submittedPaths.length > 0
+            ? await ipc.runAgent(activeId, body, onEvent, submittedPaths, submittedDisplayNames)
+            : await ipc.runAgent(activeId, body, onEvent);
+        run = handle;
+        commandReturned = true;
+        const cancelRun = async () => {
+          await handle.cancel();
+          awaitCancelledTerminal(() =>
+            applyCancelGraceFallback(TOOL_INTERRUPTED_CANCELLED, "cancelled", "cancelled"),
+          );
+        };
+        receiptAwareCancels.add(cancelRun);
+        if (settled) {
+          // A terminal event (or the watchdog) settled the turn before the handle
+          // resolved. settle() already ran with run===null (a no-op), so the now-resolved
+          // handle still needs its listener torn down. The terminal event already issued
+          // any backend cancel it needed, so just dispose — no spurious cancel_agent.
+          handle.dispose();
+        } else if (stopRequestedSessions.has(activeId)) {
+          // The user pressed Stop while runAgent was still awaiting its handle, so
+          // stop() could mark finalization but could not yet reach the backend. Send
+          // the deferred cancel now and keep the listener until the terminal receipt.
+          try {
+            await cancelRun();
+          } catch (err) {
+            stopRequestedSessions.delete(activeId);
+            lastActivity = now();
+            // Cancellation was not acknowledged. Keep streaming + listener + watchdog
+            // live, arm Stop for a retry, and state the uncertainty in the transcript.
+            setRun(set, activeId, { cancel: cancelRun, finalizing: false });
+            apply((blocks) =>
+              appendText(
+                blocks,
+                `\n\n**Stop could not be confirmed:** ${errMessage(err)}. The agent may still be running.`,
+              ),
+            );
+            setRun(set, activeId, { composerPhase: "thinking" });
+            return;
+          }
+          // Cancellation is acknowledged, but native still has to capture and emit
+          // the durable terminal receipt. Keep streaming/finalizing locked until that
+          // event arrives or the bounded grace fallback above expires.
+        } else {
+          // Stop aborts the run AND clears this turn's watchdog (owned by this closure).
+          setRun(set, activeId, {
+            cancel: cancelRun,
+          });
+        }
+      } catch (err) {
+        onEvent({ type: "error", message: String(err) });
+      }
+    } finally {
+      if (hasAttachments && !attachmentAccepted && !commandReturned) {
+        set((st) => {
+          const attachmentBusy = { ...st.attachmentBusy };
+          delete attachmentBusy[activeId];
+          return { attachmentBusy };
         });
       }
-    } catch (err) {
-      onEvent({ type: "error", message: String(err) });
     }
   },
 
@@ -3800,6 +4007,109 @@ export const useStore = create<AppState>((set, get) => ({
       return { drafts };
     });
     persistDraft(id, v, false); // debounced durable write
+  },
+
+  async addAttachments(paths) {
+    const id = get().activeId;
+    if (!id || paths.length === 0 || get().remoteMode || get().remoteConnected) return;
+    const run = get().runs[runKey(id)];
+    if (run?.streaming || run?.finalizing || get().attachmentBusy[id]) return;
+    const existingPaths = (get().attachments[id] ?? []).map((attachment) => attachment.path);
+    set((st) => {
+      const attachmentErrors = { ...st.attachmentErrors };
+      const attachmentSendErrors = { ...st.attachmentSendErrors };
+      const attachmentRetryPaths = { ...st.attachmentRetryPaths };
+      delete attachmentErrors[id];
+      delete attachmentSendErrors[id];
+      delete attachmentRetryPaths[id];
+      return {
+        attachmentBusy: { ...st.attachmentBusy, [id]: true },
+        attachmentErrors,
+        attachmentSendErrors,
+        attachmentRetryPaths,
+      };
+    });
+    try {
+      const result = await ipc.validateAttachments([...existingPaths, ...paths]);
+      set((st) => {
+        const sessionStillExists =
+          st.sessions.some((session) => session.id === id) || st.pendingSession?.id === id;
+        const attachmentBusy = { ...st.attachmentBusy };
+        if (!sessionStillExists) {
+          delete attachmentBusy[id];
+          return { attachmentBusy };
+        }
+        attachmentBusy[id] = false;
+        const attachmentErrors = { ...st.attachmentErrors };
+        if (result.errors.length > 0) {
+          attachmentErrors[id] = result.errors
+            .map((error) => error.name + ": " + error.message)
+            .join("\n");
+        } else {
+          delete attachmentErrors[id];
+        }
+        return {
+          attachments: {
+            ...st.attachments,
+            [id]: admitAttachmentDisplayNames(st.attachments[id] ?? [], result.attachments),
+          },
+          attachmentErrors,
+          attachmentBusy,
+        };
+      });
+    } catch (error) {
+      set((st) => {
+        const sessionStillExists =
+          st.sessions.some((session) => session.id === id) || st.pendingSession?.id === id;
+        const attachmentBusy = { ...st.attachmentBusy };
+        if (!sessionStillExists) {
+          delete attachmentBusy[id];
+          return { attachmentBusy };
+        }
+        attachmentBusy[id] = false;
+        return {
+          attachmentBusy,
+          attachmentErrors: { ...st.attachmentErrors, [id]: errMessage(error) },
+          attachmentRetryPaths: { ...st.attachmentRetryPaths, [id]: [...paths] },
+        };
+      });
+    }
+  },
+
+  async retryAttachmentValidation() {
+    const id = get().activeId;
+    if (!id) return;
+    const paths = get().attachmentRetryPaths[id];
+    if (!paths?.length) return;
+    await get().addAttachments(paths);
+  },
+
+  removeAttachment(path) {
+    const id = get().activeId;
+    if (!id) return;
+    const run = get().runs[runKey(id)];
+    if (run?.streaming || run?.finalizing || get().attachmentBusy[id]) return;
+    set((st) => {
+      const next = (st.attachments[id] ?? []).filter((attachment) => attachment.path !== path);
+      const attachments = { ...st.attachments };
+      if (next.length > 0) attachments[id] = next;
+      else delete attachments[id];
+      return { attachments };
+    });
+  },
+
+  clearAttachmentError() {
+    const id = get().activeId;
+    if (!id) return;
+    set((st) => {
+      const attachmentErrors = { ...st.attachmentErrors };
+      const attachmentSendErrors = { ...st.attachmentSendErrors };
+      const attachmentRetryPaths = { ...st.attachmentRetryPaths };
+      delete attachmentErrors[id];
+      delete attachmentSendErrors[id];
+      delete attachmentRetryPaths[id];
+      return { attachmentErrors, attachmentSendErrors, attachmentRetryPaths };
+    });
   },
 
   appendDraft(v) {

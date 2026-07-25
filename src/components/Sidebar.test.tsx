@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within, act } from "@testing-library/react";
 
 import {
   DEFAULT_SETTINGS,
@@ -1148,6 +1148,50 @@ describe("Sidebar", () => {
       fireEvent.click(expand);
       expect(useStore.getState().sidebarCollapsed).toBe(false);
       expect(screen.getByRole("button", { name: /Sort sessions/ })).toBeInTheDocument();
+    });
+
+    it("uses the compact rail in a narrow desktop viewport without changing the saved preference", () => {
+      let narrow = true;
+      const listeners = new Set<(event: MediaQueryListEvent) => void>();
+      vi.stubGlobal(
+        "matchMedia",
+        vi.fn(() => ({
+          matches: narrow,
+          media: "(max-width: 760px)",
+          onchange: null,
+          addEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) =>
+            listeners.add(listener),
+          removeEventListener: (_type: string, listener: (event: MediaQueryListEvent) => void) =>
+            listeners.delete(listener),
+          addListener: vi.fn(),
+          removeListener: vi.fn(),
+          dispatchEvent: vi.fn(),
+        })),
+      );
+      useStore.setState({
+        sessions: [session({ id: "a" })],
+        activeId: "a",
+        sidebarCollapsed: false,
+      });
+
+      try {
+        render(<Sidebar />);
+        const expand = screen.getByRole("button", { name: "Expand sidebar" });
+        expect(expand).toBeInTheDocument();
+        expect(useStore.getState().sidebarCollapsed).toBe(false);
+
+        fireEvent.click(expand);
+        expect(screen.getByRole("button", { name: /Sort sessions/ })).toBeInTheDocument();
+
+        narrow = false;
+        act(() =>
+          listeners.forEach((listener) => listener({ matches: false } as MediaQueryListEvent)),
+        );
+        expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
+        expect(useStore.getState().sidebarCollapsed).toBe(false);
+      } finally {
+        vi.unstubAllGlobals();
+      }
     });
 
     it("opens a pending chat from the rail's + button", async () => {

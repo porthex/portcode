@@ -26,6 +26,17 @@ test("feature-completeness agent has the required safety and completeness contra
   }
 });
 
+test("feature completeness plans atomic executable cases and bounded optional exclusions", async () => {
+  const prompt = await readFile(agentUrl, "utf8");
+  for (const requiredText of [
+    "one principal oracle",
+    "one capability family",
+    "split executable UI behavior",
+    "Optional requirements as bounded exclusion tests",
+    "deterministic test or transport evidence",
+  ]) assert.match(prompt, new RegExp(escapeRegExp(requiredText), "i"), `missing: ${requiredText}`);
+});
+
 test("feature model schema requires evidence-backed states, omissions, and edge cases", async () => {
   const schema = JSON.parse(await readFile(schemaUrl, "utf8"));
 
@@ -52,6 +63,7 @@ test("feature model schema requires evidence-backed states, omissions, and edge 
   ]);
   assert.equal(schema.$defs.behaviorOmission.allOf[1].properties.id.pattern, "^MB-[0-9]{3}$");
   assert.equal(schema.$defs.designOmission.allOf[1].properties.id.pattern, "^MD-[0-9]{3}$");
+  assert.match("EC-A11Y-001", new RegExp(schema.$defs.edgeCase.properties.id.pattern));
 
   const categories = schema.$defs.edgeCaseCharter.properties.categories.required;
   assert.deepEqual(categories, [

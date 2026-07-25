@@ -13,7 +13,11 @@
     "provenance": { "$ref": "#/$defs/provenance" },
     "run": { "$ref": "#/$defs/run" },
     "environment": { "$ref": "#/$defs/environment" },
-    "designStatePlan": { "type": "array", "items": { "$ref": "#/$defs/designStatePlanItem" }, "minItems": 1 },
+    "designStatePlan": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/designStatePlanItem" },
+      "minItems": 1
+    },
     "inspectedStates": { "type": "array", "items": { "$ref": "#/$defs/inspectedState" } },
     "observations": { "type": "array", "items": { "$ref": "#/$defs/designObservation" } },
     "coverage": { "$ref": "#/$defs/coverage" },
@@ -23,7 +27,15 @@
     {
       "if": { "properties": { "outcome": { "const": "completed" } } },
       "then": {
-        "required": ["provenance", "run", "environment", "designStatePlan", "inspectedStates", "observations", "coverage"]
+        "required": [
+          "provenance",
+          "run",
+          "environment",
+          "designStatePlan",
+          "inspectedStates",
+          "observations",
+          "coverage"
+        ]
       }
     },
     {
@@ -33,18 +45,52 @@
   ],
   "$defs": {
     "category": {
-      "enum": ["default", "hover", "focus", "pressed", "selected", "disabled", "loading", "empty", "error", "success", "partial", "unsaved", "offline", "stale", "overflow", "responsive", "overlay", "motion", "theme"]
+      "enum": [
+        "default",
+        "hover",
+        "focus",
+        "pressed",
+        "selected",
+        "disabled",
+        "loading",
+        "empty",
+        "error",
+        "success",
+        "partial",
+        "unsaved",
+        "offline",
+        "stale",
+        "overflow",
+        "responsive",
+        "overlay",
+        "motion",
+        "theme"
+      ]
     },
     "provenance": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["agent", "agentVersion", "featureModelSha256", "gitBase", "gitHead", "artifactRoot", "dataProfile"],
+      "required": [
+        "agent",
+        "agentVersion",
+        "featureModelSha256",
+        "featureBriefSha256",
+        "riskRegisterSha256",
+        "gitBase",
+        "gitHead",
+        "workingTreeSha256",
+        "artifactRoot",
+        "dataProfile"
+      ],
       "properties": {
         "agent": { "const": "design-ux-auditor" },
         "agentVersion": { "const": "0.1.0" },
         "featureModelSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "featureBriefSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "riskRegisterSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
         "gitBase": { "type": ["string", "null"] },
         "gitHead": { "type": ["string", "null"] },
+        "workingTreeSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
         "artifactRoot": { "type": "string", "minLength": 1 },
         "dataProfile": { "type": "string", "minLength": 1 }
       }
@@ -62,15 +108,33 @@
     "environment": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["target", "appMode", "platform", "browser", "viewports", "themes", "motionModes"],
+      "required": [
+        "target",
+        "appMode",
+        "platform",
+        "browser",
+        "viewports",
+        "themes",
+        "motionModes"
+      ],
       "properties": {
         "target": { "type": "string", "minLength": 1 },
         "appMode": { "type": "string", "minLength": 1 },
         "platform": { "type": "string", "minLength": 1 },
         "browser": { "type": ["string", "null"] },
         "viewports": { "type": "array", "items": { "$ref": "#/$defs/viewport" }, "minItems": 1 },
-        "themes": { "type": "array", "items": { "enum": ["light", "dark", "system", "unknown"] }, "minItems": 1, "uniqueItems": true },
-        "motionModes": { "type": "array", "items": { "enum": ["reduce", "no-preference", "unknown"] }, "minItems": 1, "uniqueItems": true }
+        "themes": {
+          "type": "array",
+          "items": { "enum": ["light", "dark", "system", "unknown"] },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "motionModes": {
+          "type": "array",
+          "items": { "enum": ["reduce", "no-preference", "unknown"] },
+          "minItems": 1,
+          "uniqueItems": true
+        }
       }
     },
     "viewport": {
@@ -86,7 +150,15 @@
     "designStatePlanItem": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "category", "sourceStateIds", "applicable", "rationale", "expectedDesign", "evidenceBasis"],
+      "required": [
+        "id",
+        "category",
+        "sourceStateIds",
+        "applicable",
+        "rationale",
+        "expectedDesign",
+        "evidenceBasis"
+      ],
       "properties": {
         "id": { "type": "string", "pattern": "^DS-[0-9]{3}$" },
         "category": { "$ref": "#/$defs/category" },
@@ -94,7 +166,11 @@
         "applicable": { "type": "boolean" },
         "rationale": { "type": "string", "minLength": 1 },
         "expectedDesign": { "type": "string", "minLength": 1 },
-        "evidenceBasis": { "type": "array", "items": { "$ref": "#/$defs/designBasis" }, "minItems": 1 }
+        "evidenceBasis": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/designBasis" },
+          "minItems": 1
+        }
       }
     },
     "designBasis": {
@@ -102,7 +178,16 @@
       "additionalProperties": false,
       "required": ["type", "locator", "expectation"],
       "properties": {
-        "type": { "enum": ["explicit-requirement", "feature-state", "project-pattern", "design-token", "platform-convention", "accessibility-standard"] },
+        "type": {
+          "enum": [
+            "explicit-requirement",
+            "feature-state",
+            "project-pattern",
+            "design-token",
+            "platform-convention",
+            "accessibility-standard"
+          ]
+        },
         "locator": { "type": "string", "minLength": 1 },
         "expectation": { "type": "string", "minLength": 1 }
       }
@@ -110,7 +195,19 @@
     "inspectedState": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["planId", "status", "viewportId", "theme", "motionMode", "steps", "actual", "screenshots", "observationIds", "blockerId", "dispositionReason"],
+      "required": [
+        "planId",
+        "status",
+        "viewportId",
+        "theme",
+        "motionMode",
+        "steps",
+        "actual",
+        "screenshots",
+        "observationIds",
+        "blockerId",
+        "dispositionReason"
+      ],
       "properties": {
         "planId": { "type": "string", "pattern": "^DS-[0-9]{3}$" },
         "status": { "enum": ["passed", "observation-recorded", "blocked", "not-applicable"] },
@@ -120,7 +217,11 @@
         "steps": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "actual": { "type": "string", "minLength": 1 },
         "screenshots": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-        "observationIds": { "type": "array", "items": { "type": "string", "pattern": "^DES-[0-9]{3}$" }, "uniqueItems": true },
+        "observationIds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^DES-[0-9]{3}$" },
+          "uniqueItems": true
+        },
         "blockerId": { "type": ["string", "null"] },
         "dispositionReason": { "type": ["string", "null"] }
       }
@@ -128,20 +229,65 @@
     "designObservation": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "title", "classification", "provisionalImpact", "confidence", "planIds", "basis", "preconditions", "steps", "expected", "actual", "viewportIds", "evidence", "status"],
+      "required": [
+        "id",
+        "title",
+        "classification",
+        "provisionalImpact",
+        "confidence",
+        "planIds",
+        "basis",
+        "preconditions",
+        "steps",
+        "expected",
+        "actual",
+        "viewportIds",
+        "evidence",
+        "status"
+      ],
       "properties": {
         "id": { "type": "string", "pattern": "^DES-[0-9]{3}$" },
         "title": { "type": "string", "minLength": 1 },
-        "classification": { "enum": ["missing-state-design", "visual-defect", "missing-feedback", "missing-affordance", "project-inconsistency", "responsive-defect", "focus-or-keyboard-defect", "accessibility-presentation", "motion-defect"] },
-        "provisionalImpact": { "enum": ["primary-flow-blocked", "recovery-or-comprehension", "misleading-state", "interaction-barrier", "limited-impact"] },
+        "classification": {
+          "enum": [
+            "missing-state-design",
+            "visual-defect",
+            "missing-feedback",
+            "missing-affordance",
+            "project-inconsistency",
+            "responsive-defect",
+            "focus-or-keyboard-defect",
+            "accessibility-presentation",
+            "motion-defect"
+          ]
+        },
+        "provisionalImpact": {
+          "enum": [
+            "primary-flow-blocked",
+            "recovery-or-comprehension",
+            "misleading-state",
+            "interaction-barrier",
+            "limited-impact"
+          ]
+        },
         "confidence": { "enum": ["high", "medium", "low"] },
-        "planIds": { "type": "array", "items": { "type": "string", "pattern": "^DS-[0-9]{3}$" }, "minItems": 1, "uniqueItems": true },
+        "planIds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^DS-[0-9]{3}$" },
+          "minItems": 1,
+          "uniqueItems": true
+        },
         "basis": { "type": "array", "items": { "$ref": "#/$defs/designBasis" }, "minItems": 1 },
         "preconditions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "steps": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
         "expected": { "type": "string", "minLength": 1 },
         "actual": { "type": "string", "minLength": 1 },
-        "viewportIds": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "uniqueItems": true },
+        "viewportIds": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true
+        },
         "evidence": { "$ref": "#/$defs/designEvidence" },
         "status": { "const": "observed-unverified" }
       }
@@ -151,7 +297,11 @@
       "additionalProperties": false,
       "required": ["screenshots", "trace", "accessibility", "console"],
       "properties": {
-        "screenshots": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+        "screenshots": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1
+        },
         "trace": { "type": ["string", "null"] },
         "accessibility": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "console": { "type": "array", "items": { "type": "string", "minLength": 1 } }
@@ -160,7 +310,16 @@
     "coverage": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["planned", "applicable", "inspected", "passed", "observationsRecorded", "blocked", "notApplicable", "untestedRisks"],
+      "required": [
+        "planned",
+        "applicable",
+        "inspected",
+        "passed",
+        "observationsRecorded",
+        "blocked",
+        "notApplicable",
+        "untestedRisks"
+      ],
       "properties": {
         "planned": { "type": "integer", "minimum": 0 },
         "applicable": { "type": "integer", "minimum": 0 },

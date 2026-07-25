@@ -43,6 +43,23 @@ test("feature model rejects duplicate IDs, dangling transitions, wrong omission 
   assert.ok(errors.some((error) => error.includes("requirement REQ-001 is not covered")));
 });
 
+test("feature model cannot omit, mutate, or invent frozen explicit requirements", () => {
+  const brief = {
+    outcome: "ready",
+    originalRequirements: [{ id: "REQ-001", text: "Show active work" }],
+    finalRequirements: [{ id: "FR-001", text: "Keep active work visible" }],
+  };
+  const model = validFeatureModel();
+  model.sourceSummary.explicitRequirements.push({ id: "FR-001", text: "Keep active work visible", source: { type: "acceptance-criteria", locator: "brief FR-001" } });
+  model.edgeCaseCharter.categories.input[0].coversRequirementIds.push("FR-001");
+  assert.deepEqual(validateFeatureModelSemantics(model, brief), []);
+  model.sourceSummary.explicitRequirements[0].text = "Paraphrased requirement";
+  model.sourceSummary.explicitRequirements.push({ id: "REQ-999", text: "Invented", source: { type: "original-task", locator: "task" } });
+  const errors = validateFeatureModelSemantics(model, brief);
+  assert.ok(errors.some((error) => error.includes("mutates frozen requirement REQ-001")));
+  assert.ok(errors.some((error) => error.includes("invents explicit requirement REQ-999")));
+});
+
 test("exploration report rejects dangling cases, orphan observations, contradictory totals, impossible reproduction, and empty evidence", () => {
   const model = validFeatureModel();
   const report = validExplorationReport();

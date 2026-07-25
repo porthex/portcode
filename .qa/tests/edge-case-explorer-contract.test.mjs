@@ -29,6 +29,20 @@ test("edge-case explorer requires real interaction, observability, safety, and e
   }
 });
 
+test("edge-case explorer defines the runner-owned coverage equations exactly", async () => {
+  const prompt = await readFile(agentUrl, "utf8");
+
+  for (const requiredText of [
+    "executed = passed + observation-recorded",
+    "observationsRecorded = observations.length",
+    "blocked scenarios are not included in executed",
+    "not-applicable scenarios are not included in executed",
+    "Apply the same equations independently within every category",
+  ]) {
+    assert.match(prompt, new RegExp(escapeRegExp(requiredText), "i"), `missing: ${requiredText}`);
+  }
+});
+
 test("exploration report separates executed coverage from evidence-backed observations", async () => {
   const schema = JSON.parse(await readFile(schemaUrl, "utf8"));
 

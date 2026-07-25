@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  type Attachment,
   DEFAULT_SETTINGS,
   OPENAI_FALLBACK_MODELS,
   type Message,
@@ -50,6 +51,7 @@ vi.mock("../lib/ipc", () => ({
   resolveCodexRequest: vi.fn(),
   setTelemetryConsent: vi.fn(),
   openFolder: vi.fn(),
+  validateAttachments: vi.fn(),
   runAgent: vi.fn(),
   subscribeSessionEvents: vi.fn(),
   cancelAgentById: vi.fn(),
@@ -257,6 +259,7 @@ beforeEach(() => {
   m.resolveCodexRequest.mockResolvedValue(undefined);
   m.setTelemetryConsent.mockResolvedValue(undefined);
   m.openFolder.mockResolvedValue(null);
+  m.validateAttachments.mockResolvedValue({ attachments: [], errors: [] });
   m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}), dispose: vi.fn() });
   m.subscribeSessionEvents.mockResolvedValue(() => {});
   m.cancelAgentById.mockResolvedValue(undefined);
@@ -2505,6 +2508,353 @@ describe("renameSession", () => {
   });
 });
 
+const attachment = (over: Partial<Attachment> = {}): Attachment => {
+  const name = over.name ?? "example.rs";
+  return {
+    path: "C:/fixtures/example.rs",
+    name,
+    displayName: over.displayName ?? name,
+    kind: "text",
+    mediaType: "text/x-rust",
+    size: 12,
+    thumbnailUrl: null,
+    ...over,
+  };
+};
+
+describe("composer attachments", () => {
+  it("keeps valid files and session-scoped actionable errors from one validation", async () => {
+    const existing = attachment({ path: "C:/fixtures/old.md", name: "old.md" });
+    const added = attachment();
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      attachments: { a: [existing], b: [attachment({ path: "C:/b.txt", name: "b.txt" })] },
+    });
+    m.validateAttachments.mockResolvedValue({
+      attachments: [existing, added],
+      errors: [{ name: "archive.zip", message: "This file type is not supported." }],
+    });
+
+    await useStore.getState().addAttachments([added.path, "C:/fixtures/archive.zip"]);
+
+    expect(m.validateAttachments).toHaveBeenCalledWith([
+      existing.path,
+      added.path,
+      "C:/fixtures/archive.zip",
+    ]);
+    expect(useStore.getState().attachments.a).toEqual([existing, added]);
+    expect(useStore.getState().attachments.b).toHaveLength(1);
+    expect(useStore.getState().attachmentErrors.a).toContain("archive.zip");
+    expect(useStore.getState().attachmentBusy.a).toBe(false);
+  });
+
+  it("routes a slow validation back to its originating session and blocks duplicate adds", async () => {
+    let finish!: (value: { attachments: Attachment[]; errors: [] }) => void;
+    m.validateAttachments.mockImplementationOnce(
+      () => new Promise((resolve) => (finish = resolve)),
+    );
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      attachments: {},
+    });
+
+    const first = useStore.getState().addAttachments(["C:/fixtures/a.txt"]);
+    const duplicate = useStore.getState().addAttachments(["C:/fixtures/a.txt"]);
+    useStore.setState({ activeId: "b" });
+    const added = attachment({ path: "C:/fixtures/a.txt", name: "a.txt" });
+    finish({ attachments: [added], errors: [] });
+    await Promise.all([first, duplicate]);
+
+    expect(m.validateAttachments).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().attachments.a).toEqual([added]);
+    expect(useStore.getState().attachments.b).toBeUndefined();
+  });
+
+  it("surfaces native validation failures, preserves valid files, and clears the error", async () => {
+    const existing = attachment();
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      attachments: { a: [existing] },
+    });
+    m.validateAttachments.mockRejectedValueOnce(new Error("Attachment validation is unavailable."));
+
+    await useStore.getState().addAttachments(["C:/fixtures/new.txt"]);
+
+    expect(useStore.getState().attachments.a).toEqual([existing]);
+    expect(useStore.getState().attachmentBusy.a).toBe(false);
+    expect(useStore.getState().attachmentErrors.a).toBe("Attachment validation is unavailable.");
+    useStore.getState().clearAttachmentError();
+    expect(useStore.getState().attachmentErrors.a).toBeUndefined();
+  });
+
+  it("does not restore a validation result after its session disappears", async () => {
+    let finish!: (value: { attachments: Attachment[]; errors: [] }) => void;
+    m.validateAttachments.mockImplementationOnce(
+      () => new Promise((resolve) => (finish = resolve)),
+    );
+    useStore.setState({ sessions: [session({ id: "a" })], activeId: "a", attachments: {} });
+
+    const adding = useStore.getState().addAttachments(["C:/fixtures/late.txt"]);
+    useStore.setState({
+      sessions: [session({ id: "b" })],
+      activeId: "b",
+      attachments: {},
+    });
+    finish({
+      attachments: [attachment({ path: "C:/fixtures/late.txt", name: "late.txt" })],
+      errors: [],
+    });
+    await adding;
+
+    expect(useStore.getState().attachments.a).toBeUndefined();
+    expect(useStore.getState().attachmentBusy.a).toBeUndefined();
+    expect(useStore.getState().attachmentErrors.a).toBeUndefined();
+    expect(useStore.getState().attachmentRetryPaths.a).toBeUndefined();
+  });
+
+  it("does not recreate attachment state when validation rejects after session deletion", async () => {
+    let fail!: (error: Error) => void;
+    m.validateAttachments.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => (fail = reject)),
+    );
+    useStore.setState({ sessions: [session({ id: "a" })], activeId: "a", attachments: {} });
+
+    const adding = useStore.getState().addAttachments(["C:/fixtures/late.txt"]);
+    useStore.setState({ sessions: [session({ id: "b" })], activeId: "b", attachments: {} });
+    fail(new Error("late failure"));
+    await adding;
+
+    expect(useStore.getState().attachments.a).toBeUndefined();
+    expect(useStore.getState().attachmentBusy.a).toBeUndefined();
+    expect(useStore.getState().attachmentErrors.a).toBeUndefined();
+    expect(useStore.getState().attachmentRetryPaths.a).toBeUndefined();
+  });
+
+  it("removes by canonical path while idle but freezes attachment changes during a turn", () => {
+    const first = attachment();
+    const second = attachment({ path: "C:/fixtures/pixel.png", name: "pixel.png", kind: "image" });
+    useStore.setState({ activeId: "a", attachments: { a: [first, second] } });
+
+    useStore.getState().removeAttachment(first.path);
+    expect(useStore.getState().attachments.a).toEqual([second]);
+
+    useStore.getState().removeAttachment(second.path);
+    expect(useStore.getState().attachments.a).toBeUndefined();
+    useStore.setState({ attachments: { a: [second] } });
+
+    useStore.setState({
+      runs: { a: runState({ streaming: true }) },
+      streaming: true,
+    });
+    useStore.getState().removeAttachment(second.path);
+    expect(useStore.getState().attachments.a).toEqual([second]);
+  });
+
+  it("keeps attachment input until turn_start accepts it, then clears only its session", async () => {
+    const sent = attachment();
+    const other = attachment({ path: "C:/fixtures/other.txt", name: "other.txt" });
+    let emit!: (event: StreamEvent) => void;
+    m.runAgent.mockImplementationOnce(async (_sessionId, _text, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
+    useStore.setState({
+      sessions: [session({ id: "a" }), session({ id: "b" })],
+      activeId: "a",
+      messages: { a: [] },
+      drafts: {},
+      attachments: { a: [sent], b: [other] },
+    });
+
+    await useStore.getState().send("");
+
+    expect(m.runAgent).toHaveBeenCalledWith(
+      "a",
+      "",
+      expect.any(Function),
+      [sent.path],
+      [sent.displayName],
+    );
+    expect(useStore.getState().attachments.a).toEqual([sent]);
+    expect(useStore.getState().attachments.b).toEqual([other]);
+    expect(useStore.getState().messages.a[0].blocks).toEqual([
+      { kind: "text", text: "Attached: example.rs" },
+    ]);
+
+    emit({ type: "turn_start", messageId: "native-message", turnId: "native-turn" });
+
+    expect(useStore.getState().attachments.a).toBeUndefined();
+    expect(useStore.getState().attachments.b).toEqual([other]);
+  });
+
+  it("keeps a text-only draft until turn_start accepts it", async () => {
+    let emit!: (event: StreamEvent) => void;
+    m.runAgent.mockImplementationOnce(async (_sessionId, _text, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: { a: [] },
+      drafts: { a: "Inspect this" },
+      attachments: {},
+    });
+
+    await useStore.getState().send("Inspect this");
+    expect(useStore.getState().drafts.a).toBe("Inspect this");
+
+    emit({ type: "turn_start", messageId: "native-message", turnId: "native-turn" });
+    expect(useStore.getState().drafts.a).toBeUndefined();
+    expect(m.saveDraft).toHaveBeenCalledWith("a", "");
+  });
+
+  it("uses collision-free attachment labels in optimistic transcript and title", async () => {
+    const first = attachment({
+      path: "C:/alpha/index.ts",
+      name: "index.ts",
+      displayName: undefined,
+    });
+    const second = attachment({
+      path: "C:/beta/index.ts",
+      name: "index.ts",
+      displayName: undefined,
+    });
+    useStore.setState({
+      sessions: [session({ id: "a", title: "New chat" })],
+      activeId: "a",
+      messages: { a: [] },
+      drafts: {},
+      attachments: { a: [first, second] },
+    });
+
+    await useStore.getState().send("");
+
+    expect(useStore.getState().messages.a[0].blocks).toEqual([
+      { kind: "text", text: "Attached: index.ts <attachment 1>, index.ts <attachment 2>" },
+    ]);
+    expect(useStore.getState().sessions[0].title).toContain("index.ts <attachment 1>");
+  });
+
+  it("preserves an admitted duplicate label after removal and submits it immutably", async () => {
+    const first = attachment({ path: "C:/alpha/index.ts", name: "index.ts" });
+    const second = attachment({ path: "C:/beta/index.ts", name: "index.ts" });
+    m.validateAttachments
+      .mockResolvedValueOnce({ attachments: [first], errors: [] })
+      .mockResolvedValueOnce({ attachments: [first, second], errors: [] });
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: { a: [] },
+      drafts: {},
+      attachments: {},
+    });
+
+    await useStore.getState().addAttachments([first.path]);
+    await useStore.getState().addAttachments([second.path]);
+    expect(useStore.getState().attachments.a.map((item) => item.displayName)).toEqual([
+      "index.ts <attachment 1>",
+      "index.ts <attachment 2>",
+    ]);
+
+    useStore.getState().removeAttachment(first.path);
+    await useStore.getState().send("");
+
+    expect(useStore.getState().messages.a[0].blocks).toEqual([
+      { kind: "text", text: "Attached: index.ts <attachment 2>" },
+    ]);
+    expect(m.runAgent).toHaveBeenCalledWith(
+      "a",
+      "",
+      expect.any(Function),
+      [second.path],
+      ["index.ts <attachment 2>"],
+    );
+  });
+
+  it("preserves attachments and the typed draft when native acceptance rejects", async () => {
+    const sent = attachment();
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: { a: [] },
+      drafts: { a: "Inspect this" },
+      attachments: { a: [sent] },
+    });
+    m.runAgent.mockRejectedValueOnce(new Error("example.rs: This file could not be read."));
+
+    await useStore.getState().send("Inspect this");
+
+    expect(useStore.getState().attachments.a).toEqual([sent]);
+    expect(useStore.getState().drafts.a).toBe("Inspect this");
+    expect(useStore.getState().attachmentBusy.a).toBeUndefined();
+  });
+
+  it("restores an actionable retry snapshot when an error follows command return before turn_start", async () => {
+    const sent = attachment();
+    let emit!: (event: StreamEvent) => void;
+    m.runAgent.mockImplementationOnce(async (_sessionId, _text, onEvent) => {
+      emit = onEvent;
+      return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+    });
+    useStore.setState({
+      sessions: [session({ id: "a" })],
+      activeId: "a",
+      messages: { a: [] },
+      drafts: { a: "Inspect this" },
+      attachments: { a: [sent] },
+    });
+
+    await useStore.getState().send("Inspect this");
+    emit({ type: "error", message: "Error: turn start was not accepted" });
+
+    expect(useStore.getState().attachments.a).toEqual([sent]);
+    expect(useStore.getState().drafts.a).toBe("Inspect this");
+    expect(useStore.getState().attachmentBusy.a).toBeUndefined();
+    expect(useStore.getState().attachmentSendErrors.a).toBe(true);
+    expect(useStore.getState().attachmentErrors.a).toBe(
+      "Your message and files were not sent. turn start was not accepted Review them and retry Send.",
+    );
+    expect(useStore.getState().messages.a).toEqual([]);
+  });
+
+  it("locks submitted attachments while an earlier model write is still settling", async () => {
+    const sent = attachment();
+    let finishModelWrite!: () => void;
+    m.updateSessionModel.mockImplementationOnce(
+      () => new Promise<void>((resolve) => (finishModelWrite = resolve)),
+    );
+    useStore.setState({
+      sessions: [session({ id: "a", model: "gpt-5.6-terra" })],
+      activeId: "a",
+      messages: { a: [] },
+      drafts: { a: "Inspect this" },
+      attachments: { a: [sent] },
+    });
+
+    const changingModel = useStore.getState().setSessionModel("gpt-5.6-sol");
+    const sending = useStore.getState().send("Inspect this");
+    await Promise.resolve();
+
+    expect(useStore.getState().attachmentBusy.a).toBe(true);
+    useStore.getState().removeAttachment(sent.path);
+    expect(useStore.getState().attachments.a).toEqual([sent]);
+
+    finishModelWrite();
+    await Promise.all([changingModel, sending]);
+    expect(m.runAgent).toHaveBeenCalledWith(
+      "a",
+      "Inspect this",
+      expect.any(Function),
+      [sent.path],
+      [sent.displayName],
+    );
+  });
+});
+
 describe("send", () => {
   it("ignores empty text, a missing session, or an in-flight turn", async () => {
     useStore.setState({ activeId: null });
@@ -3226,7 +3576,7 @@ describe("send", () => {
     expect(useStore.getState().sessions[0].title).toBe("Keep me");
   });
 
-  it("surfaces a runAgent rejection as an inline error and stops streaming", async () => {
+  it("rolls back a runAgent rejection before acceptance and exposes retry state", async () => {
     m.runAgent.mockRejectedValue(new Error("boom"));
     useStore.setState({ sessions: [session({ id: "a" })], activeId: "a", messages: { a: [] } });
 
@@ -3234,9 +3584,9 @@ describe("send", () => {
 
     const st = useStore.getState();
     expect(st.streaming).toBe(false);
-    const text = st.messages.a[1].blocks.map((b) => (b.kind === "text" ? b.text : "")).join("");
-    expect(text).toContain("Error");
-    expect(text).toContain("boom");
+    expect(st.messages.a).toEqual([]);
+    expect(st.attachmentErrors.a).toContain("boom");
+    expect(st.attachmentSendErrors.a).toBe(true);
   });
 
   it("routes through the remote command path (not the local agent) when connected", async () => {
@@ -3432,6 +3782,7 @@ describe("send", () => {
       });
 
       await useStore.getState().send("go");
+      emit({ type: "turn_start", messageId: "native-turn", turnId: "native-turn", startedAt: 100 });
       emit({ type: "error", message: raw });
 
       const text = useStore
@@ -3464,6 +3815,7 @@ describe("send", () => {
     });
 
     await useStore.getState().send("go");
+    emit({ type: "turn_start", messageId: "native-turn", turnId: "native-turn", startedAt: 100 });
     emit({ type: "error", message: localFailure });
 
     const text = useStore
@@ -3496,6 +3848,7 @@ describe("send", () => {
     });
 
     await useStore.getState().send("go");
+    emit({ type: "turn_start", messageId: "native-turn", turnId: "native-turn", startedAt: 100 });
     emit({ type: "error", message: raw });
 
     const text = useStore
@@ -3526,6 +3879,7 @@ describe("send", () => {
     });
 
     await useStore.getState().send("go");
+    emit({ type: "turn_start", messageId: "native-turn", turnId: "native-turn", startedAt: 100 });
     emit({ type: "error", message: "HTTP 503 upstream body" });
 
     const text = useStore
@@ -4554,10 +4908,16 @@ describe("composer drafts on send", () => {
   it("clears the sent session's draft everywhere, flushing the backend immediately", async () => {
     vi.useFakeTimers();
     try {
+      let emit!: (event: StreamEvent) => void;
+      m.runAgent.mockImplementation(async (_id, _text, onEvent) => {
+        emit = onEvent;
+        return { cancel: vi.fn(async () => {}), dispose: vi.fn() };
+      });
       useStore.getState().setDraft("a half-written thought");
       expect(useStore.getState().drafts.a).toBe("a half-written thought");
 
       await useStore.getState().send("ship it");
+      emit({ type: "turn_start", messageId: "native-turn", turnId: "native-turn", startedAt: 100 });
 
       // The open loop is closed: in-memory map + localStorage mirror cleared, and the
       // durable backend cleared IMMEDIATELY (not waiting on the debounce) so a fast

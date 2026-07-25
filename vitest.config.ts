@@ -3,6 +3,9 @@ import react from "@vitejs/plugin-react";
 
 // Frontend test runner. Never makes live LLM calls — see CONTRIBUTING.md.
 export default defineConfig({
+  define: {
+    __PORTCODE_QA_CONTROLS__: false,
+  },
   plugins: [react()],
   test: {
     environment: "jsdom",

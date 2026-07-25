@@ -5,7 +5,10 @@ import tailwindcss from "@tailwindcss/vite";
 // Tauri expects a fixed port and ignores hmr over the network.
 const host = process.env.TAURI_DEV_HOST;
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
+  define: {
+    __PORTCODE_QA_CONTROLS__: JSON.stringify(mode === "qa"),
+  },
   plugins: [react(), tailwindcss()],
   clearScreen: false,
   server: {
@@ -27,4 +30,4 @@ export default defineConfig({
     // not shipped in the bundle. Dev/contributor builds (no token) emit none.
     sourcemap: !!process.env.SENTRY_AUTH_TOKEN,
   },
-});
+}));

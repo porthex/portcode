@@ -406,7 +406,7 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
       <BackgroundTasksPanel />
       <PermissionPrompt />
       <CodexRequestPrompt />
-      <div data-testid="chat-composer-area" className="w-full shrink-0">
+      <div data-testid="chat-composer-area" className="w-full min-h-0 shrink">
         <Composer />
       </div>
     </div>

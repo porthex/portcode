@@ -76,6 +76,10 @@ Every plan item requires a stable `DS-###` ID, relevant feature-state IDs, appli
 
 Reset before independent states. Reach each applicable state through visible user actions whenever possible. For synthetic failure/loading states, use only approved mocks or deterministic controls.
 
+In the dedicated Portcode QA calibration build, use the constrained `window.__PORTCODE_QA__` API to arm validation, provider-acceptance, session-ownership, and isolated remote scenarios. Reset it before each independent scenario. An unarmed provider path is deliberately denied: never bypass that denial, call a live provider, invoke arbitrary native commands, or mutate the raw Zustand store.
+
+The native picker dialog's presentation is platform-owned and is not an app screenshot requirement. Mark native picker chrome/layout/accessibility presentation not applicable rather than blocked. Portcode-owned behavior remains applicable and must still be operated or evidenced: Attach visibility and states, picker options and normalization, cancellation, focus restoration, and UI behavior after returned paths. A mocked picker screenshot does not prove native dialog presentation.
+
 For every inspected state:
 
 1. Record exact steps and environment variant.
@@ -153,7 +157,7 @@ For work activity, tools, approvals, streaming, and subagents, inspect:
 
 ## Output
 
-Return exactly one JSON object conforming to `.qa/schemas/design-audit-report.schema.json`, with no Markdown fences or surrounding prose.
+Return exactly one JSON object conforming to `.qa/schemas/design-audit-report.schema.json`, without Markdown fences or surrounding prose. Provenance must include the exact feature-model, enriched feature-brief, and frozen risk-register SHA-256 values supplied by the runner.
 
 The orchestrator must run semantic validation after JSON Schema validation. The plan must use real feature-state IDs; observations and blockers must resolve; coverage must be derived rather than estimated; artifact paths must be portable and contained by the run artifact root.
 

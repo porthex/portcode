@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qa://schemas/risk-verification/0.1.0",
+  "title": "Post-implementation frozen-risk verification",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "reportId", "outcome", "blockers"],
+  "properties": {
+    "schemaVersion": { "const": "0.1.0" },
+    "reportId": { "type": "string", "minLength": 1 },
+    "outcome": { "enum": ["completed", "blocked"] },
+    "riskRegisterId": { "type": "string", "minLength": 1 },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "blockers": { "type": "array", "items": { "$ref": "#/$defs/blocker" } },
+    "verdicts": { "type": "array", "items": { "$ref": "#/$defs/verdict" } },
+    "summary": { "$ref": "#/$defs/summary" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "outcome": { "const": "completed" } } },
+      "then": {
+        "required": ["riskRegisterId", "provenance", "verdicts", "summary"],
+        "properties": { "blockers": { "maxItems": 0 } }
+      }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "blocked" } } },
+      "then": { "properties": { "blockers": { "minItems": 1 } } }
+    }
+  ],
+  "$defs": {
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent",
+        "agentVersion",
+        "featureBriefSha256",
+        "riskRegisterSha256",
+        "featureModelSha256",
+        "gitBase",
+        "gitHead",
+        "workingTreeSha256",
+        "artifactRoot",
+        "dataProfile"
+      ],
+      "properties": {
+        "agent": { "const": "post-implementation-risk-verifier" },
+        "agentVersion": { "const": "0.1.0" },
+        "featureBriefSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "riskRegisterSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "featureModelSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "gitBase": { "type": ["string", "null"] },
+        "gitHead": { "type": ["string", "null"] },
+        "workingTreeSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "artifactRoot": { "type": "string", "minLength": 1 },
+        "dataProfile": { "type": "string", "minLength": 1 }
+      }
+    },
+    "blocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "reason"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^BLK-[0-9]{3}$" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "tests", "screenshots", "trace", "console", "pageErrors", "network"],
+      "properties": {
+        "source": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "tests": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "screenshots": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "trace": { "type": ["string", "null"] },
+        "console": { "type": "array", "items": { "type": "string" } },
+        "pageErrors": { "type": "array", "items": { "type": "string" } },
+        "network": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "verdict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "riskId",
+        "status",
+        "candidateId",
+        "rationale",
+        "steps",
+        "expected",
+        "actual",
+        "satisfiedMethods",
+        "satisfiedCapabilities",
+        "scopeEvidence",
+        "evidence"
+      ],
+      "properties": {
+        "riskId": { "type": "string", "pattern": "^RISK-[0-9]{3}$" },
+        "status": { "enum": ["verified-safe", "finding", "not-applicable", "blocked"] },
+        "candidateId": { "type": ["string", "null"], "pattern": "^RV-[0-9]{3}$" },
+        "rationale": { "type": "string" },
+        "steps": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "expected": { "type": "string" },
+        "actual": { "type": "string" },
+        "satisfiedMethods": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "source-review",
+              "unit-test",
+              "integration-test",
+              "runtime",
+              "native-runtime",
+              "browser-runtime",
+              "transport-capture",
+              "controlled-race"
+            ]
+          }
+        },
+        "satisfiedCapabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "scopeEvidence": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "evidence": { "$ref": "#/$defs/evidence" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "finding" } } },
+          "then": {
+            "properties": {
+              "candidateId": { "type": "string", "pattern": "^RV-[0-9]{3}$" },
+              "steps": { "minItems": 1 },
+              "expected": { "minLength": 1 },
+              "actual": { "minLength": 1 }
+            }
+          },
+          "else": { "properties": { "candidateId": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "status": { "const": "not-applicable" } } },
+          "then": { "properties": { "scopeEvidence": { "minItems": 1 } } }
+        }
+      ]
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "verifiedSafe", "findings", "notApplicable", "blocked", "coverageGate"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "verifiedSafe": { "type": "integer", "minimum": 0 },
+        "findings": { "type": "integer", "minimum": 0 },
+        "notApplicable": { "type": "integer", "minimum": 0 },
+        "blocked": { "type": "integer", "minimum": 0 },
+        "coverageGate": { "enum": ["pass", "needs-review"] }
+      }
+    }
+  }
+}

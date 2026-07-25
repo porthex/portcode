@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qa://schemas/feature-brief/0.1.0",
+  "title": "Synthesized feature build brief",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "briefId", "outcome", "blockers"],
+  "properties": {
+    "schemaVersion": { "const": "0.1.0" },
+    "briefId": { "type": "string", "minLength": 1 },
+    "outcome": { "enum": ["ready", "blocked"] },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "blockers": { "type": "array", "items": { "$ref": "#/$defs/blocker" } },
+    "originalRequestVerbatim": { "type": "string", "minLength": 1 },
+    "originalRequirements": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/originalRequirement" },
+      "minItems": 1
+    },
+    "proposalDecisions": { "type": "array", "items": { "$ref": "#/$defs/decision" } },
+    "finalRequirements": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finalRequirement" },
+      "minItems": 1
+    },
+    "builderBrief": { "type": "string", "minLength": 1 },
+    "changeBudget": { "type": "string", "minLength": 1 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "outcome": { "const": "ready" } } },
+      "then": {
+        "required": [
+          "provenance",
+          "originalRequestVerbatim",
+          "originalRequirements",
+          "proposalDecisions",
+          "finalRequirements",
+          "builderBrief",
+          "changeBudget"
+        ],
+        "properties": { "blockers": { "maxItems": 0 } }
+      }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "blocked" } } },
+      "then": { "properties": { "blockers": { "minItems": 1 } } }
+    }
+  ],
+  "$defs": {
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent",
+        "agentVersion",
+        "taskSha256",
+        "useCaseScoutSha256",
+        "riskRegisterSha256",
+        "gitBase",
+        "gitHead",
+        "workingTreeSha256"
+      ],
+      "properties": {
+        "agent": { "const": "feature-brief-synthesizer" },
+        "agentVersion": { "const": "0.1.0" },
+        "taskSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "useCaseScoutSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "riskRegisterSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "gitBase": { "type": ["string", "null"] },
+        "gitHead": { "type": ["string", "null"] },
+        "workingTreeSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" }
+      }
+    },
+    "blocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "reason"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^BLK-[0-9]{3}$" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "originalRequirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "text"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^REQ-[0-9]{3}$" },
+        "text": { "type": "string", "minLength": 1 }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["proposalId", "category", "decision", "rationale"],
+      "properties": {
+        "proposalId": { "type": "string", "pattern": "^UC-[0-9]{3}$" },
+        "category": { "enum": ["Expected", "Optional", "Rejected"] },
+        "decision": { "enum": ["include", "defer", "reject"] },
+        "rationale": { "type": "string", "minLength": 1 }
+      }
+    },
+    "finalRequirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "text", "origin", "sourceIds", "acceptanceCriteria", "riskIds"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^FR-[0-9]{3}$" },
+        "text": { "type": "string", "minLength": 1 },
+        "origin": { "enum": ["Required", "Expected", "Optional"] },
+        "sourceIds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^(REQ|UC)-[0-9]{3}$" },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "acceptanceCriteria": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1
+        },
+        "riskIds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^RISK-[0-9]{3}$" },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

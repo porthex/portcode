@@ -34,15 +34,33 @@
     "provenance": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["agent", "agentVersion", "featureModelSha256", "explorationReportSha256", "designReportSha256", "gitBase", "gitHead", "artifactRoot", "dataProfile"],
+      "required": [
+        "agent",
+        "agentVersion",
+        "featureModelSha256",
+        "featureBriefSha256",
+        "riskRegisterSha256",
+        "explorationReportSha256",
+        "designReportSha256",
+        "riskVerificationSha256",
+        "gitBase",
+        "gitHead",
+        "workingTreeSha256",
+        "artifactRoot",
+        "dataProfile"
+      ],
       "properties": {
         "agent": { "const": "independent-reproducer" },
         "agentVersion": { "const": "0.1.0" },
         "featureModelSha256": { "$ref": "#/$defs/sha256" },
+        "featureBriefSha256": { "$ref": "#/$defs/sha256" },
+        "riskRegisterSha256": { "$ref": "#/$defs/sha256" },
         "explorationReportSha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
         "designReportSha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "riskVerificationSha256": { "$ref": "#/$defs/sha256" },
         "gitBase": { "type": ["string", "null"] },
         "gitHead": { "type": ["string", "null"] },
+        "workingTreeSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
         "artifactRoot": { "type": "string", "minLength": 1 },
         "dataProfile": { "type": "string", "minLength": 1 }
       }
@@ -67,7 +85,12 @@
         "appMode": { "type": "string", "minLength": 1 },
         "platform": { "type": "string", "minLength": 1 },
         "browser": { "type": ["string", "null"] },
-        "viewportIds": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1, "uniqueItems": true },
+        "viewportIds": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true
+        },
         "dataResetId": { "type": "string", "minLength": 1 }
       }
     },
@@ -76,23 +99,59 @@
       "additionalProperties": false,
       "required": ["candidateId", "source", "sourceReportSha256"],
       "properties": {
-        "candidateId": { "type": "string", "pattern": "^(OBS|DES)-[0-9]{3}$" },
-        "source": { "enum": ["edge-case-explorer", "design-ux-auditor"] },
+        "candidateId": { "type": "string", "pattern": "^(OBS|DES|RV)-[0-9]{3}$" },
+        "source": {
+          "enum": ["edge-case-explorer", "design-ux-auditor", "post-implementation-risk-verifier"]
+        },
         "sourceReportSha256": { "$ref": "#/$defs/sha256" }
       }
     },
     "verdict": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["candidateId", "source", "disposition", "reasonCode", "rationale", "classification", "finalSeverity", "reach", "frequency", "preconditions", "steps", "expected", "actual", "reproduction", "oracleBasis", "evidence"],
+      "required": [
+        "candidateId",
+        "source",
+        "disposition",
+        "reasonCode",
+        "rationale",
+        "classification",
+        "finalSeverity",
+        "reach",
+        "frequency",
+        "preconditions",
+        "steps",
+        "expected",
+        "actual",
+        "reproduction",
+        "oracleBasis",
+        "evidence"
+      ],
       "properties": {
-        "candidateId": { "type": "string", "pattern": "^(OBS|DES)-[0-9]{3}$" },
-        "source": { "enum": ["edge-case-explorer", "design-ux-auditor"] },
+        "candidateId": { "type": "string", "pattern": "^(OBS|DES|RV)-[0-9]{3}$" },
+        "source": {
+          "enum": ["edge-case-explorer", "design-ux-auditor", "post-implementation-risk-verifier"]
+        },
         "disposition": { "enum": ["confirmed", "rejected", "inconclusive"] },
-        "reasonCode": { "enum": ["reproduced", "not-reproduced", "expected-behavior", "invalid-oracle", "duplicate", "insufficient-evidence", "environment-blocked", "intermittent", "unsafe-to-reproduce"] },
+        "reasonCode": {
+          "enum": [
+            "reproduced",
+            "not-reproduced",
+            "expected-behavior",
+            "invalid-oracle",
+            "duplicate",
+            "insufficient-evidence",
+            "environment-blocked",
+            "intermittent",
+            "unsafe-to-reproduce"
+          ]
+        },
         "rationale": { "type": "string", "minLength": 1 },
         "classification": { "type": "string", "minLength": 1 },
-        "finalSeverity": { "type": ["string", "null"], "enum": ["critical", "high", "medium", "low", null] },
+        "finalSeverity": {
+          "type": ["string", "null"],
+          "enum": ["critical", "high", "medium", "low", null]
+        },
         "reach": { "enum": ["common", "occasional", "rare", "unknown"] },
         "frequency": { "enum": ["always", "frequent", "intermittent", "once", "not-observed"] },
         "preconditions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
@@ -100,7 +159,11 @@
         "expected": { "type": "string", "minLength": 1 },
         "actual": { "type": "string", "minLength": 1 },
         "reproduction": { "$ref": "#/$defs/reproduction" },
-        "oracleBasis": { "type": "array", "items": { "$ref": "#/$defs/oracleBasis" }, "minItems": 1 },
+        "oracleBasis": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/oracleBasis" },
+          "minItems": 1
+        },
         "evidence": { "$ref": "#/$defs/independentEvidence" }
       },
       "allOf": [
@@ -135,7 +198,16 @@
       "additionalProperties": false,
       "required": ["type", "locator", "expectation"],
       "properties": {
-        "type": { "enum": ["explicit-requirement", "feature-state", "project-rule", "existing-pattern", "platform-convention", "accessibility-standard"] },
+        "type": {
+          "enum": [
+            "explicit-requirement",
+            "feature-state",
+            "project-rule",
+            "existing-pattern",
+            "platform-convention",
+            "accessibility-standard"
+          ]
+        },
         "locator": { "type": "string", "minLength": 1 },
         "expectation": { "type": "string", "minLength": 1 }
       }
@@ -162,7 +234,16 @@
     "summary": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["totalCandidates", "confirmed", "rejected", "inconclusive", "bySeverity", "blockingSeverities", "mergeGate", "gateReasons"],
+      "required": [
+        "totalCandidates",
+        "confirmed",
+        "rejected",
+        "inconclusive",
+        "bySeverity",
+        "blockingSeverities",
+        "mergeGate",
+        "gateReasons"
+      ],
       "properties": {
         "totalCandidates": { "type": "integer", "minimum": 0 },
         "confirmed": { "type": "integer", "minimum": 0 },
@@ -179,7 +260,12 @@
             "low": { "type": "integer", "minimum": 0 }
           }
         },
-        "blockingSeverities": { "type": "array", "items": { "enum": ["critical", "high", "medium", "low"] }, "minItems": 1, "uniqueItems": true },
+        "blockingSeverities": {
+          "type": "array",
+          "items": { "enum": ["critical", "high", "medium", "low"] },
+          "minItems": 1,
+          "uniqueItems": true
+        },
         "mergeGate": { "enum": ["pass", "fail", "needs-review"] },
         "gateReasons": { "type": "array", "items": { "type": "string", "minLength": 1 } }
       }
@@ -192,7 +278,11 @@
         "id": { "type": "string", "pattern": "^BLK-[0-9]{3}$" },
         "area": { "type": "string", "minLength": 1 },
         "reason": { "type": "string", "minLength": 1 },
-        "affectedCandidateIds": { "type": "array", "items": { "type": "string", "pattern": "^(OBS|DES)-[0-9]{3}$" }, "uniqueItems": true }
+        "affectedCandidateIds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^(OBS|DES|RV)-[0-9]{3}$" },
+          "uniqueItems": true
+        }
       }
     }
   }

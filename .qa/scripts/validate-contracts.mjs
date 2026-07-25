@@ -9,7 +9,211 @@ const CATEGORIES = [
   "neighboringRegression",
 ];
 
-export function validateFeatureModelSemantics(model) {
+const STRONG_PRIMARY_EVIDENCE = new Set([
+  "project-pattern",
+  "platform-primary",
+  "accessibility-standard",
+  "user-evidence",
+]);
+
+export function validateUseCaseScoutSemantics(report, originalTask = null) {
+  const errors = [];
+  if (!report || typeof report !== "object") return ["use-case scout report must be an object"];
+  if (report.outcome === "blocked") {
+    if (!Array.isArray(report.blockers) || report.blockers.length === 0) errors.push("blocked use-case scout requires at least one blocker");
+    return errors;
+  }
+  if (report.outcome !== "ready") return ["use-case scout outcome must be ready or blocked"];
+  checkUnique(report.originalRequirements ?? [], "original requirement", errors);
+  checkUnique(report.proposals ?? [], "use-case proposal", errors);
+  if (typeof originalTask === "string") {
+    const normalizedTask = originalTask.replace(/\r\n/g, "\n");
+    const requirementTexts = (report.originalRequirements ?? []).map(({ text }) => String(text ?? "").replace(/\r\n/g, "\n"));
+    for (const requirement of report.originalRequirements ?? []) {
+      if (!normalizedTask.includes(String(requirement.text ?? "").replace(/\r\n/g, "\n"))) {
+        errors.push(`original requirement ${requirement.id} is not verbatim text from the original task file`);
+      }
+    }
+    const substantiveLines = normalizedTask.split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#") && !line.startsWith("```") && !/^[-*]\s*$/.test(line))
+      .map((line) => line.replace(/^>\s?/, "").replace(/^[-*]\s+/, "").replace(/^\d+[.)]\s+/, ""));
+    for (const line of substantiveLines) {
+      if (!requirementTexts.some((text) => text.includes(line) || line.includes(text))) {
+        errors.push(`original task line is not traceable to a verbatim requirement: ${line}`);
+      }
+    }
+  }
+  for (const proposal of report.proposals ?? []) {
+    const evidence = proposal.evidence ?? [];
+    if (proposal.disposition === "expected") {
+      const hasPrimary = evidence.some(({ type }) => STRONG_PRIMARY_EVIDENCE.has(type));
+      const comparableLocators = new Set(
+        evidence.filter(({ type }) => type === "comparable-product").map(({ locator }) => locator),
+      );
+      if (!hasPrimary && comparableLocators.size < 2) {
+        errors.push(`proposal ${proposal.id} needs strong evidence: one primary source or two independent comparable products`);
+      }
+      if (proposal.changeRisk !== "additive-low") {
+        errors.push(`expected proposal ${proposal.id} must be additive-low; larger changes must remain optional`);
+      }
+    }
+    if (proposal.disposition !== "rejected" && evidence.length === 0) {
+      errors.push(`proposal ${proposal.id} requires evidence`);
+    }
+  }
+  return errors;
+}
+
+export function validateRiskRegisterSemantics(report, scout = null) {
+  const errors = [];
+  if (!report || typeof report !== "object") return ["risk register must be an object"];
+  if (report.outcome === "blocked") {
+    if (!Array.isArray(report.blockers) || report.blockers.length === 0) errors.push("blocked risk register requires at least one blocker");
+    return errors;
+  }
+  if (report.outcome !== "ready") return ["risk register outcome must be ready or blocked"];
+  checkUnique(report.risks ?? [], "risk", errors);
+  const requirementIds = new Set((scout?.originalRequirements ?? []).map(({ id }) => id));
+  const proposalIds = new Set((scout?.proposals ?? []).map(({ id }) => id));
+  for (const risk of report.risks ?? []) {
+    if (scout) {
+      checkReferences(risk.relatedRequirementIds, requirementIds, `risk ${risk.id} requirement`, errors);
+      checkReferences(risk.relatedProposalIds, proposalIds, `risk ${risk.id} proposal`, errors);
+    }
+    if ((risk.verification?.methods?.length ?? 0) === 0) {
+      errors.push(`risk ${risk.id} requires at least one verification method`);
+    }
+    if (["critical", "high"].includes(risk.severity) && (risk.verification?.requiredCapabilities?.length ?? 0) === 0) {
+      errors.push(`high-risk ${risk.id} requires explicit verification capabilities`);
+    }
+  }
+  return errors;
+}
+
+export function validateFeatureBriefSemantics(brief, scout, register, originalTask = null) {
+  const errors = [];
+  if (!brief || typeof brief !== "object") return ["feature brief must be an object"];
+  if (brief.outcome === "blocked") {
+    if (!Array.isArray(brief.blockers) || brief.blockers.length === 0) errors.push("blocked feature brief requires at least one blocker");
+    return errors;
+  }
+  if (brief.outcome !== "ready") return ["feature brief outcome must be ready or blocked"];
+  if (
+    typeof originalTask === "string" &&
+    String(brief.originalRequestVerbatim ?? "").replace(/\r\n/g, "\n").trimEnd() !== originalTask.replace(/\r\n/g, "\n").trimEnd()
+  ) {
+    errors.push("feature brief originalRequestVerbatim must exactly match the original task file");
+  }
+  const sourceRequirements = scout?.originalRequirements ?? [];
+  const copied = new Map((brief.originalRequirements ?? []).map((item) => [item.id, item.text]));
+  for (const requirement of sourceRequirements) {
+    if (copied.get(requirement.id) !== requirement.text) {
+      errors.push(`original requirement ${requirement.id} is immutable and must be copied verbatim`);
+    }
+  }
+  if (copied.size !== sourceRequirements.length) errors.push("feature brief original requirements must exactly match the scout report");
+  checkUnique(brief.proposalDecisions ?? [], "proposal decision", errors, "proposalId");
+  checkUnique(brief.finalRequirements ?? [], "final requirement", errors);
+  const proposalById = new Map((scout?.proposals ?? []).map((item) => [item.id, item]));
+  const proposalIds = new Set(proposalById.keys());
+  const decisions = new Map((brief.proposalDecisions ?? []).map((item) => [item.proposalId, item]));
+  for (const proposalId of proposalIds) if (!decisions.has(proposalId)) errors.push(`feature brief omits proposal decision ${proposalId}`);
+  for (const proposalId of decisions.keys()) if (!proposalIds.has(proposalId)) errors.push(`feature brief contains unknown proposal ${proposalId}`);
+  for (const [proposalId, decision] of decisions) {
+    const proposal = proposalById.get(proposalId);
+    if (!proposal) continue;
+    const expected = proposal.disposition === "expected"
+      ? { category: "Expected", decision: "include" }
+      : proposal.disposition === "optional"
+        ? { category: "Optional", decision: "defer" }
+        : { category: "Rejected", decision: "reject" };
+    if (decision.category !== expected.category || decision.decision !== expected.decision) {
+      errors.push(`proposal ${proposalId} must be ${expected.category}/${expected.decision}`);
+    }
+  }
+  const sourceIds = new Set((brief.finalRequirements ?? []).flatMap(({ sourceIds: ids = [] }) => ids));
+  for (const requirement of sourceRequirements) {
+    if (!sourceIds.has(requirement.id)) errors.push(`final requirements omit original requirement ${requirement.id}`);
+  }
+  for (const proposal of scout?.proposals ?? []) {
+    if (proposal.disposition === "expected" && !sourceIds.has(proposal.id)) {
+      errors.push(`final requirements omit included expected proposal ${proposal.id}`);
+    }
+  }
+  const riskIds = new Set((register?.risks ?? []).map(({ id }) => id));
+  const mappedRisks = new Set((brief.finalRequirements ?? []).flatMap(({ riskIds: ids = [] }) => ids));
+  for (const riskId of riskIds) if (!mappedRisks.has(riskId)) errors.push(`feature brief does not map frozen risk ${riskId} to a final requirement`);
+  return errors;
+}
+
+export function validateRiskVerificationSemantics(report, register) {
+  const errors = [];
+  if (!report || typeof report !== "object") return ["risk verification report must be an object"];
+  if (report.outcome === "blocked") {
+    if (!Array.isArray(report.blockers) || report.blockers.length === 0) errors.push("blocked risk verification requires at least one blocker");
+    return errors;
+  }
+  if (report.outcome !== "completed") return ["risk verification outcome must be completed or blocked"];
+  if (report.riskRegisterId !== register?.registerId) errors.push("risk verification register identity mismatch");
+  checkUnique(report.verdicts ?? [], "risk verdict", errors, "riskId");
+  const riskById = new Map((register?.risks ?? []).map((risk) => [risk.id, risk]));
+  const riskIds = new Set(riskById.keys());
+  const verdictIds = new Set((report.verdicts ?? []).map(({ riskId }) => riskId));
+  for (const riskId of riskIds) if (!verdictIds.has(riskId)) errors.push(`risk verification omits ${riskId}`);
+  for (const riskId of verdictIds) if (!riskIds.has(riskId)) errors.push(`risk verification contains unknown ${riskId}`);
+  for (const verdict of report.verdicts ?? []) {
+    const risk = riskById.get(verdict.riskId);
+    if (["verified-safe", "finding", "not-applicable"].includes(verdict.status) && !hasEvidence(verdict.evidence)) {
+      errors.push(`risk verdict ${verdict.riskId} requires objective evidence`);
+    }
+    if (["blocked", "not-applicable"].includes(verdict.status) && !verdict.rationale) {
+      errors.push(`risk verdict ${verdict.riskId} requires a rationale`);
+    }
+    if (verdict.status === "verified-safe" && risk) {
+      const satisfiedMethods = new Set(verdict.satisfiedMethods ?? []);
+      const satisfiedCapabilities = new Set(verdict.satisfiedCapabilities ?? []);
+      for (const method of risk.verification?.methods ?? []) {
+        if (!satisfiedMethods.has(method)) errors.push(`risk verdict ${verdict.riskId} did not satisfy required method ${method}`);
+      }
+      for (const capability of risk.verification?.requiredCapabilities ?? []) {
+        if (!satisfiedCapabilities.has(capability)) errors.push(`risk verdict ${verdict.riskId} did not satisfy required capability ${capability}`);
+      }
+    }
+    if (verdict.status === "not-applicable") {
+      const scopeEvidence = verdict.scopeEvidence ?? [];
+      const machineEvidence = [
+        ...(verdict.evidence?.source ?? []),
+        ...(verdict.evidence?.tests ?? []),
+      ];
+      if (scopeEvidence.length === 0 || machineEvidence.length === 0) {
+        errors.push(`risk verdict ${verdict.riskId} needs machine-checkable scope and reachability evidence or must be blocked`);
+      }
+      if (risk && ["critical", "high"].includes(risk.severity) && (verdict.satisfiedMethods?.length ?? 0) === 0) {
+        errors.push(`high-risk not-applicable verdict ${verdict.riskId} must record a satisfied verification method or be blocked`);
+      }
+    }
+    for (const path of evidencePaths(verdict.evidence)) {
+      if (!isPortableRelativePath(path)) errors.push(`risk verdict ${verdict.riskId} has unsafe artifact path ${path}`);
+    }
+  }
+  const verdicts = report.verdicts ?? [];
+  const expectedSummary = {
+    total: verdicts.length,
+    verifiedSafe: verdicts.filter(({ status }) => status === "verified-safe").length,
+    findings: verdicts.filter(({ status }) => status === "finding").length,
+    notApplicable: verdicts.filter(({ status }) => status === "not-applicable").length,
+    blocked: verdicts.filter(({ status }) => status === "blocked").length,
+  };
+  for (const [key, value] of Object.entries(expectedSummary)) {
+    if (report.summary?.[key] !== value) errors.push(`risk verification summary.${key} must be ${value}`);
+  }
+  const expectedGate = expectedSummary.blocked > 0 ? "needs-review" : "pass";
+  if (report.summary?.coverageGate !== expectedGate) errors.push(`risk verification summary.coverageGate must be ${expectedGate}`);
+  return errors;
+}
+
+export function validateFeatureModelSemantics(model, brief = null) {
   const errors = [];
   if (!model || typeof model !== "object") return ["feature model must be an object"];
   if (model.outcome === "blocked") {
@@ -27,6 +231,21 @@ export function validateFeatureModelSemantics(model) {
   const designs = model.missingDesigns ?? [];
 
   checkUnique(requirements, "requirement", errors);
+  if (brief?.outcome === "ready") {
+    const frozenRequirements = [
+      ...(brief.originalRequirements ?? []),
+      ...(brief.finalRequirements ?? []).map(({ id, text }) => ({ id, text })),
+    ];
+    const modelById = new Map(requirements.map(({ id, text }) => [id, text]));
+    const frozenById = new Map(frozenRequirements.map(({ id, text }) => [id, text]));
+    for (const [id, text] of frozenById) {
+      if (!modelById.has(id)) errors.push(`feature model omits frozen requirement ${id}`);
+      else if (modelById.get(id) !== text) errors.push(`feature model mutates frozen requirement ${id}`);
+    }
+    for (const id of modelById.keys()) {
+      if (!frozenById.has(id)) errors.push(`feature model invents explicit requirement ${id}`);
+    }
+  }
   checkUnique(states, "state", errors);
   checkUnique(transitions, "transition", errors);
   checkUnique(behaviors, "missing behavior", errors);
@@ -278,6 +497,8 @@ function hasEvidence(evidence) {
     evidence &&
       ((evidence.screenshots?.length ?? 0) > 0 ||
         evidence.trace ||
+        (evidence.source?.length ?? 0) > 0 ||
+        (evidence.tests?.length ?? 0) > 0 ||
         (evidence.console?.length ?? 0) > 0 ||
         (evidence.pageErrors?.length ?? 0) > 0 ||
         (evidence.network?.length ?? 0) > 0),
@@ -416,8 +637,13 @@ export function validateConfirmedReportSemantics(
   model,
   explorationReport,
   designReport,
+  riskVerificationReport,
   identities = {},
 ) {
+  if (riskVerificationReport && !riskVerificationReport.outcome && Object.keys(identities).length === 0) {
+    identities = riskVerificationReport;
+    riskVerificationReport = null;
+  }
   const errors = [];
   if (!report || typeof report !== "object") return ["confirmation report must be an object"];
   if (report.outcome === "blocked") {
@@ -435,6 +661,13 @@ export function validateConfirmedReportSemantics(
       .map(({ id }) => ({ id, source: "edge-case-explorer", hash: identities.explorationSha256 })),
     ...((designReport?.outcome === "completed" ? designReport.observations : []) ?? [])
       .map(({ id }) => ({ id, source: "design-ux-auditor", hash: identities.designSha256 })),
+    ...((riskVerificationReport?.outcome === "completed" ? riskVerificationReport.verdicts : []) ?? [])
+      .filter(({ status, candidateId }) => status === "finding" && candidateId)
+      .map(({ candidateId }) => ({
+        id: candidateId,
+        source: "post-implementation-risk-verifier",
+        hash: identities.riskVerificationSha256,
+      })),
   ];
   checkUnique(candidates, "source candidate", errors);
 
@@ -466,6 +699,9 @@ export function validateConfirmedReportSemantics(
   }
   if (identities.designSha256 && report.provenance?.designReportSha256 !== identities.designSha256) {
     errors.push("confirmation provenance has wrong design report hash");
+  }
+  if (identities.riskVerificationSha256 && report.provenance?.riskVerificationSha256 !== identities.riskVerificationSha256) {
+    errors.push("confirmation provenance has wrong risk verification report hash");
   }
 
   for (const verdict of verdicts) {
@@ -528,7 +764,12 @@ export function validateConfirmedReportSemantics(
     if (report.summary?.bySeverity?.[severity] !== value) errors.push(`summary.bySeverity.${severity} must be ${value}`);
   }
 
-  const blocking = new Set(report.summary?.blockingSeverities ?? []);
+  const reportedBlocking = [...(report.summary?.blockingSeverities ?? [])].sort();
+  const configuredBlocking = identities.blockingSeverities ? [...identities.blockingSeverities].sort() : reportedBlocking;
+  if (identities.blockingSeverities && JSON.stringify(reportedBlocking) !== JSON.stringify(configuredBlocking)) {
+    errors.push("summary.blockingSeverities must exactly match the runner-owned gate policy");
+  }
+  const blocking = new Set(configuredBlocking);
   const blockingIds = confirmed
     .filter(({ finalSeverity }) => blocking.has(finalSeverity))
     .map(({ candidateId }) => candidateId);
