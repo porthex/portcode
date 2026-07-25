@@ -340,9 +340,7 @@ const inspectUi = async (socket: WebSocket) => {
   );
 
   const interfaceOpened = await evaluate<boolean>(`(() => {
-    const button = [...document.querySelectorAll('button')].find(
-      (candidate) => candidate.textContent?.trim() === 'Interface'
-    );
+    const button = document.querySelector('button[aria-controls="pc-settings-interface"]');
     if (!(button instanceof HTMLButtonElement)) return false;
     button.click();
     return true;
