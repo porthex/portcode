@@ -340,7 +340,7 @@ const inspectUi = async (socket: WebSocket) => {
   );
 
   const modelClicked = await evaluate<boolean>(`(() => {
-    const model = document.querySelector('#pc-settings-claude-model[role="combobox"]');
+    const model = document.querySelector('#pc-settings-openai-model[role="combobox"]');
     if (!(model instanceof HTMLButtonElement)) return false;
     model.click();
     return true;
@@ -349,13 +349,13 @@ const inspectUi = async (socket: WebSocket) => {
   const modelMenuOpened = await waitForValue<boolean>(
     "Model listbox",
     `(() => {
-      const list = document.querySelector('#pc-settings-claude-model-listbox[role="listbox"]');
+      const list = document.querySelector('#pc-settings-openai-model-listbox[role="listbox"]');
       return !!list && list.querySelectorAll('[role="option"]').length >= 2;
     })()`,
     Boolean,
   );
 
-  await evaluate(`document.querySelector('#pc-settings-claude-model[role="combobox"]')?.click()`);
+  await evaluate(`document.querySelector('#pc-settings-openai-model[role="combobox"]')?.click()`);
   await evaluate(`document.querySelector('button[aria-label="Close settings"]')?.click()`);
   const settingsClosed = await waitForValue<boolean>(
     "Settings close",

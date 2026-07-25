@@ -609,10 +609,14 @@ fn validate_model_account(
     model: &str,
     account_profile_id: Option<&str>,
 ) -> Result<(), String> {
+    // Mobile is a remote client and does not compile the desktop Codex engine,
+    // but synced sessions still carry its stable primary-account identity.
+    const PRIMARY_CODEX_ACCOUNT_ID: &str = "codex-primary";
+
     if llm::provider_name_for_model(model)? != "openai" {
         return Err("Portcode conversations now run through the Codex engine.".into());
     }
-    if account_profile_id.is_some_and(|id| id != codex_engine::PRIMARY_CODEX_ACCOUNT_ID) {
+    if account_profile_id.is_some_and(|id| id != PRIMARY_CODEX_ACCOUNT_ID) {
         return Err("The selected Codex account is no longer available.".into());
     }
     Ok(())
