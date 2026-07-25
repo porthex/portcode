@@ -17,7 +17,7 @@ type RenderState = {
 
 type JourneyState = {
   settingsOpened: boolean;
-  modelMenuOpened: boolean;
+  settingsControlUpdated: boolean;
   settingsClosed: boolean;
   composerAcceptedDraft: boolean;
   composerNestedList: boolean;
@@ -323,7 +323,7 @@ const inspectUi = async (socket: WebSocket) => {
   }
 
   // Exercise the real WebView journey that previously escaped the smoke gate:
-  // Settings render isolation, the Portcode-native model listbox, and React's
+  // Settings render isolation, a controlled settings interaction, and React's
   // controlled composer. No prompt is submitted and no provider call is made.
   const settingsButtonClicked = await evaluate<boolean>(`(() => {
     const button = document.querySelector('button[aria-label="Settings"], button[title="Settings"]');
@@ -339,27 +339,60 @@ const inspectUi = async (socket: WebSocket) => {
     Boolean,
   );
 
-  const modelPicker = await evaluate<{ found: boolean; disabled: boolean }>(`(() => {
-    const model = document.querySelector('#pc-settings-openai-model[role="combobox"]');
-    if (!(model instanceof HTMLButtonElement)) return { found: false, disabled: false };
-    if (!model.disabled) model.click();
-    return { found: true, disabled: model.disabled };
+  const interfaceOpened = await evaluate<boolean>(`(() => {
+    const button = [...document.querySelectorAll('button')].find(
+      (candidate) => candidate.textContent?.trim() === 'Interface'
+    );
+    if (!(button instanceof HTMLButtonElement)) return false;
+    button.click();
+    return true;
   })()`);
-  if (!modelPicker?.found) throw new Error("Could not find the themed model picker.");
-  const modelMenuOpened = modelPicker.disabled
-    ? true
-    : await waitForValue<boolean>(
-        "Model listbox",
-        `(() => {
-          const list = document.querySelector('#pc-settings-openai-model-listbox[role="listbox"]');
-          return !!list && list.querySelectorAll('[role="option"]').length >= 2;
-        })()`,
-        Boolean,
-      );
+  if (!interfaceOpened) throw new Error("Could not open Interface settings.");
 
-  if (!modelPicker.disabled) {
-    await evaluate(`document.querySelector('#pc-settings-openai-model[role="combobox"]')?.click()`);
-  }
+  const scaleChanged = await evaluate<boolean>(`(() => {
+    const group = document.querySelector('[role="group"][aria-label="Interface scale"]');
+    const button = [...(group?.querySelectorAll('button') ?? [])].find(
+      (candidate) => candidate.textContent?.trim() === 'Comfortable'
+    );
+    if (!(button instanceof HTMLButtonElement)) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!scaleChanged) throw new Error("Could not find the Interface scale control.");
+  await waitForValue<boolean>(
+    "Interface scale update",
+    `(() => {
+      const group = document.querySelector('[role="group"][aria-label="Interface scale"]');
+      const button = [...(group?.querySelectorAll('button') ?? [])].find(
+        (candidate) => candidate.textContent?.trim() === 'Comfortable'
+      );
+      return button?.getAttribute('aria-pressed') === 'true';
+    })()`,
+    Boolean,
+  );
+
+  const scaleRestored = await evaluate<boolean>(`(() => {
+    const group = document.querySelector('[role="group"][aria-label="Interface scale"]');
+    const button = [...(group?.querySelectorAll('button') ?? [])].find(
+      (candidate) => candidate.textContent?.trim() === 'Default'
+    );
+    if (!(button instanceof HTMLButtonElement)) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!scaleRestored) throw new Error("Could not restore the Interface scale.");
+  const settingsControlUpdated = await waitForValue<boolean>(
+    "Interface scale restore",
+    `(() => {
+      const group = document.querySelector('[role="group"][aria-label="Interface scale"]');
+      const button = [...(group?.querySelectorAll('button') ?? [])].find(
+        (candidate) => candidate.textContent?.trim() === 'Default'
+      );
+      return button?.getAttribute('aria-pressed') === 'true';
+    })()`,
+    Boolean,
+  );
+
   await evaluate(`document.querySelector('button[aria-label="Close settings"]')?.click()`);
   const settingsClosed = await waitForValue<boolean>(
     "Settings close",
@@ -617,7 +650,7 @@ const inspectUi = async (socket: WebSocket) => {
   return {
     ...state,
     settingsOpened,
-    modelMenuOpened,
+    settingsControlUpdated,
     settingsClosed,
     composerAcceptedDraft,
     composerNestedList,
