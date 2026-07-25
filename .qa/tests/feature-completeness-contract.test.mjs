@@ -34,7 +34,8 @@ test("feature completeness plans atomic executable cases and bounded optional ex
     "split executable UI behavior",
     "Optional requirements as bounded exclusion tests",
     "deterministic test or transport evidence",
-  ]) assert.match(prompt, new RegExp(escapeRegExp(requiredText), "i"), `missing: ${requiredText}`);
+  ])
+    assert.match(prompt, new RegExp(escapeRegExp(requiredText), "i"), `missing: ${requiredText}`);
 });
 
 test("feature model schema requires evidence-backed states, omissions, and edge cases", async () => {
@@ -42,12 +43,7 @@ test("feature model schema requires evidence-backed states, omissions, and edge 
 
   assert.equal(schema.$schema, "https://json-schema.org/draft/2020-12/schema");
   assert.equal(schema.additionalProperties, false);
-  assert.deepEqual(schema.required, [
-    "schemaVersion",
-    "modelId",
-    "outcome",
-    "blockers",
-  ]);
+  assert.deepEqual(schema.required, ["schemaVersion", "modelId", "outcome", "blockers"]);
 
   const omission = schema.$defs.omissionBase;
   assert.equal(omission.additionalProperties, false);

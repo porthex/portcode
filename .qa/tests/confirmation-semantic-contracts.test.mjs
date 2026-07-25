@@ -18,10 +18,13 @@ const identities = {
 };
 
 test("blocked confirmation report is valid without invented run fields", () => {
-  assert.deepEqual(validateConfirmedReportSemantics({
-    outcome: "blocked",
-    blockers: [{ id: "BLK-001", reason: "Target mismatch" }],
-  }), []);
+  assert.deepEqual(
+    validateConfirmedReportSemantics({
+      outcome: "blocked",
+      blockers: [{ id: "BLK-001", reason: "Target mismatch" }],
+    }),
+    [],
+  );
 });
 
 test("complete confirmation report accounts for all candidates and derives the failing gate", () => {
@@ -44,7 +47,11 @@ test("confirmation rejects missing candidates, false confirmation, reused paths,
   assert.ok(errors.some((error) => error.includes("manifest omits candidate DES-001")));
   assert.ok(errors.some((error) => error.includes("confirmed candidate OBS-001 was not observed")));
   assert.ok(errors.some((error) => error.includes("unsafe independent artifact path")));
-  assert.ok(errors.some((error) => error.includes("rejected candidate DES-001 must not have final severity")));
+  assert.ok(
+    errors.some((error) =>
+      error.includes("rejected candidate DES-001 must not have final severity"),
+    ),
+  );
   assert.ok(errors.some((error) => error.includes("summary.confirmed")));
   assert.ok(errors.some((error) => error.includes("mergeGate must be fail")));
 });

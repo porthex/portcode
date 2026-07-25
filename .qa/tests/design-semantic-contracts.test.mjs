@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-  DESIGN_CATEGORIES,
-  validateDesignAuditSemantics,
-} from "../scripts/validate-contracts.mjs";
+import { DESIGN_CATEGORIES, validateDesignAuditSemantics } from "../scripts/validate-contracts.mjs";
 
 const model = {
   modelId: "fm-design",
@@ -14,10 +11,13 @@ const model = {
 };
 
 test("blocked design audit does not require invented run details", () => {
-  assert.deepEqual(validateDesignAuditSemantics({
-    outcome: "blocked",
-    blockers: [{ id: "BLK-001", reason: "App unavailable" }],
-  }), []);
+  assert.deepEqual(
+    validateDesignAuditSemantics({
+      outcome: "blocked",
+      blockers: [{ id: "BLK-001", reason: "App unavailable" }],
+    }),
+    [],
+  );
 });
 
 test("valid design audit has complete categories, resolved references, evidence, and derived coverage", () => {
@@ -46,35 +46,39 @@ function validReport() {
     applicable: category === "default",
     rationale: category === "default" ? "Primary rendered state" : "Not applicable to fixture",
     expectedDesign: category === "default" ? "Content is legible" : "No reachable variant",
-    evidenceBasis: [{ type: "feature-state", locator: "state-default", expectation: "Readable state" }],
+    evidenceBasis: [
+      { type: "feature-state", locator: "state-default", expectation: "Readable state" },
+    ],
   }));
-  const inspectedStates = plans.map((plan) => plan.applicable
-    ? {
-        planId: plan.id,
-        status: "passed",
-        viewportId: "desktop",
-        theme: "dark",
-        motionMode: "no-preference",
-        steps: ["Open feature"],
-        actual: "Content is legible",
-        screenshots: ["screenshots/ds-001.png"],
-        observationIds: [],
-        blockerId: null,
-        dispositionReason: null,
-      }
-    : {
-        planId: plan.id,
-        status: "not-applicable",
-        viewportId: null,
-        theme: null,
-        motionMode: null,
-        steps: [],
-        actual: "Not reachable in fixture",
-        screenshots: [],
-        observationIds: [],
-        blockerId: null,
-        dispositionReason: "Not reachable in fixture",
-      });
+  const inspectedStates = plans.map((plan) =>
+    plan.applicable
+      ? {
+          planId: plan.id,
+          status: "passed",
+          viewportId: "desktop",
+          theme: "dark",
+          motionMode: "no-preference",
+          steps: ["Open feature"],
+          actual: "Content is legible",
+          screenshots: ["screenshots/ds-001.png"],
+          observationIds: [],
+          blockerId: null,
+          dispositionReason: null,
+        }
+      : {
+          planId: plan.id,
+          status: "not-applicable",
+          viewportId: null,
+          theme: null,
+          motionMode: null,
+          steps: [],
+          actual: "Not reachable in fixture",
+          screenshots: [],
+          observationIds: [],
+          blockerId: null,
+          dispositionReason: "Not reachable in fixture",
+        },
+  );
   return {
     schemaVersion: "0.1.0",
     runId: "design-run-001",

@@ -1,6 +1,15 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { copyFile, lstat, mkdir, readFile, readdir, readlink, realpath, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  readlink,
+  realpath,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -73,7 +82,12 @@ export const VERIFICATION_STAGES = [
 export const STAGES = VERIFICATION_STAGES;
 
 export function assertSafeRunId(runId) {
-  if (typeof runId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(runId) || runId === "." || runId === "..") {
+  if (
+    typeof runId !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(runId) ||
+    runId === "." ||
+    runId === ".."
+  ) {
     throw new Error("--resume-run must be a safe run ID, not a path");
   }
   return runId;
@@ -81,7 +95,9 @@ export function assertSafeRunId(runId) {
 
 export function reusableStageCheckpoint(manifest, stageId) {
   const checkpoint = manifest.stages?.find(({ id }) => id === stageId);
-  return checkpoint?.validationStatus === "validated" && checkpoint.outcome !== "blocked" ? checkpoint : null;
+  return checkpoint?.validationStatus === "validated" && checkpoint.outcome !== "blocked"
+    ? checkpoint
+    : null;
 }
 
 export function pruneInvalidStageCheckpoints(manifest) {
@@ -93,8 +109,16 @@ export function pruneInvalidStageCheckpoints(manifest) {
 
 export function resumeProvenanceMismatches(manifest, expected) {
   return [
-    "runId", "phase", "mode", "provider", "taskSha256", "gitBase", "gitHead",
-    "gitDiffSha256", "gitStatusSha256", "workingTreeSha256",
+    "runId",
+    "phase",
+    "mode",
+    "provider",
+    "taskSha256",
+    "gitBase",
+    "gitHead",
+    "gitDiffSha256",
+    "gitStatusSha256",
+    "workingTreeSha256",
   ].filter((key) => manifest[key] !== expected[key]);
 }
 
@@ -131,7 +155,9 @@ function extractJsonObjects(output) {
 export function extractJsonObject(output) {
   const candidates = extractJsonObjects(output);
   if (candidates.length !== 1) {
-    throw new Error(`Agent output must contain exactly one JSON object; found ${candidates.length}`);
+    throw new Error(
+      `Agent output must contain exactly one JSON object; found ${candidates.length}`,
+    );
   }
   return candidates[0];
 }
@@ -141,7 +167,9 @@ export async function extractValidatedJsonObject(output, validate) {
   const valid = [];
   for (const candidate of candidates) if (await validate(candidate)) valid.push(candidate);
   if (valid.length !== 1) {
-    throw new Error(`Agent output must contain exactly one schema-valid JSON report; found ${valid.length} of ${candidates.length} parseable objects`);
+    throw new Error(
+      `Agent output must contain exactly one schema-valid JSON report; found ${valid.length} of ${candidates.length} parseable objects`,
+    );
   }
   return valid[0];
 }
@@ -232,20 +260,39 @@ export function validateStageProvenance(stageId, report, expected) {
   requireEqual("gitBase", expected.gitBase);
   requireEqual("gitHead", expected.gitHead);
   requireEqual("workingTreeSha256", expected.workingTreeSha256);
-  const runtimeStages = ["edge-case-explorer", "design-ux-auditor", "post-implementation-risk-verifier", "independent-reproducer"];
+  const runtimeStages = [
+    "edge-case-explorer",
+    "design-ux-auditor",
+    "post-implementation-risk-verifier",
+    "independent-reproducer",
+  ];
   if (runtimeStages.includes(stageId)) {
     requireEqual("artifactRoot", expected.application?.artifactRoot);
     requireEqual("dataProfile", expected.application?.dataProfile);
-    if (report.run && report.run.mode !== expected.mode) errors.push(`${stageId} run.mode does not match the runner mode`);
+    if (report.run && report.run.mode !== expected.mode)
+      errors.push(`${stageId} run.mode does not match the runner mode`);
     if (report.environment) {
-      if (report.environment.target !== expected.application?.target) errors.push(`${stageId} environment.target does not match the runner target`);
-      if (report.environment.appMode !== expected.application?.appMode) errors.push(`${stageId} environment.appMode does not match the runner app mode`);
+      if (report.environment.target !== expected.application?.target)
+        errors.push(`${stageId} environment.target does not match the runner target`);
+      if (report.environment.appMode !== expected.application?.appMode)
+        errors.push(`${stageId} environment.appMode does not match the runner app mode`);
     }
-    if (stageId === "independent-reproducer" && report.environment?.dataResetId !== expected.application?.resetIdentity) {
-      errors.push("independent-reproducer environment.dataResetId does not match the runner reset identity");
+    if (
+      stageId === "independent-reproducer" &&
+      report.environment?.dataResetId !== expected.application?.resetIdentity
+    ) {
+      errors.push(
+        "independent-reproducer environment.dataResetId does not match the runner reset identity",
+      );
     }
   }
-  if (["real-world-use-case-scout", "pre-implementation-risk-architect", "feature-completeness"].includes(stageId)) {
+  if (
+    [
+      "real-world-use-case-scout",
+      "pre-implementation-risk-architect",
+      "feature-completeness",
+    ].includes(stageId)
+  ) {
     requireEqual("taskSha256", expected.taskSha256);
   }
   if (["pre-implementation-risk-architect", "feature-brief-synthesizer"].includes(stageId)) {
@@ -254,11 +301,26 @@ export function validateStageProvenance(stageId, report, expected) {
   if (stageId === "feature-brief-synthesizer") {
     requireEqual("riskRegisterSha256", expected.riskRegisterSha256);
   }
-  if (["feature-completeness", "edge-case-explorer", "design-ux-auditor", "post-implementation-risk-verifier", "independent-reproducer"].includes(stageId)) {
+  if (
+    [
+      "feature-completeness",
+      "edge-case-explorer",
+      "design-ux-auditor",
+      "post-implementation-risk-verifier",
+      "independent-reproducer",
+    ].includes(stageId)
+  ) {
     requireEqual("featureBriefSha256", expected.featureBriefSha256);
     requireEqual("riskRegisterSha256", expected.riskRegisterSha256);
   }
-  if (["edge-case-explorer", "design-ux-auditor", "post-implementation-risk-verifier", "independent-reproducer"].includes(stageId)) {
+  if (
+    [
+      "edge-case-explorer",
+      "design-ux-auditor",
+      "post-implementation-risk-verifier",
+      "independent-reproducer",
+    ].includes(stageId)
+  ) {
     requireEqual("featureModelSha256", expected.featureModelSha256);
   }
   if (stageId === "independent-reproducer") {
@@ -269,10 +331,15 @@ export function validateStageProvenance(stageId, report, expected) {
   return errors;
 }
 
-export function deriveCoverageGate(riskVerification, findingGate = "needs-review", exploration = null) {
+export function deriveCoverageGate(
+  riskVerification,
+  findingGate = "needs-review",
+  exploration = null,
+) {
   if (findingGate === "fail") return "fail";
   if (!riskVerification || riskVerification.outcome !== "completed") return "needs-review";
-  if ((riskVerification.verdicts ?? []).some(({ status }) => status === "blocked")) return "needs-review";
+  if ((riskVerification.verdicts ?? []).some(({ status }) => status === "blocked"))
+    return "needs-review";
   if (exploration) {
     if (exploration.outcome !== "completed") return "needs-review";
     if ((exploration.coverage?.blocked ?? 0) > 0) return "needs-review";
@@ -286,10 +353,14 @@ export function deriveFindingGate(confirmationReport, blockingSeverities) {
   }
   const policy = new Set(blockingSeverities ?? []);
   const blockingCandidateIds = (confirmationReport.verdicts ?? [])
-    .filter(({ disposition, finalSeverity }) => disposition === "confirmed" && policy.has(finalSeverity))
+    .filter(
+      ({ disposition, finalSeverity }) => disposition === "confirmed" && policy.has(finalSeverity),
+    )
     .map(({ candidateId }) => candidateId)
     .sort();
-  const hasInconclusive = (confirmationReport.verdicts ?? []).some(({ disposition }) => disposition === "inconclusive");
+  const hasInconclusive = (confirmationReport.verdicts ?? []).some(
+    ({ disposition }) => disposition === "inconclusive",
+  );
   return {
     gate: blockingCandidateIds.length ? "fail" : hasInconclusive ? "needs-review" : "pass",
     blockingCandidateIds,
@@ -325,10 +396,18 @@ async function inspectEvidenceArtifacts(report, runRoot, stageId = null, attempt
   await mkdir(stageEvidenceRoot, { recursive: true });
   const canonicalEvidenceRoot = await realpath(stageEvidenceRoot);
   for (const declaredPath of evidencePaths(report)) {
-    const candidate = isAbsolute(declaredPath) ? resolve(declaredPath) : resolve(runRoot, declaredPath);
+    const candidate = isAbsolute(declaredPath)
+      ? resolve(declaredPath)
+      : resolve(runRoot, declaredPath);
     const relativeCandidate = relative(stageEvidenceRoot, candidate);
-    if (relativeCandidate === ".." || relativeCandidate.startsWith(`..${sep}`) || isAbsolute(relativeCandidate)) {
-      errors.push(`evidence artifact is not owned by stage ${stageId ?? "validation"}: ${declaredPath}`);
+    if (
+      relativeCandidate === ".." ||
+      relativeCandidate.startsWith(`..${sep}`) ||
+      isAbsolute(relativeCandidate)
+    ) {
+      errors.push(
+        `evidence artifact is not owned by stage ${stageId ?? "validation"}: ${declaredPath}`,
+      );
       continue;
     }
     try {
@@ -339,7 +418,11 @@ async function inspectEvidenceArtifacts(report, runRoot, stageId = null, attempt
       }
       const canonicalCandidate = await realpath(candidate);
       const relativeCanonical = relative(canonicalEvidenceRoot, canonicalCandidate);
-      if (relativeCanonical === ".." || relativeCanonical.startsWith(`..${sep}`) || isAbsolute(relativeCanonical)) {
+      if (
+        relativeCanonical === ".." ||
+        relativeCanonical.startsWith(`..${sep}`) ||
+        isAbsolute(relativeCanonical)
+      ) {
         errors.push(`evidence artifact resolves outside the stage evidence root: ${declaredPath}`);
         continue;
       }
@@ -348,7 +431,8 @@ async function inspectEvidenceArtifacts(report, runRoot, stageId = null, attempt
         sha256: sha256(await readFile(candidate)),
       });
     } catch (error) {
-      if (error?.code === "ENOENT") errors.push(`evidence artifact does not exist: ${declaredPath}`);
+      if (error?.code === "ENOENT")
+        errors.push(`evidence artifact does not exist: ${declaredPath}`);
       else errors.push(`unable to validate evidence artifact ${declaredPath}: ${error.message}`);
     }
   }
@@ -374,7 +458,10 @@ async function listArtifactFiles(root) {
 }
 
 async function captureArtifactSnapshot(runRoot, extraPaths = []) {
-  const paths = new Set([...(await listArtifactFiles(runRoot)), ...extraPaths.map((path) => resolve(path))]);
+  const paths = new Set([
+    ...(await listArtifactFiles(runRoot)),
+    ...extraPaths.map((path) => resolve(path)),
+  ]);
   const snapshot = new Map();
   for (const path of [...paths].sort()) {
     const info = await lstat(path);
@@ -396,7 +483,8 @@ async function assertRunnerArtifactsUnchanged(before, runRoot, stageEvidenceRoot
         kind: info.isFile() ? "file" : info.isSymbolicLink() ? "symlink" : "other",
         sha256: info.isFile() ? sha256(await readFile(path)) : null,
       };
-      if (current.kind !== identity.kind || current.sha256 !== identity.sha256) errors.push(`modified runner-owned artifact ${path}`);
+      if (current.kind !== identity.kind || current.sha256 !== identity.sha256)
+        errors.push(`modified runner-owned artifact ${path}`);
     } catch (error) {
       if (error?.code === "ENOENT") errors.push(`removed runner-owned artifact ${path}`);
       else throw error;
@@ -405,11 +493,16 @@ async function assertRunnerArtifactsUnchanged(before, runRoot, stageEvidenceRoot
   for (const path of after.keys()) {
     if (before.has(path)) continue;
     const relativeEvidence = relative(stageEvidenceRoot, path);
-    if (relativeEvidence === ".." || relativeEvidence.startsWith(`..${sep}`) || isAbsolute(relativeEvidence)) {
+    if (
+      relativeEvidence === ".." ||
+      relativeEvidence.startsWith(`..${sep}`) ||
+      isAbsolute(relativeEvidence)
+    ) {
       errors.push(`created artifact outside the stage evidence root ${path}`);
     }
   }
-  if (errors.length) throw new Error(`provider changed runner-owned artifacts:\n- ${errors.join("\n- ")}`);
+  if (errors.length)
+    throw new Error(`provider changed runner-owned artifacts:\n- ${errors.join("\n- ")}`);
 }
 
 async function main() {
@@ -419,24 +512,36 @@ async function main() {
   const config = JSON.parse(await readFile(configPath, "utf8"));
   const providerName = options.provider ?? config.defaultProvider;
   if (!config.providers[providerName]) throw new Error(`Unknown QA provider: ${providerName}`);
-  if (options.mode !== "change") throw new Error("--mode currently supports change only; full-repository coverage is not implemented");
+  if (options.mode !== "change")
+    throw new Error(
+      "--mode currently supports change only; full-repository coverage is not implemented",
+    );
   const phase = options.phase ?? "verify";
-  if (!new Set(["prepare", "verify"]).has(phase)) throw new Error("--phase must be prepare or verify");
+  if (!new Set(["prepare", "verify"]).has(phase))
+    throw new Error("--phase must be prepare or verify");
   const taskPath = resolve(projectRoot, requireOption(options.task, "--task is required"));
   const task = await readFile(taskPath, "utf8");
   if (!task.trim()) throw new Error("Task file is empty");
   const selectedStages = phase === "prepare" ? PREPARATION_STAGES : VERIFICATION_STAGES;
 
   if (options.dryRun) {
-    process.stdout.write(`${JSON.stringify({
-      phase,
-      mode: options.mode,
-      provider: providerName,
-      task: normalizePath(taskPath),
-      preparation: options.preparation ? normalizePath(resolve(projectRoot, options.preparation)) : null,
-      stages: selectedStages.map(({ id }) => id),
-      app: { started: false, target: config.application.target },
-    }, null, 2)}\n`);
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          phase,
+          mode: options.mode,
+          provider: providerName,
+          task: normalizePath(taskPath),
+          preparation: options.preparation
+            ? normalizePath(resolve(projectRoot, options.preparation))
+            : null,
+          stages: selectedStages.map(({ id }) => id),
+          app: { started: false, target: config.application.target },
+        },
+        null,
+        2,
+      )}\n`,
+    );
     return 0;
   }
 
@@ -446,7 +551,9 @@ async function main() {
   const reportRoot = resolve(runRoot, "reports");
   const rawRoot = resolve(runRoot, "raw");
   const promptRoot = resolve(runRoot, "prompts");
-  await Promise.all([inputRoot, reportRoot, rawRoot, promptRoot].map((path) => mkdir(path, { recursive: true })));
+  await Promise.all(
+    [inputRoot, reportRoot, rawRoot, promptRoot].map((path) => mkdir(path, { recursive: true })),
+  );
   const copiedTaskPath = resolve(inputRoot, "task.md");
   const git = await captureGitContext(projectRoot);
   const sourceBaseline = await captureSourceSnapshot(projectRoot, config.artifacts.root);
@@ -470,9 +577,11 @@ async function main() {
       workingTreeSha256,
     };
     const mismatches = resumeProvenanceMismatches(manifest, expected);
-    if (mismatches.length) throw new Error(`Cannot resume run with changed provenance: ${mismatches.join(", ")}`);
+    if (mismatches.length)
+      throw new Error(`Cannot resume run with changed provenance: ${mismatches.join(", ")}`);
     const copiedTask = await readFile(copiedTaskPath, "utf8");
-    if (sha256(copiedTask) !== manifest.taskSha256) throw new Error("Cannot resume run: copied task provenance changed");
+    if (sha256(copiedTask) !== manifest.taskSha256)
+      throw new Error("Cannot resume run: copied task provenance changed");
     const prunedStages = pruneInvalidStageCheckpoints(manifest);
     manifest.recoveries ??= [];
     manifest.recoveries.push({ resumedAt: new Date().toISOString(), prunedStages });
@@ -512,7 +621,20 @@ async function main() {
   }
   await writeJson(resolve(runRoot, "run-manifest.json"), manifest);
 
-  const context = { config, configPath, copiedTaskPath, manifest, originalTask: task, projectRoot, providerName, promptRoot, rawRoot, reportRoot, runRoot, sourceBaseline };
+  const context = {
+    config,
+    configPath,
+    copiedTaskPath,
+    manifest,
+    originalTask: task,
+    projectRoot,
+    providerName,
+    promptRoot,
+    rawRoot,
+    reportRoot,
+    runRoot,
+    sourceBaseline,
+  };
   try {
     if (phase === "prepare") return await runPreparationPhase(context);
     return await runVerificationPhase(context, options.preparation);
@@ -528,28 +650,48 @@ async function main() {
 async function runPreparationPhase(context) {
   const { manifest, originalTask, reportRoot, runRoot } = context;
   const reports = { originalTask };
-  reports.scout = await runOrLoadStage({ ...context, stage: PREPARATION_STAGES[0], inputPaths: [] });
+  reports.scout = await runOrLoadStage({
+    ...context,
+    stage: PREPARATION_STAGES[0],
+    inputPaths: [],
+  });
   validateSemantic("real-world-use-case-scout", reports);
   validateProvenanceOrThrow("real-world-use-case-scout", reports.scout, manifest);
-  if (reports.scout.outcome === "blocked") return finishBlocked(manifest, runRoot, "Use-case research blocked");
+  if (reports.scout.outcome === "blocked")
+    return finishBlocked(manifest, runRoot, "Use-case research blocked");
   await sealStageCheckpoint(context, "real-world-use-case-scout");
   const scoutPath = resolve(reportRoot, PREPARATION_STAGES[0].report);
   const useCaseScoutSha256 = sha256(await readFile(scoutPath));
 
-  reports.risks = await runOrLoadStage({ ...context, stage: PREPARATION_STAGES[1], inputPaths: [scoutPath] });
+  reports.risks = await runOrLoadStage({
+    ...context,
+    stage: PREPARATION_STAGES[1],
+    inputPaths: [scoutPath],
+  });
   validateSemantic("pre-implementation-risk-architect", reports);
-  validateProvenanceOrThrow("pre-implementation-risk-architect", reports.risks, { ...manifest, useCaseScoutSha256 });
-  if (reports.risks.outcome === "blocked") return finishBlocked(manifest, runRoot, "Pre-implementation risk analysis blocked");
+  validateProvenanceOrThrow("pre-implementation-risk-architect", reports.risks, {
+    ...manifest,
+    useCaseScoutSha256,
+  });
+  if (reports.risks.outcome === "blocked")
+    return finishBlocked(manifest, runRoot, "Pre-implementation risk analysis blocked");
   await sealStageCheckpoint(context, "pre-implementation-risk-architect");
   const riskPath = resolve(reportRoot, PREPARATION_STAGES[1].report);
   const riskRegisterSha256 = sha256(await readFile(riskPath));
 
-  reports.brief = await runOrLoadStage({ ...context, stage: PREPARATION_STAGES[2], inputPaths: [scoutPath, riskPath] });
+  reports.brief = await runOrLoadStage({
+    ...context,
+    stage: PREPARATION_STAGES[2],
+    inputPaths: [scoutPath, riskPath],
+  });
   validateSemantic("feature-brief-synthesizer", reports);
   validateProvenanceOrThrow("feature-brief-synthesizer", reports.brief, {
-    ...manifest, useCaseScoutSha256, riskRegisterSha256,
+    ...manifest,
+    useCaseScoutSha256,
+    riskRegisterSha256,
   });
-  if (reports.brief.outcome === "blocked") return finishBlocked(manifest, runRoot, "Feature brief synthesis blocked");
+  if (reports.brief.outcome === "blocked")
+    return finishBlocked(manifest, runRoot, "Feature brief synthesis blocked");
   await sealStageCheckpoint(context, "feature-brief-synthesizer");
   const briefPath = resolve(reportRoot, PREPARATION_STAGES[2].report);
   const featureBriefSha256 = sha256(await readFile(briefPath));
@@ -563,33 +705,51 @@ async function runPreparationPhase(context) {
     builderBrief: normalizePath(relative(context.projectRoot, briefPath)),
   };
   await writeJson(resolve(runRoot, "run-manifest.json"), manifest);
-  process.stdout.write(`${JSON.stringify({
-    runId: manifest.runId,
-    preparationRoot: normalizePath(runRoot),
-    featureBrief: normalizePath(briefPath),
-    riskRegister: normalizePath(riskPath),
-    next: `Build from the feature brief, then run --phase verify --preparation ${normalizePath(runRoot)}`,
-  }, null, 2)}\n`);
+  process.stdout.write(
+    `${JSON.stringify(
+      {
+        runId: manifest.runId,
+        preparationRoot: normalizePath(runRoot),
+        featureBrief: normalizePath(briefPath),
+        riskRegister: normalizePath(riskPath),
+        next: `Build from the feature brief, then run --phase verify --preparation ${normalizePath(runRoot)}`,
+      },
+      null,
+      2,
+    )}\n`,
+  );
   return 0;
 }
 
 async function loadPreparation(context, preparationOption, taskSha256) {
   const { projectRoot, config } = context;
-  const preparationRoot = resolve(projectRoot, requireOption(preparationOption, "--preparation is required for --phase verify"));
-  const manifest = JSON.parse(await readFile(resolve(preparationRoot, "run-manifest.json"), "utf8"));
-  if (manifest.phase !== "prepare" || manifest.status !== "prepared") throw new Error("Preparation must be a completed prepare-phase run");
-  if (manifest.taskSha256 !== taskSha256) throw new Error("Preparation task hash does not match the verification task");
+  const preparationRoot = resolve(
+    projectRoot,
+    requireOption(preparationOption, "--preparation is required for --phase verify"),
+  );
+  const manifest = JSON.parse(
+    await readFile(resolve(preparationRoot, "run-manifest.json"), "utf8"),
+  );
+  if (manifest.phase !== "prepare" || manifest.status !== "prepared")
+    throw new Error("Preparation must be a completed prepare-phase run");
+  if (manifest.taskSha256 !== taskSha256)
+    throw new Error("Preparation task hash does not match the verification task");
   const scoutPath = resolve(preparationRoot, "reports", PREPARATION_STAGES[0].report);
   const riskPath = resolve(preparationRoot, "reports", PREPARATION_STAGES[1].report);
   const briefPath = resolve(preparationRoot, "reports", PREPARATION_STAGES[2].report);
-  const [scoutBytes, riskBytes, briefBytes] = await Promise.all([readFile(scoutPath), readFile(riskPath), readFile(briefPath)]);
+  const [scoutBytes, riskBytes, briefBytes] = await Promise.all([
+    readFile(scoutPath),
+    readFile(riskPath),
+    readFile(briefPath),
+  ]);
   const hashes = {
     useCaseScoutSha256: sha256(scoutBytes),
     riskRegisterSha256: sha256(riskBytes),
     featureBriefSha256: sha256(briefBytes),
   };
   for (const [key, value] of Object.entries(hashes)) {
-    if (manifest.preparation?.[key] !== value) throw new Error(`Preparation ${key} failed integrity validation`);
+    if (manifest.preparation?.[key] !== value)
+      throw new Error(`Preparation ${key} failed integrity validation`);
   }
   const reports = {
     originalTask: context.originalTask,
@@ -598,22 +758,49 @@ async function loadPreparation(context, preparationOption, taskSha256) {
     brief: JSON.parse(briefBytes.toString("utf8")),
   };
   await Promise.all([
-    validateJsonSchema(config, resolve(projectRoot, PREPARATION_STAGES[0].schema), scoutPath, projectRoot),
-    validateJsonSchema(config, resolve(projectRoot, PREPARATION_STAGES[1].schema), riskPath, projectRoot),
-    validateJsonSchema(config, resolve(projectRoot, PREPARATION_STAGES[2].schema), briefPath, projectRoot),
+    validateJsonSchema(
+      config,
+      resolve(projectRoot, PREPARATION_STAGES[0].schema),
+      scoutPath,
+      projectRoot,
+    ),
+    validateJsonSchema(
+      config,
+      resolve(projectRoot, PREPARATION_STAGES[1].schema),
+      riskPath,
+      projectRoot,
+    ),
+    validateJsonSchema(
+      config,
+      resolve(projectRoot, PREPARATION_STAGES[2].schema),
+      briefPath,
+      projectRoot,
+    ),
   ]);
   const provenanceErrors = [
     ...validateStageProvenance("real-world-use-case-scout", reports.scout, manifest),
-    ...validateStageProvenance("pre-implementation-risk-architect", reports.risks, { ...manifest, useCaseScoutSha256: hashes.useCaseScoutSha256 }),
-    ...validateStageProvenance("feature-brief-synthesizer", reports.brief, { ...manifest, ...hashes }),
+    ...validateStageProvenance("pre-implementation-risk-architect", reports.risks, {
+      ...manifest,
+      useCaseScoutSha256: hashes.useCaseScoutSha256,
+    }),
+    ...validateStageProvenance("feature-brief-synthesizer", reports.brief, {
+      ...manifest,
+      ...hashes,
+    }),
   ];
   const semanticErrors = [
     ...validateUseCaseScoutSemantics(reports.scout, reports.originalTask),
     ...validateRiskRegisterSemantics(reports.risks, reports.scout),
-    ...validateFeatureBriefSemantics(reports.brief, reports.scout, reports.risks, reports.originalTask),
+    ...validateFeatureBriefSemantics(
+      reports.brief,
+      reports.scout,
+      reports.risks,
+      reports.originalTask,
+    ),
   ];
   const preparationErrors = [...provenanceErrors, ...semanticErrors];
-  if (preparationErrors.length) throw new Error(`Preparation validation failed:\n- ${preparationErrors.join("\n- ")}`);
+  if (preparationErrors.length)
+    throw new Error(`Preparation validation failed:\n- ${preparationErrors.join("\n- ")}`);
   return { preparationRoot, scoutPath, riskPath, briefPath, reports, hashes };
 }
 
@@ -639,41 +826,56 @@ async function runVerificationPhase(context, preparationOption) {
     });
     validateSemantic("feature-completeness", reports);
     validateProvenanceOrThrow("feature-completeness", reports.feature, {
-      ...manifest, ...reports.identities,
+      ...manifest,
+      ...reports.identities,
     });
-    if (reports.feature.outcome === "blocked") return finishBlocked(manifest, runRoot, "Feature model blocked");
+    if (reports.feature.outcome === "blocked")
+      return finishBlocked(manifest, runRoot, "Feature model blocked");
     await sealStageCheckpoint(context, "feature-completeness");
     const featurePath = resolve(reportRoot, VERIFICATION_STAGES[0].report);
     reports.identities.featureModelSha256 = sha256(await readFile(featurePath));
 
     appProcess = await startApplication(context.config.application, projectRoot, runRoot);
     reports.exploration = await runOrLoadStage({
-      ...context, stage: VERIFICATION_STAGES[1],
+      ...context,
+      stage: VERIFICATION_STAGES[1],
       inputPaths: [featurePath, preparation.briefPath, preparation.riskPath],
     });
     validateSemantic("edge-case-explorer", reports);
-    validateProvenanceOrThrow("edge-case-explorer", reports.exploration, { ...manifest, ...reports.identities });
-    if (reports.exploration.outcome === "blocked") return finishBlocked(manifest, runRoot, "Edge exploration blocked");
+    validateProvenanceOrThrow("edge-case-explorer", reports.exploration, {
+      ...manifest,
+      ...reports.identities,
+    });
+    if (reports.exploration.outcome === "blocked")
+      return finishBlocked(manifest, runRoot, "Edge exploration blocked");
     await sealStageCheckpoint(context, "edge-case-explorer");
 
     reports.design = await runOrLoadStage({
-      ...context, stage: VERIFICATION_STAGES[2],
+      ...context,
+      stage: VERIFICATION_STAGES[2],
       inputPaths: [featurePath, preparation.briefPath, preparation.riskPath],
     });
     validateSemantic("design-ux-auditor", reports);
-    validateProvenanceOrThrow("design-ux-auditor", reports.design, { ...manifest, ...reports.identities });
-    if (reports.design.outcome === "blocked") return finishBlocked(manifest, runRoot, "Design audit blocked");
+    validateProvenanceOrThrow("design-ux-auditor", reports.design, {
+      ...manifest,
+      ...reports.identities,
+    });
+    if (reports.design.outcome === "blocked")
+      return finishBlocked(manifest, runRoot, "Design audit blocked");
     await sealStageCheckpoint(context, "design-ux-auditor");
 
     reports.riskVerification = await runOrLoadStage({
-      ...context, stage: VERIFICATION_STAGES[3],
+      ...context,
+      stage: VERIFICATION_STAGES[3],
       inputPaths: [featurePath, preparation.briefPath, preparation.riskPath],
     });
     validateSemantic("post-implementation-risk-verifier", reports);
     validateProvenanceOrThrow("post-implementation-risk-verifier", reports.riskVerification, {
-      ...manifest, ...reports.identities,
+      ...manifest,
+      ...reports.identities,
     });
-    if (reports.riskVerification.outcome === "blocked") return finishBlocked(manifest, runRoot, "Frozen-risk verification blocked");
+    if (reports.riskVerification.outcome === "blocked")
+      return finishBlocked(manifest, runRoot, "Frozen-risk verification blocked");
     await sealStageCheckpoint(context, "post-implementation-risk-verifier");
 
     const explorationPath = resolve(reportRoot, VERIFICATION_STAGES[1].report);
@@ -684,40 +886,67 @@ async function runVerificationPhase(context, preparationOption) {
     reports.identities.riskVerificationSha256 = sha256(await readFile(riskVerificationPath));
 
     reports.confirmed = await runOrLoadStage({
-      ...context, stage: VERIFICATION_STAGES[4],
-      inputPaths: [featurePath, explorationPath, designPath, riskVerificationPath, preparation.briefPath, preparation.riskPath],
+      ...context,
+      stage: VERIFICATION_STAGES[4],
+      inputPaths: [
+        featurePath,
+        explorationPath,
+        designPath,
+        riskVerificationPath,
+        preparation.briefPath,
+        preparation.riskPath,
+      ],
     });
     validateSemantic("independent-reproducer", reports);
     validateProvenanceOrThrow("independent-reproducer", reports.confirmed, {
-      ...manifest, ...reports.identities,
+      ...manifest,
+      ...reports.identities,
     });
     if (reports.confirmed.outcome === "blocked") {
-      return finishBlocked(manifest, runRoot, `Independent reproduction blocked: ${reports.confirmed.blockers?.map(({ reason }) => reason).join("; ") || "unspecified blocker"}`);
+      return finishBlocked(
+        manifest,
+        runRoot,
+        `Independent reproduction blocked: ${reports.confirmed.blockers?.map(({ reason }) => reason).join("; ") || "unspecified blocker"}`,
+      );
     }
     await sealStageCheckpoint(context, "independent-reproducer");
 
     const configuredBlockingSeverities = context.config.gate?.blockingSeverities ?? [];
     const reportedBlockingSeverities = reports.confirmed.summary?.blockingSeverities ?? [];
-    if (JSON.stringify([...reportedBlockingSeverities].sort()) !== JSON.stringify([...configuredBlockingSeverities].sort())) {
-      throw new Error("independent-reproducer summary.blockingSeverities does not match the runner-owned gate policy");
+    if (
+      JSON.stringify([...reportedBlockingSeverities].sort()) !==
+      JSON.stringify([...configuredBlockingSeverities].sort())
+    ) {
+      throw new Error(
+        "independent-reproducer summary.blockingSeverities does not match the runner-owned gate policy",
+      );
     }
     const finding = deriveFindingGate(reports.confirmed, configuredBlockingSeverities);
     const findingGate = finding.gate;
     if (reports.confirmed.summary?.mergeGate !== findingGate) {
-      throw new Error("independent-reproducer summary.mergeGate does not match the runner-derived finding gate");
+      throw new Error(
+        "independent-reproducer summary.mergeGate does not match the runner-derived finding gate",
+      );
     }
     manifest.status = "completed";
     manifest.completedAt = new Date().toISOString();
     manifest.findingGate = findingGate;
     manifest.blockingCandidateIds = finding.blockingCandidateIds;
-    manifest.coverageGate = deriveCoverageGate(reports.riskVerification, "pass", reports.exploration);
-    manifest.mergeGate = findingGate === "fail"
-      ? "fail"
-      : findingGate === "needs-review" || manifest.coverageGate !== "pass"
-        ? "needs-review"
-        : "pass";
+    manifest.coverageGate = deriveCoverageGate(
+      reports.riskVerification,
+      "pass",
+      reports.exploration,
+    );
+    manifest.mergeGate =
+      findingGate === "fail"
+        ? "fail"
+        : findingGate === "needs-review" || manifest.coverageGate !== "pass"
+          ? "needs-review"
+          : "pass";
     await writeJson(resolve(runRoot, "run-manifest.json"), manifest);
-    process.stdout.write(`${JSON.stringify({ runId: manifest.runId, runRoot: normalizePath(runRoot), findingGate, coverageGate: manifest.coverageGate, mergeGate: manifest.mergeGate }, null, 2)}\n`);
+    process.stdout.write(
+      `${JSON.stringify({ runId: manifest.runId, runRoot: normalizePath(runRoot), findingGate, coverageGate: manifest.coverageGate, mergeGate: manifest.mergeGate }, null, 2)}\n`,
+    );
     return manifest.mergeGate === "pass" ? 0 : 1;
   } finally {
     if (appProcess) await stopApplication(appProcess);
@@ -730,14 +959,25 @@ async function runOrLoadStage(context) {
   if (!checkpoint) return runStage(context);
   const outputPath = resolve(reportRoot, stage.report);
   const bytes = await readFile(outputPath);
-  if (sha256(bytes) !== checkpoint.reportSha256) throw new Error(`Cannot resume run: ${stage.id} report hash changed`);
+  if (sha256(bytes) !== checkpoint.reportSha256)
+    throw new Error(`Cannot resume run: ${stage.id} report hash changed`);
   await validateJsonSchema(config, resolve(projectRoot, stage.schema), outputPath, projectRoot);
   const report = JSON.parse(bytes.toString("utf8"));
-  const evidenceInspection = await inspectEvidenceArtifacts(report, runRoot, stage.id, checkpoint.attempt);
+  const evidenceInspection = await inspectEvidenceArtifacts(
+    report,
+    runRoot,
+    stage.id,
+    checkpoint.attempt,
+  );
   if (evidenceInspection.errors.length) {
-    throw new Error(`Cannot resume run: ${stage.id} evidence validation failed:\n- ${evidenceInspection.errors.join("\n- ")}`);
+    throw new Error(
+      `Cannot resume run: ${stage.id} evidence validation failed:\n- ${evidenceInspection.errors.join("\n- ")}`,
+    );
   }
-  if (JSON.stringify(evidenceInspection.artifacts) !== JSON.stringify(checkpoint.evidenceArtifacts ?? [])) {
+  if (
+    JSON.stringify(evidenceInspection.artifacts) !==
+    JSON.stringify(checkpoint.evidenceArtifacts ?? [])
+  ) {
     throw new Error(`Cannot resume run: ${stage.id} evidence manifest changed`);
   }
   return report;
@@ -753,8 +993,19 @@ async function sealStageCheckpoint(context, stageId) {
 
 async function runStage(context) {
   const {
-    stage, config, configPath, copiedTaskPath, inputPaths, manifest, projectRoot,
-    providerName, promptRoot, rawRoot, reportRoot, runRoot, sourceBaseline,
+    stage,
+    config,
+    configPath,
+    copiedTaskPath,
+    inputPaths,
+    manifest,
+    projectRoot,
+    providerName,
+    promptRoot,
+    rawRoot,
+    reportRoot,
+    runRoot,
+    sourceBaseline,
   } = context;
   const assertSourceIdentity = async () => {
     const current = await captureSourceSnapshot(projectRoot, config.artifacts.root);
@@ -786,7 +1037,11 @@ async function runStage(context) {
     });
     const promptPath = resolve(promptRoot, `${stage.id}.attempt-${attempt}.txt`);
     await writeFile(promptPath, prompt, "utf8");
-    const protectedArtifacts = await captureArtifactSnapshot(runRoot, [copiedTaskPath, configPath, ...inputPaths]);
+    const protectedArtifacts = await captureArtifactSnapshot(runRoot, [
+      copiedTaskPath,
+      configPath,
+      ...inputPaths,
+    ]);
     const startedAt = new Date().toISOString();
     let raw;
     try {
@@ -794,22 +1049,44 @@ async function runStage(context) {
     } finally {
       await assertRunnerArtifactsUnchanged(protectedArtifacts, runRoot, evidenceRoot);
     }
-    await writeFile(resolve(rawRoot, `${stage.id}.attempt-${attempt}.stdout.txt`), raw.stdout, "utf8");
-    await writeFile(resolve(rawRoot, `${stage.id}.attempt-${attempt}.stderr.txt`), raw.stderr, "utf8");
+    await writeFile(
+      resolve(rawRoot, `${stage.id}.attempt-${attempt}.stdout.txt`),
+      raw.stdout,
+      "utf8",
+    );
+    await writeFile(
+      resolve(rawRoot, `${stage.id}.attempt-${attempt}.stderr.txt`),
+      raw.stderr,
+      "utf8",
+    );
     await writeJson(resolve(rawRoot, `${stage.id}.attempt-${attempt}.process.json`), {
       code: raw.code,
       timedOut: raw.timedOut === true,
       spawnError: raw.spawnError === true,
     });
-    if (raw.timedOut) throw new Error(`Agent provider timed out after ${config.providers[providerName].timeoutMs}ms`);
-    if (raw.spawnError || raw.code !== 0) throw new Error(`Agent provider exited ${raw.code ?? "before start"}: ${raw.stderr || raw.stdout}`);
+    if (raw.timedOut)
+      throw new Error(
+        `Agent provider timed out after ${config.providers[providerName].timeoutMs}ms`,
+      );
+    if (raw.spawnError || raw.code !== 0)
+      throw new Error(
+        `Agent provider exited ${raw.code ?? "before start"}: ${raw.stderr || raw.stdout}`,
+      );
     let candidateIndex = 0;
     const report = await extractValidatedJsonObject(raw.stdout, async (candidate) => {
       candidateIndex += 1;
-      const candidatePath = resolve(rawRoot, `${stage.id}.attempt-${attempt}.candidate-${candidateIndex}.json`);
+      const candidatePath = resolve(
+        rawRoot,
+        `${stage.id}.attempt-${attempt}.candidate-${candidateIndex}.json`,
+      );
       await writeJson(candidatePath, candidate);
       try {
-        await validateJsonSchema(config, resolve(projectRoot, stage.schema), candidatePath, projectRoot);
+        await validateJsonSchema(
+          config,
+          resolve(projectRoot, stage.schema),
+          candidatePath,
+          projectRoot,
+        );
         return true;
       } catch {
         return false;
@@ -819,7 +1096,9 @@ async function runStage(context) {
     await validateJsonSchema(config, resolve(projectRoot, stage.schema), outputPath, projectRoot);
     const evidenceInspection = await inspectEvidenceArtifacts(report, runRoot, stage.id, attempt);
     if (evidenceInspection.errors.length) {
-      throw new Error(`${stage.id} evidence validation failed:\n- ${evidenceInspection.errors.join("\n- ")}`);
+      throw new Error(
+        `${stage.id} evidence validation failed:\n- ${evidenceInspection.errors.join("\n- ")}`,
+      );
     }
     manifest.stages = (manifest.stages ?? []).filter(({ id }) => id !== stage.id);
     manifest.stages.push({
@@ -842,37 +1121,71 @@ async function runStage(context) {
 
 function validateSemantic(stageId, reports) {
   let errors;
-  if (stageId === "real-world-use-case-scout") errors = validateUseCaseScoutSemantics(reports.scout, reports.originalTask);
-  else if (stageId === "pre-implementation-risk-architect") errors = validateRiskRegisterSemantics(reports.risks, reports.scout);
-  else if (stageId === "feature-brief-synthesizer") errors = validateFeatureBriefSemantics(reports.brief, reports.scout, reports.risks, reports.originalTask);
-  else if (stageId === "feature-completeness") errors = validateFeatureModelSemantics(reports.feature, reports.brief);
-  else if (stageId === "edge-case-explorer") errors = validateExplorationReportSemantics(reports.exploration, reports.feature);
-  else if (stageId === "design-ux-auditor") errors = validateDesignAuditSemantics(reports.design, reports.feature);
-  else if (stageId === "post-implementation-risk-verifier") errors = validateRiskVerificationSemantics(reports.riskVerification, reports.risks);
-  else errors = validateConfirmedReportSemantics(
-    reports.confirmed,
-    reports.feature,
-    reports.exploration,
-    reports.design,
-    reports.riskVerification,
-    reports.identities,
-  );
-  if (errors.length) throw new Error(`${stageId} semantic validation failed:\n- ${errors.join("\n- ")}`);
+  if (stageId === "real-world-use-case-scout")
+    errors = validateUseCaseScoutSemantics(reports.scout, reports.originalTask);
+  else if (stageId === "pre-implementation-risk-architect")
+    errors = validateRiskRegisterSemantics(reports.risks, reports.scout);
+  else if (stageId === "feature-brief-synthesizer")
+    errors = validateFeatureBriefSemantics(
+      reports.brief,
+      reports.scout,
+      reports.risks,
+      reports.originalTask,
+    );
+  else if (stageId === "feature-completeness")
+    errors = validateFeatureModelSemantics(reports.feature, reports.brief);
+  else if (stageId === "edge-case-explorer")
+    errors = validateExplorationReportSemantics(reports.exploration, reports.feature);
+  else if (stageId === "design-ux-auditor")
+    errors = validateDesignAuditSemantics(reports.design, reports.feature);
+  else if (stageId === "post-implementation-risk-verifier")
+    errors = validateRiskVerificationSemantics(reports.riskVerification, reports.risks);
+  else
+    errors = validateConfirmedReportSemantics(
+      reports.confirmed,
+      reports.feature,
+      reports.exploration,
+      reports.design,
+      reports.riskVerification,
+      reports.identities,
+    );
+  if (errors.length)
+    throw new Error(`${stageId} semantic validation failed:\n- ${errors.join("\n- ")}`);
 }
 
 function validateProvenanceOrThrow(stageId, report, expected) {
   const errors = validateStageProvenance(stageId, report, expected);
-  if (errors.length) throw new Error(`${stageId} provenance validation failed:\n- ${errors.join("\n- ")}`);
+  if (errors.length)
+    throw new Error(`${stageId} provenance validation failed:\n- ${errors.join("\n- ")}`);
 }
 
 async function invokeProvider(provider, prompt, projectRoot) {
-  const args = provider.args.map((value) => value === "{{prompt}}" ? prompt : value);
+  const args = provider.args.map((value) => (value === "{{prompt}}" ? prompt : value));
   const allowedEnvironment = [
-    "PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "HOME", "USERPROFILE",
-    "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "TERM", "LANG",
-    "HERMES_HOME", "HERMES_REAL_HOME",
+    "PATH",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "TERM",
+    "LANG",
+    "HERMES_HOME",
+    "HERMES_REAL_HOME",
   ];
-  const environment = Object.fromEntries(allowedEnvironment.filter((key) => process.env[key] !== undefined).map((key) => [key, process.env[key]]));
+  const environment = Object.fromEntries(
+    allowedEnvironment
+      .filter((key) => process.env[key] !== undefined)
+      .map((key) => [key, process.env[key]]),
+  );
   let result;
   try {
     result = await runProcess(provider.command, args, {
@@ -891,12 +1204,17 @@ async function invokeProvider(provider, prompt, projectRoot) {
 
 async function validateJsonSchema(config, schemaPath, documentPath, projectRoot) {
   const script = resolve(projectRoot, ".qa/scripts/validate-json-schema.py");
-  const result = await runProcess(config.validation.pythonCommand, [script, schemaPath, documentPath], {
-    cwd: projectRoot,
-    timeoutMs: 60_000,
-    shell: false,
-  });
-  if (result.code !== 0) throw new Error(`JSON Schema validation failed:\n${result.stderr || result.stdout}`);
+  const result = await runProcess(
+    config.validation.pythonCommand,
+    [script, schemaPath, documentPath],
+    {
+      cwd: projectRoot,
+      timeoutMs: 60_000,
+      shell: false,
+    },
+  );
+  if (result.code !== 0)
+    throw new Error(`JSON Schema validation failed:\n${result.stderr || result.stdout}`);
 }
 
 export function resolveApplicationCommand(command, projectRoot) {
@@ -933,7 +1251,8 @@ async function startApplication(application, projectRoot, runRoot) {
 async function waitForReady(url, timeoutMs, processHandle) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (processHandle.exitCode !== null) throw new Error(`Application exited before readiness with code ${processHandle.exitCode}`);
+    if (processHandle.exitCode !== null)
+      throw new Error(`Application exited before readiness with code ${processHandle.exitCode}`);
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(2_000) });
       if (response.ok) return;
@@ -960,12 +1279,18 @@ async function stopApplication(processHandle) {
 
 async function captureGitContext(projectRoot) {
   const [base, head, status, diff] = await Promise.all([
-    runGit(["merge-base", "HEAD", "main"], projectRoot).catch(() => runGit(["rev-parse", "HEAD"], projectRoot)),
+    runGit(["merge-base", "HEAD", "main"], projectRoot).catch(() =>
+      runGit(["rev-parse", "HEAD"], projectRoot),
+    ),
     runGit(["rev-parse", "HEAD"], projectRoot),
     runGit(["status", "--short", "--untracked-files=all"], projectRoot),
-    runGit(["diff", "--no-ext-diff", "--binary", "HEAD", "--", ".", ":(exclude).qa/**"], projectRoot),
+    runGit(
+      ["diff", "--no-ext-diff", "--binary", "HEAD", "--", ".", ":(exclude).qa/**"],
+      projectRoot,
+    ),
   ]);
-  const applicationStatus = status.split("\n")
+  const applicationStatus = status
+    .split("\n")
     .map((line) => line.trimEnd())
     .filter((line) => line && !line.slice(3).replaceAll("\\", "/").startsWith(".qa/"))
     .join("\n");
@@ -980,22 +1305,27 @@ async function captureSourceSnapshot(projectRoot, artifactRoot) {
   });
   if (result.code !== 0) throw new Error(`Unable to enumerate source files: ${result.stderr}`);
   const excluded = normalizePath(artifactRoot).replace(/\/$/, "") + "/";
-  const paths = result.stdout.split("\0").filter(Boolean).filter((path) => !normalizePath(path).startsWith(excluded));
+  const paths = result.stdout
+    .split("\0")
+    .filter(Boolean)
+    .filter((path) => !normalizePath(path).startsWith(excluded));
   const snapshot = new Map();
-  await Promise.all(paths.map(async (path) => {
-    try {
-      const absolutePath = resolve(projectRoot, path);
-      const info = await lstat(absolutePath);
-      const identity = info.isSymbolicLink()
-        ? `symlink:${info.mode}:${await readlink(absolutePath)}`
-        : info.isFile()
-          ? `file:${info.mode}:${sha256(await readFile(absolutePath))}`
-          : `other:${info.mode}`;
-      snapshot.set(normalizePath(path), identity);
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-    }
-  }));
+  await Promise.all(
+    paths.map(async (path) => {
+      try {
+        const absolutePath = resolve(projectRoot, path);
+        const info = await lstat(absolutePath);
+        const identity = info.isSymbolicLink()
+          ? `symlink:${info.mode}:${await readlink(absolutePath)}`
+          : info.isFile()
+            ? `file:${info.mode}:${sha256(await readFile(absolutePath))}`
+            : `other:${info.mode}`;
+        snapshot.set(normalizePath(path), identity);
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }),
+  );
   return snapshot;
 }
 
@@ -1005,7 +1335,11 @@ async function runGit(args, cwd) {
   return result.stdout;
 }
 
-function runProcess(command, args, { cwd, timeoutMs, shell, env = process.env, killTree = false, captureTimeout = false }) {
+function runProcess(
+  command,
+  args,
+  { cwd, timeoutMs, shell, env = process.env, killTree = false, captureTimeout = false },
+) {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(command, args, {
       cwd,
@@ -1017,13 +1351,20 @@ function runProcess(command, args, { cwd, timeoutMs, shell, env = process.env, k
     let stdout = "";
     let stderr = "";
     let timedOut = false;
-    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
     child.on("error", reject);
     const timer = setTimeout(() => {
       timedOut = true;
       if (killTree && process.platform === "win32" && child.pid) {
-        spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true, stdio: "ignore" });
+        spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+          windowsHide: true,
+          stdio: "ignore",
+        });
       } else {
         child.kill("SIGTERM");
       }
@@ -1042,7 +1383,9 @@ async function finishBlocked(manifest, runRoot, reason) {
   manifest.mergeGate = "needs-review";
   manifest.blockedReason = reason;
   await writeJson(resolve(runRoot, "run-manifest.json"), manifest);
-  process.stdout.write(`${JSON.stringify({ runId: manifest.runId, runRoot: normalizePath(runRoot), mergeGate: "needs-review", reason }, null, 2)}\n`);
+  process.stdout.write(
+    `${JSON.stringify({ runId: manifest.runId, runRoot: normalizePath(runRoot), mergeGate: "needs-review", reason }, null, 2)}\n`,
+  );
   return 2;
 }
 
@@ -1086,9 +1429,13 @@ async function writeJson(path, value) {
 const isMain = process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url;
 if (isMain) {
   main()
-    .then((code) => { process.exitCode = code; })
+    .then((code) => {
+      process.exitCode = code;
+    })
     .catch((error) => {
-      process.stderr.write(`QA runner error: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+      process.stderr.write(
+        `QA runner error: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
+      );
       process.exitCode = 2;
     });
 }

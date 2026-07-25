@@ -23,7 +23,14 @@ test("blocked contracts are valid without invented ready-run fields", () => {
       runId: "run-blocked",
       outcome: "blocked",
       featureModelId: "fm-blocked",
-      blockers: [{ id: "BLK-001", area: "feature-model", reason: "Feature model blocked", affectedCaseIds: [] }],
+      blockers: [
+        {
+          id: "BLK-001",
+          area: "feature-model",
+          reason: "Feature model blocked",
+          affectedCaseIds: [],
+        },
+      ],
     }),
     [],
   );
@@ -50,11 +57,19 @@ test("feature model cannot omit, mutate, or invent frozen explicit requirements"
     finalRequirements: [{ id: "FR-001", text: "Keep active work visible" }],
   };
   const model = validFeatureModel();
-  model.sourceSummary.explicitRequirements.push({ id: "FR-001", text: "Keep active work visible", source: { type: "acceptance-criteria", locator: "brief FR-001" } });
+  model.sourceSummary.explicitRequirements.push({
+    id: "FR-001",
+    text: "Keep active work visible",
+    source: { type: "acceptance-criteria", locator: "brief FR-001" },
+  });
   model.edgeCaseCharter.categories.input[0].coversRequirementIds.push("FR-001");
   assert.deepEqual(validateFeatureModelSemantics(model, brief), []);
   model.sourceSummary.explicitRequirements[0].text = "Paraphrased requirement";
-  model.sourceSummary.explicitRequirements.push({ id: "REQ-999", text: "Invented", source: { type: "original-task", locator: "task" } });
+  model.sourceSummary.explicitRequirements.push({
+    id: "REQ-999",
+    text: "Invented",
+    source: { type: "original-task", locator: "task" },
+  });
   const errors = validateFeatureModelSemantics(model, brief);
   assert.ok(errors.some((error) => error.includes("mutates frozen requirement REQ-001")));
   assert.ok(errors.some((error) => error.includes("invents explicit requirement REQ-999")));
@@ -311,14 +326,78 @@ function validExplorationReport() {
       blocked: 0,
       notApplicable: 0,
       byCategory: {
-        input: { planned: 1, selected: 1, executed: 1, passed: 0, observationsRecorded: 1, blocked: 0, notApplicable: 0 },
-        timing: { planned: 0, selected: 0, executed: 0, passed: 0, observationsRecorded: 0, blocked: 0, notApplicable: 0 },
-        lifecycle: { planned: 0, selected: 0, executed: 0, passed: 0, observationsRecorded: 0, blocked: 0, notApplicable: 0 },
-        interaction: { planned: 0, selected: 0, executed: 0, passed: 0, observationsRecorded: 0, blocked: 0, notApplicable: 0 },
-        persistence: { planned: 0, selected: 0, executed: 0, passed: 0, observationsRecorded: 0, blocked: 0, notApplicable: 0 },
-        layout: { planned: 0, selected: 0, executed: 0, passed: 0, observationsRecorded: 0, blocked: 0, notApplicable: 0 },
-        accessibility: { planned: 0, selected: 0, executed: 0, passed: 0, observationsRecorded: 0, blocked: 0, notApplicable: 0 },
-        neighboringRegression: { planned: 0, selected: 0, executed: 0, passed: 0, observationsRecorded: 0, blocked: 0, notApplicable: 0 },
+        input: {
+          planned: 1,
+          selected: 1,
+          executed: 1,
+          passed: 0,
+          observationsRecorded: 1,
+          blocked: 0,
+          notApplicable: 0,
+        },
+        timing: {
+          planned: 0,
+          selected: 0,
+          executed: 0,
+          passed: 0,
+          observationsRecorded: 0,
+          blocked: 0,
+          notApplicable: 0,
+        },
+        lifecycle: {
+          planned: 0,
+          selected: 0,
+          executed: 0,
+          passed: 0,
+          observationsRecorded: 0,
+          blocked: 0,
+          notApplicable: 0,
+        },
+        interaction: {
+          planned: 0,
+          selected: 0,
+          executed: 0,
+          passed: 0,
+          observationsRecorded: 0,
+          blocked: 0,
+          notApplicable: 0,
+        },
+        persistence: {
+          planned: 0,
+          selected: 0,
+          executed: 0,
+          passed: 0,
+          observationsRecorded: 0,
+          blocked: 0,
+          notApplicable: 0,
+        },
+        layout: {
+          planned: 0,
+          selected: 0,
+          executed: 0,
+          passed: 0,
+          observationsRecorded: 0,
+          blocked: 0,
+          notApplicable: 0,
+        },
+        accessibility: {
+          planned: 0,
+          selected: 0,
+          executed: 0,
+          passed: 0,
+          observationsRecorded: 0,
+          blocked: 0,
+          notApplicable: 0,
+        },
+        neighboringRegression: {
+          planned: 0,
+          selected: 0,
+          executed: 0,
+          passed: 0,
+          observationsRecorded: 0,
+          blocked: 0,
+          notApplicable: 0,
+        },
       },
       untestedRisks: [],
     },

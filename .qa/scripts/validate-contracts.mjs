@@ -20,7 +20,8 @@ export function validateUseCaseScoutSemantics(report, originalTask = null) {
   const errors = [];
   if (!report || typeof report !== "object") return ["use-case scout report must be an object"];
   if (report.outcome === "blocked") {
-    if (!Array.isArray(report.blockers) || report.blockers.length === 0) errors.push("blocked use-case scout requires at least one blocker");
+    if (!Array.isArray(report.blockers) || report.blockers.length === 0)
+      errors.push("blocked use-case scout requires at least one blocker");
     return errors;
   }
   if (report.outcome !== "ready") return ["use-case scout outcome must be ready or blocked"];
@@ -28,16 +29,29 @@ export function validateUseCaseScoutSemantics(report, originalTask = null) {
   checkUnique(report.proposals ?? [], "use-case proposal", errors);
   if (typeof originalTask === "string") {
     const normalizedTask = originalTask.replace(/\r\n/g, "\n");
-    const requirementTexts = (report.originalRequirements ?? []).map(({ text }) => String(text ?? "").replace(/\r\n/g, "\n"));
+    const requirementTexts = (report.originalRequirements ?? []).map(({ text }) =>
+      String(text ?? "").replace(/\r\n/g, "\n"),
+    );
     for (const requirement of report.originalRequirements ?? []) {
       if (!normalizedTask.includes(String(requirement.text ?? "").replace(/\r\n/g, "\n"))) {
-        errors.push(`original requirement ${requirement.id} is not verbatim text from the original task file`);
+        errors.push(
+          `original requirement ${requirement.id} is not verbatim text from the original task file`,
+        );
       }
     }
-    const substantiveLines = normalizedTask.split("\n")
+    const substantiveLines = normalizedTask
+      .split("\n")
       .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith("#") && !line.startsWith("```") && !/^[-*]\s*$/.test(line))
-      .map((line) => line.replace(/^>\s?/, "").replace(/^[-*]\s+/, "").replace(/^\d+[.)]\s+/, ""));
+      .filter(
+        (line) =>
+          line && !line.startsWith("#") && !line.startsWith("```") && !/^[-*]\s*$/.test(line),
+      )
+      .map((line) =>
+        line
+          .replace(/^>\s?/, "")
+          .replace(/^[-*]\s+/, "")
+          .replace(/^\d+[.)]\s+/, ""),
+      );
     for (const line of substantiveLines) {
       if (!requirementTexts.some((text) => text.includes(line) || line.includes(text))) {
         errors.push(`original task line is not traceable to a verbatim requirement: ${line}`);
@@ -52,10 +66,14 @@ export function validateUseCaseScoutSemantics(report, originalTask = null) {
         evidence.filter(({ type }) => type === "comparable-product").map(({ locator }) => locator),
       );
       if (!hasPrimary && comparableLocators.size < 2) {
-        errors.push(`proposal ${proposal.id} needs strong evidence: one primary source or two independent comparable products`);
+        errors.push(
+          `proposal ${proposal.id} needs strong evidence: one primary source or two independent comparable products`,
+        );
       }
       if (proposal.changeRisk !== "additive-low") {
-        errors.push(`expected proposal ${proposal.id} must be additive-low; larger changes must remain optional`);
+        errors.push(
+          `expected proposal ${proposal.id} must be additive-low; larger changes must remain optional`,
+        );
       }
     }
     if (proposal.disposition !== "rejected" && evidence.length === 0) {
@@ -69,7 +87,8 @@ export function validateRiskRegisterSemantics(report, scout = null) {
   const errors = [];
   if (!report || typeof report !== "object") return ["risk register must be an object"];
   if (report.outcome === "blocked") {
-    if (!Array.isArray(report.blockers) || report.blockers.length === 0) errors.push("blocked risk register requires at least one blocker");
+    if (!Array.isArray(report.blockers) || report.blockers.length === 0)
+      errors.push("blocked risk register requires at least one blocker");
     return errors;
   }
   if (report.outcome !== "ready") return ["risk register outcome must be ready or blocked"];
@@ -78,13 +97,21 @@ export function validateRiskRegisterSemantics(report, scout = null) {
   const proposalIds = new Set((scout?.proposals ?? []).map(({ id }) => id));
   for (const risk of report.risks ?? []) {
     if (scout) {
-      checkReferences(risk.relatedRequirementIds, requirementIds, `risk ${risk.id} requirement`, errors);
+      checkReferences(
+        risk.relatedRequirementIds,
+        requirementIds,
+        `risk ${risk.id} requirement`,
+        errors,
+      );
       checkReferences(risk.relatedProposalIds, proposalIds, `risk ${risk.id} proposal`, errors);
     }
     if ((risk.verification?.methods?.length ?? 0) === 0) {
       errors.push(`risk ${risk.id} requires at least one verification method`);
     }
-    if (["critical", "high"].includes(risk.severity) && (risk.verification?.requiredCapabilities?.length ?? 0) === 0) {
+    if (
+      ["critical", "high"].includes(risk.severity) &&
+      (risk.verification?.requiredCapabilities?.length ?? 0) === 0
+    ) {
       errors.push(`high-risk ${risk.id} requires explicit verification capabilities`);
     }
   }
@@ -95,13 +122,16 @@ export function validateFeatureBriefSemantics(brief, scout, register, originalTa
   const errors = [];
   if (!brief || typeof brief !== "object") return ["feature brief must be an object"];
   if (brief.outcome === "blocked") {
-    if (!Array.isArray(brief.blockers) || brief.blockers.length === 0) errors.push("blocked feature brief requires at least one blocker");
+    if (!Array.isArray(brief.blockers) || brief.blockers.length === 0)
+      errors.push("blocked feature brief requires at least one blocker");
     return errors;
   }
   if (brief.outcome !== "ready") return ["feature brief outcome must be ready or blocked"];
   if (
     typeof originalTask === "string" &&
-    String(brief.originalRequestVerbatim ?? "").replace(/\r\n/g, "\n").trimEnd() !== originalTask.replace(/\r\n/g, "\n").trimEnd()
+    String(brief.originalRequestVerbatim ?? "")
+      .replace(/\r\n/g, "\n")
+      .trimEnd() !== originalTask.replace(/\r\n/g, "\n").trimEnd()
   ) {
     errors.push("feature brief originalRequestVerbatim must exactly match the original task file");
   }
@@ -109,32 +139,43 @@ export function validateFeatureBriefSemantics(brief, scout, register, originalTa
   const copied = new Map((brief.originalRequirements ?? []).map((item) => [item.id, item.text]));
   for (const requirement of sourceRequirements) {
     if (copied.get(requirement.id) !== requirement.text) {
-      errors.push(`original requirement ${requirement.id} is immutable and must be copied verbatim`);
+      errors.push(
+        `original requirement ${requirement.id} is immutable and must be copied verbatim`,
+      );
     }
   }
-  if (copied.size !== sourceRequirements.length) errors.push("feature brief original requirements must exactly match the scout report");
+  if (copied.size !== sourceRequirements.length)
+    errors.push("feature brief original requirements must exactly match the scout report");
   checkUnique(brief.proposalDecisions ?? [], "proposal decision", errors, "proposalId");
   checkUnique(brief.finalRequirements ?? [], "final requirement", errors);
   const proposalById = new Map((scout?.proposals ?? []).map((item) => [item.id, item]));
   const proposalIds = new Set(proposalById.keys());
   const decisions = new Map((brief.proposalDecisions ?? []).map((item) => [item.proposalId, item]));
-  for (const proposalId of proposalIds) if (!decisions.has(proposalId)) errors.push(`feature brief omits proposal decision ${proposalId}`);
-  for (const proposalId of decisions.keys()) if (!proposalIds.has(proposalId)) errors.push(`feature brief contains unknown proposal ${proposalId}`);
+  for (const proposalId of proposalIds)
+    if (!decisions.has(proposalId))
+      errors.push(`feature brief omits proposal decision ${proposalId}`);
+  for (const proposalId of decisions.keys())
+    if (!proposalIds.has(proposalId))
+      errors.push(`feature brief contains unknown proposal ${proposalId}`);
   for (const [proposalId, decision] of decisions) {
     const proposal = proposalById.get(proposalId);
     if (!proposal) continue;
-    const expected = proposal.disposition === "expected"
-      ? { category: "Expected", decision: "include" }
-      : proposal.disposition === "optional"
-        ? { category: "Optional", decision: "defer" }
-        : { category: "Rejected", decision: "reject" };
+    const expected =
+      proposal.disposition === "expected"
+        ? { category: "Expected", decision: "include" }
+        : proposal.disposition === "optional"
+          ? { category: "Optional", decision: "defer" }
+          : { category: "Rejected", decision: "reject" };
     if (decision.category !== expected.category || decision.decision !== expected.decision) {
       errors.push(`proposal ${proposalId} must be ${expected.category}/${expected.decision}`);
     }
   }
-  const sourceIds = new Set((brief.finalRequirements ?? []).flatMap(({ sourceIds: ids = [] }) => ids));
+  const sourceIds = new Set(
+    (brief.finalRequirements ?? []).flatMap(({ sourceIds: ids = [] }) => ids),
+  );
   for (const requirement of sourceRequirements) {
-    if (!sourceIds.has(requirement.id)) errors.push(`final requirements omit original requirement ${requirement.id}`);
+    if (!sourceIds.has(requirement.id))
+      errors.push(`final requirements omit original requirement ${requirement.id}`);
   }
   for (const proposal of scout?.proposals ?? []) {
     if (proposal.disposition === "expected" && !sourceIds.has(proposal.id)) {
@@ -142,8 +183,12 @@ export function validateFeatureBriefSemantics(brief, scout, register, originalTa
     }
   }
   const riskIds = new Set((register?.risks ?? []).map(({ id }) => id));
-  const mappedRisks = new Set((brief.finalRequirements ?? []).flatMap(({ riskIds: ids = [] }) => ids));
-  for (const riskId of riskIds) if (!mappedRisks.has(riskId)) errors.push(`feature brief does not map frozen risk ${riskId} to a final requirement`);
+  const mappedRisks = new Set(
+    (brief.finalRequirements ?? []).flatMap(({ riskIds: ids = [] }) => ids),
+  );
+  for (const riskId of riskIds)
+    if (!mappedRisks.has(riskId))
+      errors.push(`feature brief does not map frozen risk ${riskId} to a final requirement`);
   return errors;
 }
 
@@ -151,20 +196,28 @@ export function validateRiskVerificationSemantics(report, register) {
   const errors = [];
   if (!report || typeof report !== "object") return ["risk verification report must be an object"];
   if (report.outcome === "blocked") {
-    if (!Array.isArray(report.blockers) || report.blockers.length === 0) errors.push("blocked risk verification requires at least one blocker");
+    if (!Array.isArray(report.blockers) || report.blockers.length === 0)
+      errors.push("blocked risk verification requires at least one blocker");
     return errors;
   }
-  if (report.outcome !== "completed") return ["risk verification outcome must be completed or blocked"];
-  if (report.riskRegisterId !== register?.registerId) errors.push("risk verification register identity mismatch");
+  if (report.outcome !== "completed")
+    return ["risk verification outcome must be completed or blocked"];
+  if (report.riskRegisterId !== register?.registerId)
+    errors.push("risk verification register identity mismatch");
   checkUnique(report.verdicts ?? [], "risk verdict", errors, "riskId");
   const riskById = new Map((register?.risks ?? []).map((risk) => [risk.id, risk]));
   const riskIds = new Set(riskById.keys());
   const verdictIds = new Set((report.verdicts ?? []).map(({ riskId }) => riskId));
-  for (const riskId of riskIds) if (!verdictIds.has(riskId)) errors.push(`risk verification omits ${riskId}`);
-  for (const riskId of verdictIds) if (!riskIds.has(riskId)) errors.push(`risk verification contains unknown ${riskId}`);
+  for (const riskId of riskIds)
+    if (!verdictIds.has(riskId)) errors.push(`risk verification omits ${riskId}`);
+  for (const riskId of verdictIds)
+    if (!riskIds.has(riskId)) errors.push(`risk verification contains unknown ${riskId}`);
   for (const verdict of report.verdicts ?? []) {
     const risk = riskById.get(verdict.riskId);
-    if (["verified-safe", "finding", "not-applicable"].includes(verdict.status) && !hasEvidence(verdict.evidence)) {
+    if (
+      ["verified-safe", "finding", "not-applicable"].includes(verdict.status) &&
+      !hasEvidence(verdict.evidence)
+    ) {
       errors.push(`risk verdict ${verdict.riskId} requires objective evidence`);
     }
     if (["blocked", "not-applicable"].includes(verdict.status) && !verdict.rationale) {
@@ -174,10 +227,14 @@ export function validateRiskVerificationSemantics(report, register) {
       const satisfiedMethods = new Set(verdict.satisfiedMethods ?? []);
       const satisfiedCapabilities = new Set(verdict.satisfiedCapabilities ?? []);
       for (const method of risk.verification?.methods ?? []) {
-        if (!satisfiedMethods.has(method)) errors.push(`risk verdict ${verdict.riskId} did not satisfy required method ${method}`);
+        if (!satisfiedMethods.has(method))
+          errors.push(`risk verdict ${verdict.riskId} did not satisfy required method ${method}`);
       }
       for (const capability of risk.verification?.requiredCapabilities ?? []) {
-        if (!satisfiedCapabilities.has(capability)) errors.push(`risk verdict ${verdict.riskId} did not satisfy required capability ${capability}`);
+        if (!satisfiedCapabilities.has(capability))
+          errors.push(
+            `risk verdict ${verdict.riskId} did not satisfy required capability ${capability}`,
+          );
       }
     }
     if (verdict.status === "not-applicable") {
@@ -187,14 +244,23 @@ export function validateRiskVerificationSemantics(report, register) {
         ...(verdict.evidence?.tests ?? []),
       ];
       if (scopeEvidence.length === 0 || machineEvidence.length === 0) {
-        errors.push(`risk verdict ${verdict.riskId} needs machine-checkable scope and reachability evidence or must be blocked`);
+        errors.push(
+          `risk verdict ${verdict.riskId} needs machine-checkable scope and reachability evidence or must be blocked`,
+        );
       }
-      if (risk && ["critical", "high"].includes(risk.severity) && (verdict.satisfiedMethods?.length ?? 0) === 0) {
-        errors.push(`high-risk not-applicable verdict ${verdict.riskId} must record a satisfied verification method or be blocked`);
+      if (
+        risk &&
+        ["critical", "high"].includes(risk.severity) &&
+        (verdict.satisfiedMethods?.length ?? 0) === 0
+      ) {
+        errors.push(
+          `high-risk not-applicable verdict ${verdict.riskId} must record a satisfied verification method or be blocked`,
+        );
       }
     }
     for (const path of evidencePaths(verdict.evidence)) {
-      if (!isPortableRelativePath(path)) errors.push(`risk verdict ${verdict.riskId} has unsafe artifact path ${path}`);
+      if (!isPortableRelativePath(path))
+        errors.push(`risk verdict ${verdict.riskId} has unsafe artifact path ${path}`);
     }
   }
   const verdicts = report.verdicts ?? [];
@@ -206,10 +272,12 @@ export function validateRiskVerificationSemantics(report, register) {
     blocked: verdicts.filter(({ status }) => status === "blocked").length,
   };
   for (const [key, value] of Object.entries(expectedSummary)) {
-    if (report.summary?.[key] !== value) errors.push(`risk verification summary.${key} must be ${value}`);
+    if (report.summary?.[key] !== value)
+      errors.push(`risk verification summary.${key} must be ${value}`);
   }
   const expectedGate = expectedSummary.blocked > 0 ? "needs-review" : "pass";
-  if (report.summary?.coverageGate !== expectedGate) errors.push(`risk verification summary.coverageGate must be ${expectedGate}`);
+  if (report.summary?.coverageGate !== expectedGate)
+    errors.push(`risk verification summary.coverageGate must be ${expectedGate}`);
   return errors;
 }
 
@@ -240,7 +308,8 @@ export function validateFeatureModelSemantics(model, brief = null) {
     const frozenById = new Map(frozenRequirements.map(({ id, text }) => [id, text]));
     for (const [id, text] of frozenById) {
       if (!modelById.has(id)) errors.push(`feature model omits frozen requirement ${id}`);
-      else if (modelById.get(id) !== text) errors.push(`feature model mutates frozen requirement ${id}`);
+      else if (modelById.get(id) !== text)
+        errors.push(`feature model mutates frozen requirement ${id}`);
     }
     for (const id of modelById.keys()) {
       if (!frozenById.has(id)) errors.push(`feature model invents explicit requirement ${id}`);
@@ -260,7 +329,9 @@ export function validateFeatureModelSemantics(model, brief = null) {
       errors.push(`transition ${transition.id} references unknown source state ${transition.from}`);
     }
     if (!stateIds.has(transition.to)) {
-      errors.push(`transition ${transition.id} references unknown destination state ${transition.to}`);
+      errors.push(
+        `transition ${transition.id} references unknown destination state ${transition.to}`,
+      );
     }
     const failureState = transition.failure?.stateId;
     if (failureState && !stateIds.has(failureState)) {
@@ -282,9 +353,19 @@ export function validateFeatureModelSemantics(model, brief = null) {
   const cases = collectCases(model, errors);
   checkUnique(cases, "edge-case", errors);
   for (const edgeCase of cases) {
-    checkReferences(edgeCase.coversRequirementIds, requirementIds, `edge case ${edgeCase.id} requirement`, errors);
+    checkReferences(
+      edgeCase.coversRequirementIds,
+      requirementIds,
+      `edge case ${edgeCase.id} requirement`,
+      errors,
+    );
     checkReferences(edgeCase.coversStateIds, stateIds, `edge case ${edgeCase.id} state`, errors);
-    checkReferences(edgeCase.coversTransitionIds, transitionIds, `edge case ${edgeCase.id} transition`, errors);
+    checkReferences(
+      edgeCase.coversTransitionIds,
+      transitionIds,
+      `edge case ${edgeCase.id} transition`,
+      errors,
+    );
   }
 
   const mustCases = cases.filter(({ priority }) => priority === "must");
@@ -355,7 +436,8 @@ export function validateExplorationReportSemantics(report, model) {
     }
   }
   for (const edgeCase of modelCases) {
-    if (!plannedIds.has(edgeCase.id)) errors.push(`scenario plan omits feature-model case ${edgeCase.id}`);
+    if (!plannedIds.has(edgeCase.id))
+      errors.push(`scenario plan omits feature-model case ${edgeCase.id}`);
   }
 
   for (const scenario of executed) {
@@ -375,7 +457,8 @@ export function validateExplorationReportSemantics(report, model) {
         errors.push(`scenario ${scenario.caseId} requires observationIds`);
       }
       for (const id of scenario.observationIds ?? []) {
-        if (!observationIds.has(id)) errors.push(`scenario ${scenario.caseId} references unknown observation ${id}`);
+        if (!observationIds.has(id))
+          errors.push(`scenario ${scenario.caseId} references unknown observation ${id}`);
       }
     } else if ((scenario.observationIds ?? []).length > 0) {
       errors.push(`scenario ${scenario.caseId} has observations but status is ${scenario.status}`);
@@ -391,14 +474,21 @@ export function validateExplorationReportSemantics(report, model) {
     if (scenario.status === "not-applicable" && !scenario.dispositionReason) {
       errors.push(`not-applicable scenario ${scenario.caseId} requires dispositionReason`);
     }
-    if (scenario.startedAt && scenario.completedAt && Date.parse(scenario.completedAt) < Date.parse(scenario.startedAt)) {
+    if (
+      scenario.startedAt &&
+      scenario.completedAt &&
+      Date.parse(scenario.completedAt) < Date.parse(scenario.startedAt)
+    ) {
       errors.push(`scenario ${scenario.caseId} completed before it started`);
     }
   }
 
-  const referencedObservations = new Set(executed.flatMap(({ observationIds = [] }) => observationIds));
+  const referencedObservations = new Set(
+    executed.flatMap(({ observationIds = [] }) => observationIds),
+  );
   for (const observation of observations) {
-    if (!referencedObservations.has(observation.id)) errors.push(`orphan observation ${observation.id}`);
+    if (!referencedObservations.has(observation.id))
+      errors.push(`orphan observation ${observation.id}`);
     if (observation.reproduction?.observed > observation.reproduction?.attempts) {
       errors.push(`observation ${observation.id}: observed cannot exceed attempts`);
     }
@@ -411,11 +501,16 @@ export function validateExplorationReportSemantics(report, model) {
       }
     }
     for (const caseId of observation.charterCaseIds ?? []) {
-      if (!modelCaseById.has(caseId)) errors.push(`observation ${observation.id} references unknown charter case ${caseId}`);
+      if (!modelCaseById.has(caseId))
+        errors.push(`observation ${observation.id} references unknown charter case ${caseId}`);
     }
   }
 
-  if (report.run?.startedAt && report.run?.completedAt && Date.parse(report.run.completedAt) < Date.parse(report.run.startedAt)) {
+  if (
+    report.run?.startedAt &&
+    report.run?.completedAt &&
+    Date.parse(report.run.completedAt) < Date.parse(report.run.startedAt)
+  ) {
     errors.push("exploration run completed before it started");
   }
 
@@ -430,7 +525,8 @@ function collectCases(model, errors) {
       cases.push({ ...edgeCase, category });
     }
   }
-  if (cases.length === 0 && model.outcome === "ready") errors.push("ready feature model has no edge cases");
+  if (cases.length === 0 && model.outcome === "ready")
+    errors.push("ready feature model has no edge cases");
   return cases;
 }
 
@@ -440,14 +536,17 @@ function validateCoverage(report, modelCases, plans, executed, observations, err
   const actual = {
     planned: modelCases.length,
     selected: selected.length,
-    executed: executed.filter(({ status }) => status === "passed" || status === "observation-recorded").length,
+    executed: executed.filter(
+      ({ status }) => status === "passed" || status === "observation-recorded",
+    ).length,
     passed: executed.filter(({ status }) => status === "passed").length,
     observationsRecorded: observations.length,
     blocked: executed.filter(({ status }) => status === "blocked").length,
     notApplicable: executed.filter(({ status }) => status === "not-applicable").length,
   };
   for (const [key, value] of Object.entries(actual)) {
-    if (coverage[key] !== value) errors.push(`coverage.${key} must be ${value}, received ${coverage[key]}`);
+    if (coverage[key] !== value)
+      errors.push(`coverage.${key} must be ${value}, received ${coverage[key]}`);
   }
 
   for (const category of CATEGORIES) {
@@ -456,14 +555,21 @@ function validateCoverage(report, modelCases, plans, executed, observations, err
       continue;
     }
     const categoryCases = modelCases.filter((edgeCase) => edgeCase.category === category);
-    const categoryPlans = plans.filter((plan) => modelCases.find((edgeCase) => edgeCase.id === plan.caseId)?.category === category);
+    const categoryPlans = plans.filter(
+      (plan) => modelCases.find((edgeCase) => edgeCase.id === plan.caseId)?.category === category,
+    );
     const categoryExecuted = executed.filter(({ category: value }) => value === category);
     const expected = {
       planned: categoryCases.length,
       selected: categoryPlans.filter(({ selected: value }) => value).length,
-      executed: categoryExecuted.filter(({ status }) => status === "passed" || status === "observation-recorded").length,
+      executed: categoryExecuted.filter(
+        ({ status }) => status === "passed" || status === "observation-recorded",
+      ).length,
       passed: categoryExecuted.filter(({ status }) => status === "passed").length,
-      observationsRecorded: categoryExecuted.reduce((sum, item) => sum + (item.observationIds?.length ?? 0), 0),
+      observationsRecorded: categoryExecuted.reduce(
+        (sum, item) => sum + (item.observationIds?.length ?? 0),
+        0,
+      ),
       blocked: categoryExecuted.filter(({ status }) => status === "blocked").length,
       notApplicable: categoryExecuted.filter(({ status }) => status === "not-applicable").length,
     };
@@ -473,7 +579,9 @@ function validateCoverage(report, modelCases, plans, executed, observations, err
       }
     }
   }
-  const extraCategories = Object.keys(coverage.byCategory ?? {}).filter((key) => !CATEGORIES.includes(key));
+  const extraCategories = Object.keys(coverage.byCategory ?? {}).filter(
+    (key) => !CATEGORIES.includes(key),
+  );
   for (const category of extraCategories) errors.push(`unknown coverage category ${category}`);
 }
 
@@ -495,13 +603,13 @@ function checkReferences(values = [], validIds, label, errors) {
 function hasEvidence(evidence) {
   return Boolean(
     evidence &&
-      ((evidence.screenshots?.length ?? 0) > 0 ||
-        evidence.trace ||
-        (evidence.source?.length ?? 0) > 0 ||
-        (evidence.tests?.length ?? 0) > 0 ||
-        (evidence.console?.length ?? 0) > 0 ||
-        (evidence.pageErrors?.length ?? 0) > 0 ||
-        (evidence.network?.length ?? 0) > 0),
+    ((evidence.screenshots?.length ?? 0) > 0 ||
+      evidence.trace ||
+      (evidence.source?.length ?? 0) > 0 ||
+      (evidence.tests?.length ?? 0) > 0 ||
+      (evidence.console?.length ?? 0) > 0 ||
+      (evidence.pageErrors?.length ?? 0) > 0 ||
+      (evidence.network?.length ?? 0) > 0),
   );
 }
 
@@ -516,9 +624,25 @@ function isPortableRelativePath(value) {
 }
 
 const DESIGN_CATEGORIES = [
-  "default", "hover", "focus", "pressed", "selected", "disabled", "loading",
-  "empty", "error", "success", "partial", "unsaved", "offline", "stale",
-  "overflow", "responsive", "overlay", "motion", "theme",
+  "default",
+  "hover",
+  "focus",
+  "pressed",
+  "selected",
+  "disabled",
+  "loading",
+  "empty",
+  "error",
+  "success",
+  "partial",
+  "unsaved",
+  "offline",
+  "stale",
+  "overflow",
+  "responsive",
+  "overlay",
+  "motion",
+  "theme",
 ];
 
 export function validateDesignAuditSemantics(report, model) {
@@ -531,8 +655,10 @@ export function validateDesignAuditSemantics(report, model) {
     return errors;
   }
   if (report.outcome !== "completed") return ["design audit outcome must be completed or blocked"];
-  if (!model || model.outcome !== "ready") return ["completed design audit requires a ready feature model"];
-  if (report.featureModelId !== model.modelId) errors.push("design audit feature model identity mismatch");
+  if (!model || model.outcome !== "ready")
+    return ["completed design audit requires a ready feature model"];
+  if (report.featureModelId !== model.modelId)
+    errors.push("design audit feature model identity mismatch");
 
   const plans = report.designStatePlan ?? [];
   const inspected = report.inspectedStates ?? [];
@@ -555,10 +681,12 @@ export function validateDesignAuditSemantics(report, model) {
   }
   for (const plan of plans) {
     for (const stateId of plan.sourceStateIds ?? []) {
-      if (!stateIds.has(stateId)) errors.push(`design plan ${plan.id} references unknown feature state ${stateId}`);
+      if (!stateIds.has(stateId))
+        errors.push(`design plan ${plan.id} references unknown feature state ${stateId}`);
     }
     const related = inspected.filter(({ planId }) => planId === plan.id);
-    if (plan.applicable && related.length === 0) errors.push(`applicable design plan ${plan.id} was not inspected`);
+    if (plan.applicable && related.length === 0)
+      errors.push(`applicable design plan ${plan.id} was not inspected`);
     if (!plan.applicable && !related.some(({ status }) => status === "not-applicable")) {
       errors.push(`non-applicable design plan ${plan.id} lacks not-applicable disposition`);
     }
@@ -570,22 +698,29 @@ export function validateDesignAuditSemantics(report, model) {
     if (item.viewportId && !viewportIds.has(item.viewportId)) {
       errors.push(`inspected state ${item.planId} references unknown viewport ${item.viewportId}`);
     }
-    if ((item.status === "passed" || item.status === "observation-recorded") && (item.screenshots?.length ?? 0) === 0) {
+    if (
+      (item.status === "passed" || item.status === "observation-recorded") &&
+      (item.screenshots?.length ?? 0) === 0
+    ) {
       errors.push(`inspected state ${item.planId} requires screenshot evidence`);
     }
     for (const path of item.screenshots ?? []) {
-      if (!isPortableRelativePath(path)) errors.push(`inspected state ${item.planId} has unsafe artifact path ${path}`);
+      if (!isPortableRelativePath(path))
+        errors.push(`inspected state ${item.planId} has unsafe artifact path ${path}`);
     }
     if (item.status === "observation-recorded") {
-      if ((item.observationIds?.length ?? 0) === 0) errors.push(`inspected state ${item.planId} requires observation IDs`);
+      if ((item.observationIds?.length ?? 0) === 0)
+        errors.push(`inspected state ${item.planId} requires observation IDs`);
       for (const id of item.observationIds ?? []) {
-        if (!observationIds.has(id)) errors.push(`inspected state ${item.planId} references unknown observation ${id}`);
+        if (!observationIds.has(id))
+          errors.push(`inspected state ${item.planId} references unknown observation ${id}`);
       }
     } else if ((item.observationIds?.length ?? 0) > 0) {
       errors.push(`inspected state ${item.planId} has observations with status ${item.status}`);
     }
     if (item.status === "blocked") {
-      if (!item.blockerId || !blockerIds.has(item.blockerId)) errors.push(`blocked design state ${item.planId} requires valid blockerId`);
+      if (!item.blockerId || !blockerIds.has(item.blockerId))
+        errors.push(`blocked design state ${item.planId} requires valid blockerId`);
     } else if (item.blockerId) {
       errors.push(`design state ${item.planId} has blockerId with status ${item.status}`);
     }
@@ -598,10 +733,14 @@ export function validateDesignAuditSemantics(report, model) {
   for (const observation of observations) {
     if (!referenced.has(observation.id)) errors.push(`orphan design observation ${observation.id}`);
     for (const planId of observation.planIds ?? []) {
-      if (!planById.has(planId)) errors.push(`design observation ${observation.id} references unknown plan ${planId}`);
+      if (!planById.has(planId))
+        errors.push(`design observation ${observation.id} references unknown plan ${planId}`);
     }
     for (const viewportId of observation.viewportIds ?? []) {
-      if (!viewportIds.has(viewportId)) errors.push(`design observation ${observation.id} references unknown viewport ${viewportId}`);
+      if (!viewportIds.has(viewportId))
+        errors.push(
+          `design observation ${observation.id} references unknown viewport ${viewportId}`,
+        );
     }
     if ((observation.evidence?.screenshots?.length ?? 0) === 0) {
       errors.push(`design observation ${observation.id} requires screenshot evidence`);
@@ -610,14 +749,17 @@ export function validateDesignAuditSemantics(report, model) {
       ...(observation.evidence?.screenshots ?? []),
       ...(observation.evidence?.trace ? [observation.evidence.trace] : []),
     ]) {
-      if (!isPortableRelativePath(path)) errors.push(`design observation ${observation.id} has unsafe artifact path ${path}`);
+      if (!isPortableRelativePath(path))
+        errors.push(`design observation ${observation.id} has unsafe artifact path ${path}`);
     }
   }
 
   const expectedCoverage = {
     planned: plans.length,
     applicable: plans.filter(({ applicable }) => applicable).length,
-    inspected: inspected.filter(({ status }) => status === "passed" || status === "observation-recorded").length,
+    inspected: inspected.filter(
+      ({ status }) => status === "passed" || status === "observation-recorded",
+    ).length,
     passed: inspected.filter(({ status }) => status === "passed").length,
     observationsRecorded: observations.length,
     blocked: inspected.filter(({ status }) => status === "blocked").length,
@@ -626,7 +768,11 @@ export function validateDesignAuditSemantics(report, model) {
   for (const [key, value] of Object.entries(expectedCoverage)) {
     if (report.coverage?.[key] !== value) errors.push(`design coverage.${key} must be ${value}`);
   }
-  if (report.run?.startedAt && report.run?.completedAt && Date.parse(report.run.completedAt) < Date.parse(report.run.startedAt)) {
+  if (
+    report.run?.startedAt &&
+    report.run?.completedAt &&
+    Date.parse(report.run.completedAt) < Date.parse(report.run.startedAt)
+  ) {
     errors.push("design audit run completed before it started");
   }
   return errors;
@@ -640,7 +786,11 @@ export function validateConfirmedReportSemantics(
   riskVerificationReport,
   identities = {},
 ) {
-  if (riskVerificationReport && !riskVerificationReport.outcome && Object.keys(identities).length === 0) {
+  if (
+    riskVerificationReport &&
+    !riskVerificationReport.outcome &&
+    Object.keys(identities).length === 0
+  ) {
     identities = riskVerificationReport;
     riskVerificationReport = null;
   }
@@ -653,15 +803,21 @@ export function validateConfirmedReportSemantics(
     return errors;
   }
   if (report.outcome !== "completed") return ["confirmation outcome must be completed or blocked"];
-  if (!model || model.outcome !== "ready") return ["completed confirmation requires a ready feature model"];
-  if (report.featureModelId !== model.modelId) errors.push("confirmation feature model identity mismatch");
+  if (!model || model.outcome !== "ready")
+    return ["completed confirmation requires a ready feature model"];
+  if (report.featureModelId !== model.modelId)
+    errors.push("confirmation feature model identity mismatch");
 
   const candidates = [
-    ...((explorationReport?.outcome === "completed" ? explorationReport.observations : []) ?? [])
-      .map(({ id }) => ({ id, source: "edge-case-explorer", hash: identities.explorationSha256 })),
-    ...((designReport?.outcome === "completed" ? designReport.observations : []) ?? [])
-      .map(({ id }) => ({ id, source: "design-ux-auditor", hash: identities.designSha256 })),
-    ...((riskVerificationReport?.outcome === "completed" ? riskVerificationReport.verdicts : []) ?? [])
+    ...(
+      (explorationReport?.outcome === "completed" ? explorationReport.observations : []) ?? []
+    ).map(({ id }) => ({ id, source: "edge-case-explorer", hash: identities.explorationSha256 })),
+    ...((designReport?.outcome === "completed" ? designReport.observations : []) ?? []).map(
+      ({ id }) => ({ id, source: "design-ux-auditor", hash: identities.designSha256 }),
+    ),
+    ...(
+      (riskVerificationReport?.outcome === "completed" ? riskVerificationReport.verdicts : []) ?? []
+    )
       .filter(({ status, candidateId }) => status === "finding" && candidateId)
       .map(({ candidateId }) => ({
         id: candidateId,
@@ -689,18 +845,28 @@ export function validateConfirmedReportSemantics(
       errors.push(`manifest contains unknown candidate ${item.candidateId}`);
       continue;
     }
-    if (item.source !== candidate.source) errors.push(`manifest candidate ${item.candidateId} has wrong source`);
+    if (item.source !== candidate.source)
+      errors.push(`manifest candidate ${item.candidateId} has wrong source`);
     if (candidate.hash && item.sourceReportSha256 !== candidate.hash) {
       errors.push(`manifest candidate ${item.candidateId} has wrong source report hash`);
     }
   }
-  if (identities.explorationSha256 && report.provenance?.explorationReportSha256 !== identities.explorationSha256) {
+  if (
+    identities.explorationSha256 &&
+    report.provenance?.explorationReportSha256 !== identities.explorationSha256
+  ) {
     errors.push("confirmation provenance has wrong exploration report hash");
   }
-  if (identities.designSha256 && report.provenance?.designReportSha256 !== identities.designSha256) {
+  if (
+    identities.designSha256 &&
+    report.provenance?.designReportSha256 !== identities.designSha256
+  ) {
     errors.push("confirmation provenance has wrong design report hash");
   }
-  if (identities.riskVerificationSha256 && report.provenance?.riskVerificationSha256 !== identities.riskVerificationSha256) {
+  if (
+    identities.riskVerificationSha256 &&
+    report.provenance?.riskVerificationSha256 !== identities.riskVerificationSha256
+  ) {
     errors.push("confirmation provenance has wrong risk verification report hash");
   }
 
@@ -710,7 +876,8 @@ export function validateConfirmedReportSemantics(
       errors.push(`verdict contains unknown candidate ${verdict.candidateId}`);
       continue;
     }
-    if (verdict.source !== candidate.source) errors.push(`verdict candidate ${verdict.candidateId} has wrong source`);
+    if (verdict.source !== candidate.source)
+      errors.push(`verdict candidate ${verdict.candidateId} has wrong source`);
     const reproduction = verdict.reproduction ?? {};
     if (reproduction.observed > reproduction.attempts) {
       errors.push(`candidate ${verdict.candidateId}: observed cannot exceed attempts`);
@@ -726,22 +893,36 @@ export function validateConfirmedReportSemantics(
     }
     for (const artifactPath of evidencePaths(verdict.evidence)) {
       if (!isPortableRelativePath(artifactPath)) {
-        errors.push(`candidate ${verdict.candidateId} has unsafe independent artifact path ${artifactPath}`);
+        errors.push(
+          `candidate ${verdict.candidateId} has unsafe independent artifact path ${artifactPath}`,
+        );
       }
     }
 
     if (verdict.disposition === "confirmed") {
-      if (reproduction.observed < 1) errors.push(`confirmed candidate ${verdict.candidateId} was not observed`);
-      if (verdict.reasonCode !== "reproduced") errors.push(`confirmed candidate ${verdict.candidateId} must use reproduced reason`);
+      if (reproduction.observed < 1)
+        errors.push(`confirmed candidate ${verdict.candidateId} was not observed`);
+      if (verdict.reasonCode !== "reproduced")
+        errors.push(`confirmed candidate ${verdict.candidateId} must use reproduced reason`);
       if (!new Set(["critical", "high", "medium", "low"]).has(verdict.finalSeverity)) {
         errors.push(`confirmed candidate ${verdict.candidateId} requires final severity`);
       }
     } else if (verdict.disposition === "rejected") {
-      if (verdict.finalSeverity !== null) errors.push(`rejected candidate ${verdict.candidateId} must not have final severity`);
-      if (verdict.reasonCode === "reproduced") errors.push(`rejected candidate ${verdict.candidateId} cannot use reproduced reason`);
+      if (verdict.finalSeverity !== null)
+        errors.push(`rejected candidate ${verdict.candidateId} must not have final severity`);
+      if (verdict.reasonCode === "reproduced")
+        errors.push(`rejected candidate ${verdict.candidateId} cannot use reproduced reason`);
     } else if (verdict.disposition === "inconclusive") {
-      if (verdict.finalSeverity !== null) errors.push(`inconclusive candidate ${verdict.candidateId} must not have final severity`);
-      if (!["insufficient-evidence", "environment-blocked", "intermittent", "unsafe-to-reproduce"].includes(verdict.reasonCode)) {
+      if (verdict.finalSeverity !== null)
+        errors.push(`inconclusive candidate ${verdict.candidateId} must not have final severity`);
+      if (
+        ![
+          "insufficient-evidence",
+          "environment-blocked",
+          "intermittent",
+          "unsafe-to-reproduce",
+        ].includes(verdict.reasonCode)
+      ) {
         errors.push(`inconclusive candidate ${verdict.candidateId} has invalid reason`);
       }
     } else {
@@ -761,12 +942,18 @@ export function validateConfirmedReportSemantics(
   }
   for (const severity of ["critical", "high", "medium", "low"]) {
     const value = confirmed.filter(({ finalSeverity }) => finalSeverity === severity).length;
-    if (report.summary?.bySeverity?.[severity] !== value) errors.push(`summary.bySeverity.${severity} must be ${value}`);
+    if (report.summary?.bySeverity?.[severity] !== value)
+      errors.push(`summary.bySeverity.${severity} must be ${value}`);
   }
 
   const reportedBlocking = [...(report.summary?.blockingSeverities ?? [])].sort();
-  const configuredBlocking = identities.blockingSeverities ? [...identities.blockingSeverities].sort() : reportedBlocking;
-  if (identities.blockingSeverities && JSON.stringify(reportedBlocking) !== JSON.stringify(configuredBlocking)) {
+  const configuredBlocking = identities.blockingSeverities
+    ? [...identities.blockingSeverities].sort()
+    : reportedBlocking;
+  if (
+    identities.blockingSeverities &&
+    JSON.stringify(reportedBlocking) !== JSON.stringify(configuredBlocking)
+  ) {
     errors.push("summary.blockingSeverities must exactly match the runner-owned gate policy");
   }
   const blocking = new Set(configuredBlocking);
@@ -776,7 +963,8 @@ export function validateConfirmedReportSemantics(
   const inconclusiveIds = verdicts
     .filter(({ disposition }) => disposition === "inconclusive")
     .map(({ candidateId }) => candidateId);
-  const expectedGate = blockingIds.length > 0 ? "fail" : inconclusiveIds.length > 0 ? "needs-review" : "pass";
+  const expectedGate =
+    blockingIds.length > 0 ? "fail" : inconclusiveIds.length > 0 ? "needs-review" : "pass";
   if (report.summary?.mergeGate !== expectedGate) {
     errors.push(`summary.mergeGate must be ${expectedGate}`);
   }
@@ -787,7 +975,11 @@ export function validateConfirmedReportSemantics(
   for (const id of expectedGate === "fail" ? blockingIds : inconclusiveIds) {
     if (!gateReasonText.includes(id)) errors.push(`summary.gateReasons omits candidate ${id}`);
   }
-  if (report.run?.startedAt && report.run?.completedAt && Date.parse(report.run.completedAt) < Date.parse(report.run.startedAt)) {
+  if (
+    report.run?.startedAt &&
+    report.run?.completedAt &&
+    Date.parse(report.run.completedAt) < Date.parse(report.run.startedAt)
+  ) {
     errors.push("confirmation run completed before it started");
   }
   return errors;

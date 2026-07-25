@@ -8,7 +8,9 @@ async function target() {
   const response = await fetch(`${DEVTOOLS_URL}/json/list`, { signal: AbortSignal.timeout(3000) });
   if (!response.ok) throw new Error(`DevTools target list failed: HTTP ${response.status}`);
   const targets = await response.json();
-  const page = targets.find((candidate) => candidate.type === "page" && candidate.webSocketDebuggerUrl);
+  const page = targets.find(
+    (candidate) => candidate.type === "page" && candidate.webSocketDebuggerUrl,
+  );
   if (!page) throw new Error("No debuggable Portcode WebView2 page was found.");
   return page;
 }
@@ -17,9 +19,13 @@ async function connect(url) {
   const socket = new WebSocket(url);
   await new Promise((resolvePromise, reject) => {
     socket.addEventListener("open", resolvePromise, { once: true });
-    socket.addEventListener("error", () => reject(new Error("Could not connect to WebView2 CDP.")), {
-      once: true,
-    });
+    socket.addEventListener(
+      "error",
+      () => reject(new Error("Could not connect to WebView2 CDP.")),
+      {
+        once: true,
+      },
+    );
   });
   let sequence = 0;
   const pending = new Map();

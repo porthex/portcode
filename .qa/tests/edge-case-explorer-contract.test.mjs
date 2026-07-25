@@ -86,13 +86,7 @@ test("exploration report separates executed coverage from evidence-backed observ
   ]);
 
   const evidenceRequired = schema.$defs.evidence.required;
-  assert.deepEqual(evidenceRequired, [
-    "screenshots",
-    "trace",
-    "console",
-    "pageErrors",
-    "network",
-  ]);
+  assert.deepEqual(evidenceRequired, ["screenshots", "trace", "console", "pageErrors", "network"]);
 });
 
 function escapeRegExp(value) {
