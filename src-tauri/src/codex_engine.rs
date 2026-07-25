@@ -16,6 +16,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::{
+    attachments::PreparedTurn,
     codex_app_server::{CodexAppServer, Incoming},
     db::{self, Db},
     events::EventSink,
@@ -351,10 +352,15 @@ impl CodexEngine {
             .map_err(|error| error.to_string())
     }
 
-    pub async fn run_turn(self: &Arc<Self>, session_id: String, text: String, settings: Settings) {
+    pub(crate) async fn run_turn(
+        self: &Arc<Self>,
+        session_id: String,
+        turn: PreparedTurn,
+        settings: Settings,
+    ) {
         let run_id = uuid::Uuid::new_v4().to_string();
         if let Err(message) = self
-            .run_turn_inner(&run_id, &session_id, &text, &settings)
+            .run_turn_inner(&run_id, &session_id, &turn, &settings)
             .await
         {
             self.pending_starts
@@ -389,7 +395,7 @@ impl CodexEngine {
         &self,
         run_id: &str,
         session_id: &str,
-        text: &str,
+        prepared_turn: &PreparedTurn,
         settings: &Settings,
     ) -> Result<(), String> {
         {
@@ -524,14 +530,14 @@ impl CodexEngine {
                 run_id: run_id.to_string(),
                 session_id: session_id.to_string(),
                 thread_id: thread_id.clone(),
-                text: text.to_string(),
+                text: prepared_turn.display_text.clone(),
                 started_at_ms: db::now_ms(),
             },
         );
 
         let mut params = Map::new();
         params.insert("threadId".into(), Value::String(thread_id.clone()));
-        params.insert("input".into(), json!([{ "type": "text", "text": text }]));
+        params.insert("input".into(), Value::Array(prepared_turn.input.clone()));
         insert_optional_string(&mut params, "cwd", cwd.as_deref());
         insert_optional_string(&mut params, "model", session.model.as_deref());
         params.insert(

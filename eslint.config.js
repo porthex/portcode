@@ -13,6 +13,8 @@ export default tseslint.config(
       "coverage/**",
       "node_modules/**",
       "src-tauri/**",
+      // QA run reports, screenshots, traces, and synthetic fixtures are generated evidence.
+      ".qa/generated/**",
       // graphify knowledge-graph output is machine-generated, not source.
       "graphify-out/**",
       // Transient Claude Code agent git worktrees (gitignored): full repo copies

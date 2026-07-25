@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tauri::{AppHandle, Manager};
 
+use crate::attachments;
 use crate::codex_engine::{CodexEngine, PRIMARY_CODEX_ACCOUNT_ID};
 use crate::db::{self, Db};
 use crate::settings::Settings;
@@ -254,8 +255,11 @@ impl CommandHandler for DesktopCommandHandler {
                     Err(_) => return Ok(()),
                 };
                 let codex = self.codex.clone();
+                let Ok(prepared_turn) = attachments::prepare_turn(&text, &[]) else {
+                    return Ok(());
+                };
                 tauri::async_runtime::spawn(async move {
-                    codex.run_turn(session_id, text, settings).await;
+                    codex.run_turn(session_id, prepared_turn, settings).await;
                 });
                 Ok(())
             }

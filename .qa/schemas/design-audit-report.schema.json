@@ -1,0 +1,346 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qa://schemas/design-audit-report/0.1.0",
+  "title": "Design and UX States Audit Report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "runId", "outcome", "featureModelId", "blockers"],
+  "properties": {
+    "schemaVersion": { "const": "0.1.0" },
+    "runId": { "type": "string", "minLength": 1 },
+    "outcome": { "enum": ["completed", "blocked"] },
+    "featureModelId": { "type": "string", "minLength": 1 },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "run": { "$ref": "#/$defs/run" },
+    "environment": { "$ref": "#/$defs/environment" },
+    "designStatePlan": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/designStatePlanItem" },
+      "minItems": 1
+    },
+    "inspectedStates": { "type": "array", "items": { "$ref": "#/$defs/inspectedState" } },
+    "observations": { "type": "array", "items": { "$ref": "#/$defs/designObservation" } },
+    "coverage": { "$ref": "#/$defs/coverage" },
+    "blockers": { "type": "array", "items": { "$ref": "#/$defs/blocker" } }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "outcome": { "const": "completed" } } },
+      "then": {
+        "required": [
+          "provenance",
+          "run",
+          "environment",
+          "designStatePlan",
+          "inspectedStates",
+          "observations",
+          "coverage"
+        ]
+      }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "blocked" } } },
+      "then": { "properties": { "blockers": { "minItems": 1 } } }
+    }
+  ],
+  "$defs": {
+    "category": {
+      "enum": [
+        "default",
+        "hover",
+        "focus",
+        "pressed",
+        "selected",
+        "disabled",
+        "loading",
+        "empty",
+        "error",
+        "success",
+        "partial",
+        "unsaved",
+        "offline",
+        "stale",
+        "overflow",
+        "responsive",
+        "overlay",
+        "motion",
+        "theme"
+      ]
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent",
+        "agentVersion",
+        "featureModelSha256",
+        "featureBriefSha256",
+        "riskRegisterSha256",
+        "gitBase",
+        "gitHead",
+        "workingTreeSha256",
+        "artifactRoot",
+        "dataProfile"
+      ],
+      "properties": {
+        "agent": { "const": "design-ux-auditor" },
+        "agentVersion": { "const": "0.1.0" },
+        "featureModelSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "featureBriefSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "riskRegisterSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "gitBase": { "type": ["string", "null"] },
+        "gitHead": { "type": ["string", "null"] },
+        "workingTreeSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "artifactRoot": { "type": "string", "minLength": 1 },
+        "dataProfile": { "type": "string", "minLength": 1 }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "startedAt", "completedAt"],
+      "properties": {
+        "mode": { "enum": ["change", "full"] },
+        "startedAt": { "type": "string", "format": "date-time" },
+        "completedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target",
+        "appMode",
+        "platform",
+        "browser",
+        "viewports",
+        "themes",
+        "motionModes"
+      ],
+      "properties": {
+        "target": { "type": "string", "minLength": 1 },
+        "appMode": { "type": "string", "minLength": 1 },
+        "platform": { "type": "string", "minLength": 1 },
+        "browser": { "type": ["string", "null"] },
+        "viewports": { "type": "array", "items": { "$ref": "#/$defs/viewport" }, "minItems": 1 },
+        "themes": {
+          "type": "array",
+          "items": { "enum": ["light", "dark", "system", "unknown"] },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "motionModes": {
+          "type": "array",
+          "items": { "enum": ["reduce", "no-preference", "unknown"] },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      }
+    },
+    "viewport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "width", "height"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "designStatePlanItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "category",
+        "sourceStateIds",
+        "applicable",
+        "rationale",
+        "expectedDesign",
+        "evidenceBasis"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^DS-[0-9]{3}$" },
+        "category": { "$ref": "#/$defs/category" },
+        "sourceStateIds": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "applicable": { "type": "boolean" },
+        "rationale": { "type": "string", "minLength": 1 },
+        "expectedDesign": { "type": "string", "minLength": 1 },
+        "evidenceBasis": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/designBasis" },
+          "minItems": 1
+        }
+      }
+    },
+    "designBasis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "locator", "expectation"],
+      "properties": {
+        "type": {
+          "enum": [
+            "explicit-requirement",
+            "feature-state",
+            "project-pattern",
+            "design-token",
+            "platform-convention",
+            "accessibility-standard"
+          ]
+        },
+        "locator": { "type": "string", "minLength": 1 },
+        "expectation": { "type": "string", "minLength": 1 }
+      }
+    },
+    "inspectedState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "planId",
+        "status",
+        "viewportId",
+        "theme",
+        "motionMode",
+        "steps",
+        "actual",
+        "screenshots",
+        "observationIds",
+        "blockerId",
+        "dispositionReason"
+      ],
+      "properties": {
+        "planId": { "type": "string", "pattern": "^DS-[0-9]{3}$" },
+        "status": { "enum": ["passed", "observation-recorded", "blocked", "not-applicable"] },
+        "viewportId": { "type": ["string", "null"] },
+        "theme": { "type": ["string", "null"] },
+        "motionMode": { "type": ["string", "null"] },
+        "steps": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "actual": { "type": "string", "minLength": 1 },
+        "screenshots": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "observationIds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^DES-[0-9]{3}$" },
+          "uniqueItems": true
+        },
+        "blockerId": { "type": ["string", "null"] },
+        "dispositionReason": { "type": ["string", "null"] }
+      }
+    },
+    "designObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "classification",
+        "provisionalImpact",
+        "confidence",
+        "planIds",
+        "basis",
+        "preconditions",
+        "steps",
+        "expected",
+        "actual",
+        "viewportIds",
+        "evidence",
+        "status"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^DES-[0-9]{3}$" },
+        "title": { "type": "string", "minLength": 1 },
+        "classification": {
+          "enum": [
+            "missing-state-design",
+            "visual-defect",
+            "missing-feedback",
+            "missing-affordance",
+            "project-inconsistency",
+            "responsive-defect",
+            "focus-or-keyboard-defect",
+            "accessibility-presentation",
+            "motion-defect"
+          ]
+        },
+        "provisionalImpact": {
+          "enum": [
+            "primary-flow-blocked",
+            "recovery-or-comprehension",
+            "misleading-state",
+            "interaction-barrier",
+            "limited-impact"
+          ]
+        },
+        "confidence": { "enum": ["high", "medium", "low"] },
+        "planIds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^DS-[0-9]{3}$" },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "basis": { "type": "array", "items": { "$ref": "#/$defs/designBasis" }, "minItems": 1 },
+        "preconditions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "steps": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+        "expected": { "type": "string", "minLength": 1 },
+        "actual": { "type": "string", "minLength": 1 },
+        "viewportIds": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "evidence": { "$ref": "#/$defs/designEvidence" },
+        "status": { "const": "observed-unverified" }
+      }
+    },
+    "designEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["screenshots", "trace", "accessibility", "console"],
+      "properties": {
+        "screenshots": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1
+        },
+        "trace": { "type": ["string", "null"] },
+        "accessibility": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "console": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "planned",
+        "applicable",
+        "inspected",
+        "passed",
+        "observationsRecorded",
+        "blocked",
+        "notApplicable",
+        "untestedRisks"
+      ],
+      "properties": {
+        "planned": { "type": "integer", "minimum": 0 },
+        "applicable": { "type": "integer", "minimum": 0 },
+        "inspected": { "type": "integer", "minimum": 0 },
+        "passed": { "type": "integer", "minimum": 0 },
+        "observationsRecorded": { "type": "integer", "minimum": 0 },
+        "blocked": { "type": "integer", "minimum": 0 },
+        "notApplicable": { "type": "integer", "minimum": 0 },
+        "untestedRisks": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "blocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "area", "reason", "affectedPlanIds"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^BLK-[0-9]{3}$" },
+        "area": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "affectedPlanIds": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+      }
+    }
+  }
+}

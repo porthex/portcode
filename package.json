@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "build:qa": "tsc --noEmit && vite build --mode qa",
     "build:web": "vite build --config vite.web.config.ts",
     "dev:web": "vite --config vite.web.config.ts",
     "dev:self": "vite --mode selfdev",
@@ -34,6 +35,9 @@
     "test:coverage": "vitest run --coverage",
     "test:e2e": "tsx e2e/smoke.mts",
     "test:e2e:typecheck": "tsc --noEmit -p e2e/tsconfig.json",
+    "qa:contracts": "node --test .qa/tests/*.test.mjs",
+    "qa:prepare": "node .qa/scripts/qa-runner.mjs --phase prepare --mode change",
+    "qa:change": "node .qa/scripts/qa-runner.mjs --phase verify --mode change",
     "prepare": "husky"
   },
   "dependencies": {

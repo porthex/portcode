@@ -34,6 +34,31 @@ export interface Message {
   receipt?: TurnReceipt;
 }
 
+export type AttachmentKind = "text" | "image";
+
+/** Native-validated metadata for one local composer attachment. File contents
+ * never enter frontend state; image previews are optional bounded data URLs. */
+export interface Attachment {
+  path: string;
+  name: string;
+  /** Privacy-safe stable identity used for review and authoritative transcript display. */
+  displayName?: string;
+  kind: AttachmentKind;
+  mediaType: string;
+  size: number;
+  thumbnailUrl: string | null;
+}
+
+export interface AttachmentIssue {
+  name: string;
+  message: string;
+}
+
+export interface AttachmentValidationResult {
+  attachments: Attachment[];
+  errors: AttachmentIssue[];
+}
+
 /** A display-ready page of persisted conversation history. `nextCursor` is an
  * opaque backend cursor for the next older page; null means the beginning. */
 export interface UiMessagePage {

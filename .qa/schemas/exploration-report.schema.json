@@ -1,0 +1,389 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qa://schemas/exploration-report/0.2.0",
+  "title": "Edge-Case Exploration Report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "runId", "outcome", "featureModelId", "blockers"],
+  "properties": {
+    "schemaVersion": { "const": "0.2.0" },
+    "runId": { "type": "string", "minLength": 1 },
+    "outcome": { "enum": ["completed", "blocked"] },
+    "featureModelId": { "type": "string", "minLength": 1 },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "run": { "$ref": "#/$defs/run" },
+    "environment": { "$ref": "#/$defs/environment" },
+    "instrumentation": { "$ref": "#/$defs/instrumentation" },
+    "scenarioPlan": { "type": "array", "items": { "$ref": "#/$defs/scenarioPlanItem" } },
+    "executedScenarios": { "type": "array", "items": { "$ref": "#/$defs/scenarioResult" } },
+    "observations": { "type": "array", "items": { "$ref": "#/$defs/observation" } },
+    "coverage": { "$ref": "#/$defs/coverage" },
+    "blockers": { "type": "array", "items": { "$ref": "#/$defs/blocker" } }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "outcome": { "const": "completed" } } },
+      "then": {
+        "required": [
+          "provenance",
+          "run",
+          "environment",
+          "instrumentation",
+          "scenarioPlan",
+          "executedScenarios",
+          "observations",
+          "coverage"
+        ]
+      }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "blocked" } } },
+      "then": { "properties": { "blockers": { "minItems": 1 } } }
+    }
+  ],
+  "$defs": {
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent",
+        "agentVersion",
+        "featureModelSha256",
+        "featureBriefSha256",
+        "riskRegisterSha256",
+        "gitBase",
+        "gitHead",
+        "workingTreeSha256",
+        "artifactRoot",
+        "dataProfile"
+      ],
+      "properties": {
+        "agent": { "const": "edge-case-explorer" },
+        "agentVersion": { "const": "0.2.0" },
+        "featureModelSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "featureBriefSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "riskRegisterSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "gitBase": { "type": ["string", "null"] },
+        "gitHead": { "type": ["string", "null"] },
+        "workingTreeSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "artifactRoot": { "type": "string", "minLength": 1 },
+        "dataProfile": { "type": "string", "minLength": 1 }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "startedAt", "completedAt"],
+      "properties": {
+        "mode": { "enum": ["change", "full"] },
+        "startedAt": { "type": "string", "format": "date-time" },
+        "completedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "appMode", "url", "platform", "browser", "viewport", "reducedMotion"],
+      "properties": {
+        "target": { "type": "string", "minLength": 1 },
+        "appMode": { "type": "string", "minLength": 1 },
+        "url": { "type": ["string", "null"] },
+        "platform": { "type": "string", "minLength": 1 },
+        "browser": { "type": ["string", "null"] },
+        "viewport": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["width", "height"],
+          "properties": {
+            "width": { "type": "integer", "minimum": 1 },
+            "height": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "reducedMotion": { "enum": ["reduce", "no-preference", "unknown"] }
+      }
+    },
+    "instrumentation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["console", "pageErrors", "network", "trace", "baselineEvents"],
+      "properties": {
+        "console": { "$ref": "#/$defs/hookStatus" },
+        "pageErrors": { "$ref": "#/$defs/hookStatus" },
+        "network": { "$ref": "#/$defs/hookStatus" },
+        "trace": { "$ref": "#/$defs/hookStatus" },
+        "baselineEvents": { "type": "array", "items": { "$ref": "#/$defs/baselineEvent" } }
+      }
+    },
+    "hookStatus": { "enum": ["active", "unavailable", "failed"] },
+    "baselineEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timestamp", "source", "message"],
+      "properties": {
+        "timestamp": { "type": "string", "format": "date-time" },
+        "source": { "enum": ["console", "page-error", "network", "app"] },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    },
+    "scenarioPlanItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["caseId", "selected", "selectionReason"],
+      "properties": {
+        "caseId": { "type": "string", "minLength": 1 },
+        "selected": { "type": "boolean" },
+        "selectionReason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "scenarioResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "caseId",
+        "source",
+        "category",
+        "status",
+        "risk",
+        "oracle",
+        "steps",
+        "expected",
+        "actual",
+        "startedAt",
+        "completedAt",
+        "observationIds",
+        "blockerId",
+        "dispositionReason",
+        "evidenceRefs"
+      ],
+      "properties": {
+        "caseId": { "type": "string", "minLength": 1 },
+        "source": { "enum": ["charter", "ad-hoc"] },
+        "category": { "$ref": "#/$defs/category" },
+        "status": { "enum": ["passed", "observation-recorded", "blocked", "not-applicable"] },
+        "risk": { "type": "string", "minLength": 1 },
+        "oracle": { "type": "string", "minLength": 1 },
+        "steps": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+        "expected": { "type": "string", "minLength": 1 },
+        "actual": { "type": "string", "minLength": 1 },
+        "startedAt": { "type": "string", "format": "date-time" },
+        "completedAt": { "type": "string", "format": "date-time" },
+        "observationIds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^OBS-[0-9]{3}$" },
+          "uniqueItems": true
+        },
+        "blockerId": { "type": ["string", "null"] },
+        "dispositionReason": { "type": ["string", "null"] },
+        "evidenceRefs": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "classification",
+        "provisionalImpact",
+        "confidence",
+        "charterCaseIds",
+        "preconditions",
+        "steps",
+        "expected",
+        "actual",
+        "reproduction",
+        "evidence",
+        "status"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^OBS-[0-9]{3}$" },
+        "title": { "type": "string", "minLength": 1 },
+        "classification": {
+          "enum": [
+            "functional-defect-candidate",
+            "behavior-omission-candidate",
+            "state-desync-candidate",
+            "crash-or-freeze-candidate",
+            "console-error-candidate",
+            "network-error-candidate",
+            "accessibility-candidate",
+            "design-gap-candidate"
+          ]
+        },
+        "provisionalImpact": {
+          "enum": [
+            "unsafe-or-security",
+            "data-loss",
+            "primary-flow-blocked",
+            "recovery-required",
+            "misleading-state",
+            "limited-impact"
+          ]
+        },
+        "confidence": { "enum": ["high", "medium", "low"] },
+        "charterCaseIds": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "preconditions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "steps": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+        "expected": { "type": "string", "minLength": 1 },
+        "actual": { "type": "string", "minLength": 1 },
+        "reproduction": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["attempts", "observed", "resetBetweenAttempts"],
+          "properties": {
+            "attempts": { "type": "integer", "minimum": 1 },
+            "observed": { "type": "integer", "minimum": 1 },
+            "resetBetweenAttempts": { "type": "boolean" }
+          }
+        },
+        "evidence": { "$ref": "#/$defs/evidence" },
+        "status": { "const": "observed-unverified" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["screenshots", "trace", "console", "pageErrors", "network"],
+      "properties": {
+        "screenshots": { "type": "array", "items": { "$ref": "#/$defs/artifactPath" } },
+        "trace": { "oneOf": [{ "$ref": "#/$defs/artifactPath" }, { "type": "null" }] },
+        "console": { "type": "array", "items": { "$ref": "#/$defs/logEntry" } },
+        "pageErrors": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "network": { "type": "array", "items": { "$ref": "#/$defs/networkEntry" } }
+      },
+      "anyOf": [
+        { "properties": { "screenshots": { "minItems": 1 } } },
+        { "properties": { "trace": { "type": "string" } } },
+        { "properties": { "console": { "minItems": 1 } } },
+        { "properties": { "pageErrors": { "minItems": 1 } } },
+        { "properties": { "network": { "minItems": 1 } } }
+      ]
+    },
+    "artifactPath": { "type": "string", "minLength": 1 },
+    "logEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timestamp", "level", "message"],
+      "properties": {
+        "timestamp": { "type": "string", "format": "date-time" },
+        "level": { "enum": ["error", "warning", "info"] },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    },
+    "networkEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timestamp", "method", "url", "status", "failure"],
+      "properties": {
+        "timestamp": { "type": "string", "format": "date-time" },
+        "method": { "type": "string", "minLength": 1 },
+        "url": { "type": "string", "minLength": 1 },
+        "status": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 },
+        "failure": { "type": ["string", "null"] }
+      },
+      "anyOf": [
+        { "properties": { "status": { "type": "integer" } } },
+        { "properties": { "failure": { "type": "string", "minLength": 1 } } }
+      ]
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "planned",
+        "selected",
+        "executed",
+        "passed",
+        "observationsRecorded",
+        "blocked",
+        "notApplicable",
+        "byCategory",
+        "untestedRisks"
+      ],
+      "properties": {
+        "planned": { "type": "integer", "minimum": 0 },
+        "selected": { "type": "integer", "minimum": 0 },
+        "executed": { "type": "integer", "minimum": 0 },
+        "passed": { "type": "integer", "minimum": 0 },
+        "observationsRecorded": { "type": "integer", "minimum": 0 },
+        "blocked": { "type": "integer", "minimum": 0 },
+        "notApplicable": { "type": "integer", "minimum": 0 },
+        "byCategory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "input",
+            "timing",
+            "lifecycle",
+            "interaction",
+            "persistence",
+            "layout",
+            "accessibility",
+            "neighboringRegression"
+          ],
+          "properties": {
+            "input": { "$ref": "#/$defs/categoryCoverage" },
+            "timing": { "$ref": "#/$defs/categoryCoverage" },
+            "lifecycle": { "$ref": "#/$defs/categoryCoverage" },
+            "interaction": { "$ref": "#/$defs/categoryCoverage" },
+            "persistence": { "$ref": "#/$defs/categoryCoverage" },
+            "layout": { "$ref": "#/$defs/categoryCoverage" },
+            "accessibility": { "$ref": "#/$defs/categoryCoverage" },
+            "neighboringRegression": { "$ref": "#/$defs/categoryCoverage" }
+          }
+        },
+        "untestedRisks": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "categoryCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "planned",
+        "selected",
+        "executed",
+        "passed",
+        "observationsRecorded",
+        "blocked",
+        "notApplicable"
+      ],
+      "properties": {
+        "planned": { "type": "integer", "minimum": 0 },
+        "selected": { "type": "integer", "minimum": 0 },
+        "executed": { "type": "integer", "minimum": 0 },
+        "passed": { "type": "integer", "minimum": 0 },
+        "observationsRecorded": { "type": "integer", "minimum": 0 },
+        "blocked": { "type": "integer", "minimum": 0 },
+        "notApplicable": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "blocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "area", "reason", "affectedCaseIds"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^BLK-[0-9]{3}$" },
+        "area": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "affectedCaseIds": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+      }
+    },
+    "category": {
+      "enum": [
+        "input",
+        "timing",
+        "lifecycle",
+        "interaction",
+        "persistence",
+        "layout",
+        "accessibility",
+        "neighboringRegression"
+      ]
+    }
+  }
+}

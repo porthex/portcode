@@ -85,12 +85,36 @@ const SESSION_PANEL_DEFAULT_WIDTH = 248;
 const SESSION_PANEL_MIN_WIDTH = 200;
 const SESSION_PANEL_MAX_WIDTH = 420;
 
+function useNarrowDesktopSidebar(): boolean {
+  const query = "(max-width: 760px)";
+  const [narrow, setNarrow] = useState(() =>
+    typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? window.matchMedia(query).matches
+      : false,
+  );
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia(query);
+    const update = (event: MediaQueryListEvent) => setNarrow(event.matches);
+    setNarrow(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  return narrow;
+}
+
 /** The sessions sidebar. Its expanded width is draggable and persisted; collapsing
  * keeps that width in reserve while the shell morphs to the slim 52px rail. The
  * mobile drawer passes `collapsible={false}` and remains a fixed-width panel. */
 export function Sidebar({ collapsible = true }: { collapsible?: boolean }) {
   const sidebarCollapsed = useStore((s) => s.sidebarCollapsed);
-  const isCollapsed = collapsible && sidebarCollapsed;
+  const narrowDesktopSidebar = useNarrowDesktopSidebar();
+  const [narrowExpanded, setNarrowExpanded] = useState(false);
+  useEffect(() => {
+    if (!narrowDesktopSidebar) setNarrowExpanded(false);
+  }, [narrowDesktopSidebar]);
+  const isCollapsed =
+    collapsible && (sidebarCollapsed || (narrowDesktopSidebar && !narrowExpanded));
   const [resizing, setResizing] = useState(false);
   const { width, setWidth } = usePersistentPanelWidth({
     storageKey: "pc.sessionsPanelWidth",
@@ -108,7 +132,16 @@ export function Sidebar({ collapsible = true }: { collapsible?: boolean }) {
       }`}
       style={{ width: isCollapsed ? 52 : expandedWidth }}
     >
-      {isCollapsed ? <SessionRail /> : <SessionPanel collapsible={collapsible} />}
+      {isCollapsed ? (
+        <SessionRail
+          onExpand={() => {
+            useStore.getState().setSidebarCollapsed(false);
+            if (narrowDesktopSidebar) setNarrowExpanded(true);
+          }}
+        />
+      ) : (
+        <SessionPanel collapsible={collapsible} />
+      )}
       {collapsible && !isCollapsed && (
         <PanelResizeHandle
           label="Resize sessions explorer"
@@ -1210,11 +1243,10 @@ function SessionPanel({ collapsible }: { collapsible: boolean }) {
 /** The collapsed 52px rail: logo, expand, new session, count, spacer, settings,
  *  and the auth status dot. Two always-reachable affordances — collapse from the
  *  panel header, expand from here. */
-function SessionRail() {
+function SessionRail({ onExpand }: { onExpand: () => void }) {
   const sessions = useStore((s) => s.sessions);
   const archivedIds = useStore((s) => s.archivedIds);
   const setShowSettings = useStore((s) => s.setShowSettings);
-  const setSidebarCollapsed = useStore((s) => s.setSidebarCollapsed);
   const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
   const openAIAccounts = useStore((s) => s.openAIAccounts);
   const activeId = useStore((s) => s.activeId);
@@ -1253,7 +1285,7 @@ function SessionRail() {
         </div>
       </div>
       <button
-        onClick={() => setSidebarCollapsed(false)}
+        onClick={onExpand}
         aria-label="Expand sidebar"
         title="Expand sidebar"
         className="pc-rail-btn pc-rail-btn--cyan"

@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qa://schemas/use-case-scout/0.1.0",
+  "title": "Evidence-backed real-world use-case scout report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "reportId", "outcome", "blockers"],
+  "properties": {
+    "schemaVersion": { "const": "0.1.0" },
+    "reportId": { "type": "string", "minLength": 1 },
+    "outcome": { "enum": ["ready", "blocked"] },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "blockers": { "type": "array", "items": { "$ref": "#/$defs/blocker" } },
+    "originalRequirements": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/requirement" },
+      "minItems": 1
+    },
+    "proposals": { "type": "array", "items": { "$ref": "#/$defs/proposal" } },
+    "researchSummary": { "type": "string", "minLength": 1 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "outcome": { "const": "ready" } } },
+      "then": {
+        "required": ["provenance", "originalRequirements", "proposals", "researchSummary"],
+        "properties": { "blockers": { "maxItems": 0 } }
+      }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "blocked" } } },
+      "then": { "properties": { "blockers": { "minItems": 1 } } }
+    }
+  ],
+  "$defs": {
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent",
+        "agentVersion",
+        "taskSha256",
+        "gitBase",
+        "gitHead",
+        "workingTreeSha256"
+      ],
+      "properties": {
+        "agent": { "const": "real-world-use-case-scout" },
+        "agentVersion": { "const": "0.1.0" },
+        "taskSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "gitBase": { "type": ["string", "null"] },
+        "gitHead": { "type": ["string", "null"] },
+        "workingTreeSha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" }
+      }
+    },
+    "blocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "reason"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^BLK-[0-9]{3}$" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "text", "locator"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^REQ-[0-9]{3}$" },
+        "text": { "type": "string", "minLength": 1 },
+        "locator": { "type": "string", "minLength": 1 }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "locator", "claim"],
+      "properties": {
+        "type": {
+          "enum": [
+            "project-pattern",
+            "platform-primary",
+            "accessibility-standard",
+            "user-evidence",
+            "comparable-product"
+          ]
+        },
+        "product": { "type": ["string", "null"] },
+        "locator": { "type": "string", "minLength": 1 },
+        "claim": { "type": "string", "minLength": 1 },
+        "observedAt": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "proposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "category",
+        "realWorldUseCase",
+        "expectedBehavior",
+        "disposition",
+        "changeRisk",
+        "rationale",
+        "evidence"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^UC-[0-9]{3}$" },
+        "title": { "type": "string", "minLength": 1 },
+        "category": {
+          "enum": [
+            "input-modality",
+            "workflow",
+            "failure-recovery",
+            "accessibility",
+            "interoperability",
+            "product-consistency"
+          ]
+        },
+        "realWorldUseCase": { "type": "string", "minLength": 1 },
+        "expectedBehavior": { "type": "string", "minLength": 1 },
+        "disposition": { "enum": ["expected", "optional", "rejected"] },
+        "changeRisk": { "enum": ["additive-low", "behavioral-medium", "architectural-high"] },
+        "rationale": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence" } }
+      }
+    }
+  }
+}

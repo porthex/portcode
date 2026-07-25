@@ -11,10 +11,18 @@ import "./index.css";
 // in and a DSN was baked into this build (App re-syncs on later toggles).
 initTelemetry(useStore.getState().crashReporting);
 
-ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-  <React.StrictMode>
-    <ErrorBoundary>
-      <App />
-    </ErrorBoundary>
-  </React.StrictMode>,
-);
+async function bootstrap(): Promise<void> {
+  if (__PORTCODE_QA_CONTROLS__) {
+    await import("./qa/install").then(({ installQaControls }) => installQaControls());
+  }
+
+  ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+    <React.StrictMode>
+      <ErrorBoundary>
+        <App />
+      </ErrorBoundary>
+    </React.StrictMode>,
+  );
+}
+
+void bootstrap();

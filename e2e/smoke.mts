@@ -17,7 +17,7 @@ type RenderState = {
 
 type JourneyState = {
   settingsOpened: boolean;
-  modelMenuOpened: boolean;
+  settingsControlUpdated: boolean;
   settingsClosed: boolean;
   composerAcceptedDraft: boolean;
   composerNestedList: boolean;
@@ -186,7 +186,11 @@ const inspectUi = async (socket: WebSocket) => {
 
   await send("Runtime.enable");
   const evaluate = async <T,>(expression: string): Promise<T | undefined> => {
-    const response = await send("Runtime.evaluate", { expression, returnByValue: true });
+    const response = await send("Runtime.evaluate", {
+      expression,
+      returnByValue: true,
+      awaitPromise: true,
+    });
     return response.result?.result?.value as T | undefined;
   };
 
@@ -323,7 +327,7 @@ const inspectUi = async (socket: WebSocket) => {
   }
 
   // Exercise the real WebView journey that previously escaped the smoke gate:
-  // Settings render isolation, the Portcode-native model listbox, and React's
+  // Settings render isolation, a controlled settings interaction, and React's
   // controlled composer. No prompt is submitted and no provider call is made.
   const settingsButtonClicked = await evaluate<boolean>(`(() => {
     const button = document.querySelector('button[aria-label="Settings"], button[title="Settings"]');
@@ -339,29 +343,99 @@ const inspectUi = async (socket: WebSocket) => {
     Boolean,
   );
 
-  const modelClicked = await evaluate<boolean>(`(() => {
-    const model = document.querySelector('#pc-settings-claude-model[role="combobox"]');
-    if (!(model instanceof HTMLButtonElement)) return false;
-    model.click();
+  const interfaceOpened = await evaluate<boolean>(`(() => {
+    const button = document.querySelector('button[aria-controls="pc-settings-interface"]');
+    if (!(button instanceof HTMLButtonElement)) return false;
+    button.click();
     return true;
   })()`);
-  if (!modelClicked) throw new Error("Could not find the themed model picker.");
-  const modelMenuOpened = await waitForValue<boolean>(
-    "Model listbox",
+  if (!interfaceOpened) throw new Error("Could not open Interface settings.");
+
+  const scaleChanged = await evaluate<boolean>(`(() => {
+    const group = document.querySelector('[role="group"][aria-label="Interface scale"]');
+    const button = [...(group?.querySelectorAll('button') ?? [])].find(
+      (candidate) => candidate.textContent?.trim() === 'Comfortable'
+    );
+    if (!(button instanceof HTMLButtonElement)) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!scaleChanged) throw new Error("Could not find the Interface scale control.");
+  await waitForValue<boolean>(
+    "Interface scale update",
     `(() => {
-      const list = document.querySelector('#pc-settings-claude-model-listbox[role="listbox"]');
-      return !!list && list.querySelectorAll('[role="option"]').length >= 2;
+      const group = document.querySelector('[role="group"][aria-label="Interface scale"]');
+      const button = [...(group?.querySelectorAll('button') ?? [])].find(
+        (candidate) => candidate.textContent?.trim() === 'Comfortable'
+      );
+      return button?.getAttribute('aria-pressed') === 'true';
     })()`,
     Boolean,
   );
 
-  await evaluate(`document.querySelector('#pc-settings-claude-model[role="combobox"]')?.click()`);
+  const scaleRestored = await evaluate<boolean>(`(() => {
+    const group = document.querySelector('[role="group"][aria-label="Interface scale"]');
+    const button = [...(group?.querySelectorAll('button') ?? [])].find(
+      (candidate) => candidate.textContent?.trim() === 'Default'
+    );
+    if (!(button instanceof HTMLButtonElement)) return false;
+    button.click();
+    return true;
+  })()`);
+  if (!scaleRestored) throw new Error("Could not restore the Interface scale.");
+  const settingsControlUpdated = await waitForValue<boolean>(
+    "Interface scale restore",
+    `(() => {
+      const group = document.querySelector('[role="group"][aria-label="Interface scale"]');
+      const button = [...(group?.querySelectorAll('button') ?? [])].find(
+        (candidate) => candidate.textContent?.trim() === 'Default'
+      );
+      return button?.getAttribute('aria-pressed') === 'true';
+    })()`,
+    Boolean,
+  );
+
   await evaluate(`document.querySelector('button[aria-label="Close settings"]')?.click()`);
   const settingsClosed = await waitForValue<boolean>(
     "Settings close",
     `!document.querySelector('[role="dialog"][aria-labelledby="pc-settings-title"]')`,
     Boolean,
   );
+
+  let composerPrepared = await evaluate<boolean>(`(() => {
+    const composer = document.querySelector('[aria-label="Message Portcode"]');
+    return composer instanceof HTMLElement && composer.isContentEditable;
+  })()`);
+  if (!composerPrepared) {
+    const sessionCreated = await evaluate<boolean>(`(async () => {
+      const invoke = window.__TAURI_INTERNALS__?.invoke;
+      if (typeof invoke !== 'function') return false;
+      const id = 'e2e-' + crypto.randomUUID();
+      await invoke('create_session', {
+        id,
+        title: 'Desktop smoke draft',
+        workspace: null,
+        model: null,
+        accountProfileId: null,
+      });
+      return true;
+    })()`);
+    if (!sessionCreated) throw new Error("Could not create the local smoke session.");
+    await evaluate(`(() => {
+      setTimeout(() => location.reload(), 0);
+      return true;
+    })()`);
+    composerPrepared = await waitForValue<boolean>(
+      "Reloaded composer readiness",
+      `(() => {
+        const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+        return composer instanceof HTMLElement && composer.isContentEditable;
+      })()`,
+      Boolean,
+      30000,
+    );
+  }
+  if (!composerPrepared) throw new Error("Could not prepare a chat for the composer journey.");
 
   await waitForValue<boolean>(
     "Composer readiness",
@@ -613,7 +687,7 @@ const inspectUi = async (socket: WebSocket) => {
   return {
     ...state,
     settingsOpened,
-    modelMenuOpened,
+    settingsControlUpdated,
     settingsClosed,
     composerAcceptedDraft,
     composerNestedList,

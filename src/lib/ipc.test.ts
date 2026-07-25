@@ -11,6 +11,8 @@ import type { WebSession, WebSessionConnector } from "./webSession";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
+vi.mock("@tauri-apps/api/webview", () => ({ getCurrentWebview: vi.fn() }));
+vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: vi.fn() }));
 
 const TAURI_KEY = "__TAURI_INTERNALS__";
 const win = window as unknown as Record<string, unknown>;
@@ -564,6 +566,101 @@ describe("Tauri command serialization", () => {
     await expect(ipc.openFolder()).resolves.toBeNull();
   });
 
+  it("picks multiple supported files and validates their paths through native code", async () => {
+    const { ipc, invoke } = await load();
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const dialogOpen = vi.mocked(open);
+    const paths = ["C:/fixtures/example.rs", "C:/fixtures/pixel.png"];
+    dialogOpen.mockResolvedValue(paths);
+
+    await expect(ipc.pickAttachmentPaths()).resolves.toEqual(paths);
+    expect(dialogOpen).toHaveBeenCalledWith(
+      expect.objectContaining({
+        directory: false,
+        multiple: true,
+        filters: expect.arrayContaining([
+          expect.objectContaining({ name: "Text, code, and images" }),
+        ]),
+      }),
+    );
+    dialogOpen.mockResolvedValue(paths[0]);
+    await expect(ipc.pickAttachmentPaths()).resolves.toEqual([paths[0]]);
+
+    const validation = {
+      attachments: [
+        {
+          path: paths[0],
+          name: "example.rs",
+          kind: "text",
+          mediaType: "text/x-rust",
+          size: 12,
+          thumbnailUrl: null,
+        },
+      ],
+      errors: [],
+    };
+    invoke.mockResolvedValue(validation);
+    await expect(ipc.validateAttachments(paths)).resolves.toBe(validation);
+    expect(invoke).toHaveBeenCalledWith("validate_attachments", { paths });
+  });
+
+  it("normalizes native webview file drops to logical composer coordinates", async () => {
+    const { ipc } = await load();
+    const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    const unlisten = vi.fn();
+    let nativeHandler!: (event: { payload: unknown }) => void;
+    vi.mocked(getCurrentWebview).mockReturnValue({
+      onDragDropEvent: vi.fn(async (handler) => {
+        nativeHandler = handler as typeof nativeHandler;
+        return unlisten;
+      }),
+    } as unknown as ReturnType<typeof getCurrentWebview>);
+    vi.mocked(getCurrentWindow).mockReturnValue({
+      scaleFactor: vi.fn(async () => 2),
+    } as unknown as ReturnType<typeof getCurrentWindow>);
+    const onDrop = vi.fn();
+
+    await expect(ipc.onNativeFileDrop(onDrop)).resolves.toBe(unlisten);
+    const position = { toLogical: vi.fn(() => ({ x: 42, y: 18 })) };
+    nativeHandler({
+      payload: {
+        type: "enter",
+        paths: ["C:/fixtures/example.rs"],
+        position,
+      },
+    });
+    nativeHandler({ payload: { type: "over", position } });
+    nativeHandler({
+      payload: {
+        type: "drop",
+        paths: ["C:/fixtures/example.rs"],
+        position,
+      },
+    });
+    nativeHandler({ payload: { type: "leave" } });
+
+    expect(position.toLogical).toHaveBeenCalledWith(2);
+    expect(onDrop).toHaveBeenNthCalledWith(1, {
+      type: "enter",
+      paths: ["C:/fixtures/example.rs"],
+      x: 42,
+      y: 18,
+    });
+    expect(onDrop).toHaveBeenNthCalledWith(2, {
+      type: "over",
+      x: 42,
+      y: 18,
+    });
+    expect(onDrop).toHaveBeenNthCalledWith(3, {
+      type: "drop",
+      paths: ["C:/fixtures/example.rs"],
+      x: 42,
+      y: 18,
+    });
+    expect(onDrop).toHaveBeenNthCalledWith(4, { type: "leave" });
+  });
+
   it("run_agent wires the per-session channel and unwraps event payloads", async () => {
     const { ipc, invoke, listen } = await load();
     const unlisten = vi.fn();
@@ -575,12 +672,20 @@ describe("Tauri command serialization", () => {
     invoke.mockResolvedValue(undefined);
 
     const onEvent = vi.fn();
-    const handle = await ipc.runAgent("sess-1", "hello", onEvent);
+    const handle = await ipc.runAgent(
+      "sess-1",
+      "hello",
+      onEvent,
+      ["C:/fixtures/example.rs", "C:/fixtures/pixel.png"],
+      ["example.rs <attachment 1>", "pixel.png <attachment 2>"],
+    );
 
     expect(listen).toHaveBeenCalledWith("agent://sess-1", expect.any(Function));
     expect(invoke).toHaveBeenCalledWith("run_agent", {
       sessionId: "sess-1",
       text: "hello",
+      attachmentPaths: ["C:/fixtures/example.rs", "C:/fixtures/pixel.png"],
+      attachmentDisplayNames: ["example.rs <attachment 1>", "pixel.png <attachment 2>"],
     });
 
     // Core events arrive wrapped as `{ payload }`; the bridge unwraps them.
@@ -911,6 +1016,24 @@ describe("browser fallback (no Tauri core)", () => {
   it("openFolder returns the canned preview path", async () => {
     const { ipc } = await load();
     await expect(ipc.openFolder()).resolves.toBe("C:/dev/porthex/portcode");
+  });
+
+  it("honestly disables local attachments without a native desktop host", async () => {
+    const { ipc } = await load();
+    await expect(ipc.pickAttachmentPaths()).resolves.toEqual([]);
+    await expect(ipc.validateAttachments(["/synthetic/example.txt"])).resolves.toEqual({
+      attachments: [],
+      errors: [
+        {
+          name: "example.txt",
+          message: "Local attachments are available only in the Portcode desktop app.",
+        },
+      ],
+    });
+    const handler = vi.fn();
+    const unlisten = await ipc.onNativeFileDrop(handler);
+    unlisten();
+    expect(handler).not.toHaveBeenCalled();
   });
 
   it("resolvePermission is harmless when nothing is pending", async () => {

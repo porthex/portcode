@@ -2,6 +2,7 @@
 // back to an in-browser mock so the UI is fully runnable via `vite` alone.
 
 import type {
+  AttachmentValidationResult,
   CodexActivityEvent,
   CodexRequestResponse,
   ConnectInfo,
@@ -79,6 +80,31 @@ export function isWebClientMode(): boolean {
 const webClientActive = (): boolean => webClientEnabled && !isTauri();
 
 type Unlisten = () => void;
+
+type QaValidationInterceptor = (
+  paths: string[],
+  validateNative: (paths: string[]) => Promise<AttachmentValidationResult>,
+) => Promise<AttachmentValidationResult>;
+
+let qaValidationInterceptor: QaValidationInterceptor | null = null;
+
+type QaAgentInterceptor = (
+  sessionId: string,
+  text: string,
+  onEvent: (event: StreamEvent) => void,
+  attachmentPaths: string[],
+  attachmentDisplayNames: string[],
+) => Promise<AgentRunHandle>;
+
+let qaAgentInterceptor: QaAgentInterceptor | null = null;
+
+export function installQaValidationInterceptor(interceptor: QaValidationInterceptor): void {
+  qaValidationInterceptor = interceptor;
+}
+
+export function installQaAgentInterceptor(interceptor: QaAgentInterceptor): void {
+  qaAgentInterceptor = interceptor;
+}
 
 /** Lazily import the Tauri API only when actually running under Tauri. */
 async function tauri() {
@@ -759,6 +785,146 @@ export async function openFolder(): Promise<string | null> {
   return "C:/dev/porthex/portcode"; // preview mock
 }
 
+const ATTACHMENT_EXTENSIONS = [
+  "txt",
+  "md",
+  "markdown",
+  "rst",
+  "json",
+  "jsonl",
+  "yaml",
+  "yml",
+  "toml",
+  "xml",
+  "csv",
+  "tsv",
+  "html",
+  "htm",
+  "css",
+  "scss",
+  "sass",
+  "less",
+  "js",
+  "jsx",
+  "mjs",
+  "cjs",
+  "ts",
+  "tsx",
+  "py",
+  "rs",
+  "go",
+  "java",
+  "kt",
+  "kts",
+  "swift",
+  "c",
+  "h",
+  "cc",
+  "cpp",
+  "cxx",
+  "hpp",
+  "cs",
+  "rb",
+  "php",
+  "sh",
+  "bash",
+  "zsh",
+  "fish",
+  "ps1",
+  "bat",
+  "cmd",
+  "sql",
+  "graphql",
+  "gql",
+  "proto",
+  "ini",
+  "cfg",
+  "conf",
+  "env",
+  "log",
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+];
+
+/** Open the desktop's native multi-file picker. Native validation still decides
+ * what is accepted; the filter only makes supported choices easier to find. */
+export async function pickAttachmentPaths(): Promise<string[]> {
+  if (!isTauri()) return [];
+  const dialog = await import("@tauri-apps/plugin-dialog");
+  const result = await dialog.open({
+    directory: false,
+    multiple: true,
+    filters: [{ name: "Text, code, and images", extensions: ATTACHMENT_EXTENSIONS }],
+  });
+  if (Array.isArray(result))
+    return result.filter((path): path is string => typeof path === "string");
+  return typeof result === "string" ? [result] : [];
+}
+
+export type NativeFileDropEvent =
+  | { type: "enter"; paths: string[]; x: number; y: number }
+  | { type: "over"; x: number; y: number }
+  | { type: "drop"; paths: string[]; x: number; y: number }
+  | { type: "leave" };
+
+/** Subscribe to Tauri's OS-level file-drop stream. Tauri reports physical
+ * pixels, while DOM hit-testing uses logical CSS pixels, so normalize once at
+ * this boundary before a component compares the pointer with its client rect. */
+export async function onNativeFileDrop(
+  handler: (event: NativeFileDropEvent) => void,
+): Promise<Unlisten> {
+  if (!isTauri()) return () => {};
+  const [{ getCurrentWebview }, { getCurrentWindow }] = await Promise.all([
+    import("@tauri-apps/api/webview"),
+    import("@tauri-apps/api/window"),
+  ]);
+  const scaleFactor = await getCurrentWindow().scaleFactor();
+  return getCurrentWebview().onDragDropEvent((event) => {
+    const payload = event.payload;
+    if (payload.type === "leave") {
+      handler({ type: "leave" });
+      return;
+    }
+    const position = payload.position.toLogical(scaleFactor);
+    if (payload.type === "enter" || payload.type === "drop") {
+      handler({
+        type: payload.type,
+        paths: payload.paths,
+        x: position.x,
+        y: position.y,
+      });
+      return;
+    }
+    handler({ type: "over", x: position.x, y: position.y });
+  });
+}
+
+/** Canonicalize, deduplicate, read-check, and limit local files in Rust. */
+export async function validateAttachments(paths: string[]): Promise<AttachmentValidationResult> {
+  if (__PORTCODE_QA_CONTROLS__) {
+    if (!qaValidationInterceptor) throw new Error("QA validation controls are not installed");
+    return qaValidationInterceptor(paths, validateAttachmentsNative);
+  }
+  return validateAttachmentsNative(paths);
+}
+
+async function validateAttachmentsNative(paths: string[]): Promise<AttachmentValidationResult> {
+  if (!isTauri()) {
+    return {
+      attachments: [],
+      errors: paths.map((path) => ({
+        name: path.split(/[\\/]/).pop() || "Selected file",
+        message: "Local attachments are available only in the Portcode desktop app.",
+      })),
+    };
+  }
+  const { core } = await tauri();
+  return core.invoke<AttachmentValidationResult>("validate_attachments", { paths });
+}
+
 /**
  * A handle to a single running agent turn.
  *
@@ -785,7 +951,13 @@ export async function runAgent(
   sessionId: string,
   text: string,
   onEvent: (e: StreamEvent) => void,
+  attachmentPaths: string[] = [],
+  attachmentDisplayNames: string[] = [],
 ): Promise<AgentRunHandle> {
+  if (__PORTCODE_QA_CONTROLS__) {
+    if (!qaAgentInterceptor) throw new Error("QA agent controls are not installed");
+    return qaAgentInterceptor(sessionId, text, onEvent, attachmentPaths, attachmentDisplayNames);
+  }
   if (isTauri()) {
     const { core, event } = await tauri();
     const channel = `agent://${sessionId}`;
@@ -793,7 +965,7 @@ export async function runAgent(
       onEvent(ev.payload),
     );
     try {
-      await core.invoke("run_agent", { sessionId, text });
+      await core.invoke("run_agent", { sessionId, text, attachmentPaths, attachmentDisplayNames });
     } catch (error) {
       // Listener installation precedes the invoke so no first event is missed. If
       // reservation/invocation is rejected, tear it back down immediately.
