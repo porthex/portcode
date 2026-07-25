@@ -221,6 +221,7 @@ export function Composer() {
   const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
   const settingsError = useStore((s) => s.settingsError);
   const ref = useRef<HTMLDivElement>(null);
+  const replaceEditorDraftRef = useRef<((value: string) => void) | null>(null);
   const dropZoneRef = useRef<HTMLDivElement>(null);
   const attachButtonRef = useRef<HTMLButtonElement>(null);
   const attachmentRemoveRefs = useRef(new Map<string, HTMLButtonElement>());
@@ -418,15 +419,30 @@ export function Composer() {
       return;
     }
     const submittedSessionId = activeId;
+    const rollbackRevisionBefore = submittedSessionId
+      ? (useStore.getState().sendDraftRestoreRevisions[submittedSessionId] ?? 0)
+      : 0;
+    replaceEditorDraftRef.current?.("");
     await send(t);
-    // send() owns the acceptance boundary and clears the session draft only after
-    // every model/catalog/settings preflight succeeds. Preserve both the editor
-    // text and its height when a compatibility repair fails, or when the user has
-    // already started typing a follow-up while the command handle was resolving.
-    if (!submittedSessionId || submittedSessionId in useStore.getState().drafts) return;
-    if (ref.current) {
-      ref.current.style.height =
-        rowHeightRef.current != null ? rowHeightRef.current + "px" : "auto";
+    // The editor control belongs to the currently rendered session. A delayed
+    // admission result from another session must never import or resize through it.
+    if (!submittedSessionId || useStore.getState().activeId !== submittedSessionId) return;
+    const stateAfterSend = useStore.getState();
+    const ownedSendRolledBack =
+      (stateAfterSend.sendDraftRestoreRevisions[submittedSessionId] ?? 0) !==
+      rollbackRevisionBefore;
+    // A follow-up draft typed while native handle admission is pending is already
+    // authoritative Lexical state. Never re-import it unless this exact send rolled back.
+    if (!ownedSendRolledBack) {
+      if (ref.current) {
+        ref.current.style.height =
+          rowHeightRef.current != null ? rowHeightRef.current + "px" : "auto";
+      }
+      return;
+    }
+    const restoredDraft = stateAfterSend.drafts[submittedSessionId];
+    if (restoredDraft !== undefined) {
+      replaceEditorDraftRef.current?.(restoredDraft);
     }
   };
 
@@ -511,6 +527,7 @@ export function Composer() {
               disabled={!activeId}
               placeholder={placeholder}
               maxHeight={MAX_TEXTAREA_H}
+              replaceDraftRef={replaceEditorDraftRef}
             />
           </div>
 

@@ -283,6 +283,8 @@ interface AppState {
   attachmentSendErrors: Record<string, boolean>;
   attachmentRetryPaths: Record<string, string[]>;
   attachmentBusy: Record<string, boolean>;
+  /** Incremented only when rollback restores the submitted draft text. */
+  sendDraftRestoreRevisions: Record<string, number>;
   // The composer's live presence phase, driven by REAL turn/stream events (never
   // padded). Surfaced in the role="status" region beside the composer.
   composerPhase: ComposerPhase;
@@ -1210,6 +1212,9 @@ const armRemoteWatchdog = (sessionId: string, turnId: string): void => {
 // drop a pending save. A send (or any clear) flushes immediately instead.
 const DRAFT_SAVE_DEBOUNCE_MS = 400;
 const draftSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const draftSaveQueues = new Map<string, Promise<void>>();
+const retiredDraftSaves = new Set<string>();
+const draftEditRevisions = new Map<string, number>();
 
 const flushPendingDraftSave = (sessionId: string): void => {
   const t = draftSaveTimers.get(sessionId);
@@ -1219,16 +1224,33 @@ const flushPendingDraftSave = (sessionId: string): void => {
   }
 };
 
-// Fire the durable backend write. Best-effort: a backend reject is swallowed (the
-// localStorage mirror already holds the value). Wrapped so the debounce timer can
-// never throw an unhandled error — tolerating a test IPC mock that omits saveDraft
-// (a missing fn throws synchronously) or returns a non-promise.
+// Serialize durable writes per session. Timer cancellation cannot stop an IPC write
+// already in flight, so a later accepted-send clear must queue behind it rather than
+// race it and risk the stale nonblank write completing last.
 const fireDraftSave = (sessionId: string, text: string): void => {
-  try {
-    void Promise.resolve(ipc.saveDraft(sessionId, text)).catch(() => {});
-  } catch {
-    /* ipc.saveDraft unavailable in this environment — drop the durable write */
+  if (retiredDraftSaves.has(sessionId)) return;
+  const previous = draftSaveQueues.get(sessionId);
+  let queued: Promise<void>;
+  if (previous === undefined) {
+    try {
+      queued = Promise.resolve(ipc.saveDraft(sessionId, text)).catch(() => {});
+    } catch {
+      queued = Promise.resolve();
+    }
+  } else {
+    queued = previous
+      .catch(() => {})
+      .then(() =>
+        retiredDraftSaves.has(sessionId)
+          ? Promise.resolve()
+          : Promise.resolve(ipc.saveDraft(sessionId, text)),
+      )
+      .catch(() => {});
   }
+  draftSaveQueues.set(sessionId, queued);
+  void queued.finally(() => {
+    if (draftSaveQueues.get(sessionId) === queued) draftSaveQueues.delete(sessionId);
+  });
 };
 
 // Persist a session's draft to the durable backend. `immediate` (send/clear) skips
@@ -1717,6 +1739,7 @@ export const useStore = create<AppState>((set, get) => ({
   attachmentSendErrors: {},
   attachmentRetryPaths: {},
   attachmentBusy: {},
+  sendDraftRestoreRevisions: {},
   composerPhase: "idle",
   activeTool: null,
   scrollTargetId: null,
@@ -2466,15 +2489,22 @@ export const useStore = create<AppState>((set, get) => ({
       (state.backgroundTasks[id] ?? []).some((task) => task.status === "running")
     )
       return;
+    flushPendingDraftSave(id);
+    retiredDraftSaves.add(id);
+    const pendingDraftSave = draftSaveQueues.get(id);
+    if (pendingDraftSave) await pendingDraftSave.catch(() => {});
     try {
       await ipc.deleteSession(id);
     } catch (err) {
+      retiredDraftSaves.delete(id);
+      persistDraft(id, get().drafts[id] ?? "", false);
       // A failed delete (locked DB / core not ready) must surface instead of being a
       // swallowed unhandled rejection — caller is a bare onClick={() => deleteSession(s.id)}.
       // Reuse initError so Chat's existing error/retry panel shows it; leave the list untouched.
       set({ initError: errMessage(err) });
       return;
     }
+    retiredDraftSaves.delete(id);
     teardownBackgroundListener(id); // stop tracking the deleted session's tasks
     set((st) => {
       const sessions = st.sessions.filter((s) => s.id !== id);
@@ -2506,6 +2536,9 @@ export const useStore = create<AppState>((set, get) => ({
         writeJSON("pc.drafts", drafts);
       }
       flushPendingDraftSave(id); // cancel any in-flight debounced save for the gone session
+      draftEditRevisions.delete(id);
+      const sendDraftRestoreRevisions = { ...st.sendDraftRestoreRevisions };
+      delete sendDraftRestoreRevisions[id];
       const attachments = { ...st.attachments };
       const attachmentErrors = { ...st.attachmentErrors };
       const attachmentSendErrors = { ...st.attachmentSendErrors };
@@ -2544,6 +2577,7 @@ export const useStore = create<AppState>((set, get) => ({
         activeId,
         usage,
         drafts,
+        sendDraftRestoreRevisions,
         attachments,
         attachmentErrors,
         attachmentSendErrors,
@@ -2720,6 +2754,7 @@ export const useStore = create<AppState>((set, get) => ({
   async send(text) {
     const { activeId, streaming } = get();
     const activeRun = activeId ? get().runs[runKey(activeId)] : undefined;
+    const runBeforeOptimistic = activeRun;
     const submittedAttachments = activeId ? (get().attachments[activeId] ?? []) : [];
     const hasAttachments = submittedAttachments.length > 0;
     if (
@@ -2740,20 +2775,212 @@ export const useStore = create<AppState>((set, get) => ({
       return;
     }
     const submittedDraft = get().drafts[activeId];
+    const draftSavePendingAtSubmit = draftSaveTimers.has(activeId);
+    const draftEditRevisionAtSubmit = draftEditRevisions.get(activeId) ?? 0;
+    const agentsBeforeOptimistic = get().agents[activeId] ?? [];
     const messageLoad = get().messageLoads[activeId];
     if (messageLoad && messageLoad.phase !== "ready" && messageLoad.phase !== "refreshing") return;
-    if (hasAttachments) {
+
+    // Build the provisional local turn before any persistence/catalogue preflight can
+    // await. Attachment sends must leave the composer and appear in chat in the same
+    // synchronous transition as the click; turn_start remains the commit boundary.
+    const body = text.trim();
+    const attachmentNames = attachmentSummaryLabels(submittedAttachments).join(", ");
+    const displayBody = body
+      ? hasAttachments
+        ? body + "\n\nAttached: " + attachmentNames
+        : body
+      : "Attached: " + attachmentNames;
+    const provisionalTurnId = uid();
+    const optimisticStartedAt = now();
+    const optimisticScrollRequestId = uid();
+    const sessionBeforeOptimistic = get().sessions.find((session) => session.id === activeId);
+    const scrollRequestBeforeOptimistic = get().transcriptScrollRequest;
+    const userMsg: Message = {
+      id: uid(),
+      role: "user",
+      blocks: [{ kind: "text", text: displayBody }],
+      createdAt: now(),
+      turnId: provisionalTurnId,
+    };
+    const assistant: Message = {
+      id: provisionalTurnId,
+      role: "assistant",
+      blocks: [],
+      createdAt: optimisticStartedAt,
+      turnId: provisionalTurnId,
+    };
+    let optimisticLocalInserted = false;
+    let optimisticDraftCleared = false;
+    const insertOptimisticLocalTurn = () => {
+      if (optimisticLocalInserted) return;
+      optimisticLocalInserted = true;
+      setRun(set, activeId, {
+        composerPhase: "received",
+        activeTool: null,
+        pendingCodexRequest: null,
+        turnId: provisionalTurnId,
+        startedAt: optimisticStartedAt,
+        unseenOutcome: null,
+      });
+      armSettleTimer(activeId, provisionalTurnId);
       set((st) => {
+        const msgs = st.messages[activeId] ?? [];
+        const sessions = st.sessions.map((s) =>
+          s.id === activeId
+            ? {
+                ...s,
+                title: msgs.length === 0 ? deriveTitle(displayBody) : s.title,
+                updatedAt: optimisticStartedAt,
+              }
+            : s,
+        );
+        const attachments = { ...st.attachments };
+        const attachmentErrors = { ...st.attachmentErrors };
         const attachmentSendErrors = { ...st.attachmentSendErrors };
+        const attachmentRetryPaths = { ...st.attachmentRetryPaths };
+        const attachmentBusy = { ...st.attachmentBusy };
+        if (st.attachments[activeId] === submittedAttachments) {
+          delete attachments[activeId];
+        }
+        delete attachmentErrors[activeId];
         delete attachmentSendErrors[activeId];
+        delete attachmentRetryPaths[activeId];
+        if (hasAttachments) attachmentBusy[activeId] = true;
+        else delete attachmentBusy[activeId];
+        let drafts = st.drafts;
+        if (submittedDraft !== undefined && st.drafts[activeId] === submittedDraft) {
+          drafts = { ...st.drafts };
+          delete drafts[activeId];
+          writeJSON("pc.drafts", drafts);
+          optimisticDraftCleared = true;
+        }
         return {
-          attachmentBusy: { ...st.attachmentBusy, [activeId]: true },
+          sessions,
+          ...runPatch(st, activeId, {
+            streaming: true,
+            finalizing: false,
+            cancel: null,
+            phaseRevision: 0,
+            receipt: null,
+            outcome: null,
+            agentDurationMs: null,
+          }),
+          messages: {
+            ...st.messages,
+            [activeId]: [...msgs, userMsg, assistant],
+          },
+          transcriptScrollRequest: {
+            id: optimisticScrollRequestId,
+            sessionId: activeId,
+            kind: "newTurn",
+            targetMessageId: userMsg.id,
+          },
+          attachments,
+          attachmentErrors,
           attachmentSendErrors,
+          attachmentRetryPaths,
+          attachmentBusy,
+          drafts,
+          agents: { ...st.agents, [activeId]: [] },
         };
       });
-    }
+      if (optimisticDraftCleared) flushPendingDraftSave(activeId);
+    };
+
+    // Every local send enters the optimistic transcript/composer transaction before
+    // asynchronous model, auth, reasoning, or first-session preflight. Remote sends
+    // keep their desktop-authoritative command projection below.
+    if (!get().remoteConnected) insertOptimisticLocalTurn();
+
     let attachmentAccepted = false;
     let commandReturned = false;
+    let optimisticRolledBack = false;
+    const rollbackOptimisticPreflight = () => {
+      if (!optimisticLocalInserted || attachmentAccepted || optimisticRolledBack) return;
+      optimisticRolledBack = true;
+      let restoredDraft: string | undefined;
+      set((st) => {
+        const sessionStillExists =
+          st.sessions.some((session) => session.id === activeId) ||
+          st.pendingSession?.id === activeId;
+        const attachmentBusy = { ...st.attachmentBusy };
+        delete attachmentBusy[activeId];
+        if (!sessionStillExists) return { attachmentBusy };
+
+        const attachments = { ...st.attachments };
+        const currentAttachments = attachments[activeId] ?? [];
+        const currentPaths = new Set(currentAttachments.map((attachment) => attachment.path));
+        attachments[activeId] = [
+          ...submittedAttachments.filter((attachment) => !currentPaths.has(attachment.path)),
+          ...currentAttachments,
+        ];
+
+        let drafts = st.drafts;
+        const draftChangedAfterSubmit =
+          (draftEditRevisions.get(activeId) ?? 0) !== draftEditRevisionAtSubmit;
+        if (submittedDraft !== undefined && !draftChangedAfterSubmit) {
+          restoredDraft = submittedDraft;
+          drafts = { ...st.drafts, [activeId]: submittedDraft };
+          writeJSON("pc.drafts", drafts);
+        }
+
+        const run = st.runs[runKey(activeId)];
+        const sessions =
+          sessionBeforeOptimistic === undefined
+            ? st.sessions
+            : st.sessions.map((session) =>
+                session.id === activeId && session.updatedAt === optimisticStartedAt
+                  ? {
+                      ...session,
+                      title: sessionBeforeOptimistic.title,
+                      updatedAt: sessionBeforeOptimistic.updatedAt,
+                    }
+                  : session,
+              );
+        const agents =
+          agentsBeforeOptimistic.length > 0 && (st.agents[activeId]?.length ?? 0) === 0
+            ? { ...st.agents, [activeId]: agentsBeforeOptimistic }
+            : st.agents;
+        const sendDraftRestoreRevisions =
+          restoredDraft === undefined
+            ? st.sendDraftRestoreRevisions
+            : {
+                ...st.sendDraftRestoreRevisions,
+                [activeId]: (st.sendDraftRestoreRevisions[activeId] ?? 0) + 1,
+              };
+        const rollbackRunProjection = (() => {
+          if (run?.turnId !== provisionalTurnId) return {};
+          const runs = { ...st.runs };
+          if (runBeforeOptimistic === undefined) delete runs[runKey(activeId)];
+          else runs[runKey(activeId)] = runBeforeOptimistic;
+          return { runs, ...projectActiveRun({ activeId: st.activeId, runs }) };
+        })();
+        return {
+          sessions,
+          agents,
+          attachments,
+          drafts,
+          sendDraftRestoreRevisions,
+          attachmentBusy,
+          messages: {
+            ...st.messages,
+            [activeId]: (st.messages[activeId] ?? []).filter(
+              (message) => message.turnId !== provisionalTurnId,
+            ),
+          },
+          transcriptScrollRequest:
+            st.transcriptScrollRequest?.id === optimisticScrollRequestId
+              ? scrollRequestBeforeOptimistic
+              : st.transcriptScrollRequest,
+          ...rollbackRunProjection,
+        };
+      });
+      clearSettleTimer(activeId);
+      if (restoredDraft !== undefined && draftSavePendingAtSubmit) {
+        persistDraft(activeId, restoredDraft, false);
+      }
+    };
     try {
       // A model click updates the UI optimistically while its SQLite write is queued.
       // Never let Send overtake that write: native admission reads the persisted row,
@@ -2769,7 +2996,11 @@ export const useStore = create<AppState>((set, get) => ({
           }
           if (get().activeId !== activeId) return;
           const latestRun = get().runs[runKey(activeId)];
-          if (latestRun?.streaming || latestRun?.finalizing) return;
+          if (
+            (latestRun?.streaming || latestRun?.finalizing) &&
+            latestRun.turnId !== provisionalTurnId
+          )
+            return;
         }
       }
 
@@ -2823,15 +3054,6 @@ export const useStore = create<AppState>((set, get) => ({
         }
       }
 
-      // Trim once so the stored user bubble and the forwarded command match the
-      // derived (trimmed) title — a padded draft otherwise renders odd blank lines.
-      const body = text.trim();
-      const attachmentNames = attachmentSummaryLabels(submittedAttachments).join(", ");
-      const displayBody = body
-        ? hasAttachments
-          ? body + "\n\nAttached: " + attachmentNames
-          : body
-        : "Attached: " + attachmentNames;
       // A blank New chat is only local navigation state. Persist it immediately
       // before the first turn, keeping empty sessions out of history and SQLite.
       if (pendingSession && get().remoteConnected) {
@@ -2895,7 +3117,6 @@ export const useStore = create<AppState>((set, get) => ({
           set((st) => ({
             creatingSession: false,
             initError: errMessage(err),
-            drafts: { ...st.drafts, [activeId]: body },
             attachmentBusy: hasAttachments
               ? { ...st.attachmentBusy, [activeId]: false }
               : st.attachmentBusy,
@@ -2909,17 +3130,17 @@ export const useStore = create<AppState>((set, get) => ({
       // 900ms fallback for a slow first byte. Honest — never padded latency.
       // Reset the tool label up front so a new turn never briefly shows the previous
       // turn's last tool before its first real event arrives.
-      const provisionalTurnId = uid();
-      const optimisticStartedAt = now();
-      setRun(set, activeId, {
-        composerPhase: "received",
-        activeTool: null,
-        pendingCodexRequest: null,
-        turnId: provisionalTurnId,
-        startedAt: optimisticStartedAt,
-        unseenOutcome: null,
-      });
-      armSettleTimer(activeId, provisionalTurnId);
+      if (!optimisticLocalInserted) {
+        setRun(set, activeId, {
+          composerPhase: "received",
+          activeTool: null,
+          pendingCodexRequest: null,
+          turnId: provisionalTurnId,
+          startedAt: optimisticStartedAt,
+          unseenOutcome: null,
+        });
+        armSettleTimer(activeId, provisionalTurnId);
+      }
 
       // Remote mode: this device is the phone driving a paired desktop. Forward the
       // turn as a `run` command instead of running the local agent — the desktop is
@@ -2984,58 +3205,7 @@ export const useStore = create<AppState>((set, get) => ({
         return;
       }
 
-      const userMsg: Message = {
-        id: uid(),
-        role: "user",
-        blocks: [{ kind: "text", text: displayBody }],
-        createdAt: now(),
-        turnId: provisionalTurnId,
-      };
-      const assistant: Message = {
-        id: provisionalTurnId,
-        role: "assistant",
-        blocks: [],
-        createdAt: optimisticStartedAt,
-        turnId: provisionalTurnId,
-      };
-
-      set((st) => {
-        const msgs = st.messages[activeId] ?? [];
-        const sessions = st.sessions.map((s) =>
-          s.id === activeId
-            ? {
-                ...s,
-                updatedAt: now(),
-                title: msgs.length === 0 ? deriveTitle(displayBody) : s.title,
-              }
-            : s,
-        );
-        return {
-          sessions,
-          ...runPatch(st, activeId, {
-            streaming: true,
-            turnId: provisionalTurnId,
-            startedAt: optimisticStartedAt,
-            finalizing: false,
-            agentDurationMs: null,
-            phaseRevision: 0,
-            receipt: null,
-            outcome: null,
-          }),
-          messages: {
-            ...st.messages,
-            [activeId]: [...msgs, userMsg, assistant],
-          },
-          transcriptScrollRequest: {
-            id: uid(),
-            sessionId: activeId,
-            kind: "newTurn",
-            targetMessageId: userMsg.id,
-          },
-          // Each turn's agents panel starts empty; this turn's subagents repopulate it.
-          agents: { ...st.agents, [activeId]: [] },
-        };
-      });
+      insertOptimisticLocalTurn();
 
       const apply = (fn: (blocks: ContentBlock[]) => ContentBlock[]) =>
         set((st) => ({
@@ -3068,38 +3238,21 @@ export const useStore = create<AppState>((set, get) => ({
       let awaitingCancelTerminal = false;
       let observedTurnId = provisionalTurnId;
       let nativeTurnIdKnown = false;
-      const acceptSubmittedAttachments = () => {
+      const acceptSubmittedSend = () => {
         if (attachmentAccepted) return;
         attachmentAccepted = true;
-        let clearedDraft = false;
-        set((st) => {
-          const attachments = { ...st.attachments };
-          const attachmentErrors = { ...st.attachmentErrors };
-          const attachmentSendErrors = { ...st.attachmentSendErrors };
-          const attachmentRetryPaths = { ...st.attachmentRetryPaths };
-          const attachmentBusy = { ...st.attachmentBusy };
-          delete attachments[activeId];
-          delete attachmentErrors[activeId];
-          delete attachmentSendErrors[activeId];
-          delete attachmentRetryPaths[activeId];
-          delete attachmentBusy[activeId];
-          let drafts = st.drafts;
-          if (submittedDraft !== undefined && st.drafts[activeId] === submittedDraft) {
-            drafts = { ...st.drafts };
-            delete drafts[activeId];
-            writeJSON("pc.drafts", drafts);
-            clearedDraft = true;
-          }
-          return {
-            attachments,
-            attachmentErrors,
-            attachmentSendErrors,
-            attachmentRetryPaths,
-            attachmentBusy,
-            drafts,
-          };
-        });
-        if (clearedDraft) persistDraft(activeId, "", true);
+        const draftChangedAfterSubmit =
+          (draftEditRevisions.get(activeId) ?? 0) !== draftEditRevisionAtSubmit;
+        if (optimisticDraftCleared && !draftChangedAfterSubmit) {
+          persistDraft(activeId, "", true);
+        }
+        if (hasAttachments) {
+          set((st) => {
+            const attachmentBusy = { ...st.attachmentBusy };
+            delete attachmentBusy[activeId];
+            return { attachmentBusy };
+          });
+        }
       };
       // More than one tool_use can arrive in a single model turn. Track all live ids
       // so one fast result does not clear the presence label while a sibling tool is
@@ -3247,7 +3400,7 @@ export const useStore = create<AppState>((set, get) => ({
         lastActivity = now();
         switch (e.type) {
           case "turn_start": {
-            acceptSubmittedAttachments();
+            acceptSubmittedSend();
             const currentRun = get().runs[runKey(activeId)] ?? EMPTY_RUN;
             const turnId = e.turnId ?? e.messageId;
             observedTurnId = turnId;
@@ -3413,21 +3566,13 @@ export const useStore = create<AppState>((set, get) => ({
               const errorMessage = sessionScopedStreamError(get(), activeId, e.message);
               const displayError = errorMessage.replace(/^(?:Error:\s*)+/i, "").trim();
               if (!nativeTurnIdKnown) {
+                rollbackOptimisticPreflight();
                 set((st) => {
                   const sessionStillExists =
                     st.sessions.some((session) => session.id === activeId) ||
                     st.pendingSession?.id === activeId;
-                  const attachmentBusy = { ...st.attachmentBusy };
-                  delete attachmentBusy[activeId];
-                  if (!sessionStillExists) return { attachmentBusy };
+                  if (!sessionStillExists) return {};
                   return {
-                    attachmentBusy,
-                    messages: {
-                      ...st.messages,
-                      [activeId]: (st.messages[activeId] ?? []).filter(
-                        (message) => message.turnId !== provisionalTurnId,
-                      ),
-                    },
                     attachmentErrors: {
                       ...st.attachmentErrors,
                       [activeId]: hasAttachments
@@ -3435,17 +3580,6 @@ export const useStore = create<AppState>((set, get) => ({
                         : `Your message was not sent. ${displayError} Review it and retry Send.`,
                     },
                     attachmentSendErrors: { ...st.attachmentSendErrors, [activeId]: true },
-                    ...runPatch(st, activeId, {
-                      streaming: false,
-                      finalizing: false,
-                      cancel: null,
-                      pendingPermission: null,
-                      pendingCodexRequest: null,
-                      composerPhase: "idle",
-                      activeTool: null,
-                      receipt: null,
-                      outcome: null,
-                    }),
                   };
                 });
                 clearSettleTimer(activeId);
@@ -3589,12 +3723,15 @@ export const useStore = create<AppState>((set, get) => ({
         onEvent({ type: "error", message: String(err) });
       }
     } finally {
-      if (hasAttachments && !attachmentAccepted && !commandReturned) {
-        set((st) => {
-          const attachmentBusy = { ...st.attachmentBusy };
-          delete attachmentBusy[activeId];
-          return { attachmentBusy };
-        });
+      if (!attachmentAccepted && !commandReturned) {
+        rollbackOptimisticPreflight();
+        if (hasAttachments) {
+          set((st) => {
+            const attachmentBusy = { ...st.attachmentBusy };
+            delete attachmentBusy[activeId];
+            return { attachmentBusy };
+          });
+        }
       }
     }
   },
@@ -3987,6 +4124,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   setDraft(v) {
     const id = get().activeId;
+    if (id) draftEditRevisions.set(id, (draftEditRevisions.get(id) ?? 0) + 1);
     if (id && get().pendingSession?.id === id) {
       set((st) => {
         const drafts = { ...st.drafts };

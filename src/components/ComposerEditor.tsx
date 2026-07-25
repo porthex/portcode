@@ -39,7 +39,7 @@ import { CheckListPlugin } from "@lexical/react/LexicalCheckListPlugin";
 import { MarkdownShortcutPlugin } from "@lexical/react/LexicalMarkdownShortcutPlugin";
 import { OnChangePlugin } from "@lexical/react/LexicalOnChangePlugin";
 import { RichTextPlugin } from "@lexical/react/LexicalRichTextPlugin";
-import { useEffect, useRef, type MutableRefObject, type RefObject } from "react";
+import { useEffect, useLayoutEffect, useRef, type MutableRefObject, type RefObject } from "react";
 
 export const COMPOSER_TRANSFORMERS: Transformer[] = [
   CHECK_LIST,
@@ -92,6 +92,7 @@ type ComposerEditorProps = {
   placeholder: string;
   editableRef: RefObject<HTMLDivElement | null>;
   maxHeight: number;
+  replaceDraftRef: MutableRefObject<((value: string) => void) | null>;
 };
 
 function $nestedListFromWrapper(node: LexicalNode | null): ListNode | null {
@@ -323,6 +324,33 @@ function ExternalDraftPlugin({
   return null;
 }
 
+function DraftControlPlugin({
+  replaceDraftRef,
+  lastEmittedValue,
+}: {
+  replaceDraftRef: ComposerEditorProps["replaceDraftRef"];
+  lastEmittedValue: MutableRefObject<string>;
+}) {
+  const [editor] = useLexicalComposerContext();
+
+  useLayoutEffect(() => {
+    replaceDraftRef.current = (value) => {
+      lastEmittedValue.current = value;
+      editor.update(
+        () => {
+          $importComposerMarkdown(value);
+        },
+        { tag: EXTERNAL_DRAFT_TAG, discrete: true },
+      );
+    };
+    return () => {
+      replaceDraftRef.current = null;
+    };
+  }, [editor, lastEmittedValue, replaceDraftRef]);
+
+  return null;
+}
+
 export function registerComposerEnterCommand(editor: LexicalEditor, onSubmit: () => void) {
   return editor.registerCommand(
     KEY_ENTER_COMMAND,
@@ -433,6 +461,7 @@ export function ComposerEditor({
   placeholder,
   editableRef,
   maxHeight,
+  replaceDraftRef,
 }: ComposerEditorProps) {
   const lastEmittedValue = useRef(value);
 
@@ -482,6 +511,7 @@ export function ComposerEditor({
       />
       <EditablePlugin disabled={disabled} />
       <ExternalDraftPlugin value={value} lastEmittedValue={lastEmittedValue} />
+      <DraftControlPlugin replaceDraftRef={replaceDraftRef} lastEmittedValue={lastEmittedValue} />
       <SubmitPlugin onSubmit={onSubmit} />
       <ListKeyboardPlugin />
       <GrowPlugin editableRef={editableRef} maxHeight={maxHeight} />
