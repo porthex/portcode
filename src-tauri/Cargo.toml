@@ -60,7 +60,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Hashing and encoding used by the durable conversation store, Git review, and
 # end-to-end encrypted Phone Sync protocol.
-sha2 = "0.10"
+sha2 = "0.11"
 base64 = "0.22"
 rand = "0.10"
 tempfile = "3"
