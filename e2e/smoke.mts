@@ -339,23 +339,27 @@ const inspectUi = async (socket: WebSocket) => {
     Boolean,
   );
 
-  const modelClicked = await evaluate<boolean>(`(() => {
+  const modelPicker = await evaluate<{ found: boolean; disabled: boolean }>(`(() => {
     const model = document.querySelector('#pc-settings-openai-model[role="combobox"]');
-    if (!(model instanceof HTMLButtonElement)) return false;
-    model.click();
-    return true;
+    if (!(model instanceof HTMLButtonElement)) return { found: false, disabled: false };
+    if (!model.disabled) model.click();
+    return { found: true, disabled: model.disabled };
   })()`);
-  if (!modelClicked) throw new Error("Could not find the themed model picker.");
-  const modelMenuOpened = await waitForValue<boolean>(
-    "Model listbox",
-    `(() => {
-      const list = document.querySelector('#pc-settings-openai-model-listbox[role="listbox"]');
-      return !!list && list.querySelectorAll('[role="option"]').length >= 2;
-    })()`,
-    Boolean,
-  );
+  if (!modelPicker?.found) throw new Error("Could not find the themed model picker.");
+  const modelMenuOpened = modelPicker.disabled
+    ? true
+    : await waitForValue<boolean>(
+        "Model listbox",
+        `(() => {
+          const list = document.querySelector('#pc-settings-openai-model-listbox[role="listbox"]');
+          return !!list && list.querySelectorAll('[role="option"]').length >= 2;
+        })()`,
+        Boolean,
+      );
 
-  await evaluate(`document.querySelector('#pc-settings-openai-model[role="combobox"]')?.click()`);
+  if (!modelPicker.disabled) {
+    await evaluate(`document.querySelector('#pc-settings-openai-model[role="combobox"]')?.click()`);
+  }
   await evaluate(`document.querySelector('button[aria-label="Close settings"]')?.click()`);
   const settingsClosed = await waitForValue<boolean>(
     "Settings close",
