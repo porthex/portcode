@@ -186,7 +186,11 @@ const inspectUi = async (socket: WebSocket) => {
 
   await send("Runtime.enable");
   const evaluate = async <T,>(expression: string): Promise<T | undefined> => {
-    const response = await send("Runtime.evaluate", { expression, returnByValue: true });
+    const response = await send("Runtime.evaluate", {
+      expression,
+      returnByValue: true,
+      awaitPromise: true,
+    });
     return response.result?.result?.value as T | undefined;
   };
 
@@ -398,16 +402,39 @@ const inspectUi = async (socket: WebSocket) => {
     Boolean,
   );
 
-  const composerPrepared = await evaluate<boolean>(`(() => {
+  let composerPrepared = await evaluate<boolean>(`(() => {
     const composer = document.querySelector('[aria-label="Message Portcode"]');
-    if (composer instanceof HTMLElement && composer.isContentEditable) return true;
-    const newChat = [...document.querySelectorAll('button')].find(
-      (candidate) => candidate.textContent?.trim() === 'New chat'
-    );
-    if (!(newChat instanceof HTMLButtonElement)) return false;
-    newChat.click();
-    return true;
+    return composer instanceof HTMLElement && composer.isContentEditable;
   })()`);
+  if (!composerPrepared) {
+    const sessionCreated = await evaluate<boolean>(`(async () => {
+      const invoke = window.__TAURI_INTERNALS__?.invoke;
+      if (typeof invoke !== 'function') return false;
+      const id = 'e2e-' + crypto.randomUUID();
+      await invoke('create_session', {
+        id,
+        title: 'Desktop smoke draft',
+        workspace: null,
+        model: null,
+        accountProfileId: null,
+      });
+      return true;
+    })()`);
+    if (!sessionCreated) throw new Error("Could not create the local smoke session.");
+    await evaluate(`(() => {
+      setTimeout(() => location.reload(), 0);
+      return true;
+    })()`);
+    composerPrepared = await waitForValue<boolean>(
+      "Reloaded composer readiness",
+      `(() => {
+        const composer = document.querySelector('[contenteditable="true"][aria-label="Message Portcode"]');
+        return composer instanceof HTMLElement && composer.isContentEditable;
+      })()`,
+      Boolean,
+      30000,
+    );
+  }
   if (!composerPrepared) throw new Error("Could not prepare a chat for the composer journey.");
 
   await waitForValue<boolean>(
