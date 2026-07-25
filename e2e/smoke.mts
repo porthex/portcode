@@ -398,6 +398,18 @@ const inspectUi = async (socket: WebSocket) => {
     Boolean,
   );
 
+  const composerPrepared = await evaluate<boolean>(`(() => {
+    const composer = document.querySelector('[aria-label="Message Portcode"]');
+    if (composer instanceof HTMLElement && composer.isContentEditable) return true;
+    const newChat = [...document.querySelectorAll('button')].find(
+      (candidate) => candidate.textContent?.trim() === 'New chat'
+    );
+    if (!(newChat instanceof HTMLButtonElement)) return false;
+    newChat.click();
+    return true;
+  })()`);
+  if (!composerPrepared) throw new Error("Could not prepare a chat for the composer journey.");
+
   await waitForValue<boolean>(
     "Composer readiness",
     `(() => {
