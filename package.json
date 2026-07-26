@@ -71,7 +71,7 @@
     "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/cli": "^2.11.4",
     "@testing-library/dom": "^10.0.0",
-    "@testing-library/jest-dom": "^6.4.0",
+    "@testing-library/jest-dom": "^7.0.0",
     "@testing-library/react": "^16.0.0",
     "@types/node": "^26.1.1",
     "@types/react": "^19.2.17",
