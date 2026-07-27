@@ -141,7 +141,7 @@ const ToolCallDetails = memo(function ToolCallDetails({
 // generous readable prefix and reveal the complete output only on explicit ask.
 const MAX_PLAIN_OUTPUT_CHARS = 40_000;
 
-const PlainOutput = memo(function PlainOutput({
+export const PlainOutput = memo(function PlainOutput({
   text,
   error,
   interrupted,
@@ -240,7 +240,7 @@ const MAX_DIFF_LINES = 500;
 
 // memo: DiffView's only prop is `text`, so skip re-building the line tree
 // when an unrelated parent re-render leaves the diff text unchanged.
-const DiffView = memo(function DiffView({ text }: { text: string }) {
+export const DiffView = memo(function DiffView({ text }: { text: string }) {
   const lines = useMemo(() => text.split("\n"), [text]);
   const shown = lines.length > MAX_DIFF_LINES ? lines.slice(0, MAX_DIFF_LINES) : lines;
   const hidden = lines.length - shown.length;

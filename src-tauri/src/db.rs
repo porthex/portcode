@@ -25,6 +25,94 @@ use portcode_sync::wire::{TurnChangeCertainty, TurnChangeState, TurnReceipt, Tur
 /// `RemoteCommand::FetchMessages`). See `Db::messages_tail`.
 pub const SYNC_CACHE_WINDOW: i64 = 200;
 
+const MAX_CODEX_ACTIVITY_EVENTS_PER_THREAD: i64 = 4_096;
+const MAX_CODEX_ACTIVITY_BYTES_PER_THREAD: i64 = 4 * 1024 * 1024;
+/// Session-wide bounds prevent many distinct child thread IDs from bypassing the
+/// per-thread cap. Global bounds constrain the entire durable activity ledger.
+/// Pruning always removes the oldest non-terminal evidence before terminal truth.
+const MAX_CODEX_ACTIVITY_EVENTS_PER_SESSION: i64 = 8_192;
+const MAX_CODEX_ACTIVITY_BYTES_PER_SESSION: i64 = 8 * 1024 * 1024;
+const MAX_CODEX_ACTIVITY_EVENTS_GLOBAL: i64 = 32_768;
+const MAX_CODEX_ACTIVITY_BYTES_GLOBAL: i64 = 32 * 1024 * 1024;
+
+const CODEX_ACTIVITY_ENCODED_BYTES_SQL: &str = "length(CAST(session_id AS BLOB))
+     + length(CAST(thread_id AS BLOB))
+     + COALESCE(length(CAST(turn_id AS BLOB)), 0)
+     + COALESCE(length(CAST(item_id AS BLOB)), 0)
+     + length(CAST(method AS BLOB))
+     + length(CAST(params_json AS BLOB))
+     + COALESCE(length(CAST(request_id_json AS BLOB)), 0)";
+
+fn prune_codex_activity_scope(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: Option<&str>,
+    thread_id: Option<&str>,
+    max_events: i64,
+    max_bytes: i64,
+) -> rusqlite::Result<()> {
+    let scope = "(?1 IS NULL OR session_id = ?1) AND (?2 IS NULL OR thread_id = ?2)";
+    let count: i64 = transaction.query_row(
+        &format!("SELECT COUNT(*) FROM codex_events WHERE {scope}"),
+        params![session_id, thread_id],
+        |row| row.get(0),
+    )?;
+    if count > max_events {
+        transaction.execute(
+            &format!(
+                "DELETE FROM codex_events WHERE sequence IN (
+                    SELECT sequence FROM codex_events WHERE {scope}
+                    ORDER BY CASE WHEN method IN (
+                        'turn/completed', 'item/completed', 'thread/closed',
+                        'serverRequest/resolved'
+                    ) THEN 1 ELSE 0 END ASC, sequence ASC
+                    LIMIT ?3
+                 )"
+            ),
+            params![session_id, thread_id, count - max_events],
+        )?;
+    }
+
+    let encoded_bytes: i64 = transaction.query_row(
+        &format!(
+            "SELECT COALESCE(SUM({CODEX_ACTIVITY_ENCODED_BYTES_SQL}), 0)
+             FROM codex_events WHERE {scope}"
+        ),
+        params![session_id, thread_id],
+        |row| row.get(0),
+    )?;
+    if encoded_bytes <= max_bytes {
+        return Ok(());
+    }
+    let rows = {
+        let mut statement = transaction.prepare(&format!(
+            "SELECT sequence, {CODEX_ACTIVITY_ENCODED_BYTES_SQL}
+             FROM codex_events WHERE {scope}
+             ORDER BY CASE WHEN method IN (
+                 'turn/completed', 'item/completed', 'thread/closed',
+                 'serverRequest/resolved'
+             ) THEN 1 ELSE 0 END ASC, sequence ASC"
+        ))?;
+        let collected = statement
+            .query_map(params![session_id, thread_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        collected
+    };
+    let mut remaining_bytes = encoded_bytes;
+    for (sequence, row_bytes) in rows {
+        if remaining_bytes <= max_bytes {
+            break;
+        }
+        transaction.execute(
+            "DELETE FROM codex_events WHERE sequence = ?1",
+            params![sequence],
+        )?;
+        remaining_bytes = remaining_bytes.saturating_sub(row_bytes);
+    }
+    Ok(())
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -262,6 +350,14 @@ pub struct CodexActivityRow {
     pub emitted_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexActivityPage {
+    pub events: Vec<CodexActivityRow>,
+    pub has_more: bool,
+    pub next_cursor: Option<i64>,
+}
+
 /// Result of the compare-and-set used to attribute an unpinned legacy session.
 /// Once a non-NULL profile is present this API never rewrites it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -455,6 +551,37 @@ const RECEIPT_STATE_TERMINAL: i64 = 1;
 const RECEIPT_STATE_AGENT_TERMINAL: i64 = 2;
 
 impl Db {
+    #[cfg(test)]
+    pub(crate) fn install_codex_activity_insert_failure_fixture(&self) {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_codex_activity_insert
+                 BEFORE INSERT ON codex_events
+                 BEGIN
+                   SELECT RAISE(FAIL, 'deterministic codex activity append failure');
+                 END;",
+            )
+            .unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_assistant_message_insert_failure_fixture(&self) {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_assistant_message_insert
+                 BEFORE INSERT ON messages
+                 WHEN NEW.role = 'assistant'
+                 BEGIN
+                   SELECT RAISE(FAIL, 'deterministic assistant message insert failure');
+                 END;",
+            )
+            .unwrap();
+    }
+
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
         // Retry briefly on a transient lock instead of failing a write instantly —
@@ -1039,14 +1166,44 @@ impl Db {
         request_id: Option<&Value>,
         emitted_at_ms: i64,
     ) -> rusqlite::Result<i64> {
+        self.append_codex_activity_with_messages(
+            session_id,
+            thread_id,
+            turn_id,
+            item_id,
+            method,
+            params_value,
+            request_id,
+            emitted_at_ms,
+            &[],
+        )
+    }
+
+    /// Atomically append sanitized activity provenance and any transcript messages
+    /// derived from that same lifecycle record. Activity is inserted first, and the
+    /// transaction rolls every write back if either table rejects its insert.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_codex_activity_with_messages(
+        &self,
+        session_id: &str,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        item_id: Option<&str>,
+        method: &str,
+        params_value: &Value,
+        request_id: Option<&Value>,
+        emitted_at_ms: i64,
+        messages: &[(ChatMessage, i64)],
+    ) -> rusqlite::Result<i64> {
         let params_json = serde_json::to_string(params_value)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         let request_id_json = request_id
             .map(serde_json::to_string)
             .transpose()
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        transaction.execute(
             "INSERT INTO codex_events (
                  session_id, thread_id, turn_id, item_id, method,
                  params_json, request_id_json, emitted_at_ms
@@ -1062,33 +1219,109 @@ impl Db {
                 emitted_at_ms,
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        let sequence = transaction.last_insert_rowid();
+        let mut message_sequence = transaction.query_row(
+            "SELECT COALESCE(MAX(seq), -1) + 1 FROM messages WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        for (message, created_at) in messages {
+            let id = uuid::Uuid::new_v4().to_string();
+            let content = serde_json::to_string(&message.content)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            transaction.execute(
+                "INSERT INTO messages (id, session_id, seq, role, content, created_at, turn_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id,
+                    session_id,
+                    message_sequence,
+                    message.role,
+                    content,
+                    created_at,
+                    turn_id,
+                ],
+            )?;
+            message_sequence = message_sequence.saturating_add(1);
+        }
+        prune_codex_activity_scope(
+            &transaction,
+            Some(session_id),
+            Some(thread_id),
+            MAX_CODEX_ACTIVITY_EVENTS_PER_THREAD,
+            MAX_CODEX_ACTIVITY_BYTES_PER_THREAD,
+        )?;
+        prune_codex_activity_scope(
+            &transaction,
+            Some(session_id),
+            None,
+            MAX_CODEX_ACTIVITY_EVENTS_PER_SESSION,
+            MAX_CODEX_ACTIVITY_BYTES_PER_SESSION,
+        )?;
+        prune_codex_activity_scope(
+            &transaction,
+            None,
+            None,
+            MAX_CODEX_ACTIVITY_EVENTS_GLOBAL,
+            MAX_CODEX_ACTIVITY_BYTES_GLOBAL,
+        )?;
+        transaction.commit()?;
+        Ok(sequence)
     }
 
     /// Read the newest bounded activity window in chronological order. The
     /// bounded IPC surface keeps a long-running Codex thread from producing an
-    /// unbounded startup payload; older rows remain durable in SQLite.
+    /// unbounded startup payload. Durable per-thread retention is also capped by
+    /// encoded bytes and event count; this read is a window, not pagination.
     pub fn codex_activity(
         &self,
         session_id: &str,
         limit: u32,
     ) -> rusqlite::Result<Vec<CodexActivityRow>> {
+        Ok(self.codex_activity_page(session_id, limit, None)?.events)
+    }
+
+    /// Check the durable lifecycle ledger before admitting turn-owned updates.
+    /// A successful authoritative terminal is immutable across process reloads.
+    pub fn codex_turn_completed(
+        &self,
+        session_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM codex_events
+                WHERE session_id = ?1
+                  AND thread_id = ?2
+                  AND turn_id = ?3
+                  AND method = 'turn/completed'
+            )",
+            params![session_id, thread_id, turn_id],
+            |row| row.get(0),
+        )
+    }
+
+    /// Read one bounded activity page, walking toward older sequence numbers.
+    /// One extra row makes has_more authoritative for an exactly full page.
+    pub fn codex_activity_page(
+        &self,
+        session_id: &str,
+        limit: u32,
+        before_sequence: Option<i64>,
+    ) -> rusqlite::Result<CodexActivityPage> {
         let limit = i64::from(limit.clamp(1, 2_000));
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT sequence, session_id, thread_id, turn_id, item_id, method,
                     params_json, request_id_json, emitted_at_ms
-             FROM (
-                 SELECT sequence, session_id, thread_id, turn_id, item_id, method,
-                        params_json, request_id_json, emitted_at_ms
-                 FROM codex_events
-                 WHERE session_id = ?1
-                 ORDER BY sequence DESC
-                 LIMIT ?2
-             )
-             ORDER BY sequence ASC",
+             FROM codex_events
+             WHERE session_id = ?1 AND (?2 IS NULL OR sequence < ?2)
+             ORDER BY sequence DESC
+             LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![session_id, limit], |row| {
+        let rows = stmt.query_map(params![session_id, before_sequence, limit + 1], |row| {
             let params_json: String = row.get(6)?;
             let request_id_json: Option<String> = row.get(7)?;
             let params_value = serde_json::from_str(&params_json).map_err(|error| {
@@ -1121,7 +1354,20 @@ impl Db {
                 emitted_at_ms: row.get(8)?,
             })
         })?;
-        rows.collect()
+        let mut events = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = events.len() > limit as usize;
+        events.truncate(limit as usize);
+        events.reverse();
+        let next_cursor = if has_more {
+            events.first().map(|event| event.sequence)
+        } else {
+            None
+        };
+        Ok(CodexActivityPage {
+            events,
+            has_more,
+            next_cursor,
+        })
     }
 
     /// Pin an un-attributed legacy session exactly once. A competing choice can
@@ -2633,6 +2879,263 @@ mod tests {
 
         db.delete_session("codex-chat").unwrap();
         assert!(db.codex_activity("codex-chat", 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn codex_activity_page_distinguishes_exact_limit_and_walks_one_older_row() {
+        let db = mem_db();
+        for session_id in ["exact-window", "one-more"] {
+            db.create_session(session_id, session_id, None, None, 100)
+                .unwrap();
+        }
+        for index in 0..2_000 {
+            db.append_codex_activity(
+                "exact-window",
+                "thread",
+                Some("turn"),
+                None,
+                "future/event",
+                &json!({ "index": index }),
+                None,
+                i64::from(index),
+            )
+            .unwrap();
+        }
+        for index in 0..2_001 {
+            db.append_codex_activity(
+                "one-more",
+                "thread",
+                Some("turn"),
+                None,
+                "future/event",
+                &json!({ "index": index }),
+                None,
+                i64::from(index),
+            )
+            .unwrap();
+        }
+
+        let exact = db.codex_activity_page("exact-window", 2_000, None).unwrap();
+        assert_eq!(exact.events.len(), 2_000);
+        assert!(!exact.has_more);
+        assert_eq!(exact.next_cursor, None);
+
+        let newest = db.codex_activity_page("one-more", 2_000, None).unwrap();
+        assert_eq!(newest.events.len(), 2_000);
+        assert!(newest.has_more);
+        assert_eq!(newest.events.first().map(|row| row.sequence), Some(2_002));
+        let older = db
+            .codex_activity_page("one-more", 2_000, newest.next_cursor)
+            .unwrap();
+        assert_eq!(older.events.len(), 1);
+        assert!(!older.has_more);
+        assert_eq!(older.events.first().map(|row| row.sequence), Some(2_001));
+    }
+
+    #[test]
+    fn codex_activity_retention_is_bounded_by_events_and_encoded_bytes() {
+        let db = mem_db();
+        db.create_session("codex-bounded", "Codex bounded", None, None, 100)
+            .unwrap();
+
+        for index in 0..4_200 {
+            db.append_codex_activity(
+                "codex-bounded",
+                "count-thread",
+                Some("count-turn"),
+                None,
+                "future/progress",
+                &json!({"index": index}),
+                None,
+                i64::from(index),
+            )
+            .unwrap();
+        }
+        for index in 0..300 {
+            db.append_codex_activity(
+                "codex-bounded",
+                "bytes-thread",
+                Some("bytes-turn"),
+                None,
+                "future/progress",
+                &json!({"index": index, "payload": "界".repeat(8_000)}),
+                None,
+                i64::from(index),
+            )
+            .unwrap();
+        }
+        db.append_codex_activity(
+            "codex-bounded",
+            "bytes-thread",
+            Some("bytes-turn"),
+            None,
+            "turn/completed",
+            &json!({"threadId":"bytes-thread","turn":{"id":"bytes-turn","status":"completed"}}),
+            None,
+            1_000,
+        )
+        .unwrap();
+        for index in 300..400 {
+            db.append_codex_activity(
+                "codex-bounded",
+                "bytes-thread",
+                Some("bytes-turn"),
+                None,
+                "future/progress",
+                &json!({"index": index, "payload": "界".repeat(8_000)}),
+                None,
+                i64::from(index),
+            )
+            .unwrap();
+        }
+
+        let conn = db.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM codex_events WHERE thread_id = 'count-thread'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let bytes: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(length(CAST(method AS BLOB)) + length(CAST(params_json AS BLOB)) + COALESCE(length(CAST(request_id_json AS BLOB)), 0)), 0) FROM codex_events WHERE thread_id = 'bytes-thread'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let terminal: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM codex_events WHERE thread_id = 'bytes-thread' AND method = 'turn/completed')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(count <= 4_096);
+        assert!(bytes <= 4 * 1024 * 1024);
+        assert!(
+            terminal,
+            "terminal truth must outrank later diagnostic bulk"
+        );
+    }
+
+    #[test]
+    fn codex_activity_retention_bounds_many_threads_per_session_and_globally() {
+        const EXPECTED_SESSION_EVENT_CAP: i64 = 8_192;
+        const EXPECTED_GLOBAL_EVENT_CAP: i64 = 32_768;
+        let db = mem_db();
+        for session_index in 0..5 {
+            let session = format!("bounded-session-{session_index}");
+            db.create_session(&session, &session, None, None, session_index)
+                .unwrap();
+        }
+        {
+            let mut conn = db.conn.lock().unwrap();
+            let transaction = conn.transaction().unwrap();
+            for session_index in 0..5 {
+                let session = format!("bounded-session-{session_index}");
+                for index in 0..8_200 {
+                    transaction
+                        .execute(
+                            "INSERT INTO codex_events (
+                                session_id, thread_id, turn_id, item_id, method,
+                                params_json, request_id_json, emitted_at_ms
+                             ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, NULL, ?6)",
+                            params![
+                                session,
+                                format!("child-{session_index}-{index}"),
+                                format!("turn-{index}"),
+                                if index == 0 {
+                                    "turn/completed"
+                                } else {
+                                    "future/progress"
+                                },
+                                format!(r#"{{"index":{index},"payload":"{}"}}"#, "x".repeat(1_200)),
+                                i64::from(index)
+                            ],
+                        )
+                        .unwrap();
+                }
+            }
+            transaction.commit().unwrap();
+        }
+
+        db.append_codex_activity(
+            "bounded-session-4",
+            "trigger-child",
+            Some("trigger-turn"),
+            None,
+            "future/progress",
+            &json!({"trigger": true}),
+            None,
+            99_999,
+        )
+        .unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let session_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM codex_events WHERE session_id = 'bounded-session-4'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let global_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM codex_events", [], |row| row.get(0))
+            .unwrap();
+        let session_bytes: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COALESCE(SUM({CODEX_ACTIVITY_ENCODED_BYTES_SQL}), 0)
+                     FROM codex_events WHERE session_id = 'bounded-session-4'"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let global_bytes: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COALESCE(SUM({CODEX_ACTIVITY_ENCODED_BYTES_SQL}), 0)
+                     FROM codex_events"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let terminal_survives: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM codex_events
+                    WHERE session_id = 'bounded-session-4'
+                      AND thread_id = 'child-4-0'
+                      AND method = 'turn/completed'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert!(session_count <= EXPECTED_SESSION_EVENT_CAP);
+        assert!(global_count <= EXPECTED_GLOBAL_EVENT_CAP);
+        assert!(session_bytes <= 8 * 1024 * 1024);
+        assert!(global_bytes <= 32 * 1024 * 1024);
+        assert!(terminal_survives);
+
+        let newest = db
+            .codex_activity_page("bounded-session-4", 2_000, None)
+            .unwrap();
+        assert_eq!(newest.events.len(), 2_000);
+        assert!(newest.has_more);
+        let older = db
+            .codex_activity_page("bounded-session-4", 2_000, newest.next_cursor)
+            .unwrap();
+        assert!(!older.events.is_empty());
+        assert!(older
+            .events
+            .iter()
+            .all(|event| event.sequence < newest.events[0].sequence));
     }
 
     #[test]

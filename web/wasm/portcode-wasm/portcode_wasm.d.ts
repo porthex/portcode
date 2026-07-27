@@ -74,12 +74,21 @@ export interface TurnFailure {
 }
 
 /**
+ * Bounded, wire-safe state distilled from rich Codex app-server parameters.
+ * Text, paths, credentials, request bodies, tool output, and reasoning are never
+ * represented here; unknown future payload kinds decode to Unknown.
+ */
+export interface PhoneCodexPlanStep {
+    status: string;
+}
+
+/**
  * Events streamed to the frontend. Tagged + camelCased to match `StreamEvent`
  * in `src/types.ts`. This is the rich internal desktop event; Phone Sync frames
  * embed the separate projected [`PhoneStreamEvent`] type below.
  * (Was `crate::llm::StreamEvent`.)
  */
-export type StreamEvent = { type: "turn_start"; messageId: string; turnId?: string; startedAt?: number } | { type: "turn_phase"; turnId: string; phase: TurnPhase; at: number; revision?: number; status?: TurnStatus; stopReason?: string; agentDurationMs?: number; receiptExpected?: boolean } | { type: "text_delta"; text: string } | { type: "tool_use"; id: string; name: string; input: Value } | { type: "tool_result"; id: string; output: string; isError: boolean } | { type: "permission_request"; id: string; tool: string; risk?: PermissionRisk; summary: string; input: Value; diff?: string } | { type: "usage"; inputTokens: number; outputTokens: number } | { type: "turn_end"; stopReason: string; receipt?: TurnReceipt } | { type: "error"; message: string; receipt?: TurnReceipt } | { type: "agent_started"; agentId: string; description: string; parentId?: string } | { type: "agent_progress"; agentId: string; step: number } | { type: "agent_finished"; agentId: string; status: string } | { type: "background_task_started"; id: string; command: string } | { type: "background_task_finished"; id: string; command: string; exitCode: number; output: string } | { type: "codex_event"; sequence: number; method: string; params: Value; requestId?: Value; threadId?: string; turnId?: string; itemId?: string; emittedAtMs: number } | { type: "codex_request"; id: string; method: string; params: Value };
+export type StreamEvent = { type: "turn_start"; messageId: string; turnId?: string; startedAt?: number } | { type: "turn_phase"; turnId: string; phase: TurnPhase; at: number; revision?: number; status?: TurnStatus; stopReason?: string; agentDurationMs?: number; receiptExpected?: boolean } | { type: "text_delta"; text: string } | { type: "assistant_message_snapshot"; turnId: string; blocks: Block[] } | { type: "tool_use"; id: string; name: string; input: Value } | { type: "tool_result"; id: string; output: string; isError: boolean } | { type: "permission_request"; id: string; tool: string; risk?: PermissionRisk; summary: string; input: Value; diff?: string } | { type: "usage"; inputTokens: number; outputTokens: number } | { type: "turn_end"; stopReason: string; receipt?: TurnReceipt } | { type: "error"; message: string; receipt?: TurnReceipt } | { type: "agent_started"; agentId: string; description: string; parentId?: string; parentThreadId?: string; launchTurnId?: string; model?: string; reasoningEffort?: string; activity?: string } | { type: "agent_progress"; agentId: string; step: number; parentThreadId?: string; launchTurnId?: string; currentTurnId?: string; turnCount?: number } | { type: "agent_finished"; agentId: string; status: string; result?: string; providerStatus?: string; parentThreadId?: string; launchTurnId?: string; currentTurnId?: string; turnCount?: number; activity?: string } | { type: "background_task_started"; id: string; command: string } | { type: "background_task_finished"; id: string; command: string; exitCode: number; output: string } | { type: "codex_event"; sequence: number; method: string; params: Value; requestId?: Value; threadId?: string; turnId?: string; itemId?: string; emittedAtMs: number } | { type: "codex_request"; id: string; method: string; params: Value };
 
 /**
  * Everything that crosses the encrypted channel, in both directions.
@@ -221,7 +230,7 @@ export type PhoneBlock = { type: "text"; text: string } | { type: "tool_use"; id
  * tags match the legacy `StreamEvent` shape; `Unknown` keeps future public
  * event tags from terminating an older receive loop.
  */
-export type PhoneStreamEvent = { type: "turn_start"; messageId: string; turnId?: string; startedAt?: number } | { type: "text_delta"; text: string } | { type: "tool_use"; id: string; name: string; input: Value } | { type: "tool_result"; id: string; output: string; isError: boolean } | { type: "permission_request"; id: string; tool: string; risk?: PermissionRisk; summary: string; input: Value; diff?: string } | { type: "usage"; inputTokens: number; outputTokens: number } | { type: "turn_end"; stopReason: string; receipt?: PhoneTurnReceipt } | { type: "error"; message: string; receipt?: PhoneTurnReceipt } | { type: "agent_started"; agentId: string; description: string; parentId?: string } | { type: "agent_progress"; agentId: string; step: number } | { type: "agent_finished"; agentId: string; status: string } | { type: "background_task_started"; id: string; command: string } | { type: "background_task_finished"; id: string; command: string; exitCode: number; output: string } | { type: "unknown" };
+export type PhoneStreamEvent = { type: "turn_start"; messageId: string; turnId?: string; startedAt?: number } | { type: "text_delta"; text: string } | { type: "assistant_message_snapshot"; turnId: string; blocks: PhoneBlock[] } | { type: "tool_use"; id: string; name: string; input: Value } | { type: "tool_result"; id: string; output: string; isError: boolean } | { type: "permission_request"; id: string; tool: string; risk?: PermissionRisk; summary: string; input: Value; diff?: string } | { type: "usage"; inputTokens: number; outputTokens: number } | { type: "turn_end"; stopReason: string; receipt?: PhoneTurnReceipt } | { type: "error"; message: string; receipt?: PhoneTurnReceipt } | { type: "agent_started"; agentId: string; description: string; parentId?: string; parentThreadId?: string; launchTurnId?: string; model?: string; reasoningEffort?: string; activity?: string } | { type: "agent_progress"; agentId: string; step: number; parentThreadId?: string; launchTurnId?: string; currentTurnId?: string; turnCount?: number } | { type: "agent_finished"; agentId: string; status: string; result?: string; providerStatus?: string; parentThreadId?: string; launchTurnId?: string; currentTurnId?: string; turnCount?: number; activity?: string } | { type: "codex_activity"; kind: string; method: string; requestId?: string; threadId?: string; turnId?: string; itemId?: string; sequence?: number; emittedAtMs?: number; redacted?: boolean; truncated?: boolean; redactionReasons?: string[]; truncationReasons?: string[]; originalBytes?: number; retainedBytes?: number; payload?: PhoneCodexActivityPayload } | { type: "background_task_started"; id: string; command: string } | { type: "background_task_finished"; id: string; command: string; exitCode: number; output: string } | { type: "unknown" };
 
 /**
  * Public persisted message row. Its content and receipt are public DTOs, so a
@@ -303,6 +312,8 @@ export type TurnStatus = "completed" | "cancelled" | "error" | "interrupted";
  * orthogonal to [`TurnChangeCertainty`], which only qualifies attribution.
  */
 export type TurnChangeState = "not_applicable" | "none" | "changed" | "unknown";
+
+export type PhoneCodexActivityPayload = { type: "plan"; steps: PhoneCodexPlanStep[] } | { type: "diff"; additions: number; deletions: number; files: number } | { type: "tool"; itemType: string; status: string; terminal: boolean } | { type: "terminal"; status: string } | { type: "unknown" };
 
 
 export class IntoUnderlyingByteSource {

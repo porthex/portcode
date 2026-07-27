@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "../store/store";
 import { buildAgentTree, type AgentBranchInfo } from "../lib/agentTree";
 import type { AgentInfo, AgentStatus } from "../types";
@@ -32,6 +32,7 @@ export function AgentsPanel() {
   const failed = agents ? agents.filter((a) => a.status === "error").length : 0;
   const completed = agents ? agents.filter((a) => a.status === "ok").length : 0;
   const stopped = agents ? agents.filter((a) => a.status === "cancelled").length : 0;
+  const unknown = agents ? agents.filter((a) => a.status === "unknown").length : 0;
   const agentTree = useMemo(() => buildAgentTree(agents ?? []), [agents]);
 
   // Open for a newly selected live run and when a run transitions from idle to
@@ -60,7 +61,13 @@ export function AgentsPanel() {
       >
         <span
           className={`pc-dot ${
-            running > 0 ? "pc-dot--ring" : failed > 0 ? "bg-danger" : "pc-dot--success"
+            running > 0
+              ? "pc-dot--ring"
+              : failed > 0
+                ? "bg-danger"
+                : unknown > 0
+                  ? "bg-faint"
+                  : "pc-dot--success"
           }`}
           aria-hidden="true"
         />
@@ -74,9 +81,11 @@ export function AgentsPanel() {
             ? `${agents.length} total`
             : failed > 0
               ? `${failed} failed`
-              : stopped > 0
-                ? `${completed} done · ${stopped} stopped`
-                : "all done"}
+              : unknown > 0
+                ? `${unknown} unknown`
+                : stopped > 0
+                  ? `${completed} done · ${stopped} stopped`
+                  : "all done"}
         </span>
         <span aria-hidden="true">{open ? "▾" : "▸"}</span>
       </button>
@@ -114,6 +123,8 @@ function statusMeta(status: AgentStatus): { label: string; dot: string; text: st
       return { label: "stopped", dot: "pc-dot--success", text: "text-faint" };
     case "error":
       return { label: "failed", dot: "bg-danger", text: "text-danger" };
+    case "unknown":
+      return { label: "unknown", dot: "bg-faint", text: "text-muted" };
   }
 }
 
@@ -156,6 +167,17 @@ function AgentRow({
   const [stopFeedback, setStopFeedback] = useState<StopFeedback>("idle");
   const retryTimer = useRef<number | null>(null);
   const runningRef = useRef(running);
+  const rowRef = useRef<HTMLDivElement>(null);
+  const stopButtonRef = useRef<HTMLButtonElement>(null);
+  const shouldRestoreFocus =
+    !running &&
+    runningRef.current &&
+    typeof document !== "undefined" &&
+    document.activeElement === stopButtonRef.current;
+
+  useLayoutEffect(() => {
+    if (shouldRestoreFocus) rowRef.current?.focus();
+  }, [shouldRestoreFocus]);
 
   useEffect(() => {
     runningRef.current = running;
@@ -206,6 +228,9 @@ function AgentRow({
 
   return (
     <div
+      ref={rowRef}
+      data-agent-row="true"
+      tabIndex={-1}
       className="group flex min-h-8 items-center gap-2 py-1 pr-2 text-[12px]"
       style={{ paddingLeft: 12 + depth * 14 }}
       aria-label={`${agent.description}, ${detail}`}
@@ -222,11 +247,10 @@ function AgentRow({
       >
         {agent.description}
       </span>
-      <span className={`font-mono text-[10px] ${meta.text}`} aria-live="polite">
-        {detail}
-      </span>
+      <span className={`font-mono text-[10px] ${meta.text}`}>{detail}</span>
       {running && (
         <button
+          ref={stopButtonRef}
           type="button"
           onClick={() => void requestStop()}
           disabled={stopFeedback === "stopping"}

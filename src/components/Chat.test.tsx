@@ -1,9 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { render, screen, fireEvent, act } from "@testing-library/react";
+import { render, screen, fireEvent, act, within } from "@testing-library/react";
 
 import { Chat } from "./Chat";
 import { useStore } from "../store/store";
-import type { Message, ContentBlock, Session, TurnReceipt as TurnReceiptData } from "../types";
+import type {
+  CodexActivityEvent,
+  Message,
+  ContentBlock,
+  Session,
+  SyncFrame,
+  TurnReceipt as TurnReceiptData,
+} from "../types";
 
 // Chat is the transcript for the active session. It is display-only: it reads
 // `activeId`, `messages[activeId]`, and `streaming` from the real store, renders
@@ -112,21 +119,102 @@ describe("Chat empty state", () => {
 });
 
 describe("Chat transcript", () => {
-  it("keeps raw Codex activity out of the chat layout", () => {
+  it("associates structured activity with its exact turn and exposes unknown methods", () => {
+    const activity: CodexActivityEvent[] = [
+      {
+        sequence: 1,
+        sessionId: "s1",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "item-1",
+        method: "item/completed",
+        params: {
+          turnId: "turn-1",
+          item: {
+            id: "item-1",
+            type: "commandExecution",
+            command: "pnpm typecheck",
+            status: "completed",
+            aggregatedOutput: "clean",
+          },
+        },
+        emittedAtMs: 10,
+      },
+      {
+        sequence: 2,
+        sessionId: "s1",
+        threadId: "thread-1",
+        turnId: "turn-2",
+        method: "future/newMethod",
+        params: { detail: "inspect me" },
+        emittedAtMs: 20,
+      },
+    ];
     useStore.setState({
       activeId: "s1",
+      sessions: [session()],
+      messages: {
+        s1: [
+          {
+            id: "assistant-1",
+            turnId: "turn-1",
+            role: "assistant",
+            blocks: [{ kind: "text", text: "First result" }],
+            receipt: receipt({ turnId: "turn-1" }),
+            createdAt: 1,
+          },
+          {
+            id: "assistant-2",
+            turnId: "turn-2",
+            role: "assistant",
+            blocks: [{ kind: "text", text: "Second result" }],
+            receipt: receipt({ turnId: "turn-2" }),
+            createdAt: 2,
+          },
+        ],
+      },
+      streaming: false,
+      codexActivity: { s1: activity },
+    });
+
+    const { container } = render(<Chat />);
+
+    const receiptToggles = screen.getAllByRole("button", {
+      name: /expand work activity/i,
+    });
+    expect(receiptToggles).toHaveLength(1);
+    fireEvent.click(receiptToggles[0]!);
+    expect(
+      screen
+        .getByRole("button", {
+          name: "pnpm typecheck, completed, expand output",
+        })
+        .closest("#pc-msg-assistant-1"),
+    ).not.toBeNull();
+    expect(container.querySelector("#pc-msg-assistant-2 .pc-turn-receipt")).toHaveAttribute(
+      "data-has-activity",
+      "false",
+    );
+    expect(
+      screen.getByRole("button", {
+        name: "Unrecognized Codex activity (1), expand",
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps unknown activity inspectable in an empty transcript", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
       messages: { s1: [] },
-      streaming: true,
       codexActivity: {
         s1: [
           {
             sequence: 1,
             sessionId: "s1",
             threadId: "thread-1",
-            turnId: "turn-1",
-            itemId: "item-1",
-            method: "item/started",
-            params: { item: { type: "collabAgentToolCall", tool: "spawnAgent" } },
+            method: "future/emptyTranscript",
+            params: { visible: true },
             emittedAtMs: 10,
           },
         ],
@@ -135,8 +223,203 @@ describe("Chat transcript", () => {
 
     render(<Chat />);
 
-    expect(screen.queryByRole("region", { name: "Codex activity" })).not.toBeInTheDocument();
-    expect(screen.queryByText(/Agent collaboration started/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: EMPTY_HEADING })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "Unrecognized Codex activity (1), expand",
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("switches unknown activity with the selected session without bleed", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session(), session({ id: "s2", title: "Other" })],
+      messages: { s1: [], s2: [] },
+      codexActivity: {
+        s1: [
+          {
+            sequence: 1,
+            sessionId: "s1",
+            threadId: "thread-1",
+            method: "future/sessionOne",
+            params: {},
+            emittedAtMs: 10,
+          },
+        ],
+        s2: [
+          {
+            sequence: 2,
+            sessionId: "s2",
+            threadId: "thread-2",
+            method: "future/sessionTwo",
+            params: {},
+            emittedAtMs: 20,
+          },
+        ],
+      },
+    });
+
+    render(<Chat />);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Unrecognized Codex activity (1), expand",
+      }),
+    );
+    expect(screen.getByText("future/sessionOne")).toBeInTheDocument();
+
+    act(() => useStore.setState({ activeId: "s2" }));
+
+    expect(screen.getByText("future/sessionTwo")).toBeInTheDocument();
+    expect(screen.queryByText("future/sessionOne")).not.toBeInTheDocument();
+  });
+
+  it("renders the bounded remote activity DTO while excluding every desktop-private field", () => {
+    const sensitive = [
+      "REMOTE_RAW_COMMAND_SENTINEL",
+      "REMOTE_RAW_PATH_SENTINEL",
+      "REMOTE_RAW_RESULT_SENTINEL",
+      "REMOTE_CHILD_PAYLOAD_SENTINEL",
+      "REMOTE_REQUEST_PAYLOAD_SENTINEL",
+      "REMOTE_REASONING_SENTINEL",
+    ];
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: {
+        s1: [
+          {
+            id: "assistant-1",
+            turnId: "turn-1",
+            role: "assistant",
+            blocks: [{ kind: "text", text: "Remote-safe transcript" }],
+            receipt: receipt(),
+            createdAt: 1,
+          },
+        ],
+      },
+      remoteMode: true,
+      codexActivity: {},
+    });
+    const frames = [
+      {
+        type: "codex_activity",
+        kind: "event",
+        method: "turn/plan/updated",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        sequence: 1,
+        emittedAtMs: 10,
+        redacted: false,
+        truncated: false,
+        payload: { type: "plan", steps: [{ status: "completed" }, { status: "inProgress" }] },
+      },
+      {
+        type: "codex_activity",
+        kind: "event",
+        method: "turn/diff/updated",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        sequence: 2,
+        emittedAtMs: 20,
+        redacted: false,
+        truncated: false,
+        payload: { type: "diff", additions: 4, deletions: 2, files: 1 },
+      },
+      {
+        type: "codex_activity",
+        kind: "event",
+        method: "item/completed",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "item-safe",
+        sequence: 3,
+        emittedAtMs: 30,
+        redacted: true,
+        truncated: false,
+        payload: {
+          type: "tool",
+          itemType: "commandExecution",
+          status: "completed",
+          terminal: true,
+        },
+      },
+      {
+        type: "codex_activity",
+        kind: "event",
+        method: "turn/completed",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        sequence: 4,
+        emittedAtMs: 40,
+        redacted: false,
+        truncated: false,
+        payload: { type: "terminal", status: "completed" },
+      },
+      {
+        type: "codex_activity",
+        kind: "event",
+        method: "future/safe-metadata",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        sequence: 5,
+        emittedAtMs: 50,
+        redacted: true,
+        truncated: true,
+        redactionReasons: ["rawReasoning"],
+      },
+    ];
+    for (const event of frames) {
+      useStore
+        .getState()
+        .applyFrame({ t: "live", session_id: "s1", event } as unknown as SyncFrame);
+    }
+    const stalePrivateEvent: CodexActivityEvent = {
+      sequence: 6,
+      sessionId: "s1",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      itemId: "private-item",
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          id: "private-item",
+          type: "commandExecution",
+          status: "completed",
+          command: sensitive[0],
+          cwd: sensitive[1],
+          aggregatedOutput: sensitive[2],
+          child: sensitive[3],
+          request: sensitive[4],
+          reasoning_text: sensitive[5],
+        },
+      },
+      requestId: { payload: sensitive[4] },
+      emittedAtMs: 60,
+    };
+    useStore.setState((state) => ({
+      codexActivity: {
+        ...state.codexActivity,
+        s1: [...(state.codexActivity.s1 ?? []), stalePrivateEvent],
+      },
+    }));
+
+    render(<Chat />);
+
+    expect(screen.getByText("Remote-safe transcript")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /expand work activity/i }));
+    expect(screen.getByText("Step 1")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Live changes, updated/i })).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /Command, completed/i })).toHaveLength(2);
+    expect(screen.getByText("Turn completed")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Unrecognized Codex activity (1), expand" }),
+    );
+    expect(screen.getByText("future/safe-metadata")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /safe metadata, expand/i })).toBeInTheDocument();
+    for (const sentinel of sensitive) expect(document.body).not.toHaveTextContent(sentinel);
   });
 
   it("mounts a structured Codex request above the composer", () => {
@@ -334,6 +617,248 @@ describe("Chat transcript", () => {
     expect(screen.getByRole("log")).toHaveAttribute("aria-busy", "false");
     expect(container.querySelector(".pc-stop")).toHaveAttribute("aria-hidden", "true");
     expect(container.querySelectorAll('[role="status"][aria-live="polite"]')).toHaveLength(1);
+  });
+
+  it("correlates reloaded historical agents to each owning assistant receipt", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: {
+        s1: [
+          {
+            id: "assistant-1",
+            turnId: "turn-1",
+            role: "assistant",
+            blocks: [{ kind: "text", text: "First result" }],
+            receipt: receipt({ turnId: "turn-1" }),
+            createdAt: 1,
+          },
+          {
+            id: "assistant-2",
+            turnId: "turn-2",
+            role: "assistant",
+            blocks: [{ kind: "text", text: "Second result" }],
+            receipt: receipt({ turnId: "turn-2", status: "error" }),
+            createdAt: 2,
+          },
+        ],
+      },
+      streaming: false,
+      agents: {
+        s1: [
+          {
+            id: "agent-turn-1",
+            description: "first turn agent",
+            status: "ok",
+            step: 1,
+            launchTurnId: "turn-1",
+          },
+          {
+            id: "agent-turn-2",
+            description: "second turn agent",
+            status: "error",
+            step: 1,
+            launchTurnId: "turn-2",
+          },
+        ],
+      },
+      runs: {},
+    });
+
+    const { container } = render(<Chat />);
+    expect(screen.queryByRole("button", { name: /expand work activity/i })).toBeNull();
+
+    const first = container.querySelector<HTMLElement>("#pc-msg-assistant-1")!;
+    const second = container.querySelector<HTMLElement>("#pc-msg-assistant-2")!;
+    expect(within(first).getByRole("region", { name: "Codex swarm workflow" })).toHaveTextContent(
+      "All 1 agent completed",
+    );
+    expect(within(second).getByRole("region", { name: "Codex swarm workflow" })).toHaveTextContent(
+      "1 of 1 agent failed",
+    );
+    expect(document.body).not.toHaveTextContent("first turn agent");
+    expect(document.body).not.toHaveTextContent("second turn agent");
+  });
+
+  it("never projects exact child-thread activity into a parent receipt", () => {
+    const childPlanSentinel = "CHILD PLAN MUST STAY OUT OF PARENT TRANSCRIPT";
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: {
+        s1: [
+          {
+            id: "assistant-parent",
+            turnId: "shared-turn-id",
+            role: "assistant",
+            blocks: [{ kind: "text", text: "Parent answer" }],
+            receipt: receipt({ turnId: "shared-turn-id" }),
+            createdAt: 1,
+          },
+        ],
+      },
+      agents: {
+        s1: [
+          {
+            id: "child-thread",
+            description: "child",
+            status: "ok",
+            step: 1,
+            launchTurnId: "root-turn",
+          },
+        ],
+      },
+      codexActivity: {
+        s1: [
+          {
+            sequence: 1,
+            sessionId: "s1",
+            threadId: "child-thread",
+            turnId: "shared-turn-id",
+            method: "item/completed",
+            itemId: "child-plan",
+            params: {
+              threadId: "child-thread",
+              turnId: "shared-turn-id",
+              item: { id: "child-plan", type: "plan", text: childPlanSentinel },
+              completedAtMs: 10,
+            },
+            emittedAtMs: 10,
+          },
+        ],
+      },
+    });
+
+    render(<Chat />);
+
+    expect(screen.queryByText(childPlanSentinel)).toBeNull();
+    expect(screen.queryByRole("button", { name: /expand work activity/i })).toBeNull();
+  });
+
+  it("filters child ownership identically across the current page and a 2,001+ record archive", () => {
+    const current = Array.from({ length: 2_000 }, (_, index): CodexActivityEvent => ({
+      sequence: index + 3,
+      sessionId: "s1",
+      threadId: "root-thread",
+      method: "thread/status/changed",
+      params: { threadId: "root-thread", status: "idle" },
+      emittedAtMs: index + 3,
+    }));
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [] },
+      agents: {
+        s1: [
+          {
+            id: "child-thread",
+            description: "correct child",
+            status: "ok",
+            step: 1,
+          },
+        ],
+      },
+      codexActivity: { s1: current },
+      codexActivityPaging: {
+        s1: {
+          hasMore: false,
+          nextCursor: null,
+          loadingOlder: false,
+          archiveLimited: false,
+          olderEvents: [
+            {
+              sequence: 1,
+              sessionId: "s1",
+              threadId: "child-thread",
+              turnId: "child-turn",
+              method: "future/childOnly",
+              params: { safe: "CHILD_ONLY_SENTINEL" },
+              emittedAtMs: 1,
+            },
+            {
+              sequence: 2,
+              sessionId: "s1",
+              threadId: "root-thread",
+              method: "future/parentOnly",
+              params: { safe: "PARENT_ONLY_SENTINEL" },
+              emittedAtMs: 2,
+            },
+          ],
+        },
+      },
+    });
+
+    render(<Chat />);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Unrecognized Codex activity (1), expand" }),
+    );
+    expect(screen.getByText("future/parentOnly")).toBeInTheDocument();
+    expect(screen.queryByText("future/childOnly")).toBeNull();
+    expect(document.body).not.toHaveTextContent("CHILD_ONLY_SENTINEL");
+  });
+
+  it("navigates every retained parent range in a bounded 10,000-row archive", () => {
+    const all = Array.from({ length: 10_000 }, (_, index): CodexActivityEvent => {
+      const sequence = index + 1;
+      const child = sequence === 5_000;
+      return {
+        sequence,
+        sessionId: "s1",
+        threadId: child ? "child-thread" : "root-thread",
+        method: child ? "future/childOnly" : "future/parentArchive",
+        params: { safe: child ? "CHILD_ARCHIVE_SENTINEL" : "parent-safe" },
+        emittedAtMs: sequence,
+      };
+    });
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [] },
+      agents: {
+        s1: [
+          {
+            id: "child-thread",
+            description: "isolated child",
+            status: "ok",
+            step: 1,
+          },
+        ],
+      },
+      codexActivity: { s1: all.slice(8_000) },
+      codexActivityPaging: {
+        s1: {
+          hasMore: false,
+          nextCursor: null,
+          loadingOlder: false,
+          archiveLimited: false,
+          olderEvents: all.slice(0, 8_000),
+        },
+      },
+    });
+
+    render(<Chat />);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Unrecognized Codex activity (200), expand" }),
+    );
+    const details = screen.getByRole("region", {
+      name: "Unrecognized Codex activity details",
+    });
+    expect(within(details).getByText("Sequence 10000")).toBeInTheDocument();
+    expect(within(details).queryByText("Sequence 1")).toBeNull();
+    expect(details).not.toHaveTextContent("future/childOnly");
+    expect(details).not.toHaveTextContent("CHILD_ARCHIVE_SENTINEL");
+
+    const oldest = screen.getByRole("button", { name: "Show oldest retained activity" });
+    oldest.focus();
+    fireEvent.click(oldest);
+    expect(document.activeElement).toBe(oldest);
+    expect(within(details).getByText("Sequence 1")).toBeInTheDocument();
+    expect(within(details).queryByText("Sequence 10000")).toBeNull();
+    expect(within(details).getAllByRole("listitem").length).toBeLessThanOrEqual(200);
+
+    fireEvent.click(screen.getByRole("button", { name: "Show newest retained activity" }));
+    expect(within(details).getByText("Sequence 10000")).toBeInTheDocument();
+    expect(within(details).queryByText("Sequence 1")).toBeNull();
   });
 
   it("opens the persisted turn review from a completed receipt", () => {

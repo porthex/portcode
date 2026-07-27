@@ -255,6 +255,12 @@ export type PermissionRisk =
   | "unknown"
   | (string & Record<never, never>);
 
+export type AssistantMessageSnapshotBlock =
+  | { type: "text"; text: string }
+  | { type: "tool_use"; id: string; name: ToolName; input: unknown }
+  | { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean }
+  | ReasoningWireBlock;
+
 /** Events streamed from the core during an agent run. */
 export type StreamEvent =
   | {
@@ -281,6 +287,11 @@ export type StreamEvent =
       receiptExpected?: boolean;
     }
   | { type: "text_delta"; text: string }
+  | {
+      type: "assistant_message_snapshot";
+      turnId: string;
+      blocks: AssistantMessageSnapshotBlock[];
+    }
   | { type: "tool_use"; id: string; name: ToolName; input: unknown }
   | { type: "tool_result"; id: string; output: string; isError: boolean }
   | {
@@ -298,12 +309,41 @@ export type StreamEvent =
   | { type: "turn_end"; stopReason: string; receipt?: TurnReceipt }
   | { type: "error"; message: string; receipt?: TurnReceipt }
   // ── subagents (`delegate_task`; historical `task`) ─────────────────────
-  /** A subagent started. `parentId` is the launching subagent, absent at top level. */
-  | { type: "agent_started"; agentId: string; description: string; parentId?: string }
-  /** A subagent completed a model turn — `step` is its 1-based turn count. */
-  | { type: "agent_progress"; agentId: string; step: number }
-  /** A subagent finished. `status` is "ok" | "cancelled" | "error". */
-  | { type: "agent_finished"; agentId: string; status: string }
+  /** A subagent started. Optional correlation fields are additive for legacy peers. */
+  | {
+      type: "agent_started";
+      agentId: string;
+      description: string;
+      parentId?: string;
+      parentThreadId?: string;
+      launchTurnId?: string;
+      model?: string;
+      reasoningEffort?: string;
+      activity?: string;
+    }
+  /** A real child model turn started; step remains the legacy turn-count field. */
+  | {
+      type: "agent_progress";
+      agentId: string;
+      step: number;
+      parentThreadId?: string;
+      launchTurnId?: string;
+      currentTurnId?: string;
+      turnCount?: number;
+    }
+  /** A subagent finished. Unknown/future provider states remain explicit. */
+  | {
+      type: "agent_finished";
+      agentId: string;
+      status: string;
+      result?: string;
+      providerStatus?: string;
+      parentThreadId?: string;
+      launchTurnId?: string;
+      currentTurnId?: string;
+      turnCount?: number;
+      activity?: string;
+    }
   // ── background command tasks (`run_command`; historical `shell`) ─────────────
   /** A command was launched in the background. Emitted on the SESSION
    *  channel, so the persistent session listener (not the per-turn one) tracks it. */
@@ -317,7 +357,7 @@ export type StreamEvent =
       exitCode: number;
       output: string;
     }
-  /** Desktop-only, lossless app-server activity. The normalized variants above
+  /** Desktop-only routed app-server parameters. The normalized variants above
    * still drive chat state; this keeps every known/unknown Codex event visible. */
   | {
       type: "codex_event";
@@ -331,7 +371,7 @@ export type StreamEvent =
       emittedAtMs: number;
     }
   /** Desktop-only app-server request whose response is richer than a binary
-   * permission decision. The method-specific params stay lossless so newer
+   * permission decision. The method-specific recorded params stay available so newer
    * Codex fields can be rendered without changing the transport first. */
   | {
       type: "codex_request";
@@ -341,7 +381,7 @@ export type StreamEvent =
     };
 
 /** Terminal/live state of a subagent in the agents panel. */
-export type AgentStatus = "running" | "ok" | "cancelled" | "error";
+export type AgentStatus = "running" | "ok" | "cancelled" | "error" | "unknown";
 
 /** Live/terminal state of a background command task. `running` until it finishes,
  *  then `ok` (exit 0) or `error` (any non-zero / failed-to-run exit). */
@@ -365,10 +405,23 @@ export interface AgentInfo {
   description: string;
   /** The launching subagent's id, or undefined for a top-level launch. */
   parentId?: string;
+  /** Stable Codex thread correlation; may be the root thread at top level. */
+  parentThreadId?: string;
+  /** Root turn that launched this child. */
+  launchTurnId?: string;
+  /** Child turn currently running, or the last turn observed before completion. */
+  currentTurnId?: string;
+  model?: string;
+  reasoningEffort?: string;
+  activity?: string;
+  result?: string;
+  providerStatus?: string;
   /** "running" until an `agent_finished` arrives, then its terminal status. */
   status: AgentStatus;
   /** Latest reported turn count (`agent_progress`); 0 before the first turn. */
   step: number;
+  /** Monotonic real child-turn count; mirrors step for legacy consumers. */
+  turnCount?: number;
 }
 
 export interface PendingPermission {
@@ -399,7 +452,7 @@ export type CodexRequestResponse =
       content?: unknown;
     };
 
-/** Lossless activity from the real Codex app-server. Normalized StreamEvent
+/** Routed activity parameters from the real Codex app-server. Normalized StreamEvent
  * variants continue to drive the familiar chat UI; this record powers the full
  * inspectable activity timeline and safely retains unknown future methods. */
 export interface CodexActivityEvent {
@@ -412,6 +465,40 @@ export interface CodexActivityEvent {
   params: unknown;
   requestId?: unknown;
   emittedAtMs: number;
+}
+
+export type PhoneCodexActivityPayload =
+  | { type: "plan"; steps: Array<{ status: string }> }
+  | { type: "diff"; additions: number; deletions: number; files: number }
+  | { type: "tool"; itemType: string; status: string; terminal: boolean }
+  | { type: "terminal"; status: string }
+  | { type: string };
+
+export interface PhoneCodexActivityEvent {
+  type: "codex_activity";
+  kind: string;
+  method: string;
+  requestId?: string;
+  threadId?: string;
+  turnId?: string;
+  itemId?: string;
+  sequence?: number;
+  emittedAtMs?: number;
+  redacted: boolean;
+  truncated: boolean;
+  redactionReasons?: string[];
+  truncationReasons?: string[];
+  originalBytes?: number;
+  retainedBytes?: number;
+  payload?: PhoneCodexActivityPayload;
+}
+
+export type PhoneStreamEvent = StreamEvent | PhoneCodexActivityEvent;
+
+export interface CodexActivityPage {
+  events: CodexActivityEvent[];
+  hasMore: boolean;
+  nextCursor: number | null;
 }
 
 export interface DirEntry {
@@ -1155,7 +1242,7 @@ export type SyncFrame =
   // held list (vs message_delta, which replaces/appends recent rows). Mirrors the
   // Rust `SyncFrame::MessagePage` (frame fields snake_case; rows camelCase).
   | { t: "message_page"; session_id: string; messages: MessageRow[]; has_more: boolean }
-  | { t: "live"; session_id: string; event: StreamEvent }
+  | { t: "live"; session_id: string; event: PhoneStreamEvent }
   | { t: "command"; command: RemoteCommand }
   | { t: "ack"; session_id: string; seq: number }
   | { t: "hello"; device_id: string; cursors: { sessionId: string; seq: number }[] }

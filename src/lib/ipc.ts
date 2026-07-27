@@ -4,6 +4,7 @@
 import type {
   AttachmentValidationResult,
   CodexActivityEvent,
+  CodexActivityPage,
   CodexRequestResponse,
   ConnectInfo,
   DirEntry,
@@ -611,15 +612,20 @@ export async function getMessages(sessionId: string): Promise<Message[]> {
   return [];
 }
 
-/** Read the newest durable raw app-server activity for one Portcode session.
+/** Read the newest durable recorded app-server parameters for one Portcode session.
  * Browser/phone shells never receive this desktop-private diagnostic stream. */
 export async function getCodexActivity(
   sessionId: string,
   limit = 500,
-): Promise<CodexActivityEvent[]> {
-  if (!isTauri()) return [];
+  beforeSequence?: number | null,
+): Promise<CodexActivityPage | CodexActivityEvent[]> {
+  if (!isTauri()) return { events: [], hasMore: false, nextCursor: null };
   const { core } = await tauri();
-  return core.invoke<CodexActivityEvent[]>("get_codex_activity", { sessionId, limit });
+  return core.invoke<CodexActivityPage>("get_codex_activity", {
+    sessionId,
+    limit,
+    beforeSequence,
+  });
 }
 
 /** Load one display-ready page of persisted history. Cursor null/undefined loads

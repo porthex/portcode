@@ -130,6 +130,76 @@ export function nextStageAttempt(entries) {
   return attempts.length ? Math.max(...attempts) + 1 : 1;
 }
 
+const EXPLORATION_CATEGORIES = [
+  "input",
+  "timing",
+  "lifecycle",
+  "interaction",
+  "persistence",
+  "layout",
+  "accessibility",
+  "neighboringRegression",
+];
+
+export function canonicalizeExplorationCoverage(report, featureModel) {
+  const canonical = structuredClone(report);
+  if (canonical?.outcome === "blocked") return canonical;
+
+  const modelCases = EXPLORATION_CATEGORIES.flatMap((category) =>
+    (featureModel?.edgeCaseCharter?.categories?.[category] ?? []).map((edgeCase) => ({
+      ...edgeCase,
+      category,
+    })),
+  );
+  const plans = canonical?.scenarioPlan ?? [];
+  const executed = canonical?.executedScenarios ?? [];
+  const observations = canonical?.observations ?? [];
+  const untestedRisks = [...(canonical?.coverage?.untestedRisks ?? [])];
+  const selected = plans.filter(({ selected: value }) => value);
+  const byCategory = Object.fromEntries(
+    EXPLORATION_CATEGORIES.map((category) => {
+      const categoryCases = modelCases.filter((edgeCase) => edgeCase.category === category);
+      const categoryPlans = plans.filter(
+        (plan) => modelCases.find((edgeCase) => edgeCase.id === plan.caseId)?.category === category,
+      );
+      const categoryExecuted = executed.filter(({ category: value }) => value === category);
+      return [
+        category,
+        {
+          planned: categoryCases.length,
+          selected: categoryPlans.filter(({ selected: value }) => value).length,
+          executed: categoryExecuted.filter(
+            ({ status }) => status === "passed" || status === "observation-recorded",
+          ).length,
+          passed: categoryExecuted.filter(({ status }) => status === "passed").length,
+          observationsRecorded: categoryExecuted.reduce(
+            (sum, item) => sum + (item.observationIds?.length ?? 0),
+            0,
+          ),
+          blocked: categoryExecuted.filter(({ status }) => status === "blocked").length,
+          notApplicable: categoryExecuted.filter(({ status }) => status === "not-applicable")
+            .length,
+        },
+      ];
+    }),
+  );
+
+  canonical.coverage = {
+    planned: modelCases.length,
+    selected: selected.length,
+    executed: executed.filter(
+      ({ status }) => status === "passed" || status === "observation-recorded",
+    ).length,
+    passed: executed.filter(({ status }) => status === "passed").length,
+    observationsRecorded: observations.length,
+    blocked: executed.filter(({ status }) => status === "blocked").length,
+    notApplicable: executed.filter(({ status }) => status === "not-applicable").length,
+    untestedRisks,
+    byCategory,
+  };
+  return canonical;
+}
+
 const scriptPath = fileURLToPath(import.meta.url);
 const defaultProjectRoot = resolve(dirname(scriptPath), "../..");
 
@@ -841,6 +911,8 @@ async function runVerificationPhase(context, preparationOption) {
       stage: VERIFICATION_STAGES[1],
       inputPaths: [featurePath, preparation.briefPath, preparation.riskPath],
     });
+    reports.exploration = canonicalizeExplorationCoverage(reports.exploration, reports.feature);
+    await persistCanonicalStageReport(context, VERIFICATION_STAGES[1], reports.exploration);
     validateSemantic("edge-case-explorer", reports);
     validateProvenanceOrThrow("edge-case-explorer", reports.exploration, {
       ...manifest,
@@ -989,6 +1061,22 @@ async function sealStageCheckpoint(context, stageId) {
   checkpoint.validationStatus = "validated";
   checkpoint.validatedAt = new Date().toISOString();
   await writeJson(resolve(context.runRoot, "run-manifest.json"), context.manifest);
+}
+
+async function persistCanonicalStageReport(context, stage, report) {
+  const outputPath = resolve(context.reportRoot, stage.report);
+  await writeJson(outputPath, report);
+  await validateJsonSchema(
+    context.config,
+    resolve(context.projectRoot, stage.schema),
+    outputPath,
+    context.projectRoot,
+  );
+  const checkpoint = context.manifest.stages?.find(({ id }) => id === stage.id);
+  if (checkpoint?.validationStatus === "report-ready") {
+    checkpoint.reportSha256 = sha256(await readFile(outputPath));
+    await writeJson(resolve(context.runRoot, "run-manifest.json"), context.manifest);
+  }
 }
 
 async function runStage(context) {

@@ -850,12 +850,15 @@ async fn get_codex_activity(
     state: State<'_, AppState>,
     session_id: String,
     limit: Option<u32>,
-) -> Result<Vec<db::CodexActivityRow>, String> {
+    before_sequence: Option<i64>,
+) -> Result<db::CodexActivityPage, String> {
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.codex_activity(&session_id, limit.unwrap_or(500)))
-        .await
-        .map_err(|error| format!("Codex activity worker failed: {error}"))?
-        .map_err(|error| error.to_string())
+    tokio::task::spawn_blocking(move || {
+        db.codex_activity_page(&session_id, limit.unwrap_or(500), before_sequence)
+    })
+    .await
+    .map_err(|error| format!("Codex activity worker failed: {error}"))?
+    .map_err(|error| error.to_string())
 }
 
 // ── drafts (composer open-loop persistence) ──────────────────────────────────

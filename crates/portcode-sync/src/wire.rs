@@ -28,7 +28,7 @@ use tsify::Tsify;
 
 /// A single content block, matching the Anthropic content-block wire format.
 /// (Was `crate::llm::Block`.)
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[cfg_attr(target_arch = "wasm32", derive(Tsify))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Block {
@@ -290,6 +290,13 @@ pub enum StreamEvent {
     TextDelta {
         text: String,
     },
+    /// Authoritative replacement for one assistant turn. This reconciles a
+    /// contradictory streamed draft without appending duplicate text.
+    AssistantMessageSnapshot {
+        #[serde(rename = "turnId")]
+        turn_id: String,
+        blocks: Vec<Block>,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -347,6 +354,28 @@ pub enum StreamEvent {
         description: String,
         #[serde(rename = "parentId", default, skip_serializing_if = "Option::is_none")]
         parent_id: Option<String>,
+        #[serde(
+            rename = "parentThreadId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        parent_thread_id: Option<String>,
+        #[serde(
+            rename = "launchTurnId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        launch_turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(
+            rename = "reasoningEffort",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        reasoning_effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity: Option<String>,
     },
     /// A subagent completed a model turn — a cheap liveness signal for the panel.
     /// `step` is its 1-based turn count.
@@ -354,12 +383,62 @@ pub enum StreamEvent {
         #[serde(rename = "agentId")]
         agent_id: String,
         step: u32,
+        #[serde(
+            rename = "parentThreadId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        parent_thread_id: Option<String>,
+        #[serde(
+            rename = "launchTurnId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        launch_turn_id: Option<String>,
+        #[serde(
+            rename = "currentTurnId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        current_turn_id: Option<String>,
+        #[serde(rename = "turnCount", default, skip_serializing_if = "Option::is_none")]
+        turn_count: Option<u32>,
     },
     /// A subagent finished. `status` is `"ok"`, `"cancelled"`, or `"error"`.
     AgentFinished {
         #[serde(rename = "agentId")]
         agent_id: String,
         status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        #[serde(
+            rename = "providerStatus",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        provider_status: Option<String>,
+        #[serde(
+            rename = "parentThreadId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        parent_thread_id: Option<String>,
+        #[serde(
+            rename = "launchTurnId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        launch_turn_id: Option<String>,
+        #[serde(
+            rename = "currentTurnId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        current_turn_id: Option<String>,
+        #[serde(rename = "turnCount", default, skip_serializing_if = "Option::is_none")]
+        turn_count: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity: Option<String>,
     },
     /// A `shell` command was launched in the background (the `background` mode).
     BackgroundTaskStarted {
@@ -563,6 +642,41 @@ pub struct PhoneMessageRow {
     pub receipt: Option<PhoneTurnReceipt>,
 }
 
+/// Bounded, wire-safe state distilled from rich Codex app-server parameters.
+/// Text, paths, credentials, request bodies, tool output, and reasoning are never
+/// represented here; unknown future payload kinds decode to Unknown.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(rename_all = "camelCase")]
+pub struct PhoneCodexPlanStep {
+    pub status: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(Tsify))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PhoneCodexActivityPayload {
+    Plan {
+        steps: Vec<PhoneCodexPlanStep>,
+    },
+    Diff {
+        additions: u32,
+        deletions: u32,
+        files: u32,
+    },
+    Tool {
+        #[serde(rename = "itemType")]
+        item_type: String,
+        status: String,
+        terminal: bool,
+    },
+    Terminal {
+        status: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
 /// Public live event delivered to Phone Sync peers. Required fields and JSON
 /// tags match the legacy `StreamEvent` shape; `Unknown` keeps future public
 /// event tags from terminating an older receive loop.
@@ -580,6 +694,11 @@ pub enum PhoneStreamEvent {
     },
     TextDelta {
         text: String,
+    },
+    AssistantMessageSnapshot {
+        #[serde(rename = "turnId")]
+        turn_id: String,
+        blocks: Vec<PhoneBlock>,
     },
     ToolUse {
         id: String,
@@ -625,16 +744,138 @@ pub enum PhoneStreamEvent {
         description: String,
         #[serde(rename = "parentId", default, skip_serializing_if = "Option::is_none")]
         parent_id: Option<String>,
+        #[serde(
+            rename = "parentThreadId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        parent_thread_id: Option<String>,
+        #[serde(
+            rename = "launchTurnId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        launch_turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(
+            rename = "reasoningEffort",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        reasoning_effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity: Option<String>,
     },
     AgentProgress {
         #[serde(rename = "agentId")]
         agent_id: String,
         step: u32,
+        #[serde(
+            rename = "parentThreadId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        parent_thread_id: Option<String>,
+        #[serde(
+            rename = "launchTurnId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        launch_turn_id: Option<String>,
+        #[serde(
+            rename = "currentTurnId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        current_turn_id: Option<String>,
+        #[serde(rename = "turnCount", default, skip_serializing_if = "Option::is_none")]
+        turn_count: Option<u32>,
     },
     AgentFinished {
         #[serde(rename = "agentId")]
         agent_id: String,
         status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        #[serde(
+            rename = "providerStatus",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        provider_status: Option<String>,
+        #[serde(
+            rename = "parentThreadId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        parent_thread_id: Option<String>,
+        #[serde(
+            rename = "launchTurnId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        launch_turn_id: Option<String>,
+        #[serde(
+            rename = "currentTurnId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        current_turn_id: Option<String>,
+        #[serde(rename = "turnCount", default, skip_serializing_if = "Option::is_none")]
+        turn_count: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity: Option<String>,
+    },
+    CodexActivity {
+        kind: String,
+        method: String,
+        #[serde(rename = "requestId", default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        #[serde(rename = "threadId", default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+        #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        #[serde(rename = "itemId", default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<i64>,
+        #[serde(
+            rename = "emittedAtMs",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        emitted_at_ms: Option<i64>,
+        #[serde(default)]
+        redacted: bool,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(
+            rename = "redactionReasons",
+            default,
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        redaction_reasons: Vec<String>,
+        #[serde(
+            rename = "truncationReasons",
+            default,
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        truncation_reasons: Vec<String>,
+        #[serde(
+            rename = "originalBytes",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        original_bytes: Option<u64>,
+        #[serde(
+            rename = "retainedBytes",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        retained_bytes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<PhoneCodexActivityPayload>,
     },
     BackgroundTaskStarted {
         id: String,
@@ -692,6 +933,67 @@ mod tests {
                 receipt: None,
             }
         );
+    }
+
+    #[test]
+    fn legacy_agent_events_decode_with_additive_correlation_fields_absent() {
+        let started: StreamEvent = serde_json::from_value(json!({
+            "type": "agent_started",
+            "agentId": "child-1",
+            "description": "audit"
+        }))
+        .unwrap();
+        assert!(matches!(
+            started,
+            StreamEvent::AgentStarted {
+                parent_id: None,
+                parent_thread_id: None,
+                launch_turn_id: None,
+                model: None,
+                reasoning_effort: None,
+                activity: None,
+                ..
+            }
+        ));
+
+        let progress: StreamEvent = serde_json::from_value(json!({
+            "type": "agent_progress",
+            "agentId": "child-1",
+            "step": 2
+        }))
+        .unwrap();
+        assert!(matches!(
+            progress,
+            StreamEvent::AgentProgress {
+                step: 2,
+                parent_thread_id: None,
+                launch_turn_id: None,
+                current_turn_id: None,
+                turn_count: None,
+                ..
+            }
+        ));
+
+        let finished: PhoneStreamEvent = serde_json::from_value(json!({
+            "type": "agent_finished",
+            "agentId": "child-1",
+            "status": "future-provider-state"
+        }))
+        .unwrap();
+        assert!(matches!(
+            finished,
+            PhoneStreamEvent::AgentFinished {
+                status,
+                result: None,
+                provider_status: None,
+                parent_thread_id: None,
+                launch_turn_id: None,
+                current_turn_id: None,
+                turn_count: None,
+                activity: None,
+                ..
+            } if status == "future-provider-state"
+        ));
     }
 
     #[test]
@@ -869,6 +1171,64 @@ mod tests {
             .unwrap()
             .get("risk")
             .is_none());
+    }
+
+    #[test]
+    fn codex_activity_payload_round_trips_additively_for_new_decoders() {
+        let encoded = json!({
+            "type": "codex_activity",
+            "kind": "event",
+            "method": "turn/plan/updated",
+            "threadId": "thread-safe",
+            "turnId": "turn-safe",
+            "sequence": 7,
+            "emittedAtMs": 70,
+            "redacted": false,
+            "truncated": false,
+            "payload": {
+                "type": "plan",
+                "steps": [
+                    {"status": "completed"},
+                    {"status": "inProgress"}
+                ]
+            }
+        });
+        let decoded: PhoneStreamEvent = serde_json::from_value(encoded).unwrap();
+        let round_trip = serde_json::to_value(decoded).unwrap();
+        assert_eq!(round_trip["payload"]["type"], "plan");
+        assert_eq!(round_trip["payload"]["steps"][1]["status"], "inProgress");
+    }
+
+    #[test]
+    fn sanitized_codex_activity_is_additive_for_legacy_decoders() {
+        let event: PhoneStreamEvent = serde_json::from_value(json!({
+            "type": "codex_activity",
+            "kind": "event",
+            "method": "future/alpha",
+            "threadId": "thread-public",
+            "turnId": "turn-public",
+            "itemId": "item-public",
+            "redacted": true,
+            "truncated": false
+        }))
+        .unwrap();
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["method"], "future/alpha");
+        assert_eq!(encoded["threadId"], "thread-public");
+        assert_eq!(encoded["redacted"], true);
+
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum LegacyPhoneStreamEvent {
+            TextDelta {
+                #[serde(rename = "text")]
+                _text: String,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let legacy: LegacyPhoneStreamEvent = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(legacy, LegacyPhoneStreamEvent::Unknown));
     }
 
     #[test]

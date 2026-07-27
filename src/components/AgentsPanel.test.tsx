@@ -158,6 +158,22 @@ describe("AgentsPanel", () => {
     expect(screen.getByText("still running")).toBeInTheDocument();
   });
 
+  it("moves focus to the surviving row when a focused Stop disappears and has no row live regions", () => {
+    seed([agent({ id: "focus", description: "focus worker", step: 1 })]);
+    render(<AgentsPanel />);
+    const stop = screen.getByRole("button", { name: "Stop subagent: focus worker" });
+    stop.focus();
+    expect(stop).toHaveFocus();
+
+    act(() => {
+      seed([agent({ id: "focus", description: "focus worker", status: "ok", step: 1 })]);
+    });
+
+    const row = screen.getByText("focus worker").closest("[data-agent-row]");
+    expect(row).toHaveFocus();
+    expect(row?.querySelector("[aria-live]")).toBeNull();
+  });
+
   it("only running subagents get a Stop button (plus the header toggle)", () => {
     seed([
       agent({ id: "run", description: "running one", status: "running", step: 1 }),

@@ -2,11 +2,13 @@ import { create } from "zustand";
 import type {
   AgentInfo,
   AgentStatus,
+  AssistantMessageSnapshotBlock,
   ArchiveSessionResult,
   Attachment,
   BackgroundTaskInfo,
   BackgroundTaskStatus,
   CodexActivityEvent,
+  CodexActivityPage,
   CodexRequestResponse,
   ComposerPhase,
   ContentBlock,
@@ -24,6 +26,8 @@ import type {
   PendingCodexRequest,
   PendingPermission,
   PermissionMode,
+  PhoneCodexActivityEvent,
+  PhoneStreamEvent,
   PhoneSyncStatus,
   ReasoningEffort,
   ReviewTarget,
@@ -57,6 +61,7 @@ import * as ipc from "../lib/ipc";
 import { isMobilePlatform } from "../lib/platform";
 import { markdownLiteralText, remoteAccountLabel } from "../lib/sessionFormat";
 import { classifySettingsSaveFailure } from "../lib/settingsPersistence";
+import { CODEX_ACTIVITY_ARCHIVE_LIMIT, CODEX_ACTIVITY_WINDOW } from "../lib/codexActivity";
 
 // ── Per-run state ─────────────────────────────────────────────────────────────
 // The streaming/cancel/pendingPermission of a single agent run. Today there is at
@@ -220,9 +225,20 @@ interface AppState {
   usage: Record<string, Usage>; // sessionId -> cumulative token usage
   agents: Record<string, AgentInfo[]>; // sessionId -> live subagents (the agents panel)
   backgroundTasks: Record<string, BackgroundTaskInfo[]>; // sessionId -> background command tasks
-  /** Durable + live lossless app-server activity, kept separate from the compact
+  /** Durable + live routed app-server parameters, kept separate from the compact
    * normalized transcript blocks so unknown Codex features remain inspectable. */
   codexActivity: Record<string, CodexActivityEvent[]>;
+  codexActivityPaging: Record<
+    string,
+    {
+      hasMore: boolean;
+      nextCursor: number | null;
+      loadingOlder: boolean;
+      olderEvents: CodexActivityEvent[];
+      /** True when the bounded archive stopped before all durable pages fit. */
+      archiveLimited: boolean;
+    }
+  >;
   settings: Settings;
   openAIAuthStatus: OpenAIAuthStatus | null; // ChatGPT subscription sign-in state
   openAIAuthError: string | null; // OpenAI sign-in/out/catalog failure
@@ -337,6 +353,7 @@ interface AppState {
   retryLoad: (id: string) => Promise<void>;
   hydrateMessages: (id: string, options?: { force?: boolean; prefetch?: boolean }) => Promise<void>;
   loadCodexActivity: (id: string) => Promise<void>;
+  loadOlderCodexActivity: (id: string) => Promise<void>;
   prefetchSession: (id: string) => Promise<void>;
   toggleFiles: () => void;
   toggleSidebar: () => void;
@@ -515,10 +532,18 @@ const now = () => Date.now();
 // maintain a per-session list of subagents. These pure helpers let the desktop
 // `onEvent` path and the phone `applyRemoteEvent` path update the map identically.
 
-// Map the wire status string to the AgentStatus union (defensive: an unknown
-// value reads as a finished "ok" rather than widening the type).
+// Map only explicit provider terminal semantics to a known result. A missing or
+// future value stays honest instead of being projected as success.
 const toAgentStatus = (s: string): AgentStatus =>
-  s === "running" || s === "cancelled" || s === "error" ? s : "ok";
+  s === "running" || s === "ok" || s === "cancelled" || s === "error"
+    ? s
+    : s === "completed" || s === "shutdown"
+      ? "ok"
+      : s === "interrupted"
+        ? "cancelled"
+        : s === "errored" || s === "notFound" || s === "failed"
+          ? "error"
+          : "unknown";
 
 const patchAgents = (
   agents: Record<string, AgentInfo[]>,
@@ -526,17 +551,40 @@ const patchAgents = (
   fn: (list: AgentInfo[]) => AgentInfo[],
 ): Record<string, AgentInfo[]> => ({ ...agents, [sessionId]: fn(agents[sessionId] ?? []) });
 
-// Add a newly-started agent, preserving start order; replace on a duplicate id
-// (defensive against a re-delivered agent_started) rather than listing it twice.
-const startAgent = (list: AgentInfo[], info: AgentInfo): AgentInfo[] =>
-  list.some((a) => a.id === info.id)
-    ? list.map((a) => (a.id === info.id ? info : a))
-    : [...list, info];
+const enrichAgent = (current: AgentInfo, next: AgentInfo): AgentInfo => ({
+  ...current,
+  description:
+    next.description !== "Codex subagent" || current.description === "Codex subagent"
+      ? next.description
+      : current.description,
+  parentId: next.parentId ?? current.parentId,
+  parentThreadId: next.parentThreadId ?? current.parentThreadId,
+  launchTurnId: next.launchTurnId ?? current.launchTurnId,
+  currentTurnId: next.currentTurnId ?? current.currentTurnId,
+  model: next.model ?? current.model,
+  reasoningEffort: next.reasoningEffort ?? current.reasoningEffort,
+  activity: next.activity ?? current.activity,
+  result: next.result ?? current.result,
+  providerStatus: next.providerStatus ?? current.providerStatus,
+  status:
+    current.status === "running"
+      ? next.status
+      : current.status === "unknown" && next.status !== "running"
+        ? next.status
+        : current.status,
+  step: Math.max(current.step, next.step),
+  turnCount: Math.max(current.turnCount ?? current.step, next.turnCount ?? next.step),
+});
 
-// Patch one agent by id; a no-op when the id isn't present (e.g. a progress /
-// finished event arriving for an agent whose start we never saw).
-const updateAgent = (list: AgentInfo[], id: string, patch: Partial<AgentInfo>): AgentInfo[] =>
-  list.map((a) => (a.id === id ? { ...a, ...patch } : a));
+// Every lifecycle event carries a stable child thread id, so progress/finish can
+// create an honest placeholder when a start was missed. A later start only enriches it.
+const upsertAgent = (list: AgentInfo[], info: AgentInfo): AgentInfo[] => {
+  const index = list.findIndex((agent) => agent.id === info.id);
+  if (index < 0) return [...list, info];
+  const updated = [...list];
+  updated[index] = enrichAgent(updated[index], info);
+  return updated;
+};
 
 // Fold one agent lifecycle StreamEvent into a session's agent list. Shared by the
 // desktop and phone event paths; returns the agents map unchanged for any other
@@ -549,25 +597,292 @@ const applyAgentEvent = (
   switch (e.type) {
     case "agent_started":
       return patchAgents(agents, sessionId, (list) =>
-        startAgent(list, {
+        upsertAgent(list, {
           id: e.agentId,
           description: e.description,
           parentId: e.parentId,
+          parentThreadId: e.parentThreadId,
+          launchTurnId: e.launchTurnId,
+          model: e.model,
+          reasoningEffort: e.reasoningEffort,
+          activity: e.activity,
           status: "running",
           step: 0,
         }),
       );
     case "agent_progress":
       return patchAgents(agents, sessionId, (list) =>
-        updateAgent(list, e.agentId, { step: e.step }),
+        upsertAgent(list, {
+          id: e.agentId,
+          description: "Codex subagent",
+          parentThreadId: e.parentThreadId,
+          launchTurnId: e.launchTurnId,
+          currentTurnId: e.currentTurnId,
+          status: "running",
+          step: Math.max(e.step, e.turnCount ?? 0),
+          turnCount: Math.max(e.step, e.turnCount ?? 0),
+        }),
       );
     case "agent_finished":
       return patchAgents(agents, sessionId, (list) =>
-        updateAgent(list, e.agentId, { status: toAgentStatus(e.status) }),
+        upsertAgent(list, {
+          id: e.agentId,
+          description: "Codex subagent",
+          parentThreadId: e.parentThreadId,
+          launchTurnId: e.launchTurnId,
+          currentTurnId: e.currentTurnId,
+          status: toAgentStatus(e.status),
+          step: e.turnCount ?? 0,
+          turnCount: e.turnCount,
+          result: e.result,
+          providerStatus: e.providerStatus,
+          activity: e.activity,
+        }),
       );
     default:
       return agents;
   }
+};
+
+type AgentRouteMetadata = Pick<
+  AgentInfo,
+  "description" | "parentId" | "parentThreadId" | "launchTurnId" | "model" | "reasoningEffort"
+>;
+
+const asObject = (value: unknown): Record<string, unknown> | undefined =>
+  value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+
+const optionalString = (value: unknown): string | undefined =>
+  typeof value === "string" && value.length > 0 ? value : undefined;
+
+const activityItem = (event: CodexActivityEvent): Record<string, unknown> | undefined =>
+  asObject(asObject(event.params)?.item);
+
+/** Reconstruct the normalized child-agent view using only known 0.145.0 fields. */
+export const rebuildAgentsFromCodexActivity = (
+  sessionId: string,
+  events: CodexActivityEvent[],
+): AgentInfo[] => {
+  const ordered = events
+    .filter((event) => event.sessionId === sessionId)
+    .slice()
+    .sort((left, right) => left.sequence - right.sequence);
+  const childIds = new Set<string>();
+  for (const event of ordered) {
+    const params = asObject(event.params);
+    const item = activityItem(event);
+    if (item?.type === "collabAgentToolCall") {
+      for (const receiver of Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : []) {
+        const receiverId = optionalString(receiver);
+        if (receiverId) childIds.add(receiverId);
+      }
+    }
+    if (event.method === "thread/started") {
+      const thread = asObject(params?.thread);
+      const id = optionalString(thread?.id);
+      if (id && optionalString(thread?.parentThreadId)) childIds.add(id);
+    }
+    if (item?.type === "subAgentActivity") {
+      const id = optionalString(item.agentThreadId);
+      if (id) childIds.add(id);
+    }
+  }
+
+  const metadata = new Map<string, AgentRouteMetadata>();
+  for (const event of ordered) {
+    const params = asObject(event.params);
+    const item = activityItem(event);
+    if (item?.type === "collabAgentToolCall") {
+      const sender = optionalString(item.senderThreadId) ?? event.threadId;
+      const description = optionalString(item.prompt) ?? "Codex subagent";
+      for (const receiver of Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : []) {
+        const id = optionalString(receiver);
+        if (!id) continue;
+        const current = metadata.get(id);
+        metadata.set(id, {
+          description:
+            description !== "Codex subagent" ? description : (current?.description ?? description),
+          parentId: childIds.has(sender) ? sender : current?.parentId,
+          parentThreadId: sender || current?.parentThreadId,
+          launchTurnId: event.turnId ?? optionalString(params?.turnId) ?? current?.launchTurnId,
+          model: optionalString(item.model) ?? current?.model,
+          reasoningEffort: optionalString(item.reasoningEffort) ?? current?.reasoningEffort,
+        });
+      }
+    }
+    if (event.method === "thread/started") {
+      const thread = asObject(params?.thread);
+      const id = optionalString(thread?.id);
+      const parentThreadId = optionalString(thread?.parentThreadId);
+      if (!id || !parentThreadId || !childIds.has(id)) continue;
+      const current = metadata.get(id);
+      metadata.set(id, {
+        description: current?.description ?? "Codex subagent",
+        parentId: childIds.has(parentThreadId) ? parentThreadId : current?.parentId,
+        parentThreadId: current?.parentThreadId ?? parentThreadId,
+        launchTurnId: current?.launchTurnId,
+        model: current?.model,
+        reasoningEffort: current?.reasoningEffort,
+      });
+    }
+  }
+
+  let agents: Record<string, AgentInfo[]> = {};
+  const results = new Map<string, string>();
+  const turns = new Map<string, Set<string>>();
+  const emit = (event: StreamEvent) => {
+    agents = applyAgentEvent(agents, sessionId, event);
+  };
+  const correlation = (id: string) => metadata.get(id) ?? { description: "Codex subagent" };
+
+  for (const event of ordered) {
+    const params = asObject(event.params);
+    const item = activityItem(event);
+    if (event.method === "thread/started") {
+      const thread = asObject(params?.thread);
+      const id = optionalString(thread?.id);
+      if (id && childIds.has(id)) {
+        emit({ type: "agent_started", agentId: id, ...correlation(id), activity: "started" });
+      }
+    }
+    if (item?.type === "collabAgentToolCall") {
+      for (const receiver of Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : []) {
+        const id = optionalString(receiver);
+        if (!id) continue;
+        emit({
+          type: "agent_started",
+          agentId: id,
+          ...correlation(id),
+          activity: optionalString(item.tool),
+        });
+      }
+      const states = asObject(item.agentsStates);
+      if (states) {
+        for (const [id, rawState] of Object.entries(states)) {
+          if (!childIds.has(id)) continue;
+          const state = asObject(rawState);
+          const providerStatus = optionalString(state?.status);
+          if (providerStatus === "pendingInit" || providerStatus === "running") continue;
+          const result = optionalString(state?.message);
+          if (result) results.set(id, result);
+          emit({
+            type: "agent_finished",
+            agentId: id,
+            status: providerStatus ?? "unknown",
+            providerStatus,
+            result,
+            ...correlation(id),
+          });
+        }
+      }
+    }
+    if (item?.type === "subAgentActivity") {
+      const id = optionalString(item.agentThreadId);
+      const kind = optionalString(item.kind);
+      if (id && kind === "started") {
+        emit({
+          type: "agent_started",
+          agentId: id,
+          ...correlation(id),
+          description: optionalString(item.agentPath) ?? correlation(id).description,
+          activity: kind,
+        });
+      } else if (id && kind === "interrupted") {
+        emit({
+          type: "agent_finished",
+          agentId: id,
+          status: "interrupted",
+          activity: kind,
+          ...correlation(id),
+        });
+      }
+    }
+    if (event.method === "turn/started" && childIds.has(event.threadId)) {
+      const turn = asObject(params?.turn);
+      const turnId = optionalString(turn?.id) ?? event.turnId ?? undefined;
+      if (turnId) {
+        const seen = turns.get(event.threadId) ?? new Set<string>();
+        const unseen = !seen.has(turnId);
+        seen.add(turnId);
+        turns.set(event.threadId, seen);
+        if (unseen) {
+          emit({
+            type: "agent_progress",
+            agentId: event.threadId,
+            step: seen.size,
+            turnCount: seen.size,
+            currentTurnId: turnId,
+            parentThreadId: correlation(event.threadId).parentThreadId,
+            launchTurnId: correlation(event.threadId).launchTurnId,
+          });
+        }
+      }
+    }
+    if (item?.type === "agentMessage" && childIds.has(event.threadId)) {
+      const result = optionalString(item.text);
+      if (result) results.set(event.threadId, result);
+    }
+    if (event.method === "turn/completed" && childIds.has(event.threadId)) {
+      const turn = asObject(params?.turn);
+      const providerStatus = optionalString(turn?.status);
+      const seen = turns.get(event.threadId);
+      emit({
+        type: "agent_finished",
+        agentId: event.threadId,
+        status: providerStatus ?? "unknown",
+        providerStatus,
+        result: results.get(event.threadId),
+        currentTurnId: optionalString(turn?.id) ?? event.turnId ?? undefined,
+        turnCount: seen?.size,
+        parentThreadId: correlation(event.threadId).parentThreadId,
+        launchTurnId: correlation(event.threadId).launchTurnId,
+      });
+    }
+  }
+  return (agents[sessionId] ?? []).map((agent) => ({
+    ...agent,
+    result: results.get(agent.id) ?? agent.result,
+  }));
+};
+
+const mergeHydratedAgents = (hydrated: AgentInfo[], live: AgentInfo[]): AgentInfo[] => {
+  const merged = hydrated.slice();
+  for (const current of live) {
+    const index = merged.findIndex((agent) => agent.id === current.id);
+    if (index < 0) {
+      merged.push(current);
+      continue;
+    }
+    const historical = merged[index];
+    const status =
+      current.status === "running" && historical.status !== "running"
+        ? historical.status
+        : current.status;
+    merged[index] = {
+      ...historical,
+      ...current,
+      description:
+        current.description === "Codex subagent" ? historical.description : current.description,
+      parentId: current.parentId ?? historical.parentId,
+      parentThreadId: current.parentThreadId ?? historical.parentThreadId,
+      launchTurnId: current.launchTurnId ?? historical.launchTurnId,
+      currentTurnId: current.currentTurnId ?? historical.currentTurnId,
+      model: current.model ?? historical.model,
+      reasoningEffort: current.reasoningEffort ?? historical.reasoningEffort,
+      activity: current.activity ?? historical.activity,
+      result: current.result ?? historical.result,
+      providerStatus: current.providerStatus ?? historical.providerStatus,
+      step: Math.max(current.step, historical.step),
+      turnCount: Math.max(
+        current.turnCount ?? current.step,
+        historical.turnCount ?? historical.step,
+      ),
+      status,
+    };
+  }
+  return merged;
 };
 
 // ── Background command tasks (the background-tasks panel) ────────────────────
@@ -583,12 +898,35 @@ type TerminalAgentStatus = Exclude<AgentStatus, "running">;
 const terminalizeRunningAgents = (
   agents: Record<string, AgentInfo[]>,
   sessionId: string,
+  launchTurnId: string | null | undefined,
   status: TerminalAgentStatus,
 ): Record<string, AgentInfo[]> => {
   const list = agents[sessionId];
-  if (!list?.some((agent) => agent.status === "running")) return agents;
+  if (!launchTurnId || !list?.some((agent) => agent.status === "running")) return agents;
+  const ownedIds = new Set(
+    list.filter((agent) => agent.launchTurnId === launchTurnId).map((agent) => agent.id),
+  );
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const agent of list) {
+      if (
+        !ownedIds.has(agent.id) &&
+        ((agent.parentId && ownedIds.has(agent.parentId)) ||
+          (agent.parentThreadId && ownedIds.has(agent.parentThreadId)))
+      ) {
+        ownedIds.add(agent.id);
+        changed = true;
+      }
+    }
+  }
+  if (!list.some((agent) => agent.status === "running" && ownedIds.has(agent.id))) {
+    return agents;
+  }
   return patchAgents(agents, sessionId, (current) =>
-    current.map((agent) => (agent.status === "running" ? { ...agent, status } : agent)),
+    current.map((agent) =>
+      agent.status === "running" && ownedIds.has(agent.id) ? { ...agent, status } : agent,
+    ),
   );
 };
 
@@ -843,7 +1181,7 @@ const terminalizeTurnState = (
     status === "completed" ? "ok" : status === "cancelled" ? "cancelled" : "error";
   return {
     messages,
-    agents: terminalizeRunningAgents(st.agents, sessionId, agentStatus),
+    agents: terminalizeRunningAgents(st.agents, sessionId, turnId, agentStatus),
     ...runPatch(st, sessionId, {
       streaming: false,
       cancel: null,
@@ -954,6 +1292,19 @@ const applyBackgroundEvent = (
   }
 };
 
+export const mergeCodexActivity = (
+  current: readonly CodexActivityEvent[],
+  incoming: readonly CodexActivityEvent[],
+): CodexActivityEvent[] => {
+  const bySequence = new Map<number, CodexActivityEvent>();
+  for (const event of incoming) bySequence.set(event.sequence, event);
+  // Existing live state wins an overlapping sequence from a possibly stale load.
+  for (const event of current) bySequence.set(event.sequence, event);
+  return [...bySequence.values()]
+    .sort((left, right) => left.sequence - right.sequence)
+    .slice(-CODEX_ACTIVITY_WINDOW);
+};
+
 const applyCodexActivityEvent = (
   activity: Record<string, CodexActivityEvent[]>,
   sessionId: string,
@@ -974,9 +1325,7 @@ const applyCodexActivityEvent = (
     emittedAtMs: event.emittedAtMs,
   };
   // Keep the live React state bounded; SQLite retains the complete activity log.
-  const rows = [...current, next]
-    .sort((left, right) => left.sequence - right.sequence)
-    .slice(-2_000);
+  const rows = mergeCodexActivity(current, [next]);
   return { ...activity, [sessionId]: rows };
 };
 
@@ -1034,6 +1383,7 @@ const ensureBackgroundListener = async (sessionId: string): Promise<void> => {
   try {
     unlisten = await ipc.subscribeSessionEvents(sessionId, (e) =>
       useStore.setState((st) => ({
+        agents: applyAgentEvent(st.agents, sessionId, e),
         backgroundTasks: applyBackgroundEvent(st.backgroundTasks, sessionId, e),
         codexActivity: applyCodexActivityEvent(st.codexActivity, sessionId, e),
         ...applyCodexRequestEvent(st, sessionId, e),
@@ -1333,6 +1683,29 @@ const armSettleTimer = (sessionId: string, turnId: string): void => {
 const MESSAGE_CACHE_TTL_MS = 60_000;
 const MESSAGE_CACHE_INACTIVE_LIMIT = 20;
 const messageLoadPromises = new Map<string, Promise<void>>();
+const codexActivityLoadGenerations = new Map<string, number>();
+const codexActivityOlderLoadGenerations = new Map<string, number>();
+
+const nextActivityGeneration = (generations: Map<string, number>, id: string): number => {
+  const next = (generations.get(id) ?? 0) + 1;
+  generations.set(id, next);
+  return next;
+};
+
+const normalizeCodexActivityPage = (
+  value: CodexActivityPage | CodexActivityEvent[],
+): CodexActivityPage =>
+  Array.isArray(value) ? { events: value, hasMore: false, nextCursor: null } : value;
+
+const mergeCodexActivityEvidence = (
+  older: readonly CodexActivityEvent[],
+  latest: readonly CodexActivityEvent[],
+): CodexActivityEvent[] => {
+  const bySequence = new Map<number, CodexActivityEvent>();
+  for (const event of older) bySequence.set(event.sequence, event);
+  for (const event of latest) bySequence.set(event.sequence, event);
+  return [...bySequence.values()].sort((left, right) => left.sequence - right.sequence);
+};
 
 const idleMessageLoad = (at = now()): MessageLoadState => ({
   phase: "idle",
@@ -1697,6 +2070,7 @@ export const useStore = create<AppState>((set, get) => ({
   agents: {},
   backgroundTasks: {},
   codexActivity: {},
+  codexActivityPaging: {},
   settings: DEFAULT_SETTINGS,
   openAIAuthStatus: null,
   openAIAuthError: null,
@@ -2234,14 +2608,120 @@ export const useStore = create<AppState>((set, get) => ({
 
   async loadCodexActivity(id) {
     if (get().remoteMode || get().remoteConnected) return;
+    if (!get().sessions.some((session) => session.id === id)) return;
+    const generation = nextActivityGeneration(codexActivityLoadGenerations, id);
     try {
-      const events = await ipc.getCodexActivity(id);
-      set((st) => ({
-        codexActivity: { ...st.codexActivity, [id]: events },
-      }));
+      const page = normalizeCodexActivityPage(
+        await ipc.getCodexActivity(id, CODEX_ACTIVITY_WINDOW),
+      );
+      set((st) => {
+        if (
+          codexActivityLoadGenerations.get(id) !== generation ||
+          !st.sessions.some((session) => session.id === id)
+        ) {
+          return {};
+        }
+        const activity = mergeCodexActivity(st.codexActivity[id] ?? [], page.events);
+        const hydratedAgents = mergeHydratedAgents(
+          rebuildAgentsFromCodexActivity(id, activity),
+          st.agents[id] ?? [],
+        );
+        return {
+          codexActivity: { ...st.codexActivity, [id]: activity },
+          codexActivityPaging: {
+            ...st.codexActivityPaging,
+            [id]: {
+              hasMore: page.hasMore,
+              nextCursor: page.nextCursor,
+              loadingOlder: false,
+              olderEvents: [],
+              archiveLimited: false,
+            },
+          },
+          agents: hydratedAgents.length > 0 ? { ...st.agents, [id]: hydratedAgents } : st.agents,
+        };
+      });
     } catch {
       // The normalized transcript remains fully usable if an older core has no
-      // raw activity table. A later live codex_event still creates the timeline.
+      // recorded activity table. A later live codex_event still creates the timeline.
+    }
+  },
+
+  async loadOlderCodexActivity(id) {
+    const state = get();
+    const paging = state.codexActivityPaging[id];
+    if (
+      state.remoteMode ||
+      state.remoteConnected ||
+      !state.sessions.some((session) => session.id === id) ||
+      !paging?.hasMore ||
+      paging.loadingOlder ||
+      paging.archiveLimited ||
+      paging.nextCursor == null
+    ) {
+      return;
+    }
+    const generation = nextActivityGeneration(codexActivityOlderLoadGenerations, id);
+    const expectedCursor = paging.nextCursor;
+    set((current) => ({
+      codexActivityPaging: {
+        ...current.codexActivityPaging,
+        [id]: { ...paging, loadingOlder: true },
+      },
+    }));
+    try {
+      const page = normalizeCodexActivityPage(
+        await ipc.getCodexActivity(id, CODEX_ACTIVITY_WINDOW, expectedCursor),
+      );
+      set((current) => {
+        const currentPaging = current.codexActivityPaging[id];
+        if (
+          codexActivityOlderLoadGenerations.get(id) !== generation ||
+          !current.sessions.some((session) => session.id === id) ||
+          currentPaging?.nextCursor !== expectedCursor
+        ) {
+          return {};
+        }
+        const latest = current.codexActivity[id] ?? [];
+        const mergedOlder = mergeCodexActivityEvidence(page.events, currentPaging.olderEvents);
+        const overflow = mergedOlder.length > CODEX_ACTIVITY_ARCHIVE_LIMIT;
+        const olderEvents = overflow ? currentPaging.olderEvents : mergedOlder;
+        const archiveLimited =
+          overflow || (page.hasMore && olderEvents.length >= CODEX_ACTIVITY_ARCHIVE_LIMIT);
+        const evidence = mergeCodexActivityEvidence(olderEvents, latest);
+        return {
+          codexActivityPaging: {
+            ...current.codexActivityPaging,
+            [id]: {
+              hasMore: page.hasMore && !archiveLimited,
+              nextCursor: archiveLimited ? null : page.nextCursor,
+              loadingOlder: false,
+              olderEvents,
+              archiveLimited,
+            },
+          },
+          agents: {
+            ...current.agents,
+            [id]: mergeHydratedAgents(
+              rebuildAgentsFromCodexActivity(id, evidence),
+              current.agents[id] ?? [],
+            ),
+          },
+        };
+      });
+    } catch {
+      set((current) => {
+        const currentPaging = current.codexActivityPaging[id];
+        if (codexActivityOlderLoadGenerations.get(id) !== generation || !currentPaging) {
+          return {};
+        }
+        return {
+          codexActivityPaging: {
+            ...current.codexActivityPaging,
+            [id]: { ...currentPaging, loadingOlder: false },
+          },
+        };
+      });
     }
   },
 
@@ -2493,6 +2973,8 @@ export const useStore = create<AppState>((set, get) => ({
     retiredDraftSaves.add(id);
     const pendingDraftSave = draftSaveQueues.get(id);
     if (pendingDraftSave) await pendingDraftSave.catch(() => {});
+    nextActivityGeneration(codexActivityLoadGenerations, id);
+    nextActivityGeneration(codexActivityOlderLoadGenerations, id);
     try {
       await ipc.deleteSession(id);
     } catch (err) {
@@ -2518,6 +3000,10 @@ export const useStore = create<AppState>((set, get) => ({
       delete backgroundTasks[id]; // drop its background tasks
       const codexActivity = { ...st.codexActivity };
       delete codexActivity[id];
+      const codexActivityPaging = { ...st.codexActivityPaging };
+      delete codexActivityPaging[id];
+      const agents = { ...st.agents };
+      delete agents[id];
       const activeId = st.activeId === id ? (sessions[0]?.id ?? null) : st.activeId;
       // Prune the gone session's usage + draft to stay in lockstep with the backend
       // (db.rs deletes both rows on delete_session). Otherwise the deleted session's
@@ -2574,6 +3060,8 @@ export const useStore = create<AppState>((set, get) => ({
         runs,
         backgroundTasks,
         codexActivity,
+        codexActivityPaging,
+        agents,
         activeId,
         usage,
         drafts,
@@ -2882,7 +3370,6 @@ export const useStore = create<AppState>((set, get) => ({
           attachmentRetryPaths,
           attachmentBusy,
           drafts,
-          agents: { ...st.agents, [activeId]: [] },
         };
       });
       if (optimisticDraftCleared) flushPendingDraftSave(activeId);
@@ -3460,7 +3947,7 @@ export const useStore = create<AppState>((set, get) => ({
                   toolOutput,
                   receipt,
                 ),
-                agents: terminalizeRunningAgents(st.agents, activeId, agentStatus),
+                agents: terminalizeRunningAgents(st.agents, activeId, e.turnId, agentStatus),
                 ...runPatch(st, activeId, {
                   streaming: false,
                   cancel: null,
@@ -3495,6 +3982,14 @@ export const useStore = create<AppState>((set, get) => ({
             }
             break;
           }
+          case "assistant_message_snapshot":
+            set((st) => ({
+              messages: patchTurnMessage(st.messages, activeId, e.turnId, (message) => ({
+                ...message,
+                blocks: snapshotContentBlocks(e.blocks),
+              })),
+            }));
+            break;
           case "text_delta":
             // First real byte settles the receipt into "thinking with you…" (and
             // cancels the fallback timer). Only advance from "received" so a Stop
@@ -3857,11 +4352,7 @@ export const useStore = create<AppState>((set, get) => ({
       await get().sendRemoteCommand({ cmd: "cancel_agent", agent_id: agentId });
       return;
     }
-    try {
-      await ipc.cancelAgentById(agentId);
-    } catch {
-      /* best-effort: the subagent will also stop on the session-wide Stop */
-    }
+    await ipc.cancelAgentById(agentId);
   },
 
   async resolvePermission(
@@ -6024,6 +6515,114 @@ function patchLast(
   return { ...messages, [sessionId]: updated };
 }
 
+function snapshotContentBlocks(blocks: readonly AssistantMessageSnapshotBlock[]): ContentBlock[] {
+  const projected: ContentBlock[] = [];
+  for (const block of blocks.slice(0, 64)) {
+    if (block.type === "text" && typeof block.text === "string") {
+      projected.push({ kind: "text", text: block.text });
+    } else if (
+      block.type === "tool_use" &&
+      typeof block.id === "string" &&
+      typeof block.name === "string"
+    ) {
+      projected.push({
+        kind: "tool_use",
+        id: block.id,
+        name: block.name,
+        input: block.input,
+      });
+    } else if (
+      block.type === "tool_result" &&
+      typeof block.tool_use_id === "string" &&
+      typeof block.content === "string"
+    ) {
+      projected.push({
+        kind: "tool_result",
+        toolUseId: block.tool_use_id,
+        output: block.content,
+        isError: block.is_error === true,
+      });
+    }
+    // Opaque reasoning and future block variants are intentionally non-renderable.
+  }
+  return projected;
+}
+
+let remoteCodexFallbackSequence = Number.MIN_SAFE_INTEGER;
+
+const safeRemotePlanStatus = (value: unknown): "pending" | "inProgress" | "completed" | null =>
+  value === "pending" || value === "inProgress" || value === "completed" ? value : null;
+
+function remoteCodexActivityEvent(
+  sessionId: string,
+  event: PhoneCodexActivityEvent,
+): CodexActivityEvent {
+  const metadata = {
+    redacted: event.redacted === true,
+    truncated: event.truncated === true,
+    redactionReasons: (event.redactionReasons ?? []).slice(0, 16),
+    truncationReasons: (event.truncationReasons ?? []).slice(0, 16),
+    ...(event.originalBytes === undefined ? {} : { originalBytes: event.originalBytes }),
+    ...(event.retainedBytes === undefined ? {} : { retainedBytes: event.retainedBytes }),
+  };
+  const payload = event.payload as Record<string, unknown> | undefined;
+  let params: Record<string, unknown> = {
+    ...(event.threadId === undefined ? {} : { threadId: event.threadId }),
+    ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
+    ...(event.itemId === undefined ? {} : { itemId: event.itemId }),
+    _portcodeActivity: metadata,
+  };
+  if (payload?.type === "plan" && Array.isArray(payload.steps)) {
+    params = {
+      ...params,
+      plan: payload.steps.slice(0, 64).flatMap((candidate, index) => {
+        const step = candidate as Record<string, unknown>;
+        const status = safeRemotePlanStatus(step.status);
+        return status ? [{ step: "Step " + (index + 1), status }] : [];
+      }),
+    };
+  } else if (payload?.type === "diff") {
+    const additions = typeof payload.additions === "number" ? payload.additions : 0;
+    const deletions = typeof payload.deletions === "number" ? payload.deletions : 0;
+    const files = typeof payload.files === "number" ? payload.files : 0;
+    params = {
+      ...params,
+      additions,
+      deletions,
+      files,
+      diff: "Aggregate changes: +" + additions + " -" + deletions + " across " + files + " files.",
+    };
+  } else if (payload?.type === "tool") {
+    params = {
+      ...params,
+      item: {
+        id: event.itemId ?? "remote-item",
+        type: typeof payload.itemType === "string" ? payload.itemType : "unknown",
+        status: typeof payload.status === "string" ? payload.status : "unknown",
+      },
+    };
+  } else if (payload?.type === "terminal") {
+    params = {
+      ...params,
+      turn: {
+        id: event.turnId ?? "remote-turn",
+        status: typeof payload.status === "string" ? payload.status : "unknown",
+      },
+    };
+  }
+  return {
+    sequence: event.sequence ?? remoteCodexFallbackSequence++,
+    sessionId,
+    threadId: event.threadId ?? "remote-codex",
+    turnId: event.turnId,
+    itemId: event.itemId,
+    method: event.method,
+    params,
+    requestId: event.requestId,
+    emittedAtMs: event.emittedAtMs ?? now(),
+  };
+}
+
 type RemoteSetter = (fn: (st: AppState) => Partial<AppState>) => void;
 
 // Fold one live StreamEvent (forwarded from the paired desktop) into store state
@@ -6037,7 +6636,7 @@ type RemoteSetter = (fn: (st: AppState) => Partial<AppState>) => void;
 // surfaces it on the visible composer/HUD/permission gate only when that session
 // is the one on screen. So a background session's turn updates its own run without
 // flipping the visible composer or popping a prompt the user has no context for.
-function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent): void {
+function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: PhoneStreamEvent): void {
   // First real byte for the on-screen session settles the receipt into "thinking…"
   // and cancels the fallback timer — mirrors the local onEvent. Background-session
   // frames never touch the visible presence.
@@ -6104,15 +6703,27 @@ function applyRemoteEvent(set: RemoteSetter, sessionId: string, e: StreamEvent):
             unseenOutcome: null,
           }),
           messages,
-          // Each turn's agents panel starts empty. The desktop clears it in send();
-          // the phone has no local send() for the turn (the desktop drives it), so
-          // turn_start — the per-turn boundary where the assistant bubble is created
-          // — is the symmetric place to reset it, else finished subagents from prior
-          // turns would accumulate in the panel for the whole connected session.
-          agents: { ...st.agents, [sessionId]: [] },
         };
       });
       break;
+    case "assistant_message_snapshot":
+      set((st) => ({
+        messages: patchTurnMessage(st.messages, sessionId, e.turnId, (message) => ({
+          ...message,
+          blocks: snapshotContentBlocks(e.blocks),
+        })),
+      }));
+      break;
+    case "codex_activity": {
+      const activity = remoteCodexActivityEvent(sessionId, e);
+      set((st) => ({
+        codexActivity: {
+          ...st.codexActivity,
+          [sessionId]: mergeCodexActivity(st.codexActivity[sessionId] ?? [], [activity]),
+        },
+      }));
+      break;
+    }
     case "text_delta":
       settleActivePresence();
       set((st) => ({

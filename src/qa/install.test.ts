@@ -69,4 +69,36 @@ describe("QA control installer", () => {
     expect(state.sessions).toEqual([]);
     expect(state.runs).toEqual({});
   });
+
+  it("purges synthetic Codex activity and agent state before reused session IDs are reseeded", () => {
+    const controls = installQaControls();
+    controls.seedLocalComposer({ sessions: [{ id: "qa-reused" }], activeId: "qa-reused" });
+    useStore.setState({
+      agents: { "qa-reused": [{ id: "stale-agent" }] as never },
+      backgroundTasks: { "qa-reused": [{ id: "stale-task" }] as never },
+      codexActivity: { "qa-reused": [{ sequence: 1, kind: "unknown" }] as never },
+      codexActivityPaging: {
+        "qa-reused": {
+          hasMore: true,
+          nextCursor: 1,
+          loadingOlder: false,
+          olderEvents: [{ sequence: 1, kind: "unknown" }] as never,
+          archiveLimited: false,
+        },
+      },
+      usage: { "qa-reused": { inputTokens: 1, outputTokens: 1 } as never },
+      messagePaging: { "qa-reused": { hasMore: true, loading: false, oldestSeq: 1 } },
+    });
+
+    controls.resetScenario();
+    controls.seedLocalComposer({ sessions: [{ id: "qa-reused" }], activeId: "qa-reused" });
+
+    const state = useStore.getState();
+    expect(state.agents).toEqual({});
+    expect(state.backgroundTasks).toEqual({});
+    expect(state.codexActivity).toEqual({});
+    expect(state.codexActivityPaging).toEqual({});
+    expect(state.usage).toEqual({});
+    expect(state.messagePaging).toEqual({});
+  });
 });

@@ -44,16 +44,18 @@ describe("agentTree", () => {
       agent({ id: "child", parentId: "root", status: "ok" }),
       agent({ id: "stopped", status: "cancelled" }),
       agent({ id: "failed", status: "error" }),
+      agent({ id: "unknown", status: "unknown" }),
     ];
 
     expect(summarizeAgents(agents)).toEqual({
-      total: 4,
-      roots: 3,
+      total: 5,
+      roots: 4,
       children: 1,
       running: 1,
       completed: 1,
       stopped: 1,
       failed: 1,
+      unknown: 1,
     });
   });
 
@@ -64,10 +66,11 @@ describe("agentTree", () => {
       agent({ id: "live-child", parentId: "context" }),
       agent({ id: "failed", status: "error" }),
       agent({ id: "stopped", status: "cancelled" }),
+      agent({ id: "unknown", status: "unknown" }),
     ]);
 
     const compact = visibleAgentTree(forest, false);
-    expect(compact.map((branch) => branch.agent.id)).toEqual(["context", "failed"]);
+    expect(compact.map((branch) => branch.agent.id)).toEqual(["context", "failed", "unknown"]);
     expect(compact[0].children[0].agent.id).toBe("live-child");
     expect(visibleAgentTree(forest, true)).toBe(forest);
   });
