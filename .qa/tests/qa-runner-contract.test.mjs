@@ -9,6 +9,7 @@ import {
   STAGES,
   assertSafeRunId,
   buildStagePrompt,
+  canonicalizeExplorationCoverage,
   extractJsonObject,
   compareSourceSnapshots,
   nextStageAttempt,
@@ -63,6 +64,143 @@ test("stage prompt pins inputs, output contract, and read-only source boundary",
     "Do not write the report file yourself",
   ])
     assert.match(prompt, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
+});
+
+test("runner canonicalizes exploration coverage from records without mutating the raw candidate", () => {
+  const categories = {
+    input: [{ id: "EC-INPUT-1" }, { id: "EC-INPUT-2" }],
+    timing: [],
+    lifecycle: [],
+    interaction: [],
+    persistence: [],
+    layout: [],
+    accessibility: [],
+    neighboringRegression: [{ id: "EC-REGRESSION-1" }],
+  };
+  const raw = {
+    scenarioPlan: [
+      { caseId: "EC-INPUT-1", selected: true },
+      { caseId: "EC-INPUT-2", selected: true },
+      { caseId: "EC-REGRESSION-1", selected: true },
+    ],
+    executedScenarios: [
+      { caseId: "EC-INPUT-1", category: "input", status: "passed", observationIds: [] },
+      {
+        caseId: "EC-INPUT-2",
+        category: "input",
+        status: "observation-recorded",
+        observationIds: ["OBS-1", "OBS-2"],
+      },
+      {
+        caseId: "EC-REGRESSION-1",
+        category: "neighboringRegression",
+        status: "blocked",
+        observationIds: [],
+      },
+    ],
+    observations: [{ id: "OBS-1" }, { id: "OBS-2" }],
+    coverage: {
+      planned: 99,
+      selected: 99,
+      executed: 99,
+      passed: 99,
+      observationsRecorded: 99,
+      blocked: 99,
+      notApplicable: 99,
+      untestedRisks: ["RISK-KEEP-ME"],
+      byCategory: {},
+    },
+  };
+  const original = structuredClone(raw);
+  const canonical = canonicalizeExplorationCoverage(raw, {
+    edgeCaseCharter: { categories },
+  });
+
+  assert.deepEqual(raw, original, "raw provider candidate must remain immutable");
+  assert.deepEqual(canonical.coverage, {
+    planned: 3,
+    selected: 3,
+    executed: 2,
+    passed: 1,
+    observationsRecorded: 2,
+    blocked: 1,
+    notApplicable: 0,
+    untestedRisks: ["RISK-KEEP-ME"],
+    byCategory: {
+      input: {
+        planned: 2,
+        selected: 2,
+        executed: 2,
+        passed: 1,
+        observationsRecorded: 2,
+        blocked: 0,
+        notApplicable: 0,
+      },
+      timing: {
+        planned: 0,
+        selected: 0,
+        executed: 0,
+        passed: 0,
+        observationsRecorded: 0,
+        blocked: 0,
+        notApplicable: 0,
+      },
+      lifecycle: {
+        planned: 0,
+        selected: 0,
+        executed: 0,
+        passed: 0,
+        observationsRecorded: 0,
+        blocked: 0,
+        notApplicable: 0,
+      },
+      interaction: {
+        planned: 0,
+        selected: 0,
+        executed: 0,
+        passed: 0,
+        observationsRecorded: 0,
+        blocked: 0,
+        notApplicable: 0,
+      },
+      persistence: {
+        planned: 0,
+        selected: 0,
+        executed: 0,
+        passed: 0,
+        observationsRecorded: 0,
+        blocked: 0,
+        notApplicable: 0,
+      },
+      layout: {
+        planned: 0,
+        selected: 0,
+        executed: 0,
+        passed: 0,
+        observationsRecorded: 0,
+        blocked: 0,
+        notApplicable: 0,
+      },
+      accessibility: {
+        planned: 0,
+        selected: 0,
+        executed: 0,
+        passed: 0,
+        observationsRecorded: 0,
+        blocked: 0,
+        notApplicable: 0,
+      },
+      neighboringRegression: {
+        planned: 1,
+        selected: 1,
+        executed: 0,
+        passed: 0,
+        observationsRecorded: 0,
+        blocked: 1,
+        notApplicable: 0,
+      },
+    },
+  });
 });
 
 test("source snapshot comparison reports modified, added, and removed paths", () => {

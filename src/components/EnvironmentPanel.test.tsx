@@ -13,6 +13,7 @@ import { EnvironmentPanel } from "./EnvironmentPanel";
 
 vi.mock("../lib/ipc", () => ({
   getWorkspaceSummary: vi.fn(),
+  cancelAgentById: vi.fn(),
 }));
 
 import * as ipc from "../lib/ipc";
@@ -97,6 +98,7 @@ beforeEach(() => {
   useStore.setState(initialState, true);
   seed();
   m.getWorkspaceSummary.mockResolvedValue(repositorySummary());
+  m.cancelAgentById.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -116,9 +118,353 @@ describe("EnvironmentPanel", () => {
       "title",
       "D:\\Projects\\portcode",
     );
+    expect(within(panel).queryByRole("button", { name: /commit|push|pull request/i })).toBeNull();
+  });
+
+  it("mounts Stop, surfaces failure as Retry Stop, and hides controls for terminal or unknown rows", async () => {
+    seed([
+      agent("running audit"),
+      agent("completed audit", { status: "ok" }),
+      agent("unclear audit", { status: "unknown" }),
+    ]);
+    m.cancelAgentById.mockRejectedValueOnce(new Error("interrupt rejected"));
+    render(<EnvironmentPanel />);
+    const panel = await openPanel();
+
+    expect(within(panel).getByText("unclear audit")).toBeInTheDocument();
     expect(
-      within(panel).queryByRole("button", { name: /stop|commit|push|pull request/i }),
+      within(panel).queryByRole("button", { name: "Stop subagent: completed audit" }),
     ).toBeNull();
+    expect(
+      within(panel).queryByRole("button", { name: "Stop subagent: unclear audit" }),
+    ).toBeNull();
+
+    fireEvent.click(within(panel).getByRole("button", { name: "Stop subagent: running audit" }));
+    const retry = await within(panel).findByRole("button", {
+      name: "Retry stop subagent: running audit",
+    });
+    expect(within(panel).getByRole("alert")).toHaveTextContent(
+      "Stop failed. The subagent may still be running.",
+    );
+
+    fireEvent.click(retry);
+    await waitFor(() => expect(m.cancelAgentById).toHaveBeenCalledTimes(2));
+    expect(
+      within(panel).getByRole("button", { name: "Stop requested for subagent: running audit" }),
+    ).toBeDisabled();
+  });
+
+  it("restores Retry Stop after a successful acknowledgement loses its terminal lifecycle", async () => {
+    seed([agent("quiet worker")]);
+    render(<EnvironmentPanel />);
+    const panel = await openPanel();
+    vi.useFakeTimers();
+
+    fireEvent.click(within(panel).getByRole("button", { name: "Stop subagent: quiet worker" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    act(() => vi.advanceTimersByTime(5_000));
+
+    expect(
+      within(panel).getByRole("button", { name: "Retry stop subagent: quiet worker" }),
+    ).toBeEnabled();
+  });
+
+  it("moves focus to the surviving agent list when a focused Stop disappears", async () => {
+    seed([agent("focus worker")]);
+    render(<EnvironmentPanel />);
+    const panel = await openPanel();
+    const list = within(panel).getByRole("list", { name: "Agent activity" });
+    const stop = within(panel).getByRole("button", { name: "Stop subagent: focus worker" });
+    stop.focus();
+    expect(stop).toHaveFocus();
+
+    act(() => seed([agent("focus worker", { status: "ok" })]));
+
+    expect(list).toHaveFocus();
+  });
+
+  it("inspects exact nested child activity read-only without mounting an input", async () => {
+    seed([
+      agent("root-thread", { description: "root agent" }),
+      agent("child-thread", {
+        description: "nested child",
+        parentId: "root-thread",
+        currentTurnId: "child-turn",
+      }),
+    ]);
+    useStore.setState({
+      codexActivity: {
+        s1: [
+          {
+            sequence: 1,
+            sessionId: "s1",
+            threadId: "child-thread",
+            turnId: "child-turn",
+            method: "turn/started",
+            params: {
+              threadId: "child-thread",
+              turn: { id: "child-turn", status: "inProgress", items: [], error: null },
+              startedAtMs: 10,
+            },
+            emittedAtMs: 10,
+          },
+          {
+            sequence: 2,
+            sessionId: "s1",
+            threadId: "child-thread",
+            turnId: "child-turn",
+            method: "turn/plan/updated",
+            params: {
+              threadId: "child-thread",
+              turnId: "child-turn",
+              plan: [{ step: "Inspect nested package", status: "inProgress" }],
+            },
+            emittedAtMs: 20,
+          },
+          {
+            sequence: 3,
+            sessionId: "s1",
+            threadId: "child-thread",
+            turnId: "child-turn",
+            itemId: "command-1",
+            method: "item/completed",
+            params: {
+              threadId: "child-thread",
+              turnId: "child-turn",
+              item: {
+                id: "command-1",
+                type: "commandExecution",
+                command: "pnpm test child",
+                status: "completed",
+                aggregatedOutput: "child tests passed",
+                exitCode: 0,
+              },
+              completedAtMs: 30,
+            },
+            emittedAtMs: 30,
+          },
+          {
+            sequence: 4,
+            sessionId: "s1",
+            threadId: "child-thread",
+            turnId: "child-turn",
+            method: "turn/diff/updated",
+            params: { threadId: "child-thread", turnId: "child-turn", diff: "+child diff" },
+            emittedAtMs: 40,
+          },
+          {
+            sequence: 5,
+            sessionId: "s1",
+            threadId: "child-thread",
+            turnId: "child-turn",
+            method: "warning",
+            params: { threadId: "child-thread", turnId: "child-turn", message: "Child notice" },
+            emittedAtMs: 50,
+          },
+          {
+            sequence: 6,
+            sessionId: "s1",
+            threadId: "child-thread",
+            turnId: "child-turn",
+            method: "turn/completed",
+            params: {
+              threadId: "child-thread",
+              turn: { id: "child-turn", status: "completed", items: [], error: null },
+              completedAtMs: 60,
+            },
+            emittedAtMs: 60,
+          },
+        ],
+      },
+    });
+    render(<EnvironmentPanel />);
+    const panel = await openPanel();
+
+    fireEvent.click(
+      within(panel).getByRole("button", { name: "Inspect subagent activity: nested child" }),
+    );
+    const inspector = within(panel).getByRole("region", {
+      name: "Child activity: nested child",
+    });
+
+    expect(within(inspector).getByText("Inspect nested package")).toBeInTheDocument();
+    expect(within(inspector).getByText("pnpm test child")).toBeInTheDocument();
+    expect(within(inspector).getByText("Child notice")).toBeInTheDocument();
+    expect(within(inspector).getByText("completed")).toBeInTheDocument();
+    expect(within(inspector).queryByRole("textbox")).toBeNull();
+    expect(within(inspector).queryByRole("button", { name: /send|submit/i })).toBeNull();
+  });
+
+  it("isolates unknown-only children across a bounded 2,001+ record paginated archive", async () => {
+    seed([
+      agent("target-child", { description: "target child", currentTurnId: "target-turn" }),
+      agent("other-child", { description: "other child", currentTurnId: "other-turn" }),
+    ]);
+    const current = Array.from({ length: 2_000 }, (_, index) => ({
+      sequence: index + 3,
+      sessionId: "s1",
+      threadId: "root-thread",
+      method: "thread/status/changed",
+      params: { threadId: "root-thread", status: "idle" },
+      emittedAtMs: index + 3,
+    }));
+    useStore.setState({
+      codexActivity: { s1: current },
+      codexActivityPaging: {
+        s1: {
+          hasMore: false,
+          nextCursor: null,
+          loadingOlder: false,
+          archiveLimited: false,
+          olderEvents: [
+            {
+              sequence: 1,
+              sessionId: "s1",
+              threadId: "target-child",
+              turnId: "target-turn",
+              method: "future/targetChildOnly",
+              params: {
+                safe: "CHILD_ONLY_SENTINEL",
+                reasoning_text: "RAW_CHILD_REASONING_SENTINEL",
+              },
+              emittedAtMs: 1,
+            },
+            {
+              sequence: 2,
+              sessionId: "s1",
+              threadId: "other-child",
+              turnId: "other-turn",
+              method: "future/otherChildOnly",
+              params: { safe: "OTHER_CHILD_SENTINEL" },
+              emittedAtMs: 2,
+            },
+          ],
+        },
+      },
+    });
+    render(<EnvironmentPanel />);
+    const panel = await openPanel();
+
+    fireEvent.click(
+      within(panel).getByRole("button", { name: "Inspect subagent activity: other child" }),
+    );
+    let inspector = within(panel).getByRole("region", { name: "Child activity: other child" });
+    fireEvent.click(
+      within(inspector).getByRole("button", {
+        name: "Unrecognized Codex activity (1), expand",
+      }),
+    );
+    expect(within(inspector).getByText("future/otherChildOnly")).toBeInTheDocument();
+    expect(inspector).not.toHaveTextContent("CHILD_ONLY_SENTINEL");
+    fireEvent.click(within(inspector).getByRole("button", { name: "Close child activity" }));
+
+    fireEvent.click(
+      within(panel).getByRole("button", { name: "Inspect subagent activity: target child" }),
+    );
+    inspector = within(panel).getByRole("region", { name: "Child activity: target child" });
+    fireEvent.click(
+      within(inspector).getByRole("button", {
+        name: "Unrecognized Codex activity (1), expand",
+      }),
+    );
+    expect(within(inspector).getByText("future/targetChildOnly")).toBeInTheDocument();
+    expect(inspector).not.toHaveTextContent("OTHER_CHILD_SENTINEL");
+    fireEvent.click(
+      within(inspector).getByRole("button", {
+        name: "future/targetChildOnly recorded parameters, expand",
+      }),
+    );
+    expect(inspector).toHaveTextContent("CHILD_ONLY_SENTINEL");
+    expect(inspector).not.toHaveTextContent("RAW_CHILD_REASONING_SENTINEL");
+  });
+
+  it("navigates a child's full 10,000-row archive while bounding detailed DOM work", async () => {
+    seed([agent("target-child", { description: "target child", currentTurnId: "turn-10000" })]);
+    const all = Array.from({ length: 10_000 }, (_, index) => {
+      const sequence = index + 1;
+      const detailed = sequence % 50 === 0;
+      return {
+        sequence,
+        sessionId: "s1",
+        threadId: "target-child",
+        turnId: detailed ? "turn-" + sequence : undefined,
+        method: detailed ? "warning" : "future/childArchive",
+        params: detailed
+          ? {
+              threadId: "target-child",
+              turnId: "turn-" + sequence,
+              message: "Child detail " + sequence,
+            }
+          : { safe: "child-" + sequence },
+        emittedAtMs: sequence,
+      };
+    });
+    useStore.setState({
+      codexActivity: { s1: all.slice(8_000) },
+      codexActivityPaging: {
+        s1: {
+          hasMore: false,
+          nextCursor: null,
+          loadingOlder: false,
+          archiveLimited: false,
+          olderEvents: all.slice(0, 8_000),
+        },
+      },
+    });
+    render(<EnvironmentPanel />);
+    const panel = await openPanel();
+    fireEvent.click(
+      within(panel).getByRole("button", { name: "Inspect subagent activity: target child" }),
+    );
+    const inspector = within(panel).getByRole("region", { name: "Child activity: target child" });
+
+    expect(within(inspector).getByText("Child detail 10000")).toBeInTheDocument();
+    expect(within(inspector).queryByText("child-1")).toBeNull();
+    expect(within(inspector).getAllByText("Turn unknown").length).toBeLessThanOrEqual(4);
+
+    const oldest = within(inspector).getByRole("button", {
+      name: "Show oldest retained activity",
+    });
+    oldest.focus();
+    fireEvent.click(oldest);
+    expect(document.activeElement).toBe(oldest);
+    fireEvent.click(
+      within(inspector).getByRole("button", {
+        name: "Unrecognized Codex activity (196), expand",
+      }),
+    );
+    expect(within(inspector).getByText("Sequence 1")).toBeInTheDocument();
+    expect(within(inspector).queryByText("Child detail 10000")).toBeNull();
+    expect(within(inspector).getAllByRole("listitem").length).toBeLessThanOrEqual(200);
+
+    fireEvent.click(
+      within(inspector).getByRole("button", { name: "Show newest retained activity" }),
+    );
+    expect(within(inspector).getByText("Child detail 10000")).toBeInTheDocument();
+    expect(within(inspector).queryByText("Sequence 1")).toBeNull();
+  });
+
+  it("closes only child inspection on Escape and restores its Inspect trigger", async () => {
+    seed([agent("target-child", { description: "target child" })]);
+    render(<EnvironmentPanel />);
+    const panel = await openPanel();
+    const inspect = within(panel).getByRole("button", {
+      name: "Inspect subagent activity: target child",
+    });
+    inspect.focus();
+    fireEvent.click(inspect);
+    const close = within(panel).getByRole("button", { name: "Close child activity" });
+    expect(close).toHaveClass("min-h-6", "min-w-6");
+
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(
+      within(panel).queryByRole("region", { name: "Child activity: target child" }),
+    ).toBeNull();
+    expect(screen.getByRole("region", { name: "Environment and agents" })).toBeInTheDocument();
+    expect(inspect).toHaveFocus();
   });
 
   it("opens the full review workspace from the Changes fact", async () => {

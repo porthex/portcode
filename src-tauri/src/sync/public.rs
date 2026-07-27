@@ -9,8 +9,9 @@ use std::collections::HashMap;
 
 use portcode_sync::protocol::SyncFrame;
 use portcode_sync::wire::{
-    Block, MessageRow, PhoneBlock, PhoneMessageRow, PhoneSessionRow, PhoneStreamEvent,
-    PhoneTurnChangedFile, PhoneTurnReceipt, SessionRow, StreamEvent, TurnReceipt,
+    Block, MessageRow, PhoneBlock, PhoneCodexActivityPayload, PhoneCodexPlanStep, PhoneMessageRow,
+    PhoneSessionRow, PhoneStreamEvent, PhoneTurnChangedFile, PhoneTurnReceipt, SessionRow,
+    StreamEvent, TurnReceipt,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -94,6 +95,174 @@ fn public_identifier(value: &str) -> String {
     encoded
 }
 
+fn public_codex_method(value: &str) -> String {
+    let bounded = bounded_public_text(value, 128);
+    if bounded == value
+        && !bounded.is_empty()
+        && bounded.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-')
+        })
+    {
+        bounded
+    } else {
+        let digest = Sha256::digest(value.as_bytes());
+        let mut encoded = String::with_capacity(39);
+        encoded.push_str("redacted-method-");
+        for byte in &digest[..12] {
+            encoded.push_str(&format!("{byte:02x}"));
+        }
+        encoded
+    }
+}
+
+fn public_codex_request_id(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(public_identifier(value)),
+        Value::Number(value) => Some(public_identifier(&value.to_string())),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct PublicCodexActivityMetadata {
+    redacted: bool,
+    truncated: bool,
+    redaction_reasons: Vec<String>,
+    truncation_reasons: Vec<String>,
+    original_bytes: Option<u64>,
+    retained_bytes: Option<u64>,
+}
+
+fn public_activity_reasons(metadata: Option<&Value>, key: &str) -> Vec<String> {
+    metadata
+        .and_then(|value| value.get(key))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|reason| {
+            matches!(
+                *reason,
+                "rawReasoning"
+                    | "knownSecret"
+                    | "nonScalarRequestId"
+                    | "maxDepth"
+                    | "maxFields"
+                    | "maxArrayItems"
+                    | "maxStringBytes"
+                    | "maxEncodedBytes"
+                    | "maxMethodBytes"
+            )
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+fn codex_activity_metadata(params: &Value) -> PublicCodexActivityMetadata {
+    let metadata = params.get("_portcodeActivity");
+    PublicCodexActivityMetadata {
+        redacted: metadata
+            .and_then(|value| value.get("redacted"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        truncated: metadata
+            .and_then(|value| value.get("truncated"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        redaction_reasons: public_activity_reasons(metadata, "redactionReasons"),
+        truncation_reasons: public_activity_reasons(metadata, "truncationReasons"),
+        original_bytes: metadata
+            .and_then(|value| value.get("originalBytes"))
+            .and_then(Value::as_u64),
+        retained_bytes: metadata
+            .and_then(|value| value.get("retainedBytes"))
+            .and_then(Value::as_u64),
+    }
+}
+fn public_codex_status(value: Option<&str>) -> String {
+    match value {
+        Some("pending") => "pending",
+        Some("inProgress") => "inProgress",
+        Some("completed") => "completed",
+        Some("failed" | "errored" | "notFound") => "failed",
+        Some("interrupted" | "cancelled" | "canceled" | "declined") => "interrupted",
+        _ => "unknown",
+    }
+    .to_string()
+}
+
+fn public_codex_activity_payload(
+    method: &str,
+    params: &Value,
+) -> Option<PhoneCodexActivityPayload> {
+    match method {
+        "turn/plan/updated" => {
+            let steps = params
+                .get("plan")
+                .and_then(Value::as_array)?
+                .iter()
+                .take(64)
+                .map(|step| PhoneCodexPlanStep {
+                    status: public_codex_status(step.get("status").and_then(Value::as_str)),
+                })
+                .collect();
+            Some(PhoneCodexActivityPayload::Plan { steps })
+        }
+        "turn/diff/updated" => {
+            let diff = params.get("diff").and_then(Value::as_str)?;
+            let mut additions = 0_u32;
+            let mut deletions = 0_u32;
+            let mut files = 0_u32;
+            for line in diff.lines().take(100_000) {
+                if line.starts_with("diff --git ") {
+                    files = files.saturating_add(1);
+                } else if line.starts_with('+') && !line.starts_with("+++") {
+                    additions = additions.saturating_add(1);
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    deletions = deletions.saturating_add(1);
+                }
+            }
+            Some(PhoneCodexActivityPayload::Diff {
+                additions,
+                deletions,
+                files,
+            })
+        }
+        "item/started" | "item/completed" => {
+            let item = params.get("item")?;
+            let item_type = match item.get("type").and_then(Value::as_str) {
+                Some(
+                    value @ ("commandExecution"
+                    | "fileChange"
+                    | "mcpToolCall"
+                    | "contextCompaction"
+                    | "plan"
+                    | "collabAgentToolCall"
+                    | "subAgentActivity"),
+                ) => value.to_string(),
+                _ => "unknown".to_string(),
+            };
+            let status = public_codex_status(item.get("status").and_then(Value::as_str));
+            let terminal = method == "item/completed"
+                || matches!(status.as_str(), "completed" | "failed" | "interrupted");
+            Some(PhoneCodexActivityPayload::Tool {
+                item_type,
+                status,
+                terminal,
+            })
+        }
+        "turn/completed" => Some(PhoneCodexActivityPayload::Terminal {
+            status: public_codex_status(
+                params
+                    .get("turn")
+                    .and_then(|turn| turn.get("status"))
+                    .and_then(Value::as_str),
+            ),
+        }),
+        _ => None,
+    }
+}
+
 fn public_tool_id(value: &str) -> String {
     // Hash even syntactically-safe provider ids: they are not an application
     // identifier and have no public meaning beyond correlation.
@@ -155,6 +324,14 @@ fn public_stop_reason(value: &str) -> String {
 fn public_agent_status(value: &str) -> String {
     match value {
         "ok" | "cancelled" | "error" => value.to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn public_agent_provider_status(value: &str) -> String {
+    match value {
+        "pendingInit" | "running" | "interrupted" | "completed" | "errored" | "shutdown"
+        | "notFound" | "failed" => value.to_string(),
         _ => "unknown".to_string(),
     }
 }
@@ -224,6 +401,16 @@ pub fn project_event(event: &StreamEvent) -> PhoneStreamEvent {
         StreamEvent::TextDelta { text } => PhoneStreamEvent::TextDelta {
             text: bounded_public_text(text, MAX_LIVE_TEXT_BYTES),
         },
+        StreamEvent::AssistantMessageSnapshot { turn_id, blocks } => {
+            PhoneStreamEvent::AssistantMessageSnapshot {
+                turn_id: public_identifier(turn_id),
+                blocks: blocks
+                    .iter()
+                    .take(MAX_MESSAGE_BLOCKS)
+                    .filter_map(|block| project_block(block, MAX_MESSAGE_TEXT_BYTES))
+                    .collect(),
+            }
+        }
         StreamEvent::ToolUse { id, name, .. } => PhoneStreamEvent::ToolUse {
             id: public_tool_id(id),
             name: public_tool_name(name).to_string(),
@@ -268,20 +455,69 @@ pub fn project_event(event: &StreamEvent) -> PhoneStreamEvent {
         },
         StreamEvent::AgentStarted {
             agent_id,
-            description,
+            description: _,
             parent_id,
+            parent_thread_id,
+            launch_turn_id,
+            model,
+            reasoning_effort,
+            activity,
         } => PhoneStreamEvent::AgentStarted {
             agent_id: public_identifier(agent_id),
-            description: bounded_public_text(description, 256),
+            // Native descriptions may originate from a child prompt or agentPath.
+            // Keep the additive wire field for legacy decoders, but never copy
+            // opaque desktop-local task content across the public boundary.
+            description: "Codex subagent".to_string(),
             parent_id: parent_id.as_deref().map(public_identifier),
+            parent_thread_id: parent_thread_id.as_deref().map(public_identifier),
+            launch_turn_id: launch_turn_id.as_deref().map(public_identifier),
+            model: model
+                .as_deref()
+                .map(|value| bounded_public_text(value, 128)),
+            reasoning_effort: reasoning_effort
+                .as_deref()
+                .map(|value| bounded_public_text(value, 32)),
+            activity: activity
+                .as_deref()
+                .map(|value| bounded_public_text(value, 64)),
         },
-        StreamEvent::AgentProgress { agent_id, step } => PhoneStreamEvent::AgentProgress {
+        StreamEvent::AgentProgress {
+            agent_id,
+            step,
+            parent_thread_id,
+            launch_turn_id,
+            current_turn_id,
+            turn_count,
+        } => PhoneStreamEvent::AgentProgress {
             agent_id: public_identifier(agent_id),
             step: *step,
+            parent_thread_id: parent_thread_id.as_deref().map(public_identifier),
+            launch_turn_id: launch_turn_id.as_deref().map(public_identifier),
+            current_turn_id: current_turn_id.as_deref().map(public_identifier),
+            turn_count: *turn_count,
         },
-        StreamEvent::AgentFinished { agent_id, status } => PhoneStreamEvent::AgentFinished {
+        StreamEvent::AgentFinished {
+            agent_id,
+            status,
+            provider_status,
+            parent_thread_id,
+            launch_turn_id,
+            current_turn_id,
+            turn_count,
+            activity,
+            ..
+        } => PhoneStreamEvent::AgentFinished {
             agent_id: public_identifier(agent_id),
             status: public_agent_status(status),
+            result: None,
+            provider_status: provider_status.as_deref().map(public_agent_provider_status),
+            parent_thread_id: parent_thread_id.as_deref().map(public_identifier),
+            launch_turn_id: launch_turn_id.as_deref().map(public_identifier),
+            current_turn_id: current_turn_id.as_deref().map(public_identifier),
+            turn_count: *turn_count,
+            activity: activity
+                .as_deref()
+                .map(|value| bounded_public_text(value, 64)),
         },
         StreamEvent::BackgroundTaskStarted { id, .. } => PhoneStreamEvent::BackgroundTaskStarted {
             id: public_identifier(id),
@@ -299,11 +535,63 @@ pub fn project_event(event: &StreamEvent) -> PhoneStreamEvent {
                 },
             }
         }
-        // A raw app-server payload can contain local paths, command arguments,
-        // MCP data, and future fields with no public privacy contract. Keep it
-        // desktop-only; the safe normalized events above remain the phone wire.
-        StreamEvent::CodexEvent { .. } | StreamEvent::CodexRequest { .. } => {
-            PhoneStreamEvent::Unknown
+        StreamEvent::CodexEvent {
+            sequence,
+            method,
+            params,
+            request_id,
+            thread_id,
+            turn_id,
+            item_id,
+            emitted_at_ms,
+        } => {
+            let metadata = codex_activity_metadata(params);
+            PhoneStreamEvent::CodexActivity {
+                kind: "event".to_string(),
+                method: public_codex_method(method),
+                request_id: request_id.as_ref().and_then(public_codex_request_id),
+                thread_id: thread_id.as_deref().map(public_identifier),
+                turn_id: turn_id.as_deref().map(public_identifier),
+                item_id: item_id.as_deref().map(public_identifier),
+                sequence: Some(*sequence),
+                emitted_at_ms: Some(*emitted_at_ms),
+                redacted: metadata.redacted,
+                truncated: metadata.truncated,
+                redaction_reasons: metadata.redaction_reasons,
+                truncation_reasons: metadata.truncation_reasons,
+                original_bytes: metadata.original_bytes,
+                retained_bytes: metadata.retained_bytes,
+                payload: public_codex_activity_payload(method, params),
+            }
+        }
+        StreamEvent::CodexRequest { id, method, params } => {
+            let metadata = codex_activity_metadata(params);
+            PhoneStreamEvent::CodexActivity {
+                kind: "request".to_string(),
+                method: public_codex_method(method),
+                request_id: Some(public_identifier(id)),
+                thread_id: params
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .map(public_identifier),
+                turn_id: params
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .map(public_identifier),
+                item_id: params
+                    .get("itemId")
+                    .and_then(Value::as_str)
+                    .map(public_identifier),
+                sequence: None,
+                emitted_at_ms: None,
+                redacted: metadata.redacted,
+                truncated: metadata.truncated,
+                redaction_reasons: metadata.redaction_reasons,
+                truncation_reasons: metadata.truncation_reasons,
+                original_bytes: metadata.original_bytes,
+                retained_bytes: metadata.retained_bytes,
+                payload: None,
+            }
         }
     }
 }
@@ -783,14 +1071,30 @@ mod tests {
                 agent_id: format!("agent-{SECRET}"),
                 description: format!("task {SECRET}"),
                 parent_id: Some(format!("parent-{SECRET}")),
+                parent_thread_id: Some(format!("parent-thread-{SECRET}")),
+                launch_turn_id: Some(format!("launch-{SECRET}")),
+                model: Some(format!("model-{SECRET}")),
+                reasoning_effort: Some(format!("effort-{SECRET}")),
+                activity: Some(format!("activity-{SECRET}")),
             },
             StreamEvent::AgentProgress {
                 agent_id: format!("agent-{SECRET}"),
                 step: u32::MAX,
+                parent_thread_id: Some(format!("parent-{SECRET}")),
+                launch_turn_id: Some(format!("launch-{SECRET}")),
+                current_turn_id: Some(format!("turn-{SECRET}")),
+                turn_count: Some(u32::MAX),
             },
             StreamEvent::AgentFinished {
                 agent_id: format!("agent-{SECRET}"),
                 status: format!("future-{SECRET}"),
+                result: Some(format!("private result {SECRET}")),
+                provider_status: Some(format!("future-{SECRET}")),
+                parent_thread_id: Some(format!("parent-{SECRET}")),
+                launch_turn_id: Some(format!("launch-{SECRET}")),
+                current_turn_id: Some(format!("turn-{SECRET}")),
+                turn_count: Some(u32::MAX),
+                activity: Some(format!("activity-{SECRET}")),
             },
             StreamEvent::BackgroundTaskStarted {
                 id: "background-1".into(),
@@ -812,6 +1116,221 @@ mod tests {
             assert!(!encoded.contains("\"command\":\"sk-ant"), "{encoded}");
             assert!(!encoded.contains("diff sk-ant"), "{encoded}");
         }
+    }
+
+    #[test]
+    fn child_descriptions_never_forward_benign_sensitive_prompts_or_paths() {
+        const PROMPT: &str = "Review the quiet merger terms for Project Birch";
+        const AGENT_PATH: &str = "C:\\Users\\Acer\\clients\\birch\\private-notes.md";
+
+        for description in [PROMPT, AGENT_PATH] {
+            let projected = project_event(&StreamEvent::AgentStarted {
+                agent_id: "child-thread".into(),
+                description: description.into(),
+                parent_id: Some("parent-agent".into()),
+                parent_thread_id: Some("root-thread".into()),
+                launch_turn_id: Some("root-turn".into()),
+                model: Some("gpt-5.6".into()),
+                reasoning_effort: Some("high".into()),
+                activity: Some("spawnAgent".into()),
+            });
+            let wire = serde_json::to_string(&projected).unwrap();
+
+            assert!(!wire.contains(PROMPT), "prompt reached phone wire: {wire}");
+            assert!(
+                !wire.contains(AGENT_PATH),
+                "path reached phone wire: {wire}"
+            );
+            assert_eq!(
+                serde_json::to_value(projected).unwrap()["description"],
+                "Codex subagent"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_activity_projects_only_additive_wire_safe_convergence_payloads() {
+        const RAW_SENTINEL: &str = "RAW_SENTINEL_PUBLIC_CODEX_ACTIVITY";
+        let fixtures = [
+            (
+                StreamEvent::CodexEvent {
+                    sequence: 21,
+                    method: "turn/plan/updated".into(),
+                    params: json!({
+                        "plan": [
+                            {"step": RAW_SENTINEL, "status": "completed"},
+                            {"step": "C:\\private\\secret", "status": "inProgress"}
+                        ],
+                        "credential": RAW_SENTINEL,
+                        "kind": "chain_of_thought",
+                        "content": RAW_SENTINEL
+                    }),
+                    request_id: None,
+                    thread_id: Some("thread-1".into()),
+                    turn_id: Some("turn-1".into()),
+                    item_id: None,
+                    emitted_at_ms: 210,
+                },
+                "plan",
+            ),
+            (
+                StreamEvent::CodexEvent {
+                    sequence: 22,
+                    method: "turn/diff/updated".into(),
+                    params: json!({"diff":"diff --git a/private b/private\n+secret\n-old"}),
+                    request_id: None,
+                    thread_id: Some("thread-1".into()),
+                    turn_id: Some("turn-1".into()),
+                    item_id: None,
+                    emitted_at_ms: 220,
+                },
+                "diff",
+            ),
+            (
+                StreamEvent::CodexEvent {
+                    sequence: 23,
+                    method: "item/completed".into(),
+                    params: json!({
+                        "item": {
+                            "id": "item-1",
+                            "type": "commandExecution",
+                            "status": "completed",
+                            "command": RAW_SENTINEL,
+                            "cwd": "C:\\private",
+                            "aggregatedOutput": RAW_SENTINEL
+                        }
+                    }),
+                    request_id: None,
+                    thread_id: Some("thread-1".into()),
+                    turn_id: Some("turn-1".into()),
+                    item_id: Some("item-1".into()),
+                    emitted_at_ms: 230,
+                },
+                "tool",
+            ),
+            (
+                StreamEvent::CodexEvent {
+                    sequence: 24,
+                    method: "turn/completed".into(),
+                    params: json!({"turn":{"id":"turn-1","status":"completed","items":[RAW_SENTINEL]}}),
+                    request_id: None,
+                    thread_id: Some("thread-1".into()),
+                    turn_id: Some("turn-1".into()),
+                    item_id: None,
+                    emitted_at_ms: 240,
+                },
+                "terminal",
+            ),
+        ];
+
+        for (event, payload_type) in fixtures {
+            let projected = serde_json::to_value(project_event(&event)).unwrap();
+            let encoded = serde_json::to_string(&projected).unwrap();
+            assert_eq!(projected["payload"]["type"], payload_type);
+            assert!(!encoded.contains(RAW_SENTINEL), "{encoded}");
+            assert!(!encoded.contains("C:\\\\private"), "{encoded}");
+            assert!(!encoded.contains("\"command\":"), "{encoded}");
+            assert!(!encoded.contains("aggregatedOutput"), "{encoded}");
+        }
+    }
+
+    #[test]
+    fn sanitized_codex_events_and_requests_remain_distinguishable_remotely() {
+        let first = project_event(&StreamEvent::CodexEvent {
+            sequence: 7,
+            method: "future/alpha".into(),
+            params: json!({
+                "threadId": "private-thread",
+                "turnId": "private-turn",
+                "secret": SECRET,
+                "_portcodeActivity": {
+                    "redacted": true,
+                    "truncated": false,
+                    "redactionReasons": ["knownSecret", "rawReasoning", "private-reason"],
+                    "originalBytes": 900,
+                    "retainedBytes": 90
+                }
+            }),
+            request_id: None,
+            thread_id: Some("private-thread".into()),
+            turn_id: Some("private-turn".into()),
+            item_id: Some("private-item".into()),
+            emitted_at_ms: 123,
+        });
+        let second = project_event(&StreamEvent::CodexEvent {
+            sequence: 8,
+            method: "future/beta".into(),
+            params: json!({
+                "threadId": "private-thread",
+                "payload": SECRET,
+                "_portcodeActivity": {"redacted": false, "truncated": true}
+            }),
+            request_id: Some(json!(SECRET)),
+            thread_id: Some("private-thread".into()),
+            turn_id: None,
+            item_id: None,
+            emitted_at_ms: 124,
+        });
+        let request = project_event(&StreamEvent::CodexRequest {
+            id: format!("request-{SECRET}"),
+            method: "future/request".into(),
+            params: json!({
+                "threadId": "private-thread",
+                "turnId": "private-turn",
+                "credential": SECRET,
+                "_portcodeActivity": {"redacted": true, "truncated": true}
+            }),
+        });
+
+        let first = serde_json::to_value(first).unwrap();
+        let second = serde_json::to_value(second).unwrap();
+        let request = serde_json::to_value(request).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first["method"], "future/alpha");
+        assert_eq!(second["method"], "future/beta");
+        assert_eq!(request["method"], "future/request");
+        assert_eq!(first["kind"], "event");
+        assert_eq!(request["kind"], "request");
+        assert_eq!(first["redacted"], true);
+        assert_eq!(
+            first["redactionReasons"],
+            json!(["knownSecret", "rawReasoning"])
+        );
+        assert_eq!(first["originalBytes"], 900);
+        assert_eq!(first["retainedBytes"], 90);
+        assert_eq!(second["truncated"], true);
+        assert!(first.get("threadId").is_some());
+        assert!(request.get("turnId").is_some());
+        let encoded = serde_json::to_string(&(first, second, request)).unwrap();
+        assert!(!encoded.contains(SECRET));
+        assert!(!encoded.contains("credential"));
+        assert!(!encoded.contains("payload"));
+        assert!(!encoded.contains("private-reason"));
+    }
+
+    #[test]
+    fn future_agent_status_projects_as_unknown_without_forwarding_result_content() {
+        let projected = project_event(&StreamEvent::AgentFinished {
+            agent_id: "child-private".into(),
+            status: "future-provider-state".into(),
+            result: Some("provider-authored private result".into()),
+            provider_status: Some("future-provider-state".into()),
+            parent_thread_id: Some("parent-private".into()),
+            launch_turn_id: Some("launch-private".into()),
+            current_turn_id: Some("turn-private".into()),
+            turn_count: Some(2),
+            activity: Some("completed".into()),
+        });
+        assert!(matches!(
+            projected,
+            PhoneStreamEvent::AgentFinished {
+                status,
+                result: None,
+                provider_status: Some(provider_status),
+                turn_count: Some(2),
+                ..
+            } if status == "unknown" && provider_status == "unknown"
+        ));
     }
 
     #[test]

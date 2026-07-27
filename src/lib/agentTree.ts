@@ -13,6 +13,7 @@ export interface AgentSummary {
   completed: number;
   stopped: number;
   failed: number;
+  unknown: number;
 }
 
 /**
@@ -69,12 +70,13 @@ export function summarizeAgents(
   agents: AgentInfo[],
   forest: AgentBranchInfo[] = buildAgentTree(agents),
 ): AgentSummary {
-  const status = { running: 0, completed: 0, stopped: 0, failed: 0 };
+  const status = { running: 0, completed: 0, stopped: 0, failed: 0, unknown: 0 };
   for (const agent of agents) {
     if (agent.status === "running") status.running += 1;
     else if (agent.status === "ok") status.completed += 1;
     else if (agent.status === "cancelled") status.stopped += 1;
-    else status.failed += 1;
+    else if (agent.status === "error") status.failed += 1;
+    else status.unknown += 1;
   }
   return {
     total: agents.length,
@@ -99,7 +101,10 @@ export function visibleAgentTree(
     const children = branch.children
       .map(filterBranch)
       .filter((child): child is AgentBranchInfo => child !== null);
-    const visible = branch.agent.status === "running" || branch.agent.status === "error";
+    const visible =
+      branch.agent.status === "running" ||
+      branch.agent.status === "error" ||
+      branch.agent.status === "unknown";
     return visible || children.length > 0 ? { agent: branch.agent, children } : null;
   };
 

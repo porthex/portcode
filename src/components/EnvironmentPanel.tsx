@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -19,9 +20,12 @@ import {
   type AgentBranchInfo,
 } from "../lib/agentTree";
 import { useStore } from "../store/store";
-import type { AgentInfo, AgentStatus, WorkspaceSummary } from "../types";
+import type { AgentInfo, AgentStatus, CodexActivityEvent, WorkspaceSummary } from "../types";
+import { remoteSafeCodexActivityEvents } from "../lib/codexActivity";
+import { CodexActivityHistoryInspector } from "./CodexActivity";
 
 const EMPTY_AGENTS: AgentInfo[] = [];
+const EMPTY_CODEX_ACTIVITY: CodexActivityEvent[] = [];
 const number = new Intl.NumberFormat();
 
 type EnvironmentPanelProviderProps = PropsWithChildren<{
@@ -214,7 +218,7 @@ export function EnvironmentPanelProvider({
         : "workspace";
   const triggerStatus = `${agentSummary.running} running${
     agentSummary.failed > 0 ? `, ${agentSummary.failed} failed` : ""
-  }`;
+  }${agentSummary.unknown > 0 ? `, ${agentSummary.unknown} unknown` : ""}`;
 
   return (
     <EnvironmentPanelContext.Provider
@@ -289,9 +293,11 @@ export function EnvironmentPanelTrigger({
         className={`pc-environment-trigger__health pc-dot ${
           agentSummary.failed > 0
             ? "bg-danger"
-            : agentSummary.running > 0
-              ? "pc-dot--ring"
-              : "pc-dot--success"
+            : agentSummary.unknown > 0
+              ? "bg-faint"
+              : agentSummary.running > 0
+                ? "pc-dot--ring"
+                : "pc-dot--success"
         }`}
         aria-hidden="true"
       />
@@ -338,6 +344,62 @@ export function EnvironmentPanelDock({ onClose }: { onClose: () => void }) {
     panelRef,
     closeRef,
   } = useEnvironmentPanel();
+  const activeId = useStore((state) => state.activeId);
+  const activityEvents = useStore((state) =>
+    state.activeId
+      ? (state.codexActivity[state.activeId] ?? EMPTY_CODEX_ACTIVITY)
+      : EMPTY_CODEX_ACTIVITY,
+  );
+  const activityPaging = useStore((state) =>
+    state.activeId ? state.codexActivityPaging[state.activeId] : undefined,
+  );
+  const loadOlderCodexActivity = useStore((state) => state.loadOlderCodexActivity);
+  const remoteMode = useStore((state) => state.remoteMode);
+  const [inspectedAgentId, setInspectedAgentId] = useState<string | null>(null);
+  const agentListRef = useRef<HTMLUListElement>(null);
+  const focusedStopAgentRef = useRef<string | null>(null);
+  const inspectedAgent = agents.find((agent) => agent.id === inspectedAgentId);
+  const closeInspectedAgent = useCallback(() => {
+    const agentId = inspectedAgentId;
+    if (!agentId) return;
+    setInspectedAgentId(null);
+    window.requestAnimationFrame(() => {
+      const trigger = Array.from(
+        panelRef.current?.querySelectorAll<HTMLButtonElement>("[data-inspect-agent-id]") ?? [],
+      ).find((button) => button.dataset.inspectAgentId === agentId);
+      trigger?.focus();
+    });
+  }, [inspectedAgentId, panelRef]);
+  const inspectedEvents = useMemo(() => {
+    if (!inspectedAgent || !activeId) return EMPTY_CODEX_ACTIVITY;
+    const combined = [...(activityPaging?.olderEvents ?? EMPTY_CODEX_ACTIVITY), ...activityEvents];
+    const visible = remoteMode ? remoteSafeCodexActivityEvents(combined) : combined;
+    return visible.filter(
+      (event) => event.sessionId === activeId && event.threadId === inspectedAgent.id,
+    );
+  }, [activeId, activityEvents, activityPaging?.olderEvents, inspectedAgent, remoteMode]);
+
+  useLayoutEffect(() => {
+    const focusedAgentId = focusedStopAgentRef.current;
+    if (!focusedAgentId || document.activeElement !== document.body) return;
+    const survivingRow = Array.from(
+      panelRef.current?.querySelectorAll<HTMLElement>("[data-environment-agent-id]") ?? [],
+    ).find((row) => row.dataset.environmentAgentId === focusedAgentId);
+    (survivingRow ?? agentListRef.current)?.focus();
+    focusedStopAgentRef.current = null;
+  }, [agents, panelRef, visibleTree]);
+
+  useEffect(() => {
+    if (!inspectedAgentId) return;
+    const closeChildOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      event.preventDefault();
+      event.stopPropagation();
+      closeInspectedAgent();
+    };
+    window.addEventListener("keydown", closeChildOnEscape, true);
+    return () => window.removeEventListener("keydown", closeChildOnEscape, true);
+  }, [closeInspectedAgent, inspectedAgentId]);
 
   return (
     <section
@@ -407,6 +469,11 @@ export function EnvironmentPanelDock({ onClose }: { onClose: () => void }) {
                 {agentSummary.failed} failed
               </span>
             )}
+            {agentSummary.unknown > 0 && (
+              <span className="rounded-full bg-white/[0.045] px-1.5 py-0.5 text-muted">
+                {agentSummary.unknown} unknown
+              </span>
+            )}
             <span className="rounded-full bg-white/[0.035] px-1.5 py-0.5 text-faint">
               {finished} done
             </span>
@@ -420,11 +487,21 @@ export function EnvironmentPanelDock({ onClose }: { onClose: () => void }) {
             </div>
           ) : (
             <ul
+              ref={agentListRef}
+              tabIndex={-1}
               aria-label="Agent activity"
               className="max-h-[238px] overflow-y-auto py-0.5 [scrollbar-color:#2b354d_transparent] [scrollbar-width:thin]"
             >
               {visibleTree.map((branch) => (
-                <CompactAgentBranch key={branch.agent.id} branch={branch} depth={0} />
+                <CompactAgentBranch
+                  key={branch.agent.id}
+                  branch={branch}
+                  depth={0}
+                  onInspect={setInspectedAgentId}
+                  onStopFocus={(agentId) => {
+                    focusedStopAgentRef.current = agentId;
+                  }}
+                />
               ))}
               {hiddenFinished > 0 && (
                 <li className="border-t border-border/70">
@@ -442,6 +519,41 @@ export function EnvironmentPanelDock({ onClose }: { onClose: () => void }) {
             </ul>
           )}
         </div>
+        {inspectedAgent && (
+          <section
+            className="mt-2 rounded-lg border border-border bg-bg/50 p-2"
+            role="region"
+            aria-label={`Child activity: ${inspectedAgent.description}`}
+          >
+            <div className="mb-2 flex items-center gap-2">
+              <span className="min-w-0 flex-1 truncate text-[11px] text-fg">
+                {inspectedAgent.description}
+              </span>
+              <span className="font-mono text-[8px] uppercase text-muted">
+                {agentStatus(inspectedAgent.status).label.toLowerCase()}
+              </span>
+              <button
+                type="button"
+                aria-label="Close child activity"
+                onClick={closeInspectedAgent}
+                className="grid min-h-6 min-w-6 shrink-0 place-items-center rounded text-[15px] leading-none text-faint outline-none transition-colors hover:bg-white/[0.05] hover:text-fg focus-visible:ring-2 focus-visible:ring-accent-2/30"
+              >
+                ×
+              </button>
+            </div>
+            <CodexActivityHistoryInspector
+              key={inspectedAgent.id}
+              events={inspectedEvents}
+              renderTurns
+              emptyMessage="No durable activity recorded."
+              hasMore={activityPaging?.hasMore}
+              loadingOlder={activityPaging?.loadingOlder}
+              archiveLimited={activityPaging?.archiveLimited}
+              metadataOnly={remoteMode}
+              onLoadOlder={activeId ? () => void loadOlderCodexActivity(activeId) : undefined}
+            />
+          </section>
+        )}
       </div>
     </section>
   );
@@ -604,14 +716,35 @@ function FactRow({
   return <div className={className}>{content}</div>;
 }
 
-function CompactAgentBranch({ branch, depth }: { branch: AgentBranchInfo; depth: number }) {
+function CompactAgentBranch({
+  branch,
+  depth,
+  onInspect,
+  onStopFocus,
+}: {
+  branch: AgentBranchInfo;
+  depth: number;
+  onInspect: (agentId: string) => void;
+  onStopFocus: (agentId: string) => void;
+}) {
   return (
     <li>
-      <CompactAgentRow agent={branch.agent} depth={depth} />
+      <CompactAgentRow
+        agent={branch.agent}
+        depth={depth}
+        onInspect={() => onInspect(branch.agent.id)}
+        onStopFocus={() => onStopFocus(branch.agent.id)}
+      />
       {branch.children.length > 0 && (
         <ul aria-label={`Subagents of ${branch.agent.description}`}>
           {branch.children.map((child) => (
-            <CompactAgentBranch key={child.agent.id} branch={child} depth={depth + 1} />
+            <CompactAgentBranch
+              key={child.agent.id}
+              branch={child}
+              depth={depth + 1}
+              onInspect={onInspect}
+              onStopFocus={onStopFocus}
+            />
           ))}
         </ul>
       )}
@@ -619,14 +752,62 @@ function CompactAgentBranch({ branch, depth }: { branch: AgentBranchInfo; depth:
   );
 }
 
-function CompactAgentRow({ agent, depth }: { agent: AgentInfo; depth: number }) {
+function CompactAgentRow({
+  agent,
+  depth,
+  onInspect,
+  onStopFocus,
+}: {
+  agent: AgentInfo;
+  depth: number;
+  onInspect: () => void;
+  onStopFocus: () => void;
+}) {
   const meta = agentStatus(agent.status);
+  const cancelAgent = useStore((state) => state.cancelAgent);
+  const [stopState, setStopState] = useState<"idle" | "stopping" | "failed" | "requested">("idle");
+  const retryTimer = useRef<number | null>(null);
+  const runningRef = useRef(agent.status === "running");
   const detail =
     agent.status === "running" ? (agent.step > 0 ? `Step ${agent.step}` : "Starting") : meta.label;
+
+  useEffect(() => {
+    runningRef.current = agent.status === "running";
+    if (agent.status !== "running") {
+      if (retryTimer.current !== null) window.clearTimeout(retryTimer.current);
+      retryTimer.current = null;
+      setStopState("idle");
+    }
+  }, [agent.status]);
+
+  useEffect(
+    () => () => {
+      if (retryTimer.current !== null) window.clearTimeout(retryTimer.current);
+    },
+    [],
+  );
+
+  const requestStop = async () => {
+    if (agent.status !== "running" || stopState === "stopping" || stopState === "requested") return;
+    setStopState("stopping");
+    try {
+      await cancelAgent(agent.id);
+      setStopState("requested");
+      if (runningRef.current) {
+        retryTimer.current = window.setTimeout(() => {
+          if (runningRef.current) setStopState("failed");
+        }, 5_000);
+      }
+    } catch {
+      setStopState("failed");
+    }
+  };
 
   return (
     <div
       role="group"
+      data-environment-agent-id={agent.id}
+      tabIndex={-1}
       className={`grid min-h-[38px] grid-cols-[22px_minmax(0,1fr)_auto] items-center border-b border-border/70 py-1 pr-2 ${
         depth === 0 ? "bg-[#b06bff]/[0.025]" : "bg-white/[0.012]"
       }`}
@@ -647,7 +828,53 @@ function CompactAgentRow({ agent, depth }: { agent: AgentInfo; depth: number }) 
           {depth === 0 ? "Root" : "Child"} · {meta.label}
         </div>
       </div>
-      <span className={`ml-2 font-mono text-[8px] uppercase ${meta.text}`}>{detail}</span>
+      <div className="ml-2 flex items-center gap-1.5">
+        <span className={`font-mono text-[8px] uppercase ${meta.text}`}>{detail}</span>
+        <button
+          type="button"
+          aria-label={`Inspect subagent activity: ${agent.description}`}
+          data-inspect-agent-id={agent.id}
+          onClick={onInspect}
+          className="rounded border border-border-2 px-1.5 py-0.5 font-mono text-[8px] uppercase text-muted"
+        >
+          Inspect
+        </button>
+        {agent.status === "running" && (
+          <button
+            onFocus={onStopFocus}
+            type="button"
+            aria-label={
+              stopState === "failed"
+                ? `Retry stop subagent: ${agent.description}`
+                : stopState === "requested"
+                  ? `Stop requested for subagent: ${agent.description}`
+                  : stopState === "stopping"
+                    ? `Stopping subagent: ${agent.description}`
+                    : `Stop subagent: ${agent.description}`
+            }
+            disabled={stopState === "stopping" || stopState === "requested"}
+            onClick={() => void requestStop()}
+            className={`rounded border px-1.5 py-0.5 font-mono text-[8px] uppercase outline-none transition-colors focus-visible:ring-2 focus-visible:ring-accent-2/30 disabled:cursor-wait disabled:opacity-60 ${
+              stopState === "failed"
+                ? "border-danger/40 bg-danger/10 text-danger"
+                : "border-border-2 bg-white/[0.025] text-muted hover:border-danger/35 hover:text-danger"
+            }`}
+          >
+            {stopState === "failed"
+              ? "Retry Stop"
+              : stopState === "requested"
+                ? "Stop requested"
+                : stopState === "stopping"
+                  ? "Stopping…"
+                  : "Stop"}
+          </button>
+        )}
+        {stopState === "failed" && (
+          <span role="alert" className="sr-only">
+            Stop failed. The subagent may still be running.
+          </span>
+        )}
+      </div>
     </div>
   );
 }
@@ -677,6 +904,12 @@ function agentStatus(status: AgentStatus): { label: string; text: string; glyph:
         label: "Failed",
         text: "text-danger",
         glyph: "border border-danger/30 bg-danger/10 text-danger",
+      };
+    case "unknown":
+      return {
+        label: "Unknown",
+        text: "text-muted",
+        glyph: "border border-border-2 bg-white/[0.04] text-muted",
       };
   }
 }

@@ -6,9 +6,11 @@ import type { AgentInfo, ContentBlock, Message, TurnReceipt as TurnReceiptData }
 import { useStore } from "../store/store";
 import { usePrefersReducedMotion, useScramble } from "../lib/useScramble";
 import { useContextMenu, type ContextMenuItem } from "./ContextMenu";
+import type { CodexTurnActivity } from "../lib/codexActivity";
 import { ToolCall } from "./ToolCall";
 import { isRoutineToolName, ToolActivityGroup, type ActivityCall } from "./ToolActivityGroup";
 import { TurnChangesCard, TurnReceipt } from "./TurnReceipt";
+import { CodexTurnActivityView } from "./CodexActivity";
 
 // Hoisted to module scope so they're referentially stable across renders —
 // otherwise a fresh array each render defeats React.memo on TextBlock and makes
@@ -122,6 +124,8 @@ export const MessageView = memo(function MessageView({
   isActive = false,
   turnPresentation,
   agents,
+  activity,
+  remoteSafeActivity = false,
   onReviewChanges,
   reviewAvailable = true,
 }: {
@@ -134,6 +138,8 @@ export const MessageView = memo(function MessageView({
     finalizing: boolean;
   };
   agents?: AgentInfo[];
+  activity?: CodexTurnActivity;
+  remoteSafeActivity?: boolean;
   onReviewChanges?: (receipt: TurnReceiptData) => void;
   reviewAvailable?: boolean;
 }) {
@@ -162,11 +168,22 @@ export const MessageView = memo(function MessageView({
   // exploration row. A text block, mutation, delegation, unknown tool, or any
   // error flushes the group and remains individually visible in exact order.
   const renderItems = useMemo(
-    () => buildRenderItems(message.blocks, resultByUseId, isActive),
-    [message.blocks, resultByUseId, isActive],
+    () => buildRenderItems(message.blocks, resultByUseId, isActive, activity?.structuredItemIds),
+    [message.blocks, resultByUseId, isActive, activity?.structuredItemIds],
   );
+  const remoteTerminalVisible =
+    remoteSafeActivity &&
+    (activity?.status === "completed" ||
+      activity?.status === "failed" ||
+      activity?.status === "interrupted");
   const showReceipt =
-    !isUser && Boolean(message.receipt || turnPresentation?.active || turnPresentation?.finalizing);
+    !isUser &&
+    Boolean(
+      message.receipt ||
+      turnPresentation?.active ||
+      turnPresentation?.finalizing ||
+      (remoteSafeActivity && activity),
+    );
   const textItems = showReceipt
     ? renderItems.filter(
         (item): item is Extract<RenderItem, { kind: "text" }> => item.kind === "text",
@@ -174,7 +191,31 @@ export const MessageView = memo(function MessageView({
     : [];
   const activityItems = showReceipt ? renderItems.filter((item) => item.kind !== "text") : [];
   const observableAgents = showReceipt ? (agents ?? []) : [];
-  const activityCount = activityItems.length + observableAgents.length;
+  const activityCount =
+    activityItems.length +
+    observableAgents.length +
+    (activity?.visibleCount ?? 0) +
+    (remoteTerminalVisible ? 1 : 0);
+  const receiptActivity =
+    activityCount > 0 ? (
+      <div className="space-y-1.5">
+        {activity && (activity.visibleCount > 0 || remoteTerminalVisible) && (
+          <CodexTurnActivityView
+            activity={activity}
+            remoteSafe={remoteSafeActivity}
+            reviewAvailable={reviewAvailable && Boolean(message.receipt)}
+            onReviewChanges={
+              message.receipt && onReviewChanges
+                ? () => onReviewChanges(message.receipt!)
+                : undefined
+            }
+          />
+        )}
+        {activityItems.map((item) => renderActivityItem(item, isActive))}
+        {observableAgents.length > 0 && <SubagentReceiptActivity agents={observableAgents} />}
+      </div>
+    ) : null;
+  const deferReceiptActivity = (activity?.visibleCount ?? 0) > 0 || remoteTerminalVisible;
 
   // Right-click → copy the message's text. Disabled when the message has no text
   // (e.g. a tool-only assistant turn). Plain text inside the bubble keeps its own
@@ -227,16 +268,8 @@ export const MessageView = memo(function MessageView({
                   waiting={turnPresentation?.waiting}
                   finalizing={turnPresentation?.finalizing}
                   activityCount={activityCount}
-                  activity={
-                    activityCount > 0 ? (
-                      <div className="space-y-1.5">
-                        {activityItems.map((item) => renderActivityItem(item, isActive))}
-                        {observableAgents.length > 0 && (
-                          <SubagentReceiptActivity agents={observableAgents} />
-                        )}
-                      </div>
-                    ) : null
-                  }
+                  activity={deferReceiptActivity ? null : receiptActivity}
+                  deferredActivity={deferReceiptActivity ? receiptActivity : null}
                 />
                 {textItems.map((item) => (
                   <TextBlock
@@ -320,7 +353,9 @@ function SubagentReceiptActivity({ agents }: { agents: AgentInfo[] }) {
                   ? "pc-dot--ring"
                   : agent.status === "error"
                     ? "pc-dot--danger"
-                    : "pc-dot--success"
+                    : agent.status === "unknown"
+                      ? "pc-dot--warn"
+                      : "pc-dot--success"
               }`}
               aria-hidden="true"
             />
@@ -339,6 +374,7 @@ function subagentStatus(agent: AgentInfo) {
   if (agent.status === "running") return agent.step > 0 ? `step ${agent.step}` : "starting";
   if (agent.status === "ok") return "completed";
   if (agent.status === "cancelled") return "stopped";
+  if (agent.status === "unknown") return "unknown";
   return "failed";
 }
 
@@ -346,6 +382,7 @@ function buildRenderItems(
   blocks: ContentBlock[],
   resultByUseId: Map<string, ResultBlock>,
   isActive: boolean,
+  structuredItemIds?: ReadonlySet<string>,
 ): RenderItem[] {
   const items: RenderItem[] = [];
   let routine: ActivityCall[] = [];
@@ -361,6 +398,10 @@ function buildRenderItems(
     if (block.kind === "text") {
       flushRoutine();
       items.push({ kind: "text", block, index });
+      return;
+    }
+    if (structuredItemIds?.has(block.id)) {
+      flushRoutine();
       return;
     }
 

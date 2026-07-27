@@ -4,8 +4,19 @@ import { render, screen, fireEvent, act } from "@testing-library/react";
 import { MessageView } from "./Message";
 import { markdownLiteralText } from "../lib/sessionFormat";
 import { STEP_MS } from "../lib/useScramble";
+import {
+  codexTurnKey,
+  projectCodexActivity,
+  remoteSafeCodexActivityEvents,
+} from "../lib/codexActivity";
 import { useStore } from "../store/store";
-import type { ContentBlock, Message, Role, TurnReceipt as TurnReceiptData } from "../types";
+import type {
+  CodexActivityEvent,
+  ContentBlock,
+  Message,
+  Role,
+  TurnReceipt as TurnReceiptData,
+} from "../types";
 
 // MessageView is a pure, props-driven presentational component: it folds a
 // Message's content blocks into rendered output (markdown for text, a ToolCall
@@ -670,6 +681,65 @@ describe("MessageView — turn receipt presentation", () => {
     expect(container.querySelector(".pc-turn-agents__status")).toHaveTextContent("step 2");
   });
 
+  it("labels every terminal and starting subagent state in plain text", () => {
+    render(
+      <MessageView
+        message={{
+          ...message("assistant", [{ kind: "text", text: "Delegation states." }]),
+          turnId: "turn-1",
+        }}
+        turnPresentation={{
+          active: true,
+          startedAt: 1_000,
+          waiting: false,
+          finalizing: false,
+        }}
+        agents={[
+          {
+            id: "starting",
+            description: "Starting agent",
+            status: "running",
+            step: 0,
+          },
+          {
+            id: "complete",
+            description: "Complete agent",
+            status: "ok",
+            step: 1,
+          },
+          {
+            id: "stopped",
+            description: "Stopped agent",
+            status: "cancelled",
+            step: 1,
+          },
+          {
+            id: "failed",
+            description: "Failed agent",
+            status: "error",
+            step: 1,
+          },
+          {
+            id: "unknown",
+            description: "Unknown agent",
+            status: "unknown",
+            step: 1,
+          },
+        ]}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /expand work activity/i }));
+    expect(screen.getByText("starting")).toBeInTheDocument();
+    expect(screen.getByText("completed")).toBeInTheDocument();
+    expect(screen.getByText("stopped")).toBeInTheDocument();
+    expect(screen.getByText("failed")).toBeInTheDocument();
+    expect(screen.getByText("unknown")).toBeInTheDocument();
+    const unknownRow = screen.getByText("Unknown agent").closest(".pc-turn-agents__row");
+    expect(unknownRow?.querySelector(".pc-dot")).toHaveClass("pc-dot--warn");
+    expect(unknownRow?.querySelector(".pc-dot")).not.toHaveClass("pc-dot--success");
+  });
+
   it("omits Git chrome for a non-Git or failed-capture receipt with no change evidence", () => {
     const { container } = render(
       <MessageView
@@ -750,6 +820,134 @@ describe("MessageView — turn receipt presentation", () => {
 
     expect(screen.getByText("Review on desktop")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /review 1 changed file/i })).toBeNull();
+  });
+});
+
+describe("MessageView — structured Codex activity", () => {
+  it("renders remote-safe terminal and tool state without exposing local raw fields", () => {
+    const privateSentinel = "MESSAGE_REMOTE_PRIVATE_COMMAND_SENTINEL";
+    const activity = projectCodexActivity(
+      remoteSafeCodexActivityEvents([
+        {
+          sequence: 1,
+          sessionId: "s1",
+          threadId: "thread-1",
+          turnId: "turn-remote",
+          itemId: "item-remote",
+          method: "item/completed",
+          params: {
+            item: {
+              id: "item-remote",
+              type: "commandExecution",
+              status: "completed",
+              command: privateSentinel,
+              cwd: privateSentinel,
+              aggregatedOutput: privateSentinel,
+              reasoning_text: privateSentinel,
+            },
+          },
+          emittedAtMs: 5,
+        },
+        {
+          sequence: 2,
+          sessionId: "s1",
+          threadId: "thread-1",
+          turnId: "turn-remote",
+          method: "turn/completed",
+          params: { turn: { id: "turn-remote", status: "completed" } },
+          emittedAtMs: 10,
+        },
+      ]),
+    ).turns[codexTurnKey("s1", "turn-remote")]!;
+    expect(activity).toBeDefined();
+    expect(activity.status).toBe("completed");
+    render(
+      <MessageView
+        message={{
+          ...message("assistant", [{ kind: "text", text: "Remote final" }]),
+          turnId: "turn-remote",
+          receipt: receipt({ turnId: "turn-remote" }),
+        }}
+        activity={activity}
+        remoteSafeActivity
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /expand work activity/i }));
+    expect(screen.getByText("Turn completed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Command, completed/i })).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent(privateSentinel);
+    expect(document.body).not.toHaveTextContent("Recorded parameters");
+  });
+
+  it("suppresses only duplicate generic tool IDs and counts projected activity", () => {
+    const activityEvents: CodexActivityEvent[] = [
+      {
+        sequence: 1,
+        sessionId: "s1",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "I1",
+        method: "item/completed",
+        params: {
+          turnId: "turn-1",
+          item: {
+            id: "I1",
+            type: "commandExecution",
+            command: "pnpm test",
+            status: "completed",
+            aggregatedOutput: "passed",
+          },
+        },
+        emittedAtMs: 10,
+      },
+    ];
+    const activity = projectCodexActivity(activityEvents).turns[codexTurnKey("s1", "turn-1")]!;
+    const turnMessage: Message = {
+      ...message("assistant", [
+        {
+          kind: "tool_use",
+          id: "I1",
+          name: "run_command",
+          input: { command: "pnpm test" },
+        },
+        {
+          kind: "tool_result",
+          toolUseId: "I1",
+          output: "passed",
+          isError: false,
+        },
+        { kind: "tool_use", id: "I2", name: "unrelated_tool", input: {} },
+        {
+          kind: "tool_result",
+          toolUseId: "I2",
+          output: "kept",
+          isError: false,
+        },
+      ]),
+      receipt: receipt(),
+      turnId: "turn-1",
+    };
+
+    const { container } = render(<MessageView message={turnMessage} activity={activity} />);
+
+    expect(container.querySelector(".pc-turn-receipt")).toHaveAttribute(
+      "data-has-activity",
+      "true",
+    );
+    expect(
+      container.querySelector('[aria-label="pnpm test, completed, expand output"]'),
+    ).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /expand work activity/i }));
+    expect(
+      screen.getByRole("button", {
+        name: "pnpm test, completed, expand output",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Run command pnpm test/i }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Unrelated tool/i })).toBeInTheDocument();
   });
 });
 

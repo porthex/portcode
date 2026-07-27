@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   type Attachment,
+  type CodexActivityEvent,
   DEFAULT_SETTINGS,
   OPENAI_FALLBACK_MODELS,
   type Message,
@@ -17,14 +18,21 @@ import {
   type Session,
   type StreamEvent,
   type SyncFrame,
+  type TurnChangedFile,
   type TurnReceipt,
   type TurnStatus,
   type UpdateInfo,
 } from "../types";
+import { codexTurnKey, projectCodexActivity } from "../lib/codexActivity";
 import * as ipc from "../lib/ipc";
 import { markdownLiteralText } from "../lib/sessionFormat";
 import { SETTINGS_COMMITTED_DURABILITY_UNCONFIRMED_PREFIX } from "../lib/settingsPersistence";
-import { modelsForOpenAIProfile, teardownAllBackgroundListeners, useStore } from "./store";
+import {
+  mergeCodexActivity,
+  modelsForOpenAIProfile,
+  teardownAllBackgroundListeners,
+  useStore,
+} from "./store";
 
 // The store is the app's brain: it orchestrates the IPC bridge and folds the
 // agent's streamed events into renderable message blocks. We mock the IPC layer
@@ -35,6 +43,7 @@ vi.mock("../lib/ipc", () => ({
   listSessions: vi.fn(),
   createSession: vi.fn(),
   getMessages: vi.fn(),
+  getCodexActivity: vi.fn(),
   getMessagePage: vi.fn(),
   getSessionArchiveWarning: vi.fn(),
   deleteSession: vi.fn(),
@@ -236,6 +245,7 @@ beforeEach(() => {
   m.getSettings.mockResolvedValue(DEFAULT_SETTINGS);
   m.listSessions.mockResolvedValue([]);
   m.getMessages.mockResolvedValue([]);
+  m.getCodexActivity.mockResolvedValue([]);
   m.getMessagePage.mockImplementation(async (sessionId) => ({
     messages: await m.getMessages(sessionId),
     nextCursor: null,
@@ -296,6 +306,993 @@ beforeEach(() => {
   m.relaunchApp.mockResolvedValue(undefined);
   m.getUpdateChannel.mockResolvedValue("stable");
   m.onUpdaterEvent.mockResolvedValue(() => {});
+});
+
+describe("Codex activity hydration", () => {
+  const activityEvent = (sequence: number): CodexActivityEvent => ({
+    sequence,
+    sessionId: "s1",
+    threadId: "thread-1",
+    turnId: "turn-1",
+    itemId: "item-1",
+    method: "future/method",
+    params: { sequence },
+    emittedAtMs: sequence * 10,
+  });
+
+  beforeEach(() => {
+    useStore.setState({
+      sessions: [session({ id: "s1" }), session({ id: "s2" })],
+      activeId: "s1",
+      messages: { s1: [], s2: [] },
+    });
+  });
+
+  it("merges a stale load with a live tail and requests the full supported window", async () => {
+    let resolveLoad!: (events: CodexActivityEvent[]) => void;
+    m.getCodexActivity.mockImplementation(
+      () => new Promise<CodexActivityEvent[]>((resolve) => (resolveLoad = resolve)),
+    );
+
+    const load = useStore.getState().loadCodexActivity("s1");
+    useStore.setState({ codexActivity: { s1: [activityEvent(2)] } });
+    resolveLoad([activityEvent(1)]);
+    await load;
+
+    expect(m.getCodexActivity).toHaveBeenCalledWith("s1", 2_000);
+    expect(useStore.getState().codexActivity.s1?.map((candidate) => candidate.sequence)).toEqual([
+      1, 2,
+    ]);
+  });
+
+  it("rejects deferred hydration after deletion and after delete/recreate of the same id", async () => {
+    let resolveDeleted!: (events: CodexActivityEvent[]) => void;
+    m.getCodexActivity.mockImplementation((id) =>
+      id === "s1"
+        ? new Promise<CodexActivityEvent[]>((resolve) => (resolveDeleted = resolve))
+        : Promise.resolve([]),
+    );
+    useStore.setState({
+      sessions: [session({ id: "s1" }), session({ id: "s2" })],
+      activeId: "s2",
+      messages: { s1: [], s2: [] },
+      archivedIds: ["s1"],
+      agents: {
+        s1: [{ id: "old-agent", description: "old", status: "running", step: 1 }],
+      },
+    });
+
+    const staleLoad = useStore.getState().loadCodexActivity("s1");
+    await useStore.getState().deleteSession("s1");
+    useStore.setState({
+      sessions: [...useStore.getState().sessions, session({ id: "s1", title: "Recreated" })],
+    });
+    resolveDeleted([activityEvent(1)]);
+    await staleLoad;
+
+    expect(useStore.getState().sessions.some((candidate) => candidate.id === "s1")).toBe(true);
+    expect(useStore.getState().codexActivity.s1).toBeUndefined();
+    expect(useStore.getState().agents.s1).toBeUndefined();
+  });
+
+  it("accepts only the newest activity load generation", async () => {
+    let resolveOlder!: (events: CodexActivityEvent[]) => void;
+    let resolveNewer!: (events: CodexActivityEvent[]) => void;
+    m.getCodexActivity
+      .mockImplementationOnce(
+        () => new Promise<CodexActivityEvent[]>((resolve) => (resolveOlder = resolve)),
+      )
+      .mockImplementationOnce(
+        () => new Promise<CodexActivityEvent[]>((resolve) => (resolveNewer = resolve)),
+      );
+    useStore.setState({ sessions: [session()], activeId: "s1", messages: { s1: [] } });
+
+    const older = useStore.getState().loadCodexActivity("s1");
+    const newer = useStore.getState().loadCodexActivity("s1");
+    resolveNewer([activityEvent(2)]);
+    await newer;
+    resolveOlder([activityEvent(1)]);
+    await older;
+
+    expect(useStore.getState().codexActivity.s1?.map((candidate) => candidate.sequence)).toEqual([
+      2,
+    ]);
+  });
+
+  it("deduplicates, orders, and bounds merged rows to the newest 2,000 sequences", () => {
+    const merged = mergeCodexActivity(
+      [activityEvent(2_005)],
+      [...Array.from({ length: 2_005 }, (_, index) => activityEvent(index + 1))].reverse(),
+    );
+
+    expect(merged).toHaveLength(2_000);
+    expect(merged[0]?.sequence).toBe(6);
+    expect(merged[merged.length - 1]?.sequence).toBe(2_005);
+    expect(new Set(merged.map((candidate) => candidate.sequence)).size).toBe(2_000);
+  });
+
+  it("distinguishes exactly 2,000 persisted events from 2,001 and pages older route evidence", async () => {
+    const exactWindow = Array.from({ length: 2_000 }, (_, index) => activityEvent(index + 1));
+    useStore.setState({ sessions: [session()], activeId: "s1", messages: { s1: [] } });
+    m.getCodexActivity.mockResolvedValueOnce({
+      events: exactWindow,
+      hasMore: false,
+      nextCursor: null,
+    } as never);
+
+    await useStore.getState().loadCodexActivity("s1");
+    expect(useStore.getState().codexActivity.s1).toHaveLength(2_000);
+    expect(useStore.getState().codexActivityPaging.s1?.hasMore).toBe(false);
+
+    const route: CodexActivityEvent = {
+      ...activityEvent(1),
+      threadId: "root-thread",
+      turnId: "root-turn",
+      itemId: "spawn-child",
+      method: "item/started",
+      params: {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        item: {
+          id: "spawn-child",
+          type: "collabAgentToolCall",
+          tool: "spawnAgent",
+          status: "inProgress",
+          senderThreadId: "root-thread",
+          receiverThreadIds: ["child-thread"],
+          prompt: "inspect child",
+          agentsStates: {},
+        },
+        startedAtMs: 10,
+      },
+    };
+    const recent = Array.from({ length: 1_999 }, (_, index) => activityEvent(index + 2));
+    recent.push({
+      ...activityEvent(2_001),
+      threadId: "child-thread",
+      turnId: "child-turn",
+      itemId: null,
+      method: "turn/completed",
+      params: {
+        threadId: "child-thread",
+        turn: { id: "child-turn", status: "completed", items: [], error: null },
+        completedAtMs: 20_010,
+      },
+    });
+    useStore.setState({ codexActivity: {}, codexActivityPaging: {}, agents: {} });
+    m.getCodexActivity
+      .mockResolvedValueOnce({ events: recent, hasMore: true, nextCursor: 2 } as never)
+      .mockResolvedValueOnce({ events: [route], hasMore: false, nextCursor: null } as never);
+
+    await useStore.getState().loadCodexActivity("s1");
+    expect(useStore.getState().codexActivity.s1).toHaveLength(2_000);
+    expect(useStore.getState().codexActivityPaging.s1?.hasMore).toBe(true);
+    expect(useStore.getState().agents.s1).toBeUndefined();
+
+    await useStore.getState().loadOlderCodexActivity("s1");
+    expect(useStore.getState().codexActivity.s1).toHaveLength(2_000);
+    expect(useStore.getState().codexActivityPaging.s1).toMatchObject({
+      hasMore: false,
+      nextCursor: null,
+    });
+    expect(useStore.getState().agents.s1).toEqual([
+      expect.objectContaining({
+        id: "child-thread",
+        launchTurnId: "root-turn",
+        status: "ok",
+      }),
+    ]);
+  });
+
+  it("keeps oldest and recent evidence reachable across four bounded activity pages", async () => {
+    const page = (from: number, to: number) =>
+      Array.from({ length: to - from + 1 }, (_, index) => activityEvent(from + index));
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      messages: { s1: [] },
+      codexActivity: {},
+      codexActivityPaging: {},
+    });
+    m.getCodexActivity
+      .mockResolvedValueOnce({
+        events: page(4_002, 6_001),
+        hasMore: true,
+        nextCursor: 4_002,
+      } as never)
+      .mockResolvedValueOnce({
+        events: page(2_002, 4_001),
+        hasMore: true,
+        nextCursor: 2_002,
+      } as never)
+      .mockResolvedValueOnce({ events: page(2, 2_001), hasMore: true, nextCursor: 2 } as never)
+      .mockResolvedValueOnce({
+        events: [activityEvent(1)],
+        hasMore: false,
+        nextCursor: null,
+      } as never);
+
+    await useStore.getState().loadCodexActivity("s1");
+    await useStore.getState().loadOlderCodexActivity("s1");
+    await useStore.getState().loadOlderCodexActivity("s1");
+    await useStore.getState().loadOlderCodexActivity("s1");
+
+    const state = useStore.getState();
+    expect(state.codexActivity.s1?.map((candidate) => candidate.sequence)).toEqual(
+      page(4_002, 6_001).map((candidate) => candidate.sequence),
+    );
+    const archived = state.codexActivityPaging.s1?.olderEvents ?? [];
+    expect(archived.length).toBeLessThanOrEqual(8_000);
+    expect(archived.map((candidate) => candidate.sequence)).toEqual(
+      expect.arrayContaining([1, 2_001, 2_002, 4_001]),
+    );
+    expect(state.codexActivityPaging.s1).toMatchObject({
+      hasMore: false,
+      nextCursor: null,
+      loadingOlder: false,
+    });
+  });
+
+  it("stops honestly when the bounded activity archive reaches its limit", async () => {
+    const page = (from: number, to: number) =>
+      Array.from({ length: to - from + 1 }, (_, index) => activityEvent(from + index));
+    useStore.setState({
+      sessions: [session()],
+      activeId: "s1",
+      messages: { s1: [] },
+      codexActivity: {},
+      codexActivityPaging: {},
+    });
+    m.getCodexActivity
+      .mockResolvedValueOnce({
+        events: page(8_001, 10_000),
+        hasMore: true,
+        nextCursor: 8_001,
+      } as never)
+      .mockResolvedValueOnce({
+        events: page(6_001, 8_000),
+        hasMore: true,
+        nextCursor: 6_001,
+      } as never)
+      .mockResolvedValueOnce({
+        events: page(4_001, 6_000),
+        hasMore: true,
+        nextCursor: 4_001,
+      } as never)
+      .mockResolvedValueOnce({
+        events: page(2_001, 4_000),
+        hasMore: true,
+        nextCursor: 2_001,
+      } as never)
+      .mockResolvedValueOnce({ events: page(1, 2_000), hasMore: true, nextCursor: 1 } as never);
+
+    await useStore.getState().loadCodexActivity("s1");
+    await useStore.getState().loadOlderCodexActivity("s1");
+    await useStore.getState().loadOlderCodexActivity("s1");
+    await useStore.getState().loadOlderCodexActivity("s1");
+    await useStore.getState().loadOlderCodexActivity("s1");
+
+    expect(useStore.getState().codexActivity.s1).toHaveLength(2_000);
+    expect(useStore.getState().codexActivity.s1?.map((candidate) => candidate.sequence)).toEqual(
+      expect.arrayContaining([8_001, 10_000]),
+    );
+    expect(useStore.getState().codexActivityPaging.s1).toMatchObject({
+      hasMore: false,
+      nextCursor: null,
+      archiveLimited: true,
+      olderEvents: expect.arrayContaining([
+        expect.objectContaining({ sequence: 1 }),
+        expect.objectContaining({ sequence: 8_000 }),
+      ]),
+    });
+    expect(useStore.getState().codexActivityPaging.s1?.olderEvents).toHaveLength(8_000);
+
+    await useStore.getState().loadOlderCodexActivity("s1");
+    expect(m.getCodexActivity).toHaveBeenCalledTimes(5);
+  });
+
+  it("releases the bounded older-page control when its IPC request fails", async () => {
+    useStore.setState({
+      codexActivityPaging: {
+        s1: {
+          hasMore: true,
+          nextCursor: 50,
+          loadingOlder: false,
+          olderEvents: [],
+          archiveLimited: false,
+        },
+      },
+    });
+    m.getCodexActivity.mockRejectedValueOnce(new Error("older page unavailable"));
+
+    await useStore.getState().loadOlderCodexActivity("s1");
+
+    expect(useStore.getState().codexActivityPaging.s1).toMatchObject({
+      hasMore: true,
+      nextCursor: 50,
+      loadingOlder: false,
+    });
+  });
+
+  it("hydrates only the requested session", async () => {
+    useStore.setState({ codexActivity: { s1: [activityEvent(10)] } });
+    m.getCodexActivity.mockResolvedValue([
+      { ...activityEvent(1), sessionId: "s2", threadId: "thread-2" },
+    ]);
+
+    await useStore.getState().loadCodexActivity("s2");
+
+    expect(useStore.getState().codexActivity.s1?.map((candidate) => candidate.sequence)).toEqual([
+      10,
+    ]);
+    expect(useStore.getState().codexActivity.s2?.map((candidate) => candidate.sequence)).toEqual([
+      1,
+    ]);
+  });
+
+  it("appends persisted live activity once when the session listener replays a sequence", async () => {
+    let emit!: (event: StreamEvent) => void;
+    m.subscribeSessionEvents.mockImplementation(async (_sessionId, onEvent) => {
+      emit = onEvent;
+      return () => {};
+    });
+    useStore.setState({
+      sessions: [session({ id: "s1" })],
+      activeId: "s1",
+      messages: { s1: [] },
+      codexActivity: { s1: [activityEvent(1)] },
+    });
+
+    await useStore.getState().selectSession("s1");
+    const live: StreamEvent = {
+      type: "codex_event",
+      sequence: 2,
+      threadId: "thread-1",
+      turnId: "turn-1",
+      itemId: "item-2",
+      method: "future/live",
+      params: { source: "live" },
+      emittedAtMs: 20,
+    };
+    emit(live);
+    emit({ ...live, params: { source: "replay" } });
+
+    expect(useStore.getState().codexActivity.s1).toEqual([
+      activityEvent(1),
+      {
+        sequence: 2,
+        sessionId: "s1",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "item-2",
+        method: "future/live",
+        params: { source: "live" },
+        emittedAtMs: 20,
+      },
+    ]);
+  });
+
+  it("rebuilds one completed composite identically after message and activity hydration", async () => {
+    const compositeEvent = (
+      sequence: number,
+      threadId: string,
+      turnId: string,
+      method: string,
+      params: unknown,
+      itemId?: string,
+    ): CodexActivityEvent => ({
+      sequence,
+      sessionId: "s1",
+      threadId,
+      turnId,
+      itemId,
+      method,
+      params,
+      emittedAtMs: sequence * 10,
+    });
+    const canonicalTurn = (id: string, status: "inProgress" | "completed") => ({
+      id,
+      items: [],
+      itemsView: "full",
+      status,
+      error: null,
+      startedAt: 1,
+      completedAt: status === "completed" ? 2 : null,
+      durationMs: status === "completed" ? 1_000 : null,
+    });
+    const canonicalChildThread = {
+      id: "child-thread",
+      sessionId: "codex-session-tree",
+      forkedFromId: null,
+      parentThreadId: "root-thread",
+      preview: "schema-valid thread",
+      ephemeral: false,
+      modelProvider: "openai",
+      createdAt: 1,
+      updatedAt: 1,
+      recencyAt: 1,
+      status: { type: "idle" },
+      path: null,
+      cwd: "C:/work",
+      cliVersion: "0.145.0",
+      source: "appServer",
+      threadSource: "user",
+      agentNickname: null,
+      agentRole: null,
+      gitInfo: null,
+      name: null,
+      turns: [],
+    };
+    const events = [
+      compositeEvent(1, "root-thread", "root-turn", "turn/started", {
+        threadId: "root-thread",
+        turn: canonicalTurn("root-turn", "inProgress"),
+      }),
+      compositeEvent(2, "root-thread", "root-turn", "turn/plan/updated", {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        explanation: "Composite fixture plan",
+        plan: [
+          { step: "Inspect durable state", status: "completed" },
+          { step: "Reload exactly once", status: "inProgress" },
+        ],
+      }),
+      compositeEvent(
+        3,
+        "root-thread",
+        "root-turn",
+        "item/started",
+        {
+          threadId: "root-thread",
+          turnId: "root-turn",
+          item: {
+            id: "command-1",
+            type: "commandExecution",
+            command: "cargo test composite",
+            cwd: "C:/work",
+            processId: null,
+            source: "agent",
+            status: "inProgress",
+            commandActions: [{ type: "unknown", command: "cargo test composite" }],
+            aggregatedOutput: null,
+            exitCode: null,
+            durationMs: null,
+          },
+          startedAtMs: 1_000,
+        },
+        "command-1",
+      ),
+      compositeEvent(
+        4,
+        "root-thread",
+        "root-turn",
+        "item/completed",
+        {
+          threadId: "root-thread",
+          turnId: "root-turn",
+          item: {
+            id: "command-1",
+            type: "commandExecution",
+            command: "cargo test composite",
+            cwd: "C:/work",
+            processId: null,
+            source: "agent",
+            status: "completed",
+            commandActions: [{ type: "unknown", command: "cargo test composite" }],
+            aggregatedOutput: "composite command complete",
+            exitCode: 0,
+            durationMs: 12,
+          },
+          completedAtMs: 1_012,
+        },
+        "command-1",
+      ),
+      compositeEvent(
+        5,
+        "root-thread",
+        "root-turn",
+        "item/started",
+        {
+          threadId: "root-thread",
+          turnId: "root-turn",
+          item: {
+            id: "spawn-child",
+            type: "collabAgentToolCall",
+            tool: "spawnAgent",
+            status: "inProgress",
+            senderThreadId: "root-thread",
+            receiverThreadIds: ["child-thread"],
+            prompt: "Audit dependencies",
+            model: "gpt-5.6-terra",
+            reasoningEffort: "high",
+            agentsStates: {},
+          },
+          startedAtMs: 1_020,
+        },
+        "spawn-child",
+      ),
+      compositeEvent(6, "child-thread", "child-turn", "thread/started", {
+        thread: canonicalChildThread,
+      }),
+      compositeEvent(7, "child-thread", "child-turn", "turn/started", {
+        threadId: "child-thread",
+        turn: canonicalTurn("child-turn", "inProgress"),
+      }),
+      compositeEvent(8, "child-thread", "child-turn", "turn/completed", {
+        threadId: "child-thread",
+        turn: canonicalTurn("child-turn", "completed"),
+      }),
+      compositeEvent(9, "root-thread", "root-turn", "future/rootComposite", {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        safe: "root unknown survives",
+      }),
+      compositeEvent(10, "child-thread", "child-turn", "future/childComposite", {
+        threadId: "child-thread",
+        turnId: "child-turn",
+        safe: "child unknown remains child-owned",
+      }),
+      compositeEvent(
+        11,
+        "root-thread",
+        "root-turn",
+        "item/completed",
+        {
+          threadId: "root-thread",
+          turnId: "root-turn",
+          item: {
+            id: "message-final",
+            type: "agentMessage",
+            text: "AUTHORITATIVE FINAL COMPOSITE",
+            phase: "final_answer",
+            memoryCitation: null,
+          },
+          completedAtMs: 1_100,
+        },
+        "message-final",
+      ),
+      compositeEvent(12, "root-thread", "root-turn", "turn/diff/updated", {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        diff: "+durable composite diff",
+      }),
+      compositeEvent(13, "root-thread", "root-turn", "turn/completed", {
+        threadId: "root-thread",
+        turn: canonicalTurn("root-turn", "completed"),
+      }),
+    ];
+    const changedFiles: TurnChangedFile[] = [
+      {
+        path: "src/composite.ts",
+        status: "modified",
+        additions: 1,
+        deletions: 0,
+        binary: false,
+        certainty: "exact",
+      },
+    ];
+    const receipt = turnReceipt({
+      turnId: "root-turn",
+      changedFiles,
+      changedFileCount: 1,
+      additions: 1,
+    });
+    const finalMessage: Message = {
+      id: "root-turn",
+      role: "assistant",
+      blocks: [{ kind: "text", text: "AUTHORITATIVE FINAL COMPOSITE" }],
+      createdAt: receipt.startedAt,
+      turnId: "root-turn",
+      receipt,
+    };
+    const terminalAgent = {
+      id: "child-thread",
+      description: "Audit dependencies",
+      status: "ok" as const,
+      step: 1,
+      parentThreadId: "root-thread",
+      launchTurnId: "root-turn",
+      currentTurnId: "child-turn",
+      turnCount: 1,
+      providerStatus: "completed",
+      activity: "turnCompleted",
+      model: "gpt-5.6-terra",
+      reasoningEffort: "high",
+    };
+    const semanticSnapshot = () => {
+      const state = useStore.getState();
+      const activity = state.codexActivity.s1 ?? [];
+      const projection = projectCodexActivity(activity);
+      const root = projection.turns[codexTurnKey("s1", "root-turn")]!;
+      const rootUnknown = projection.unknown.filter(
+        (record) => record.threadId === "root-thread" && record.turnId === "root-turn",
+      );
+      const agent = state.agents.s1?.find((candidate) => candidate.id === "child-thread");
+      return {
+        assistant: (state.messages.s1 ?? []).filter(
+          (message) => message.role === "assistant" && message.turnId === "root-turn",
+        ),
+        receiptCount: (state.messages.s1 ?? []).filter(
+          (message) => message.turnId === "root-turn" && message.receipt,
+        ).length,
+        rootStatus: root.status,
+        plan: root.plan,
+        finalPlanText: (state.messages.s1 ?? [])
+          .flatMap((message) => message.blocks)
+          .filter((block) => block.kind === "text")
+          .map((block) => block.text),
+        command: root.commands["command-1"],
+        diff: root.turnDiff,
+        rootUnknown,
+        agent: agent
+          ? {
+              id: agent.id,
+              parentThreadId: agent.parentThreadId,
+              launchTurnId: agent.launchTurnId,
+              currentTurnId: agent.currentTurnId,
+              turnCount: agent.turnCount,
+              status: agent.status,
+              result: agent.result,
+            }
+          : null,
+        sequences: activity.map((candidate) => candidate.sequence),
+        rootEncoded: JSON.stringify(root),
+        messagesEncoded: JSON.stringify(state.messages.s1 ?? []),
+      };
+    };
+
+    useStore.setState({
+      messages: { s1: [finalMessage] },
+      codexActivity: { s1: events },
+      agents: { s1: [terminalAgent] },
+    });
+    const beforeReload = semanticSnapshot();
+
+    useStore.setState({
+      messages: {},
+      messageLoads: {},
+      codexActivity: {},
+      codexActivityPaging: {},
+      agents: {},
+    });
+    m.getMessagePage.mockResolvedValueOnce({ messages: [finalMessage], nextCursor: null });
+    m.getCodexActivity.mockResolvedValueOnce({
+      events,
+      hasMore: false,
+      nextCursor: null,
+    } as never);
+
+    await useStore.getState().hydrateMessages("s1", { force: true });
+    await useStore.getState().loadCodexActivity("s1");
+
+    const afterReload = semanticSnapshot();
+    expect(afterReload).toEqual(beforeReload);
+    expect(afterReload.assistant).toHaveLength(1);
+    expect(afterReload.receiptCount).toBe(1);
+    expect(afterReload.rootStatus).toBe("completed");
+    expect(afterReload.plan).toMatchObject({
+      terminal: true,
+      steps: [
+        { text: "Inspect durable state", status: "completed" },
+        { text: "Reload exactly once", status: "inProgress" },
+      ],
+    });
+    expect(afterReload.finalPlanText).toEqual(["AUTHORITATIVE FINAL COMPOSITE"]);
+    expect(afterReload.command).toMatchObject({
+      status: "completed",
+      terminal: true,
+      exitCode: 0,
+      output: "composite command complete",
+    });
+    expect(afterReload.diff).toMatchObject({ text: "+durable composite diff" });
+    expect(afterReload.rootUnknown).toEqual([
+      expect.objectContaining({ method: "future/rootComposite", sequence: 9 }),
+    ]);
+    expect(afterReload.agent).toMatchObject({
+      id: "child-thread",
+      parentThreadId: "root-thread",
+      launchTurnId: "root-turn",
+      currentTurnId: "child-turn",
+      turnCount: 1,
+      status: "ok",
+    });
+    expect(afterReload.sequences).toEqual(events.map((candidate) => candidate.sequence));
+    expect(new Set(afterReload.sequences).size).toBe(events.length);
+    expect(afterReload.rootEncoded).not.toContain("child unknown remains child-owned");
+    expect(afterReload.rootEncoded).not.toContain("child-turn");
+    expect(afterReload.messagesEncoded).not.toContain("Composite fixture plan");
+    expect(afterReload.messagesEncoded).not.toContain("child unknown remains child-owned");
+    expect(afterReload.messagesEncoded).not.toContain("ghost");
+  });
+
+  it("rebuilds nested child lifecycle, turn counts, and results after reload", async () => {
+    const event = (
+      sequence: number,
+      threadId: string,
+      turnId: string,
+      method: string,
+      params: unknown,
+      itemId?: string,
+    ): CodexActivityEvent => ({
+      sequence,
+      sessionId: "s1",
+      threadId,
+      turnId,
+      itemId,
+      method,
+      params,
+      emittedAtMs: sequence * 10,
+    });
+    m.getCodexActivity.mockResolvedValue([
+      event(1, "root-thread", "root-turn", "item/started", {
+        threadId: "root-thread",
+        turnId: "root-turn",
+        item: {
+          id: "spawn-a",
+          type: "collabAgentToolCall",
+          tool: "spawnAgent",
+          status: "inProgress",
+          senderThreadId: "root-thread",
+          receiverThreadIds: ["child-a"],
+          prompt: "audit dependencies",
+          model: "gpt-5.6-terra",
+          reasoningEffort: "high",
+          agentsStates: {},
+        },
+      }),
+      event(2, "child-a", "child-turn-1", "thread/started", {
+        thread: { id: "child-a", parentThreadId: "root-thread" },
+      }),
+      event(3, "child-a", "child-turn-1", "turn/started", {
+        threadId: "child-a",
+        turn: { id: "child-turn-1", status: "inProgress", items: [] },
+      }),
+      event(4, "child-a", "child-turn-1", "item/started", {
+        threadId: "child-a",
+        turnId: "child-turn-1",
+        item: {
+          id: "spawn-b",
+          type: "collabAgentToolCall",
+          tool: "spawnAgent",
+          status: "inProgress",
+          senderThreadId: "child-a",
+          receiverThreadIds: ["child-b"],
+          prompt: "inspect nested package",
+          model: null,
+          reasoningEffort: null,
+          agentsStates: {},
+        },
+      }),
+      event(5, "child-b", "nested-turn-1", "thread/started", {
+        thread: { id: "child-b", parentThreadId: "child-a" },
+      }),
+      event(6, "child-b", "nested-turn-1", "turn/started", {
+        threadId: "child-b",
+        turn: { id: "nested-turn-1", status: "inProgress", items: [] },
+      }),
+      event(7, "child-a", "child-turn-1", "item/completed", {
+        threadId: "child-a",
+        turnId: "child-turn-1",
+        item: {
+          id: "message-a",
+          type: "agentMessage",
+          text: "audit complete",
+          phase: "final_answer",
+        },
+      }),
+      event(8, "child-a", "child-turn-1", "turn/completed", {
+        threadId: "child-a",
+        turn: { id: "child-turn-1", status: "completed", items: [] },
+      }),
+      event(9, "child-a", "child-turn-1", "item/completed", {
+        threadId: "child-a",
+        turnId: "child-turn-1",
+        item: {
+          id: "spawn-b",
+          type: "collabAgentToolCall",
+          tool: "spawnAgent",
+          status: "completed",
+          senderThreadId: "child-a",
+          receiverThreadIds: ["child-b"],
+          prompt: "inspect nested package",
+          model: null,
+          reasoningEffort: null,
+          agentsStates: { "child-b": { status: "errored", message: "nested audit failed" } },
+        },
+      }),
+    ]);
+
+    await useStore.getState().loadCodexActivity("s1");
+
+    expect(useStore.getState().agents.s1).toEqual([
+      expect.objectContaining({
+        id: "child-a",
+        parentThreadId: "root-thread",
+        launchTurnId: "root-turn",
+        currentTurnId: "child-turn-1",
+        turnCount: 1,
+        status: "ok",
+        result: "audit complete",
+        model: "gpt-5.6-terra",
+        reasoningEffort: "high",
+      }),
+      expect.objectContaining({
+        id: "child-b",
+        parentId: "child-a",
+        parentThreadId: "child-a",
+        launchTurnId: "child-turn-1",
+        currentTurnId: "nested-turn-1",
+        turnCount: 1,
+        status: "error",
+        result: "nested audit failed",
+      }),
+    ]);
+  });
+
+  it("merges hydration with newer live terminal state without duplicates or regression", async () => {
+    let resolveLoad!: (events: CodexActivityEvent[]) => void;
+    m.getCodexActivity.mockImplementation(
+      () => new Promise<CodexActivityEvent[]>((resolve) => (resolveLoad = resolve)),
+    );
+    const load = useStore.getState().loadCodexActivity("s1");
+    useStore.setState({
+      agents: {
+        s1: [
+          {
+            id: "child-a",
+            description: "Codex subagent",
+            status: "error",
+            step: 3,
+            turnCount: 3,
+            currentTurnId: "child-turn-3",
+            result: "live failure",
+          },
+        ],
+      },
+    });
+    resolveLoad([
+      {
+        sequence: 1,
+        sessionId: "s1",
+        threadId: "root-thread",
+        turnId: "root-turn",
+        itemId: "spawn-a",
+        method: "item/started",
+        params: {
+          threadId: "root-thread",
+          turnId: "root-turn",
+          item: {
+            id: "spawn-a",
+            type: "collabAgentToolCall",
+            tool: "spawnAgent",
+            status: "inProgress",
+            senderThreadId: "root-thread",
+            receiverThreadIds: ["child-a"],
+            prompt: "audit dependencies",
+            model: "gpt-5.6-terra",
+            reasoningEffort: "high",
+            agentsStates: {},
+          },
+        },
+        emittedAtMs: 10,
+      },
+      {
+        sequence: 2,
+        sessionId: "s1",
+        threadId: "child-a",
+        turnId: "child-turn-1",
+        method: "turn/started",
+        params: {
+          threadId: "child-a",
+          turn: { id: "child-turn-1", status: "inProgress", items: [] },
+        },
+        emittedAtMs: 20,
+      },
+    ]);
+    await load;
+
+    expect(useStore.getState().agents.s1).toEqual([
+      expect.objectContaining({
+        id: "child-a",
+        description: "audit dependencies",
+        status: "error",
+        step: 3,
+        turnCount: 3,
+        currentTurnId: "child-turn-3",
+        result: "live failure",
+        model: "gpt-5.6-terra",
+        reasoningEffort: "high",
+      }),
+    ]);
+  });
+
+  it("restores exact subAgentActivity states and retains unrelated newer live rows", async () => {
+    useStore.setState({
+      agents: {
+        s1: [{ id: "live-only", description: "live row", status: "running", step: 1 }],
+      },
+    });
+    m.getCodexActivity.mockResolvedValue([
+      {
+        sequence: 1,
+        sessionId: "s1",
+        threadId: "root-thread",
+        turnId: "root-turn",
+        method: "item/started",
+        params: {
+          threadId: "root-thread",
+          turnId: "root-turn",
+          item: {
+            id: "state-spawn",
+            type: "collabAgentToolCall",
+            tool: "spawnAgent",
+            status: "inProgress",
+            senderThreadId: "root-thread",
+            receiverThreadIds: [null, "state-child"],
+            prompt: "state child",
+            model: null,
+            reasoningEffort: null,
+            agentsStates: {
+              "state-child": { status: "running", message: null },
+              "unrouted-child": { status: "completed", message: "must not create a row" },
+            },
+          },
+        },
+        emittedAtMs: 10,
+      },
+      {
+        sequence: 2,
+        sessionId: "s1",
+        threadId: "root-thread",
+        turnId: "root-turn",
+        method: "item/started",
+        params: {
+          threadId: "root-thread",
+          turnId: "root-turn",
+          item: {
+            id: "activity-started",
+            type: "subAgentActivity",
+            kind: "started",
+            agentThreadId: "activity-child",
+            agentPath: "activity audit",
+          },
+        },
+        emittedAtMs: 20,
+      },
+      {
+        sequence: 3,
+        sessionId: "s1",
+        threadId: "root-thread",
+        turnId: "root-turn",
+        method: "item/completed",
+        params: {
+          threadId: "root-thread",
+          turnId: "root-turn",
+          item: {
+            id: "activity-interrupted",
+            type: "subAgentActivity",
+            kind: "interrupted",
+            agentThreadId: "activity-child",
+            agentPath: "activity audit",
+          },
+        },
+        emittedAtMs: 30,
+      },
+    ]);
+
+    await useStore.getState().loadCodexActivity("s1");
+
+    expect(useStore.getState().agents.s1).toEqual([
+      expect.objectContaining({ id: "state-child", status: "running" }),
+      expect.objectContaining({
+        id: "activity-child",
+        description: "activity audit",
+        status: "cancelled",
+        activity: "interrupted",
+      }),
+      expect.objectContaining({ id: "live-only", description: "live row", status: "running" }),
+    ]);
+  });
 });
 
 describe("init", () => {
@@ -3174,6 +4171,15 @@ describe("send", () => {
     emit({ type: "tool_result", id: "t1", output: "ok", isError: false });
     expect(assistant().blocks).toHaveLength(3);
 
+    // An authoritative completion snapshot replaces a contradictory draft/tool
+    // transcript for this exact turn without appending duplicate text.
+    emit({
+      type: "assistant_message_snapshot",
+      turnId: assistant().turnId!,
+      blocks: [{ type: "text", text: "Authoritative final answer" }],
+    });
+    expect(assistant().blocks).toEqual([{ kind: "text", text: "Authoritative final answer" }]);
+
     // usage accumulates per session
     emit({ type: "usage", inputTokens: 100, outputTokens: 40 });
     emit({ type: "usage", inputTokens: 10, outputTokens: 5 });
@@ -4285,7 +5291,15 @@ describe("stop", () => {
         ],
       },
       agents: {
-        a: [{ id: "child", description: "check", status: "running", step: 1 }],
+        a: [
+          {
+            id: "child",
+            description: "check",
+            launchTurnId: "assistant",
+            status: "running",
+            step: 1,
+          },
+        ],
       },
       streaming: true,
       cancel,
@@ -8796,7 +9810,7 @@ describe("live subagents (agents panel)", () => {
     expect(a[1].parentId).toBe("g1");
   });
 
-  it("maps the finish status string, defaulting an unknown value to ok", async () => {
+  it("maps an unknown future finish status to an honest unknown state", async () => {
     const emit = await startTurn();
     emit({ type: "agent_started", agentId: "c", description: "x" });
     emit({ type: "agent_finished", agentId: "c", status: "cancelled" });
@@ -8804,25 +9818,277 @@ describe("live subagents (agents panel)", () => {
 
     emit({ type: "agent_started", agentId: "e", description: "y" });
     emit({ type: "agent_finished", agentId: "e", status: "kaboom" });
-    expect(useStore.getState().agents.a.find((x) => x.id === "e")?.status).toBe("ok");
+    expect(useStore.getState().agents.a.find((x) => x.id === "e")?.status).toBe("unknown");
   });
 
-  it("clears the previous turn's subagents when a new turn starts", async () => {
+  it("keeps prior-turn terminal agent evidence when a new turn starts", async () => {
     const emit = await startTurn();
-    emit({ type: "agent_started", agentId: "g1", description: "old" });
+    const launchTurnId = useStore.getState().runs.a.turnId!;
+    emit({
+      type: "agent_started",
+      agentId: "g1",
+      description: "old",
+      launchTurnId,
+    });
     expect(useStore.getState().agents.a).toHaveLength(1);
     emit({ type: "turn_end", stopReason: "end_turn" });
 
-    // The next turn on the same session starts with an empty panel.
+    const terminal = useStore.getState().agents.a[0];
+    expect(terminal.status).not.toBe("running");
+
     await useStore.getState().send("again");
-    expect(useStore.getState().agents.a).toEqual([]);
+    expect(useStore.getState().agents.a).toEqual([terminal]);
   });
 
-  it("ignores a progress/finished event for an agent it never saw start", async () => {
+  it("terminalizes only agents owned by the authoritative root turn, including descendants", async () => {
     const emit = await startTurn();
-    emit({ type: "agent_progress", agentId: "ghost", step: 2 });
-    emit({ type: "agent_finished", agentId: "ghost", status: "ok" });
-    expect(useStore.getState().agents.a).toEqual([]);
+    emit({
+      type: "turn_start",
+      messageId: "message-turn-2",
+      turnId: "turn-2",
+      startedAt: 200,
+    });
+    useStore.setState({
+      agents: {
+        a: [
+          {
+            id: "older-independent",
+            description: "older independent work",
+            status: "running",
+            step: 2,
+            launchTurnId: "turn-1",
+          },
+          {
+            id: "owned-root-child",
+            description: "owned child",
+            status: "running",
+            step: 1,
+            launchTurnId: "turn-2",
+          },
+          {
+            id: "owned-nested-child",
+            description: "owned nested child",
+            status: "running",
+            step: 1,
+            parentId: "owned-root-child",
+            launchTurnId: "child-turn-1",
+          },
+        ],
+      },
+    });
+
+    emit({
+      type: "turn_end",
+      stopReason: "cancelled",
+      receipt: turnReceipt({
+        turnId: "turn-2",
+        status: "cancelled",
+        stopReason: "cancelled",
+      }),
+    });
+
+    expect(useStore.getState().agents.a).toEqual([
+      expect.objectContaining({ id: "older-independent", status: "running" }),
+      expect.objectContaining({ id: "owned-root-child", status: "cancelled" }),
+      expect.objectContaining({ id: "owned-nested-child", status: "cancelled" }),
+    ]);
+  });
+
+  it("upserts missed progress/finish and lets a late start enrich without regression", async () => {
+    const emit = await startTurn();
+    emit({
+      type: "agent_progress",
+      agentId: "ghost",
+      step: 2,
+      parentThreadId: "root-thread",
+      launchTurnId: "root-turn",
+      currentTurnId: "child-turn-2",
+      turnCount: 2,
+    });
+    expect(useStore.getState().agents.a[0]).toMatchObject({
+      id: "ghost",
+      status: "running",
+      step: 2,
+      turnCount: 2,
+      currentTurnId: "child-turn-2",
+    });
+
+    emit({
+      type: "agent_finished",
+      agentId: "ghost",
+      status: "error",
+      result: "dependency audit failed",
+      providerStatus: "errored",
+      launchTurnId: "root-turn",
+    });
+    emit({
+      type: "agent_started",
+      agentId: "ghost",
+      description: "audit dependencies",
+      parentId: "parent-agent",
+      parentThreadId: "parent-agent",
+      launchTurnId: "root-turn",
+      model: "gpt-5.6-terra",
+      reasoningEffort: "high",
+    });
+
+    expect(useStore.getState().agents.a).toEqual([
+      expect.objectContaining({
+        id: "ghost",
+        description: "audit dependencies",
+        parentId: "parent-agent",
+        status: "error",
+        step: 2,
+        turnCount: 2,
+        result: "dependency audit failed",
+        providerStatus: "errored",
+        model: "gpt-5.6-terra",
+        reasoningEffort: "high",
+      }),
+    ]);
+  });
+
+  it("applies wire-safe remote Codex activity payloads without raw provider fields", () => {
+    useStore.setState({ activeId: "a", codexActivity: {} });
+    const frames = [
+      {
+        type: "codex_activity",
+        kind: "event",
+        method: "turn/plan/updated",
+        threadId: "thread-hash",
+        turnId: "turn-hash",
+        sequence: 10,
+        emittedAtMs: 100,
+        redacted: false,
+        truncated: false,
+        payload: { type: "plan", steps: [{ status: "completed" }, { status: "inProgress" }] },
+      },
+      {
+        type: "codex_activity",
+        kind: "event",
+        method: "turn/diff/updated",
+        threadId: "thread-hash",
+        turnId: "turn-hash",
+        sequence: 11,
+        emittedAtMs: 110,
+        redacted: false,
+        truncated: false,
+        payload: { type: "diff", additions: 4, deletions: 2, files: 1 },
+      },
+      {
+        type: "codex_activity",
+        kind: "event",
+        method: "item/completed",
+        threadId: "thread-hash",
+        turnId: "turn-hash",
+        itemId: "item-hash",
+        sequence: 12,
+        emittedAtMs: 120,
+        redacted: true,
+        truncated: false,
+        payload: {
+          type: "tool",
+          itemType: "commandExecution",
+          status: "completed",
+          terminal: true,
+        },
+      },
+      {
+        type: "codex_activity",
+        kind: "event",
+        method: "turn/completed",
+        threadId: "thread-hash",
+        turnId: "turn-hash",
+        sequence: 13,
+        emittedAtMs: 130,
+        redacted: false,
+        truncated: false,
+        payload: { type: "terminal", status: "completed" },
+      },
+      {
+        type: "codex_activity",
+        kind: "event",
+        method: "future/safe-metadata",
+        threadId: "thread-hash",
+        sequence: 14,
+        emittedAtMs: 140,
+        redacted: true,
+        truncated: true,
+        redactionReasons: ["rawReasoning"],
+      },
+    ];
+
+    for (const event of frames) {
+      useStore.getState().applyFrame({
+        t: "live",
+        session_id: "a",
+        event,
+      } as unknown as SyncFrame);
+    }
+
+    const activity = useStore.getState().codexActivity.a;
+    expect(activity.map((candidate) => candidate.method)).toEqual([
+      "turn/plan/updated",
+      "turn/diff/updated",
+      "item/completed",
+      "turn/completed",
+      "future/safe-metadata",
+    ]);
+    expect(activity[0]?.params).toMatchObject({
+      plan: [{ status: "completed" }, { status: "inProgress" }],
+    });
+    expect(activity[1]?.params).toMatchObject({ additions: 4, deletions: 2, files: 1 });
+    expect(activity[2]?.params).toMatchObject({
+      item: { id: "item-hash", type: "commandExecution", status: "completed" },
+    });
+    expect(JSON.stringify(activity)).not.toMatch(
+      /credential|absolute|RAW_SENTINEL|chain.of.thought/i,
+    );
+  });
+
+  it("replaces contradictory remote assistant text by exact turn snapshot", () => {
+    useStore.setState({
+      activeId: "a",
+      messages: {
+        a: [
+          {
+            id: "message-a",
+            role: "assistant",
+            blocks: [{ kind: "text", text: "contradictory streamed draft" }],
+            createdAt: 1,
+            turnId: "turn-a",
+          },
+          {
+            id: "message-newer",
+            role: "assistant",
+            blocks: [{ kind: "text", text: "newer turn" }],
+            createdAt: 2,
+            turnId: "turn-newer",
+          },
+        ],
+      },
+    });
+
+    useStore.getState().applyFrame({
+      t: "live",
+      session_id: "a",
+      event: {
+        type: "assistant_message_snapshot",
+        turnId: "turn-a",
+        blocks: [{ type: "text", text: "authoritative final answer" }],
+      },
+    } as unknown as SyncFrame);
+
+    expect(useStore.getState().messages.a).toEqual([
+      expect.objectContaining({
+        turnId: "turn-a",
+        blocks: [{ kind: "text", text: "authoritative final answer" }],
+      }),
+      expect.objectContaining({
+        turnId: "turn-newer",
+        blocks: [{ kind: "text", text: "newer turn" }],
+      }),
+    ]);
   });
 
   it("folds agent events from a phone live frame onto their session", () => {
@@ -8836,9 +10102,29 @@ describe("live subagents (agents panel)", () => {
     expect(useStore.getState().agents.a[0]).toMatchObject({ description: "remote", step: 2 });
   });
 
-  it("clears the prior turn's subagents at the start of a new remote turn (phone path)", () => {
-    // The phone has no local send() for the turn — the desktop drives it — so the
-    // per-turn reset must happen on the turn_start frame, symmetric to the desktop.
+  it("projects a future remote finish status safely as unknown", () => {
+    useStore.setState({ activeId: "a", agents: {} });
+    useStore.getState().applyFrame({
+      t: "live",
+      session_id: "a",
+      event: {
+        type: "agent_finished",
+        agentId: "remote-child",
+        status: "future-provider-state",
+        providerStatus: "future-provider-state",
+      },
+    });
+
+    expect(useStore.getState().agents.a).toEqual([
+      expect.objectContaining({
+        id: "remote-child",
+        status: "unknown",
+        providerStatus: "future-provider-state",
+      }),
+    ]);
+  });
+
+  it("keeps prior terminal agent evidence at a new remote turn boundary", () => {
     useStore.setState({
       activeId: "a",
       agents: { a: [{ id: "old", description: "prior turn", status: "ok", step: 4 }] },
@@ -8846,14 +10132,12 @@ describe("live subagents (agents panel)", () => {
     const frame = (event: StreamEvent): SyncFrame => ({ t: "live", session_id: "a", event });
 
     useStore.getState().applyFrame(frame({ type: "turn_start", messageId: "m2" }));
-    // The stale finished subagent from the previous turn is gone.
-    expect(useStore.getState().agents.a).toEqual([]);
+    expect(useStore.getState().agents.a.map((x) => x.id)).toEqual(["old"]);
 
-    // This turn's subagents repopulate the now-empty panel (no accumulation).
     useStore
       .getState()
       .applyFrame(frame({ type: "agent_started", agentId: "new", description: "fresh" }));
-    expect(useStore.getState().agents.a.map((x) => x.id)).toEqual(["new"]);
+    expect(useStore.getState().agents.a.map((x) => x.id)).toEqual(["old", "new"]);
   });
 
   it("cancelAgent calls the per-agent IPC on the desktop", async () => {
@@ -8869,9 +10153,9 @@ describe("live subagents (agents panel)", () => {
     expect(m.cancelAgentById).not.toHaveBeenCalled();
   });
 
-  it("cancelAgent swallows an IPC failure so the panel never throws", async () => {
+  it("cancelAgent rejects on IPC failure so mounted controls can offer Retry Stop", async () => {
     m.cancelAgentById.mockRejectedValueOnce(new Error("ipc boom"));
-    await expect(useStore.getState().cancelAgent("g1")).resolves.toBeUndefined();
+    await expect(useStore.getState().cancelAgent("g1")).rejects.toThrow("ipc boom");
   });
 });
 
@@ -8991,9 +10275,8 @@ describe("background shell tasks (background-tasks panel)", () => {
       agents: { a: [{ id: "g", description: "x", status: "running", step: 1 }] },
     });
     useStore.getState().applyFrame(bgFrame("a", { type: "turn_start", messageId: "m2" }));
-    // The subagent panel resets...
-    expect(useStore.getState().agents.a).toEqual([]);
-    // ...but the running background task is untouched.
+    // Historical agent evidence and the running background task are both retained.
+    expect(useStore.getState().agents.a).toHaveLength(1);
     expect(useStore.getState().backgroundTasks.a).toHaveLength(1);
     expect(useStore.getState().backgroundTasks.a[0].id).toBe("t1");
   });

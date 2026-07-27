@@ -23,6 +23,8 @@ export interface TurnReceiptProps {
   finalizing?: boolean;
   /** Observable tool/subagent UI only. Never pass hidden provider reasoning here. */
   activity?: ReactNode;
+  /** Activity that must not exist in the DOM until the disclosure is opened. */
+  deferredActivity?: ReactNode;
   activityCount?: number;
 }
 
@@ -51,11 +53,12 @@ export function TurnReceipt({
   waiting = false,
   finalizing = false,
   activity,
+  deferredActivity,
   activityCount = 0,
 }: TurnReceiptProps) {
   const detailsId = useId();
   const [open, setOpen] = useState(false);
-  const hasActivity = activityCount > 0 && activity != null;
+  const hasActivity = activityCount > 0 && (activity != null || deferredActivity != null);
   const toggleRef = useRef<HTMLButtonElement>(null);
   const detailsRef = useRef<HTMLDivElement>(null);
   const lifecycleLive = active || finalizing;
@@ -175,6 +178,7 @@ export function TurnReceipt({
               }}
             >
               {activity}
+              {open ? deferredActivity : null}
             </div>
           </div>
         </div>
