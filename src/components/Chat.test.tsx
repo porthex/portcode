@@ -666,17 +666,18 @@ describe("Chat transcript", () => {
     });
 
     const { container } = render(<Chat />);
-    const toggles = screen.getAllByRole("button", { name: /expand work activity/i });
-    expect(toggles).toHaveLength(2);
-    fireEvent.click(toggles[0]!);
-    fireEvent.click(toggles[1]!);
+    expect(screen.queryByRole("button", { name: /expand work activity/i })).toBeNull();
 
     const first = container.querySelector<HTMLElement>("#pc-msg-assistant-1")!;
     const second = container.querySelector<HTMLElement>("#pc-msg-assistant-2")!;
-    expect(within(first).getByText("first turn agent")).toBeInTheDocument();
-    expect(within(first).queryByText("second turn agent")).toBeNull();
-    expect(within(second).getByText("second turn agent")).toBeInTheDocument();
-    expect(within(second).queryByText("first turn agent")).toBeNull();
+    expect(within(first).getByRole("region", { name: "Codex swarm workflow" })).toHaveTextContent(
+      "All 1 agent completed",
+    );
+    expect(within(second).getByRole("region", { name: "Codex swarm workflow" })).toHaveTextContent(
+      "1 of 1 agent failed",
+    );
+    expect(document.body).not.toHaveTextContent("first turn agent");
+    expect(document.body).not.toHaveTextContent("second turn agent");
   });
 
   it("never projects exact child-thread activity into a parent receipt", () => {

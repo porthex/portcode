@@ -25,3 +25,22 @@ describe("expanded turn receipt layout", () => {
     expect(detailsRule).not.toMatch(/\boverflow(?:-y)?\s*:\s*(?:auto|scroll|hidden)/);
   });
 });
+
+describe("inline agent workflow card", () => {
+  it("stays in transcript flow without creating a nested scroller", () => {
+    const cardRule = css.match(/\.pc-agent-workflow\s*\{([^}]*)\}/)?.[1];
+
+    expect(cardRule).toBeDefined();
+    expect(cardRule).not.toMatch(/\bmax-height\s*:/);
+    expect(cardRule).not.toMatch(/\boverflow(?:-y)?\s*:\s*(?:auto|scroll)/);
+  });
+
+  it("has a constrained-width collapse and reduced-motion-safe live signal", () => {
+    expect(css).toMatch(
+      /@container\s*\(max-width:\s*520px\)\s*\{[\s\S]*?\.pc-agent-workflow\s*\{[^}]*grid-template-columns:\s*1fr;/,
+    );
+    expect(css).toMatch(
+      /@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*?\.pc-agent-workflow__signal-core\s*\{[^}]*animation:\s*none;/,
+    );
+  });
+});

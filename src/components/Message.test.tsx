@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, act } from "@testing-library/react";
+import { render, screen, fireEvent, act, within } from "@testing-library/react";
 
 import { MessageView } from "./Message";
 import { markdownLiteralText } from "../lib/sessionFormat";
@@ -654,90 +654,143 @@ describe("MessageView — turn receipt presentation", () => {
     expect(screen.getByText("Read file")).toBeInTheDocument();
   });
 
-  it("shows subagent activity as observable work without exposing a reasoning surface", () => {
+  it("promotes a compact swarm card inline and does not mount child prompts in Working", () => {
+    const privatePrompt = "Audit accessibility at C:\\private\\repo";
     const { container } = render(
       <MessageView
         message={{
-          ...message("assistant", [{ kind: "text", text: "Delegation complete." }]),
+          ...message("assistant", [
+            { kind: "text", text: "I’m launching a focused swarm." },
+            { kind: "text", text: "I’ll report back when the agents finish." },
+          ]),
           turnId: "turn-1",
         }}
         turnPresentation={{ active: true, startedAt: 1_000, waiting: false, finalizing: false }}
         agents={[
+          { id: "agent-1", description: privatePrompt, status: "running", step: 0 },
           {
-            id: "agent-1",
-            description: "Audit accessibility",
-            status: "running",
-            step: 2,
-          },
-        ]}
-      />,
-    );
-
-    expect(screen.getByRole("button", { name: /expand work activity/i })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /expand work activity/i }));
-    expect(screen.getByRole("region", { name: "Subagent activity" })).toBeInTheDocument();
-    expect(screen.getByText("Audit accessibility")).toBeInTheDocument();
-    expect(screen.queryByText(/reasoning/i)).not.toBeInTheDocument();
-    expect(container.querySelector(".pc-turn-agents__status")).toHaveTextContent("step 2");
-  });
-
-  it("labels every terminal and starting subagent state in plain text", () => {
-    render(
-      <MessageView
-        message={{
-          ...message("assistant", [{ kind: "text", text: "Delegation states." }]),
-          turnId: "turn-1",
-        }}
-        turnPresentation={{
-          active: true,
-          startedAt: 1_000,
-          waiting: false,
-          finalizing: false,
-        }}
-        agents={[
-          {
-            id: "starting",
-            description: "Starting agent",
+            id: "agent-2",
+            description: "Verify the implementation",
             status: "running",
             step: 0,
           },
+        ]}
+      />,
+    );
+
+    const card = screen.getByRole("region", { name: "Codex swarm workflow" });
+    expect(card).toHaveTextContent("Codex swarm");
+    expect(card).toHaveTextContent("Launching");
+    expect(card).toHaveTextContent("Launching 2 agents");
+    expect(card).toHaveTextContent(/starting in the background/i);
+    expect(screen.queryByRole("button", { name: /expand work activity/i })).toBeNull();
+    expect(document.body).not.toHaveTextContent(privatePrompt);
+    expect(document.body).not.toHaveTextContent("Verify the implementation");
+
+    const intro = screen.getByText("I’m launching a focused swarm.");
+    const followup = screen.getByText("I’ll report back when the agents finish.");
+    expect(intro.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(card.compareDocumentPosition(followup) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(container.querySelector(".pc-turn-agents")).toBeNull();
+  });
+
+  it("updates the inline swarm card from running through convergence and result collection", () => {
+    const runningMessage = {
+      ...message("assistant", [{ kind: "text", text: "The swarm is underway." }]),
+      turnId: "turn-1",
+    };
+    const turnPresentation = {
+      active: true,
+      startedAt: 1_000,
+      waiting: false,
+      finalizing: false,
+    };
+    const { rerender } = render(
+      <MessageView
+        message={runningMessage}
+        turnPresentation={turnPresentation}
+        agents={[
+          { id: "build", description: "Build", status: "running", step: 1 },
+          { id: "review", description: "Review", status: "running", step: 1 },
+        ]}
+      />,
+    );
+
+    expect(screen.getByRole("region", { name: "Codex swarm workflow" })).toHaveTextContent(
+      "2 of 2 agents running",
+    );
+
+    rerender(
+      <MessageView
+        message={runningMessage}
+        turnPresentation={turnPresentation}
+        agents={[
+          { id: "build", description: "Build", status: "ok", step: 2 },
+          { id: "review", description: "Review", status: "running", step: 1 },
+        ]}
+      />,
+    );
+    expect(screen.getByRole("region", { name: "Codex swarm workflow" })).toHaveTextContent(
+      "1 of 2 agents finished",
+    );
+
+    rerender(
+      <MessageView
+        message={runningMessage}
+        turnPresentation={turnPresentation}
+        agents={[
+          { id: "build", description: "Build", status: "ok", step: 2 },
+          { id: "review", description: "Review", status: "ok", step: 1 },
+        ]}
+      />,
+    );
+    expect(screen.getByRole("region", { name: "Codex swarm workflow" })).toHaveTextContent(
+      "2 agents finished · preparing response",
+    );
+
+    rerender(
+      <MessageView
+        message={{ ...runningMessage, receipt: receipt() }}
+        agents={[
+          { id: "build", description: "Build", status: "ok", step: 2 },
+          { id: "review", description: "Review", status: "ok", step: 1 },
+        ]}
+      />,
+    );
+    const completedCard = screen.getByRole("region", { name: "Codex swarm workflow" });
+    expect(completedCard).toHaveTextContent("Completed");
+    expect(completedCard).toHaveTextContent("All 2 agents completed");
+    expect(within(completedCard).queryByRole("status")).toBeNull();
+  });
+
+  it("does not invent elapsed time for settled workflows without a durable duration", () => {
+    const { container } = render(
+      <MessageView
+        message={{
+          ...message("assistant", [{ kind: "text", text: "Recovered result" }]),
+          turnId: "turn-recovered",
+          receipt: receipt({
+            turnId: "turn-recovered",
+            durationMs: undefined,
+            agentDurationMs: undefined,
+          }),
+        }}
+        agents={[
           {
-            id: "complete",
-            description: "Complete agent",
+            id: "done",
+            description: "Completed child",
             status: "ok",
             step: 1,
-          },
-          {
-            id: "stopped",
-            description: "Stopped agent",
-            status: "cancelled",
-            step: 1,
-          },
-          {
-            id: "failed",
-            description: "Failed agent",
-            status: "error",
-            step: 1,
-          },
-          {
-            id: "unknown",
-            description: "Unknown agent",
-            status: "unknown",
-            step: 1,
+            launchTurnId: "turn-recovered",
           },
         ]}
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /expand work activity/i }));
-    expect(screen.getByText("starting")).toBeInTheDocument();
-    expect(screen.getByText("completed")).toBeInTheDocument();
-    expect(screen.getByText("stopped")).toBeInTheDocument();
-    expect(screen.getByText("failed")).toBeInTheDocument();
-    expect(screen.getByText("unknown")).toBeInTheDocument();
-    const unknownRow = screen.getByText("Unknown agent").closest(".pc-turn-agents__row");
-    expect(unknownRow?.querySelector(".pc-dot")).toHaveClass("pc-dot--warn");
-    expect(unknownRow?.querySelector(".pc-dot")).not.toHaveClass("pc-dot--success");
+    expect(screen.getByRole("region", { name: "Codex swarm workflow" })).toHaveTextContent(
+      "Completed",
+    );
+    expect(container.querySelector(".pc-agent-workflow__elapsed")).toBeNull();
   });
 
   it("omits Git chrome for a non-Git or failed-capture receipt with no change evidence", () => {

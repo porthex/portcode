@@ -1,4 +1,4 @@
-import { memo, useMemo, type ComponentProps } from "react";
+import { Fragment, memo, useMemo, type ComponentProps } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -11,6 +11,7 @@ import { ToolCall } from "./ToolCall";
 import { isRoutineToolName, ToolActivityGroup, type ActivityCall } from "./ToolActivityGroup";
 import { TurnChangesCard, TurnReceipt } from "./TurnReceipt";
 import { CodexTurnActivityView } from "./CodexActivity";
+import { AgentWorkflowCard } from "./AgentWorkflowCard";
 
 // Hoisted to module scope so they're referentially stable across renders —
 // otherwise a fresh array each render defeats React.memo on TextBlock and makes
@@ -190,12 +191,8 @@ export const MessageView = memo(function MessageView({
       )
     : [];
   const activityItems = showReceipt ? renderItems.filter((item) => item.kind !== "text") : [];
-  const observableAgents = showReceipt ? (agents ?? []) : [];
   const activityCount =
-    activityItems.length +
-    observableAgents.length +
-    (activity?.visibleCount ?? 0) +
-    (remoteTerminalVisible ? 1 : 0);
+    activityItems.length + (activity?.visibleCount ?? 0) + (remoteTerminalVisible ? 1 : 0);
   const receiptActivity =
     activityCount > 0 ? (
       <div className="space-y-1.5">
@@ -212,10 +209,19 @@ export const MessageView = memo(function MessageView({
           />
         )}
         {activityItems.map((item) => renderActivityItem(item, isActive))}
-        {observableAgents.length > 0 && <SubagentReceiptActivity agents={observableAgents} />}
       </div>
     ) : null;
   const deferReceiptActivity = (activity?.visibleCount ?? 0) > 0 || remoteTerminalVisible;
+  const workflowAgents = agents ?? [];
+  const workflowCard =
+    workflowAgents.length > 0 ? (
+      <AgentWorkflowCard
+        agents={workflowAgents}
+        rootActive={Boolean(turnPresentation?.active)}
+        startedAt={turnPresentation?.startedAt ?? message.receipt?.startedAt}
+        durationMs={message.receipt?.agentDurationMs ?? message.receipt?.durationMs}
+      />
+    ) : null;
 
   // Right-click → copy the message's text. Disabled when the message has no text
   // (e.g. a tool-only assistant turn). Plain text inside the bubble keeps its own
@@ -271,14 +277,17 @@ export const MessageView = memo(function MessageView({
                   activity={deferReceiptActivity ? null : receiptActivity}
                   deferredActivity={deferReceiptActivity ? receiptActivity : null}
                 />
-                {textItems.map((item) => (
-                  <TextBlock
-                    key={`text-${item.index}`}
-                    text={item.block.text}
-                    animate={animate}
-                    active={isActive}
-                    caret={animate && item.index === lastTextIndex}
-                  />
+                {textItems.length === 0 && workflowCard}
+                {textItems.map((item, index) => (
+                  <Fragment key={`text-${item.index}`}>
+                    <TextBlock
+                      text={item.block.text}
+                      animate={animate}
+                      active={isActive}
+                      caret={animate && item.index === lastTextIndex}
+                    />
+                    {index === 0 && workflowCard}
+                  </Fragment>
                 ))}
                 {message.receipt && (
                   <TurnChangesCard
@@ -335,47 +344,6 @@ function renderActivityItem(item: Exclude<RenderItem, { kind: "text" }>, active:
       result={item.result}
     />
   );
-}
-
-function SubagentReceiptActivity({ agents }: { agents: AgentInfo[] }) {
-  return (
-    <section className="pc-turn-agents" aria-label="Subagent activity">
-      <div className="pc-turn-agents__head">
-        <span>Subagents</span>
-        <span>{agents.length}</span>
-      </div>
-      <ul>
-        {agents.map((agent) => (
-          <li key={agent.id} className="pc-turn-agents__row">
-            <span
-              className={`pc-dot ${
-                agent.status === "running"
-                  ? "pc-dot--ring"
-                  : agent.status === "error"
-                    ? "pc-dot--danger"
-                    : agent.status === "unknown"
-                      ? "pc-dot--warn"
-                      : "pc-dot--success"
-              }`}
-              aria-hidden="true"
-            />
-            <span className="min-w-0 flex-1 truncate" title={agent.description}>
-              {agent.description}
-            </span>
-            <span className="pc-turn-agents__status">{subagentStatus(agent)}</span>
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-
-function subagentStatus(agent: AgentInfo) {
-  if (agent.status === "running") return agent.step > 0 ? `step ${agent.step}` : "starting";
-  if (agent.status === "ok") return "completed";
-  if (agent.status === "cancelled") return "stopped";
-  if (agent.status === "unknown") return "unknown";
-  return "failed";
 }
 
 function buildRenderItems(
