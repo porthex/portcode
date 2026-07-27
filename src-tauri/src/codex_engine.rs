@@ -1676,7 +1676,7 @@ impl CodexEngine {
                     completed_at_ms,
                 ));
             }
-            let sanitized_turn = sanitize_activity_params("thread/resume/history", &turn);
+            let sanitized_turn = sanitize_activity_params("thread/resume/history", turn);
             self.db
                 .append_codex_activity_with_messages(
                     session_id,
@@ -5338,7 +5338,7 @@ mod tests {
                 let value = serde_json::to_value(event).unwrap();
                 (value["type"] == "agent_finished").then_some(value)
             })
-            .last()
+            .next_back()
             .unwrap();
         assert_eq!(finished["agentId"], "child-thread");
         assert_eq!(finished["result"], "audit complete");
@@ -5409,7 +5409,7 @@ mod tests {
                 let value = serde_json::to_value(event).unwrap();
                 (value["type"] == "agent_finished").then_some(value)
             })
-            .last()
+            .next_back()
             .unwrap();
         assert_eq!(finished["agentId"], "child-thread");
         assert_eq!(finished["status"], "ok");
