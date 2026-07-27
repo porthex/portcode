@@ -26,21 +26,55 @@ describe("expanded turn receipt layout", () => {
   });
 });
 
-describe("inline agent workflow card", () => {
-  it("stays in transcript flow without creating a nested scroller", () => {
+describe("inline Agent Forge workflow", () => {
+  it("stays in transcript flow without creating a nested scroller or loading bar", () => {
     const cardRule = css.match(/\.pc-agent-workflow\s*\{([^}]*)\}/)?.[1];
 
     expect(cardRule).toBeDefined();
     expect(cardRule).not.toMatch(/\bmax-height\s*:/);
     expect(cardRule).not.toMatch(/\boverflow(?:-y)?\s*:\s*(?:auto|scroll)/);
+    expect(cardRule).toMatch(/\bwidth:\s*min\(680px,\s*100%\)/);
+    expect(css).not.toContain(".pc-agent-workflow__progress");
+    expect(css).not.toContain(".pc-agent-workflow__signal-core");
   });
 
-  it("has a constrained-width collapse and reduced-motion-safe live signal", () => {
+  it("renders three-face cubes with distinct lifecycle palettes", () => {
+    expect(css).toMatch(/\.pc-agent-forge__cube\s*\{/);
+    expect(css).toMatch(/\.pc-agent-forge__face--top\s*\{/);
+    expect(css).toMatch(/\.pc-agent-forge__face--left\s*\{/);
+    expect(css).toMatch(/\.pc-agent-forge__face--right\s*\{/);
+    for (const state of ["launching", "running", "completed", "failed", "stopped", "attention"]) {
+      expect(css).toContain(`[data-agent-state="${state}"]`);
+    }
+  });
+
+  it("changes terminal cube geometry instead of relying on color alone", () => {
     expect(css).toMatch(
-      /@container\s*\(max-width:\s*520px\)\s*\{[\s\S]*?\.pc-agent-workflow\s*\{[^}]*grid-template-columns:\s*1fr;/,
+      /\[data-agent-state="failed"\][^{]*\.pc-agent-forge__face--right\s*\{[^}]*transform:\s*translate\(5px,\s*-2px\);/s,
     );
     expect(css).toMatch(
-      /@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*?\.pc-agent-workflow__signal-core\s*\{[^}]*animation:\s*none;/,
+      /\[data-agent-state="stopped"\][^{]*\.pc-agent-forge__face--top\s*\{[^}]*transform:\s*translateY\(-4px\);/s,
+    );
+    expect(css).toMatch(
+      /\[data-agent-state="stopped"\][^{]*\.pc-agent-forge__face--left\s*\{[^}]*transform:\s*translate\(-2px,\s*2px\);/s,
+    );
+    expect(css).toMatch(
+      /\[data-agent-state="stopped"\][^{]*\.pc-agent-forge__face--right\s*\{[^}]*transform:\s*translate\(2px,\s*2px\);/s,
+    );
+  });
+
+  it("keeps active motion local to cubes and disables it for reduced motion", () => {
+    expect(css).toMatch(/@keyframes\s+pcForgeCore\b/);
+    expect(css).toMatch(
+      /\[data-agent-state="running"\][^{]*\.pc-agent-forge__core\s*\{[^}]*animation:[^;}]*pcForgeCore[^;}]*infinite;/s,
+    );
+    const completedRule = css.match(
+      /\[data-agent-state="completed"\][^{]*\.pc-agent-forge__cube\s*\{([^}]*)\}/s,
+    )?.[1];
+    expect(completedRule).toBeDefined();
+    expect(completedRule).not.toContain("infinite");
+    expect(css).toMatch(
+      /@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*?\.pc-agent-forge__cube,[\s\S]*?\.pc-agent-forge__core\s*\{[^}]*animation:\s*none\s*!important;[^}]*transition:\s*none\s*!important;/,
     );
   });
 });

@@ -683,6 +683,16 @@ describe("MessageView — turn receipt presentation", () => {
     expect(card).toHaveTextContent("Launching");
     expect(card).toHaveTextContent("Launching 2 agents");
     expect(card).toHaveTextContent(/starting in the background/i);
+    const forge = within(card).getByRole("list", { name: "2 delegated agents" });
+    const agentCells = within(forge).getAllByRole("listitem");
+    expect(agentCells).toHaveLength(2);
+    expect(agentCells[0]).toHaveAttribute("data-agent-state", "launching");
+    expect(agentCells[0]).toHaveTextContent("Agent 1");
+    expect(agentCells[0]).toHaveTextContent("Launching");
+    expect(agentCells[1]).toHaveAttribute("data-agent-state", "launching");
+    expect(agentCells[1]).toHaveTextContent("Agent 2");
+    expect(within(card).getAllByTestId("agent-cube")).toHaveLength(2);
+    expect(card.querySelector(".pc-agent-workflow__progress")).toBeNull();
     expect(screen.queryByRole("button", { name: /expand work activity/i })).toBeNull();
     expect(document.body).not.toHaveTextContent(privatePrompt);
     expect(document.body).not.toHaveTextContent("Verify the implementation");
@@ -692,6 +702,70 @@ describe("MessageView — turn receipt presentation", () => {
     expect(intro.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(card.compareDocumentPosition(followup) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(container.querySelector(".pc-turn-agents")).toBeNull();
+  });
+
+  it("bounds large swarms to six cubes plus an overflow cluster", () => {
+    const agents = Array.from({ length: 8 }, (_, index) => ({
+      id: `agent-${index + 1}`,
+      description: `Private child prompt ${index + 1}`,
+      status: "running" as const,
+      step: 1,
+    }));
+    render(
+      <MessageView
+        message={{
+          ...message("assistant", [{ kind: "text", text: "Eight agents are underway." }]),
+          turnId: "turn-large",
+        }}
+        turnPresentation={{ active: true, startedAt: 1_000, waiting: false, finalizing: false }}
+        agents={agents}
+      />,
+    );
+
+    const card = screen.getByRole("region", { name: "Codex swarm workflow" });
+    expect(within(card).getAllByTestId("agent-cube")).toHaveLength(6);
+    expect(within(card).getByLabelText("2 more delegated agents")).toHaveTextContent("+2");
+    expect(card).not.toHaveTextContent("Private child prompt");
+  });
+
+  it("exposes lifecycle text and form for every cube state without using child descriptions", () => {
+    render(
+      <MessageView
+        message={{
+          ...message("assistant", [{ kind: "text", text: "The forge is evolving." }]),
+          turnId: "turn-states",
+        }}
+        turnPresentation={{ active: true, startedAt: 1_000, waiting: false, finalizing: false }}
+        agents={[
+          { id: "launch", description: "Private launch prompt", status: "running", step: 0 },
+          { id: "work", description: "Private work prompt", status: "running", step: 1 },
+          { id: "done", description: "Private result", status: "ok", step: 2 },
+          { id: "fail", description: "Private failure", status: "error", step: 1 },
+          { id: "stop", description: "Private cancellation", status: "cancelled", step: 1 },
+          { id: "unknown", description: "Private unknown", status: "unknown", step: 1 },
+        ]}
+      />,
+    );
+
+    const card = screen.getByRole("region", { name: "Codex swarm workflow" });
+    const cells = within(card).getAllByRole("listitem");
+    expect(cells.map((cell) => cell.getAttribute("data-agent-state"))).toEqual([
+      "launching",
+      "running",
+      "completed",
+      "failed",
+      "stopped",
+      "attention",
+    ]);
+    expect(cells.map((cell) => cell.textContent)).toEqual([
+      "Agent 1Launching",
+      "Agent 2Working",
+      "Agent 3Complete",
+      "Agent 4Failed",
+      "Agent 5Stopped",
+      "Agent 6Attention",
+    ]);
+    expect(card).not.toHaveTextContent("Private");
   });
 
   it("updates the inline swarm card from running through convergence and result collection", () => {
@@ -719,6 +793,11 @@ describe("MessageView — turn receipt presentation", () => {
     expect(screen.getByRole("region", { name: "Codex swarm workflow" })).toHaveTextContent(
       "2 of 2 agents running",
     );
+    const initialCells = screen.getAllByRole("listitem");
+    expect(initialCells.map((cell) => cell.getAttribute("data-agent-state"))).toEqual([
+      "running",
+      "running",
+    ]);
 
     rerender(
       <MessageView
@@ -733,6 +812,12 @@ describe("MessageView — turn receipt presentation", () => {
     expect(screen.getByRole("region", { name: "Codex swarm workflow" })).toHaveTextContent(
       "1 of 2 agents finished",
     );
+    const convergingCells = screen.getAllByRole("listitem");
+    expect(convergingCells[0]).toBe(initialCells[0]);
+    expect(convergingCells.map((cell) => cell.getAttribute("data-agent-state"))).toEqual([
+      "completed",
+      "running",
+    ]);
 
     rerender(
       <MessageView
@@ -747,6 +832,9 @@ describe("MessageView — turn receipt presentation", () => {
     expect(screen.getByRole("region", { name: "Codex swarm workflow" })).toHaveTextContent(
       "2 agents finished · preparing response",
     );
+    expect(
+      screen.getAllByRole("listitem").map((cell) => cell.getAttribute("data-agent-state")),
+    ).toEqual(["completed", "completed"]);
 
     rerender(
       <MessageView
@@ -760,6 +848,11 @@ describe("MessageView — turn receipt presentation", () => {
     const completedCard = screen.getByRole("region", { name: "Codex swarm workflow" });
     expect(completedCard).toHaveTextContent("Completed");
     expect(completedCard).toHaveTextContent("All 2 agents completed");
+    expect(
+      within(completedCard)
+        .getAllByRole("listitem")
+        .map((cell) => cell.getAttribute("data-agent-state")),
+    ).toEqual(["completed", "completed"]);
     expect(within(completedCard).queryByRole("status")).toBeNull();
   });
 
