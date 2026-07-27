@@ -111,7 +111,7 @@ export function AgentWorkflowCard({
         )}
       </ul>
       <p className="pc-agent-workflow__status">{workflow.statusLine}</p>
-      <p className="pc-agent-workflow__guidance">{workflow.guidance}</p>
+      <span className="sr-only">{workflow.guidance}</span>
       {rootActive && (
         <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
           {workflow.phaseLabel}. {workflow.statusLine}.

@@ -693,6 +693,7 @@ describe("MessageView — turn receipt presentation", () => {
     expect(agentCells[1]).toHaveTextContent("Agent 2");
     expect(within(card).getAllByTestId("agent-cube")).toHaveLength(2);
     expect(card.querySelector(".pc-agent-workflow__progress")).toBeNull();
+    expect(card.querySelector(".pc-agent-workflow__guidance")).toBeNull();
     expect(screen.queryByRole("button", { name: /expand work activity/i })).toBeNull();
     expect(document.body).not.toHaveTextContent(privatePrompt);
     expect(document.body).not.toHaveTextContent("Verify the implementation");

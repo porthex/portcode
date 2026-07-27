@@ -33,9 +33,23 @@ describe("inline Agent Forge workflow", () => {
     expect(cardRule).toBeDefined();
     expect(cardRule).not.toMatch(/\bmax-height\s*:/);
     expect(cardRule).not.toMatch(/\boverflow(?:-y)?\s*:\s*(?:auto|scroll)/);
-    expect(cardRule).toMatch(/\bwidth:\s*min\(680px,\s*100%\)/);
+    expect(cardRule).toMatch(/\bwidth:\s*min\(520px,\s*100%\)/);
+    expect(cardRule).toMatch(/\bpadding:\s*7px\s+9px\s+8px/);
     expect(css).not.toContain(".pc-agent-workflow__progress");
     expect(css).not.toContain(".pc-agent-workflow__signal-core");
+  });
+
+  it("uses a compact horizontal agent strip", () => {
+    const forgeRule = css.match(/\.pc-agent-forge\s*\{([^}]*)\}/)?.[1];
+    const agentRule = css.match(/\.pc-agent-forge__agent\s*\{([^}]*)\}/)?.[1];
+    const cubeRule = css.match(/\.pc-agent-forge__cube\s*\{([^}]*)\}/)?.[1];
+
+    expect(forgeRule).toMatch(/\bdisplay:\s*flex/);
+    expect(forgeRule).toMatch(/\bmargin:\s*6px\s+0\s+5px/);
+    expect(agentRule).toMatch(/\bmin-height:\s*34px/);
+    expect(agentRule).toMatch(/\bpadding:\s*3px\s+5px/);
+    expect(cubeRule).toMatch(/\bwidth:\s*26px/);
+    expect(cubeRule).toMatch(/\bheight:\s*25px/);
   });
 
   it("renders three-face cubes with distinct lifecycle palettes", () => {

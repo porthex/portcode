@@ -1501,12 +1501,12 @@ button.pc-turn-receipt__strip:focus-visible {
 }
 .pc-agent-workflow {
   position: relative;
-  width: min(680px, 100%);
+  width: min(520px, 100%);
   min-width: 0;
-  padding: 10px 12px 11px;
+  padding: 7px 9px 8px;
   overflow: hidden;
   border: 1px solid rgba(133, 148, 178, 0.16);
-  border-radius: 9px;
+  border-radius: 8px;
   background: linear-gradient(180deg, rgba(15, 18, 27, 0.72), rgba(7, 9, 15, 0.62));
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025);
 }
@@ -1519,16 +1519,16 @@ button.pc-turn-receipt__strip:focus-visible {
 }
 .pc-agent-workflow__head {
   justify-content: space-between;
-  gap: 12px;
+  gap: 9px;
 }
 .pc-agent-workflow__identity {
-  gap: 8px;
+  gap: 6px;
 }
 .pc-agent-workflow__title {
   min-width: 0;
   overflow: hidden;
   color: var(--color-fg);
-  font-size: 12.5px;
+  font-size: 11.5px;
   font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1543,26 +1543,26 @@ button.pc-turn-receipt__strip:focus-visible {
 .pc-agent-workflow__phase {
   flex: none;
   color: var(--color-accent-2);
-  font-size: 8.5px;
+  font-size: 8px;
   letter-spacing: 0.25px;
 }
 .pc-agent-workflow__meta {
   flex: none;
-  gap: 8px;
+  gap: 6px;
   color: var(--color-faint);
-  font-size: 8.5px;
+  font-size: 8px;
   white-space: nowrap;
 }
 .pc-agent-workflow__elapsed::before {
   content: "·";
-  margin-right: 8px;
+  margin-right: 6px;
   color: var(--color-border-2);
 }
 .pc-agent-forge {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(72px, 92px));
-  gap: 7px;
-  margin: 10px 0 9px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 6px 0 5px;
   padding: 0;
   list-style: none;
 }
@@ -1572,14 +1572,14 @@ button.pc-turn-receipt__strip:focus-visible {
   --forge-right: rgba(33, 230, 255, 0.17);
   --forge-core: var(--color-accent-2);
   --forge-glow: rgba(33, 230, 255, 0.28);
-  display: grid;
+  display: flex;
   min-width: 0;
-  min-height: 74px;
-  place-items: center;
-  align-content: center;
-  gap: 5px;
-  padding: 7px 5px 6px;
-  border-radius: 8px;
+  min-height: 34px;
+  flex: 0 1 76px;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 5px;
+  border-radius: 6px;
   background: rgba(7, 9, 15, 0.36);
   transition:
     background 0.2s ease,
@@ -1588,9 +1588,10 @@ button.pc-turn-receipt__strip:focus-visible {
 .pc-agent-forge__cube {
   position: relative;
   display: block;
-  width: 38px;
-  height: 36px;
-  filter: drop-shadow(0 0 7px var(--forge-glow));
+  width: 26px;
+  height: 25px;
+  flex: none;
+  filter: drop-shadow(0 0 5px var(--forge-glow));
   transform-origin: 50% 60%;
   transition:
     filter 0.24s ease,
@@ -1619,13 +1620,13 @@ button.pc-turn-receipt__strip:focus-visible {
 }
 .pc-agent-forge__core {
   position: absolute;
-  top: 15px;
-  left: 16px;
-  width: 7px;
-  height: 7px;
+  top: 10px;
+  left: 11px;
+  width: 5px;
+  height: 5px;
   border: 1px solid color-mix(in srgb, var(--forge-core) 68%, white);
   background: var(--forge-core);
-  box-shadow: 0 0 9px var(--forge-glow);
+  box-shadow: 0 0 6px var(--forge-glow);
   transform: rotate(45deg);
 }
 .pc-agent-forge__copy,
@@ -1634,12 +1635,12 @@ button.pc-turn-receipt__strip:focus-visible {
   display: block;
   min-width: 0;
   max-width: 100%;
-  text-align: center;
+  text-align: left;
 }
 .pc-agent-forge__label {
   overflow: hidden;
   color: var(--color-muted);
-  font-size: 8.5px;
+  font-size: 8px;
   font-weight: 600;
   letter-spacing: 0.15px;
   text-overflow: ellipsis;
@@ -1648,7 +1649,7 @@ button.pc-turn-receipt__strip:focus-visible {
 .pc-agent-forge__state {
   margin-top: 1px;
   color: var(--forge-core);
-  font-size: 7.5px;
+  font-size: 7px;
   letter-spacing: 0.25px;
   text-transform: uppercase;
 }
@@ -1723,40 +1724,35 @@ button.pc-turn-receipt__strip:focus-visible {
 .pc-agent-forge__cluster {
   position: relative;
   display: block;
-  width: 38px;
-  height: 36px;
+  width: 26px;
+  height: 25px;
+  flex: none;
 }
 .pc-agent-forge__cluster > span {
   position: absolute;
-  width: 14px;
-  height: 14px;
+  width: 10px;
+  height: 10px;
   border: 1px solid rgba(133, 148, 178, 0.34);
   background: rgba(133, 148, 178, 0.08);
   transform: rotate(30deg) skew(-8deg);
 }
 .pc-agent-forge__cluster > span:nth-child(1) {
-  top: 4px;
-  left: 5px;
+  top: 2px;
+  left: 2px;
 }
 .pc-agent-forge__cluster > span:nth-child(2) {
-  top: 9px;
-  left: 13px;
+  top: 7px;
+  left: 8px;
 }
 .pc-agent-forge__cluster > span:nth-child(3) {
-  top: 14px;
-  left: 21px;
+  top: 12px;
+  left: 14px;
 }
 .pc-agent-workflow__status {
   margin: 0;
   color: var(--color-fg);
-  font-size: 10px;
+  font-size: 9.5px;
   font-weight: 560;
-}
-.pc-agent-workflow__guidance {
-  margin: 3px 0 0;
-  color: var(--color-faint);
-  font-size: 10.5px;
-  line-height: 1.42;
 }
 .pc-agent-workflow--completed .pc-agent-workflow__phase,
 .pc-agent-workflow--completed .pc-agent-workflow__status {
@@ -1803,22 +1799,24 @@ button.pc-turn-receipt__strip:focus-visible {
     transform: scale(1);
   }
 }
-@container (max-width: 520px) {
+@container (max-width: 420px) {
   .pc-agent-workflow__head {
     align-items: flex-start;
   }
-  .pc-agent-workflow__identity {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 1px;
-  }
   .pc-agent-forge {
-    grid-template-columns: repeat(3, minmax(64px, 1fr));
+    gap: 3px;
+  }
+  .pc-agent-forge__agent {
+    flex: 1 1 72px;
   }
 }
 @container (max-width: 340px) {
-  .pc-agent-forge {
-    grid-template-columns: repeat(2, minmax(64px, 1fr));
+  .pc-agent-workflow__head {
+    flex-wrap: wrap;
+    gap: 3px 8px;
+  }
+  .pc-agent-forge__agent {
+    flex-basis: 68px;
   }
 }
 @media (prefers-reduced-motion: reduce) {
