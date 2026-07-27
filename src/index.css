@@ -1543,14 +1543,14 @@ button.pc-turn-receipt__strip:focus-visible {
 .pc-agent-workflow__phase {
   flex: none;
   color: var(--color-accent-2);
-  font-size: 8px;
+  font-size: 8.5px;
   letter-spacing: 0.25px;
 }
 .pc-agent-workflow__meta {
   flex: none;
   gap: 6px;
-  color: var(--color-faint);
-  font-size: 8px;
+  color: var(--color-muted);
+  font-size: 8.5px;
   white-space: nowrap;
 }
 .pc-agent-workflow__elapsed::before {
@@ -1640,7 +1640,7 @@ button.pc-turn-receipt__strip:focus-visible {
 .pc-agent-forge__label {
   overflow: hidden;
   color: var(--color-muted);
-  font-size: 8px;
+  font-size: 8.5px;
   font-weight: 600;
   letter-spacing: 0.15px;
   text-overflow: ellipsis;
@@ -1649,7 +1649,8 @@ button.pc-turn-receipt__strip:focus-visible {
 .pc-agent-forge__state {
   margin-top: 1px;
   color: var(--forge-core);
-  font-size: 7px;
+  font-size: 7.5px;
+  font-weight: 600;
   letter-spacing: 0.25px;
   text-transform: uppercase;
 }

@@ -52,6 +52,18 @@ describe("inline Agent Forge workflow", () => {
     expect(cubeRule).toMatch(/\bheight:\s*25px/);
   });
 
+  it("keeps compact labels readable without increasing the card footprint", () => {
+    const metaRule = [...css.matchAll(/\.pc-agent-workflow__meta\s*\{([^}]*)\}/g)].pop()?.[1];
+    const labelRule = css.match(/\.pc-agent-forge__label\s*\{([^}]*)\}/)?.[1];
+    const stateRule = [...css.matchAll(/\.pc-agent-forge__state\s*\{([^}]*)\}/g)].pop()?.[1];
+
+    expect(metaRule).toMatch(/\bcolor:\s*var\(--color-muted\)/);
+    expect(metaRule).toMatch(/\bfont-size:\s*8\.5px/);
+    expect(labelRule).toMatch(/\bfont-size:\s*8\.5px/);
+    expect(stateRule).toMatch(/\bfont-size:\s*7\.5px/);
+    expect(stateRule).toMatch(/\bfont-weight:\s*600/);
+  });
+
   it("renders three-face cubes with distinct lifecycle palettes", () => {
     expect(css).toMatch(/\.pc-agent-forge__cube\s*\{/);
     expect(css).toMatch(/\.pc-agent-forge__face--top\s*\{/);
