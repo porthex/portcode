@@ -1,12 +1,4 @@
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { useStore } from "../store/store";
 import { MessageView } from "./Message";
 import { Composer } from "./Composer";
@@ -14,14 +6,12 @@ import { PermissionPrompt } from "./PermissionPrompt";
 import { BackgroundTasksPanel } from "./BackgroundTasksPanel";
 import { CodexRequestPrompt } from "./CodexRequestPrompt";
 import { type Message } from "../types";
-import type { AgentInfo, CodexActivityEvent } from "../types";
-import { remoteSafeCodexActivityEvents } from "../lib/codexActivity";
-import { CodexActivityHistoryInspector } from "./CodexActivity";
+import type { AgentInfo } from "../types";
 
 // Stable reference so the selector never returns a fresh array (which would
 // trip useSyncExternalStore's infinite-loop guard).
 const EMPTY: Message[] = [];
-const EMPTY_ACTIVITY: CodexActivityEvent[] = [];
+
 const TRANSCRIPT_VERTICAL_PADDING_PX = 48;
 
 const agentsForLaunchTurn = (
@@ -58,16 +48,13 @@ type ChatProps = {
 export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps = {}) {
   const activeId = useStore((s) => s.activeId);
   const messages = useStore((s) => (activeId && s.messages[activeId]) || EMPTY);
-  const codexEvents = useStore((s) => (activeId && s.codexActivity[activeId]) || EMPTY_ACTIVITY);
+
   const hasCachedMessages = useStore((s) => Boolean(activeId && activeId in s.messages));
   const messageLoad = useStore((s) => (activeId ? s.messageLoads[activeId] : undefined));
   const streaming = useStore((s) => s.streaming);
   const activeRun = useStore((s) => (s.activeId ? s.runs[s.activeId] : undefined));
   const activeAgents = useStore((s) => (s.activeId ? s.agents[s.activeId] : undefined));
-  const activityPaging = useStore((s) =>
-    s.activeId ? s.codexActivityPaging[s.activeId] : undefined,
-  );
-  const loadOlderCodexActivity = useStore((s) => s.loadOlderCodexActivity);
+
   const remoteMode = useStore((s) => s.remoteMode);
   const openTurnReview = useStore((s) => s.openTurnReview);
   const initError = useStore((s) => s.initError);
@@ -128,27 +115,6 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
   // of jumping. Tracked per the messages array's identity.
   const prevScrollHeight = useRef(0);
   const prevFirstId = useRef<string | null>(null);
-  const childThreadIds = useMemo(
-    () => new Set((activeAgents ?? []).map((agent) => agent.id)),
-    [activeAgents],
-  );
-  const parentCodexEvents = useMemo(() => {
-    if (!activeId) return EMPTY_ACTIVITY;
-    const visibleEvents = remoteMode ? remoteSafeCodexActivityEvents(codexEvents) : codexEvents;
-    return visibleEvents.filter(
-      (event) => event.sessionId === activeId && !childThreadIds.has(event.threadId),
-    );
-  }, [activeId, childThreadIds, codexEvents, remoteMode]);
-  const inspectorEvents = useMemo(() => {
-    const older = activityPaging?.olderEvents ?? EMPTY_ACTIVITY;
-    const visibleOlder = remoteMode ? remoteSafeCodexActivityEvents(older) : older;
-    const parentOlder = activeId
-      ? visibleOlder.filter(
-          (event) => event.sessionId === activeId && !childThreadIds.has(event.threadId),
-        )
-      : EMPTY_ACTIVITY;
-    return [...parentOlder, ...parentCodexEvents];
-  }, [activeId, activityPaging?.olderEvents, childThreadIds, parentCodexEvents, remoteMode]);
 
   // Distance from the top below which scrolling up triggers loading older history.
   const LOAD_OLDER_THRESHOLD_PX = 200;
@@ -426,16 +392,6 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
               {refreshError && (
                 <RefreshErrorNotice onRetry={() => activeId && void retryLoad(activeId)} />
               )}
-              <CodexActivityHistoryInspector
-                scopeKey={activeId ?? "no-session"}
-                events={inspectorEvents}
-                unknownOnly
-                hasMore={activityPaging?.hasMore}
-                loadingOlder={activityPaging?.loadingOlder}
-                archiveLimited={activityPaging?.archiveLimited}
-                metadataOnly={remoteMode}
-                onLoadOlder={activeId ? () => void loadOlderCodexActivity(activeId) : undefined}
-              />
             </div>
           </div>
           {!pinned && messages.length > 0 && (

@@ -119,7 +119,7 @@ describe("Chat empty state", () => {
 });
 
 describe("Chat transcript", () => {
-  it("omits per-turn structured activity while exposing unknown methods separately", () => {
+  it("omits recognized and unknown Codex activity from receipt-backed turns", () => {
     const activity: CodexActivityEvent[] = [
       {
         sequence: 1,
@@ -189,14 +189,11 @@ describe("Chat transcript", () => {
       "data-has-activity",
       "false",
     );
-    expect(
-      screen.getByRole("button", {
-        name: "Unrecognized Codex activity (1), expand",
-      }),
-    ).toBeInTheDocument();
+    expect(screen.queryByText(/Unrecognized Codex activity/i)).toBeNull();
+    expect(screen.queryByText("future/newMethod")).toBeNull();
   });
 
-  it("keeps unknown activity inspectable in an empty transcript", () => {
+  it("does not expose unknown Codex activity in a new empty session", () => {
     useStore.setState({
       activeId: "s1",
       sessions: [session()],
@@ -218,14 +215,11 @@ describe("Chat transcript", () => {
     render(<Chat />);
 
     expect(screen.getByRole("heading", { name: EMPTY_HEADING })).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", {
-        name: "Unrecognized Codex activity (1), expand",
-      }),
-    ).toBeInTheDocument();
+    expect(screen.queryByText(/Unrecognized Codex activity/i)).toBeNull();
+    expect(screen.queryByText("future/emptyTranscript")).toBeNull();
   });
 
-  it("switches unknown activity with the selected session without bleed", () => {
+  it("does not surface unknown activity while switching sessions", () => {
     useStore.setState({
       activeId: "s1",
       sessions: [session(), session({ id: "s2", title: "Other" })],
@@ -255,20 +249,15 @@ describe("Chat transcript", () => {
     });
 
     render(<Chat />);
-    fireEvent.click(
-      screen.getByRole("button", {
-        name: "Unrecognized Codex activity (1), expand",
-      }),
-    );
-    expect(screen.getByText("future/sessionOne")).toBeInTheDocument();
+    expect(screen.queryByText("future/sessionOne")).toBeNull();
 
     act(() => useStore.setState({ activeId: "s2" }));
 
-    expect(screen.getByText("future/sessionTwo")).toBeInTheDocument();
-    expect(screen.queryByText("future/sessionOne")).not.toBeInTheDocument();
+    expect(screen.queryByText("future/sessionTwo")).toBeNull();
+    expect(screen.queryByText(/Unrecognized Codex activity/i)).toBeNull();
   });
 
-  it("renders the bounded remote activity DTO while excluding every desktop-private field", () => {
+  it("keeps remote activity DTOs out of Chat with every desktop-private field", () => {
     const sensitive = [
       "REMOTE_RAW_COMMAND_SENTINEL",
       "REMOTE_RAW_PATH_SENTINEL",
@@ -407,11 +396,8 @@ describe("Chat transcript", () => {
     expect(screen.queryByText("Step 1")).toBeNull();
     expect(screen.queryByRole("button", { name: /Live changes, updated/i })).toBeNull();
     expect(screen.queryByRole("button", { name: /Command, completed/i })).toBeNull();
-    fireEvent.click(
-      screen.getByRole("button", { name: "Unrecognized Codex activity (1), expand" }),
-    );
-    expect(screen.getByText("future/safe-metadata")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /safe metadata, expand/i })).toBeInTheDocument();
+    expect(screen.queryByText("future/safe-metadata")).toBeNull();
+    expect(screen.queryByText(/Unrecognized Codex activity/i)).toBeNull();
     for (const sentinel of sensitive) expect(document.body).not.toHaveTextContent(sentinel);
   });
 
@@ -728,7 +714,7 @@ describe("Chat transcript", () => {
     expect(screen.queryByRole("button", { name: /expand work activity/i })).toBeNull();
   });
 
-  it("filters child ownership identically across the current page and a 2,001+ record archive", () => {
+  it("does not surface parent or child unknown events from a 2,001+ record archive", () => {
     const current = Array.from({ length: 2_000 }, (_, index): CodexActivityEvent => ({
       sequence: index + 3,
       sessionId: "s1",
@@ -782,15 +768,13 @@ describe("Chat transcript", () => {
     });
 
     render(<Chat />);
-    fireEvent.click(
-      screen.getByRole("button", { name: "Unrecognized Codex activity (1), expand" }),
-    );
-    expect(screen.getByText("future/parentOnly")).toBeInTheDocument();
+    expect(screen.queryByText("future/parentOnly")).toBeNull();
     expect(screen.queryByText("future/childOnly")).toBeNull();
+    expect(document.body).not.toHaveTextContent("PARENT_ONLY_SENTINEL");
     expect(document.body).not.toHaveTextContent("CHILD_ONLY_SENTINEL");
   });
 
-  it("navigates every retained parent range in a bounded 10,000-row archive", () => {
+  it("does not mount unknown-event controls for a 10,000-row archive", () => {
     const all = Array.from({ length: 10_000 }, (_, index): CodexActivityEvent => {
       const sequence = index + 1;
       const child = sequence === 5_000;
@@ -830,28 +814,10 @@ describe("Chat transcript", () => {
     });
 
     render(<Chat />);
-    fireEvent.click(
-      screen.getByRole("button", { name: "Unrecognized Codex activity (200), expand" }),
-    );
-    const details = screen.getByRole("region", {
-      name: "Unrecognized Codex activity details",
-    });
-    expect(within(details).getByText("Sequence 10000")).toBeInTheDocument();
-    expect(within(details).queryByText("Sequence 1")).toBeNull();
-    expect(details).not.toHaveTextContent("future/childOnly");
-    expect(details).not.toHaveTextContent("CHILD_ARCHIVE_SENTINEL");
-
-    const oldest = screen.getByRole("button", { name: "Show oldest retained activity" });
-    oldest.focus();
-    fireEvent.click(oldest);
-    expect(document.activeElement).toBe(oldest);
-    expect(within(details).getByText("Sequence 1")).toBeInTheDocument();
-    expect(within(details).queryByText("Sequence 10000")).toBeNull();
-    expect(within(details).getAllByRole("listitem").length).toBeLessThanOrEqual(200);
-
-    fireEvent.click(screen.getByRole("button", { name: "Show newest retained activity" }));
-    expect(within(details).getByText("Sequence 10000")).toBeInTheDocument();
-    expect(within(details).queryByText("Sequence 1")).toBeNull();
+    expect(screen.queryByText(/Unrecognized Codex activity/i)).toBeNull();
+    expect(screen.queryByText("Sequence 10000")).toBeNull();
+    expect(screen.queryByRole("button", { name: /retained activity/i })).toBeNull();
+    expect(document.body).not.toHaveTextContent("CHILD_ARCHIVE_SENTINEL");
   });
 
   it("opens the persisted turn review from a completed receipt", () => {
