@@ -66,6 +66,138 @@ describe("web-client mode flag", () => {
   });
 });
 
+describe("Codex marketplace bridge", () => {
+  it("serializes only the allowlisted native marketplace and plugin commands", async () => {
+    enterTauri();
+    const { ipc, invoke } = await load();
+    invoke.mockResolvedValue(undefined);
+
+    await ipc.listCodexPlugins();
+    await ipc.readCodexPlugin("team", "notes");
+    await ipc.addCodexMarketplace("https://example.com/team.git", "main", true);
+    await ipc.removeCodexMarketplace("team", true);
+    await ipc.upgradeCodexMarketplace("team");
+    await ipc.installCodexPlugin("team", "notes", true);
+    await ipc.uninstallCodexPlugin("notes@team", true);
+
+    expect(invoke.mock.calls).toEqual([
+      ["codex_marketplace_list"],
+      ["codex_marketplace_plugin_read", { marketplace: "team", plugin: "notes" }],
+      [
+        "codex_marketplace_add",
+        { source: "https://example.com/team.git", refName: "main", sourceConfirmed: true },
+      ],
+      ["codex_marketplace_remove", { marketplaceName: "team", removalConfirmed: true }],
+      ["codex_marketplace_refresh", { marketplaceName: "team" }],
+      [
+        "codex_marketplace_plugin_install",
+        {
+          marketplace: "team",
+          plugin: "notes",
+          disclosureConfirmed: true,
+        },
+      ],
+      ["codex_marketplace_plugin_uninstall", { pluginId: "notes@team", removalConfirmed: true }],
+    ]);
+  });
+
+  it("returns deterministic display-safe browser marketplace mocks", async () => {
+    const { ipc } = await load();
+
+    const first = await ipc.listCodexPlugins();
+    const second = await ipc.listCodexPlugins();
+    expect(second).toEqual(first);
+    expect(first.marketplaces).toHaveLength(1);
+    expect(first.marketplaces[0].plugins).toHaveLength(1);
+
+    const detail = await ipc.readCodexPlugin("preview", "starter");
+    expect(detail.scheduledTasks).toEqual([
+      {
+        key: "daily-review",
+        name: "Daily review",
+        prompt: "Review the current project and summarize the next useful step.",
+        schedule: { type: "daily", time: "09:00" },
+      },
+    ]);
+
+    await expect(
+      ipc.addCodexMarketplace("https://example.com/team.git", "main", true),
+    ).resolves.toEqual({ marketplaceName: "preview-added", alreadyAdded: false });
+    await expect(
+      ipc.addCodexMarketplace(
+        "https://example.com/tokenizer-plugin.git",
+        "feature/tokenizer",
+        true,
+      ),
+    ).resolves.toEqual({ marketplaceName: "preview-added", alreadyAdded: false });
+    await expect(ipc.addCodexMarketplace("https://intranet/team.git", null, true)).rejects.toThrow(
+      "public HTTPS",
+    );
+    await expect(
+      ipc.addCodexMarketplace("https://example.com/team.git?access_token=secret", null, true),
+    ).rejects.toThrow("public HTTPS");
+    for (const source of [
+      "https://example.com/access_token/sk-live-123/repo.git",
+      "https://example.com/repo.git#access_token=sk-live-123",
+      "https://example.com/repo.git?auth=sk-live-123",
+      "https://example.com/auth/planted-value/repo.git",
+      "https://example.com/bearer/planted-value/repo.git",
+      "https://example.com/%61ccess_%74oken/planted-value/repo.git",
+      "https://example.com/%25252561ccess_%25252574oken/planted-value/repo.git",
+      "https://example.com/%zz/%25252561ccess_%25252574oken/planted-value/repo.git",
+    ]) {
+      await expect(ipc.addCodexMarketplace(source, null, true)).rejects.toThrow("public HTTPS");
+    }
+    await expect(
+      ipc.addCodexMarketplace("https://example.com/team.git", "access_token=sk-live-123", true),
+    ).rejects.toThrow("credentials");
+    for (const ref of [
+      "feature/auth/planted-value",
+      "feature/bearer/planted-value",
+      "feature/%61ccess_%74oken/planted-value",
+      "feature/%25252561ccess_%25252574oken/planted-value",
+      "feature/%zz/%25252561ccess_%25252574oken/planted-value",
+    ]) {
+      await expect(
+        ipc.addCodexMarketplace("https://example.com/team.git", ref, true),
+      ).rejects.toThrow("credentials");
+    }
+    await expect(
+      ipc.addCodexMarketplace("https://example.com/team.git", null, false),
+    ).rejects.toThrow("confirmation");
+    await expect(ipc.removeCodexMarketplace("team", false)).rejects.toThrow("confirmation");
+    await expect(ipc.removeCodexMarketplace("team", true)).resolves.toEqual({
+      marketplaceName: "team",
+      removed: true,
+    });
+    await expect(ipc.upgradeCodexMarketplace("team")).resolves.toEqual({
+      selectedMarketplaces: ["team"],
+      upgradedCount: 1,
+      errors: [],
+    });
+    await expect(ipc.installCodexPlugin("preview", "starter", true)).resolves.toEqual({
+      authPolicy: "onUse",
+      appsNeedingAuth: [],
+    });
+    await expect(ipc.uninstallCodexPlugin("starter@preview", false)).rejects.toThrow(
+      "confirmation",
+    );
+    await expect(ipc.uninstallCodexPlugin("starter@preview", true)).resolves.toBeUndefined();
+
+    const serialized = JSON.stringify({ first, detail });
+    for (const forbidden of [
+      "marketplacePath",
+      "installedRoot",
+      "localPath",
+      "accessToken",
+      "refreshToken",
+      "clientSecret",
+      "http://",
+    ]) {
+      expect(serialized).not.toContain(forbidden);
+    }
+  });
+});
 describe("Tauri command serialization", () => {
   beforeEach(enterTauri);
 

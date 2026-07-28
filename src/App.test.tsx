@@ -56,6 +56,9 @@ vi.mock("./components/review/ReviewWorkspace", async () => {
     },
   };
 });
+vi.mock("./components/CodexMarketplace", () => ({
+  CodexMarketplace: () => <div data-testid="codex-marketplace" />,
+}));
 vi.mock("./components/EnvironmentPanel", () => ({
   EnvironmentPanelProvider: ({ children }: React.PropsWithChildren) => <>{children}</>,
   EnvironmentPanelTrigger: ({
@@ -420,6 +423,26 @@ describe("App layout", () => {
     expect(screen.getByTestId("file-rail")).not.toHaveAttribute("aria-hidden");
     expect(fileToggle).toHaveAttribute("aria-pressed", "true");
     expect(useStore.getState().showFiles).toBe(true);
+  });
+
+  it("routes the center surface to Marketplace while keeping chat and review inert", () => {
+    useStore.setState({ workspaceSurface: "marketplace", showFiles: true });
+    render(<App />);
+
+    expect(screen.getByTestId("marketplace-surface")).toBeVisible();
+    expect(screen.getByTestId("codex-marketplace")).toBeVisible();
+    expect(screen.getByTestId("chat-surface")).not.toBeVisible();
+    expect(screen.getByTestId("chat-surface")).toHaveAttribute("inert");
+    expect(screen.getByTestId("review-surface")).not.toBeVisible();
+    expect(screen.getByTestId("review-surface")).toHaveAttribute("inert");
+    expect(screen.getByTestId("file-rail")).toHaveStyle({ gridTemplateColumns: "0fr" });
+    expect(screen.getByText("Plugin marketplace")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Back to chat" }));
+    expect(useStore.getState().workspaceSurface).toBe("chat");
+    expect(screen.getByTestId("chat-surface")).toBeVisible();
+    expect(screen.getByTestId("marketplace-surface")).not.toBeVisible();
+    expect(screen.getByTestId("marketplace-surface")).toHaveAttribute("inert");
   });
 
   it("preserves review controller state when leaving and reopening the surface", () => {

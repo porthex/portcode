@@ -5,6 +5,12 @@ import type {
   AttachmentValidationResult,
   CodexActivityEvent,
   CodexActivityPage,
+  CodexMarketplaceAddResult,
+  CodexMarketplaceCatalog,
+  CodexMarketplaceRemoveResult,
+  CodexMarketplaceUpgradeResult,
+  CodexPluginDetail,
+  CodexPluginInstallResult,
   CodexRequestResponse,
   ConnectInfo,
   DirEntry,
@@ -251,6 +257,100 @@ export async function getPlanUsage(
     });
   }
   return mock.getPlanUsage(provider, accountProfileId);
+}
+
+// ── Codex marketplace (desktop-local; deterministic preview mocks only) ────────
+
+export async function listCodexPlugins(): Promise<CodexMarketplaceCatalog> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<CodexMarketplaceCatalog>("codex_marketplace_list");
+  }
+  return mock.listCodexPlugins();
+}
+
+export async function readCodexPlugin(
+  marketplaceName: string,
+  pluginName: string,
+): Promise<CodexPluginDetail> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<CodexPluginDetail>("codex_marketplace_plugin_read", {
+      marketplace: marketplaceName,
+      plugin: pluginName,
+    });
+  }
+  return mock.readCodexPlugin(marketplaceName, pluginName);
+}
+
+export async function addCodexMarketplace(
+  source: string,
+  refName: string | null,
+  sourceConfirmed: boolean,
+): Promise<CodexMarketplaceAddResult> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<CodexMarketplaceAddResult>("codex_marketplace_add", {
+      source,
+      refName,
+      sourceConfirmed,
+    });
+  }
+  return mock.addCodexMarketplace(source, refName, sourceConfirmed);
+}
+
+export async function removeCodexMarketplace(
+  marketplaceName: string,
+  removalConfirmed: boolean,
+): Promise<CodexMarketplaceRemoveResult> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<CodexMarketplaceRemoveResult>("codex_marketplace_remove", {
+      marketplaceName,
+      removalConfirmed,
+    });
+  }
+  return mock.removeCodexMarketplace(marketplaceName, removalConfirmed);
+}
+
+export async function upgradeCodexMarketplace(
+  marketplaceName?: string | null,
+): Promise<CodexMarketplaceUpgradeResult> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<CodexMarketplaceUpgradeResult>("codex_marketplace_refresh", {
+      marketplaceName: marketplaceName ?? null,
+    });
+  }
+  return mock.upgradeCodexMarketplace(marketplaceName);
+}
+
+export async function installCodexPlugin(
+  marketplaceName: string,
+  pluginName: string,
+  interstitialConfirmed: boolean,
+): Promise<CodexPluginInstallResult> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    return core.invoke<CodexPluginInstallResult>("codex_marketplace_plugin_install", {
+      marketplace: marketplaceName,
+      plugin: pluginName,
+      disclosureConfirmed: interstitialConfirmed,
+    });
+  }
+  return mock.installCodexPlugin(marketplaceName, pluginName, interstitialConfirmed);
+}
+
+export async function uninstallCodexPlugin(pluginId: string, confirmed: boolean): Promise<void> {
+  if (isTauri()) {
+    const { core } = await tauri();
+    await core.invoke("codex_marketplace_plugin_uninstall", {
+      pluginId,
+      removalConfirmed: confirmed,
+    });
+    return;
+  }
+  return mock.uninstallCodexPlugin(pluginId, confirmed);
 }
 
 // ── Auto-update (desktop only) ─────────────────────────────────────────────────
@@ -1130,6 +1230,151 @@ function previewReviewManifest(scope: GitReviewScope): GitReviewManifest {
 
 const PRIMARY_CODEX_ACCOUNT_ID = "codex-primary";
 
+function previewCodexCatalog(): CodexMarketplaceCatalog {
+  return {
+    marketplaces: [
+      {
+        name: "preview",
+        displayName: "Preview marketplace",
+        plugins: [
+          {
+            id: "starter@preview",
+            name: "starter",
+            displayName: "Starter",
+            shortDescription: "A deterministic marketplace preview plugin.",
+            developerName: "Portcode Preview",
+            category: "productivity",
+            version: "1.0.0",
+            localVersion: null,
+            installed: false,
+            enabled: false,
+            installPolicy: "available",
+            authPolicy: "onUse",
+            availability: "available",
+            mustShowInstallationInterstitial: true,
+            installable: true,
+            keywords: ["preview", "starter"],
+            websiteUrl: "https://example.com/plugins/starter",
+            logoUrl: "https://example.com/plugins/starter/logo.png",
+            logoUrlDark: null,
+            screenshotUrls: ["https://example.com/plugins/starter/screenshot.png"],
+          },
+        ],
+      },
+    ],
+    loadErrors: [],
+    featuredPluginIds: ["starter@preview"],
+  };
+}
+
+function previewCodexPluginDetail(): CodexPluginDetail {
+  return {
+    marketplaceName: "preview",
+    summary: previewCodexCatalog().marketplaces[0].plugins[0],
+    shareUrl: "https://example.com/plugins/starter",
+    description: "Deterministic plugin details for browser tests and preview mode.",
+    skills: [
+      {
+        name: "starter",
+        description: "Inspect the current project.",
+        shortDescription: "Inspect a project",
+        displayName: "Starter skill",
+        enabled: true,
+      },
+    ],
+    hooks: [],
+    apps: [],
+    mcpServers: [],
+    scheduledTasks: [
+      {
+        key: "daily-review",
+        name: "Daily review",
+        prompt: "Review the current project and summarize the next useful step.",
+        schedule: { type: "daily", time: "09:00" },
+      },
+    ],
+  };
+}
+
+function requirePreviewIdentifier(value: string, label: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error(`${label} is invalid.`);
+  return trimmed;
+}
+
+function containsPreviewSensitiveSourceMaterial(value: string): boolean {
+  let normalized = value.toLowerCase();
+  while (true) {
+    const decoded = normalized.replace(/%([0-9a-f]{2})/gi, (_match, hex: string) =>
+      String.fromCharCode(Number.parseInt(hex, 16)),
+    );
+    if (decoded === normalized) break;
+    normalized = decoded;
+  }
+  const sensitiveLabel =
+    /(^|[^a-z0-9])(?:access[_-]?token|auth(?:orization)?|bearer|client[_-]?secret|credential|password|refresh[_-]?token|secret|signature|token|api[_-]?key|private[_-]?key|session[_-]?key|ssh[_-]?key)([^a-z0-9]|$)|\b(?:sk-|ghp_|github_pat_)[a-z0-9_-]{6,}/i;
+  return sensitiveLabel.test(normalized);
+}
+
+function requirePreviewPublicHttpsUrl(value: string): void {
+  let url: URL;
+  try {
+    url = new URL(value.trim());
+  } catch {
+    throw new Error("Marketplace source must be a public HTTPS URL without credentials.");
+  }
+  const host = url.hostname
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.$/, "")
+    .toLowerCase();
+  const sensitiveQueryKeys = new Set([
+    "access_token",
+    "authorization",
+    "client_secret",
+    "code",
+    "credential",
+    "key",
+    "password",
+    "refresh_token",
+    "secret",
+    "sig",
+    "signature",
+    "token",
+    "x-amz-credential",
+    "x-amz-signature",
+  ]);
+  const hasSensitiveQuery = [...url.searchParams.keys()].some((key) =>
+    sensitiveQueryKeys.has(key.toLowerCase()),
+  );
+  const privateHost =
+    !host.includes(".") ||
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal") ||
+    host.endsWith(".invalid") ||
+    host.endsWith(".test") ||
+    /^(?:0\.|10\.|127\.|169\.254\.|192\.168\.|192\.0\.2\.|198\.51\.100\.|203\.0\.113\.)/.test(
+      host,
+    ) ||
+    /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(host) ||
+    host === "::1" ||
+    /^fe[89ab][0-9a-f]:/i.test(host) ||
+    /^f[cd][0-9a-f]{2}:/i.test(host);
+  if (
+    url.protocol !== "https:" ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.search !== "" ||
+    url.hash !== "" ||
+    privateHost ||
+    hasSensitiveQuery ||
+    containsPreviewSensitiveSourceMaterial(value)
+  ) {
+    throw new Error("Marketplace source must be a public HTTPS URL without credentials.");
+  }
+}
+
 const mock = (() => {
   let settings: Settings = { ...DEFAULT_SETTINGS, rules: [...DEFAULT_SETTINGS.rules] };
 
@@ -1217,6 +1462,67 @@ const mock = (() => {
           ? candidate
           : { ...candidate, provider: "openai", model: DEFAULT_SETTINGS.model };
       return { ...settings };
+    },
+    async listCodexPlugins(): Promise<CodexMarketplaceCatalog> {
+      return previewCodexCatalog();
+    },
+    async readCodexPlugin(marketplaceName: string, pluginName: string): Promise<CodexPluginDetail> {
+      if (marketplaceName !== "preview" || pluginName !== "starter") {
+        throw new Error("The plugin is not present in the preview Codex catalog.");
+      }
+      return previewCodexPluginDetail();
+    },
+    async addCodexMarketplace(
+      source: string,
+      refName: string | null,
+      sourceConfirmed: boolean,
+    ): Promise<CodexMarketplaceAddResult> {
+      if (!sourceConfirmed) throw new Error("Marketplace source confirmation is required.");
+      requirePreviewPublicHttpsUrl(source);
+      if (refName != null) {
+        const ref = requirePreviewIdentifier(refName, "Git ref");
+        if (containsPreviewSensitiveSourceMaterial(ref)) {
+          throw new Error("Git ref must not contain credentials.");
+        }
+      }
+      return { marketplaceName: "preview-added", alreadyAdded: false };
+    },
+    async removeCodexMarketplace(
+      marketplaceName: string,
+      removalConfirmed: boolean,
+    ): Promise<CodexMarketplaceRemoveResult> {
+      if (!removalConfirmed) throw new Error("Marketplace removal confirmation is required.");
+      return {
+        marketplaceName: requirePreviewIdentifier(marketplaceName, "Marketplace name"),
+        removed: true,
+      };
+    },
+    async upgradeCodexMarketplace(
+      marketplaceName?: string | null,
+    ): Promise<CodexMarketplaceUpgradeResult> {
+      const selectedMarketplaces = [
+        marketplaceName == null
+          ? "preview"
+          : requirePreviewIdentifier(marketplaceName, "Marketplace name"),
+      ];
+      return { selectedMarketplaces, upgradedCount: 1, errors: [] };
+    },
+    async installCodexPlugin(
+      marketplaceName: string,
+      pluginName: string,
+      interstitialConfirmed: boolean,
+    ): Promise<CodexPluginInstallResult> {
+      if (marketplaceName !== "preview" || pluginName !== "starter") {
+        throw new Error("Codex policy does not allow this plugin to be installed.");
+      }
+      if (!interstitialConfirmed) {
+        throw new Error("Installation disclosure confirmation is required.");
+      }
+      return { authPolicy: "onUse", appsNeedingAuth: [] };
+    },
+    async uninstallCodexPlugin(pluginId: string, confirmed: boolean): Promise<void> {
+      requirePreviewIdentifier(pluginId, "Plugin id");
+      if (!confirmed) throw new Error("Plugin removal confirmation is required.");
     },
     async openaiOauthStatus() {
       return { ...openaiOauth };

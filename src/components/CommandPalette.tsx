@@ -56,6 +56,12 @@ export function CommandPalette() {
               glyph: "±",
               run: () => setWorkspaceSurface("review"),
             },
+            {
+              id: "marketplace",
+              label: "Open plugin marketplace",
+              glyph: "◇",
+              run: () => setWorkspaceSurface("marketplace"),
+            },
           ]
         : []),
       { id: "files", label: "Toggle file explorer", glyph: "◤", hint: "Ctrl+B", run: toggleFiles },

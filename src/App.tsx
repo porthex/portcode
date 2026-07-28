@@ -5,6 +5,7 @@ import { Sidebar } from "./components/Sidebar";
 import { Chat } from "./components/Chat";
 import { FileExplorer } from "./components/FileExplorer";
 import { ReviewWorkspace } from "./components/review/ReviewWorkspace";
+import { CodexMarketplace } from "./components/CodexMarketplace";
 import { SettingsPanel } from "./components/Settings";
 import { SettingsBoundary } from "./components/SettingsBoundary";
 import { CommandPalette } from "./components/CommandPalette";
@@ -47,7 +48,7 @@ export default function App() {
   const [environmentOpen, setEnvironmentOpen] = useState(false);
 
   useEffect(() => {
-    if (workspaceSurface === "review") setEnvironmentOpen(false);
+    if (workspaceSurface !== "chat") setEnvironmentOpen(false);
   }, [workspaceSurface]);
 
   // A stable target for keyboard focus after the file rail collapses: the
@@ -294,6 +295,15 @@ export default function App() {
                 >
                   <ReviewWorkspace active={workspaceSurface === "review"} />
                 </div>
+                <div
+                  data-testid="marketplace-surface"
+                  hidden={workspaceSurface !== "marketplace"}
+                  aria-hidden={workspaceSurface !== "marketplace" || undefined}
+                  inert={workspaceSurface !== "marketplace"}
+                  className="flex min-h-0 flex-1 flex-col overflow-auto"
+                >
+                  <CodexMarketplace active={workspaceSurface === "marketplace"} />
+                </div>
               </EnvironmentPanelProvider>
             </main>
           </div>
@@ -429,7 +439,11 @@ function TitleBar({
             portcode<span className="text-faint"> / </span>
           </span>
           <span className="text-fg">
-            {workspaceSurface === "review" ? "Review changes" : (session?.title ?? "New chat")}
+            {workspaceSurface === "review"
+              ? "Review changes"
+              : workspaceSurface === "marketplace"
+                ? "Plugin marketplace"
+                : (session?.title ?? "New chat")}
           </span>
         </span>
         {sessionUsesCodex && (
@@ -486,6 +500,26 @@ function TitleBar({
           <span aria-hidden="true">±</span>
           <span className="pc-titlebar__review-label">
             {workspaceSurface === "review" ? "Chat" : "Review"}
+          </span>
+        </button>
+        <button
+          type="button"
+          aria-label={
+            workspaceSurface === "marketplace" ? "Back to chat" : "Open plugin marketplace"
+          }
+          aria-pressed={workspaceSurface === "marketplace"}
+          onClick={() =>
+            setWorkspaceSurface(workspaceSurface === "marketplace" ? "chat" : "marketplace")
+          }
+          className={`pc-titlebar__marketplace flex h-[31px] items-center gap-1.5 rounded-[7px] border px-2.5 font-mono text-[10px] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-accent-2/20 ${
+            workspaceSurface === "marketplace"
+              ? "border-accent/55 bg-accent/12 text-accent"
+              : "border-border-2 bg-panel-2/80 text-muted hover:border-accent/35 hover:text-fg"
+          }`}
+        >
+          <span aria-hidden="true">◇</span>
+          <span className="pc-titlebar__marketplace-label">
+            {workspaceSurface === "marketplace" ? "Chat" : "Plugins"}
           </span>
         </button>
         {workspaceSurface === "chat" && (

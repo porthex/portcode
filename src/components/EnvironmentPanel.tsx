@@ -170,7 +170,7 @@ export function EnvironmentPanelProvider({
 
   // Never leave this lower-priority surface lurking underneath a modal.
   useEffect(() => {
-    if (showSettings || showPalette || workspaceSurface === "review") {
+    if (showSettings || showPalette || workspaceSurface !== "chat") {
       restoreFocusFromPanel();
       onOpenChange(false);
     }
