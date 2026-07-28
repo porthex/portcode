@@ -143,6 +143,8 @@ describe("Codex marketplace bridge", () => {
       "https://example.com/auth/planted-value/repo.git",
       "https://example.com/bearer/planted-value/repo.git",
       "https://example.com/%61ccess_%74oken/planted-value/repo.git",
+      "https://example.com/%25252561ccess_%25252574oken/planted-value/repo.git",
+      "https://example.com/%zz/%25252561ccess_%25252574oken/planted-value/repo.git",
     ]) {
       await expect(ipc.addCodexMarketplace(source, null, true)).rejects.toThrow("public HTTPS");
     }
@@ -153,6 +155,8 @@ describe("Codex marketplace bridge", () => {
       "feature/auth/planted-value",
       "feature/bearer/planted-value",
       "feature/%61ccess_%74oken/planted-value",
+      "feature/%25252561ccess_%25252574oken/planted-value",
+      "feature/%zz/%25252561ccess_%25252574oken/planted-value",
     ]) {
       await expect(
         ipc.addCodexMarketplace("https://example.com/team.git", ref, true),

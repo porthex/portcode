@@ -783,7 +783,7 @@ fn percent_decode_round(value: &str) -> String {
 
 fn contains_sensitive_source_material(value: &str) -> bool {
     let mut normalized = value.to_ascii_lowercase();
-    for _ in 0..3 {
+    loop {
         let decoded = percent_decode_round(&normalized);
         if decoded == normalized {
             break;
@@ -1336,6 +1336,8 @@ mod tests {
             "https://example.com/auth/planted-value/repo.git",
             "https://example.com/bearer/planted-value/repo.git",
             "https://example.com/%61ccess_%74oken/planted-value/repo.git",
+            "https://example.com/%25252561ccess_%25252574oken/planted-value/repo.git",
+            "https://example.com/%zz/%25252561ccess_%25252574oken/planted-value/repo.git",
             "javascript:alert(1)",
             "C:\\local\\path",
             "",
@@ -1350,6 +1352,8 @@ mod tests {
             "feature/auth/planted-value",
             "feature/bearer/planted-value",
             "feature/%61ccess_%74oken/planted-value",
+            "feature/%25252561ccess_%25252574oken/planted-value",
+            "feature/%zz/%25252561ccess_%25252574oken/planted-value",
         ] {
             assert!(
                 add_params("https://example.com/repo.git", Some(bad_ref)).is_err(),

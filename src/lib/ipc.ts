@@ -1304,14 +1304,12 @@ function requirePreviewIdentifier(value: string, label: string): string {
 
 function containsPreviewSensitiveSourceMaterial(value: string): boolean {
   let normalized = value.toLowerCase();
-  for (let round = 0; round < 3; round += 1) {
-    try {
-      const decoded = decodeURIComponent(normalized);
-      if (decoded === normalized) break;
-      normalized = decoded;
-    } catch {
-      break;
-    }
+  while (true) {
+    const decoded = normalized.replace(/%([0-9a-f]{2})/gi, (_match, hex: string) =>
+      String.fromCharCode(Number.parseInt(hex, 16)),
+    );
+    if (decoded === normalized) break;
+    normalized = decoded;
   }
   const sensitiveLabel =
     /(^|[^a-z0-9])(?:access[_-]?token|auth(?:orization)?|bearer|client[_-]?secret|credential|password|refresh[_-]?token|secret|signature|token|api[_-]?key|private[_-]?key|session[_-]?key|ssh[_-]?key)([^a-z0-9]|$)|\b(?:sk-|ghp_|github_pat_)[a-z0-9_-]{6,}/i;
