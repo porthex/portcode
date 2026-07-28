@@ -8,6 +8,8 @@ mod attachments;
 mod codex_app_server;
 #[cfg(desktop)]
 mod codex_engine;
+#[cfg(desktop)]
+mod codex_marketplace;
 // Cross-target crash-reporting consent flag (the on-disk opt-in). NOT cfg-gated: the
 // desktop `telemetry` module re-uses it AND the mobile `telemetry_set_consent`
 // command writes it (the Android `PortcodeApplication` reads the same flag before it
@@ -982,6 +984,98 @@ fn list_dir(state: State<AppState>, sub: Option<String>) -> Result<Vec<DirEntry>
         _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
     Ok(entries)
+}
+
+// ── Codex marketplace (desktop-local; never projected through Phone Sync) ───
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn codex_marketplace_list(
+    state: State<'_, AppState>,
+) -> Result<codex_marketplace::CodexMarketplaceCatalogView, String> {
+    state.codex.marketplace_catalog().await
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn codex_marketplace_plugin_read(
+    state: State<'_, AppState>,
+    marketplace: String,
+    plugin: String,
+) -> Result<codex_marketplace::CodexPluginDetailView, String> {
+    state
+        .codex
+        .marketplace_plugin_detail(&marketplace, &plugin)
+        .await
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn codex_marketplace_plugin_install(
+    state: State<'_, AppState>,
+    marketplace: String,
+    plugin: String,
+    disclosure_confirmed: bool,
+) -> Result<codex_marketplace::CodexPluginInstallView, String> {
+    state
+        .codex
+        .marketplace_plugin_install(&marketplace, &plugin, disclosure_confirmed)
+        .await
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn codex_marketplace_plugin_uninstall(
+    state: State<'_, AppState>,
+    plugin_id: String,
+    removal_confirmed: bool,
+) -> Result<(), String> {
+    state
+        .codex
+        .marketplace_plugin_uninstall(&plugin_id, removal_confirmed)
+        .await
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn codex_marketplace_add(
+    state: State<'_, AppState>,
+    source: String,
+    ref_name: Option<String>,
+    source_confirmed: bool,
+) -> Result<codex_marketplace::CodexMarketplaceAddView, String> {
+    if !source_confirmed {
+        return Err("marketplace source addition must be confirmed".to_owned());
+    }
+    state
+        .codex
+        .marketplace_add(&source, ref_name.as_deref())
+        .await
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn codex_marketplace_remove(
+    state: State<'_, AppState>,
+    marketplace_name: String,
+    removal_confirmed: bool,
+) -> Result<codex_marketplace::CodexMarketplaceRemoveView, String> {
+    if !removal_confirmed {
+        return Err("marketplace removal must be confirmed".to_owned());
+    }
+    state.codex.marketplace_remove(&marketplace_name).await
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn codex_marketplace_refresh(
+    state: State<'_, AppState>,
+    marketplace_name: Option<String>,
+) -> Result<codex_marketplace::CodexMarketplaceUpgradeView, String> {
+    state
+        .codex
+        .marketplace_refresh(marketplace_name.as_deref())
+        .await
 }
 
 // ── agent ────────────────────────────────────────────────────────────────────
@@ -1975,6 +2069,13 @@ pub fn run() {
         get_usage,
         get_all_usage,
         search_messages,
+        codex_marketplace_list,
+        codex_marketplace_plugin_read,
+        codex_marketplace_plugin_install,
+        codex_marketplace_plugin_uninstall,
+        codex_marketplace_add,
+        codex_marketplace_remove,
+        codex_marketplace_refresh,
         workspace::get_workspace_summary,
         workspace::get_session_archive_warning,
         git_review::get_git_review_branches,

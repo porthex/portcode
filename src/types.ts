@@ -532,7 +532,7 @@ export interface WorkspaceSummary {
 }
 
 /** The main desktop work surface. Review is workspace-scoped, not session history. */
-export type WorkspaceSurface = "chat" | "review";
+export type WorkspaceSurface = "chat" | "review" | "marketplace";
 
 /** Which review context the workspace surface should present. */
 export type ReviewTarget = { kind: "workspace" } | { kind: "turn"; turnId: string };
@@ -1146,6 +1146,125 @@ export interface PairingPayload {
    * surfaces as a connect error rather than dialing without an address.
    */
   nodeAddr?: PairingNodeAddr;
+}
+
+// ── Desktop Codex marketplace bridge ─────────────────────────────────────────
+
+export type CodexPluginInstallPolicy = "available" | "notAvailable" | "installedByDefault";
+export type CodexPluginAuthPolicy = "onInstall" | "onUse" | "unknown";
+export type CodexPluginAvailability = "available" | "disabledByAdmin";
+
+export interface CodexMarketplaceCatalog {
+  marketplaces: CodexMarketplace[];
+  loadErrors: CodexMarketplaceLoadError[];
+  featuredPluginIds: string[];
+}
+
+export interface CodexMarketplace {
+  name: string;
+  displayName: string | null;
+  plugins: CodexPluginSummary[];
+}
+
+export interface CodexMarketplaceLoadError {
+  sourceLabel: string;
+  message: string;
+}
+
+export interface CodexPluginSummary {
+  id: string;
+  name: string;
+  displayName: string | null;
+  shortDescription: string | null;
+  developerName: string | null;
+  category: string | null;
+  version: string | null;
+  localVersion: string | null;
+  installed: boolean;
+  enabled: boolean;
+  installPolicy: CodexPluginInstallPolicy;
+  authPolicy: CodexPluginAuthPolicy;
+  availability: CodexPluginAvailability;
+  mustShowInstallationInterstitial: boolean;
+  installable: boolean;
+  keywords: string[];
+  websiteUrl: string | null;
+  logoUrl: string | null;
+  logoUrlDark: string | null;
+  screenshotUrls: string[];
+}
+
+export interface CodexPluginDetail {
+  marketplaceName: string;
+  summary: CodexPluginSummary;
+  shareUrl: string | null;
+  description: string | null;
+  skills: CodexPluginSkill[];
+  hooks: CodexPluginHook[];
+  apps: CodexPluginApp[];
+  mcpServers: string[];
+  /** null means unavailable; [] means authoritatively empty. */
+  scheduledTasks: CodexScheduledTask[] | null;
+}
+
+export interface CodexPluginSkill {
+  name: string;
+  description: string | null;
+  shortDescription: string | null;
+  displayName: string | null;
+  enabled: boolean;
+}
+
+export interface CodexPluginHook {
+  key: string;
+  eventName: string;
+}
+
+export interface CodexPluginApp {
+  id: string;
+  name: string;
+  description: string | null;
+  category: string | null;
+}
+
+export interface CodexScheduledTask {
+  key: string;
+  name: string;
+  prompt: string;
+  schedule: CodexScheduledTaskSchedule;
+}
+
+export type CodexScheduledTaskWeekday = "MO" | "TU" | "WE" | "TH" | "FR" | "SA" | "SU";
+export type CodexScheduledTaskSchedule =
+  | { type: "hourly"; intervalHours: number; days: CodexScheduledTaskWeekday[] | null }
+  | { type: "daily"; time: string }
+  | { type: "weekdays"; time: string }
+  | { type: "weekly"; days: CodexScheduledTaskWeekday[]; time: string };
+
+export interface CodexMarketplaceAddResult {
+  marketplaceName: string;
+  alreadyAdded: boolean;
+}
+
+export interface CodexMarketplaceRemoveResult {
+  marketplaceName: string;
+  removed: boolean;
+}
+
+export interface CodexMarketplaceUpgradeError {
+  marketplaceName: string;
+  message: string;
+}
+
+export interface CodexMarketplaceUpgradeResult {
+  selectedMarketplaces: string[];
+  upgradedCount: number;
+  errors: CodexMarketplaceUpgradeError[];
+}
+
+export interface CodexPluginInstallResult {
+  authPolicy: CodexPluginAuthPolicy;
+  appsNeedingAuth: CodexPluginApp[];
 }
 
 // ── Mobile remote client (the phone drives a paired desktop) ───────────────────

@@ -20,6 +20,11 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use crate::{
     attachments::PreparedTurn,
     codex_app_server::{CodexAppServer, Incoming},
+    codex_marketplace::{
+        self, CodexMarketplaceAddView, CodexMarketplaceCatalogView, CodexMarketplaceRemoveView,
+        CodexMarketplaceRoutes, CodexMarketplaceUpgradeView, CodexPluginDetailView,
+        CodexPluginInstallView,
+    },
     db::{self, Db},
     events::EventSink,
     llm::{Block, ChatMessage, StreamEvent},
@@ -308,6 +313,7 @@ pub struct CodexEngine {
     event_pump: StdMutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     shutdown_gate: RwLock<bool>,
     routes: RwLock<HashMap<String, ThreadRoute>>,
+    marketplace_routes: RwLock<CodexMarketplaceRoutes>,
     resumed_generation: Mutex<HashMap<String, u64>>,
     pending_starts: Mutex<HashMap<String, PendingTurnStart>>,
     active_by_session: Mutex<HashMap<String, ActiveSessionTurn>>,
@@ -361,6 +367,7 @@ impl CodexEngine {
             event_pump: StdMutex::new(None),
             shutdown_gate: RwLock::new(false),
             routes: RwLock::new(routes),
+            marketplace_routes: RwLock::new(CodexMarketplaceRoutes::default()),
             resumed_generation: Mutex::new(HashMap::new()),
             pending_starts: Mutex::new(HashMap::new()),
             active_by_session: Mutex::new(HashMap::new()),
@@ -412,6 +419,109 @@ impl CodexEngine {
 
     pub fn server(&self) -> &CodexAppServer {
         &self.server
+    }
+
+    pub async fn marketplace_catalog(&self) -> Result<CodexMarketplaceCatalogView, String> {
+        let response = self
+            .server
+            .plugin_list()
+            .await
+            .map_err(|_| "Codex could not load the plugin catalog.".to_owned())?;
+        let (catalog, routes) = codex_marketplace::project_catalog(&response)?;
+        *self.marketplace_routes.write().await = routes;
+        Ok(catalog)
+    }
+
+    pub async fn marketplace_plugin_detail(
+        &self,
+        marketplace: &str,
+        plugin: &str,
+    ) -> Result<CodexPluginDetailView, String> {
+        self.marketplace_catalog().await?;
+        let params = self
+            .marketplace_routes
+            .read()
+            .await
+            .read_params(marketplace, plugin)?;
+        let response = self
+            .server
+            .plugin_read(params)
+            .await
+            .map_err(|_| "Codex could not load this plugin.".to_owned())?;
+        codex_marketplace::project_plugin_detail(&response)
+    }
+
+    pub async fn marketplace_plugin_install(
+        &self,
+        marketplace: &str,
+        plugin: &str,
+        disclosure_confirmed: bool,
+    ) -> Result<CodexPluginInstallView, String> {
+        self.marketplace_catalog().await?;
+        let params = self.marketplace_routes.read().await.install_params(
+            marketplace,
+            plugin,
+            disclosure_confirmed,
+        )?;
+        let response = self
+            .server
+            .plugin_install(params)
+            .await
+            .map_err(|_| "Codex could not install this plugin.".to_owned())?;
+        codex_marketplace::project_plugin_install(&response)
+    }
+
+    pub async fn marketplace_plugin_uninstall(
+        &self,
+        plugin_id: &str,
+        removal_confirmed: bool,
+    ) -> Result<(), String> {
+        let params = codex_marketplace::uninstall_params(plugin_id, removal_confirmed)?;
+        self.server
+            .plugin_uninstall(params)
+            .await
+            .map_err(|_| "Codex could not remove this plugin.".to_owned())?;
+        Ok(())
+    }
+
+    pub async fn marketplace_add(
+        &self,
+        source: &str,
+        ref_name: Option<&str>,
+    ) -> Result<CodexMarketplaceAddView, String> {
+        let params = codex_marketplace::add_params(source, ref_name)?;
+        let response = self
+            .server
+            .marketplace_add(params)
+            .await
+            .map_err(|_| "Codex could not add this marketplace.".to_owned())?;
+        codex_marketplace::project_marketplace_add(&response)
+    }
+
+    pub async fn marketplace_remove(
+        &self,
+        marketplace_name: &str,
+    ) -> Result<CodexMarketplaceRemoveView, String> {
+        let params = codex_marketplace::remove_params(marketplace_name)?;
+        let response = self
+            .server
+            .marketplace_remove(params)
+            .await
+            .map_err(|_| "Codex could not remove this marketplace.".to_owned())?;
+        codex_marketplace::project_marketplace_remove(&response)
+    }
+
+    pub async fn marketplace_refresh(
+        &self,
+        marketplace_name: Option<&str>,
+    ) -> Result<CodexMarketplaceUpgradeView, String> {
+        let params = codex_marketplace::upgrade_params(marketplace_name)?;
+        let response = self
+            .server
+            .marketplace_upgrade(params)
+            .await
+            .map_err(|_| "Codex could not refresh the marketplace snapshot.".to_owned())?;
+        codex_marketplace::project_marketplace_upgrade(&response)
     }
 
     pub async fn account(&self, refresh: bool) -> Result<CodexAccountView, String> {

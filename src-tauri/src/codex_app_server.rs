@@ -479,6 +479,41 @@ impl CodexAppServer {
         self.request("model/list", Value::Object(params)).await
     }
 
+    /// Allowlisted marketplace discovery. No caller-supplied method name crosses this API.
+    pub async fn plugin_list(&self) -> Result<Value> {
+        self.request("plugin/list", json!({})).await
+    }
+
+    /// Allowlisted plugin detail request. Parameters are built by the private marketplace route cache.
+    pub async fn plugin_read(&self, params: Value) -> Result<Value> {
+        self.request("plugin/read", params).await
+    }
+
+    /// Allowlisted public marketplace source addition.
+    pub async fn marketplace_add(&self, params: Value) -> Result<Value> {
+        self.request("marketplace/add", params).await
+    }
+
+    /// Allowlisted marketplace source removal.
+    pub async fn marketplace_remove(&self, params: Value) -> Result<Value> {
+        self.request("marketplace/remove", params).await
+    }
+
+    /// Allowlisted marketplace source upgrade.
+    pub async fn marketplace_upgrade(&self, params: Value) -> Result<Value> {
+        self.request("marketplace/upgrade", params).await
+    }
+
+    /// Allowlisted plugin installation.
+    pub async fn plugin_install(&self, params: Value) -> Result<Value> {
+        self.request("plugin/install", params).await
+    }
+
+    /// Allowlisted plugin removal.
+    pub async fn plugin_uninstall(&self, params: Value) -> Result<Value> {
+        self.request("plugin/uninstall", params).await
+    }
+
     /// Permanently close this supervisor, stop the current generation, and reject
     /// outstanding and future requests. A new engine must construct a new server.
     pub async fn shutdown(&self) {

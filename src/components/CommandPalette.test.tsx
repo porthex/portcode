@@ -46,7 +46,7 @@ const CODEX_PRIMARY_ACCOUNT: OpenAIAccountSummary = {
 };
 
 // Fixed (non-model) command count, see CommandPalette.tsx.
-const FIXED_COMMANDS = 5;
+const FIXED_COMMANDS = 6;
 const REMOTE_FIXED_COMMANDS = 4;
 const TOTAL_COMMANDS = FIXED_COMMANDS + MODELS.length;
 
@@ -566,6 +566,16 @@ describe("running commands", () => {
     fireEvent.click(screen.getByText("Open review workspace"));
 
     expect(useStore.getState().workspaceSurface).toBe("review");
+    expect(useStore.getState().showPalette).toBe(false);
+  });
+
+  it("opens the desktop plugin marketplace surface", () => {
+    open();
+    render(<CommandPalette />);
+
+    fireEvent.click(screen.getByText("Open plugin marketplace"));
+
+    expect(useStore.getState().workspaceSurface).toBe("marketplace");
     expect(useStore.getState().showPalette).toBe(false);
   });
 
