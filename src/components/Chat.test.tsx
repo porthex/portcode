@@ -1195,9 +1195,14 @@ describe("Chat auto-scroll (only follows when pinned to bottom)", () => {
     expect(() => fireEvent.scroll(scroller as HTMLElement)).not.toThrow();
   });
 
-  it("follows the streaming transcript to the bottom via a ResizeObserver while pinned", () => {
-    const captured: { cb?: () => void } = {};
+  it("coalesces streamed transcript growth into one bottom-follow write per frame", () => {
+    const captured: { cb?: () => void; frame?: FrameRequestCallback } = {};
     const observe = vi.fn();
+    const requestAnimationFrame = vi.fn((cb: FrameRequestCallback) => {
+      captured.frame = cb;
+      return 1;
+    });
+    vi.stubGlobal("requestAnimationFrame", requestAnimationFrame);
     vi.stubGlobal(
       "ResizeObserver",
       class {
@@ -1214,12 +1219,26 @@ describe("Chat auto-scroll (only follows when pinned to bottom)", () => {
       messages: { s1: [userMessage("m1", "streaming")] },
       streaming: true,
     });
-    render(<Chat />);
-    // The streaming effect observes the content for height growth.
+    const { container } = render(<Chat />);
+    const scroller = container.querySelector(".overflow-y-auto") as HTMLElement;
+    Object.defineProperty(scroller, "scrollHeight", { value: 1000, configurable: true });
+    scroller.scrollTop = 0;
     expect(observe).toHaveBeenCalledTimes(1);
-    // Firing the observer (a content resize, pinned to bottom) must not throw.
     expect(captured.cb).toBeDefined();
+
+    act(() =>
+      useStore.setState({
+        messages: { s1: [userMessage("m1", "streaming more")] },
+      }),
+    );
     captured.cb?.();
+    captured.cb?.();
+    captured.cb?.();
+    expect(requestAnimationFrame).toHaveBeenCalledTimes(1);
+    expect(scroller.scrollTop).toBe(0);
+
+    captured.frame?.(16);
+    expect(scroller.scrollTop).toBe(1000);
   });
 });
 
@@ -1405,6 +1424,28 @@ describe("Chat scroll-to-latest affordance", () => {
     expect(screen.queryByRole("button", { name: "Scroll to latest" })).not.toBeInTheDocument();
   });
 
+  it("releases bottom-follow after a small deliberate scroll and re-pins at the end", () => {
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "hi")] },
+      streaming: true,
+    });
+
+    const { container } = render(<Chat />);
+    const scroller = container.querySelector(".overflow-y-auto") as HTMLElement;
+    Object.defineProperty(scroller, "scrollHeight", { value: 1000, configurable: true });
+    Object.defineProperty(scroller, "clientHeight", { value: 300, configurable: true });
+
+    scroller.scrollTop = 660; // 40px from the end: the user deliberately moved away.
+    fireEvent.scroll(scroller);
+    expect(screen.getByRole("button", { name: "Scroll to latest" })).toBeInTheDocument();
+
+    scroller.scrollTop = 692; // 8px from the end: fractional/layout tolerance.
+    fireEvent.scroll(scroller);
+    expect(screen.queryByRole("button", { name: "Scroll to latest" })).toBeNull();
+  });
+
   it("shows the button after the user scrolls up, then hides it and pins on click", () => {
     useStore.setState({
       activeId: "s1",
@@ -1433,6 +1474,42 @@ describe("Chat scroll-to-latest affordance", () => {
     scroller.scrollTop = scroller.scrollHeight - 300; // 1000 - clientHeight(300) => delta 0 < 80
     fireEvent.scroll(scroller);
     expect(screen.queryByRole("button", { name: "Scroll to latest" })).not.toBeInTheDocument();
+  });
+
+  it("marks the jump button unread when new AI output arrives while the user is away", () => {
+    const assistant = (text: string): Message => ({
+      id: "assistant-1",
+      role: "assistant",
+      blocks: [{ kind: "text", text }],
+      createdAt: 2,
+      turnId: "turn-1",
+    });
+    useStore.setState({
+      activeId: "s1",
+      sessions: [session()],
+      messages: { s1: [userMessage("m1", "hi"), assistant("Starting")] },
+      streaming: true,
+    });
+
+    const { container } = render(<Chat />);
+    const scroller = container.querySelector(".overflow-y-auto") as HTMLElement;
+    stubScrolledUp(scroller);
+    fireEvent.scroll(scroller);
+
+    expect(screen.queryByTestId("chat-unread-indicator")).toBeNull();
+
+    act(() =>
+      useStore.setState({
+        messages: { s1: [userMessage("m1", "hi"), assistant("Starting\nMore output")] },
+      }),
+    );
+
+    const button = screen.getByRole("button", { name: "Scroll to latest, new activity" });
+    expect(button).toBeInTheDocument();
+    expect(screen.getByTestId("chat-unread-indicator")).toHaveClass("bg-danger");
+
+    fireEvent.click(button);
+    expect(screen.queryByTestId("chat-unread-indicator")).toBeNull();
   });
 
   it("only shifts the button for an open aside at the transcript container breakpoint", () => {
