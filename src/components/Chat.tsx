@@ -15,11 +15,7 @@ import { BackgroundTasksPanel } from "./BackgroundTasksPanel";
 import { CodexRequestPrompt } from "./CodexRequestPrompt";
 import { type Message } from "../types";
 import type { AgentInfo, CodexActivityEvent } from "../types";
-import {
-  codexTurnKey,
-  projectCodexActivity,
-  remoteSafeCodexActivityEvents,
-} from "../lib/codexActivity";
+import { remoteSafeCodexActivityEvents } from "../lib/codexActivity";
 import { CodexActivityHistoryInspector } from "./CodexActivity";
 
 // Stable reference so the selector never returns a fresh array (which would
@@ -143,10 +139,6 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
       (event) => event.sessionId === activeId && !childThreadIds.has(event.threadId),
     );
   }, [activeId, childThreadIds, codexEvents, remoteMode]);
-  const activityProjection = useMemo(
-    () => projectCodexActivity(parentCodexEvents, { hasMore: activityPaging?.hasMore }),
-    [activityPaging?.hasMore, parentCodexEvents],
-  );
   const inspectorEvents = useMemo(() => {
     const older = activityPaging?.olderEvents ?? EMPTY_ACTIVITY;
     const visibleOlder = remoteMode ? remoteSafeCodexActivityEvents(older) : older;
@@ -353,10 +345,6 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
     const run = isRunMessage ? activeRun : undefined;
     const activityTurnId = message.turnId ?? (isRunMessage ? activeRun?.turnId : undefined);
     const turnAgents = agentsForLaunchTurn(activeAgents, activityTurnId);
-    const activity =
-      activeId && activityTurnId
-        ? activityProjection.turns[codexTurnKey(activeId, activityTurnId)]
-        : undefined;
     const turnPresentation =
       run && (run.streaming || run.finalizing)
         ? {
@@ -375,8 +363,6 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
         isActive={isActiveAssistant}
         turnPresentation={turnPresentation}
         agents={turnAgents}
-        activity={activity}
-        remoteSafeActivity={remoteMode}
         onReviewChanges={reviewTurn}
         reviewAvailable={!remoteMode}
       />

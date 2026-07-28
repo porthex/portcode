@@ -119,7 +119,7 @@ describe("Chat empty state", () => {
 });
 
 describe("Chat transcript", () => {
-  it("associates structured activity with its exact turn and exposes unknown methods", () => {
+  it("omits per-turn structured activity while exposing unknown methods separately", () => {
     const activity: CodexActivityEvent[] = [
       {
         sequence: 1,
@@ -179,18 +179,12 @@ describe("Chat transcript", () => {
 
     const { container } = render(<Chat />);
 
-    const receiptToggles = screen.getAllByRole("button", {
-      name: /expand work activity/i,
-    });
-    expect(receiptToggles).toHaveLength(1);
-    fireEvent.click(receiptToggles[0]!);
-    expect(
-      screen
-        .getByRole("button", {
-          name: "pnpm typecheck, completed, expand output",
-        })
-        .closest("#pc-msg-assistant-1"),
-    ).not.toBeNull();
+    expect(screen.queryByRole("button", { name: /work activity/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /pnpm typecheck/i })).toBeNull();
+    expect(container.querySelector("#pc-msg-assistant-1 .pc-turn-receipt")).toHaveAttribute(
+      "data-has-activity",
+      "false",
+    );
     expect(container.querySelector("#pc-msg-assistant-2 .pc-turn-receipt")).toHaveAttribute(
       "data-has-activity",
       "false",
@@ -409,11 +403,10 @@ describe("Chat transcript", () => {
     render(<Chat />);
 
     expect(screen.getByText("Remote-safe transcript")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /expand work activity/i }));
-    expect(screen.getByText("Step 1")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Live changes, updated/i })).toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: /Command, completed/i })).toHaveLength(2);
-    expect(screen.getByText("Turn completed")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /work activity/i })).toBeNull();
+    expect(screen.queryByText("Step 1")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Live changes, updated/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Command, completed/i })).toBeNull();
     fireEvent.click(
       screen.getByRole("button", { name: "Unrecognized Codex activity (1), expand" }),
     );

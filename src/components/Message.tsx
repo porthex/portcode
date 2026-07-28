@@ -6,11 +6,9 @@ import type { AgentInfo, ContentBlock, Message, TurnReceipt as TurnReceiptData }
 import { useStore } from "../store/store";
 import { usePrefersReducedMotion, useScramble } from "../lib/useScramble";
 import { useContextMenu, type ContextMenuItem } from "./ContextMenu";
-import type { CodexTurnActivity } from "../lib/codexActivity";
 import { ToolCall } from "./ToolCall";
 import { isRoutineToolName, ToolActivityGroup, type ActivityCall } from "./ToolActivityGroup";
 import { TurnChangesCard, TurnReceipt } from "./TurnReceipt";
-import { CodexTurnActivityView } from "./CodexActivity";
 import { AgentWorkflowCard } from "./AgentWorkflowCard";
 
 // Hoisted to module scope so they're referentially stable across renders —
@@ -125,8 +123,6 @@ export const MessageView = memo(function MessageView({
   isActive = false,
   turnPresentation,
   agents,
-  activity,
-  remoteSafeActivity = false,
   onReviewChanges,
   reviewAvailable = true,
 }: {
@@ -139,8 +135,6 @@ export const MessageView = memo(function MessageView({
     finalizing: boolean;
   };
   agents?: AgentInfo[];
-  activity?: CodexTurnActivity;
-  remoteSafeActivity?: boolean;
   onReviewChanges?: (receipt: TurnReceiptData) => void;
   reviewAvailable?: boolean;
 }) {
@@ -157,61 +151,36 @@ export const MessageView = memo(function MessageView({
     if (b.kind === "text") lastTextIndex = i;
   });
 
-  // Index results by toolUseId once per render instead of a linear find per
-  // tool_use — the active assistant row re-renders on every delta.
+  const showReceipt =
+    !isUser && Boolean(message.receipt || turnPresentation?.active || turnPresentation?.finalizing);
+
+  // Receipt-backed turns intentionally omit tool/reasoning activity. Avoid even
+  // indexing those blocks so active transcript deltas remain cheap.
   const resultByUseId = useMemo(() => {
     const m = new Map<string, ResultBlock>();
+    if (showReceipt) return m;
     for (const b of message.blocks) if (b.kind === "tool_result") m.set(b.toolUseId, b);
     return m;
-  }, [message.blocks]);
+  }, [message.blocks, showReceipt]);
 
   // Fold consecutive, successful/pending read-only primitives into one calm
   // exploration row. A text block, mutation, delegation, unknown tool, or any
   // error flushes the group and remains individually visible in exact order.
   const renderItems = useMemo(
-    () => buildRenderItems(message.blocks, resultByUseId, isActive, activity?.structuredItemIds),
-    [message.blocks, resultByUseId, isActive, activity?.structuredItemIds],
+    () =>
+      showReceipt
+        ? message.blocks.flatMap((block, index) =>
+            block.kind === "text" ? [{ kind: "text" as const, block, index }] : [],
+          )
+        : buildRenderItems(message.blocks, resultByUseId, isActive),
+    [message.blocks, resultByUseId, isActive, showReceipt],
   );
-  const remoteTerminalVisible =
-    remoteSafeActivity &&
-    (activity?.status === "completed" ||
-      activity?.status === "failed" ||
-      activity?.status === "interrupted");
-  const showReceipt =
-    !isUser &&
-    Boolean(
-      message.receipt ||
-      turnPresentation?.active ||
-      turnPresentation?.finalizing ||
-      (remoteSafeActivity && activity),
-    );
   const textItems = showReceipt
     ? renderItems.filter(
         (item): item is Extract<RenderItem, { kind: "text" }> => item.kind === "text",
       )
     : [];
-  const activityItems = showReceipt ? renderItems.filter((item) => item.kind !== "text") : [];
-  const activityCount =
-    activityItems.length + (activity?.visibleCount ?? 0) + (remoteTerminalVisible ? 1 : 0);
-  const receiptActivity =
-    activityCount > 0 ? (
-      <div className="space-y-1.5">
-        {activity && (activity.visibleCount > 0 || remoteTerminalVisible) && (
-          <CodexTurnActivityView
-            activity={activity}
-            remoteSafe={remoteSafeActivity}
-            reviewAvailable={reviewAvailable && Boolean(message.receipt)}
-            onReviewChanges={
-              message.receipt && onReviewChanges
-                ? () => onReviewChanges(message.receipt!)
-                : undefined
-            }
-          />
-        )}
-        {activityItems.map((item) => renderActivityItem(item, isActive))}
-      </div>
-    ) : null;
-  const deferReceiptActivity = (activity?.visibleCount ?? 0) > 0 || remoteTerminalVisible;
+
   const workflowAgents = agents ?? [];
   const workflowCard =
     workflowAgents.length > 0 ? (
@@ -273,9 +242,6 @@ export const MessageView = memo(function MessageView({
                   startedAt={turnPresentation?.startedAt}
                   waiting={turnPresentation?.waiting}
                   finalizing={turnPresentation?.finalizing}
-                  activityCount={activityCount}
-                  activity={deferReceiptActivity ? null : receiptActivity}
-                  deferredActivity={deferReceiptActivity ? receiptActivity : null}
                 />
                 {textItems.length === 0 && workflowCard}
                 {textItems.map((item, index) => (
@@ -350,7 +316,6 @@ function buildRenderItems(
   blocks: ContentBlock[],
   resultByUseId: Map<string, ResultBlock>,
   isActive: boolean,
-  structuredItemIds?: ReadonlySet<string>,
 ): RenderItem[] {
   const items: RenderItem[] = [];
   let routine: ActivityCall[] = [];
@@ -366,10 +331,6 @@ function buildRenderItems(
     if (block.kind === "text") {
       flushRoutine();
       items.push({ kind: "text", block, index });
-      return;
-    }
-    if (structuredItemIds?.has(block.id)) {
-      flushRoutine();
       return;
     }
 

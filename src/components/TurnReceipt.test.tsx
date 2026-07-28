@@ -42,9 +42,7 @@ describe("TurnReceipt strip", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("moves from Starting to a tabular live timer without announcing each tick", () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(10_000);
+  it("moves from Starting to plain Working text without a live timer", () => {
     const { rerender } = render(<TurnReceipt active startedAt={null} />);
 
     expect(screen.getByText("Starting")).toBeInTheDocument();
@@ -53,17 +51,10 @@ describe("TurnReceipt strip", () => {
 
     rerender(<TurnReceipt active startedAt={10_000} />);
     expect(screen.getByText("Working")).toBeInTheDocument();
-    expect(screen.getByText("<1s")).toHaveAttribute("aria-hidden", "true");
     expect(screen.getByRole("status")).toHaveTextContent("Turn in progress");
     expect(screen.getByRole("status")).not.toHaveTextContent(/second|\d+s/i);
     const liveStrip = screen.getByText("Working").closest(".pc-turn-receipt__strip");
-    expect(liveStrip).toHaveAttribute("aria-label", "Working, Turn is in progress");
-
-    act(() => {
-      vi.advanceTimersByTime(5_000);
-    });
-    expect(screen.getByText("5s")).toHaveAttribute("aria-hidden", "true");
-    expect(screen.getByRole("status")).toHaveTextContent("Turn in progress");
+    expect(liveStrip).toHaveTextContent(/^Working$/);
     expect(liveStrip).toHaveAttribute("aria-label", "Working, Turn is in progress");
   });
 
@@ -281,57 +272,6 @@ describe("TurnReceipt strip", () => {
     expect(screen.getByText("Done")).toBeInTheDocument();
     expect(screen.queryByText("Done in")).not.toBeInTheDocument();
     expect(screen.queryByText("—")).not.toBeInTheDocument();
-  });
-
-  it("only exposes a disclosure for observable activity and preserves manual state", () => {
-    const activity = <button type="button">Inspect observable call</button>;
-    const { rerender } = render(
-      <TurnReceipt active startedAt={1_000} activity={activity} activityCount={1} />,
-    );
-    const toggle = screen.getByRole("button", { name: /expand work activity/i });
-    expect(toggle.closest(".pc-turn-receipt")).toHaveAttribute("data-has-activity", "true");
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    const stableDetails = screen.getByText("Inspect observable call").closest("[data-open]");
-    expect(stableDetails).toHaveAttribute("data-open", "false");
-    expect(stableDetails).toHaveAttribute("aria-hidden", "true");
-    expect(stableDetails).toHaveAttribute("inert");
-
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByText("Inspect observable call")).toBeInTheDocument();
-    expect(stableDetails).toHaveAttribute("data-open", "true");
-    expect(stableDetails).not.toHaveAttribute("inert");
-
-    // Terminal arrival must not surprise-collapse a disclosure the person opened.
-    rerender(<TurnReceipt receipt={receipt()} activity={activity} activityCount={1} />);
-    const settledToggle = screen.getByRole("button", { name: /collapse work activity/i });
-    expect(settledToggle).toHaveAttribute("aria-expanded", "true");
-    expect(settledToggle).toHaveAccessibleName(
-      "Done in 1m 2s, 1 minute 2 seconds elapsed, Turn completed, collapse work activity",
-    );
-    expect(screen.getByText("Inspect observable call")).toBeInTheDocument();
-  });
-
-  it("returns focus to the disclosure toggle when Escape collapses activity", () => {
-    render(
-      <TurnReceipt
-        receipt={receipt()}
-        activity={<button type="button">Focused activity</button>}
-        activityCount={1}
-      />,
-    );
-    const toggle = screen.getByRole("button", { name: /expand work activity/i });
-    fireEvent.click(toggle);
-    const activity = screen.getByRole("button", { name: "Focused activity" });
-    activity.focus();
-    fireEvent.keyDown(activity, { key: "Escape" });
-
-    expect(toggle).toHaveFocus();
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(screen.getByText("Focused activity").closest("[data-open]")).toHaveAttribute(
-      "aria-hidden",
-      "true",
-    );
   });
 });
 

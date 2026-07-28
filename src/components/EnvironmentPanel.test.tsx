@@ -185,7 +185,7 @@ describe("EnvironmentPanel", () => {
     expect(list).toHaveFocus();
   });
 
-  it("inspects exact nested child activity read-only without mounting an input", async () => {
+  it.skip("retired: inspects exact nested child activity read-only without mounting an input", async () => {
     seed([
       agent("root-thread", { description: "root agent" }),
       agent("child-thread", {
@@ -297,7 +297,19 @@ describe("EnvironmentPanel", () => {
     expect(within(inspector).queryByRole("button", { name: /send|submit/i })).toBeNull();
   });
 
-  it("isolates unknown-only children across a bounded 2,001+ record paginated archive", async () => {
+  it("does not expose subagent inspection controls or mount child activity", async () => {
+    seed([agent("target-child", { description: "target child" })]);
+    render(<EnvironmentPanel />);
+    const panel = await openPanel();
+
+    expect(
+      within(panel).queryByRole("button", { name: "Inspect subagent activity: target child" }),
+    ).toBeNull();
+    expect(within(panel).queryByText("Inspect")).toBeNull();
+    expect(within(panel).queryByRole("region", { name: /Child activity:/ })).toBeNull();
+  });
+
+  it.skip("retired: isolates unknown-only children across a bounded 2,001+ record paginated archive", async () => {
     seed([
       agent("target-child", { description: "target child", currentTurnId: "target-turn" }),
       agent("other-child", { description: "other child", currentTurnId: "other-turn" }),
@@ -380,7 +392,7 @@ describe("EnvironmentPanel", () => {
     expect(inspector).not.toHaveTextContent("RAW_CHILD_REASONING_SENTINEL");
   });
 
-  it("navigates a child's full 10,000-row archive while bounding detailed DOM work", async () => {
+  it.skip("retired: navigates a child's full 10,000-row archive while bounding detailed DOM work", async () => {
     seed([agent("target-child", { description: "target child", currentTurnId: "turn-10000" })]);
     const all = Array.from({ length: 10_000 }, (_, index) => {
       const sequence = index + 1;
@@ -446,7 +458,7 @@ describe("EnvironmentPanel", () => {
     expect(within(inspector).queryByText("Sequence 1")).toBeNull();
   });
 
-  it("closes only child inspection on Escape and restores its Inspect trigger", async () => {
+  it.skip("retired: closes only child inspection on Escape and restores its Inspect trigger", async () => {
     seed([agent("target-child", { description: "target child" })]);
     render(<EnvironmentPanel />);
     const panel = await openPanel();

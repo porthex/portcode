@@ -631,7 +631,7 @@ describe("MessageView — turn receipt presentation", () => {
     expect(strip).toHaveTextContent("Response complete · Checking file changes…");
   });
 
-  it("keeps observable activity in the manual disclosure and the Markdown summary visible", () => {
+  it("keeps the Markdown summary visible while omitting observable activity chrome", () => {
     const turnMessage: Message = {
       ...message("assistant", [
         { kind: "tool_use", id: "read-1", name: "fs_read", input: { path: "src/App.tsx" } },
@@ -644,14 +644,32 @@ describe("MessageView — turn receipt presentation", () => {
     const { container } = render(<MessageView message={turnMessage} />);
 
     expect(screen.getByRole("heading", { level: 2, name: "Result" })).toBeInTheDocument();
-    const details = container.querySelector(".pc-turn-receipt__details-grid");
-    expect(details).toHaveAttribute("aria-hidden", "true");
-    expect(details).toHaveAttribute("inert");
+    expect(container.querySelector(".pc-turn-receipt__details-grid")).toBeNull();
+    expect(screen.queryByRole("button", { name: /work activity/i })).toBeNull();
+    expect(screen.queryByText("Read file")).toBeNull();
+  });
 
-    fireEvent.click(screen.getByRole("button", { name: /expand work activity/i }));
-    expect(details).toHaveAttribute("aria-hidden", "false");
-    expect(details).not.toHaveAttribute("inert");
-    expect(screen.getByText("Read file")).toBeInTheDocument();
+  it("renders active work as plain Working text without mounting reasoning or tool activity", () => {
+    const { container } = render(
+      <MessageView
+        message={{
+          ...message("assistant", [
+            { kind: "tool_use", id: "read-1", name: "fs_read", input: {} },
+            { kind: "tool_result", toolUseId: "read-1", output: "contents", isError: false },
+          ]),
+          turnId: "turn-1",
+        }}
+        turnPresentation={{ active: true, startedAt: 1_000, waiting: false, finalizing: false }}
+      />,
+    );
+
+    const strip = container.querySelector(".pc-turn-receipt__strip");
+    expect(strip).toHaveTextContent(/^Working$/);
+    expect(strip?.tagName).toBe("DIV");
+    expect(screen.queryByRole("button", { name: /work activity/i })).toBeNull();
+    expect(document.body).not.toHaveTextContent("Reasoning summary");
+    expect(document.body).not.toHaveTextContent("Read file");
+    expect(container.querySelector(".pc-turn-receipt__details-grid")).toBeNull();
   });
 
   it("promotes a compact swarm card inline and does not mount child prompts in Working", () => {
@@ -971,7 +989,7 @@ describe("MessageView — turn receipt presentation", () => {
 });
 
 describe("MessageView — structured Codex activity", () => {
-  it("renders remote-safe terminal and tool state without exposing local raw fields", () => {
+  it("renders remote-safe terminal status without mounting tool activity or raw fields", () => {
     const privateSentinel = "MESSAGE_REMOTE_PRIVATE_COMMAND_SENTINEL";
     const activity = projectCodexActivity(
       remoteSafeCodexActivityEvents([
@@ -1015,19 +1033,16 @@ describe("MessageView — structured Codex activity", () => {
           turnId: "turn-remote",
           receipt: receipt({ turnId: "turn-remote" }),
         }}
-        activity={activity}
-        remoteSafeActivity
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /expand work activity/i }));
-    expect(screen.getByText("Turn completed")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Command, completed/i })).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: /Turn completed/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Command, completed/i })).toBeNull();
     expect(document.body).not.toHaveTextContent(privateSentinel);
     expect(document.body).not.toHaveTextContent("Recorded parameters");
   });
 
-  it("suppresses only duplicate generic tool IDs and counts projected activity", () => {
+  it("does not mount projected or generic tool activity in a receipt", () => {
     const activityEvents: CodexActivityEvent[] = [
       {
         sequence: 1,
@@ -1076,25 +1091,21 @@ describe("MessageView — structured Codex activity", () => {
       turnId: "turn-1",
     };
 
-    const { container } = render(<MessageView message={turnMessage} activity={activity} />);
+    expect(activity).toBeDefined();
+    const { container } = render(<MessageView message={turnMessage} />);
 
     expect(container.querySelector(".pc-turn-receipt")).toHaveAttribute(
       "data-has-activity",
-      "true",
+      "false",
     );
     expect(
       container.querySelector('[aria-label="pnpm test, completed, expand output"]'),
     ).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: /expand work activity/i }));
-    expect(
-      screen.getByRole("button", {
-        name: "pnpm test, completed, expand output",
-      }),
-    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /work activity/i })).toBeNull();
     expect(
       screen.queryByRole("button", { name: /Run command pnpm test/i }),
     ).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Unrelated tool/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Unrelated tool/i })).toBeNull();
   });
 });
 
