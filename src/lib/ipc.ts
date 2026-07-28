@@ -1303,14 +1303,18 @@ function requirePreviewIdentifier(value: string, label: string): string {
 }
 
 function containsPreviewSensitiveSourceMaterial(value: string): boolean {
-  const normalized = value
-    .toLowerCase()
-    .replaceAll("%5f", "_")
-    .replaceAll("%2d", "-")
-    .replaceAll("%3d", "=")
-    .replaceAll("%2f", "/");
+  let normalized = value.toLowerCase();
+  for (let round = 0; round < 3; round += 1) {
+    try {
+      const decoded = decodeURIComponent(normalized);
+      if (decoded === normalized) break;
+      normalized = decoded;
+    } catch {
+      break;
+    }
+  }
   const sensitiveLabel =
-    /(^|[^a-z0-9])(?:access[_-]?token|authorization|client[_-]?secret|credential|password|refresh[_-]?token|secret|signature|token|api[_-]?key)([^a-z0-9]|$)|\bsk-[a-z0-9_-]{6,}/i;
+    /(^|[^a-z0-9])(?:access[_-]?token|auth(?:orization)?|bearer|client[_-]?secret|credential|password|refresh[_-]?token|secret|signature|token|api[_-]?key|private[_-]?key|session[_-]?key|ssh[_-]?key)([^a-z0-9]|$)|\b(?:sk-|ghp_|github_pat_)[a-z0-9_-]{6,}/i;
   return sensitiveLabel.test(normalized);
 }
 

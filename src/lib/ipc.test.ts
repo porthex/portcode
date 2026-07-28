@@ -140,12 +140,24 @@ describe("Codex marketplace bridge", () => {
       "https://example.com/access_token/sk-live-123/repo.git",
       "https://example.com/repo.git#access_token=sk-live-123",
       "https://example.com/repo.git?auth=sk-live-123",
+      "https://example.com/auth/planted-value/repo.git",
+      "https://example.com/bearer/planted-value/repo.git",
+      "https://example.com/%61ccess_%74oken/planted-value/repo.git",
     ]) {
       await expect(ipc.addCodexMarketplace(source, null, true)).rejects.toThrow("public HTTPS");
     }
     await expect(
       ipc.addCodexMarketplace("https://example.com/team.git", "access_token=sk-live-123", true),
     ).rejects.toThrow("credentials");
+    for (const ref of [
+      "feature/auth/planted-value",
+      "feature/bearer/planted-value",
+      "feature/%61ccess_%74oken/planted-value",
+    ]) {
+      await expect(
+        ipc.addCodexMarketplace("https://example.com/team.git", ref, true),
+      ).rejects.toThrow("credentials");
+    }
     await expect(
       ipc.addCodexMarketplace("https://example.com/team.git", null, false),
     ).rejects.toThrow("confirmation");

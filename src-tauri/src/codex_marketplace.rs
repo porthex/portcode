@@ -754,17 +754,46 @@ fn is_public_https(value: &str) -> bool {
     }
 }
 
+fn percent_decode_round(value: &str) -> String {
+    fn hex(value: u8) -> Option<u8> {
+        match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            b'A'..=b'F' => Some(value - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
+                decoded.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 fn contains_sensitive_source_material(value: &str) -> bool {
-    let normalized = value
-        .to_ascii_lowercase()
-        .replace("%5f", "_")
-        .replace("%2d", "-")
-        .replace("%3d", "=")
-        .replace("%2f", "/");
+    let mut normalized = value.to_ascii_lowercase();
+    for _ in 0..3 {
+        let decoded = percent_decode_round(&normalized);
+        if decoded == normalized {
+            break;
+        }
+        normalized = decoded;
+    }
     static SENSITIVE: OnceLock<Regex> = OnceLock::new();
     let sensitive = SENSITIVE.get_or_init(|| {
         Regex::new(
-            r"(?i)(^|[^a-z0-9])(?:access[_-]?token|authorization|client[_-]?secret|credential|password|refresh[_-]?token|secret|signature|token|api[_-]?key)([^a-z0-9]|$)|\bsk-[a-z0-9_-]{6,}",
+            r"(?i)(^|[^a-z0-9])(?:access[_-]?token|auth(?:orization)?|bearer|client[_-]?secret|credential|password|refresh[_-]?token|secret|signature|token|api[_-]?key|private[_-]?key|session[_-]?key|ssh[_-]?key)([^a-z0-9]|$)|\b(?:sk-|ghp_|github_pat_)[a-z0-9_-]{6,}",
         )
         .expect("marketplace source credential detector must compile")
     });
@@ -807,9 +836,13 @@ fn marketplace_display_redactors() -> &'static [Regex] {
             Regex::new(r"(?i)\b[A-Z]:[\\/][^\s,;]+")
                 .expect("marketplace Windows path redactor must compile"),
             Regex::new(
-                r"(?i)(^|[\s(])/(?:home|users|data|tmp|var|etc|opt|private)(?:/[^\s,;)]+)+",
+                r"(?i)(^|[\s=:(])\\\\[^\s,;]+",
             )
-            .expect("marketplace Unix path redactor must compile"),
+            .expect("marketplace UNC path redactor must compile"),
+            Regex::new(
+                r"(?i)(^|[\s=:(])/(?:[a-z0-9._~-]+/)+[a-z0-9._~-]+",
+            )
+            .expect("marketplace absolute path redactor must compile"),
         ]
     })
 }
@@ -822,7 +855,10 @@ fn display_safe_text(value: &str) -> String {
     out = marketplace_display_redactors()[1]
         .replace_all(&out, "[redacted-path]")
         .into_owned();
-    marketplace_display_redactors()[2]
+    out = marketplace_display_redactors()[2]
+        .replace_all(&out, "${1}[redacted-path]")
+        .into_owned();
+    marketplace_display_redactors()[3]
         .replace_all(&out, "${1}[redacted-path]")
         .into_owned()
 }
@@ -1085,7 +1121,7 @@ mod tests {
 
         // The degraded source stays visible without exposing its local path.
         assert_eq!(view.load_errors.len(), 1);
-        assert_eq!(view.load_errors[0].source_label, "marketplace.json");
+        assert_eq!(view.load_errors[0].source_label, "Marketplace source");
         assert_eq!(
             view.load_errors[0].message,
             "Marketplace metadata could not be parsed."
@@ -1297,6 +1333,9 @@ mod tests {
             "https://example.com/access_token/sk-live-123/repo.git",
             "https://example.com/repo.git#access_token=sk-live-123",
             "https://example.com/repo.git?auth=sk-live-123",
+            "https://example.com/auth/planted-value/repo.git",
+            "https://example.com/bearer/planted-value/repo.git",
+            "https://example.com/%61ccess_%74oken/planted-value/repo.git",
             "javascript:alert(1)",
             "C:\\local\\path",
             "",
@@ -1305,7 +1344,13 @@ mod tests {
             assert!(add_params(bad, None).is_err(), "{bad:?} must be rejected");
         }
 
-        for bad_ref in ["access_token=sk-live-123", "secret/sk-live-123"] {
+        for bad_ref in [
+            "access_token=sk-live-123",
+            "secret/sk-live-123",
+            "feature/auth/planted-value",
+            "feature/bearer/planted-value",
+            "feature/%61ccess_%74oken/planted-value",
+        ] {
             assert!(
                 add_params("https://example.com/repo.git", Some(bad_ref)).is_err(),
                 "{bad_ref:?} must be rejected"
@@ -1355,7 +1400,7 @@ mod tests {
                     "shortDescription": "Authorization: Bearer planted-secret at C:\\Users\\Alice\\private"
                 }
             },
-            "description": "token=planted-secret /home/alice/private",
+            "description": "token=planted-secret /home/alice/private /workspace/alice/private/file path=/mnt/c/Users/Alice/private \\\\server\\share\\Alice\\private",
             "scheduledTasks": [{
                 "key": "t",
                 "name": "C:\\Users\\Alice\\task",
@@ -1366,7 +1411,15 @@ mod tests {
         .unwrap();
         let encoded = serde_json::to_string(&detail).unwrap();
 
-        for forbidden in ["planted-secret", "Alice", "/home/alice", "C:\\\\Users"] {
+        for forbidden in [
+            "planted-secret",
+            "Alice",
+            "/home/alice",
+            "/workspace/alice",
+            "/mnt/c/Users",
+            "server\\\\share",
+            "C:\\\\Users",
+        ] {
             assert!(
                 !encoded.contains(forbidden),
                 "public detail leaked {forbidden}: {encoded}"
