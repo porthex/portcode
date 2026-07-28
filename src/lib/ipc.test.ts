@@ -123,12 +123,29 @@ describe("Codex marketplace bridge", () => {
     await expect(
       ipc.addCodexMarketplace("https://example.com/team.git", "main", true),
     ).resolves.toEqual({ marketplaceName: "preview-added", alreadyAdded: false });
+    await expect(
+      ipc.addCodexMarketplace(
+        "https://example.com/tokenizer-plugin.git",
+        "feature/tokenizer",
+        true,
+      ),
+    ).resolves.toEqual({ marketplaceName: "preview-added", alreadyAdded: false });
     await expect(ipc.addCodexMarketplace("https://intranet/team.git", null, true)).rejects.toThrow(
       "public HTTPS",
     );
     await expect(
       ipc.addCodexMarketplace("https://example.com/team.git?access_token=secret", null, true),
     ).rejects.toThrow("public HTTPS");
+    for (const source of [
+      "https://example.com/access_token/sk-live-123/repo.git",
+      "https://example.com/repo.git#access_token=sk-live-123",
+      "https://example.com/repo.git?auth=sk-live-123",
+    ]) {
+      await expect(ipc.addCodexMarketplace(source, null, true)).rejects.toThrow("public HTTPS");
+    }
+    await expect(
+      ipc.addCodexMarketplace("https://example.com/team.git", "access_token=sk-live-123", true),
+    ).rejects.toThrow("credentials");
     await expect(
       ipc.addCodexMarketplace("https://example.com/team.git", null, false),
     ).rejects.toThrow("confirmation");

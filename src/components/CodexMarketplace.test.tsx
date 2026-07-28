@@ -220,6 +220,36 @@ describe("CodexMarketplace", () => {
     );
   });
 
+  it("cannot imply cancellation after an installation has started", async () => {
+    let resolveInstall!: (value: { authPolicy: "onUse"; appsNeedingAuth: [] }) => void;
+    vi.mocked(ipc.installCodexPlugin).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveInstall = resolve;
+        }),
+    );
+
+    render(<CodexMarketplace />);
+    fireEvent.click(await screen.findByRole("button", { name: /Starter/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Install plugin" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm install" }));
+    await waitFor(() => expect(ipc.installCodexPlugin).toHaveBeenCalled());
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByRole("dialog", { name: "Install Starter" })).toBeInTheDocument();
+    const close = screen.getByRole("button", { name: "Close dialog" });
+    expect(close).toBeDisabled();
+    fireEvent.click(close);
+    expect(screen.getByRole("dialog", { name: "Install Starter" })).toBeInTheDocument();
+
+    await act(async () => {
+      resolveInstall({ authPolicy: "onUse", appsNeedingAuth: [] });
+    });
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Install Starter" })).not.toBeInTheDocument(),
+    );
+  });
+
   it("refreshes authoritative detail state after installation completes", async () => {
     const installedSummary = {
       ...summary,

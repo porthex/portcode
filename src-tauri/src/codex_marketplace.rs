@@ -9,9 +9,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::sync::OnceLock;
 
+use regex::Regex;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
+
+use crate::scrub::redact_secrets_bounded;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -262,14 +266,14 @@ pub fn project_catalog(
         let Some(marketplace) = marketplace.as_object() else {
             continue;
         };
-        let Ok(name) = required_field(marketplace, "name") else {
+        let Ok(name) = required_public_identifier(marketplace, "name") else {
             continue;
         };
         let path = optional_field(marketplace, "path");
         let display_name = marketplace
             .get("interface")
             .and_then(Value::as_object)
-            .and_then(|value| optional_field(value, "displayName"));
+            .and_then(|value| optional_display_field(value, "displayName"));
         let mut plugins = Vec::new();
         for plugin in array_field(marketplace, "plugins") {
             let Some(plugin_obj) = plugin.as_object() else {
@@ -305,23 +309,18 @@ pub fn project_catalog(
         .iter()
         .filter_map(|value| {
             let value = value.as_object()?;
-            let path = optional_field(value, "marketplacePath")?;
+            optional_field(value, "marketplacePath")?;
             let message = display_safe_provider_error(
                 &optional_field(value, "message")?,
                 "Codex could not load this marketplace source.",
             );
             Some(CodexMarketplaceLoadErrorView {
-                source_label: path
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or("marketplace")
-                    .to_owned(),
+                source_label: "Marketplace source".to_owned(),
                 message,
             })
         })
         .collect();
-    let featured_plugin_ids = string_array(root.get("featuredPluginIds"));
+    let featured_plugin_ids = display_string_array(root.get("featuredPluginIds"));
 
     Ok((
         CodexMarketplaceCatalogView {
@@ -339,7 +338,7 @@ pub fn project_plugin_detail(response: &Value) -> Result<CodexPluginDetailView, 
         .get("plugin")
         .and_then(Value::as_object)
         .ok_or_else(|| "plugin/read response omitted plugin".to_owned())?;
-    let marketplace_name = required_field(plugin, "marketplaceName")?;
+    let marketplace_name = required_public_identifier(plugin, "marketplaceName")?;
     let summary_obj = plugin
         .get("summary")
         .and_then(Value::as_object)
@@ -368,11 +367,11 @@ pub fn project_plugin_detail(response: &Value) -> Result<CodexPluginDetailView, 
         marketplace_name,
         summary,
         share_url: optional_https(plugin, "shareUrl"),
-        description: optional_field(plugin, "description"),
+        description: optional_display_field(plugin, "description"),
         skills,
         hooks,
         apps,
-        mcp_servers: string_array(plugin.get("mcpServers")),
+        mcp_servers: display_string_array(plugin.get("mcpServers")),
         scheduled_tasks,
     })
 }
@@ -385,10 +384,11 @@ pub fn add_params(source: &str, ref_name: Option<&str>) -> Result<Value, String>
     let mut params = Map::new();
     params.insert("source".to_owned(), Value::String(source));
     if let Some(ref_name) = ref_name {
-        params.insert(
-            "refName".to_owned(),
-            Value::String(required_text(ref_name, "Git reference")?),
-        );
+        let ref_name = required_text(ref_name, "Git reference")?;
+        if contains_sensitive_source_material(&ref_name) {
+            return Err("Git reference must not contain credentials".to_owned());
+        }
+        params.insert("refName".to_owned(), Value::String(ref_name));
     }
     Ok(Value::Object(params))
 }
@@ -414,7 +414,7 @@ pub fn uninstall_params(plugin_id: &str, removal_confirmed: bool) -> Result<Valu
 pub fn project_marketplace_add(response: &Value) -> Result<CodexMarketplaceAddView, String> {
     let value = object(response, "marketplace/add response")?;
     Ok(CodexMarketplaceAddView {
-        marketplace_name: required_field(value, "marketplaceName")?,
+        marketplace_name: required_display_field(value, "marketplaceName")?,
         already_added: value
             .get("alreadyAdded")
             .and_then(Value::as_bool)
@@ -433,7 +433,7 @@ pub fn project_marketplace_remove(response: &Value) -> Result<CodexMarketplaceRe
                 .is_some_and(|root| !root.is_null())
         });
     Ok(CodexMarketplaceRemoveView {
-        marketplace_name: required_field(value, "marketplaceName")?,
+        marketplace_name: required_display_field(value, "marketplaceName")?,
         removed,
     })
 }
@@ -447,7 +447,7 @@ pub fn project_marketplace_upgrade(
         .filter_map(|error| {
             let error = error.as_object()?;
             Some(CodexMarketplaceUpgradeErrorView {
-                marketplace_name: required_field(error, "marketplaceName").ok()?,
+                marketplace_name: required_display_field(error, "marketplaceName").ok()?,
                 message: display_safe_provider_error(
                     &required_field(error, "message").ok()?,
                     "Codex could not refresh this marketplace source.",
@@ -456,7 +456,7 @@ pub fn project_marketplace_upgrade(
         })
         .collect();
     Ok(CodexMarketplaceUpgradeView {
-        selected_marketplaces: string_array(value.get("selectedMarketplaces")),
+        selected_marketplaces: display_string_array(value.get("selectedMarketplaces")),
         upgraded_count: array_field(value, "upgradedRoots").len(),
         errors,
     })
@@ -476,28 +476,30 @@ pub fn project_plugin_install(response: &Value) -> Result<CodexPluginInstallView
 fn project_plugin_summary(value: &Map<String, Value>) -> Result<CodexPluginSummaryView, String> {
     let install_policy = parse_install_policy(value.get("installPolicy"));
     let availability = parse_availability(value.get("availability"));
-    let installed = value
-        .get("installed")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let installed_state = value.get("installed").and_then(Value::as_bool);
+    let authoritative_state_complete =
+        installed_state.is_some() && value.get("availability").and_then(Value::as_str).is_some();
+    let installed = installed_state.unwrap_or(false);
     let interface = value.get("interface").and_then(Value::as_object);
     let must_show_installation_interstitial = value
         .get("mustShowInstallationInterstitial")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    let installable = !installed
+    let installable = authoritative_state_complete
+        && !installed
         && install_policy == CodexPluginInstallPolicy::Available
         && availability == CodexPluginAvailability::Available;
 
     Ok(CodexPluginSummaryView {
-        id: required_field(value, "id")?,
-        name: required_field(value, "name")?,
-        display_name: interface.and_then(|item| optional_field(item, "displayName")),
-        short_description: interface.and_then(|item| optional_field(item, "shortDescription")),
-        developer_name: interface.and_then(|item| optional_field(item, "developerName")),
-        category: interface.and_then(|item| optional_field(item, "category")),
-        version: optional_field(value, "version"),
-        local_version: optional_field(value, "localVersion"),
+        id: required_public_identifier(value, "id")?,
+        name: required_public_identifier(value, "name")?,
+        display_name: interface.and_then(|item| optional_display_field(item, "displayName")),
+        short_description: interface
+            .and_then(|item| optional_display_field(item, "shortDescription")),
+        developer_name: interface.and_then(|item| optional_display_field(item, "developerName")),
+        category: interface.and_then(|item| optional_display_field(item, "category")),
+        version: optional_display_field(value, "version"),
+        local_version: optional_display_field(value, "localVersion"),
         installed,
         enabled: value
             .get("enabled")
@@ -508,7 +510,7 @@ fn project_plugin_summary(value: &Map<String, Value>) -> Result<CodexPluginSumma
         availability,
         must_show_installation_interstitial,
         installable,
-        keywords: string_array(value.get("keywords")),
+        keywords: display_string_array(value.get("keywords")),
         website_url: interface.and_then(|item| optional_https(item, "websiteUrl")),
         logo_url: interface.and_then(|item| optional_https(item, "logoUrl")),
         logo_url_dark: interface.and_then(|item| optional_https(item, "logoUrlDark")),
@@ -546,13 +548,13 @@ fn display_safe_provider_error(message: &str, fallback: &str) -> String {
 fn project_skill(value: &Value) -> Option<CodexPluginSkillView> {
     let value = value.as_object()?;
     Some(CodexPluginSkillView {
-        name: required_field(value, "name").ok()?,
-        description: optional_field(value, "description"),
-        short_description: optional_field(value, "shortDescription"),
+        name: required_display_field(value, "name").ok()?,
+        description: optional_display_field(value, "description"),
+        short_description: optional_display_field(value, "shortDescription"),
         display_name: value
             .get("interface")
             .and_then(Value::as_object)
-            .and_then(|interface| optional_field(interface, "displayName")),
+            .and_then(|interface| optional_display_field(interface, "displayName")),
         enabled: value
             .get("enabled")
             .and_then(Value::as_bool)
@@ -563,27 +565,27 @@ fn project_skill(value: &Value) -> Option<CodexPluginSkillView> {
 fn project_hook(value: &Value) -> Option<CodexPluginHookView> {
     let value = value.as_object()?;
     Some(CodexPluginHookView {
-        key: required_field(value, "key").ok()?,
-        event_name: required_field(value, "eventName").ok()?,
+        key: required_display_field(value, "key").ok()?,
+        event_name: required_display_field(value, "eventName").ok()?,
     })
 }
 
 fn project_app(value: &Value) -> Option<CodexPluginAppView> {
     let value = value.as_object()?;
     Some(CodexPluginAppView {
-        id: required_field(value, "id").ok()?,
-        name: required_field(value, "name").ok()?,
-        description: optional_field(value, "description"),
-        category: optional_field(value, "category"),
+        id: required_display_field(value, "id").ok()?,
+        name: required_display_field(value, "name").ok()?,
+        description: optional_display_field(value, "description"),
+        category: optional_display_field(value, "category"),
     })
 }
 
 fn project_task(value: &Value) -> Option<CodexScheduledTaskView> {
     let value = value.as_object()?;
     Some(CodexScheduledTaskView {
-        key: required_field(value, "key").ok()?,
-        name: required_field(value, "name").ok()?,
-        prompt: required_field(value, "prompt").ok()?,
+        key: required_display_field(value, "key").ok()?,
+        name: required_display_field(value, "name").ok()?,
+        prompt: required_display_field(value, "prompt").ok()?,
         schedule: project_schedule(value.get("schedule")?)?,
     })
 }
@@ -662,7 +664,7 @@ fn parse_auth_policy(value: Option<&Value>) -> CodexPluginAuthPolicy {
 
 fn parse_availability(value: Option<&Value>) -> CodexPluginAvailability {
     match value.and_then(Value::as_str) {
-        None | Some("AVAILABLE" | "ENABLED") => CodexPluginAvailability::Available,
+        Some("AVAILABLE" | "ENABLED") => CodexPluginAvailability::Available,
         _ => CodexPluginAvailability::DisabledByAdmin,
     }
 }
@@ -675,7 +677,13 @@ fn is_public_https(value: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(value) else {
         return false;
     };
-    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || contains_sensitive_source_material(value)
+    {
         return false;
     }
     const SENSITIVE_QUERY_KEYS: &[&str] = &[
@@ -746,6 +754,23 @@ fn is_public_https(value: &str) -> bool {
     }
 }
 
+fn contains_sensitive_source_material(value: &str) -> bool {
+    let normalized = value
+        .to_ascii_lowercase()
+        .replace("%5f", "_")
+        .replace("%2d", "-")
+        .replace("%3d", "=")
+        .replace("%2f", "/");
+    static SENSITIVE: OnceLock<Regex> = OnceLock::new();
+    let sensitive = SENSITIVE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(^|[^a-z0-9])(?:access[_-]?token|authorization|client[_-]?secret|credential|password|refresh[_-]?token|secret|signature|token|api[_-]?key)([^a-z0-9]|$)|\bsk-[a-z0-9_-]{6,}",
+        )
+        .expect("marketplace source credential detector must compile")
+    });
+    sensitive.is_match(&normalized) || redact_secrets_bounded(value, 4096) != value
+}
+
 fn object<'a>(value: &'a Value, label: &str) -> Result<&'a Map<String, Value>, String> {
     value
         .as_object()
@@ -771,6 +796,51 @@ fn required_field(value: &Map<String, Value>, field: &str) -> Result<String, Str
     required_text(raw, field)
 }
 
+fn marketplace_display_redactors() -> &'static [Regex] {
+    static REDACTORS: OnceLock<Vec<Regex>> = OnceLock::new();
+    REDACTORS.get_or_init(|| {
+        vec![
+            Regex::new(
+                r"(?i)\b(?:access[_-]?token|refresh[_-]?token|token|client[_-]?secret|secret|password|credential|authorization|auth|api[_-]?key)\s*[:=]\s*[^\s,;]+",
+            )
+            .expect("marketplace credential redactor must compile"),
+            Regex::new(r"(?i)\b[A-Z]:[\\/][^\s,;]+")
+                .expect("marketplace Windows path redactor must compile"),
+            Regex::new(
+                r"(?i)(^|[\s(])/(?:home|users|data|tmp|var|etc|opt|private)(?:/[^\s,;)]+)+",
+            )
+            .expect("marketplace Unix path redactor must compile"),
+        ]
+    })
+}
+
+fn display_safe_text(value: &str) -> String {
+    let mut out = redact_secrets_bounded(value.trim(), 4096);
+    out = marketplace_display_redactors()[0]
+        .replace_all(&out, "[redacted-credential]")
+        .into_owned();
+    out = marketplace_display_redactors()[1]
+        .replace_all(&out, "[redacted-path]")
+        .into_owned();
+    marketplace_display_redactors()[2]
+        .replace_all(&out, "${1}[redacted-path]")
+        .into_owned()
+}
+
+fn required_display_field(value: &Map<String, Value>, field: &str) -> Result<String, String> {
+    let raw = required_field(value, field)?;
+    let safe = display_safe_text(&raw);
+    required_text(&safe, field)
+}
+
+fn required_public_identifier(value: &Map<String, Value>, field: &str) -> Result<String, String> {
+    let raw = required_field(value, field)?;
+    if display_safe_text(&raw) != raw {
+        return Err(format!("{field} contains private material"));
+    }
+    Ok(raw)
+}
+
 fn optional_field(value: &Map<String, Value>, field: &str) -> Option<String> {
     value
         .get(field)
@@ -778,6 +848,12 @@ fn optional_field(value: &Map<String, Value>, field: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.chars().take(4096).collect())
+}
+
+fn optional_display_field(value: &Map<String, Value>, field: &str) -> Option<String> {
+    optional_field(value, field)
+        .map(|value| display_safe_text(&value))
+        .filter(|value| !value.is_empty())
 }
 
 fn array_field<'a>(value: &'a Map<String, Value>, field: &str) -> &'a [Value] {
@@ -798,6 +874,14 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .take(2000)
         .map(|value| value.chars().take(4096).collect())
+        .collect()
+}
+
+fn display_string_array(value: Option<&Value>) -> Vec<String> {
+    string_array(value)
+        .into_iter()
+        .map(|value| display_safe_text(&value))
+        .filter(|value| !value.is_empty())
         .collect()
 }
 
@@ -1080,6 +1164,37 @@ mod tests {
     }
 
     #[test]
+    fn missing_or_malformed_authoritative_state_cannot_be_installed() {
+        let value = json!({ "marketplaces": [{ "name": "m", "plugins": [
+            {
+                "id": "missing-installed",
+                "name": "missing-installed",
+                "installPolicy": "AVAILABLE",
+                "availability": "AVAILABLE"
+            },
+            {
+                "id": "missing-availability",
+                "name": "missing-availability",
+                "installed": false,
+                "installPolicy": "AVAILABLE"
+            },
+            {
+                "id": "wrong-installed",
+                "name": "wrong-installed",
+                "installed": "false",
+                "installPolicy": "AVAILABLE",
+                "availability": "AVAILABLE"
+            }
+        ]}]});
+        let (view, routes) = project_catalog(&value).unwrap();
+
+        for plugin in &view.marketplaces[0].plugins {
+            assert!(!plugin.installable, "{} failed open", plugin.name);
+            assert!(routes.install_params("m", &plugin.name, true).is_err());
+        }
+    }
+
+    #[test]
     fn install_gate_fails_closed_and_builds_typed_params() {
         let (_, routes) = project_catalog(&catalog_fixture()).unwrap();
 
@@ -1157,6 +1272,11 @@ mod tests {
 
         let with_ref = add_params("https://example.com/repo.git", Some("main")).unwrap();
         assert_eq!(with_ref["refName"], "main");
+        assert!(add_params(
+            "https://example.com/tokenizer-plugin.git",
+            Some("feature/tokenizer")
+        )
+        .is_ok());
 
         for bad in [
             "http://example.com/repo.git",
@@ -1174,12 +1294,22 @@ mod tests {
             "https://[::1]/mp",
             "https://[fe80::1]/mp",
             "https://example.com/repo.git?access_token=secret",
+            "https://example.com/access_token/sk-live-123/repo.git",
+            "https://example.com/repo.git#access_token=sk-live-123",
+            "https://example.com/repo.git?auth=sk-live-123",
             "javascript:alert(1)",
             "C:\\local\\path",
             "",
             "   ",
         ] {
             assert!(add_params(bad, None).is_err(), "{bad:?} must be rejected");
+        }
+
+        for bad_ref in ["access_token=sk-live-123", "secret/sk-live-123"] {
+            assert!(
+                add_params("https://example.com/repo.git", Some(bad_ref)).is_err(),
+                "{bad_ref:?} must be rejected"
+            );
         }
     }
 
@@ -1207,6 +1337,54 @@ mod tests {
         let encoded = serde_json::to_value(&detail).unwrap().to_string();
         assert!(!encoded.contains("secret"), "local paths leaked: {encoded}");
         assert!(!encoded.contains("token=abc"), "app install URL leaked");
+    }
+
+    #[test]
+    fn allowlisted_display_strings_scrub_credentials_and_filesystem_paths() {
+        let detail = project_plugin_detail(&json!({ "plugin": {
+            "marketplaceName": "team",
+            "summary": {
+                "id": "p",
+                "name": "p",
+                "installed": true,
+                "enabled": true,
+                "installPolicy": "AVAILABLE",
+                "authPolicy": "ON_USE",
+                "availability": "AVAILABLE",
+                "interface": {
+                    "shortDescription": "Authorization: Bearer planted-secret at C:\\Users\\Alice\\private"
+                }
+            },
+            "description": "token=planted-secret /home/alice/private",
+            "scheduledTasks": [{
+                "key": "t",
+                "name": "C:\\Users\\Alice\\task",
+                "prompt": "Use bearer planted-secret",
+                "schedule": {"type":"daily","time":"09:00"}
+            }]
+        }}))
+        .unwrap();
+        let encoded = serde_json::to_string(&detail).unwrap();
+
+        for forbidden in ["planted-secret", "Alice", "/home/alice", "C:\\\\Users"] {
+            assert!(
+                !encoded.contains(forbidden),
+                "public detail leaked {forbidden}: {encoded}"
+            );
+        }
+        assert!(encoded.contains("redacted"));
+
+        let (catalog, _) = project_catalog(&json!({
+            "marketplaces": [],
+            "marketplaceLoadErrors": [{
+                "marketplacePath": "C:\\Users\\Alice\\secret-source",
+                "message": "failed"
+            }]
+        }))
+        .unwrap();
+        let encoded = serde_json::to_string(&catalog).unwrap();
+        assert!(!encoded.contains("Alice"));
+        assert!(!encoded.contains("secret-source"));
     }
 
     #[test]

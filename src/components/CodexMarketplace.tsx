@@ -110,7 +110,7 @@ function ActionDialog({
       );
     controls()[0]?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
+      if (event.key === "Escape" && !busy) {
         event.preventDefault();
         onCancel();
         return;
@@ -130,7 +130,7 @@ function ActionDialog({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onCancel]);
+  }, [busy, onCancel]);
 
   if (confirmation.kind === "removeMarketplace") {
     return (
@@ -142,7 +142,12 @@ function ActionDialog({
           aria-modal="true"
           aria-label={`Remove ${confirmation.marketplaceName}`}
         >
-          <button className="marketplace-dialog-close" onClick={onCancel} aria-label="Close dialog">
+          <button
+            className="marketplace-dialog-close"
+            onClick={onCancel}
+            aria-label="Close dialog"
+            disabled={busy}
+          >
             <X size={15} aria-hidden="true" />
           </button>
           <ShieldAlert size={22} aria-hidden="true" />
@@ -176,7 +181,12 @@ function ActionDialog({
         aria-modal="true"
         aria-label={`${installing ? "Install" : "Remove"} ${name}`}
       >
-        <button className="marketplace-dialog-close" onClick={onCancel} aria-label="Close dialog">
+        <button
+          className="marketplace-dialog-close"
+          onClick={onCancel}
+          aria-label="Close dialog"
+          disabled={busy}
+        >
           <X size={15} aria-hidden="true" />
         </button>
         <ShieldAlert size={22} aria-hidden="true" />

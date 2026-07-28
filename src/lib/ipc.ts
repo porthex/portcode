@@ -1302,6 +1302,18 @@ function requirePreviewIdentifier(value: string, label: string): string {
   return trimmed;
 }
 
+function containsPreviewSensitiveSourceMaterial(value: string): boolean {
+  const normalized = value
+    .toLowerCase()
+    .replaceAll("%5f", "_")
+    .replaceAll("%2d", "-")
+    .replaceAll("%3d", "=")
+    .replaceAll("%2f", "/");
+  const sensitiveLabel =
+    /(^|[^a-z0-9])(?:access[_-]?token|authorization|client[_-]?secret|credential|password|refresh[_-]?token|secret|signature|token|api[_-]?key)([^a-z0-9]|$)|\bsk-[a-z0-9_-]{6,}/i;
+  return sensitiveLabel.test(normalized);
+}
+
 function requirePreviewPublicHttpsUrl(value: string): void {
   let url: URL;
   try {
@@ -1351,8 +1363,11 @@ function requirePreviewPublicHttpsUrl(value: string): void {
     url.protocol !== "https:" ||
     url.username !== "" ||
     url.password !== "" ||
+    url.search !== "" ||
+    url.hash !== "" ||
     privateHost ||
-    hasSensitiveQuery
+    hasSensitiveQuery ||
+    containsPreviewSensitiveSourceMaterial(value)
   ) {
     throw new Error("Marketplace source must be a public HTTPS URL without credentials.");
   }
@@ -1462,7 +1477,12 @@ const mock = (() => {
     ): Promise<CodexMarketplaceAddResult> {
       if (!sourceConfirmed) throw new Error("Marketplace source confirmation is required.");
       requirePreviewPublicHttpsUrl(source);
-      if (refName != null) requirePreviewIdentifier(refName, "Git ref");
+      if (refName != null) {
+        const ref = requirePreviewIdentifier(refName, "Git ref");
+        if (containsPreviewSensitiveSourceMaterial(ref)) {
+          throw new Error("Git ref must not contain credentials.");
+        }
+      }
       return { marketplaceName: "preview-added", alreadyAdded: false };
     },
     async removeCodexMarketplace(
