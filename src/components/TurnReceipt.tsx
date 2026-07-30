@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import type {
   GitChangeStatus,
@@ -21,11 +21,6 @@ export interface TurnReceiptProps {
   waiting?: boolean;
   /** Provider work ended, while durable receipt/Git facts are still being assembled. */
   finalizing?: boolean;
-  /** Observable tool/subagent UI only. Never pass hidden provider reasoning here. */
-  activity?: ReactNode;
-  /** Activity that must not exist in the DOM until the disclosure is opened. */
-  deferredActivity?: ReactNode;
-  activityCount?: number;
 }
 
 type VisiblePhase =
@@ -41,10 +36,9 @@ type VisiblePhase =
 /**
  * Stable, provider-independent completion chrome for one assistant turn.
  *
- * The strip is always before the assistant's result. Its disclosure contains
- * observable tool/subagent activity only; the assistant's Markdown remains the
- * visible work summary outside this component. Terminal Git facts are append-only
- * below that summary via {@link TurnChangesCard}.
+ * The strip is always before the assistant's result and intentionally contains
+ * lifecycle text only. Terminal Git facts remain append-only below the assistant's
+ * visible summary via {@link TurnChangesCard}.
  */
 export function TurnReceipt({
   receipt,
@@ -52,15 +46,7 @@ export function TurnReceipt({
   startedAt = null,
   waiting = false,
   finalizing = false,
-  activity,
-  deferredActivity,
-  activityCount = 0,
 }: TurnReceiptProps) {
-  const detailsId = useId();
-  const [open, setOpen] = useState(false);
-  const hasActivity = activityCount > 0 && (activity != null || deferredActivity != null);
-  const toggleRef = useRef<HTMLButtonElement>(null);
-  const detailsRef = useRef<HTMLDivElement>(null);
   const lifecycleLive = active || finalizing;
   const lifecycleWasLive = useRef(lifecycleLive);
   const finalizingWasAnnounced = useRef(false);
@@ -78,39 +64,21 @@ export function TurnReceipt({
       finalizingWasAnnounced.current = false;
     }
   }, [finalizing, lifecycleLive, receipt]);
-  // The visible response timer stops as soon as provider/tool work ends. A
-  // provisional receipt normally supplies the exact frozen duration; retaining
-  // the last live tick is the defensive fallback if that payload is absent.
-  const now = useElapsedClock(active && !finalizing, startedAt, receipt);
+  // Live work intentionally has no timer. Terminal receipts still present the
+  // provider-neutral frozen duration when one was durably recorded.
   const phase = visiblePhase({ receipt, active, waiting, finalizing, startedAt });
   const announcePhase = lifecycleLive || announceTerminal;
-  const durationMs = receipt
-    ? (receipt.agentDurationMs ?? receipt.durationMs ?? null)
-    : startedAt === null
-      ? null
-      : Math.max(0, now - startedAt);
+  const durationMs = receipt ? (receipt.agentDurationMs ?? receipt.durationMs ?? null) : null;
   const copy = phaseCopy(phase, durationMs);
-
-  // A disclosure is controlled only by the person reading it. In particular,
-  // terminal receipt arrival must not surprise-collapse a log they opened or
-  // reopen one they deliberately closed.
-  const toggle = () => setOpen((value) => !value);
-
-  const collapse = () => {
-    if (!open) return;
-    if (detailsRef.current?.contains(document.activeElement)) toggleRef.current?.focus();
-    setOpen(false);
-  };
 
   if (!active && !finalizing && !receipt) return null;
 
-  const action = hasActivity ? `${open ? "collapse" : "expand"} work activity` : null;
   const visibleAccessibleCopy = [copy.label, receipt && durationMs !== null ? copy.duration : null]
     .filter(Boolean)
     .join(" ");
   const accessibleDuration =
     receipt && durationMs !== null ? `${formatAccessibleDuration(durationMs)} elapsed` : null;
-  const accessibleLabel = [visibleAccessibleCopy, accessibleDuration, copy.accessible, action]
+  const accessibleLabel = [visibleAccessibleCopy, accessibleDuration, copy.accessible]
     .filter(Boolean)
     .join(", ");
 
@@ -118,26 +86,12 @@ export function TurnReceipt({
     <div
       className={`pc-turn-receipt pc-turn-receipt--${phase}`}
       data-phase={phase}
-      data-has-activity={hasActivity ? "true" : "false"}
+      data-has-activity="false"
       aria-live="off"
     >
-      {hasActivity ? (
-        <button
-          ref={toggleRef}
-          type="button"
-          className="pc-turn-receipt__strip"
-          aria-label={accessibleLabel}
-          aria-expanded={open}
-          aria-controls={detailsId}
-          onClick={toggle}
-        >
-          <ReceiptStripContent phase={phase} copy={copy} open={open} />
-        </button>
-      ) : (
-        <div className="pc-turn-receipt__strip" role="group" aria-label={accessibleLabel}>
-          <ReceiptStripContent phase={phase} copy={copy} />
-        </div>
-      )}
+      <div className="pc-turn-receipt__strip" role="group" aria-label={accessibleLabel}>
+        <ReceiptStripContent phase={phase} copy={copy} />
+      </div>
 
       {receipt?.failure && (
         <div className="pc-turn-receipt__failure" aria-label="Failure diagnostics">
@@ -157,31 +111,6 @@ export function TurnReceipt({
         <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
           {phaseAnnouncement(phase)}
         </span>
-      )}
-
-      {hasActivity && (
-        <div
-          className="pc-turn-receipt__details-grid"
-          data-open={open ? "true" : "false"}
-          aria-hidden={!open}
-          inert={!open}
-        >
-          <div className="min-h-0 overflow-hidden">
-            <div
-              ref={detailsRef}
-              id={detailsId}
-              className="pc-turn-receipt__details"
-              role="region"
-              aria-label="Observable work activity"
-              onKeyDown={(event) => {
-                if (event.key === "Escape") collapse();
-              }}
-            >
-              {activity}
-              {open ? deferredActivity : null}
-            </div>
-          </div>
-        </div>
       )}
     </div>
   );
@@ -207,15 +136,10 @@ function formatDiagnosticBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
 }
 
-function ReceiptStripContent({
-  phase,
-  copy,
-  open,
-}: {
-  phase: VisiblePhase;
-  copy: PhaseCopy;
-  open?: boolean;
-}) {
+function ReceiptStripContent({ phase, copy }: { phase: VisiblePhase; copy: PhaseCopy }) {
+  if (phase === "working") {
+    return <span className="pc-turn-receipt__label">{copy.label}</span>;
+  }
   return (
     <>
       <span className="pc-turn-receipt__state-mark" aria-hidden="true">
@@ -225,11 +149,6 @@ function ReceiptStripContent({
       {copy.duration && (
         <span className="pc-turn-receipt__time" aria-hidden="true">
           {copy.duration}
-        </span>
-      )}
-      {open !== undefined && (
-        <span className="pc-turn-receipt__chevron" aria-hidden="true">
-          {open ? "▾" : "▸"}
         </span>
       )}
     </>
@@ -484,21 +403,6 @@ function changeCardTitle(certainty: TurnChangeCertainty, count: number, filesTru
     return `${files} changed during this turn`;
   }
   return `Edited ${files}`;
-}
-
-function useElapsedClock(
-  live: boolean,
-  startedAt: number | null,
-  receipt: TurnReceiptData | null | undefined,
-) {
-  const [clock, setClock] = useState(() => Date.now());
-  useEffect(() => {
-    if (!live || startedAt === null || receipt) return;
-    setClock(Date.now());
-    const timer = window.setInterval(() => setClock(Date.now()), 1_000);
-    return () => window.clearInterval(timer);
-  }, [live, receipt, startedAt]);
-  return receipt ? receipt.completedAt : clock;
 }
 
 function visiblePhase({

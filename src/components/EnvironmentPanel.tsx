@@ -20,12 +20,9 @@ import {
   type AgentBranchInfo,
 } from "../lib/agentTree";
 import { useStore } from "../store/store";
-import type { AgentInfo, AgentStatus, CodexActivityEvent, WorkspaceSummary } from "../types";
-import { remoteSafeCodexActivityEvents } from "../lib/codexActivity";
-import { CodexActivityHistoryInspector } from "./CodexActivity";
+import type { AgentInfo, AgentStatus, WorkspaceSummary } from "../types";
 
 const EMPTY_AGENTS: AgentInfo[] = [];
-const EMPTY_CODEX_ACTIVITY: CodexActivityEvent[] = [];
 const number = new Intl.NumberFormat();
 
 type EnvironmentPanelProviderProps = PropsWithChildren<{
@@ -344,40 +341,8 @@ export function EnvironmentPanelDock({ onClose }: { onClose: () => void }) {
     panelRef,
     closeRef,
   } = useEnvironmentPanel();
-  const activeId = useStore((state) => state.activeId);
-  const activityEvents = useStore((state) =>
-    state.activeId
-      ? (state.codexActivity[state.activeId] ?? EMPTY_CODEX_ACTIVITY)
-      : EMPTY_CODEX_ACTIVITY,
-  );
-  const activityPaging = useStore((state) =>
-    state.activeId ? state.codexActivityPaging[state.activeId] : undefined,
-  );
-  const loadOlderCodexActivity = useStore((state) => state.loadOlderCodexActivity);
-  const remoteMode = useStore((state) => state.remoteMode);
-  const [inspectedAgentId, setInspectedAgentId] = useState<string | null>(null);
   const agentListRef = useRef<HTMLUListElement>(null);
   const focusedStopAgentRef = useRef<string | null>(null);
-  const inspectedAgent = agents.find((agent) => agent.id === inspectedAgentId);
-  const closeInspectedAgent = useCallback(() => {
-    const agentId = inspectedAgentId;
-    if (!agentId) return;
-    setInspectedAgentId(null);
-    window.requestAnimationFrame(() => {
-      const trigger = Array.from(
-        panelRef.current?.querySelectorAll<HTMLButtonElement>("[data-inspect-agent-id]") ?? [],
-      ).find((button) => button.dataset.inspectAgentId === agentId);
-      trigger?.focus();
-    });
-  }, [inspectedAgentId, panelRef]);
-  const inspectedEvents = useMemo(() => {
-    if (!inspectedAgent || !activeId) return EMPTY_CODEX_ACTIVITY;
-    const combined = [...(activityPaging?.olderEvents ?? EMPTY_CODEX_ACTIVITY), ...activityEvents];
-    const visible = remoteMode ? remoteSafeCodexActivityEvents(combined) : combined;
-    return visible.filter(
-      (event) => event.sessionId === activeId && event.threadId === inspectedAgent.id,
-    );
-  }, [activeId, activityEvents, activityPaging?.olderEvents, inspectedAgent, remoteMode]);
 
   useLayoutEffect(() => {
     const focusedAgentId = focusedStopAgentRef.current;
@@ -388,18 +353,6 @@ export function EnvironmentPanelDock({ onClose }: { onClose: () => void }) {
     (survivingRow ?? agentListRef.current)?.focus();
     focusedStopAgentRef.current = null;
   }, [agents, panelRef, visibleTree]);
-
-  useEffect(() => {
-    if (!inspectedAgentId) return;
-    const closeChildOnEscape = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || event.defaultPrevented) return;
-      event.preventDefault();
-      event.stopPropagation();
-      closeInspectedAgent();
-    };
-    window.addEventListener("keydown", closeChildOnEscape, true);
-    return () => window.removeEventListener("keydown", closeChildOnEscape, true);
-  }, [closeInspectedAgent, inspectedAgentId]);
 
   return (
     <section
@@ -497,7 +450,6 @@ export function EnvironmentPanelDock({ onClose }: { onClose: () => void }) {
                   key={branch.agent.id}
                   branch={branch}
                   depth={0}
-                  onInspect={setInspectedAgentId}
                   onStopFocus={(agentId) => {
                     focusedStopAgentRef.current = agentId;
                   }}
@@ -519,41 +471,6 @@ export function EnvironmentPanelDock({ onClose }: { onClose: () => void }) {
             </ul>
           )}
         </div>
-        {inspectedAgent && (
-          <section
-            className="mt-2 rounded-lg border border-border bg-bg/50 p-2"
-            role="region"
-            aria-label={`Child activity: ${inspectedAgent.description}`}
-          >
-            <div className="mb-2 flex items-center gap-2">
-              <span className="min-w-0 flex-1 truncate text-[11px] text-fg">
-                {inspectedAgent.description}
-              </span>
-              <span className="font-mono text-[8px] uppercase text-muted">
-                {agentStatus(inspectedAgent.status).label.toLowerCase()}
-              </span>
-              <button
-                type="button"
-                aria-label="Close child activity"
-                onClick={closeInspectedAgent}
-                className="grid min-h-6 min-w-6 shrink-0 place-items-center rounded text-[15px] leading-none text-faint outline-none transition-colors hover:bg-white/[0.05] hover:text-fg focus-visible:ring-2 focus-visible:ring-accent-2/30"
-              >
-                ×
-              </button>
-            </div>
-            <CodexActivityHistoryInspector
-              key={inspectedAgent.id}
-              events={inspectedEvents}
-              renderTurns
-              emptyMessage="No durable activity recorded."
-              hasMore={activityPaging?.hasMore}
-              loadingOlder={activityPaging?.loadingOlder}
-              archiveLimited={activityPaging?.archiveLimited}
-              metadataOnly={remoteMode}
-              onLoadOlder={activeId ? () => void loadOlderCodexActivity(activeId) : undefined}
-            />
-          </section>
-        )}
       </div>
     </section>
   );
@@ -719,12 +636,10 @@ function FactRow({
 function CompactAgentBranch({
   branch,
   depth,
-  onInspect,
   onStopFocus,
 }: {
   branch: AgentBranchInfo;
   depth: number;
-  onInspect: (agentId: string) => void;
   onStopFocus: (agentId: string) => void;
 }) {
   return (
@@ -732,7 +647,6 @@ function CompactAgentBranch({
       <CompactAgentRow
         agent={branch.agent}
         depth={depth}
-        onInspect={() => onInspect(branch.agent.id)}
         onStopFocus={() => onStopFocus(branch.agent.id)}
       />
       {branch.children.length > 0 && (
@@ -742,7 +656,6 @@ function CompactAgentBranch({
               key={child.agent.id}
               branch={child}
               depth={depth + 1}
-              onInspect={onInspect}
               onStopFocus={onStopFocus}
             />
           ))}
@@ -755,12 +668,10 @@ function CompactAgentBranch({
 function CompactAgentRow({
   agent,
   depth,
-  onInspect,
   onStopFocus,
 }: {
   agent: AgentInfo;
   depth: number;
-  onInspect: () => void;
   onStopFocus: () => void;
 }) {
   const meta = agentStatus(agent.status);
@@ -830,15 +741,6 @@ function CompactAgentRow({
       </div>
       <div className="ml-2 flex items-center gap-1.5">
         <span className={`font-mono text-[8px] uppercase ${meta.text}`}>{detail}</span>
-        <button
-          type="button"
-          aria-label={`Inspect subagent activity: ${agent.description}`}
-          data-inspect-agent-id={agent.id}
-          onClick={onInspect}
-          className="rounded border border-border-2 px-1.5 py-0.5 font-mono text-[8px] uppercase text-muted"
-        >
-          Inspect
-        </button>
         {agent.status === "running" && (
           <button
             onFocus={onStopFocus}

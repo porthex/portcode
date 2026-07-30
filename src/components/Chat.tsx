@@ -14,19 +14,14 @@ import { PermissionPrompt } from "./PermissionPrompt";
 import { BackgroundTasksPanel } from "./BackgroundTasksPanel";
 import { CodexRequestPrompt } from "./CodexRequestPrompt";
 import { type Message } from "../types";
-import type { AgentInfo, CodexActivityEvent } from "../types";
-import {
-  codexTurnKey,
-  projectCodexActivity,
-  remoteSafeCodexActivityEvents,
-} from "../lib/codexActivity";
-import { CodexActivityHistoryInspector } from "./CodexActivity";
+import type { AgentInfo } from "../types";
 
 // Stable reference so the selector never returns a fresh array (which would
 // trip useSyncExternalStore's infinite-loop guard).
 const EMPTY: Message[] = [];
-const EMPTY_ACTIVITY: CodexActivityEvent[] = [];
+
 const TRANSCRIPT_VERTICAL_PADDING_PX = 48;
+const BOTTOM_PIN_THRESHOLD_PX = 16;
 
 const agentsForLaunchTurn = (
   agents: readonly AgentInfo[] | undefined,
@@ -62,16 +57,24 @@ type ChatProps = {
 export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps = {}) {
   const activeId = useStore((s) => s.activeId);
   const messages = useStore((s) => (activeId && s.messages[activeId]) || EMPTY);
-  const codexEvents = useStore((s) => (activeId && s.codexActivity[activeId]) || EMPTY_ACTIVITY);
+
   const hasCachedMessages = useStore((s) => Boolean(activeId && activeId in s.messages));
   const messageLoad = useStore((s) => (activeId ? s.messageLoads[activeId] : undefined));
   const streaming = useStore((s) => s.streaming);
   const activeRun = useStore((s) => (s.activeId ? s.runs[s.activeId] : undefined));
   const activeAgents = useStore((s) => (s.activeId ? s.agents[s.activeId] : undefined));
-  const activityPaging = useStore((s) =>
-    s.activeId ? s.codexActivityPaging[s.activeId] : undefined,
-  );
-  const loadOlderCodexActivity = useStore((s) => s.loadOlderCodexActivity);
+  const agentsByLaunchTurn = useMemo(() => {
+    const byTurn = new Map<string, AgentInfo[]>();
+    if (!activeAgents) return byTurn;
+    for (const agent of activeAgents) {
+      const turnId = agent.launchTurnId;
+      if (!turnId || byTurn.has(turnId)) continue;
+      const owned = agentsForLaunchTurn(activeAgents, turnId);
+      if (owned) byTurn.set(turnId, owned);
+    }
+    return byTurn;
+  }, [activeAgents]);
+
   const remoteMode = useStore((s) => s.remoteMode);
   const openTurnReview = useStore((s) => s.openTurnReview);
   const initError = useStore((s) => s.initError);
@@ -94,6 +97,10 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
   // Mirror of stuckToBottom in render state so the "scroll to latest" button can
   // appear/hide reactively (the ref alone wouldn't re-render).
   const [pinned, setPinned] = useState(true);
+  const [hasUnreadActivity, setHasUnreadActivity] = useState(false);
+  const unreadActivityRef = useRef(false);
+  const followFrameRef = useRef<number | null>(null);
+  const previousLatestAssistantRef = useRef<Message | undefined>(undefined);
   // After this client sends a turn, keep that turn at least one transcript viewport
   // tall. Bottom-following then places the user bubble at the top while the answer
   // grows into the space below (Claude/Codex-style), without exposing older turns.
@@ -132,31 +139,6 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
   // of jumping. Tracked per the messages array's identity.
   const prevScrollHeight = useRef(0);
   const prevFirstId = useRef<string | null>(null);
-  const childThreadIds = useMemo(
-    () => new Set((activeAgents ?? []).map((agent) => agent.id)),
-    [activeAgents],
-  );
-  const parentCodexEvents = useMemo(() => {
-    if (!activeId) return EMPTY_ACTIVITY;
-    const visibleEvents = remoteMode ? remoteSafeCodexActivityEvents(codexEvents) : codexEvents;
-    return visibleEvents.filter(
-      (event) => event.sessionId === activeId && !childThreadIds.has(event.threadId),
-    );
-  }, [activeId, childThreadIds, codexEvents, remoteMode]);
-  const activityProjection = useMemo(
-    () => projectCodexActivity(parentCodexEvents, { hasMore: activityPaging?.hasMore }),
-    [activityPaging?.hasMore, parentCodexEvents],
-  );
-  const inspectorEvents = useMemo(() => {
-    const older = activityPaging?.olderEvents ?? EMPTY_ACTIVITY;
-    const visibleOlder = remoteMode ? remoteSafeCodexActivityEvents(older) : older;
-    const parentOlder = activeId
-      ? visibleOlder.filter(
-          (event) => event.sessionId === activeId && !childThreadIds.has(event.threadId),
-        )
-      : EMPTY_ACTIVITY;
-    return [...parentOlder, ...parentCodexEvents];
-  }, [activeId, activityPaging?.olderEvents, childThreadIds, parentCodexEvents, remoteMode]);
 
   // Distance from the top below which scrolling up triggers loading older history.
   const LOAD_OLDER_THRESHOLD_PX = 200;
@@ -171,6 +153,28 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
     )}px`;
   }, []);
 
+  const updateUnreadActivity = useCallback((next: boolean) => {
+    if (unreadActivityRef.current === next) return;
+    unreadActivityRef.current = next;
+    setHasUnreadActivity(next);
+  }, []);
+
+  const scheduleBottomFollow = useCallback(() => {
+    if (followFrameRef.current !== null) return;
+    followFrameRef.current = requestAnimationFrame(() => {
+      followFrameRef.current = null;
+      const scroller = scrollRef.current;
+      if (scroller && stuckToBottom.current) scroller.scrollTop = scroller.scrollHeight;
+    });
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (followFrameRef.current !== null) cancelAnimationFrame(followFrameRef.current);
+    },
+    [],
+  );
+
   // Track whether the user is near the bottom; a programmatic scroll keeps it true.
   // Also drives scroll-up pagination: when the user nears the TOP in remote mode and
   // older history exists, request the next page. Live store reads (getState) avoid a
@@ -179,9 +183,15 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
     const el = scrollRef.current;
     if (!el) return;
     const onScroll = () => {
-      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_PIN_THRESHOLD_PX;
+      const pinChanged = stuckToBottom.current !== atBottom;
       stuckToBottom.current = atBottom;
-      setPinned(atBottom);
+      if (pinChanged) setPinned(atBottom);
+      if (!atBottom && followFrameRef.current !== null) {
+        cancelAnimationFrame(followFrameRef.current);
+        followFrameRef.current = null;
+      }
+      if (atBottom) updateUnreadActivity(false);
       // Near the top → load older messages (remote mode only). Read live state so the
       // guards (connected / hasMore / not already loading) reflect the latest store,
       // not the values captured when this listener was attached.
@@ -199,7 +209,7 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
     };
     el.addEventListener("scroll", onScroll, { passive: true });
     return () => el.removeEventListener("scroll", onScroll);
-  }, []);
+  }, [updateUnreadActivity]);
 
   // Keep the current-turn runway matched to the real transcript viewport (the
   // composer, permission banner, and background-task panel can all change it).
@@ -220,14 +230,30 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
     setTurnAnchorSessionId(null);
     stuckToBottom.current = true;
     setPinned(true);
+    updateUnreadActivity(false);
+    previousLatestAssistantRef.current = undefined;
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [activeId]);
+  }, [activeId, updateUnreadActivity]);
 
   useLayoutEffect(() => {
-    const el = scrollRef.current;
-    if (el && stuckToBottom.current) el.scrollTop = el.scrollHeight;
-  }, [messages, streaming]);
+    if (stuckToBottom.current) scheduleBottomFollow();
+  }, [messages, scheduleBottomFollow, streaming]);
+
+  const latestAssistant = (() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index].role === "assistant") return messages[index];
+    }
+    return undefined;
+  })();
+
+  useLayoutEffect(() => {
+    const previous = previousLatestAssistantRef.current;
+    previousLatestAssistantRef.current = latestAssistant;
+    if (previous && latestAssistant !== previous && !stuckToBottom.current) {
+      updateUnreadActivity(true);
+    }
+  }, [latestAssistant, updateUnreadActivity]);
 
   // Explicit navigation requests also cover re-selecting the already-active chat,
   // which an activeId-only effect cannot observe. A new turn keeps its viewport
@@ -253,6 +279,7 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
 
     stuckToBottom.current = true;
     setPinned(true);
+    updateUnreadActivity(false);
     el.scrollTop = el.scrollHeight;
     clearTranscriptScrollRequest(request.id);
   }, [
@@ -263,6 +290,7 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
     remoteMode,
     sizeCurrentTurn,
     transcriptScrollRequest,
+    updateUnreadActivity,
     workspaceSurface,
   ]);
 
@@ -315,11 +343,12 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
     const content = contentRef.current;
     if (!el || !content || typeof ResizeObserver === "undefined") return;
     const ro = new ResizeObserver(() => {
-      if (stuckToBottom.current) el.scrollTop = el.scrollHeight;
+      if (stuckToBottom.current) scheduleBottomFollow();
+      else updateUnreadActivity(true);
     });
     ro.observe(content);
     return () => ro.disconnect();
-  }, [streaming]);
+  }, [scheduleBottomFollow, streaming, updateUnreadActivity]);
 
   const lastIndex = messages.length - 1;
   const coldLoading = Boolean(
@@ -340,6 +369,7 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
     el.scrollTop = el.scrollHeight;
     stuckToBottom.current = true;
     setPinned(true);
+    updateUnreadActivity(false);
   };
 
   const renderMessage = (message: Message, index: number) => {
@@ -352,11 +382,7 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
       );
     const run = isRunMessage ? activeRun : undefined;
     const activityTurnId = message.turnId ?? (isRunMessage ? activeRun?.turnId : undefined);
-    const turnAgents = agentsForLaunchTurn(activeAgents, activityTurnId);
-    const activity =
-      activeId && activityTurnId
-        ? activityProjection.turns[codexTurnKey(activeId, activityTurnId)]
-        : undefined;
+    const turnAgents = activityTurnId ? agentsByLaunchTurn.get(activityTurnId) : undefined;
     const turnPresentation =
       run && (run.streaming || run.finalizing)
         ? {
@@ -375,8 +401,6 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
         isActive={isActiveAssistant}
         turnPresentation={turnPresentation}
         agents={turnAgents}
-        activity={activity}
-        remoteSafeActivity={remoteMode}
         onReviewChanges={reviewTurn}
         reviewAvailable={!remoteMode}
       />
@@ -440,27 +464,24 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
               {refreshError && (
                 <RefreshErrorNotice onRetry={() => activeId && void retryLoad(activeId)} />
               )}
-              <CodexActivityHistoryInspector
-                scopeKey={activeId ?? "no-session"}
-                events={inspectorEvents}
-                unknownOnly
-                hasMore={activityPaging?.hasMore}
-                loadingOlder={activityPaging?.loadingOlder}
-                archiveLimited={activityPaging?.archiveLimited}
-                metadataOnly={remoteMode}
-                onLoadOlder={activeId ? () => void loadOlderCodexActivity(activeId) : undefined}
-              />
             </div>
           </div>
           {!pinned && messages.length > 0 && (
             <button
               type="button"
-              aria-label="Scroll to latest"
+              aria-label={hasUnreadActivity ? "Scroll to latest, new activity" : "Scroll to latest"}
               onClick={scrollToBottom}
               className={`pc-fab-enter absolute bottom-4 right-4 z-20 flex h-9 w-9 items-center justify-center rounded-full border border-border bg-panel text-fg transition-[right,opacity] duration-300 ease-out hover:border-accent-2 hover:shadow-[var(--shadow-glow-cyan)] active:brightness-90 motion-reduce:transition-none ${
                 transcriptAside && transcriptAsideOpen ? "@min-[734px]:right-[382px]" : ""
               }`}
             >
+              {hasUnreadActivity && (
+                <span
+                  data-testid="chat-unread-indicator"
+                  aria-hidden="true"
+                  className="absolute right-1 top-1 h-2 w-2 rounded-full bg-danger shadow-[0_0_8px_var(--color-danger)]"
+                />
+              )}
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
                 <path
                   d="M6 9l6 6 6-6"
