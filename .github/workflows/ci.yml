@@ -265,7 +265,7 @@ jobs:
       # binary at build time, which fails in this sandboxed runner (the Phase 0
       # spike hit the same); the wasm is functional without it, only larger.
       - name: Install wasm-pack
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.3
         with:
           # Generated glue is tool-version-sensitive; keep CI and the committed
           # browser artifact reproducible across upstream wasm-pack releases.
@@ -368,7 +368,7 @@ jobs:
 
       - name: Install wasm-pack
         if: steps.changed.outputs.run == 'true'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.3
         with:
           tool: wasm-pack@0.15.0
 
@@ -472,7 +472,7 @@ jobs:
       # Prebuilt binary — avoids compiling cargo-llvm-cov from source (which fails
       # on the pinned toolchain's dependencies).
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.3
         with:
           tool: cargo-llvm-cov
 

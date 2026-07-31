@@ -101,7 +101,7 @@ jobs:
           "tag=v$version" >> $env:GITHUB_OUTPUT
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.3
         with:
           tool: cargo-deny
 

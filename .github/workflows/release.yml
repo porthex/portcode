@@ -112,7 +112,7 @@ jobs:
       # install the prebuilt, cross-platform cargo-deny CLI and invoke it directly.
       # cargo-deny auto-discovers the root deny.toml from the working directory.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.3
         with:
           tool: cargo-deny
       - name: Supply-chain audit (cargo-deny)
