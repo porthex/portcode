@@ -90,6 +90,9 @@ export class CodexRealtimeController {
   };
 
   async start(sessionId: string): Promise<void> {
+    if (this.state.sessionId) {
+      throw new Error("Stop the current voice session before starting another.");
+    }
     if (this.state.phase !== "idle" && this.state.phase !== "error") {
       throw new Error("Voice is already starting or active.");
     }
@@ -182,8 +185,9 @@ export class CodexRealtimeController {
     }
     if (operation !== this.operation) return;
     if (stopError) {
-      this.setState({ phase: "error", sessionId: null, error: errorMessage(stopError) });
+      this.setState({ phase: "error", sessionId, error: errorMessage(stopError) });
     } else {
+      this.remoteStartRequested = false;
       this.setState({ phase: "idle", sessionId: null, error: null });
     }
   }
@@ -225,6 +229,7 @@ export class CodexRealtimeController {
     if (event.type === "closed") {
       ++this.operation;
       await this.releaseLocal();
+      this.remoteStartRequested = false;
       this.setState({ phase: "idle", sessionId: null, error: null });
       return;
     }
@@ -246,14 +251,17 @@ export class CodexRealtimeController {
     if (!this.isCurrent(operation, sessionId)) return;
     ++this.operation;
     await this.releaseLocal();
+    let stopFailed = false;
     if (stopRemote) {
       try {
         await this.stopRemoteAfterPendingStart(sessionId);
+        this.remoteStartRequested = false;
       } catch {
         // Local media cleanup remains authoritative even when native stop fails.
+        stopFailed = true;
       }
     }
-    this.setState({ phase: "error", sessionId: null, error: message });
+    this.setState({ phase: "error", sessionId: stopFailed ? sessionId : null, error: message });
   }
 
   private async releaseLocal(): Promise<void> {
@@ -276,7 +284,6 @@ export class CodexRealtimeController {
     }
     this.remoteStarted = false;
     this.answerApplied = false;
-    this.remoteStartRequested = false;
   }
 
   private async stopRemoteAfterPendingStart(sessionId: string): Promise<void> {

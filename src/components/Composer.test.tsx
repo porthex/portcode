@@ -257,6 +257,16 @@ describe("Composer experimental voice", () => {
     );
     expect(screen.getByRole("alert")).toHaveTextContent("Microphone access was denied.");
 
+    act(() =>
+      voiceHarness.setState({
+        phase: "error",
+        sessionId: "a",
+        error: "Voice did not confirm that it stopped.",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry Stop Voice (experimental)" }));
+    await waitFor(() => expect(voiceHarness.controller.stop).toHaveBeenCalledOnce());
+
     act(() => {
       useStore.setState({
         activeId: "b",

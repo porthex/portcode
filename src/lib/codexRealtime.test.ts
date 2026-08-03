@@ -261,7 +261,7 @@ describe("CodexRealtimeController", () => {
     const controller = new CodexRealtimeController(h.deps);
     await controller.start("session-1");
 
-    await expect(controller.start("session-1")).rejects.toThrow("already");
+    await expect(controller.start("session-1")).rejects.toThrow("Stop the current voice");
     expect(h.deps.getUserMedia).toHaveBeenCalledOnce();
   });
 
@@ -455,9 +455,14 @@ describe("CodexRealtimeController", () => {
     expect(h.track.stop).toHaveBeenCalledOnce();
     expect(controller.snapshot()).toEqual({
       phase: "error",
-      sessionId: null,
+      sessionId: "session-1",
       error: "native stop failed",
     });
+    await expect(controller.start("session-2")).rejects.toThrow("Stop the current voice");
+    vi.mocked(h.deps.stop).mockResolvedValueOnce();
+    await controller.stop();
+    expect(h.deps.stop).toHaveBeenCalledTimes(2);
+    expect(controller.snapshot().phase).toBe("idle");
   });
 
   it("notifies and unsubscribes snapshot observers", async () => {

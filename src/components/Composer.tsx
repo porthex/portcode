@@ -230,7 +230,7 @@ export function Composer() {
   const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
   const settingsError = useStore((s) => s.settingsError);
   const voiceAvailable = ipc.isTauri() && !isMobilePlatform() && !remoteMode;
-  const voiceEngaged = !["idle", "error"].includes(voice.phase);
+  const voiceEngaged = voice.sessionId !== null;
   const ref = useRef<HTMLDivElement>(null);
   const replaceEditorDraftRef = useRef<((value: string) => void) | null>(null);
   const dropZoneRef = useRef<HTMLDivElement>(null);
@@ -722,11 +722,13 @@ export function Composer() {
                   type="button"
                   className="pc-attach-button pc-voice-button"
                   aria-label={
-                    voice.phase === "live"
-                      ? "Stop Voice (experimental)"
-                      : voiceEngaged
-                        ? "Cancel Voice (experimental)"
-                        : "Start Voice (experimental)"
+                    voice.phase === "error" && voice.sessionId
+                      ? "Retry Stop Voice (experimental)"
+                      : voice.phase === "live"
+                        ? "Stop Voice (experimental)"
+                        : voiceEngaged
+                          ? "Cancel Voice (experimental)"
+                          : "Start Voice (experimental)"
                   }
                   title="Voice (experimental) — send one text message first in a new conversation"
                   disabled={
