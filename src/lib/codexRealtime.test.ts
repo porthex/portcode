@@ -192,7 +192,7 @@ describe("CodexRealtimeController", () => {
     vi.useRealTimers();
   });
 
-  it("tears down without a redundant stop when the remote side closes or errors", async () => {
+  it("trusts an exact remote close but explicitly stops after a nonterminal remote error", async () => {
     const closed = harness();
     const closedController = new CodexRealtimeController(closed.deps);
     await closedController.start("session-1");
@@ -212,7 +212,7 @@ describe("CodexRealtimeController", () => {
       sessionId: null,
       error: "transport failed",
     });
-    expect(failed.deps.stop).not.toHaveBeenCalled();
+    expect(failed.deps.stop).toHaveBeenCalledWith("session-2");
     expect(failed.track.stop).toHaveBeenCalledOnce();
   });
 

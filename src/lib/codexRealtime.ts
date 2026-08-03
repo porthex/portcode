@@ -228,7 +228,7 @@ export class CodexRealtimeController {
       this.setState({ phase: "idle", sessionId: null, error: null });
       return;
     }
-    await this.fail(operation, sessionId, errorMessage(new Error(event.message)), false);
+    await this.fail(operation, sessionId, errorMessage(new Error(event.message)), true);
   }
 
   private updateLiveState(sessionId: string) {

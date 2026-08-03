@@ -2724,10 +2724,7 @@ impl CodexEngine {
             }
             _ => return,
         };
-        if matches!(
-            event,
-            CodexRealtimeEvent::Closed | CodexRealtimeEvent::Error { .. }
-        ) {
+        if matches!(event, CodexRealtimeEvent::Closed) {
             self.release_realtime_session(&owner.session_id, &owner.thread_id, generation)
                 .await;
         }
@@ -5559,7 +5556,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realtime_terminal_event_releases_only_its_exact_generation_owner() {
+    async fn realtime_error_retains_its_owner_until_exact_close() {
         let (engine, db, sink) = routed_test_engine().await;
         engine
             .claim_realtime_session("session-1", "root-thread", 1)
@@ -5587,6 +5584,18 @@ mod tests {
                 raw: json!({"secret": "must-not-persist"}),
             })
             .await;
+        assert!(engine
+            .claim_realtime_session("session-2", "other-thread", 2)
+            .await
+            .is_err());
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "thread/realtime/closed".to_owned(),
+                params: json!({"threadId": "root-thread", "reason": "failed"}),
+                raw: json!({"secret": "must-not-persist"}),
+            })
+            .await;
         engine
             .claim_realtime_session("session-2", "other-thread", 2)
             .await
@@ -5594,12 +5603,18 @@ mod tests {
 
         assert_eq!(
             sink.realtime_events.lock().unwrap().as_slice(),
-            [(
-                "codex-realtime://session-1".to_owned(),
-                CodexRealtimeEvent::Error {
-                    message: "voice failed".to_owned()
-                }
-            )]
+            [
+                (
+                    "codex-realtime://session-1".to_owned(),
+                    CodexRealtimeEvent::Error {
+                        message: "voice failed".to_owned()
+                    }
+                ),
+                (
+                    "codex-realtime://session-1".to_owned(),
+                    CodexRealtimeEvent::Closed
+                )
+            ]
         );
         assert!(sink.events.lock().unwrap().is_empty());
         assert!(db.codex_activity("session-1", 100).unwrap().is_empty());
