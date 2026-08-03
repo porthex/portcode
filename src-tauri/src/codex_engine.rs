@@ -2578,11 +2578,7 @@ impl CodexEngine {
             .as_ref()
             .filter(|owner| {
                 owner.generation == generation
-                    && (thread_id.as_deref() == Some(owner.thread_id.as_str())
-                        || route.as_ref().is_some_and(|route| {
-                            route.generation == Some(generation)
-                                && route.root_thread_id == owner.thread_id
-                        }))
+                    && thread_id.as_deref() == Some(owner.thread_id.as_str())
             })
             .cloned();
         let realtime_quarantined =
@@ -5600,6 +5596,19 @@ mod tests {
         assert!(
             engine
                 .establish_child_route("voice-child", "root-thread", 1, None)
+                .await
+        );
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "thread/realtime/closed".to_owned(),
+                params: json!({"threadId": "voice-child", "reason": "child finished"}),
+                raw: json!({}),
+            })
+            .await;
+        assert!(
+            engine
+                .owns_realtime_session("session-1", "root-thread", 1)
                 .await
         );
         engine
