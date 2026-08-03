@@ -328,6 +328,7 @@ pub struct CodexEngine {
     active_by_session: Mutex<HashMap<String, ActiveSessionTurn>>,
     turn_voice_admission: Mutex<()>,
     active_realtime_session: Mutex<Option<RealtimeSessionOwner>>,
+    realtime_quarantine: Mutex<HashMap<String, RealtimeSessionOwner>>,
     active_by_thread: Mutex<HashMap<String, ActiveThreadTurn>>,
     turns: Mutex<HashMap<String, TurnProjection>>,
     failed_root_retention_order: Mutex<VecDeque<(u64, String, String, String)>>,
@@ -384,6 +385,7 @@ impl CodexEngine {
             active_by_session: Mutex::new(HashMap::new()),
             turn_voice_admission: Mutex::new(()),
             active_realtime_session: Mutex::new(None),
+            realtime_quarantine: Mutex::new(HashMap::new()),
             active_by_thread: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
             failed_root_retention_order: Mutex::new(VecDeque::new()),
@@ -447,7 +449,7 @@ impl CodexEngine {
             );
         }
         let mut active = self.active_realtime_session.lock().await;
-        match active.as_ref() {
+        let claimed = match active.as_ref() {
             None => {
                 *active = Some(RealtimeSessionOwner {
                     session_id: session_id.to_owned(),
@@ -460,7 +462,19 @@ impl CodexEngine {
                 Err("Voice is already active for this conversation.".to_owned())
             }
             Some(_) => Err("End the active voice conversation before starting another.".to_owned()),
+        };
+        drop(active);
+        if claimed.is_ok() {
+            self.realtime_quarantine.lock().await.insert(
+                session_id.to_owned(),
+                RealtimeSessionOwner {
+                    session_id: session_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    generation,
+                },
+            );
         }
+        claimed
     }
 
     async fn claim_turn_session(
@@ -481,6 +495,7 @@ impl CodexEngine {
                 "End voice before sending another message in this conversation.".to_owned(),
             );
         }
+        self.realtime_quarantine.lock().await.remove(session_id);
         let mut active = self.active_by_session.lock().await;
         if active.contains_key(session_id) {
             return Err("This conversation already has a Codex turn running.".to_string());
@@ -534,6 +549,12 @@ impl CodexEngine {
             return false;
         }
         owner.generation = next_generation;
+        drop(active);
+        if let Some(quarantine) = self.realtime_quarantine.lock().await.get_mut(session_id) {
+            if quarantine.thread_id == thread_id && quarantine.generation == previous_generation {
+                quarantine.generation = next_generation;
+            }
+        }
         true
     }
 
@@ -2496,6 +2517,19 @@ impl CodexEngine {
                         }))
             })
             .cloned();
+        let realtime_quarantined =
+            self.realtime_quarantine
+                .lock()
+                .await
+                .values()
+                .any(|quarantine| {
+                    quarantine.generation == generation
+                        && (thread_id.as_deref() == Some(quarantine.thread_id.as_str())
+                            || route.as_ref().is_some_and(|route| {
+                                route.generation == Some(generation)
+                                    && route.root_thread_id == quarantine.thread_id
+                            }))
+                });
         if method.starts_with("thread/realtime/") {
             if let Some(owner) = realtime_owner.as_ref() {
                 self.project_realtime(generation, owner, method, &params)
@@ -2503,7 +2537,7 @@ impl CodexEngine {
             }
             return;
         }
-        if realtime_owner.is_some() {
+        if realtime_owner.is_some() || realtime_quarantined {
             // Realtime V3 can fan out ordinary turn/item notifications for
             // transcript-derived delegations. They are not Portcode turns and
             // must not cross the ephemeral voice persistence boundary.
@@ -5456,6 +5490,14 @@ mod tests {
                 .establish_child_route("voice-child", "root-thread", 1, None)
                 .await
         );
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "thread/realtime/closed".to_owned(),
+                params: json!({"threadId": "root-thread", "reason": "finished"}),
+                raw: json!({"transcript": "must-not-persist"}),
+            })
+            .await;
 
         engine
             .handle_incoming(Incoming::Notification {
@@ -5473,6 +5515,20 @@ mod tests {
 
         assert!(sink.events.lock().unwrap().is_empty());
         assert!(db.codex_activity("session-1", 100).unwrap().is_empty());
+        assert!(engine
+            .realtime_quarantine
+            .lock()
+            .await
+            .contains_key("session-1"));
+        engine
+            .claim_turn_session("run-after-voice", "session-1", None)
+            .await
+            .unwrap();
+        assert!(!engine
+            .realtime_quarantine
+            .lock()
+            .await
+            .contains_key("session-1"));
     }
 
     #[tokio::test]
