@@ -511,8 +511,14 @@ impl CodexEngine {
         Ok(())
     }
 
-    async fn clear_realtime_quarantine(&self, session_id: &str) {
-        self.realtime_quarantine.lock().await.remove(session_id);
+    async fn clear_stale_realtime_quarantine(&self, session_id: &str, generation: u64) {
+        let mut quarantine = self.realtime_quarantine.lock().await;
+        if quarantine
+            .get(session_id)
+            .is_some_and(|owner| owner.generation != generation)
+        {
+            quarantine.remove(session_id);
+        }
     }
 
     async fn release_realtime_session(
@@ -1182,7 +1188,8 @@ impl CodexEngine {
             .map_err(|error| format!("Codex could not start the turn: {error}"))?;
         let turn_id = string_at(&response, &["turn", "id"])
             .ok_or_else(|| "Codex did not return a turn id.".to_string())?;
-        self.clear_realtime_quarantine(session_id).await;
+        self.clear_stale_realtime_quarantine(session_id, turn_generation)
+            .await;
         let started_at_ms = response
             .pointer("/turn/startedAt")
             .and_then(Value::as_i64)
@@ -2589,6 +2596,25 @@ impl CodexEngine {
                             .as_ref()
                             .is_some_and(|route| route.root_thread_id == quarantine.thread_id)
                 });
+        let exact_normal_root_turn = if realtime_quarantined {
+            match (
+                route.as_ref().filter(|route| !route.is_subagent),
+                thread_id.as_deref(),
+                extract_turn_id(&params),
+            ) {
+                (Some(_), Some(thread_id), Some(turn_id)) => self
+                    .active_by_thread
+                    .lock()
+                    .await
+                    .get(thread_id)
+                    .is_some_and(|active| {
+                        active.generation == generation && active.turn_id == turn_id
+                    }),
+                _ => false,
+            }
+        } else {
+            false
+        };
         if method.starts_with("thread/realtime/") {
             if let Some(owner) = realtime_owner.as_ref() {
                 self.project_realtime(generation, owner, method, &params)
@@ -2596,7 +2622,7 @@ impl CodexEngine {
             }
             return;
         }
-        if realtime_owner.is_some() || realtime_quarantined {
+        if realtime_owner.is_some() || (realtime_quarantined && !exact_normal_root_turn) {
             // Realtime V3 can fan out ordinary turn/item notifications for
             // transcript-derived delegations. They are not Portcode turns and
             // must not cross the ephemeral voice persistence boundary.
@@ -2885,7 +2911,12 @@ impl CodexEngine {
                     thread_id == quarantine.thread_id
                         || route.root_thread_id == quarantine.thread_id
                 });
-        if realtime_quarantined {
+        let exact_normal_root_turn = realtime_quarantined
+            && !route.is_subagent
+            && self
+                .exact_request_owner_is_active(generation, &route, &thread_id, &turn_id)
+                .await;
+        if realtime_quarantined && !exact_normal_root_turn {
             let _ = self
                 .server
                 .send_response_error(
@@ -5623,7 +5654,22 @@ mod tests {
             .lock()
             .await
             .contains_key("session-1"));
-        engine.clear_realtime_quarantine("session-1").await;
+        activate_test_root_turn(&engine, 1, "normal-turn").await;
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "turn/plan/updated".to_owned(),
+                params: json!({
+                    "threadId": "root-thread",
+                    "turnId": "normal-turn",
+                    "explanation": "safe normal turn",
+                    "plan": []
+                }),
+                raw: json!({"safe": true}),
+            })
+            .await;
+        assert!(!db.codex_activity("session-1", 100).unwrap().is_empty());
+        engine.clear_stale_realtime_quarantine("session-1", 2).await;
         assert!(!engine
             .realtime_quarantine
             .lock()
