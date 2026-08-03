@@ -75,6 +75,7 @@ export class CodexRealtimeController {
   private remoteStarted = false;
   private answerApplied = false;
   private remoteStartRequested = false;
+  private pendingNativeStart: Promise<void> | null = null;
   private cancelIceWait: (() => void) | null = null;
 
   constructor(deps: CodexRealtimeControllerDeps = defaultDeps()) {
@@ -137,13 +138,21 @@ export class CodexRealtimeController {
       const offer = await peer.createOffer();
       this.assertCurrent(operation, sessionId);
       await peer.setLocalDescription(offer);
+      this.assertCurrent(operation, sessionId);
       await this.waitForIce(peer, operation, sessionId);
+      this.assertCurrent(operation, sessionId);
       const sdp = peer.localDescription?.sdp;
       if (!sdp) throw new Error("WebRTC did not produce an SDP offer.");
 
       this.setState({ phase: "connecting", sessionId, error: null });
       this.remoteStartRequested = true;
-      await this.deps.start(sessionId, sdp);
+      const nativeStart = this.deps.start(sessionId, sdp);
+      this.pendingNativeStart = nativeStart;
+      try {
+        await nativeStart;
+      } finally {
+        if (this.pendingNativeStart === nativeStart) this.pendingNativeStart = null;
+      }
       this.assertCurrent(operation, sessionId);
     } catch (error) {
       if (this.isCurrent(operation, sessionId)) {
@@ -166,7 +175,7 @@ export class CodexRealtimeController {
     let stopError: unknown;
     if (shouldStopRemote) {
       try {
-        await this.deps.stop(sessionId);
+        await this.stopRemoteAfterPendingStart(sessionId);
       } catch (error) {
         stopError = error;
       }
@@ -239,7 +248,7 @@ export class CodexRealtimeController {
     await this.releaseLocal();
     if (stopRemote) {
       try {
-        await this.deps.stop(sessionId);
+        await this.stopRemoteAfterPendingStart(sessionId);
       } catch {
         // Local media cleanup remains authoritative even when native stop fails.
       }
@@ -268,6 +277,18 @@ export class CodexRealtimeController {
     this.remoteStarted = false;
     this.answerApplied = false;
     this.remoteStartRequested = false;
+  }
+
+  private async stopRemoteAfterPendingStart(sessionId: string): Promise<void> {
+    const pendingNativeStart = this.pendingNativeStart;
+    if (pendingNativeStart) {
+      try {
+        await pendingNativeStart;
+      } catch {
+        // A rejected start can still have established native ownership before failing.
+      }
+    }
+    await this.deps.stop(sessionId);
   }
 
   private waitForIce(peer: RTCPeerConnection, operation: number, sessionId: string): Promise<void> {

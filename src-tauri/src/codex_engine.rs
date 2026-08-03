@@ -537,6 +537,23 @@ impl CodexEngine {
         true
     }
 
+    async fn owns_realtime_session(
+        &self,
+        session_id: &str,
+        thread_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.active_realtime_session
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|owner| {
+                owner.session_id == session_id
+                    && owner.thread_id == thread_id
+                    && owner.generation == generation
+            })
+    }
+
     pub async fn realtime_start_webrtc(&self, session_id: &str, sdp: &str) -> Result<(), String> {
         if self.active_by_session.lock().await.contains_key(session_id) {
             return Err(
@@ -580,9 +597,7 @@ impl CodexEngine {
                     .server
                     .request("thread/resume", Value::Object(resume_params))
                     .await
-                    .map_err(|error| {
-                        format!("Codex could not resume this conversation: {error}")
-                    })?;
+                    .map_err(|_| "Codex could not resume this conversation.".to_owned())?;
                 self.reconcile_resumed_thread(session_id, &thread_id, &resumed)?;
                 let current_generation =
                     self.server.status().await.generation.unwrap_or(generation);
@@ -607,10 +622,16 @@ impl CodexEngine {
                     .await
                     .insert(thread_id.clone(), current_generation);
             }
+            if !self
+                .owns_realtime_session(session_id, &thread_id, owner_generation)
+                .await
+            {
+                return Err("Codex voice startup was cancelled.".to_owned());
+            }
             self.server
                 .realtime_start_webrtc(&thread_id, sdp)
                 .await
-                .map_err(|error| format!("Codex could not start voice: {error}"))
+                .map_err(|_| "Codex could not start voice.".to_owned())
         }
         .await;
         if result.is_err() {
@@ -635,7 +656,7 @@ impl CodexEngine {
             .server
             .realtime_stop(&owner.thread_id)
             .await
-            .map_err(|error| format!("Codex could not stop voice: {error}"));
+            .map_err(|_| "Codex could not stop voice.".to_owned());
         self.release_realtime_session(&owner.session_id, &owner.thread_id, owner.generation)
             .await;
         result
@@ -956,6 +977,7 @@ impl CodexEngine {
                 params.insert("threadId".into(), Value::String(thread_id.clone()));
                 insert_optional_string(&mut params, "cwd", cwd.as_deref());
                 insert_optional_string(&mut params, "model", session.model.as_deref());
+                enable_realtime_thread_feature(&mut params);
                 let (approval, sandbox, reviewer) = codex_permissions(&settings.permission_mode);
                 params.insert("approvalPolicy".into(), approval);
                 params.insert("sandbox".into(), sandbox);
@@ -981,6 +1003,7 @@ impl CodexEngine {
         } else {
             let mut params = Map::new();
             enable_raw_thread_events(&mut params);
+            enable_realtime_thread_feature(&mut params);
             insert_optional_string(&mut params, "cwd", cwd.as_deref());
             insert_optional_string(&mut params, "model", session.model.as_deref());
             let (approval, sandbox, reviewer) = codex_permissions(&settings.permission_mode);
@@ -5421,6 +5444,11 @@ mod tests {
             .claim_realtime_session("session-1", "root-thread", 1)
             .await
             .unwrap();
+        assert!(
+            engine
+                .owns_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
 
         assert!(
             !engine
@@ -5439,6 +5467,16 @@ mod tests {
         );
         assert!(
             !engine
+                .owns_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+        assert!(
+            engine
+                .owns_realtime_session("session-1", "root-thread", 2)
+                .await
+        );
+        assert!(
+            !engine
                 .release_realtime_session("session-1", "root-thread", 1)
                 .await
         );
@@ -5447,13 +5485,20 @@ mod tests {
                 .release_realtime_session("session-1", "root-thread", 2)
                 .await
         );
+        assert!(
+            !engine
+                .owns_realtime_session("session-1", "root-thread", 2)
+                .await
+        );
     }
 
     #[test]
-    fn realtime_thread_feature_is_enabled_by_a_fixed_native_config_override() {
+    fn thread_capabilities_enable_realtime_without_internal_raw_response_events() {
         let mut params = Map::new();
+        enable_raw_thread_events(&mut params);
         enable_realtime_thread_feature(&mut params);
 
+        assert!(params.get("experimentalRawEvents").is_none());
         assert_eq!(
             params,
             Map::from_iter([(
@@ -5827,13 +5872,6 @@ mod tests {
             codex_sandbox_policy(&crate::permissions::PermissionMode::Bypass)["type"],
             "dangerFullAccess"
         );
-    }
-
-    #[test]
-    fn new_threads_do_not_request_internal_raw_response_events() {
-        let mut params = Map::new();
-        enable_raw_thread_events(&mut params);
-        assert!(params.get("experimentalRawEvents").is_none());
     }
 
     #[test]

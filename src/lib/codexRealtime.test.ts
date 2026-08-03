@@ -282,6 +282,25 @@ describe("CodexRealtimeController", () => {
     expect(controller.snapshot().phase).toBe("idle");
   });
 
+  it("waits for a cancelled native start before stopping its possible owner", async () => {
+    const h = harness();
+    const nativeStart = deferred<void>();
+    vi.mocked(h.deps.start).mockReturnValue(nativeStart.promise);
+    const controller = new CodexRealtimeController(h.deps);
+    const starting = controller.start("session-1");
+    await vi.waitFor(() => expect(h.deps.start).toHaveBeenCalledOnce());
+
+    const stopping = controller.stop();
+    await settle();
+    expect(h.track.stop).toHaveBeenCalledOnce();
+    expect(h.deps.stop).not.toHaveBeenCalled();
+
+    nativeStart.resolve();
+    await Promise.all([starting, stopping]);
+    expect(h.deps.stop).toHaveBeenCalledWith("session-1");
+    expect(controller.snapshot().phase).toBe("idle");
+  });
+
   it("unlistens a late subscription after disposal without acquiring media", async () => {
     const h = harness();
     const lateListen = deferred<() => void>();
@@ -553,6 +572,22 @@ describe("CodexRealtimeController", () => {
 
     expect(h.peer.setLocalDescription).not.toHaveBeenCalled();
     expect(createOffer).toHaveBeenCalledOnce();
+    expect(controller.snapshot().phase).toBe("idle");
+  });
+
+  it("cannot resurrect startup after local-description setup resolves behind disposal", async () => {
+    const h = harness();
+    const localDescription = deferred<void>();
+    vi.mocked(h.peer.setLocalDescription).mockReturnValue(localDescription.promise);
+    const controller = new CodexRealtimeController(h.deps);
+    const starting = controller.start("session-1");
+    await settle();
+    await controller.dispose();
+
+    localDescription.resolve();
+    await starting;
+
+    expect(h.deps.start).not.toHaveBeenCalled();
     expect(controller.snapshot().phase).toBe("idle");
   });
 });
