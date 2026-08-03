@@ -2821,6 +2821,30 @@ impl CodexEngine {
                 .await;
             return;
         };
+        let realtime_quarantined =
+            self.realtime_quarantine
+                .lock()
+                .await
+                .values()
+                .any(|quarantine| {
+                    quarantine.generation == generation
+                        && (thread_id == quarantine.thread_id
+                            || (route.generation == Some(generation)
+                                && route.root_thread_id == quarantine.thread_id))
+                });
+        if realtime_quarantined {
+            let _ = self
+                .server
+                .send_response_error(
+                    generation,
+                    rpc_id,
+                    -32602,
+                    "Voice-derived client requests are unavailable",
+                    None,
+                )
+                .await;
+            return;
+        }
         let approval = matches!(
             method,
             "item/commandExecution/requestApproval"
@@ -5512,6 +5536,19 @@ mod tests {
                     "turnId": "realtime-derived-turn",
                     "explanation": "must-not-persist",
                     "plan": []
+                }),
+                raw: json!({"transcript": "must-not-persist"}),
+            })
+            .await;
+        engine
+            .handle_incoming(Incoming::ServerRequest {
+                generation: 1,
+                id: json!(7),
+                method: "future/privateRequest".to_owned(),
+                params: json!({
+                    "threadId": "voice-child",
+                    "turnId": "realtime-derived-turn",
+                    "transcript": "must-not-persist"
                 }),
                 raw: json!({"transcript": "must-not-persist"}),
             })
