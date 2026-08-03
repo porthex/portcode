@@ -2489,7 +2489,11 @@ impl CodexEngine {
             .as_ref()
             .filter(|owner| {
                 owner.generation == generation
-                    && thread_id.as_deref() == Some(owner.thread_id.as_str())
+                    && (thread_id.as_deref() == Some(owner.thread_id.as_str())
+                        || route.as_ref().is_some_and(|route| {
+                            route.generation == Some(generation)
+                                && route.root_thread_id == owner.thread_id
+                        }))
             })
             .cloned();
         if method.starts_with("thread/realtime/") {
@@ -5441,19 +5445,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realtime_owner_drops_transcript_derived_ordinary_activity() {
+    async fn realtime_owner_drops_transcript_derived_activity_across_its_lineage() {
         let (engine, db, sink) = routed_test_engine().await;
         engine
             .claim_realtime_session("session-1", "root-thread", 1)
             .await
             .unwrap();
+        assert!(
+            engine
+                .establish_child_route("voice-child", "root-thread", 1, None)
+                .await
+        );
 
         engine
             .handle_incoming(Incoming::Notification {
                 generation: 1,
                 method: "turn/plan/updated".to_owned(),
                 params: json!({
-                    "threadId": "root-thread",
+                    "threadId": "voice-child",
                     "turnId": "realtime-derived-turn",
                     "explanation": "must-not-persist",
                     "plan": []
