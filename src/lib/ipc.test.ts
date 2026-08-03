@@ -89,6 +89,9 @@ describe("Codex realtime bridge", () => {
   it("rejects media control outside the native desktop", async () => {
     const { ipc } = await load();
     await expect(ipc.startCodexRealtime("session-1", "v=0")).rejects.toThrow("native desktop");
+    await expect(ipc.stopCodexRealtime("session-1")).resolves.toBeUndefined();
+    const unlisten = await ipc.listenCodexRealtime("session-1", vi.fn());
+    expect(unlisten()).toBeUndefined();
   });
 
   it("admits only bounded allowlisted realtime event payloads", async () => {
@@ -108,6 +111,7 @@ describe("Codex realtime bridge", () => {
     receive?.({ payload: { type: "sdp", sdp: "not-sdp" } });
     receive?.({ payload: { type: "sdp", sdp: `v=0\r\n${"x".repeat(256 * 1024)}` } });
     receive?.({ payload: { type: "error" } });
+    receive?.({ payload: { type: "error", message: "short failure" } });
     receive?.({ payload: { type: "transcript", text: "private" } });
     receive?.({ payload: null });
     receive?.({ payload: { type: "error", message: `failed ${"é".repeat(1_024)}` } });
@@ -117,8 +121,9 @@ describe("Codex realtime bridge", () => {
       { type: "closed" },
       { type: "sdp", sdp: "v=0\r\nanswer" },
     ]);
-    expect(onEvent).toHaveBeenCalledTimes(4);
-    const boundedError = onEvent.mock.calls[3]?.[0] as { type: string; message: string };
+    expect(onEvent).toHaveBeenCalledTimes(5);
+    expect(onEvent.mock.calls[3]?.[0]).toEqual({ type: "error", message: "short failure" });
+    const boundedError = onEvent.mock.calls[4]?.[0] as { type: string; message: string };
     expect(boundedError.type).toBe("error");
     expect(new TextEncoder().encode(boundedError.message).byteLength).toBeLessThanOrEqual(1_024);
   });

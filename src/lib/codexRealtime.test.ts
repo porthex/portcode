@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { CodexRealtimeController, type CodexRealtimeControllerDeps } from "./codexRealtime";
+import {
+  CodexRealtimeController,
+  createCodexRealtimeController,
+  type CodexRealtimeControllerDeps,
+} from "./codexRealtime";
 import type { CodexRealtimeEvent } from "./ipc";
 
 function deferred<T>() {
@@ -349,6 +353,19 @@ describe("CodexRealtimeController", () => {
     ).toBeLessThanOrEqual(1_024);
   });
 
+  it("truncates an exception only at a valid UTF-8 boundary", async () => {
+    const h = harness();
+    vi.mocked(h.deps.getUserMedia).mockRejectedValue(
+      new Error(`${"x".repeat(1_023)}é${"x".repeat(50)}`),
+    );
+    const controller = new CodexRealtimeController(h.deps);
+    await controller.start("session-1");
+
+    const message = controller.snapshot().error ?? "";
+    expect(new TextEncoder().encode(message).byteLength).toBe(1_023);
+    expect(message).not.toContain("�");
+  });
+
   it("stops media that resolves after cancellation and handles an idle stop", async () => {
     const h = harness();
     const microphone = deferred<MediaStream>();
@@ -436,5 +453,106 @@ describe("CodexRealtimeController", () => {
     unsubscribe();
     await controller.stop();
     expect(subscriber).not.toHaveBeenCalled();
+  });
+
+  it("wires the production browser media factories before the desktop-only bridge rejects", async () => {
+    const h = harness();
+    const mediaDescriptor = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: h.deps.getUserMedia },
+    });
+    const peerFactory = vi.fn(function PeerFactory() {
+      return h.peer;
+    });
+    const audioFactory = vi.fn(function AudioFactory() {
+      return h.audio;
+    });
+    vi.stubGlobal("RTCPeerConnection", peerFactory);
+    vi.stubGlobal("Audio", audioFactory);
+
+    const controller = createCodexRealtimeController();
+    await controller.start("session-1");
+
+    expect(peerFactory).toHaveBeenCalledOnce();
+    expect(audioFactory).toHaveBeenCalledOnce();
+    expect(controller.snapshot().error).toContain("native desktop");
+    vi.unstubAllGlobals();
+    if (mediaDescriptor) Object.defineProperty(navigator, "mediaDevices", mediaDescriptor);
+    else Reflect.deleteProperty(navigator, "mediaDevices");
+  });
+
+  it("drops stale media, lifecycle, answer, and peer-failure callbacks after stop", async () => {
+    const h = harness();
+    const answer = deferred<void>();
+    vi.mocked(h.peer.setRemoteDescription).mockReturnValue(answer.promise);
+    const controller = new CodexRealtimeController(h.deps);
+    await controller.start("session-1");
+    const staleTrack = h.peer.ontrack;
+    const stalePeerChange = h.peer.onconnectionstatechange;
+
+    h.emit({ type: "sdp", sdp: "v=0\r\nanswer" });
+    await controller.stop();
+    h.emit({ type: "started" });
+    staleTrack?.call(h.peer, { streams: [h.stream], track: h.track } as unknown as RTCTrackEvent);
+    Object.defineProperty(h.peer, "connectionState", { value: "failed", configurable: true });
+    stalePeerChange?.call(h.peer, {} as Event);
+    answer.resolve();
+    await settle();
+
+    expect(controller.snapshot().phase).toBe("idle");
+    expect(h.audio.play).not.toHaveBeenCalled();
+  });
+
+  it("finishes ICE gathering once and ignores repeated completion signals", async () => {
+    const h = harness();
+    Object.defineProperty(h.peer, "iceGatheringState", { value: "gathering", configurable: true });
+    const controller = new CodexRealtimeController(h.deps);
+    const starting = controller.start("session-1");
+    await settle();
+    const listener = vi.mocked(h.peer.addEventListener).mock.calls[0]?.[1] as EventListener;
+
+    Object.defineProperty(h.peer, "iceGatheringState", { value: "complete", configurable: true });
+    listener({} as Event);
+    listener({} as Event);
+    await starting;
+
+    expect(h.deps.start).toHaveBeenCalledOnce();
+    expect(h.peer.removeEventListener).toHaveBeenCalledOnce();
+  });
+
+  it("lets a newer stop operation supersede a slow native stop", async () => {
+    const h = harness();
+    const nativeStop = deferred<void>();
+    vi.mocked(h.deps.stop).mockReturnValueOnce(nativeStop.promise).mockResolvedValue(undefined);
+    const controller = new CodexRealtimeController(h.deps);
+    await controller.start("session-1");
+
+    const first = controller.stop();
+    await settle();
+    const second = controller.stop();
+    await second;
+    nativeStop.resolve();
+    await first;
+
+    expect(controller.snapshot().phase).toBe("idle");
+  });
+
+  it("cancels after an offer resolves when disposal replaced the startup operation", async () => {
+    const h = harness();
+    const offer = deferred<RTCSessionDescriptionInit>();
+    const createOffer = vi.fn(() => offer.promise);
+    Object.defineProperty(h.peer, "createOffer", { value: createOffer, configurable: true });
+    const controller = new CodexRealtimeController(h.deps);
+    const starting = controller.start("session-1");
+    await settle();
+    await controller.dispose();
+
+    offer.resolve({ type: "offer", sdp: "v=0\r\nlate" });
+    await starting;
+
+    expect(h.peer.setLocalDescription).not.toHaveBeenCalled();
+    expect(createOffer).toHaveBeenCalledOnce();
+    expect(controller.snapshot().phase).toBe("idle");
   });
 });
