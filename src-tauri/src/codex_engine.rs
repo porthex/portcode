@@ -495,7 +495,6 @@ impl CodexEngine {
                 "End voice before sending another message in this conversation.".to_owned(),
             );
         }
-        self.realtime_quarantine.lock().await.remove(session_id);
         let mut active = self.active_by_session.lock().await;
         if active.contains_key(session_id) {
             return Err("This conversation already has a Codex turn running.".to_string());
@@ -510,6 +509,10 @@ impl CodexEngine {
             },
         );
         Ok(())
+    }
+
+    async fn clear_realtime_quarantine(&self, session_id: &str) {
+        self.realtime_quarantine.lock().await.remove(session_id);
     }
 
     async fn release_realtime_session(
@@ -1122,6 +1125,7 @@ impl CodexEngine {
             .map_err(|error| format!("Codex could not start the turn: {error}"))?;
         let turn_id = string_at(&response, &["turn", "id"])
             .ok_or_else(|| "Codex did not return a turn id.".to_string())?;
+        self.clear_realtime_quarantine(session_id).await;
         let started_at_ms = response
             .pointer("/turn/startedAt")
             .and_then(Value::as_i64)
@@ -5524,6 +5528,12 @@ mod tests {
             .claim_turn_session("run-after-voice", "session-1", None)
             .await
             .unwrap();
+        assert!(engine
+            .realtime_quarantine
+            .lock()
+            .await
+            .contains_key("session-1"));
+        engine.clear_realtime_quarantine("session-1").await;
         assert!(!engine
             .realtime_quarantine
             .lock()
