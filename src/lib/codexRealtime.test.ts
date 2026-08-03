@@ -85,6 +85,10 @@ async function settle() {
 }
 
 describe("CodexRealtimeController", () => {
+  it("keeps one controller owner across composer remounts", () => {
+    expect(createCodexRealtimeController()).toBe(createCodexRealtimeController());
+  });
+
   it("negotiates the pinned WebRTC media and event-channel shape before becoming live", async () => {
     const h = harness();
     const controller = new CodexRealtimeController(h.deps);

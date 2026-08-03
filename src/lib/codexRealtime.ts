@@ -340,6 +340,9 @@ export class CodexRealtimeController {
   }
 }
 
+let sharedCodexRealtimeController: CodexRealtimeController | null = null;
+
 export function createCodexRealtimeController(): CodexRealtimeController {
-  return new CodexRealtimeController();
+  sharedCodexRealtimeController ??= new CodexRealtimeController();
+  return sharedCodexRealtimeController;
 }
