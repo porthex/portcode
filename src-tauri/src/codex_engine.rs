@@ -561,6 +561,24 @@ impl CodexEngine {
         true
     }
 
+    async fn adopt_restarted_realtime_generation(
+        &self,
+        session_id: &str,
+        thread_id: &str,
+        previous_generation: u64,
+        next_generation: u64,
+    ) -> bool {
+        if self
+            .rebind_realtime_generation(session_id, thread_id, previous_generation, next_generation)
+            .await
+        {
+            return true;
+        }
+        self.claim_realtime_session(session_id, thread_id, next_generation)
+            .await
+            .is_ok()
+    }
+
     async fn owns_realtime_session(
         &self,
         session_id: &str,
@@ -673,7 +691,46 @@ impl CodexEngine {
             self.server
                 .realtime_start_webrtc(&thread_id, sdp)
                 .await
-                .map_err(|_| "Codex could not start voice.".to_owned())
+                .map_err(|_| "Codex could not start voice.".to_owned())?;
+            let started_generation = self
+                .server
+                .status()
+                .await
+                .generation
+                .ok_or_else(|| "Codex voice transport stopped during startup.".to_owned())?;
+            if started_generation != owner_generation {
+                if !self
+                    .adopt_restarted_realtime_generation(
+                        session_id,
+                        &thread_id,
+                        owner_generation,
+                        started_generation,
+                    )
+                    .await
+                {
+                    self.server.shutdown().await;
+                    return Err("Codex voice transport changed during startup.".to_owned());
+                }
+                owner_generation = started_generation;
+                self.register_root_route(session_id, &thread_id, started_generation)
+                    .await;
+                self.resumed_generation
+                    .lock()
+                    .await
+                    .insert(thread_id.clone(), started_generation);
+                if self.server.realtime_stop(&thread_id).await.is_err()
+                    || self
+                        .wait_for_realtime_release(session_id, &thread_id, started_generation)
+                        .await
+                        .is_err()
+                {
+                    self.server.shutdown().await;
+                }
+                return Err(
+                    "Codex voice transport restarted. Retry the voice connection.".to_owned(),
+                );
+            }
+            Ok(())
         }
         .await;
         if result.is_err() {
@@ -2527,12 +2584,10 @@ impl CodexEngine {
                 .await
                 .values()
                 .any(|quarantine| {
-                    quarantine.generation == generation
-                        && (thread_id.as_deref() == Some(quarantine.thread_id.as_str())
-                            || route.as_ref().is_some_and(|route| {
-                                route.generation == Some(generation)
-                                    && route.root_thread_id == quarantine.thread_id
-                            }))
+                    thread_id.as_deref() == Some(quarantine.thread_id.as_str())
+                        || route
+                            .as_ref()
+                            .is_some_and(|route| route.root_thread_id == quarantine.thread_id)
                 });
         if method.starts_with("thread/realtime/") {
             if let Some(owner) = realtime_owner.as_ref() {
@@ -2827,10 +2882,8 @@ impl CodexEngine {
                 .await
                 .values()
                 .any(|quarantine| {
-                    quarantine.generation == generation
-                        && (thread_id == quarantine.thread_id
-                            || (route.generation == Some(generation)
-                                && route.root_thread_id == quarantine.thread_id))
+                    thread_id == quarantine.thread_id
+                        || route.root_thread_id == quarantine.thread_id
                 });
         if realtime_quarantined {
             let _ = self
@@ -5657,6 +5710,40 @@ mod tests {
             !engine
                 .owns_realtime_session("session-1", "root-thread", 2)
                 .await
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_generation_adoption_reclaims_an_owner_released_by_transport_loss() {
+        let (engine, _, _) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .release_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+
+        assert!(
+            engine
+                .adopt_restarted_realtime_generation("session-1", "root-thread", 1, 2)
+                .await
+        );
+        assert!(
+            engine
+                .owns_realtime_session("session-1", "root-thread", 2)
+                .await
+        );
+        assert_eq!(
+            engine
+                .realtime_quarantine
+                .lock()
+                .await
+                .get("session-1")
+                .map(|owner| owner.generation),
+            Some(2)
         );
     }
 
