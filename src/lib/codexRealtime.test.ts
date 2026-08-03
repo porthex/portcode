@@ -483,6 +483,20 @@ describe("CodexRealtimeController", () => {
     expect(subscriber).not.toHaveBeenCalled();
   });
 
+  it("does not erase independently managed subscribers during disposal", async () => {
+    const h = harness();
+    const controller = new CodexRealtimeController(h.deps);
+    const subscriber = vi.fn();
+    const unsubscribe = controller.subscribe(subscriber);
+
+    await controller.dispose();
+    subscriber.mockClear();
+    await controller.start("session-1");
+
+    expect(subscriber).toHaveBeenCalled();
+    unsubscribe();
+  });
+
   it("wires the production browser media factories before the desktop-only bridge rejects", async () => {
     const h = harness();
     const mediaDescriptor = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");

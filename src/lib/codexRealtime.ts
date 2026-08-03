@@ -200,7 +200,6 @@ export class CodexRealtimeController {
 
   async dispose(): Promise<void> {
     await this.stop();
-    this.subscribers.clear();
   }
 
   private async handleEvent(
