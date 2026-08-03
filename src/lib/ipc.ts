@@ -259,6 +259,84 @@ export async function getPlanUsage(
   return mock.getPlanUsage(provider, accountProfileId);
 }
 
+// ── Codex realtime voice (desktop-local; experimental and ephemeral) ─────────
+
+export type CodexRealtimeEvent =
+  | { type: "sdp"; sdp: string }
+  | { type: "started" }
+  | { type: "closed" }
+  | { type: "error"; message: string };
+
+const MAX_CODEX_REALTIME_SDP_BYTES = 256 * 1024;
+const MAX_CODEX_REALTIME_ERROR_BYTES = 1_024;
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  const encoded = new TextEncoder().encode(value);
+  if (encoded.byteLength <= maxBytes) return value;
+  let end = maxBytes;
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  while (end > 0) {
+    try {
+      return decoder.decode(encoded.subarray(0, end));
+    } catch {
+      end -= 1;
+    }
+  }
+  return "";
+}
+
+function parseCodexRealtimeEvent(payload: unknown): CodexRealtimeEvent | null {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
+  const candidate = payload as Record<string, unknown>;
+  switch (candidate.type) {
+    case "started":
+      return { type: "started" };
+    case "closed":
+      return { type: "closed" };
+    case "sdp": {
+      if (typeof candidate.sdp !== "string" || !candidate.sdp.trimStart().startsWith("v=0")) {
+        return null;
+      }
+      if (new TextEncoder().encode(candidate.sdp).byteLength > MAX_CODEX_REALTIME_SDP_BYTES) {
+        return null;
+      }
+      return { type: "sdp", sdp: candidate.sdp };
+    }
+    case "error":
+      if (typeof candidate.message !== "string" || candidate.message.length === 0) return null;
+      return {
+        type: "error",
+        message: truncateUtf8(candidate.message, MAX_CODEX_REALTIME_ERROR_BYTES),
+      };
+    default:
+      return null;
+  }
+}
+
+export async function startCodexRealtime(sessionId: string, sdp: string): Promise<void> {
+  if (!isTauri()) throw new Error("Voice is available only in the native desktop app.");
+  const { core } = await tauri();
+  await core.invoke("codex_realtime_start", { sessionId, sdp });
+}
+
+export async function stopCodexRealtime(sessionId: string): Promise<void> {
+  if (!isTauri()) return;
+  const { core } = await tauri();
+  await core.invoke("codex_realtime_stop", { sessionId });
+}
+
+export async function listenCodexRealtime(
+  sessionId: string,
+  onEvent: (event: CodexRealtimeEvent) => void,
+): Promise<Unlisten> {
+  if (!isTauri()) return () => {};
+  const { event } = await tauri();
+  return event.listen<unknown>(`codex-realtime://${sessionId}`, ({ payload }) => {
+    const admitted = parseCodexRealtimeEvent(payload);
+    if (admitted) onEvent(admitted);
+  });
+}
+
 // ── Codex marketplace (desktop-local; deterministic preview mocks only) ────────
 
 export async function listCodexPlugins(): Promise<CodexMarketplaceCatalog> {

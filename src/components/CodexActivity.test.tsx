@@ -3,7 +3,11 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { CodexActivityEvent } from "../types";
 import { codexTurnKey, projectCodexActivity } from "../lib/codexActivity";
-import { CodexTurnActivityView, CodexUnknownActivityInspector } from "./CodexActivity";
+import {
+  CodexActivityHistoryInspector,
+  CodexTurnActivityView,
+  CodexUnknownActivityInspector,
+} from "./CodexActivity";
 
 const event = (
   sequence: number,
@@ -583,5 +587,51 @@ describe("CodexUnknownActivityInspector", () => {
     );
 
     expect(screen.getByText("Unable to display recorded parameters.")).toBeInTheDocument();
+  });
+});
+
+describe("CodexActivityHistoryInspector", () => {
+  it("deduplicates, sorts, filters, and navigates every bounded retained range", () => {
+    const retained = Array.from({ length: 450 }, (_, index) =>
+      event(450 - index, `future/event-${450 - index}`),
+    );
+    retained.push(event(200, "future/duplicate"));
+    retained.push(event(451, "turn/started", { params: { turn: { id: "U1" } } }));
+
+    const { rerender } = render(
+      <CodexActivityHistoryInspector events={retained} scopeKey="first" unknownOnly />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Unrecognized Codex activity/ }));
+    expect(
+      screen.getByText(/Showing unrecognized retained records 251–450 of 450/),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show oldest retained activity" }));
+    expect(screen.getByText(/retained records 1–200 of 450/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Newer" }));
+    expect(screen.getByText(/retained records 201–400 of 450/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show newest retained activity" }));
+    expect(screen.getByText(/retained records 251–450 of 450/)).toBeInTheDocument();
+
+    rerender(
+      <CodexActivityHistoryInspector events={retained} scopeKey="second" unknownOnly={false} />,
+    );
+    expect(screen.getByText(/retained records 252–451 of 451/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Older" }));
+    expect(screen.getByText(/retained records 52–251 of 451/)).toBeInTheDocument();
+  });
+
+  it("renders projected turns and explicit empty history copy", () => {
+    const { rerender } = render(
+      <CodexActivityHistoryInspector
+        events={[event(1, "turn/started", { params: { turn: { id: "U1" } } })]}
+        renderTurns
+      />,
+    );
+    expect(screen.getByText(/Turn running/i)).toBeInTheDocument();
+
+    rerender(<CodexActivityHistoryInspector events={[]} emptyMessage="No retained activity." />);
+    expect(screen.getByText("No retained activity.")).toBeInTheDocument();
   });
 });

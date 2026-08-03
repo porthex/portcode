@@ -160,7 +160,8 @@ describe("CodexMarketplace", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Codex could not load this plugin.");
     expect(screen.getByRole("heading", { name: "Starter" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Retry plugin details" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry plugin details" }));
+    expect(await screen.findByText("Review the project.")).toBeInTheDocument();
   });
 
   it("ignores a stale detail response after a newer plugin selection resolves", async () => {
@@ -319,5 +320,147 @@ describe("CodexMarketplace", () => {
     render(<CodexMarketplace />);
     expect(await screen.findByText("Starter")).toBeInTheDocument();
     expect(screen.getByText(/team.json.*Could not parse marketplace/)).toBeInTheDocument();
+  });
+
+  it("bounds non-Error catalog failures behind stable user-facing copy", async () => {
+    vi.mocked(ipc.listCodexPlugins).mockRejectedValue("private provider failure");
+    render(<CodexMarketplace />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Codex could not load the plugin catalog.",
+    );
+    expect(screen.queryByText("private provider failure")).not.toBeInTheDocument();
+  });
+
+  it("searches, refreshes, dismisses notices, and reports bounded refresh failures", async () => {
+    vi.mocked(ipc.upgradeCodexMarketplace)
+      .mockResolvedValueOnce({
+        selectedMarketplaces: ["preview"],
+        upgradedCount: 1,
+        errors: [],
+      })
+      .mockResolvedValueOnce({
+        selectedMarketplaces: ["preview"],
+        upgradedCount: 0,
+        errors: [{ marketplaceName: "preview", message: "offline" }],
+      })
+      .mockRejectedValueOnce("future refresh failure");
+    render(<CodexMarketplace />);
+    await screen.findByText("Starter");
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search plugin catalog" }), {
+      target: { value: "missing" },
+    });
+    expect(screen.getByText("No matching plugins.")).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search plugin catalog" }), {
+      target: { value: "preview" },
+    });
+    expect(screen.getByText("Starter")).toBeInTheDocument();
+
+    const refresh = screen.getByRole("button", { name: "Refresh snapshots" });
+    fireEvent.click(refresh);
+    expect(await screen.findByText("Refreshed 1 marketplace snapshot.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss notice" }));
+
+    fireEvent.click(refresh);
+    expect(await screen.findByText("Refreshed 0 snapshots; 1 failed.")).toBeInTheDocument();
+    fireEvent.click(refresh);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Codex could not refresh marketplace snapshots.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss error" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("adds and removes trusted sources while preserving exact native confirmations", async () => {
+    vi.mocked(ipc.addCodexMarketplace).mockResolvedValue({
+      marketplaceName: "custom",
+      alreadyAdded: false,
+    });
+    vi.mocked(ipc.removeCodexMarketplace).mockResolvedValue({
+      marketplaceName: "preview",
+      removed: true,
+    });
+    render(<CodexMarketplace />);
+    await screen.findByText("Starter");
+
+    fireEvent.change(screen.getByLabelText("Source URL"), {
+      target: { value: "https://github.com/porthex/plugins.git" },
+    });
+    fireEvent.change(screen.getByLabelText("Git ref (optional)"), { target: { value: " main " } });
+    fireEvent.click(screen.getByLabelText("I reviewed and trust this source."));
+    fireEvent.click(screen.getByRole("button", { name: "Add source" }));
+    await waitFor(() =>
+      expect(ipc.addCodexMarketplace).toHaveBeenCalledWith(
+        "https://github.com/porthex/plugins.git",
+        "main",
+        true,
+      ),
+    );
+    expect(await screen.findByText("Marketplace added through Codex.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove source" }));
+    const dialog = screen.getByRole("dialog", { name: "Remove preview" });
+    expect(dialog).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+    fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
+    await waitFor(() => expect(ipc.removeCodexMarketplace).toHaveBeenCalledWith("preview", true));
+    expect(
+      await screen.findByText("Marketplace source removed through Codex."),
+    ).toBeInTheDocument();
+  });
+
+  it("formats every task cadence and uninstalls an installed plugin", async () => {
+    const installedSummary = {
+      ...summary,
+      installed: true,
+      enabled: true,
+      installable: false,
+      localVersion: "1.0.0",
+    };
+    vi.mocked(ipc.readCodexPlugin).mockResolvedValue({
+      ...detail,
+      summary: installedSummary,
+      scheduledTasks: [
+        {
+          key: "hour",
+          name: "Hourly",
+          prompt: "H",
+          schedule: { type: "hourly", intervalHours: 1, days: null },
+        },
+        {
+          key: "hours",
+          name: "Hours",
+          prompt: "H2",
+          schedule: { type: "hourly", intervalHours: 3, days: ["MO"] },
+        },
+        {
+          key: "days",
+          name: "Weekdays",
+          prompt: "D",
+          schedule: { type: "weekdays", time: "10:00" },
+        },
+        {
+          key: "week",
+          name: "Weekly",
+          prompt: "W",
+          schedule: { type: "weekly", days: ["MO", "FR"], time: "11:00" },
+        },
+      ],
+    });
+    vi.mocked(ipc.uninstallCodexPlugin).mockRejectedValueOnce("private removal failure");
+    render(<CodexMarketplace />);
+    fireEvent.click(await screen.findByRole("button", { name: /Starter/ }));
+    expect(await screen.findByText("Every hour")).toBeInTheDocument();
+    expect(screen.getByText("Every 3 hours · MO")).toBeInTheDocument();
+    expect(screen.getByText("Weekdays at 10:00")).toBeInTheDocument();
+    expect(screen.getByText("MO, FR at 11:00")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove plugin" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
+    await waitFor(() => expect(ipc.uninstallCodexPlugin).toHaveBeenCalledWith(summary.id, true));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Codex could not complete the action.",
+    );
+    expect(screen.queryByText("private removal failure")).not.toBeInTheDocument();
   });
 });

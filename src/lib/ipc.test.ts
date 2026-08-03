@@ -66,6 +66,69 @@ describe("web-client mode flag", () => {
   });
 });
 
+describe("Codex realtime bridge", () => {
+  it("serializes only fixed native commands and a session-scoped event channel", async () => {
+    enterTauri();
+    const { ipc, invoke, listen } = await load();
+    invoke.mockResolvedValue(undefined);
+    const unlisten = vi.fn();
+    listen.mockResolvedValue(unlisten);
+    const onEvent = vi.fn();
+
+    await ipc.startCodexRealtime("session-1", "v=0\r\no=offer");
+    await ipc.stopCodexRealtime("session-1");
+    await ipc.listenCodexRealtime("session-1", onEvent);
+
+    expect(invoke.mock.calls).toEqual([
+      ["codex_realtime_start", { sessionId: "session-1", sdp: "v=0\r\no=offer" }],
+      ["codex_realtime_stop", { sessionId: "session-1" }],
+    ]);
+    expect(listen).toHaveBeenCalledWith("codex-realtime://session-1", expect.any(Function));
+  });
+
+  it("rejects media control outside the native desktop", async () => {
+    const { ipc } = await load();
+    await expect(ipc.startCodexRealtime("session-1", "v=0")).rejects.toThrow("native desktop");
+    await expect(ipc.stopCodexRealtime("session-1")).resolves.toBeUndefined();
+    const unlisten = await ipc.listenCodexRealtime("session-1", vi.fn());
+    expect(unlisten()).toBeUndefined();
+  });
+
+  it("admits only bounded allowlisted realtime event payloads", async () => {
+    enterTauri();
+    const { ipc, listen } = await load();
+    let receive: ((event: { payload: unknown }) => void) | undefined;
+    listen.mockImplementation(async (_channel, handler) => {
+      receive = handler as (event: { payload: unknown }) => void;
+      return () => undefined;
+    });
+    const onEvent = vi.fn();
+    await ipc.listenCodexRealtime("session-1", onEvent);
+
+    receive?.({ payload: { type: "started" } });
+    receive?.({ payload: { type: "closed" } });
+    receive?.({ payload: { type: "sdp", sdp: "v=0\r\nanswer" } });
+    receive?.({ payload: { type: "sdp", sdp: "not-sdp" } });
+    receive?.({ payload: { type: "sdp", sdp: `v=0\r\n${"x".repeat(256 * 1024)}` } });
+    receive?.({ payload: { type: "error" } });
+    receive?.({ payload: { type: "error", message: "short failure" } });
+    receive?.({ payload: { type: "transcript", text: "private" } });
+    receive?.({ payload: null });
+    receive?.({ payload: { type: "error", message: `failed ${"é".repeat(1_024)}` } });
+
+    expect(onEvent.mock.calls.slice(0, 3).map(([event]) => event)).toEqual([
+      { type: "started" },
+      { type: "closed" },
+      { type: "sdp", sdp: "v=0\r\nanswer" },
+    ]);
+    expect(onEvent).toHaveBeenCalledTimes(5);
+    expect(onEvent.mock.calls[3]?.[0]).toEqual({ type: "error", message: "short failure" });
+    const boundedError = onEvent.mock.calls[4]?.[0] as { type: string; message: string };
+    expect(boundedError.type).toBe("error");
+    expect(new TextEncoder().encode(boundedError.message).byteLength).toBeLessThanOrEqual(1_024);
+  });
+});
+
 describe("Codex marketplace bridge", () => {
   it("serializes only the allowlisted native marketplace and plugin commands", async () => {
     enterTauri();

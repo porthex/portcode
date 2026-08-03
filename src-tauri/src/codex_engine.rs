@@ -26,7 +26,7 @@ use crate::{
         CodexPluginInstallView,
     },
     db::{self, Db},
-    events::EventSink,
+    events::{CodexRealtimeEvent, EventSink},
     llm::{Block, ChatMessage, StreamEvent},
     settings::Settings,
 };
@@ -48,6 +48,8 @@ const MAX_RETAINED_SUBAGENTS_PER_GENERATION: usize = 512;
 const MAX_RETAINED_SUBAGENT_TURNS_PER_THREAD: usize = 512;
 const MAX_RETAINED_FAILED_ROOT_PROJECTIONS_PER_GENERATION: usize = 16;
 const MAX_SUBAGENT_RESULT_BYTES: usize = 16 * 1024;
+const MAX_REALTIME_EVENT_SDP_BYTES: usize = 256 * 1024;
+const MAX_REALTIME_ERROR_BYTES: usize = 1_024;
 const INTERRUPT_WATCHDOG_DELAY: Duration = Duration::from_secs(15);
 
 #[cfg(test)]
@@ -305,6 +307,13 @@ impl TurnProjection {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RealtimeSessionOwner {
+    session_id: String,
+    thread_id: String,
+    generation: u64,
+}
+
 pub struct CodexEngine {
     self_weak: Weak<CodexEngine>,
     server: CodexAppServer,
@@ -317,6 +326,9 @@ pub struct CodexEngine {
     resumed_generation: Mutex<HashMap<String, u64>>,
     pending_starts: Mutex<HashMap<String, PendingTurnStart>>,
     active_by_session: Mutex<HashMap<String, ActiveSessionTurn>>,
+    turn_voice_admission: Mutex<()>,
+    active_realtime_session: Mutex<Option<RealtimeSessionOwner>>,
+    realtime_quarantine: Mutex<HashMap<String, RealtimeSessionOwner>>,
     active_by_thread: Mutex<HashMap<String, ActiveThreadTurn>>,
     turns: Mutex<HashMap<String, TurnProjection>>,
     failed_root_retention_order: Mutex<VecDeque<(u64, String, String, String)>>,
@@ -371,6 +383,9 @@ impl CodexEngine {
             resumed_generation: Mutex::new(HashMap::new()),
             pending_starts: Mutex::new(HashMap::new()),
             active_by_session: Mutex::new(HashMap::new()),
+            turn_voice_admission: Mutex::new(()),
+            active_realtime_session: Mutex::new(None),
+            realtime_quarantine: Mutex::new(HashMap::new()),
             active_by_thread: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
             failed_root_retention_order: Mutex::new(VecDeque::new()),
@@ -419,6 +434,346 @@ impl CodexEngine {
 
     pub fn server(&self) -> &CodexAppServer {
         &self.server
+    }
+
+    async fn claim_realtime_session(
+        &self,
+        session_id: &str,
+        thread_id: &str,
+        generation: u64,
+    ) -> Result<(), String> {
+        let _admission = self.turn_voice_admission.lock().await;
+        if self.active_by_session.lock().await.contains_key(session_id) {
+            return Err(
+                "Wait for the current Codex turn to finish before starting voice.".to_owned(),
+            );
+        }
+        if self
+            .realtime_quarantine
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|owner| owner.thread_id == thread_id && owner.generation == generation)
+        {
+            return Err(
+                "Voice cannot restart on this conversation until Codex reconnects.".to_owned(),
+            );
+        }
+        let mut active = self.active_realtime_session.lock().await;
+        let claimed = match active.as_ref() {
+            None => {
+                *active = Some(RealtimeSessionOwner {
+                    session_id: session_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    generation,
+                });
+                Ok(())
+            }
+            Some(owner) if owner.session_id == session_id => {
+                Err("Voice is already active for this conversation.".to_owned())
+            }
+            Some(_) => Err("End the active voice conversation before starting another.".to_owned()),
+        };
+        drop(active);
+        if claimed.is_ok() {
+            self.realtime_quarantine.lock().await.insert(
+                session_id.to_owned(),
+                RealtimeSessionOwner {
+                    session_id: session_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    generation,
+                },
+            );
+        }
+        claimed
+    }
+
+    async fn claim_turn_session(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        attachment_snapshot: Option<Arc<tempfile::TempDir>>,
+    ) -> Result<(), String> {
+        let _admission = self.turn_voice_admission.lock().await;
+        if self
+            .active_realtime_session
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|owner| owner.session_id == session_id)
+        {
+            return Err(
+                "End voice before sending another message in this conversation.".to_owned(),
+            );
+        }
+        let mut active = self.active_by_session.lock().await;
+        if active.contains_key(session_id) {
+            return Err("This conversation already has a Codex turn running.".to_string());
+        }
+        active.insert(
+            session_id.to_string(),
+            ActiveSessionTurn {
+                run_id: run_id.to_string(),
+                generation: None,
+                turn_id: None,
+                _attachment_snapshot: attachment_snapshot,
+            },
+        );
+        Ok(())
+    }
+
+    async fn clear_stale_realtime_quarantine(&self, session_id: &str, generation: u64) {
+        let mut quarantine = self.realtime_quarantine.lock().await;
+        if quarantine
+            .get(session_id)
+            .is_some_and(|owner| owner.generation != generation)
+        {
+            quarantine.remove(session_id);
+        }
+    }
+
+    async fn release_realtime_session(
+        &self,
+        session_id: &str,
+        thread_id: &str,
+        generation: u64,
+    ) -> bool {
+        let mut active = self.active_realtime_session.lock().await;
+        let matches_owner = active.as_ref().is_some_and(|owner| {
+            owner.session_id == session_id
+                && owner.thread_id == thread_id
+                && owner.generation == generation
+        });
+        if !matches_owner {
+            return false;
+        }
+        *active = None;
+        true
+    }
+
+    async fn rebind_realtime_generation(
+        &self,
+        session_id: &str,
+        thread_id: &str,
+        previous_generation: u64,
+        next_generation: u64,
+    ) -> bool {
+        let mut active = self.active_realtime_session.lock().await;
+        let Some(owner) = active.as_mut() else {
+            return false;
+        };
+        if owner.session_id != session_id
+            || owner.thread_id != thread_id
+            || owner.generation != previous_generation
+        {
+            return false;
+        }
+        owner.generation = next_generation;
+        drop(active);
+        if let Some(quarantine) = self.realtime_quarantine.lock().await.get_mut(session_id) {
+            if quarantine.thread_id == thread_id && quarantine.generation == previous_generation {
+                quarantine.generation = next_generation;
+            }
+        }
+        true
+    }
+
+    async fn adopt_restarted_realtime_generation(
+        &self,
+        session_id: &str,
+        thread_id: &str,
+        previous_generation: u64,
+        next_generation: u64,
+    ) -> bool {
+        if self
+            .rebind_realtime_generation(session_id, thread_id, previous_generation, next_generation)
+            .await
+        {
+            return true;
+        }
+        self.claim_realtime_session(session_id, thread_id, next_generation)
+            .await
+            .is_ok()
+    }
+
+    async fn owns_realtime_session(
+        &self,
+        session_id: &str,
+        thread_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.active_realtime_session
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|owner| {
+                owner.session_id == session_id
+                    && owner.thread_id == thread_id
+                    && owner.generation == generation
+            })
+    }
+
+    async fn wait_for_realtime_release(
+        &self,
+        session_id: &str,
+        thread_id: &str,
+        generation: u64,
+    ) -> Result<(), String> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self
+                .owns_realtime_session(session_id, thread_id, generation)
+                .await
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "Codex voice did not confirm that it stopped.".to_owned())
+    }
+
+    pub async fn realtime_start_webrtc(&self, session_id: &str, sdp: &str) -> Result<(), String> {
+        if self.active_by_session.lock().await.contains_key(session_id) {
+            return Err(
+                "Wait for the current Codex turn to finish before starting voice.".to_owned(),
+            );
+        }
+        let account = self.account(false).await?;
+        if !account.signed_in {
+            return Err("Sign in to ChatGPT before starting voice.".to_owned());
+        }
+        let thread_id = realtime_thread_id(&self.db, session_id)?;
+        let generation = self
+            .server
+            .status()
+            .await
+            .generation
+            .ok_or_else(|| "Codex app-server is not running.".to_owned())?;
+        self.claim_realtime_session(session_id, &thread_id, generation)
+            .await?;
+        let mut owner_generation = generation;
+        let result = async {
+            if self.active_by_session.lock().await.contains_key(session_id) {
+                return Err(
+                    "Wait for the current Codex turn to finish before starting voice.".to_owned(),
+                );
+            }
+            self.register_root_route(session_id, &thread_id, generation)
+                .await;
+            if self
+                .resumed_generation
+                .lock()
+                .await
+                .get(&thread_id)
+                .copied()
+                != Some(generation)
+            {
+                let mut resume_params = Map::new();
+                resume_params.insert("threadId".into(), Value::String(thread_id.clone()));
+                enable_realtime_thread_feature(&mut resume_params);
+                let resumed = self
+                    .server
+                    .request("thread/resume", Value::Object(resume_params))
+                    .await
+                    .map_err(|_| "Codex could not resume this conversation.".to_owned())?;
+                self.reconcile_resumed_thread(session_id, &thread_id, &resumed)?;
+                let current_generation =
+                    self.server.status().await.generation.unwrap_or(generation);
+                if current_generation != owner_generation {
+                    if !self
+                        .rebind_realtime_generation(
+                            session_id,
+                            &thread_id,
+                            owner_generation,
+                            current_generation,
+                        )
+                        .await
+                    {
+                        return Err("Codex voice ownership changed during startup.".to_owned());
+                    }
+                    owner_generation = current_generation;
+                }
+                self.register_root_route(session_id, &thread_id, current_generation)
+                    .await;
+                self.resumed_generation
+                    .lock()
+                    .await
+                    .insert(thread_id.clone(), current_generation);
+            }
+            if !self
+                .owns_realtime_session(session_id, &thread_id, owner_generation)
+                .await
+            {
+                return Err("Codex voice startup was cancelled.".to_owned());
+            }
+            self.server
+                .realtime_start_webrtc(&thread_id, sdp)
+                .await
+                .map_err(|_| "Codex could not start voice.".to_owned())?;
+            let started_generation = self
+                .server
+                .status()
+                .await
+                .generation
+                .ok_or_else(|| "Codex voice transport stopped during startup.".to_owned())?;
+            if started_generation != owner_generation {
+                if !self
+                    .adopt_restarted_realtime_generation(
+                        session_id,
+                        &thread_id,
+                        owner_generation,
+                        started_generation,
+                    )
+                    .await
+                {
+                    self.server.shutdown().await;
+                    return Err("Codex voice transport changed during startup.".to_owned());
+                }
+                owner_generation = started_generation;
+                self.register_root_route(session_id, &thread_id, started_generation)
+                    .await;
+                self.resumed_generation
+                    .lock()
+                    .await
+                    .insert(thread_id.clone(), started_generation);
+                if self.server.realtime_stop(&thread_id).await.is_err()
+                    || self
+                        .wait_for_realtime_release(session_id, &thread_id, started_generation)
+                        .await
+                        .is_err()
+                {
+                    self.server.shutdown().await;
+                }
+                return Err(
+                    "Codex voice transport restarted. Retry the voice connection.".to_owned(),
+                );
+            }
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            self.release_realtime_session(session_id, &thread_id, owner_generation)
+                .await;
+        }
+        result
+    }
+
+    pub async fn realtime_stop(&self, session_id: &str) -> Result<(), String> {
+        let owner = self
+            .active_realtime_session
+            .lock()
+            .await
+            .as_ref()
+            .filter(|owner| owner.session_id == session_id)
+            .cloned();
+        let Some(owner) = owner else {
+            return Ok(());
+        };
+        self.server
+            .realtime_stop(&owner.thread_id)
+            .await
+            .map_err(|_| "Codex could not stop voice.".to_owned())?;
+        self.wait_for_realtime_release(&owner.session_id, &owner.thread_id, owner.generation)
+            .await
     }
 
     pub async fn marketplace_catalog(&self) -> Result<CodexMarketplaceCatalogView, String> {
@@ -687,21 +1042,8 @@ impl CodexEngine {
         prepared_turn: &PreparedTurn,
         settings: &Settings,
     ) -> Result<(), String> {
-        {
-            let mut active = self.active_by_session.lock().await;
-            if active.contains_key(session_id) {
-                return Err("This conversation already has a Codex turn running.".to_string());
-            }
-            active.insert(
-                session_id.to_string(),
-                ActiveSessionTurn {
-                    run_id: run_id.to_string(),
-                    generation: None,
-                    turn_id: None,
-                    _attachment_snapshot: prepared_turn.attachment_snapshot(),
-                },
-            );
-        }
+        self.claim_turn_session(run_id, session_id, prepared_turn.attachment_snapshot())
+            .await?;
 
         let account = self.account(false).await?;
         if !account.signed_in {
@@ -749,6 +1091,7 @@ impl CodexEngine {
                 params.insert("threadId".into(), Value::String(thread_id.clone()));
                 insert_optional_string(&mut params, "cwd", cwd.as_deref());
                 insert_optional_string(&mut params, "model", session.model.as_deref());
+                enable_realtime_thread_feature(&mut params);
                 let (approval, sandbox, reviewer) = codex_permissions(&settings.permission_mode);
                 params.insert("approvalPolicy".into(), approval);
                 params.insert("sandbox".into(), sandbox);
@@ -774,6 +1117,7 @@ impl CodexEngine {
         } else {
             let mut params = Map::new();
             enable_raw_thread_events(&mut params);
+            enable_realtime_thread_feature(&mut params);
             insert_optional_string(&mut params, "cwd", cwd.as_deref());
             insert_optional_string(&mut params, "model", session.model.as_deref());
             let (approval, sandbox, reviewer) = codex_permissions(&settings.permission_mode);
@@ -855,6 +1199,8 @@ impl CodexEngine {
             .map_err(|error| format!("Codex could not start the turn: {error}"))?;
         let turn_id = string_at(&response, &["turn", "id"])
             .ok_or_else(|| "Codex did not return a turn id.".to_string())?;
+        self.clear_stale_realtime_quarantine(session_id, turn_generation)
+            .await;
         let started_at_ms = response
             .pointer("/turn/startedAt")
             .and_then(Value::as_i64)
@@ -1254,6 +1600,7 @@ impl CodexEngine {
         self.usage_by_turn.lock().await.clear();
         self.pending_requests.lock().await.clear();
         self.deferred_by_thread.lock().await.clear();
+        self.active_realtime_session.lock().await.take();
         // Clear this last: it owns native attachment snapshots, which must remain
         // readable until active work has stopped but must not outlive shutdown.
         self.active_by_session.lock().await.clear();
@@ -1676,6 +2023,58 @@ impl CodexEngine {
             .is_some_and(|active| {
                 active.generation == Some(generation) && active.turn_id.as_deref() == Some(turn_id)
             })
+    }
+
+    async fn normal_root_for_route_is_active(
+        &self,
+        generation: u64,
+        route: &ThreadRoute,
+    ) -> Option<String> {
+        if route.generation != Some(generation) {
+            return None;
+        }
+        let active_root_turn = self
+            .active_by_thread
+            .lock()
+            .await
+            .get(&route.root_thread_id)
+            .filter(|active| active.generation == generation)
+            .map(|active| active.turn_id.clone())?;
+        self.active_by_session
+            .lock()
+            .await
+            .get(&route.session_id)
+            .is_some_and(|active| {
+                active.generation == Some(generation)
+                    && active.turn_id.as_deref() == Some(active_root_turn.as_str())
+            })
+            .then_some(active_root_turn)
+    }
+
+    async fn normal_child_route_is_active(&self, generation: u64, route: &ThreadRoute) -> bool {
+        if !route.is_subagent {
+            return false;
+        }
+        let Some(parent_thread_id) = route.parent_thread_id.as_deref() else {
+            return false;
+        };
+        let Some(launch_turn_id) = route.launch_turn_id.as_deref() else {
+            return false;
+        };
+        if !self
+            .active_by_thread
+            .lock()
+            .await
+            .get(parent_thread_id)
+            .is_some_and(|active| {
+                active.generation == generation && active.turn_id == launch_turn_id
+            })
+        {
+            return false;
+        }
+        self.normal_root_for_route_is_active(generation, route)
+            .await
+            .is_some()
     }
 
     async fn retire_exact_turn_requests_locked(
@@ -2111,19 +2510,37 @@ impl CodexEngine {
             if let Incoming::Notification { method, params, .. } = &incoming {
                 if method == "thread/started" {
                     if let Some(parent_id) = string_at(params, &["thread", "parentThreadId"]) {
-                        if self
-                            .routes
-                            .read()
-                            .await
-                            .get(&parent_id)
+                        let parent_route = self.routes.read().await.get(&parent_id).cloned();
+                        if parent_route
+                            .as_ref()
                             .and_then(|parent| parent.generation)
                             .is_some_and(|parent_generation| parent_generation != generation)
                         {
                             return;
                         }
-                        route_recovered = self
-                            .establish_child_route(&thread_id, &parent_id, generation, None)
-                            .await;
+                        let parent_is_quarantined =
+                            match parent_route.as_ref() {
+                                Some(parent) => self.realtime_quarantine.lock().await.values().any(
+                                    |quarantine| quarantine.thread_id == parent.root_thread_id,
+                                ),
+                                None => false,
+                            };
+                        if parent_is_quarantined {
+                            let normal_root_active = match parent_route.as_ref() {
+                                Some(parent) => self
+                                    .normal_root_for_route_is_active(generation, parent)
+                                    .await
+                                    .is_some(),
+                                None => false,
+                            };
+                            if !normal_root_active {
+                                return;
+                            }
+                        } else {
+                            route_recovered = self
+                                .establish_child_route(&thread_id, &parent_id, generation, None)
+                                .await;
+                        }
                     }
                 }
             }
@@ -2235,6 +2652,69 @@ impl CodexEngine {
             Some(thread_id) => self.routes.read().await.get(thread_id).cloned(),
             None => None,
         };
+        let realtime_owner = self
+            .active_realtime_session
+            .lock()
+            .await
+            .as_ref()
+            .filter(|owner| {
+                owner.generation == generation
+                    && thread_id.as_deref() == Some(owner.thread_id.as_str())
+            })
+            .cloned();
+        let realtime_quarantined =
+            self.realtime_quarantine
+                .lock()
+                .await
+                .values()
+                .any(|quarantine| {
+                    thread_id.as_deref() == Some(quarantine.thread_id.as_str())
+                        || route
+                            .as_ref()
+                            .is_some_and(|route| route.root_thread_id == quarantine.thread_id)
+                });
+        let exact_normal_root_turn = if realtime_quarantined {
+            match (
+                route.as_ref().filter(|route| !route.is_subagent),
+                thread_id.as_deref(),
+                extract_turn_id(&params),
+            ) {
+                (Some(_), Some(thread_id), Some(turn_id)) => self
+                    .active_by_thread
+                    .lock()
+                    .await
+                    .get(thread_id)
+                    .is_some_and(|active| {
+                        active.generation == generation && active.turn_id == turn_id
+                    }),
+                _ => false,
+            }
+        } else {
+            false
+        };
+        let exact_normal_child_turn = if realtime_quarantined {
+            match route.as_ref() {
+                Some(route) => self.normal_child_route_is_active(generation, route).await,
+                None => false,
+            }
+        } else {
+            false
+        };
+        if method.starts_with("thread/realtime/") {
+            if let Some(owner) = realtime_owner.as_ref() {
+                self.project_realtime(generation, owner, method, &params)
+                    .await;
+            }
+            return;
+        }
+        if realtime_owner.is_some()
+            || (realtime_quarantined && !exact_normal_root_turn && !exact_normal_child_turn)
+        {
+            // Realtime V3 can fan out ordinary turn/item notifications for
+            // transcript-derived delegations. They are not Portcode turns and
+            // must not cross the ephemeral voice persistence boundary.
+            return;
+        }
         if let Some(route) = route.as_ref() {
             if let (Some(thread_id), Some(turn_id)) =
                 (thread_id.as_deref(), extract_turn_id(&params))
@@ -2426,6 +2906,56 @@ impl CodexEngine {
         }
     }
 
+    async fn project_realtime(
+        &self,
+        generation: u64,
+        owner: &RealtimeSessionOwner,
+        method: &str,
+        params: &Value,
+    ) {
+        let event = match method {
+            "thread/realtime/sdp" => {
+                let Some(sdp) = params.get("sdp").and_then(Value::as_str) else {
+                    return;
+                };
+                if sdp.len() > MAX_REALTIME_EVENT_SDP_BYTES || !sdp.trim_start().starts_with("v=0")
+                {
+                    return;
+                }
+                CodexRealtimeEvent::Sdp {
+                    sdp: sdp.to_owned(),
+                }
+            }
+            "thread/realtime/started" => CodexRealtimeEvent::Started,
+            "thread/realtime/closed" => {
+                if !params
+                    .get("reason")
+                    .is_some_and(|reason| reason.is_string() || reason.is_null())
+                {
+                    return;
+                }
+                CodexRealtimeEvent::Closed
+            }
+            "thread/realtime/error" => {
+                let message = params
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| params.pointer("/error/message").and_then(Value::as_str))
+                    .unwrap_or("Realtime voice session failed.");
+                CodexRealtimeEvent::Error {
+                    message: truncate_utf8(message, MAX_REALTIME_ERROR_BYTES),
+                }
+            }
+            _ => return,
+        };
+        if matches!(event, CodexRealtimeEvent::Closed) {
+            self.release_realtime_session(&owner.session_id, &owner.thread_id, generation)
+                .await;
+        }
+        self.sink
+            .emit_realtime(&format!("codex-realtime://{}", owner.session_id), event);
+    }
+
     async fn handle_server_request(
         &self,
         generation: u64,
@@ -2467,6 +2997,38 @@ impl CodexEngine {
                 .await;
             return;
         };
+        let realtime_quarantined =
+            self.realtime_quarantine
+                .lock()
+                .await
+                .values()
+                .any(|quarantine| {
+                    thread_id == quarantine.thread_id
+                        || route.root_thread_id == quarantine.thread_id
+                });
+        let exact_normal_root_turn = realtime_quarantined
+            && !route.is_subagent
+            && self
+                .exact_request_owner_is_active(generation, &route, &thread_id, &turn_id)
+                .await;
+        let exact_normal_child_turn = realtime_quarantined
+            && self.normal_child_route_is_active(generation, &route).await
+            && self
+                .exact_request_owner_is_active(generation, &route, &thread_id, &turn_id)
+                .await;
+        if realtime_quarantined && !exact_normal_root_turn && !exact_normal_child_turn {
+            let _ = self
+                .server
+                .send_response_error(
+                    generation,
+                    rpc_id,
+                    -32602,
+                    "Voice-derived client requests are unavailable",
+                    None,
+                )
+                .await;
+            return;
+        }
         let approval = matches!(
             method,
             "item/commandExecution/requestApproval"
@@ -3666,6 +4228,29 @@ impl CodexEngine {
         let _lifecycle = self.request_lifecycle.lock().await;
         let mut affected_sessions = std::collections::HashSet::new();
 
+        let realtime_owner = {
+            let mut active = self.active_realtime_session.lock().await;
+            if active
+                .as_ref()
+                .is_some_and(|owner| owner.generation == generation)
+            {
+                active.take()
+            } else {
+                None
+            }
+        };
+        if let Some(owner) = realtime_owner {
+            self.sink.emit_realtime(
+                &format!("codex-realtime://{}", owner.session_id),
+                CodexRealtimeEvent::Error {
+                    message: truncate_utf8(
+                        &format!("Codex voice transport closed ({reason})."),
+                        MAX_REALTIME_ERROR_BYTES,
+                    ),
+                },
+            );
+        }
+
         let expired_starts = {
             let mut starts = self.pending_starts.lock().await;
             let keys = starts
@@ -4691,6 +5276,22 @@ fn sanitize_request_id(request_id: Option<&Value>) -> Option<Value> {
 
 fn enable_raw_thread_events(_params: &mut Map<String, Value>) {}
 
+fn enable_realtime_thread_feature(params: &mut Map<String, Value>) {
+    params.insert(
+        "config".into(),
+        json!({ "features.realtime_conversation": true }),
+    );
+}
+
+fn realtime_thread_id(db: &Db, session_id: &str) -> Result<String, String> {
+    let session = db
+        .codex_session_config(session_id)
+        .map_err(|_| "This conversation is unavailable.".to_owned())?;
+    session.codex_thread_id.ok_or_else(|| {
+        "Send one message in this conversation before starting experimental voice.".to_owned()
+    })
+}
+
 fn session_channel(session_id: &str) -> String {
     format!("agent://{session_id}")
 }
@@ -4902,11 +5503,19 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink {
         events: std::sync::Mutex<Vec<(String, StreamEvent)>>,
+        realtime_events: std::sync::Mutex<Vec<(String, CodexRealtimeEvent)>>,
     }
 
     impl EventSink for RecordingSink {
         fn emit(&self, channel: &str, event: StreamEvent) {
             self.events
+                .lock()
+                .unwrap()
+                .push((channel.to_string(), event));
+        }
+
+        fn emit_realtime(&self, channel: &str, event: CodexRealtimeEvent) {
+            self.realtime_events
                 .lock()
                 .unwrap()
                 .push((channel.to_string(), event));
@@ -5020,6 +5629,758 @@ mod tests {
         // Db owns the connection, so dropping the TempDir handle does not affect
         // the open test database on Windows.
         (engine, db, sink)
+    }
+
+    #[tokio::test]
+    async fn realtime_sdp_is_desktop_only_ephemeral_and_generation_owned() {
+        let (engine, db, sink) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "thread/realtime/sdp".to_owned(),
+                params: json!({"threadId": "root-thread", "sdp": "v=0\r\nanswer"}),
+                raw: json!({
+                    "method": "thread/realtime/sdp",
+                    "params": {"threadId": "root-thread", "sdp": "v=0\r\nanswer"}
+                }),
+            })
+            .await;
+
+        assert_eq!(
+            sink.realtime_events.lock().unwrap().as_slice(),
+            [(
+                "codex-realtime://session-1".to_owned(),
+                CodexRealtimeEvent::Sdp {
+                    sdp: "v=0\r\nanswer".to_owned()
+                }
+            )]
+        );
+        assert!(sink.events.lock().unwrap().is_empty());
+        assert!(db.codex_activity("session-1", 100).unwrap().is_empty());
+
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 2,
+                method: "thread/realtime/sdp".to_owned(),
+                params: json!({"threadId": "root-thread", "sdp": "v=0\r\nstale"}),
+                raw: json!({}),
+            })
+            .await;
+        assert_eq!(sink.realtime_events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn realtime_audio_payloads_are_dropped_without_persistence() {
+        let (engine, db, sink) = routed_test_engine().await;
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "thread/realtime/outputAudio/delta".to_owned(),
+                params: json!({"threadId": "root-thread", "audio": "base64-secret"}),
+                raw: json!({"secret": "base64-secret"}),
+            })
+            .await;
+
+        assert!(sink.realtime_events.lock().unwrap().is_empty());
+        assert!(sink.events.lock().unwrap().is_empty());
+        assert!(db.codex_activity("session-1", 100).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn realtime_owner_drops_transcript_derived_activity_across_its_lineage() {
+        let (engine, db, sink) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .establish_child_route("voice-child", "root-thread", 1, None)
+                .await
+        );
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "thread/realtime/closed".to_owned(),
+                params: json!({"threadId": "voice-child", "reason": "child finished"}),
+                raw: json!({}),
+            })
+            .await;
+        assert!(
+            engine
+                .owns_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "thread/realtime/closed".to_owned(),
+                params: json!({"threadId": "root-thread", "reason": "finished"}),
+                raw: json!({"transcript": "must-not-persist"}),
+            })
+            .await;
+
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "turn/plan/updated".to_owned(),
+                params: json!({
+                    "threadId": "voice-child",
+                    "turnId": "realtime-derived-turn",
+                    "explanation": "must-not-persist",
+                    "plan": []
+                }),
+                raw: json!({"transcript": "must-not-persist"}),
+            })
+            .await;
+        engine
+            .handle_incoming(Incoming::ServerRequest {
+                generation: 1,
+                id: json!(7),
+                method: "future/privateRequest".to_owned(),
+                params: json!({
+                    "threadId": "voice-child",
+                    "turnId": "realtime-derived-turn",
+                    "transcript": "must-not-persist"
+                }),
+                raw: json!({"transcript": "must-not-persist"}),
+            })
+            .await;
+
+        assert!(sink.events.lock().unwrap().is_empty());
+        assert!(db.codex_activity("session-1", 100).unwrap().is_empty());
+        assert!(engine
+            .realtime_quarantine
+            .lock()
+            .await
+            .contains_key("session-1"));
+        engine
+            .claim_turn_session("run-after-voice", "session-1", None)
+            .await
+            .unwrap();
+        assert!(engine
+            .realtime_quarantine
+            .lock()
+            .await
+            .contains_key("session-1"));
+        activate_test_root_turn(&engine, 1, "normal-turn").await;
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "turn/plan/updated".to_owned(),
+                params: json!({
+                    "threadId": "root-thread",
+                    "turnId": "normal-turn",
+                    "explanation": "safe normal turn",
+                    "plan": []
+                }),
+                raw: json!({"safe": true}),
+            })
+            .await;
+        assert!(!db.codex_activity("session-1", 100).unwrap().is_empty());
+        engine.clear_stale_realtime_quarantine("session-1", 2).await;
+        assert!(!engine
+            .realtime_quarantine
+            .lock()
+            .await
+            .contains_key("session-1"));
+    }
+
+    #[tokio::test]
+    async fn realtime_lease_has_one_exact_session_owner() {
+        let (engine, _, _) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+        assert!(engine
+            .claim_realtime_session("session-2", "other-thread", 1)
+            .await
+            .is_err());
+        assert!(
+            !engine
+                .release_realtime_session("session-2", "other-thread", 1)
+                .await
+        );
+        assert!(
+            engine
+                .release_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+        engine
+            .claim_realtime_session("session-2", "other-thread", 2)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn realtime_lease_rebinds_only_its_exact_owner_after_transport_restart() {
+        let (engine, _, _) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .owns_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+
+        assert!(
+            !engine
+                .rebind_realtime_generation("session-2", "root-thread", 1, 2)
+                .await
+        );
+        assert!(
+            !engine
+                .rebind_realtime_generation("session-1", "root-thread", 2, 3)
+                .await
+        );
+        assert!(
+            engine
+                .rebind_realtime_generation("session-1", "root-thread", 1, 2)
+                .await
+        );
+        assert!(
+            !engine
+                .owns_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+        assert!(
+            engine
+                .owns_realtime_session("session-1", "root-thread", 2)
+                .await
+        );
+        assert!(
+            !engine
+                .release_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+        assert!(
+            engine
+                .release_realtime_session("session-1", "root-thread", 2)
+                .await
+        );
+        assert!(
+            !engine
+                .owns_realtime_session("session-1", "root-thread", 2)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_generation_adoption_reclaims_an_owner_released_by_transport_loss() {
+        let (engine, _, _) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .release_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+
+        assert!(
+            engine
+                .adopt_restarted_realtime_generation("session-1", "root-thread", 1, 2)
+                .await
+        );
+        assert!(
+            engine
+                .owns_realtime_session("session-1", "root-thread", 2)
+                .await
+        );
+        assert_eq!(
+            engine
+                .realtime_quarantine
+                .lock()
+                .await
+                .get("session-1")
+                .map(|owner| owner.generation),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn thread_capabilities_enable_realtime_without_internal_raw_response_events() {
+        let mut params = Map::new();
+        enable_raw_thread_events(&mut params);
+        enable_realtime_thread_feature(&mut params);
+
+        assert!(params.get("experimentalRawEvents").is_none());
+        assert_eq!(
+            params,
+            Map::from_iter([(
+                "config".to_owned(),
+                json!({ "features.realtime_conversation": true }),
+            )])
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_owner_blocks_only_its_session_from_normal_turn_admission() {
+        let (engine, _, _) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+
+        assert!(engine
+            .claim_turn_session("run-1", "session-1", None)
+            .await
+            .is_err());
+        engine
+            .claim_turn_session("run-2", "session-2", None)
+            .await
+            .unwrap();
+        assert!(engine
+            .active_by_session
+            .lock()
+            .await
+            .contains_key("session-2"));
+    }
+
+    #[tokio::test]
+    async fn realtime_error_retains_its_owner_until_exact_close() {
+        let (engine, db, sink) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 2,
+                method: "thread/realtime/closed".to_owned(),
+                params: json!({"threadId": "root-thread", "reason": "stale"}),
+                raw: json!({"secret": "must-not-persist"}),
+            })
+            .await;
+        assert!(engine
+            .claim_realtime_session("session-2", "other-thread", 2)
+            .await
+            .is_err());
+
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "thread/realtime/error".to_owned(),
+                params: json!({"threadId": "root-thread", "message": "voice failed"}),
+                raw: json!({"secret": "must-not-persist"}),
+            })
+            .await;
+        assert!(engine
+            .claim_realtime_session("session-2", "other-thread", 2)
+            .await
+            .is_err());
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "thread/realtime/closed".to_owned(),
+                params: json!({"threadId": "root-thread", "reason": "failed"}),
+                raw: json!({"secret": "must-not-persist"}),
+            })
+            .await;
+        engine
+            .claim_realtime_session("session-2", "other-thread", 2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sink.realtime_events.lock().unwrap().as_slice(),
+            [
+                (
+                    "codex-realtime://session-1".to_owned(),
+                    CodexRealtimeEvent::Error {
+                        message: "voice failed".to_owned()
+                    }
+                ),
+                (
+                    "codex-realtime://session-1".to_owned(),
+                    CodexRealtimeEvent::Closed
+                )
+            ]
+        );
+        assert!(sink.events.lock().unwrap().is_empty());
+        assert!(db.codex_activity("session-1", 100).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn realtime_closed_releases_its_owner_without_persistence() {
+        let (engine, db, sink) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "thread/realtime/closed".to_owned(),
+                params: json!({"threadId": "root-thread", "reason": "finished"}),
+                raw: json!({"transcript": "must-not-persist"}),
+            })
+            .await;
+        engine
+            .claim_realtime_session("session-2", "other-thread", 2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sink.realtime_events.lock().unwrap().as_slice(),
+            [(
+                "codex-realtime://session-1".to_owned(),
+                CodexRealtimeEvent::Closed
+            )]
+        );
+        assert!(sink.events.lock().unwrap().is_empty());
+        assert!(db.codex_activity("session-1", 100).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_realtime_closed_does_not_release_or_emit_for_the_owner() {
+        let (engine, db, sink) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+
+        for params in [
+            json!({"threadId": "root-thread"}),
+            json!({"threadId": "root-thread", "reason": false}),
+        ] {
+            engine
+                .handle_incoming(Incoming::Notification {
+                    generation: 1,
+                    method: "thread/realtime/closed".to_owned(),
+                    params,
+                    raw: json!({"transcript": "must-not-persist"}),
+                })
+                .await;
+        }
+
+        assert!(
+            engine
+                .owns_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+        assert!(sink.realtime_events.lock().unwrap().is_empty());
+        assert!(sink.events.lock().unwrap().is_empty());
+        assert!(db.codex_activity("session-1", 100).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn realtime_quarantine_rejects_same_generation_restart_after_close() {
+        let (engine, _, _) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .release_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+
+        assert!(engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .is_err());
+        engine.clear_stale_realtime_quarantine("session-1", 2).await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 2)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn realtime_quarantine_allows_children_launched_by_the_exact_normal_turn() {
+        let (engine, _, sink) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .release_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+        engine
+            .claim_turn_session("run-normal", "session-1", None)
+            .await
+            .unwrap();
+        activate_test_root_turn(&engine, 1, "normal-turn").await;
+        assert!(
+            engine
+                .establish_child_route("normal-child", "root-thread", 1, Some("normal-turn"),)
+                .await
+        );
+
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "turn/started".to_owned(),
+                params: json!({
+                    "threadId": "normal-child",
+                    "turn": {"id": "normal-child-turn"}
+                }),
+                raw: json!({}),
+            })
+            .await;
+
+        assert!(sink.events.lock().unwrap().iter().any(|(_, event)| {
+            matches!(
+                event,
+                StreamEvent::AgentProgress {
+                    agent_id,
+                    current_turn_id: Some(turn_id),
+                    ..
+                } if agent_id == "normal-child" && turn_id == "normal-child-turn"
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn realtime_quarantine_defers_child_startup_until_the_normal_launch_is_owned() {
+        let (engine, _, sink) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .release_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+        engine
+            .claim_turn_session("run-normal", "session-1", None)
+            .await
+            .unwrap();
+        activate_test_root_turn(&engine, 1, "normal-turn").await;
+
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "turn/started".to_owned(),
+                params: json!({
+                    "threadId": "normal-child",
+                    "turn": {"id": "normal-child-turn"}
+                }),
+                raw: json!({}),
+            })
+            .await;
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "thread/started".to_owned(),
+                params: json!({
+                    "thread": {
+                        "id": "normal-child",
+                        "parentThreadId": "root-thread"
+                    }
+                }),
+                raw: json!({}),
+            })
+            .await;
+        assert!(sink.events.lock().unwrap().is_empty());
+
+        assert!(
+            engine
+                .establish_child_route("normal-child", "root-thread", 1, Some("normal-turn"),)
+                .await
+        );
+        engine.drain_deferred("normal-child").await;
+
+        assert!(sink.events.lock().unwrap().iter().any(|(_, event)| {
+            matches!(
+                event,
+                StreamEvent::AgentProgress {
+                    agent_id,
+                    current_turn_id: Some(turn_id),
+                    ..
+                } if agent_id == "normal-child" && turn_id == "normal-child-turn"
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn realtime_quarantine_allows_nested_children_owned_by_the_normal_lineage() {
+        let (engine, _, sink) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .release_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+        engine
+            .claim_turn_session("run-normal", "session-1", None)
+            .await
+            .unwrap();
+        activate_test_root_turn(&engine, 1, "normal-turn").await;
+        assert!(
+            engine
+                .establish_child_route("normal-child", "root-thread", 1, Some("normal-turn"),)
+                .await
+        );
+        engine.active_by_thread.lock().await.insert(
+            "normal-child".to_owned(),
+            ActiveThreadTurn {
+                generation: 1,
+                turn_id: "normal-child-turn".to_owned(),
+            },
+        );
+        assert!(
+            engine
+                .establish_child_route(
+                    "normal-grandchild",
+                    "normal-child",
+                    1,
+                    Some("normal-child-turn"),
+                )
+                .await
+        );
+
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "turn/started".to_owned(),
+                params: json!({
+                    "threadId": "normal-grandchild",
+                    "turn": {"id": "normal-grandchild-turn"}
+                }),
+                raw: json!({}),
+            })
+            .await;
+
+        assert!(sink.events.lock().unwrap().iter().any(|(_, event)| {
+            matches!(
+                event,
+                StreamEvent::AgentProgress {
+                    agent_id,
+                    current_turn_id: Some(turn_id),
+                    ..
+                } if agent_id == "normal-grandchild" && turn_id == "normal-grandchild-turn"
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn transport_close_releases_only_realtime_owner_from_that_generation() {
+        let (engine, _, sink) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+
+        engine.handle_transport_closed(2, "stale transport").await;
+        assert!(engine
+            .claim_realtime_session("session-2", "other-thread", 2)
+            .await
+            .is_err());
+
+        engine
+            .handle_transport_closed(1, "voice transport lost")
+            .await;
+        engine
+            .claim_realtime_session("session-2", "other-thread", 2)
+            .await
+            .unwrap();
+        assert!(sink.realtime_events.lock().unwrap().iter().any(|(channel, event)| {
+            channel == "codex-realtime://session-1"
+                && matches!(event, CodexRealtimeEvent::Error { message } if message.contains("voice transport lost"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_the_realtime_owner_even_without_a_transport_event() {
+        let (engine, _, _) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+
+        engine.shutdown().await;
+
+        engine
+            .claim_realtime_session("session-2", "other-thread", 2)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_retains_its_owner_until_the_terminal_event() {
+        let (engine, db, _) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("deleted-session", "root-thread", 1)
+            .await
+            .unwrap();
+
+        let _ = engine.realtime_stop("deleted-session").await;
+        assert!(engine
+            .claim_realtime_session("session-2", "other-thread", 2)
+            .await
+            .is_err());
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "thread/realtime/closed".to_owned(),
+                params: json!({"threadId": "root-thread", "reason": "stopped"}),
+                raw: json!({"transcript": "must-not-persist"}),
+            })
+            .await;
+        engine
+            .claim_realtime_session("session-2", "other-thread", 2)
+            .await
+            .unwrap();
+        assert!(db
+            .codex_activity("deleted-session", 100)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_wait_completes_only_after_the_exact_owner_is_released() {
+        let (engine, _, _) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+
+        let (waited, released) = tokio::join!(
+            engine.wait_for_realtime_release("session-1", "root-thread", 1),
+            async {
+                tokio::task::yield_now().await;
+                engine
+                    .release_realtime_session("session-1", "root-thread", 1)
+                    .await
+            }
+        );
+
+        assert!(released);
+        assert!(waited.is_ok());
+    }
+
+    #[test]
+    fn realtime_thread_identity_comes_only_from_the_session_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Db::open(&directory.path().join("portcode.db")).unwrap();
+        db.create_session("session-1", "Voice", None, None, 1)
+            .unwrap();
+        assert!(realtime_thread_id(&db, "session-1").is_err());
+        db.bind_codex_thread("session-1", "owned-thread").unwrap();
+        assert_eq!(
+            realtime_thread_id(&db, "session-1").unwrap(),
+            "owned-thread"
+        );
+        assert!(realtime_thread_id(&db, "unknown-session").is_err());
     }
 
     async fn activate_test_root_turn(engine: &CodexEngine, generation: u64, turn_id: &str) {
@@ -5210,13 +6571,6 @@ mod tests {
             codex_sandbox_policy(&crate::permissions::PermissionMode::Bypass)["type"],
             "dangerFullAccess"
         );
-    }
-
-    #[test]
-    fn new_threads_do_not_request_internal_raw_response_events() {
-        let mut params = Map::new();
-        enable_raw_thread_events(&mut params);
-        assert!(params.get("experimentalRawEvents").is_none());
     }
 
     #[test]

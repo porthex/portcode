@@ -14,12 +14,52 @@ import {
   type Usage,
 } from "../types";
 
+const voiceHarness = vi.hoisted(() => {
+  let state = { phase: "idle", sessionId: null as string | null, error: null as string | null };
+  const subscribers = new Set<() => void>();
+  const setState = (next: typeof state) => {
+    state = next;
+    subscribers.forEach((subscriber) => subscriber());
+  };
+  const controller = {
+    snapshot: vi.fn(() => state),
+    subscribe: vi.fn((subscriber: () => void) => {
+      subscribers.add(subscriber);
+      return () => subscribers.delete(subscriber);
+    }),
+    start: vi.fn(async (sessionId: string) => {
+      setState({ phase: "requestingMicrophone", sessionId, error: null });
+    }),
+    stop: vi.fn(async () => {
+      setState({ phase: "idle", sessionId: null, error: null });
+    }),
+    switchSession: vi.fn(async () => undefined),
+    dispose: vi.fn(async () => undefined),
+  };
+  return {
+    controller,
+    setState,
+    reset: () => {
+      state = { phase: "idle", sessionId: null, error: null };
+      subscribers.clear();
+      Object.values(controller).forEach((value) => {
+        if (typeof value === "function" && "mockClear" in value) value.mockClear();
+      });
+    },
+  };
+});
+
+vi.mock("../lib/codexRealtime", () => ({
+  createCodexRealtimeController: () => voiceHarness.controller,
+}));
+
 // The Composer is a thin view over the real store: it binds the ACTIVE session's
 // draft and calls the store's send/stop actions, which reach the IPC bridge. We
 // mock only the IPC layer (so `send` can't spawn the real mock-agent, and the
 // debounced draft save never hits a backend) and drive the actual store, asserting
 // on observable DOM + store state. House style mirrors store.test.ts / smoke.test.tsx.
 vi.mock("../lib/ipc", () => ({
+  isTauri: vi.fn(),
   runAgent: vi.fn(),
   openFolder: vi.fn(),
   pickAttachmentPaths: vi.fn(),
@@ -91,6 +131,7 @@ const seedDraft = (text: string, id = "a") =>
 
 beforeEach(() => {
   vi.clearAllMocks();
+  voiceHarness.reset();
   useStore.setState(initial, true);
   // Most composer tests exercise drafting/streaming, not auth. Seed the single
   // Codex account slot; auth-specific cases override it.
@@ -122,6 +163,7 @@ beforeEach(() => {
   // without ever touching a real backend.
   m.runAgent.mockResolvedValue({ cancel: vi.fn(async () => {}), dispose: vi.fn() });
   m.openFolder.mockResolvedValue(null);
+  m.isTauri.mockReturnValue(false);
   m.pickAttachmentPaths.mockResolvedValue([]);
   m.validateAttachments.mockResolvedValue({ attachments: [], errors: [] });
   m.updateSessionModel.mockResolvedValue(undefined);
@@ -170,6 +212,95 @@ const attachment = (over: Partial<Attachment> = {}): Attachment => {
     ...over,
   };
 };
+
+describe("Composer experimental voice", () => {
+  it("shows the control only in the local native desktop and starts the exact active session", async () => {
+    const preview = render(<Composer />);
+    expect(
+      screen.queryByRole("button", { name: "Start Voice (experimental)" }),
+    ).not.toBeInTheDocument();
+    preview.unmount();
+
+    m.isTauri.mockReturnValue(true);
+    render(<Composer />);
+    const voice = screen.getByRole("button", { name: "Start Voice (experimental)" });
+    expect(voice).toBeEnabled();
+    fireEvent.click(voice);
+
+    await waitFor(() => expect(voiceHarness.controller.start).toHaveBeenCalledWith("a"));
+    expect(await screen.findByText("Requesting microphone…")).toBeInTheDocument();
+  });
+
+  it("disables voice during a normal turn and stops a live call accessibly", async () => {
+    m.isTauri.mockReturnValue(true);
+    useStore.setState({ streaming: true, runs: { a: run({ streaming: true }) } });
+    const view = render(<Composer />);
+    expect(screen.getByRole("button", { name: "Start Voice (experimental)" })).toBeDisabled();
+
+    act(() => useStore.setState({ streaming: false, runs: {} }));
+    act(() => voiceHarness.setState({ phase: "live", sessionId: "a", error: null }));
+    view.rerender(<Composer />);
+    fireEvent.click(screen.getByRole("button", { name: "Stop Voice (experimental)" }));
+
+    await waitFor(() => expect(voiceHarness.controller.stop).toHaveBeenCalledOnce());
+  });
+
+  it("surfaces controller errors and retires voice on session switch and unmount", async () => {
+    m.isTauri.mockReturnValue(true);
+    const view = render(<Composer />);
+    act(() =>
+      voiceHarness.setState({
+        phase: "error",
+        sessionId: null,
+        error: "Microphone access was denied.",
+      }),
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("Microphone access was denied.");
+
+    act(() =>
+      voiceHarness.setState({
+        phase: "error",
+        sessionId: "a",
+        error: "Voice did not confirm that it stopped.",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry Stop Voice (experimental)" }));
+    await waitFor(() => expect(voiceHarness.controller.stop).toHaveBeenCalledOnce());
+
+    act(() => {
+      useStore.setState({
+        activeId: "b",
+        sessions: [session(), session({ id: "b", title: "Second" })],
+      });
+    });
+    await waitFor(() => expect(voiceHarness.controller.switchSession).toHaveBeenCalledWith("b"));
+    view.unmount();
+    expect(voiceHarness.controller.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("lets the user cancel while voice is connecting", async () => {
+    m.isTauri.mockReturnValue(true);
+    render(<Composer />);
+    act(() => voiceHarness.setState({ phase: "connecting", sessionId: "a", error: null }));
+
+    const cancel = screen.getByRole("button", { name: "Cancel Voice (experimental)" });
+    expect(cancel).toBeEnabled();
+    fireEvent.click(cancel);
+    await waitFor(() => expect(voiceHarness.controller.stop).toHaveBeenCalledOnce());
+  });
+
+  it("does not submit with Enter while voice owns the active conversation", async () => {
+    m.isTauri.mockReturnValue(true);
+    useStore.setState({ drafts: { a: "do not send" } });
+    render(<Composer />);
+    act(() => voiceHarness.setState({ phase: "live", sessionId: "a", error: null }));
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(m.runAgent).not.toHaveBeenCalled();
+    expect(useStore.getState().drafts.a).toBe("do not send");
+  });
+});
 
 describe("Composer attachments", () => {
   it("picks multiple files and renders accessible metadata and removal", async () => {
