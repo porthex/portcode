@@ -554,6 +554,24 @@ impl CodexEngine {
             })
     }
 
+    async fn wait_for_realtime_release(
+        &self,
+        session_id: &str,
+        thread_id: &str,
+        generation: u64,
+    ) -> Result<(), String> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self
+                .owns_realtime_session(session_id, thread_id, generation)
+                .await
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "Codex voice did not confirm that it stopped.".to_owned())
+    }
+
     pub async fn realtime_start_webrtc(&self, session_id: &str, sdp: &str) -> Result<(), String> {
         if self.active_by_session.lock().await.contains_key(session_id) {
             return Err(
@@ -652,14 +670,12 @@ impl CodexEngine {
         let Some(owner) = owner else {
             return Ok(());
         };
-        let result = self
-            .server
+        self.server
             .realtime_stop(&owner.thread_id)
             .await
-            .map_err(|_| "Codex could not stop voice.".to_owned());
-        self.release_realtime_session(&owner.session_id, &owner.thread_id, owner.generation)
-            .await;
-        result
+            .map_err(|_| "Codex could not stop voice.".to_owned())?;
+        self.wait_for_realtime_release(&owner.session_id, &owner.thread_id, owner.generation)
+            .await
     }
 
     pub async fn marketplace_catalog(&self) -> Result<CodexMarketplaceCatalogView, String> {
@@ -2467,11 +2483,18 @@ impl CodexEngine {
             None => None,
         };
         if method.starts_with("thread/realtime/") {
-            if let Some(route) = route
+            let owner = self
+                .active_realtime_session
+                .lock()
+                .await
                 .as_ref()
-                .filter(|route| !route.is_subagent && route.generation == Some(generation))
-            {
-                self.project_realtime(generation, route, method, &params)
+                .filter(|owner| {
+                    owner.generation == generation
+                        && thread_id.as_deref() == Some(owner.thread_id.as_str())
+                })
+                .cloned();
+            if let Some(owner) = owner.as_ref() {
+                self.project_realtime(generation, owner, method, &params)
                     .await;
             }
             return;
@@ -2670,7 +2693,7 @@ impl CodexEngine {
     async fn project_realtime(
         &self,
         generation: u64,
-        route: &ThreadRoute,
+        owner: &RealtimeSessionOwner,
         method: &str,
         params: &Value,
     ) {
@@ -2705,11 +2728,11 @@ impl CodexEngine {
             event,
             CodexRealtimeEvent::Closed | CodexRealtimeEvent::Error { .. }
         ) {
-            self.release_realtime_session(&route.session_id, &route.root_thread_id, generation)
+            self.release_realtime_session(&owner.session_id, &owner.thread_id, generation)
                 .await;
         }
         self.sink
-            .emit_realtime(&format!("codex-realtime://{}", route.session_id), event);
+            .emit_realtime(&format!("codex-realtime://{}", owner.session_id), event);
     }
 
     async fn handle_server_request(
@@ -5359,6 +5382,10 @@ mod tests {
     async fn realtime_sdp_is_desktop_only_ephemeral_and_generation_owned() {
         let (engine, db, sink) = routed_test_engine().await;
         engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+        engine
             .handle_incoming(Incoming::Notification {
                 generation: 1,
                 method: "thread/realtime/sdp".to_owned(),
@@ -5654,19 +5681,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_stop_releases_its_owner_even_when_the_session_binding_is_gone() {
-        let (engine, _, _) = routed_test_engine().await;
+    async fn explicit_stop_retains_its_owner_until_the_terminal_event() {
+        let (engine, db, _) = routed_test_engine().await;
         engine
             .claim_realtime_session("deleted-session", "root-thread", 1)
             .await
             .unwrap();
 
         let _ = engine.realtime_stop("deleted-session").await;
-
+        assert!(engine
+            .claim_realtime_session("session-2", "other-thread", 2)
+            .await
+            .is_err());
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "thread/realtime/closed".to_owned(),
+                params: json!({"threadId": "root-thread", "reason": "stopped"}),
+                raw: json!({"transcript": "must-not-persist"}),
+            })
+            .await;
         engine
             .claim_realtime_session("session-2", "other-thread", 2)
             .await
             .unwrap();
+        assert!(db
+            .codex_activity("deleted-session", 100)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_wait_completes_only_after_the_exact_owner_is_released() {
+        let (engine, _, _) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+
+        let (waited, released) = tokio::join!(
+            engine.wait_for_realtime_release("session-1", "root-thread", 1),
+            async {
+                tokio::task::yield_now().await;
+                engine
+                    .release_realtime_session("session-1", "root-thread", 1)
+                    .await
+            }
+        );
+
+        assert!(released);
+        assert!(waited.is_ok());
     }
 
     #[test]
