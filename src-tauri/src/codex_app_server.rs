@@ -47,6 +47,7 @@ const DEFAULT_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_BROADCAST_CAPACITY: usize = 1_024;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const MAX_REALTIME_SDP_BYTES: usize = 256 * 1024;
 pub type Result<T> = std::result::Result<T, CodexAppServerError>;
 
 /// A parsed `codex-cli` semantic version.
@@ -514,6 +515,22 @@ impl CodexAppServer {
         self.request("plugin/uninstall", params).await
     }
 
+    /// Start one experimental realtime session over a WebView-owned WebRTC peer.
+    /// The caller supplies only an owned thread identity and browser-generated
+    /// SDP; no arbitrary app-server method or model prompt crosses this seam.
+    pub async fn realtime_start_webrtc(&self, thread_id: &str, sdp: &str) -> Result<()> {
+        let params = webrtc_start_params(thread_id, sdp)?;
+        self.request("thread/realtime/start", params).await?;
+        Ok(())
+    }
+
+    /// Stop the active realtime session for one already-owned Codex thread.
+    pub async fn realtime_stop(&self, thread_id: &str) -> Result<()> {
+        self.request("thread/realtime/stop", json!({ "threadId": thread_id }))
+            .await?;
+        Ok(())
+    }
+
     /// Permanently close this supervisor, stop the current generation, and reject
     /// outstanding and future requests. A new engine must construct a new server.
     pub async fn shutdown(&self) {
@@ -814,6 +831,31 @@ fn initialize_params(options: &CodexAppServerOptions) -> Value {
             "experimentalApi": true,
         },
     })
+}
+
+fn webrtc_start_params(thread_id: &str, sdp: &str) -> Result<Value> {
+    let thread_id = thread_id.trim();
+    if thread_id.is_empty() {
+        return Err(CodexAppServerError::Protocol(
+            "realtime thread identity cannot be empty".to_owned(),
+        ));
+    }
+    if sdp.len() > MAX_REALTIME_SDP_BYTES {
+        return Err(CodexAppServerError::Protocol(
+            "realtime SDP offer exceeds the supported size".to_owned(),
+        ));
+    }
+    if !sdp.trim_start().starts_with("v=0") {
+        return Err(CodexAppServerError::Protocol(
+            "realtime SDP offer is malformed".to_owned(),
+        ));
+    }
+    Ok(json!({
+        "threadId": thread_id,
+        "outputModality": "audio",
+        "transport": { "type": "webrtc", "sdp": sdp },
+        "version": "v3",
+    }))
 }
 
 fn next_monotonic(counter: &AtomicU64) -> Result<u64> {
@@ -1723,6 +1765,28 @@ mod tests {
         let params = initialize_params(&CodexAppServerOptions::default());
         assert_eq!(params["clientInfo"]["name"], "portcode");
         assert_eq!(params["capabilities"]["experimentalApi"], true);
+    }
+
+    #[test]
+    fn webrtc_start_is_an_allowlisted_bounded_v3_audio_request() {
+        let offer = "v=0\r\no=portcode 1 1 IN IP4 127.0.0.1\r\n";
+        let params = webrtc_start_params("thread-1", offer).unwrap();
+
+        assert_eq!(params["threadId"], "thread-1");
+        assert_eq!(params["outputModality"], "audio");
+        assert_eq!(params["version"], "v3");
+        assert_eq!(params["transport"]["type"], "webrtc");
+        assert_eq!(params["transport"]["sdp"], offer);
+        assert!(params.get("prompt").is_none());
+        assert!(params.get("model").is_none());
+        assert!(params.get("realtimeSessionId").is_none());
+    }
+
+    #[test]
+    fn webrtc_start_rejects_empty_malformed_and_oversized_sdp() {
+        assert!(webrtc_start_params("thread-1", "").is_err());
+        assert!(webrtc_start_params("thread-1", "not-sdp").is_err());
+        assert!(webrtc_start_params("thread-1", &"x".repeat(MAX_REALTIME_SDP_BYTES + 1)).is_err());
     }
 
     #[test]

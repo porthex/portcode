@@ -986,6 +986,24 @@ fn list_dir(state: State<AppState>, sub: Option<String>) -> Result<Vec<DirEntry>
     Ok(entries)
 }
 
+// ── Codex realtime voice (desktop-local, experimental, and ephemeral) ───────
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn codex_realtime_start(
+    state: State<'_, AppState>,
+    session_id: String,
+    sdp: String,
+) -> Result<(), String> {
+    state.codex.realtime_start_webrtc(&session_id, &sdp).await
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn codex_realtime_stop(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    state.codex.realtime_stop(&session_id).await
+}
+
 // ── Codex marketplace (desktop-local; never projected through Phone Sync) ───
 
 #[cfg(desktop)]
@@ -2069,6 +2087,8 @@ pub fn run() {
         get_usage,
         get_all_usage,
         search_messages,
+        codex_realtime_start,
+        codex_realtime_stop,
         codex_marketplace_list,
         codex_marketplace_plugin_read,
         codex_marketplace_plugin_install,

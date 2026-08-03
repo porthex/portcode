@@ -9,6 +9,18 @@
 //! desktop UI AND the Phone Sync hub.
 
 use crate::llm::StreamEvent;
+use serde::Serialize;
+
+/// Ephemeral desktop-only events for one Codex realtime session. These events
+/// never enter the shared Phone Sync wire or the durable Codex activity ledger.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum CodexRealtimeEvent {
+    Sdp { sdp: String },
+    Started,
+    Closed,
+    Error { message: String },
+}
 
 /// The single side effect the Codex bridge needs from its host: deliver one
 /// `StreamEvent` on a channel. `Send + Sync` so it can be shared across the run's
@@ -27,6 +39,10 @@ pub trait EventSink: Send + Sync {
     fn emit_local(&self, channel: &str, ev: StreamEvent) {
         self.emit(channel, ev);
     }
+
+    /// Emit realtime media-control metadata to the desktop only. Implementors
+    /// must not mirror or persist this experimental, session-scoped channel.
+    fn emit_realtime(&self, channel: &str, ev: CodexRealtimeEvent);
 }
 
 /// The production [`EventSink`]: forwards to `crate::sync::emit_event`, the
@@ -46,5 +62,10 @@ impl EventSink for AppEventSink {
 
     fn emit_local(&self, channel: &str, ev: StreamEvent) {
         crate::sync::emit_local_event(&self.0, channel, ev);
+    }
+
+    fn emit_realtime(&self, channel: &str, ev: CodexRealtimeEvent) {
+        use tauri::Emitter;
+        let _ = self.0.emit(channel, ev);
     }
 }

@@ -3,10 +3,13 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  useSyncExternalStore,
   type ClipboardEvent as ReactClipboardEvent,
   type DragEvent as ReactDragEvent,
 } from "react";
 import * as ipc from "../lib/ipc";
+import { createCodexRealtimeController } from "../lib/codexRealtime";
+import { isMobilePlatform } from "../lib/platform";
 import { toolPresence } from "../lib/toolNames";
 import { modelsForOpenAIProfile, preferredOpenAIAccount, useStore } from "../store/store";
 import {
@@ -100,6 +103,12 @@ function presenceFor(
 }
 
 export function Composer() {
+  const [voiceController] = useState(createCodexRealtimeController);
+  const voice = useSyncExternalStore(
+    voiceController.subscribe,
+    voiceController.snapshot,
+    voiceController.snapshot,
+  );
   const attachmentReviewIdentitiesRef = useRef(new Map<string, AttachmentReviewIdentity>());
   const [, bumpAttachmentReviewIdentity] = useState(0);
   const [pickerError, setPickerError] = useState<string | null>(null);
@@ -220,6 +229,8 @@ export function Composer() {
   const settings = useStore((s) => s.settings);
   const openAIAuthStatus = useStore((s) => s.openAIAuthStatus);
   const settingsError = useStore((s) => s.settingsError);
+  const voiceAvailable = ipc.isTauri() && !isMobilePlatform() && !remoteMode;
+  const voiceEngaged = !["idle", "error"].includes(voice.phase);
   const ref = useRef<HTMLDivElement>(null);
   const replaceEditorDraftRef = useRef<((value: string) => void) | null>(null);
   const dropZoneRef = useRef<HTMLDivElement>(null);
@@ -288,6 +299,7 @@ export function Composer() {
     !streaming &&
     !finalizing &&
     !attachmentBusy &&
+    !voiceEngaged &&
     authenticated &&
     historyReady;
   // Armed cue (motor anticipation): a one-shot pulse the moment Send becomes
@@ -315,6 +327,21 @@ export function Composer() {
     const t = setTimeout(() => setArmed(false), 320);
     return () => clearTimeout(t);
   }, [armed]);
+
+  useEffect(() => {
+    void voiceController.switchSession(activeId);
+  }, [activeId, voiceController]);
+
+  useEffect(() => {
+    if (streaming && voiceEngaged) void voiceController.stop();
+  }, [streaming, voiceController, voiceEngaged]);
+
+  useEffect(
+    () => () => {
+      void voiceController.dispose();
+    },
+    [voiceController],
+  );
 
   const stopping = composerPhase === "stopping";
   const presence = !activeId
@@ -413,6 +440,7 @@ export function Composer() {
       streaming ||
       finalizing ||
       attachmentBusy ||
+      voiceEngaged ||
       !authenticated ||
       !historyReady
     ) {
@@ -689,11 +717,53 @@ export function Composer() {
                   <span>Attach</span>
                 </button>
               )}
+              {voiceAvailable && (
+                <button
+                  type="button"
+                  className="pc-attach-button pc-voice-button"
+                  aria-label={
+                    voice.phase === "live"
+                      ? "Stop Voice (experimental)"
+                      : voiceEngaged
+                        ? "Cancel Voice (experimental)"
+                        : "Start Voice (experimental)"
+                  }
+                  title="Voice (experimental) — send one text message first in a new conversation"
+                  disabled={
+                    voice.phase === "stopping" ||
+                    (!voiceEngaged &&
+                      (!activeId || streaming || finalizing || !authenticated || !historyReady))
+                  }
+                  onClick={() => {
+                    if (voiceEngaged) void voiceController.stop();
+                    else if (activeId) void voiceController.start(activeId);
+                  }}
+                >
+                  <span aria-hidden="true">●</span>
+                  <span>Voice (experimental)</span>
+                </button>
+              )}
               <PermissionPicker />
               <ModelSetupPicker />
             </div>
 
             <div className="pc-composer-state">
+              {voiceAvailable && voice.phase !== "idle" && voice.phase !== "error" && (
+                <span className="pc-composer-presence" role="status" aria-live="polite">
+                  {voice.phase === "requestingMicrophone"
+                    ? "Requesting microphone…"
+                    : voice.phase === "connecting"
+                      ? "Connecting voice…"
+                      : voice.phase === "live"
+                        ? "Voice live"
+                        : "Stopping voice…"}
+                </span>
+              )}
+              {voiceAvailable && voice.error && (
+                <span className="pc-composer-recovery pc-composer-recovery--error" role="alert">
+                  {voice.error}
+                </span>
+              )}
               <span
                 id="pc-composer-status"
                 role="status"
