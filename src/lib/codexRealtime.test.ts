@@ -469,6 +469,23 @@ describe("CodexRealtimeController", () => {
     expect(controller.snapshot().phase).toBe("idle");
   });
 
+  it("retains the owner when realtime-error cleanup cannot stop native voice", async () => {
+    const h = harness();
+    vi.mocked(h.deps.stop).mockRejectedValue(new Error("native stop failed"));
+    const controller = new CodexRealtimeController(h.deps);
+    await controller.start("session-1");
+
+    h.emit({ type: "error", message: "realtime failed" });
+    await settle();
+
+    expect(h.track.stop).toHaveBeenCalledOnce();
+    expect(controller.snapshot()).toEqual({
+      phase: "error",
+      sessionId: "session-1",
+      error: "realtime failed",
+    });
+  });
+
   it("notifies and unsubscribes snapshot observers", async () => {
     const h = harness();
     const controller = new CodexRealtimeController(h.deps);

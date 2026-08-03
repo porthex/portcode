@@ -448,6 +448,17 @@ impl CodexEngine {
                 "Wait for the current Codex turn to finish before starting voice.".to_owned(),
             );
         }
+        if self
+            .realtime_quarantine
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|owner| owner.thread_id == thread_id && owner.generation == generation)
+        {
+            return Err(
+                "Voice cannot restart on this conversation until Codex reconnects.".to_owned(),
+            );
+        }
         let mut active = self.active_realtime_session.lock().await;
         let claimed = match active.as_ref() {
             None => {
@@ -2014,6 +2025,58 @@ impl CodexEngine {
             })
     }
 
+    async fn normal_root_for_route_is_active(
+        &self,
+        generation: u64,
+        route: &ThreadRoute,
+    ) -> Option<String> {
+        if route.generation != Some(generation) {
+            return None;
+        }
+        let active_root_turn = self
+            .active_by_thread
+            .lock()
+            .await
+            .get(&route.root_thread_id)
+            .filter(|active| active.generation == generation)
+            .map(|active| active.turn_id.clone())?;
+        self.active_by_session
+            .lock()
+            .await
+            .get(&route.session_id)
+            .is_some_and(|active| {
+                active.generation == Some(generation)
+                    && active.turn_id.as_deref() == Some(active_root_turn.as_str())
+            })
+            .then_some(active_root_turn)
+    }
+
+    async fn normal_child_route_is_active(&self, generation: u64, route: &ThreadRoute) -> bool {
+        if !route.is_subagent {
+            return false;
+        }
+        let Some(parent_thread_id) = route.parent_thread_id.as_deref() else {
+            return false;
+        };
+        let Some(launch_turn_id) = route.launch_turn_id.as_deref() else {
+            return false;
+        };
+        if !self
+            .active_by_thread
+            .lock()
+            .await
+            .get(parent_thread_id)
+            .is_some_and(|active| {
+                active.generation == generation && active.turn_id == launch_turn_id
+            })
+        {
+            return false;
+        }
+        self.normal_root_for_route_is_active(generation, route)
+            .await
+            .is_some()
+    }
+
     async fn retire_exact_turn_requests_locked(
         &self,
         generation: u64,
@@ -2447,19 +2510,37 @@ impl CodexEngine {
             if let Incoming::Notification { method, params, .. } = &incoming {
                 if method == "thread/started" {
                     if let Some(parent_id) = string_at(params, &["thread", "parentThreadId"]) {
-                        if self
-                            .routes
-                            .read()
-                            .await
-                            .get(&parent_id)
+                        let parent_route = self.routes.read().await.get(&parent_id).cloned();
+                        if parent_route
+                            .as_ref()
                             .and_then(|parent| parent.generation)
                             .is_some_and(|parent_generation| parent_generation != generation)
                         {
                             return;
                         }
-                        route_recovered = self
-                            .establish_child_route(&thread_id, &parent_id, generation, None)
-                            .await;
+                        let parent_is_quarantined =
+                            match parent_route.as_ref() {
+                                Some(parent) => self.realtime_quarantine.lock().await.values().any(
+                                    |quarantine| quarantine.thread_id == parent.root_thread_id,
+                                ),
+                                None => false,
+                            };
+                        if parent_is_quarantined {
+                            let normal_root_active = match parent_route.as_ref() {
+                                Some(parent) => self
+                                    .normal_root_for_route_is_active(generation, parent)
+                                    .await
+                                    .is_some(),
+                                None => false,
+                            };
+                            if !normal_root_active {
+                                return;
+                            }
+                        } else {
+                            route_recovered = self
+                                .establish_child_route(&thread_id, &parent_id, generation, None)
+                                .await;
+                        }
                     }
                 }
             }
@@ -2611,6 +2692,14 @@ impl CodexEngine {
         } else {
             false
         };
+        let exact_normal_child_turn = if realtime_quarantined {
+            match route.as_ref() {
+                Some(route) => self.normal_child_route_is_active(generation, route).await,
+                None => false,
+            }
+        } else {
+            false
+        };
         if method.starts_with("thread/realtime/") {
             if let Some(owner) = realtime_owner.as_ref() {
                 self.project_realtime(generation, owner, method, &params)
@@ -2618,7 +2707,9 @@ impl CodexEngine {
             }
             return;
         }
-        if realtime_owner.is_some() || (realtime_quarantined && !exact_normal_root_turn) {
+        if realtime_owner.is_some()
+            || (realtime_quarantined && !exact_normal_root_turn && !exact_normal_child_turn)
+        {
             // Realtime V3 can fan out ordinary turn/item notifications for
             // transcript-derived delegations. They are not Portcode turns and
             // must not cross the ephemeral voice persistence boundary.
@@ -2836,7 +2927,15 @@ impl CodexEngine {
                 }
             }
             "thread/realtime/started" => CodexRealtimeEvent::Started,
-            "thread/realtime/closed" => CodexRealtimeEvent::Closed,
+            "thread/realtime/closed" => {
+                if !params
+                    .get("reason")
+                    .is_some_and(|reason| reason.is_string() || reason.is_null())
+                {
+                    return;
+                }
+                CodexRealtimeEvent::Closed
+            }
             "thread/realtime/error" => {
                 let message = params
                     .get("message")
@@ -2912,7 +3011,12 @@ impl CodexEngine {
             && self
                 .exact_request_owner_is_active(generation, &route, &thread_id, &turn_id)
                 .await;
-        if realtime_quarantined && !exact_normal_root_turn {
+        let exact_normal_child_turn = realtime_quarantined
+            && self.normal_child_route_is_active(generation, &route).await
+            && self
+                .exact_request_owner_is_active(generation, &route, &thread_id, &turn_id)
+                .await;
+        if realtime_quarantined && !exact_normal_root_turn && !exact_normal_child_turn {
             let _ = self
                 .server
                 .send_response_error(
@@ -5936,6 +6040,236 @@ mod tests {
         );
         assert!(sink.events.lock().unwrap().is_empty());
         assert!(db.codex_activity("session-1", 100).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_realtime_closed_does_not_release_or_emit_for_the_owner() {
+        let (engine, db, sink) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+
+        for params in [
+            json!({"threadId": "root-thread"}),
+            json!({"threadId": "root-thread", "reason": false}),
+        ] {
+            engine
+                .handle_incoming(Incoming::Notification {
+                    generation: 1,
+                    method: "thread/realtime/closed".to_owned(),
+                    params,
+                    raw: json!({"transcript": "must-not-persist"}),
+                })
+                .await;
+        }
+
+        assert!(
+            engine
+                .owns_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+        assert!(sink.realtime_events.lock().unwrap().is_empty());
+        assert!(sink.events.lock().unwrap().is_empty());
+        assert!(db.codex_activity("session-1", 100).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn realtime_quarantine_rejects_same_generation_restart_after_close() {
+        let (engine, _, _) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .release_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+
+        assert!(engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .is_err());
+        engine.clear_stale_realtime_quarantine("session-1", 2).await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 2)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn realtime_quarantine_allows_children_launched_by_the_exact_normal_turn() {
+        let (engine, _, sink) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .release_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+        engine
+            .claim_turn_session("run-normal", "session-1", None)
+            .await
+            .unwrap();
+        activate_test_root_turn(&engine, 1, "normal-turn").await;
+        assert!(
+            engine
+                .establish_child_route("normal-child", "root-thread", 1, Some("normal-turn"),)
+                .await
+        );
+
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "turn/started".to_owned(),
+                params: json!({
+                    "threadId": "normal-child",
+                    "turn": {"id": "normal-child-turn"}
+                }),
+                raw: json!({}),
+            })
+            .await;
+
+        assert!(sink.events.lock().unwrap().iter().any(|(_, event)| {
+            matches!(
+                event,
+                StreamEvent::AgentProgress {
+                    agent_id,
+                    current_turn_id: Some(turn_id),
+                    ..
+                } if agent_id == "normal-child" && turn_id == "normal-child-turn"
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn realtime_quarantine_defers_child_startup_until_the_normal_launch_is_owned() {
+        let (engine, _, sink) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .release_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+        engine
+            .claim_turn_session("run-normal", "session-1", None)
+            .await
+            .unwrap();
+        activate_test_root_turn(&engine, 1, "normal-turn").await;
+
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "turn/started".to_owned(),
+                params: json!({
+                    "threadId": "normal-child",
+                    "turn": {"id": "normal-child-turn"}
+                }),
+                raw: json!({}),
+            })
+            .await;
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "thread/started".to_owned(),
+                params: json!({
+                    "thread": {
+                        "id": "normal-child",
+                        "parentThreadId": "root-thread"
+                    }
+                }),
+                raw: json!({}),
+            })
+            .await;
+        assert!(sink.events.lock().unwrap().is_empty());
+
+        assert!(
+            engine
+                .establish_child_route("normal-child", "root-thread", 1, Some("normal-turn"),)
+                .await
+        );
+        engine.drain_deferred("normal-child").await;
+
+        assert!(sink.events.lock().unwrap().iter().any(|(_, event)| {
+            matches!(
+                event,
+                StreamEvent::AgentProgress {
+                    agent_id,
+                    current_turn_id: Some(turn_id),
+                    ..
+                } if agent_id == "normal-child" && turn_id == "normal-child-turn"
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn realtime_quarantine_allows_nested_children_owned_by_the_normal_lineage() {
+        let (engine, _, sink) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .release_realtime_session("session-1", "root-thread", 1)
+                .await
+        );
+        engine
+            .claim_turn_session("run-normal", "session-1", None)
+            .await
+            .unwrap();
+        activate_test_root_turn(&engine, 1, "normal-turn").await;
+        assert!(
+            engine
+                .establish_child_route("normal-child", "root-thread", 1, Some("normal-turn"),)
+                .await
+        );
+        engine.active_by_thread.lock().await.insert(
+            "normal-child".to_owned(),
+            ActiveThreadTurn {
+                generation: 1,
+                turn_id: "normal-child-turn".to_owned(),
+            },
+        );
+        assert!(
+            engine
+                .establish_child_route(
+                    "normal-grandchild",
+                    "normal-child",
+                    1,
+                    Some("normal-child-turn"),
+                )
+                .await
+        );
+
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "turn/started".to_owned(),
+                params: json!({
+                    "threadId": "normal-grandchild",
+                    "turn": {"id": "normal-grandchild-turn"}
+                }),
+                raw: json!({}),
+            })
+            .await;
+
+        assert!(sink.events.lock().unwrap().iter().any(|(_, event)| {
+            matches!(
+                event,
+                StreamEvent::AgentProgress {
+                    agent_id,
+                    current_turn_id: Some(turn_id),
+                    ..
+                } if agent_id == "normal-grandchild" && turn_id == "normal-grandchild-turn"
+            )
+        }));
     }
 
     #[tokio::test]
