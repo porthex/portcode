@@ -2482,21 +2482,27 @@ impl CodexEngine {
             Some(thread_id) => self.routes.read().await.get(thread_id).cloned(),
             None => None,
         };
+        let realtime_owner = self
+            .active_realtime_session
+            .lock()
+            .await
+            .as_ref()
+            .filter(|owner| {
+                owner.generation == generation
+                    && thread_id.as_deref() == Some(owner.thread_id.as_str())
+            })
+            .cloned();
         if method.starts_with("thread/realtime/") {
-            let owner = self
-                .active_realtime_session
-                .lock()
-                .await
-                .as_ref()
-                .filter(|owner| {
-                    owner.generation == generation
-                        && thread_id.as_deref() == Some(owner.thread_id.as_str())
-                })
-                .cloned();
-            if let Some(owner) = owner.as_ref() {
+            if let Some(owner) = realtime_owner.as_ref() {
                 self.project_realtime(generation, owner, method, &params)
                     .await;
             }
+            return;
+        }
+        if realtime_owner.is_some() {
+            // Realtime V3 can fan out ordinary turn/item notifications for
+            // transcript-derived delegations. They are not Portcode turns and
+            // must not cross the ephemeral voice persistence boundary.
             return;
         }
         if let Some(route) = route.as_ref() {
@@ -5430,6 +5436,32 @@ mod tests {
             .await;
 
         assert!(sink.realtime_events.lock().unwrap().is_empty());
+        assert!(sink.events.lock().unwrap().is_empty());
+        assert!(db.codex_activity("session-1", 100).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn realtime_owner_drops_transcript_derived_ordinary_activity() {
+        let (engine, db, sink) = routed_test_engine().await;
+        engine
+            .claim_realtime_session("session-1", "root-thread", 1)
+            .await
+            .unwrap();
+
+        engine
+            .handle_incoming(Incoming::Notification {
+                generation: 1,
+                method: "turn/plan/updated".to_owned(),
+                params: json!({
+                    "threadId": "root-thread",
+                    "turnId": "realtime-derived-turn",
+                    "explanation": "must-not-persist",
+                    "plan": []
+                }),
+                raw: json!({"transcript": "must-not-persist"}),
+            })
+            .await;
+
         assert!(sink.events.lock().unwrap().is_empty());
         assert!(db.codex_activity("session-1", 100).unwrap().is_empty());
     }
