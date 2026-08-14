@@ -114,6 +114,7 @@ struct ActiveSessionTurn {
     run_id: String,
     generation: Option<u64>,
     turn_id: Option<String>,
+    permission_mode: crate::permissions::PermissionMode,
     _attachment_snapshot: Option<Arc<tempfile::TempDir>>,
 }
 
@@ -698,6 +699,7 @@ impl CodexEngine {
                     run_id: run_id.to_string(),
                     generation: None,
                     turn_id: None,
+                    permission_mode: settings.permission_mode,
                     _attachment_snapshot: prepared_turn.attachment_snapshot(),
                 },
             );
@@ -1498,36 +1500,8 @@ impl CodexEngine {
                     "Codex did not offer a session-scoped decision for this approval.".into(),
                 );
             }
-            let result = match request.method.as_str() {
-                "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-                    let decision = if allow {
-                        if for_session {
-                            "acceptForSession"
-                        } else {
-                            "accept"
-                        }
-                    } else {
-                        "decline"
-                    };
-                    json!({ "decision": decision })
-                }
-                "item/permissions/requestApproval" => {
-                    let permissions = if allow {
-                        request
-                            .params
-                            .get("permissions")
-                            .cloned()
-                            .unwrap_or_else(|| json!({}))
-                    } else {
-                        json!({})
-                    };
-                    json!({
-                        "permissions": permissions,
-                        "scope": if for_session { "session" } else { "turn" },
-                    })
-                }
-                _ => return Err("This request is not an allow/deny approval.".to_string()),
-            };
+            let result = approval_response(&request.method, &request.params, allow, for_session)
+                .ok_or_else(|| "This request is not an allow/deny approval.".to_string())?;
             request.claimed = true;
             (request.clone(), result)
         };
@@ -2519,6 +2493,24 @@ impl CodexEngine {
             .record_raw(&route, method, &params, Some(&rpc_id), &raw)
             .await
         {
+            return;
+        }
+        let bypass = approval
+            && self
+                .active_by_session
+                .lock()
+                .await
+                .get(&route.session_id)
+                .is_some_and(|active| {
+                    active.permission_mode == crate::permissions::PermissionMode::Bypass
+                });
+        if bypass {
+            let response = approval_response(method, &params, true, false)
+                .expect("every native approval method has an allow response");
+            let _ = self
+                .transmit_response_result(generation, rpc_id, response)
+                .await;
+            drop(lifecycle);
             return;
         }
         let sanitized_params = already_sanitized_activity(method, &params);
@@ -4880,6 +4872,40 @@ fn approval_presentation(method: &str, params: &Value) -> (String, String, Value
     }
 }
 
+fn approval_response(
+    method: &str,
+    params: &Value,
+    allow: bool,
+    for_session: bool,
+) -> Option<Value> {
+    match method {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            let decision = if allow {
+                if for_session {
+                    "acceptForSession"
+                } else {
+                    "accept"
+                }
+            } else {
+                "decline"
+            };
+            Some(json!({ "decision": decision }))
+        }
+        "item/permissions/requestApproval" => Some(json!({
+            "permissions": if allow {
+                params
+                    .get("permissions")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}))
+            } else {
+                json!({})
+            },
+            "scope": if for_session { "session" } else { "turn" },
+        })),
+        _ => None,
+    }
+}
+
 fn approval_supports_session(method: &str, params: &Value) -> bool {
     match method {
         "item/commandExecution/requestApproval" => params
@@ -5029,6 +5055,7 @@ mod tests {
                 run_id: format!("run-{turn_id}"),
                 generation: Some(generation),
                 turn_id: Some(turn_id.to_string()),
+                permission_mode: crate::permissions::PermissionMode::Default,
                 _attachment_snapshot: None,
             },
         );
@@ -5124,6 +5151,7 @@ mod tests {
                     run_id: "active-run".to_string(),
                     generation: Some(1),
                     turn_id: Some("active-turn".to_string()),
+                    permission_mode: crate::permissions::PermissionMode::Default,
                     _attachment_snapshot: Some(snapshot),
                 },
             );
@@ -5157,6 +5185,7 @@ mod tests {
                 run_id: "active-run".to_string(),
                 generation: Some(1),
                 turn_id: Some("active-turn".to_string()),
+                permission_mode: crate::permissions::PermissionMode::Default,
                 _attachment_snapshot: Some(snapshot),
             },
         );
@@ -6091,6 +6120,7 @@ mod tests {
                 run_id: "old-run".to_string(),
                 generation: Some(1),
                 turn_id: Some("old-turn".to_string()),
+                permission_mode: crate::permissions::PermissionMode::Default,
                 _attachment_snapshot: None,
             },
         );
@@ -6100,6 +6130,7 @@ mod tests {
                 run_id: "replacement-run".to_string(),
                 generation: Some(2),
                 turn_id: Some("replacement-turn".to_string()),
+                permission_mode: crate::permissions::PermissionMode::Default,
                 _attachment_snapshot: None,
             },
         );
@@ -6601,6 +6632,53 @@ mod tests {
                 event,
                 StreamEvent::PermissionRequest { .. } | StreamEvent::CodexRequest { .. }
             )));
+    }
+
+    #[tokio::test]
+    async fn bypass_answers_native_approvals_without_prompting() {
+        let (engine, _, sink) = routed_test_engine().await;
+        activate_test_root_turn(&engine, 1, "bypass-turn").await;
+        engine
+            .active_by_session
+            .lock()
+            .await
+            .get_mut("session-1")
+            .unwrap()
+            .permission_mode = crate::permissions::PermissionMode::Bypass;
+        let (mut calls, release) = install_response_gate(&engine, Ok(()));
+
+        let request_engine = Arc::clone(&engine);
+        let request = tokio::spawn(async move {
+            request_engine
+                .handle_server_request(
+                    1,
+                    json!(32),
+                    "item/commandExecution/requestApproval",
+                    json!({
+                        "threadId": "root-thread",
+                        "turnId": "bypass-turn",
+                        "itemId": "bypass-request",
+                        "availableDecisions": ["accept", "decline"]
+                    }),
+                    Value::Null,
+                )
+                .await;
+        });
+
+        let response = tokio::time::timeout(Duration::from_secs(1), calls.recv())
+            .await
+            .expect("bypass response must not wait for UI approval")
+            .expect("bypass responds natively");
+        assert_eq!(response, (1, json!(32), json!({ "decision": "accept" })));
+        assert!(engine.pending_requests.lock().await.is_empty());
+        assert!(!sink
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, event)| { matches!(event, StreamEvent::PermissionRequest { .. }) }));
+        release.add_permits(1);
+        request.await.unwrap();
     }
 
     #[tokio::test]
@@ -7206,6 +7284,7 @@ mod tests {
                 run_id: "run-in-flight".to_string(),
                 generation: Some(1),
                 turn_id: None,
+                permission_mode: crate::permissions::PermissionMode::Default,
                 _attachment_snapshot: None,
             },
         );
@@ -7227,6 +7306,7 @@ mod tests {
                 run_id: "run-in-flight".to_string(),
                 generation: None,
                 turn_id: None,
+                permission_mode: crate::permissions::PermissionMode::Default,
                 _attachment_snapshot: None,
             },
         );
@@ -7333,6 +7413,7 @@ mod tests {
                 run_id: "newer-run".to_string(),
                 generation: Some(1),
                 turn_id: Some("newer-turn".to_string()),
+                permission_mode: crate::permissions::PermissionMode::Default,
                 _attachment_snapshot: None,
             },
         );
