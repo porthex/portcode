@@ -401,6 +401,21 @@ describe("Chat transcript", () => {
     for (const sentinel of sensitive) expect(document.body).not.toHaveTextContent(sentinel);
   });
 
+  it("does not show background task status above the composer", () => {
+    useStore.setState({
+      activeId: "s1",
+      messages: { s1: [] },
+      backgroundTasks: {
+        s1: [{ id: "task-1", command: "npm run dev", status: "running" }],
+      },
+    });
+
+    render(<Chat />);
+
+    expect(screen.queryByRole("region", { name: "Background tasks" })).not.toBeInTheDocument();
+    expect(screen.queryByText("1 background task running")).not.toBeInTheDocument();
+  });
+
   it("mounts a structured Codex request above the composer", () => {
     useStore.setState({
       activeId: "s1",

@@ -11,7 +11,6 @@ import { useStore } from "../store/store";
 import { MessageView } from "./Message";
 import { Composer } from "./Composer";
 import { PermissionPrompt } from "./PermissionPrompt";
-import { BackgroundTasksPanel } from "./BackgroundTasksPanel";
 import { CodexRequestPrompt } from "./CodexRequestPrompt";
 import { type Message } from "../types";
 import type { AgentInfo } from "../types";
@@ -212,7 +211,7 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
   }, [updateUnreadActivity]);
 
   // Keep the current-turn runway matched to the real transcript viewport (the
-  // composer, permission banner, and background-task panel can all change it).
+  // composer and permission banner can both change it).
   useLayoutEffect(() => {
     if (!anchorCurrentTurn || currentTurnStart < 0) return;
     sizeCurrentTurn();
@@ -514,7 +513,6 @@ export function Chat({ transcriptAside, transcriptAsideOpen = false }: ChatProps
           </div>
         )}
       </div>
-      <BackgroundTasksPanel />
       <PermissionPrompt />
       <CodexRequestPrompt />
       <div data-testid="chat-composer-area" className="w-full min-h-0 shrink">
