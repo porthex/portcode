@@ -156,8 +156,8 @@ export interface TurnReceipt {
 export type TurnPhase = "provider_started" | "agent_completed";
 
 /**
- * One end\'s high-water mark for a session: \"I already hold every message up to
- * and including `seq`.\" A reconnecting phone sends one per known session so the
+ * One end's high-water mark for a session: "I already hold every message up to
+ * and including `seq`." A reconnecting phone sends one per known session so the
  * desktop can reply with only the newer rows (`Db::messages_since`).
  */
 export interface Cursor {
@@ -206,7 +206,7 @@ export interface MessageRow {
 
 /**
  * Public changed-file item. Paths are labels projected and bounded by the
- * desktop; this type cannot carry a receipt\'s local account attribution.
+ * desktop; this type cannot carry a receipt's local account attribution.
  */
 export interface PhoneTurnChangedFile {
     path: string;
@@ -467,15 +467,15 @@ export interface InitOutput {
     readonly intounderlyingsource_cancel: (a: number) => void;
     readonly intounderlyingsource_pull: (a: number, b: any) => any;
     readonly ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hb8fbd460a1192340: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen__convert__closures_____invoke__h09e9e52498d4d1d0: (a: number, b: number, c: any, d: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__ha7823e4aac48d794: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h79b5ebf2502ea461: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hd62a5e7beb612bd6: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h03f4eb5a6d01a415: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h2f580c96019a23ca: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h17c79ca7cc9e3483: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h74a3652b4625e71a: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h7489660246e8c56f: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen__convert__closures_____invoke__h8e4092050f2e1016: (a: number, b: number, c: any, d: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__hba15ed50373f0f9e: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__he5717fda343f3e42: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h7e55d1127dc844b4: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h491f643b0bd758f9: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__hb31b9f2fd166600f: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__ha6801afd2ff3851e: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h3147e91f33883ca4: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;
