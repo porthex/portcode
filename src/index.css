@@ -1159,6 +1159,82 @@ input[type="radio"]:not(:disabled) {
   flex-shrink: 0;
   color: var(--color-accent-2);
 }
+/* Keyboard cursor for listbox-style pops (the composer Model picker): the option
+   under the roving ↑/↓ cursor lights like a hover so the focused row is obvious
+   without moving DOM focus off the list (aria-activedescendant pattern). */
+.pc-pop__item--cursor {
+  background: rgba(33, 230, 255, 0.07);
+  color: var(--color-fg);
+}
+
+/* =========================================================================
+   COMPOSER MODEL PICKER — on-theme dropdown (trigger + .pc-pop listbox)
+   Replaces the native <select> with a button that opens the design-system
+   popover. Resting = panel-2 chip like the Settings row; hover/open light cyan.
+   ========================================================================= */
+.pc-model-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 160px;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: 9px;
+  border: 1px solid var(--color-border);
+  background: var(--color-panel-2);
+  color: var(--color-fg);
+  font-size: 12px;
+  cursor: pointer;
+  transition:
+    background 0.16s ease,
+    border-color 0.16s ease,
+    color 0.16s ease,
+    box-shadow 0.16s ease;
+}
+.pc-model-trigger:not(:disabled):hover,
+.pc-model-trigger[aria-expanded="true"] {
+  border-color: rgba(33, 230, 255, 0.4);
+  color: var(--color-accent-2);
+  box-shadow: 0 0 12px rgba(33, 230, 255, 0.1);
+}
+.pc-model-trigger:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.pc-model-caret {
+  flex-shrink: 0;
+  font-size: 9px;
+  line-height: 1;
+  color: var(--color-faint);
+  transition: transform 0.16s ease;
+}
+.pc-model-trigger[aria-expanded="true"] .pc-model-caret {
+  transform: rotate(180deg);
+  color: var(--color-accent-2);
+}
+/* The model popover opens UPWARD (it lives at the bottom of the screen), is a hair
+   wider than the toolbar pops to fit "Claude Sonnet 4.6", and its option labels
+   sit a touch larger than the 12px sort/group rows. */
+.pc-model-pop {
+  min-width: 184px;
+}
+.pc-model-pop .pc-pop__item {
+  font-size: 12.5px;
+}
+/* Provider caption above each group of models (mono eyebrow, like .pc-ctx__heading). */
+.pc-model-group {
+  padding: 6px 8px 3px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--color-faint);
+  white-space: nowrap;
+}
+/* First group's caption hugs the top edge a little tighter. */
+.pc-model-pop [role="group"]:first-child .pc-model-group {
+  padding-top: 3px;
+}
 
 /* =========================================================================
    CONTEXT MENU — right-click popover (sibling of .pc-pop, portaled to <body>)

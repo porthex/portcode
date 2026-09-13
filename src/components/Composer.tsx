@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { useStore } from "../store/store";
-import { DANGER_MODES, estimateCost, PROVIDERS } from "../types";
+import { DANGER_MODES, estimateCost, MODELS, PROVIDERS } from "../types";
 
 /** Read the active session's model, falling back to the global default. */
 function useActiveModel(): string {
@@ -348,30 +348,168 @@ function ModePill() {
   );
 }
 
-/** Compact, provider-grouped picker for the ACTIVE session's model. */
+/**
+ * Compact, provider-grouped picker for the ACTIVE session's model — an on-theme
+ * dropdown built from the design system's `.pc-pop` popover (the same primitive
+ * as the sidebar Sort/Group menus), NOT a native `<select>` (which renders an
+ * off-theme OS popup). A trigger button opens a `role="listbox"` of provider
+ * groups; the active model carries a cyan ✓ + `aria-selected`. Fully keyboard
+ * driven (↑/↓/Home/End/Enter/Esc) and closes on outside click / blur.
+ */
 function ModelPicker() {
   const model = useActiveModel();
   const setSessionModel = useStore((s) => s.setSessionModel);
   const activeId = useStore((s) => s.activeId);
   const streaming = useStore((s) => s.streaming);
+
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const listId = useId();
+  const disabled = streaming || !activeId;
+
+  // The model id under the keyboard cursor while the list is open (roving focus).
+  const [activeOption, setActiveOption] = useState(model);
+  const label = MODELS.find((m) => m.id === model)?.label ?? model;
+
+  // Close (and reset the cursor) whenever the list goes shut, or the picker
+  // becomes disabled mid-stream so a turn can't start with it hanging open.
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
+
+  // Outside click / blur / Escape-at-window dismisses, matching the sidebar pop.
+  useEffect(() => {
+    if (!open) return;
+    const onDocMouseDown = (e: globalThis.MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDocMouseDown, true);
+    window.addEventListener("blur", () => setOpen(false));
+    return () => {
+      document.removeEventListener("mousedown", onDocMouseDown, true);
+    };
+  }, [open]);
+
+  // On open, seed the cursor at the current model and move focus into the list so
+  // arrow keys are immediately live; on close, return focus to the trigger.
+  useLayoutEffect(() => {
+    if (open) {
+      setActiveOption(model);
+      listRef.current?.focus();
+    }
+  }, [open, model]);
+
+  const pick = (id: string) => {
+    void setSessionModel(id);
+    setOpen(false);
+    triggerRef.current?.focus();
+  };
+
+  const move = (dir: 1 | -1) => {
+    const i = MODELS.findIndex((m) => m.id === activeOption);
+    const next = (i === -1 ? 0 : i + dir + MODELS.length) % MODELS.length;
+    setActiveOption(MODELS[next].id);
+  };
+
+  const onListKeyDown = (e: React.KeyboardEvent) => {
+    switch (e.key) {
+      case "ArrowDown":
+        e.preventDefault();
+        move(1);
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        move(-1);
+        break;
+      case "Home":
+        e.preventDefault();
+        setActiveOption(MODELS[0].id);
+        break;
+      case "End":
+        e.preventDefault();
+        setActiveOption(MODELS[MODELS.length - 1].id);
+        break;
+      case "Enter":
+      case " ":
+        e.preventDefault();
+        pick(activeOption);
+        break;
+      case "Escape":
+        e.preventDefault();
+        setOpen(false);
+        triggerRef.current?.focus();
+        break;
+      case "Tab":
+        setOpen(false);
+        break;
+    }
+  };
+
   return (
-    <select
-      aria-label="Model"
-      value={model}
-      onChange={(e) => void setSessionModel(e.target.value)}
-      disabled={streaming || !activeId}
-      className="shrink-0 rounded-lg border border-border bg-panel-2 px-2.5 py-1.5 text-[12px] text-fg outline-none disabled:opacity-50"
-    >
-      {PROVIDERS.map((p) => (
-        <optgroup key={p.id} label={p.label}>
-          {p.models.map((mdl) => (
-            <option key={mdl.id} value={mdl.id}>
-              {mdl.label}
-            </option>
+    <div ref={rootRef} className="relative shrink-0">
+      <button
+        ref={triggerRef}
+        type="button"
+        aria-label="Model"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={open ? listId : undefined}
+        disabled={disabled}
+        onClick={() => setOpen((o) => !o)}
+        className="pc-model-trigger"
+      >
+        <span className="truncate">{label}</span>
+        <span aria-hidden="true" className="pc-model-caret">
+          ▾
+        </span>
+      </button>
+      {open && (
+        <div
+          ref={listRef}
+          id={listId}
+          role="listbox"
+          aria-label="Model"
+          aria-activedescendant={`${listId}-${activeOption}`}
+          tabIndex={-1}
+          onKeyDown={onListKeyDown}
+          className="pc-pop pc-model-pop bottom-full right-0 mb-1.5"
+        >
+          {PROVIDERS.map((p) => (
+            <div key={p.id} role="group" aria-label={p.label}>
+              <div className="pc-model-group" role="presentation">
+                {p.label}
+              </div>
+              {p.models.map((mdl) => {
+                const selected = mdl.id === model;
+                const cursored = mdl.id === activeOption;
+                return (
+                  <button
+                    key={mdl.id}
+                    id={`${listId}-${mdl.id}`}
+                    role="option"
+                    aria-selected={selected}
+                    onClick={() => pick(mdl.id)}
+                    onMouseEnter={() => setActiveOption(mdl.id)}
+                    className={`pc-pop__item${cursored ? " pc-pop__item--cursor" : ""}`}
+                  >
+                    <span
+                      className="pc-pop__check"
+                      aria-hidden="true"
+                      style={{ visibility: selected ? "visible" : "hidden" }}
+                    >
+                      ✓
+                    </span>
+                    {mdl.label}
+                  </button>
+                );
+              })}
+            </div>
           ))}
-        </optgroup>
-      ))}
-    </select>
+        </div>
+      )}
+    </div>
   );
 }
 

@@ -666,6 +666,11 @@ describe("Composer plan-mode banner", () => {
 });
 
 describe("Composer ModelPicker", () => {
+  // The picker is an on-theme dropdown (trigger button → .pc-pop listbox), NOT a
+  // native <select>: opening reveals provider-grouped options, and the active
+  // model carries aria-selected + the ✓.
+  const trigger = () => screen.getByRole("button", { name: "Model" });
+
   it("reflects the active session's model and groups options by provider", () => {
     useStore.setState({
       sessions: [session({ id: "a", model: "claude-opus-4-8" })],
@@ -674,13 +679,21 @@ describe("Composer ModelPicker", () => {
     });
     render(<Composer />);
 
-    const picker = screen.getByRole("combobox", { name: "Model" }) as HTMLSelectElement;
-    expect(picker.value).toBe("claude-opus-4-8");
-    // Provider-grouped: the Anthropic <optgroup> wraps the model options.
-    const groups = picker.querySelectorAll("optgroup");
+    // The trigger shows the active model's friendly label.
+    expect(trigger()).toHaveTextContent("Claude Opus 4.8");
+
+    // Open the listbox: a single Anthropic provider group wraps the options.
+    fireEvent.click(trigger());
+    const list = screen.getByRole("listbox", { name: "Model" });
+    const groups = list.querySelectorAll('[role="group"]');
     expect(groups).toHaveLength(1);
-    expect(groups[0].label).toBe("Anthropic");
-    expect(screen.getByRole("option", { name: "Claude Sonnet 4.6" })).toBeInTheDocument();
+    expect(groups[0]).toHaveAttribute("aria-label", "Anthropic");
+    // The active model's option is marked selected; another model is offered.
+    expect(screen.getByRole("option", { name: /Claude Opus 4\.8/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByRole("option", { name: /Claude Sonnet 4\.6/ })).toBeInTheDocument();
   });
 
   it("changing the model updates the active session AND the last-used default", async () => {
@@ -691,9 +704,8 @@ describe("Composer ModelPicker", () => {
     });
     render(<Composer />);
 
-    fireEvent.change(screen.getByRole("combobox", { name: "Model" }), {
-      target: { value: "claude-sonnet-4-6" },
-    });
+    fireEvent.click(trigger());
+    fireEvent.click(screen.getByRole("option", { name: /Claude Sonnet 4\.6/ }));
 
     // setSessionModel updates the session synchronously, then awaits the
     // last-used sync into settings.model (updateSettings -> ipc.saveSettings).
@@ -712,6 +724,6 @@ describe("Composer ModelPicker", () => {
       streaming: true,
     });
     render(<Composer />);
-    expect(screen.getByRole("combobox", { name: "Model" })).toBeDisabled();
+    expect(trigger()).toBeDisabled();
   });
 });
