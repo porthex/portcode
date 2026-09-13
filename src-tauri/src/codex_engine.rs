@@ -97,6 +97,7 @@ struct ThreadRoute {
     generation: Option<u64>,
     parent_thread_id: Option<String>,
     launch_turn_id: Option<String>,
+    permission_mode: crate::permissions::PermissionMode,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +123,7 @@ struct ActiveSessionTurn {
 struct ActiveThreadTurn {
     generation: u64,
     turn_id: String,
+    permission_mode: crate::permissions::PermissionMode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -356,6 +358,7 @@ impl CodexEngine {
                         generation: None,
                         parent_thread_id: None,
                         launch_turn_id: None,
+                        permission_mode: crate::permissions::PermissionMode::Default,
                     },
                 )
             })
@@ -1614,25 +1617,25 @@ impl CodexEngine {
         }
     }
 
-    async fn exact_request_owner_is_active(
+    async fn exact_request_owner_permission_mode(
         &self,
         generation: u64,
         route: &ThreadRoute,
         thread_id: &str,
         turn_id: &str,
-    ) -> bool {
-        if route.generation != Some(generation)
-            || !self
-                .active_by_thread
-                .lock()
-                .await
-                .get(thread_id)
-                .is_some_and(|active| active.generation == generation && active.turn_id == turn_id)
-        {
-            return false;
+    ) -> Option<crate::permissions::PermissionMode> {
+        if route.generation != Some(generation) {
+            return None;
         }
+        let active = self
+            .active_by_thread
+            .lock()
+            .await
+            .get(thread_id)
+            .filter(|active| active.generation == generation && active.turn_id == turn_id)
+            .cloned()?;
         if route.is_subagent {
-            return true;
+            return Some(active.permission_mode);
         }
         let projected = self
             .turns
@@ -1641,7 +1644,7 @@ impl CodexEngine {
             .get(turn_id)
             .is_some_and(|turn| turn.is_owned_by(generation, route, thread_id, turn_id));
         if !projected {
-            return false;
+            return None;
         }
         self.active_by_session
             .lock()
@@ -1650,6 +1653,7 @@ impl CodexEngine {
             .is_some_and(|active| {
                 active.generation == Some(generation) && active.turn_id.as_deref() == Some(turn_id)
             })
+            .then_some(active.permission_mode)
     }
 
     async fn retire_exact_turn_requests_locked(
@@ -1788,6 +1792,7 @@ impl CodexEngine {
                 generation: Some(generation),
                 parent_thread_id: None,
                 launch_turn_id: None,
+                        permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
         self.drain_deferred(thread_id).await;
@@ -1862,7 +1867,7 @@ impl CodexEngine {
                 turn_id.to_string(),
             ),
         );
-        if let Some(active) = self
+        let permission_mode = if let Some(active) = self
             .active_by_session
             .lock()
             .await
@@ -1872,12 +1877,16 @@ impl CodexEngine {
                 active.generation = Some(generation);
                 active.turn_id = Some(turn_id.to_string());
             }
-        }
+            active.permission_mode
+        } else {
+            crate::permissions::PermissionMode::Default
+        };
         self.active_by_thread.lock().await.insert(
             thread_id.to_string(),
             ActiveThreadTurn {
                 generation,
                 turn_id: turn_id.to_string(),
+                permission_mode,
             },
         );
         self.sink.emit(
@@ -2281,11 +2290,33 @@ impl CodexEngine {
                 {
                     return;
                 }
+                let permission_mode = if let Some(route) = route.as_ref() {
+                    if route.is_subagent {
+                        let active = self.active_by_thread.lock().await;
+                        route
+                            .parent_thread_id
+                            .as_ref()
+                            .and_then(|parent| active.get(parent))
+                            .map(|parent| parent.permission_mode)
+                            .unwrap_or(crate::permissions::PermissionMode::Default)
+                    } else {
+                        self.active_by_session
+                            .lock()
+                            .await
+                            .get(&route.session_id)
+                            .filter(|active| active.generation == Some(generation))
+                            .map(|active| active.permission_mode)
+                            .unwrap_or(crate::permissions::PermissionMode::Default)
+                    }
+                } else {
+                    crate::permissions::PermissionMode::Default
+                };
                 self.active_by_thread.lock().await.insert(
                     thread_id.clone(),
                     ActiveThreadTurn {
                         generation,
                         turn_id: turn_id.clone(),
+                        permission_mode,
                     },
                 );
                 if let Some(route) = route.as_ref().filter(|route| route.is_subagent) {
@@ -2472,10 +2503,10 @@ impl CodexEngine {
         }
 
         let lifecycle = self.request_lifecycle.lock().await;
-        if !self
-            .exact_request_owner_is_active(generation, &route, &thread_id, &turn_id)
+        let Some(permission_mode) = self
+            .exact_request_owner_permission_mode(generation, &route, &thread_id, &turn_id)
             .await
-        {
+        else {
             drop(lifecycle);
             let _ = self
                 .server
@@ -2488,22 +2519,14 @@ impl CodexEngine {
                 )
                 .await;
             return;
-        }
+        };
         if !self
             .record_raw(&route, method, &params, Some(&rpc_id), &raw)
             .await
         {
             return;
         }
-        let bypass = approval
-            && self
-                .active_by_session
-                .lock()
-                .await
-                .get(&route.session_id)
-                .is_some_and(|active| {
-                    active.permission_mode == crate::permissions::PermissionMode::Bypass
-                });
+        let bypass = approval && permission_mode == crate::permissions::PermissionMode::Bypass;
         if bypass {
             let response = approval_response(method, &params, true, false)
                 .expect("every native approval method has an allow response");
@@ -5041,6 +5064,7 @@ mod tests {
                 generation: Some(1),
                 parent_thread_id: None,
                 launch_turn_id: None,
+                        permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
         // Db owns the connection, so dropping the TempDir handle does not affect
@@ -5064,6 +5088,7 @@ mod tests {
             ActiveThreadTurn {
                 generation,
                 turn_id: turn_id.to_string(),
+                permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
         engine.turns.lock().await.insert(
@@ -5332,6 +5357,7 @@ mod tests {
                 generation: Some(1),
                 parent_thread_id: None,
                 launch_turn_id: None,
+                        permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
 
@@ -5403,6 +5429,7 @@ mod tests {
                 generation: Some(1),
                 parent_thread_id: None,
                 launch_turn_id: None,
+                        permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
         engine
@@ -5507,6 +5534,7 @@ mod tests {
                 generation: Some(1),
                 parent_thread_id: None,
                 launch_turn_id: None,
+                        permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
 
@@ -5570,6 +5598,7 @@ mod tests {
                 generation: Some(1),
                 parent_thread_id: None,
                 launch_turn_id: None,
+                        permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
 
@@ -5640,6 +5669,7 @@ mod tests {
                 generation: Some(2),
                 parent_thread_id: None,
                 launch_turn_id: None,
+                        permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
         engine.routes.write().await.insert(
@@ -5725,6 +5755,7 @@ mod tests {
                 generation: Some(2),
                 parent_thread_id: None,
                 launch_turn_id: None,
+                        permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
         engine
@@ -5782,6 +5813,7 @@ mod tests {
                 generation: Some(1),
                 parent_thread_id: None,
                 launch_turn_id: None,
+                        permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
 
@@ -5825,6 +5857,7 @@ mod tests {
                     generation: Some(1),
                     parent_thread_id: None,
                     launch_turn_id: None,
+                        permission_mode: crate::permissions::PermissionMode::Default,
                 },
             );
         }
@@ -5886,6 +5919,7 @@ mod tests {
                     generation: Some(1),
                     parent_thread_id: None,
                     launch_turn_id: None,
+                        permission_mode: crate::permissions::PermissionMode::Default,
                 },
             );
         }
@@ -5939,6 +5973,7 @@ mod tests {
                 generation: Some(1),
                 parent_thread_id: None,
                 launch_turn_id: None,
+                        permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
 
@@ -6010,6 +6045,7 @@ mod tests {
                 generation: Some(1),
                 parent_thread_id: None,
                 launch_turn_id: None,
+                        permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
         engine
@@ -6182,6 +6218,7 @@ mod tests {
             ActiveThreadTurn {
                 generation: 1,
                 turn_id: "old-agent-turn".to_string(),
+                permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
         engine.active_by_thread.lock().await.insert(
@@ -6189,6 +6226,7 @@ mod tests {
             ActiveThreadTurn {
                 generation: 2,
                 turn_id: "replacement-agent-turn".to_string(),
+                permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
         engine.routes.write().await.insert(
@@ -6388,6 +6426,7 @@ mod tests {
                 generation: Some(1),
                 parent_thread_id: None,
                 launch_turn_id: None,
+                        permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
         engine.turns.lock().await.insert(
@@ -6645,6 +6684,13 @@ mod tests {
             .get_mut("session-1")
             .unwrap()
             .permission_mode = crate::permissions::PermissionMode::Bypass;
+        engine
+            .active_by_thread
+            .lock()
+            .await
+            .get_mut("root-thread")
+            .unwrap()
+            .permission_mode = crate::permissions::PermissionMode::Bypass;
         let (mut calls, release) = install_response_gate(&engine, Ok(()));
 
         let request_engine = Arc::clone(&engine);
@@ -6679,6 +6725,61 @@ mod tests {
             .any(|(_, event)| { matches!(event, StreamEvent::PermissionRequest { .. }) }));
         release.add_permits(1);
         request.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn newer_bypass_turn_does_not_approve_an_older_subagent_request() {
+        let (engine, _, sink) = routed_test_engine().await;
+        activate_test_root_turn(&engine, 1, "newer-bypass-turn").await;
+        engine
+            .active_by_session
+            .lock()
+            .await
+            .get_mut("session-1")
+            .unwrap()
+            .permission_mode = crate::permissions::PermissionMode::Bypass;
+        engine.routes.write().await.insert(
+            "older-agent".to_string(),
+            ThreadRoute {
+                session_id: "session-1".to_string(),
+                root_thread_id: "root-thread".to_string(),
+                is_subagent: true,
+                generation: Some(1),
+                parent_thread_id: Some("root-thread".to_string()),
+                launch_turn_id: Some("older-root-turn".to_string()),
+            },
+        );
+        engine.active_by_thread.lock().await.insert(
+            "older-agent".to_string(),
+            ActiveThreadTurn {
+                generation: 1,
+                turn_id: "older-agent-turn".to_string(),
+                permission_mode: crate::permissions::PermissionMode::Default,
+            },
+        );
+
+        engine
+            .handle_server_request(
+                1,
+                json!(33),
+                "item/commandExecution/requestApproval",
+                json!({
+                    "threadId": "older-agent",
+                    "turnId": "older-agent-turn",
+                    "itemId": "older-agent-request",
+                    "availableDecisions": ["accept", "decline"]
+                }),
+                Value::Null,
+            )
+            .await;
+
+        assert_eq!(engine.pending_requests.lock().await.len(), 1);
+        assert!(sink
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, event)| matches!(event, StreamEvent::PermissionRequest { .. })));
     }
 
     #[tokio::test]
@@ -7422,6 +7523,7 @@ mod tests {
             ActiveThreadTurn {
                 generation: 1,
                 turn_id: "newer-turn".to_string(),
+                permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
         engine.turns.lock().await.insert(
@@ -7478,6 +7580,7 @@ mod tests {
             ActiveThreadTurn {
                 generation: 1,
                 turn_id: "child-turn".to_string(),
+                permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
         engine.subagent_turns.lock().await.insert(
@@ -7580,6 +7683,7 @@ mod tests {
             ActiveThreadTurn {
                 generation: 1,
                 turn_id: "newer-child-turn".to_string(),
+                permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
         engine.agent_interrupts.lock().await.insert(
@@ -7689,6 +7793,7 @@ mod tests {
             ActiveThreadTurn {
                 generation: 1,
                 turn_id: "watchdog-child-turn".to_string(),
+                permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
         engine.agent_interrupts.lock().await.insert(
@@ -7821,6 +7926,7 @@ mod tests {
             ActiveThreadTurn {
                 generation: 1,
                 turn_id: "watchdog-child-failure".to_string(),
+                permission_mode: crate::permissions::PermissionMode::Default,
             },
         );
         engine.agent_interrupts.lock().await.insert(
@@ -7887,6 +7993,7 @@ mod tests {
                 ActiveThreadTurn {
                     generation: 1,
                     turn_id: turn_id.clone(),
+                    permission_mode: crate::permissions::PermissionMode::Default,
                 },
             );
             engine.agent_interrupts.lock().await.insert(
